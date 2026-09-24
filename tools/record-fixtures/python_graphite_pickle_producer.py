@@ -1,33 +1,25 @@
 #!/usr/bin/env python3
 """Sends one length-prefixed carbon pickle frame to `raw_capture.py --proto tcp` for
-`script/record-fixtures`'s `graphite` producer -- stdlib only (`pickle`, `struct`, `socket`), no
-carbon/graphite/Twisted dependency, so this exercises exactly the wire format
-`crates/logit-proto/src/graphite/pickle.rs`'s restricted reader has to accept: a 4-byte
-big-endian length prefix (Twisted's `Int32StringReceiver` framing carbon's own pickle receiver
-inherits), followed by `pickle.dumps([(path, (timestamp, value)), ...], protocol=...)`.
+`script/record-fixtures`'s `graphite` producer. Stdlib only, with no carbon or Twisted dependency:
+the frame is a 4-byte big-endian length prefix (Twisted's `Int32StringReceiver` framing, which
+carbon's pickle receiver inherits) followed by
+`pickle.dumps([(path, (timestamp, value)), ...], protocol=...)`, the wire format
+`crates/logit-proto/src/graphite/pickle.rs`'s restricted reader must accept.
 
-Run twice by `record_graphite()` in `script/record-fixtures` -- once with `--protocol 2` and once
-with `--protocol -1` (Python's "highest available" sentinel, which resolves to protocol 5 on
-`python:3.12-slim`, the image every producer in this file runs in) -- against two separate
-`raw_capture.py` listeners, so each protocol lands in its own fixture file
-(`graphite-pickle-p2-000.raw` / `graphite-pickle-p5-000.raw`) rather than two frames sharing one.
-`crates/logit-inputs/src/graphite/mod.rs`'s `interop_fixture_pickle_protocol_2_decodes` and
-`interop_fixture_pickle_protocol_5_decodes` each read one of those files.
+`record_graphite()` runs it twice, with `--protocol 2` and `--protocol -1` (highest available: 5
+on `python:3.12-slim`), against separate listeners, so each protocol lands in its own fixture
+(`graphite-pickle-p2-000.raw`, `graphite-pickle-p5-000.raw`) for
+`interop_fixture_pickle_protocol_{2,5}_decodes` in `crates/logit-inputs/src/graphite/mod.rs`.
 
-Protocol -1 is the one a real sender reaching for "the best available" would use, and is what
-makes this exercise `FRAME` (0x95, a protocol-4+ opcode wrapping the whole payload),
-`SHORT_BINUNICODE` (0x8c, protocol 4+'s compact string opcode for short strings -- protocol 2 uses
-plain `BINUNICODE` instead) and `MEMOIZE` (0x94, protocol 4+'s single-opcode memo store) -- three
-opcodes protocol 2 never emits, all three on the restricted reader's allow-list
-(`crates/logit-proto/src/graphite/mod.rs`'s "Pickle opcode subset" doc section).
+Protocol -1 is what a sender reaching for the best available uses, and it emits three protocol-4+
+opcodes protocol 2 never does, all on the reader's allow-list: `FRAME` (0x95), `SHORT_BINUNICODE`
+(0x8c; protocol 2 uses `BINUNICODE`), and `MEMOIZE` (0x94). See
+`docs/adr/graphite-carbon-relay.md`'s "Pickle opcode subset" and `pickle.rs`'s "Accepted opcodes".
 
-Both runs pickle the exact same `DATAPOINTS` below: a handful of `(path, (timestamp, value))`
-tuples with a deliberate mix of `int`/`float` timestamps and `int`/`float` values (pickle encodes
-those differently -- an `int` becomes `BININT`/`LONG1`, a `float` always `BINFLOAT`), so the two
-captured fixtures carry identical decoded events and a consuming test can assert the exact same
-paths/values against either one. Every path is prefixed `logit-fixture.`, matching the
-`write_graphite` fixture's collectd `Hostname`, so both `graphite` producers' fixtures satisfy the
-same "decoded paths start with logit-fixture." assertion.
+Both runs pickle the same `DATAPOINTS`, mixing `int` and `float` timestamps and values (an `int`
+encodes as `BININT1`/`BININT`, since none passes `i32`; a `float` as `BINFLOAT`), so both fixtures
+decode to identical events. Every path starts `logit-fixture.`, matching the `write_graphite`
+fixture's collectd `Hostname`, so both producers' fixtures satisfy the same path assertion.
 
 Usage: python3 python_graphite_pickle_producer.py --host capture --port 2004 --protocol 2
 """
@@ -38,9 +30,8 @@ import socket
 import struct
 import sys
 
-# Fixed, deterministic datapoints -- documented here because the consuming Rust tests
-# (`crates/logit-inputs/src/graphite/mod.rs`'s `interop_fixture_pickle_protocol_{2,5}_decodes`)
-# assert on these exact paths and values. Do not change without updating those tests.
+# `interop_fixture_pickle_protocol_{2,5}_decodes` (crates/logit-inputs/src/graphite/mod.rs)
+# assert on these exact paths and values; change them together.
 DATAPOINTS = [
     ("logit-fixture.pickle.int_value", (1700000000, 42)),
     ("logit-fixture.pickle.float_value", (1700000001.5, 12.75)),
@@ -56,10 +47,8 @@ def main() -> None:
     ap.add_argument("--protocol", type=int, required=True, help="pickle protocol, e.g. 2 or -1 (highest available)")
     args = ap.parse_args()
 
-    # Provenance for testdata/interop/graphite/README.md: -1 is a moving target across Python
-    # versions (it has meant protocol 4 as recently as Python 3.7), so the table records what it
-    # actually resolved to in the container that did the recording, not just the literal `-1` this
-    # script was invoked with.
+    # Provenance for testdata/interop/graphite/README.md: -1 resolves differently across Python
+    # versions (4 on Python 3.7), so the table records what it resolved to in this container.
     print(
         f"python_graphite_pickle_producer: pickle.HIGHEST_PROTOCOL={pickle.HIGHEST_PROTOCOL} "
         f"(requested protocol={args.protocol})",

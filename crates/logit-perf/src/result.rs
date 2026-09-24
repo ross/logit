@@ -1,20 +1,17 @@
 //! The JSON schema `logit-perf run` writes to `perf/results/<utc-ts>-<sha>[-label].json` and
-//! `logit-perf compare` reads back (docs/plans/load-test-harness.md's "Harness" section).
+//! `logit-perf compare` reads back.
 //!
-//! `Sample` is one repeat's derived numbers; `ScenarioReport` holds every repeat plus a per-field
-//! `median`/`min` across them, computed independently per field (never "the repeat with the
-//! median wall time, in full") -- simple, and exactly what `compare.rs` needs to gate on.
+//! `Sample` is one repeat's derived numbers. `ScenarioReport` holds every repeat plus a `median`
+//! and `min` computed independently per field, so neither is any single repeat.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// The commit the binary under test was built from, and whether the working tree had uncommitted
-/// changes at the time -- so a results file is never silently ambiguous about what it measured.
-/// Both fields are `None` (rendered as JSON `null`) rather than a confident-looking default when
-/// `git` itself couldn't answer -- a git-worktree checkout's dev container is one real case this
-/// happens in (`run.rs::git_info`'s doc), and a silent `false`/`"unknown"` string would read as a
-/// real answer instead of a gap.
+/// The checkout's commit, and whether its working tree had uncommitted changes.
+///
+/// Each field is `None` (JSON `null`) when `git` couldn't answer (see `run::git_info`), not a
+/// `false` or `"unknown"` that would read as an answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitInfo {
     pub sha: Option<String>,
@@ -24,10 +21,8 @@ pub struct GitInfo {
 /// One `logit-perf run` invocation: the environment it ran in, plus every scenario it measured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunReport {
-    /// The checkout the harness itself and `perf/scenarios/`/`perf/load/` came from -- distinct
-    /// from [`RunReport::binary`], which is what was actually spawned. The two agree for an
-    /// ordinary in-tree build; a `--logit-bin`-driven multi-source session (`script/vm build`) is
-    /// exactly the case where they don't, and each answers a different question.
+    /// The checkout the harness and `perf/scenarios/`/`perf/load/` came from. Distinct from
+    /// [`RunReport::binary`], what was spawned; the two differ under `--logit-bin`.
     pub git: GitInfo,
     /// RFC 3339, always UTC (a trailing `Z`), second precision.
     pub timestamp: String,
@@ -37,45 +32,37 @@ pub struct RunReport {
     pub nproc: usize,
     /// `rustc -V`'s output, verbatim (trimmed).
     pub rustc: String,
-    /// The `--profile` the binary under test was built with (`release` by default). Meaningless
-    /// under `--logit-bin` (nothing was built this invocation) but left as given, since a stashed
-    /// binary's own sidecar (`binary.built_profile`) is what actually answers the question then.
+    /// The `--profile` the binary under test was built with (`release` by default). Under
+    /// `--logit-bin` nothing was built, so it's only the flag's value.
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// What the box's power/thermal policy was while this ran. Absent in every results file
-    /// written before it existed, and any field of it may be absent on a machine or container
-    /// that doesn't expose it -- see [`BoxState`].
+    /// The box's power/thermal policy during the run; see [`BoxState`]. Absent in an older
+    /// results file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_state: Option<BoxState>,
-    /// The binary that was actually spawned -- always populated, `--logit-bin` or not, so a
-    /// results file never leaves "what did this measure" to be inferred from `git`/`profile`
-    /// alone. Absent only in a results file written before this field existed.
+    /// The binary that was spawned, recorded with or without `--logit-bin`. Absent only in an
+    /// older results file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<BinaryInfo>,
     pub scenarios: BTreeMap<String, ScenarioReport>,
 }
 
-/// Identity of the `logit` binary a run actually spawned, independent of the checkout's own
-/// [`GitInfo`] -- the two can differ under `--logit-bin` (`docs/adr/disposable-azure-perf-vm.md`'s
-/// multi-source `script/vm build`), and a results file has to say which binary produced its
-/// numbers even when the checkout it ran alongside is ambiguous or shared across several.
+/// Identity of the `logit` binary a run spawned, independent of the checkout's [`GitInfo`].
+///
+/// The two differ under `--logit-bin` (`docs/adr/disposable-azure-perf-vm.md`'s "Multiple
+/// sources, one VM"), and a results file must name the binary behind its numbers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BinaryInfo {
-    /// The path handed to (or resolved for) the spawned process, as given on the command line --
-    /// relative paths are resolved against the repo root before this is recorded, so the field
-    /// means the same thing whether `logit-perf` ran on the host or inside the dev container.
+    /// The spawned binary's path, with a relative `--logit-bin` resolved against the repo root.
     pub path: String,
-    /// `sha256sum` of the binary's bytes at the moment it was located -- the one piece of
-    /// provenance that's always obtainable, commit or no commit, clean tree or not.
+    /// `sha256sum` of the binary when located; the one provenance always obtainable.
     pub sha256: String,
-    /// From a `<bin>.json` sidecar next to the binary (`script/vm build`'s output), when one
-    /// exists and parses. A malformed sidecar is ignored with a warning rather than failing the
-    /// run -- provenance is a nicety a bad file must not be able to block a measurement over.
+    /// The source given to `script/vm build`, from a `<bin>.json` sidecar beside the binary. A
+    /// malformed sidecar is ignored with a warning rather than failing the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_ref: Option<String>,
-    /// The commit the sidecar's build was taken from, when it names one -- a bare directory or
-    /// tarball source with no `.git` of its own leaves this `None` even with a sidecar present.
+    /// The commit the sidecar's build came from; `None` for a directory or tarball source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sha: Option<String>,
     /// When the sidecar's build ran, RFC 3339 UTC, verbatim from the sidecar.
@@ -85,37 +72,30 @@ pub struct BinaryInfo {
 
 /// The CPU frequency policy and power source a run was taken under, read best-effort from sysfs.
 ///
-/// Recorded because it is the single largest source of unexplained movement in these numbers, and
-/// a results file that doesn't carry it can't be told apart from one that does: a `powersave`
-/// governor or a run on battery can move CPU µs/event by tens of percent with nothing in the code
-/// having changed (`perf/load/README.md`'s "Tuning", and `docs/design/performance.md`). Every
-/// field is `Option` and read with a plain file read that is allowed to fail -- a container or a
-/// non-Linux host that exposes none of this records `null`s rather than refusing to run.
+/// A `powersave` governor or a run on battery can move CPU µs/event by tens of percent with no
+/// code change (`perf/load/README.md`'s "Box state"). Every field is `Option`: a box or container
+/// that exposes none of this records `null`s rather than refusing to run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoxState {
-    /// `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` -- `performance` or `powersave` on
-    /// an `amd_pstate`/`intel_pstate` box. Visible inside this repo's dev container.
+    /// `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`: `performance` or `powersave` on
+    /// an `amd_pstate`/`intel_pstate` box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling_governor: Option<String>,
-    /// `…/cpu0/cpufreq/energy_performance_preference` -- the finer knob underneath the governor
-    /// (`performance`, `balance_performance`, `balance_power`, `power`). Also visible in the
-    /// container.
+    /// `…/cpu0/cpufreq/energy_performance_preference`: the finer knob under the governor
+    /// (`performance`, `balance_performance`, `balance_power`, `power`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_performance_preference: Option<String>,
-    /// `/sys/firmware/acpi/platform_profile` -- the firmware-level profile, where a machine has
-    /// one. Verified **absent** on this repo's own dev box, hence very much optional.
+    /// `/sys/firmware/acpi/platform_profile`: the firmware-level profile, where a machine has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_profile: Option<String>,
     /// Whether a mains supply is online, from the first `/sys/class/power_supply/*` whose `type`
-    /// is `Mains`. Found by scanning rather than by name: it is `ACAD` on this box, `AC` or
-    /// `ADP1` on others.
+    /// is `Mains`; found by type because its name varies (`AC`, `ACAD`, `ADP1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_ac_power: Option<bool>,
 }
 
 impl BoxState {
-    /// The reasons this run's numbers should be read with suspicion, in words -- empty when the
-    /// box looks like somewhere a measurement can be taken.
+    /// The reasons to distrust this run's numbers, in words; empty when the box looks fit.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         if self.scaling_governor.as_deref() == Some("powersave") {
@@ -139,8 +119,8 @@ impl BoxState {
 /// One scenario's results across every `--repeat`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioReport {
-    /// The scenario's configured `generate_in.count`, copied in so a results file is
-    /// self-describing without re-reading the scenario YAML it came from.
+    /// The scenario's workload size, so a results file describes itself: `generate_in.count`
+    /// for a generated scenario, median lines sent for a driven one.
     pub count: u64,
     pub repeats: Vec<Sample>,
     pub median: Sample,
@@ -150,101 +130,83 @@ pub struct ScenarioReport {
 /// The numbers derived from one repeat's wall time and `wait4` rusage.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    /// Wall time from the process's own `ready` line to the completion line --
-    /// `crate::run::spawn_and_measure`'s doc has the mechanism. Falls back to spawn -> completion
-    /// (with a printed warning) on the rare repeat where `ready` was never observed; `startup_s`
-    /// distinguishes that case from a real, fast startup.
+    /// Wall time from the `ready` line to the end of the load (see
+    /// `crate::run::spawn_and_measure`). Falls back to spawn-to-completion, with a warning, when
+    /// no `ready` line was seen; `startup_s` is then `None`.
     pub wall_s: f64,
-    /// Spawn -> the process's own `ready` line: `tracing::info!(target: "logit", "ready")`, logged
-    /// once the bind pass has opened every listener's socket and every node has been spawned
-    /// (`crates/logit-pipeline/src/runtime.rs`). `None` (rendered as JSON `null`, matching this
-    /// crate's other "the source couldn't answer" fields -- `GitInfo`'s doc has the same
-    /// reasoning) when that line never arrived before the completion line, rather than a
-    /// confident-looking `0.0`.
+    /// Spawn to the `ready` line, logged once every listener is bound and every node spawned
+    /// (`crates/logit-pipeline/src/runtime.rs`). `None` (JSON `null`, not `0.0`) when no `ready`
+    /// line arrived before the completion line.
     pub startup_s: Option<f64>,
     pub user_s: f64,
     pub sys_s: f64,
     pub max_rss_bytes: u64,
     pub events_per_s: f64,
-    /// `(user_s + sys_s) * 1e6 / count` -- the headline regression signal
-    /// (docs/adr/load-test-harness.md): far less noisy than wall time on a shared box, since it
-    /// doesn't care how many other processes were competing for the CPU during the run.
+    /// `(user_s + sys_s) * 1e6 / count`: the headline regression signal
+    /// (docs/adr/load-test-harness.md), far less noisy than wall time on a shared box because
+    /// competing processes don't inflate it.
     pub cpu_us_per_event: f64,
-    /// The socket-side half of a real-socket (`Workload::Driven`) repeat -- absent for every
-    /// generator-driven scenario, and absent from every results file written before ADR
-    /// `udp-intake-batching-and-socket-visibility` existed. `#[serde(default)]` plus
-    /// `skip_serializing_if` is the same optional-field shape [`Sample::startup_s`] already
-    /// established, and is what keeps an old results file loadable by a new `compare`.
+    /// The socket side of a real-socket (`Workload::Driven`) repeat; absent for a generated
+    /// scenario. `#[serde(default)]` keeps an older results file loadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp: Option<UdpSample>,
 }
 
-/// What a real-socket repeat's datagrams actually did: how many were sent, how many the listener
+/// What a real-socket repeat's datagrams did: how many were sent, how many the listener
 /// saw, and where the difference went.
 ///
-/// Every field here exists because a UDP scenario is the first one in this codebase where "events
-/// produced" and "events measured" can honestly differ. `events_delivered` is the denominator
-/// [`Sample::events_per_s`] and [`Sample::cpu_us_per_event`] are computed over -- never
-/// `sent_datagrams` or `sent_lines`, which would understate the true per-event cost by exactly the
-/// drop rate, in precisely the regime this scenario family's baseline is tuned into.
+/// `events_delivered` is the denominator of [`Sample::events_per_s`] and
+/// [`Sample::cpu_us_per_event`], never `sent_datagrams` or `sent_lines`: those would understate
+/// per-event cost by the drop rate, in the regime these scenarios' baselines are tuned into.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct UdpSample {
     /// Datagrams `crate::load`'s sender got the kernel to accept.
     pub sent_datagrams: u64,
-    /// statsd lines inside those datagrams -- the load spec's own count, not a decode.
+    /// statsd lines inside those datagrams, counted by the sender, not decoded.
     pub sent_lines: u64,
-    /// `logit.input.datagrams`: what the listener actually read off the socket.
+    /// `logit.input.datagrams`: what the listener read off the socket.
     pub received_datagrams: u64,
     /// `logit.input.reads`: read syscalls the listener made. `received_datagrams / reads` is the
-    /// **mean fill** of one `recvmmsg(2)` batch -- the number that says whether `receive.read_batch`
-    /// is the constraint or an irrelevance (`docs/deploying.md`'s "Listener intake").
+    /// mean fill of one `recvmmsg(2)` batch, which says whether `receive.read_batch` is the
+    /// constraint (`docs/deploying.md`'s "Listener intake").
     ///
-    /// `#[serde(default)]` because a results file written before `logit.input.reads` existed has
-    /// no such key, and a `compare` against one must still load -- the same optional-field shape
-    /// [`Sample::startup_s`] established. `0` there means "not recorded", which is also what a
-    /// non-UDP run would report, and [`UdpSample::mean_fill`] returns `None` for it rather than
-    /// dividing by it.
+    /// `#[serde(default)]` so an older results file loads; `0` means not recorded, and
+    /// [`UdpSample::mean_fill`] returns `None` for it.
     #[serde(default)]
     pub reads: u64,
-    /// `logit.input.kernel.drops`: discarded by the kernel before `recv_from` could return them.
-    /// On loopback `sent == received + this`, which `crate::run`'s self-check asserts.
+    /// `logit.input.kernel.drops`: discarded by the kernel before a read returned them. On
+    /// loopback `sent == received + this`, which `crate::run`'s self-check asserts.
     pub kernel_dropped: u64,
-    /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction -- loss
-    /// `logit` chose and counted itself, downstream of the kernel's.
+    /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction, loss
+    /// `logit` chose and counted, downstream of the kernel's.
     pub queue_dropped: u64,
-    /// `logit.component.events.received` at the deepest node -- the denominator.
+    /// `logit.component.events.received` at the terminal sink: the denominator.
     pub events_delivered: u64,
     /// Retryable `sendmmsg` failures the sender absorbed (`ENOBUFS`, a stale `ECONNREFUSED`).
-    /// Non-zero here doesn't mean a datagram was lost -- each one was retried -- but a large
-    /// number means the sender was fighting the local send path rather than measuring the
-    /// receiver.
+    /// Each was retried, so none is a lost datagram, but a large number means the sender was
+    /// fighting the local send path rather than measuring the receiver.
     pub send_errors: u64,
-    /// The high-water mark of `logit.input.receive_buffer.utilization` across the run. 1.0 is not
-    /// "nearly full": it is exactly the point at which the kernel begins dropping, so a baseline
-    /// sitting just under it is the regime this scenario family is tuned for.
+    /// The high-water mark of `logit.input.receive_buffer.utilization`. 1.0 is where the kernel
+    /// begins dropping; these scenarios' baselines are tuned to sit near it.
     pub kernel_rcvbuf_utilization_max: f64,
-    /// Datagrams/s the blast was actually paced at, after `--rate-scale`/`--verify` -- not the
-    /// spec's own `rate:`, which is what it would have been unscaled. `None` for an unpaced spec,
-    /// and for any results file written before the flag existed.
+    /// Datagrams/s the blast was paced at, after `--rate-scale`/`--verify`, not the spec's
+    /// `rate:`. `None` for an unpaced spec or an older results file.
     ///
-    /// Recorded because two runs of the same scenario at different scales are not comparable, and
-    /// nothing else in the file would say so: `compare` warns when these differ.
+    /// Two runs at different scales aren't comparable and nothing else in the file says so;
+    /// `compare` warns when these differ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_rate: Option<u64>,
 }
 
 impl UdpSample {
-    /// Datagrams per read syscall, or `None` when the read counter was not recorded (a results
-    /// file from before it existed). Not a rate and not comparable across scenarios with different
-    /// datagram sizes -- it is only ever read against the `read_batch` that produced it.
+    /// Datagrams per read syscall, or `None` when reads weren't recorded. Read it only against the
+    /// `read_batch` that produced it, not across scenarios with different datagram sizes.
     pub fn mean_fill(&self) -> Option<f64> {
         (self.reads > 0).then(|| self.received_datagrams as f64 / self.reads as f64)
     }
 
-    /// Datagrams lost anywhere, as a fraction of those sent -- kernel and receive-queue drops
-    /// together, since someone watching data loss cares that it happened, not which side of the
-    /// socket boundary it happened on. `0.0` for a run that sent nothing, rather than a `NaN` that
-    /// would poison every median it lands in.
+    /// Datagrams lost to the kernel or the receive queue, as a fraction of those sent. `0.0` for
+    /// a run that sent nothing, rather than a `NaN` that would poison every median.
     pub fn drop_rate(&self) -> f64 {
         if self.sent_datagrams == 0 {
             return 0.0;
@@ -278,8 +240,7 @@ impl Sample {
     }
 }
 
-/// The statistical median of `values` -- the average of the two middle elements for an even
-/// count, matching every other "median" in this file (`median_sample`'s per-field reduction).
+/// The median of `values`: the mean of the two middle elements for an even count.
 fn median_f64(values: &[f64]) -> f64 {
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
@@ -304,8 +265,7 @@ fn median_u64(values: &[u64]) -> u64 {
     if n % 2 == 1 {
         sorted[n / 2]
     } else {
-        // Integer average of the two middle elements, rounding down -- a peak-RSS median doesn't
-        // need fractional-byte precision.
+        // Rounds down; a peak-RSS median needs no fractional bytes.
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2
     }
 }
@@ -318,24 +278,21 @@ fn min_u64(values: &[u64]) -> u64 {
     values.iter().copied().min().unwrap_or(0)
 }
 
-/// [`median_f64`] over just the repeats that actually observed a `ready` line -- `None` only when
-/// *none* of them did, matching [`Sample::startup_s`]'s own "the source couldn't answer" meaning
-/// rather than folding a missing repeat in as if it measured zero.
+/// [`median_f64`] over the repeats that saw a `ready` line; `None` only when none did. A missing
+/// repeat isn't counted as zero.
 fn median_f64_opt(values: &[Option<f64>]) -> Option<f64> {
     let present: Vec<f64> = values.iter().filter_map(|v| *v).collect();
     (!present.is_empty()).then(|| median_f64(&present))
 }
 
-/// [`min_f64`] over just the repeats that actually observed a `ready` line -- same reasoning as
-/// [`median_f64_opt`].
+/// [`min_f64`] over the repeats that saw a `ready` line, as [`median_f64_opt`].
 fn min_f64_opt(values: &[Option<f64>]) -> Option<f64> {
     let present: Vec<f64> = values.iter().filter_map(|v| *v).collect();
     (!present.is_empty()).then(|| min_f64(&present))
 }
 
-/// Builds the per-field median [`Sample`] across `samples`. Each field's median is computed
-/// independently of the others -- the result is not, and isn't meant to be, any single repeat
-/// that actually ran; it's a per-metric summary, exactly what `compare.rs` diffs.
+/// Builds the per-field median [`Sample`] across `samples`: each field independently, so the
+/// result is a per-metric summary (what `compare` diffs), not any one repeat.
 pub fn median_sample(samples: &[Sample]) -> Sample {
     Sample {
         wall_s: median_f64(&samples.iter().map(|s| s.wall_s).collect::<Vec<_>>()),
@@ -351,8 +308,7 @@ pub fn median_sample(samples: &[Sample]) -> Sample {
     }
 }
 
-/// Builds the per-field minimum [`Sample`] across `samples`, the same independent-per-field way
-/// [`median_sample`] does.
+/// Builds the per-field minimum [`Sample`] across `samples`, field by field as [`median_sample`].
 pub fn min_sample(samples: &[Sample]) -> Sample {
     Sample {
         wall_s: min_f64(&samples.iter().map(|s| s.wall_s).collect::<Vec<_>>()),
@@ -366,13 +322,11 @@ pub fn min_sample(samples: &[Sample]) -> Sample {
     }
 }
 
-/// Reduces every [`UdpSample`] field independently with the caller's own reducers -- the same
-/// field-wise treatment the rest of [`Sample`] gets, and for the same reason: the summary is a
-/// per-metric picture, not any one repeat.
+/// Reduces every [`UdpSample`] field independently with the caller's reducers, as the rest of
+/// [`Sample`] is reduced.
 ///
-/// `None` unless *every* repeat carried a `UdpSample`. A mixed set can only come from a results
-/// file somebody has edited or merged by hand, and summarizing a subset of repeats as if it were
-/// all of them would quietly report a drop rate computed over the wrong denominator.
+/// `None` unless every repeat carried a `UdpSample`. A mixed set comes only from a hand-edited
+/// file, and summarizing the subset would report a drop rate over the wrong denominator.
 fn reduce_udp(
     samples: &[Sample],
     reduce_u64: fn(&[u64]) -> u64,
@@ -396,9 +350,8 @@ fn reduce_udp(
         kernel_rcvbuf_utilization_max: reduce_f64(
             &udp.iter().map(|u| u.kernel_rcvbuf_utilization_max).collect::<Vec<_>>(),
         ),
-        // Config, not a measurement: every repeat of one scenario ran at the same pace, so there
-        // is nothing to reduce. Carried through only when they all agree, so a hand-merged file
-        // reporting two different paces as one number is impossible.
+        // Config, not a measurement: carried through only when every repeat agrees, so a
+        // hand-merged file can't report two paces as one.
         effective_rate: udp
             .iter()
             .all(|u| u.effective_rate == udp[0].effective_rate)

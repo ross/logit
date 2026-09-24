@@ -1,7 +1,5 @@
-# Production runtime image for logit (docs/plans/nginx-integration.md, workstream B).
-#
-# Unlike Dockerfile.dev (the container contributors build and test in), this is what a consumer
-# builds or pulls to actually run `logit`. Built with `script/image`.
+# Production runtime image for logit, built with `script/image`. Dockerfile.dev is the
+# contributor build-and-test container.
 
 FROM rust:1.98.1-bookworm AS builder
 
@@ -15,9 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
-# No dependency-layer caching (e.g. cargo-chef) here -- this image is built rarely (a release, or
-# a local `script/image`), not on every save, so the extra tooling and build-graph complexity
-# aren't worth it for the caching they'd buy.
+# No dependency-layer caching (cargo-chef): this image is built rarely, so the caching isn't worth
+# the extra tooling.
 COPY . .
 RUN cargo build --release -p logit-cli
 
@@ -30,19 +27,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /work/target/release/logit /usr/local/bin/logit
 
-# GHCR reads org.opencontainers.image.source to link this package to the repo (package page
-# README, "inherit access" from the repo) -- docs/adr/publish-release-image-to-ghcr.md. No
-# .image.version: the workspace version (Cargo.toml) is a pre-release placeholder, and stamping it
-# here would imply a release process that doesn't exist yet.
+# GHCR links the package to the repo through image.source
+# (docs/adr/publish-release-image-to-ghcr.md). No image.version: the workspace version is a
+# pre-release placeholder, and stamping it would imply a release process that doesn't exist.
 LABEL org.opencontainers.image.title="logit" \
       org.opencontainers.image.description="A logging/metrics/tracing multiplexer" \
       org.opencontainers.image.source="https://github.com/ross/logit" \
       org.opencontainers.image.licenses="MIT"
 
-# Only effective when the target config sets `admin.bind` (docs/plans/operator-surface.md,
-# docs/deploying.md) -- `logit ready` exits 1 with nothing listening otherwise, same as a
-# genuinely unready process would. Exec form, naming the binary explicitly: HEALTHCHECK's exec
-# form does not go through ENTRYPOINT below.
+# Only effective when the config sets `admin.bind` (docs/deploying.md); otherwise `logit ready`
+# finds nothing listening and exits 1, as for an unready process. Names the binary because
+# HEALTHCHECK's exec form bypasses ENTRYPOINT.
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5s CMD ["logit", "ready"]
 
 USER logit

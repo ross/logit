@@ -184,8 +184,8 @@ Surfaced while checking Loki compatibility; none block the demo, all block a rea
 - `observed_time_unix_nano` always `0` on encode (`logs.rs:114`). (Landed: stamped with
   `logit_proto::now_nanos()` at encode — same workstream.)
 
-`docs/known-gaps.md:662-673` already files the compression gap for `otlp_in`; `otlp_out`'s half of
-the same gap is currently unfiled.
+[`docs/known-gaps.md`](../known-gaps.md#otlp) already files the compression gap for `otlp_in`;
+`otlp_out`'s half of the same gap is currently unfiled.
 
 ### Related, already filed — don't duplicate here
 

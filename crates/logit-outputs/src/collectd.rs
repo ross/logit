@@ -1,73 +1,50 @@
-//! collectd binary-protocol egress over UDP -- the mirror of `collectd_in` (W2), and a real relay:
-//! identity, values, and kinds round-trip through the real `CollectdDecoder` on the other end (this
-//! module's own tests). See [ADR `collectd-binary-relay`](../../../../docs/adr/collectd-binary-relay.md)
-//! and [`docs/plans/collectd-binary-relay.md`](../../../../docs/plans/collectd-binary-relay.md).
+//! `collectd_out`: collectd's binary `network` protocol over UDP, the mirror of `collectd_in`
+//! ([ADR `collectd-binary-relay`](../../../../docs/adr/collectd-binary-relay.md)).
 //!
-//! Split the way `statsd.rs`/`syslog.rs` are: the pure [`logit_proto::collectd::CollectdEncoder`]
-//! does every mapping, sanitization, and packing decision (that module's own doc is the spec for
-//! all of it -- decode/encode tables, sanitization rules, permitted normalizations), and this
-//! module is only the thin transport wrapper around it: [`CollectdOutput`] owns the socket, hands
-//! the encoder a batch, and turns its already-packed [`logit_proto::MessageBuf`]`<usize>` into UDP
-//! sends. **The codec emits every metric/tag/identity counter and diagnostic itself** (it holds its
-//! own [`Telemetry`]/[`Diagnostics`], fed by this sink's own builders below) -- this module adds
-//! only the transport-level counters a socket send can produce that the codec has no way to know
-//! about: total bytes, request timing, datagrams actually written, and an `EMSGSIZE` drop.
-//!
-//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`** -- the identical
-//! reason `statsd_out`/`syslog_out`/`prometheus_out`'s encoders do too (`crate::statsd`'s module
-//! doc, ADR `framed-encoder`). [`logit_proto::collectd::CollectdEncoder::encode_into`] fills a
-//! [`logit_proto::MessageBuf`]`<usize>` with datagram boundaries already decided (the codec's own
-//! packing loop, elision, and `max_packet_bytes` cap -- encoder state, per the trait, rather than a
-//! per-call argument), so this sink's only remaining job is one `send_to` per datagram already
-//! built.
+//! [`logit_proto::collectd::CollectdEncoder`] makes every mapping, sanitization, and packing
+//! decision, and emits its own metric/identity counters and diagnostics through the
+//! [`Telemetry`]/[`Diagnostics`] this sink's builders hand it; `logit_proto::collectd`'s module
+//! doc is the spec. It implements [`logit_proto::FramedEncoder`] (ADR `framed-encoder`): each
+//! [`logit_proto::MessageBuf`]`<usize>` entry is one already-packed datagram, meta = its message
+//! count (value lists, or `1` for a notification's datagram), because the receiver resets its
+//! sticky state at each datagram edge. This module sends each entry with one `send_to` and adds
+//! only transport-level telemetry.
 //!
 //! ## Config
 //!
-//! `endpoint` (`host:port`, resolved once per batch, never at config-load time -- same
-//! `statsd_out`/`syslog_out` precedent), `max_packet_bytes` (default `1452`, collectd's own
-//! `MaxPacketSize` default -- [`logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`]), and an optional
-//! `hostname:` used only when an event carries neither `collectd.host` nor `host.name` -- exactly
-//! `syslog_out`'s own `hostname:` field, not a mandatory one: this sink neither reads the OS
-//! hostname nor invents a placeholder (`CollectdEncoder::with_hostname`'s own doc explains why), so
-//! with nothing configured and nothing on the event, the list is dropped and counted rather than
-//! silently mislabeled. UDP only -- collectd's `network` plugin has no TCP mode to relay onto.
+//! - `endpoint`: `host:port`, resolved once per batch, never at config load.
+//! - `max_packet_bytes`: default `1452` (collectd's `MaxPacketSize`,
+//!   [`logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`]), bounded to `1024..=65535` by graph
+//!   rule 38.
+//! - `hostname:`: optional, used only when an event carries neither `collectd.host` nor
+//!   `host.name`. With neither, the list is dropped and counted (`no_host`); the sink never reads
+//!   the OS hostname or invents one (`CollectdEncoder::with_hostname`).
 //!
-//! ## Packing
-//!
-//! Entirely the codec's job (`CollectdEncoder::encode_into`'s own doc): this sink calls it once per
-//! batch and then just walks the resulting [`logit_proto::MessageBuf`]`<usize>`, one `send_to` per
-//! already-packed datagram. Unlike `statsd_out`, there is no live packing-against-a-cap in the send
-//! path at all -- the datagram boundaries are fixed before this module ever touches a socket.
+//! UDP only: collectd's `network` plugin has no TCP mode.
 //!
 //! ## Faults
 //!
-//! `endpoint` is resolved once per batch (a non-numeric host must not be re-resolved once per
-//! datagram); a resolution failure is [`Fault::Clean`]. `EMSGSIZE` (raw OS error 90, or
-//! `ErrorKind::InvalidInput` on a platform where the `send_to` shim never reaches the syscall) on
-//! one datagram counts that datagram's message count (value lists or, for a notification's own
-//! datagram, the single `1`) under
-//! `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
-//! sending continues with the next datagram -- one oversize datagram must not sink an otherwise
-//! deliverable batch. Any other send error is [`Fault::Clean`] if no datagram in this batch has
-//! been sent yet, else [`Fault::Ambiguous`] (some datagrams may have already landed).
+//! - A resolution failure is [`Fault::Clean`].
+//! - `EMSGSIZE` (raw OS error 90, or `ErrorKind::InvalidInput` where the shim never reaches the
+//!   syscall) on one datagram is a counted drop, not a `Fault`: its message count goes to
+//!   `logit.output.messages.dropped{reason="oversize_datagram"}` with a throttled diagnostic, and
+//!   sending continues. Because `send` still reports success, a cap above 65535 would fail every
+//!   datagram while counting `requests{class="ok"}`, which is why rule 38 bounds it.
+//! - Any other send error is [`Fault::Clean`] if no datagram of the batch was sent yet, else
+//!   [`Fault::Ambiguous`].
 //!
-//! ## Telemetry (transport-level; the codec's own counters are documented on it, not here)
+//! ## Telemetry
 //!
-//! `logit.output.batch.bytes` (total bytes across every datagram in the batch, emitted only when
-//! there is something to send), `logit.output.request.duration` (one timer per `send` call that
-//! actually touches the socket), `logit.output.requests{class="ok"|"error"}`,
-//! `logit.output.messages` (value lists *or notifications* actually sent -- the per-datagram
-//! message count each [`logit_proto::MessageBuf`] entry's `usize` meta carries, summed; a
-//! notification's own datagram always contributes `1`), `logit.output.datagrams`
-//! (datagrams actually sent), and `logit.output.messages.dropped{reason="oversize_datagram"}` plus
-//! a throttled `oversize_datagram` diagnostic for the `EMSGSIZE` case above.
+//! Transport-level only; the codec documents its own. `logit.output.batch.bytes` (only when there
+//! is something to send), `logit.output.request.duration`,
+//! `logit.output.requests{class="ok"|"error"}`, `logit.output.messages` (Σ sent entries' meta),
+//! `logit.output.datagrams`, and the `oversize_datagram` drop above.
 //!
 //! ## Duplicate safety
 //!
-//! [`CollectdOutput::duplicate_safe`] is `false`: a redelivered value list re-applied at the
-//! receiver double-counts every COUNTER/DERIVE/ABSOLUTE it carries (collectd has no idempotency key
-//! of any kind) -- the identical reasoning `statsd_out` gives for its own counters, and collectd's
-//! ABSOLUTE type in particular is a delta that would double-apply exactly like a statsd `|c` would.
+//! [`CollectdOutput::duplicate_safe`] is `false`: collectd has no idempotency key, so a
+//! redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE it carries, as a statsd `|c`
+//! would.
 
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
@@ -76,27 +53,22 @@ use logit_proto::collectd::{CollectdEncoder, DEFAULT_MAX_PACKET_BYTES};
 use logit_proto::{FramedEncoder, MessageBuf};
 use tokio::net::{lookup_host, UdpSocket};
 
-/// `logit_pipeline::Output` for `collectd_out`. Built via [`CollectdOutput::udp`] -- never a bare
-/// constructor, mirroring `StatsdOutput`/`SyslogOutput`.
+/// `logit_pipeline::Output` for `collectd_out`, built via [`CollectdOutput::udp`].
 pub struct CollectdOutput {
     endpoint: String,
     socket: UdpSocket,
     encoder: CollectdEncoder,
-    /// Kept on the sink, not just the encoder, so [`CollectdOutput::with_encoder`] can re-apply it
-    /// to a replacement encoder regardless of builder order -- see that method's doc comment.
+    /// Kept here too so [`CollectdOutput::with_encoder`] can re-apply it in any builder order.
     max_packet_bytes: usize,
-    /// Reused across `send` calls: the codec's own packing buffer, one entry per datagram, whose
-    /// `usize` meta is that datagram's message count (value lists, or `1` for a notification's own
-    /// datagram).
+    /// Reused across `send`s: one entry per packed datagram, meta = its message count.
     buf: MessageBuf<usize>,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl CollectdOutput {
-    /// Binds an ephemeral local UDP socket eagerly -- see `StatsdOutput::udp`'s doc comment for why
-    /// `endpoint` itself is resolved per `send`, not here: a `collectd_out` pointed at a destination
-    /// that isn't up yet is not a config error, but a bad local bind is.
+    /// Binds an ephemeral local UDP socket eagerly: a bad local bind is a config error, but a
+    /// destination that isn't up yet isn't, so `endpoint` is resolved per `send`.
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .context("binding collectd_out's local UDP socket")?;
@@ -106,9 +78,8 @@ impl CollectdOutput {
         Ok(Self {
             endpoint: endpoint.into(),
             socket,
-            // UDP only, always -- unlike `StatsdEncoder`'s uncapped `usize::MAX` default (shared
-            // with a TCP transport that has no datagram to overflow), `collectd_out` has no TCP
-            // branch at all, so its own default datagram cap applies unconditionally.
+            // `CollectdEncoder::new()` is uncapped; with no TCP branch, the datagram cap always
+            // applies.
             encoder: CollectdEncoder::new().with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES),
             max_packet_bytes: DEFAULT_MAX_PACKET_BYTES,
             buf: MessageBuf::default(),
@@ -117,15 +88,10 @@ impl CollectdOutput {
         })
     }
 
-    /// Installs `encoder`, with this sink's own cap/diagnostics/telemetry re-applied on top of it
-    /// -- the same fix `StatsdOutput::with_encoder` makes, and for the identical reason: a plain
-    /// `self.encoder = encoder` would make every builder order-dependent. Without this,
-    /// `.with_encoder(CollectdEncoder::new())` after `.with_max_packet_bytes(n)` silently reverts
-    /// to `CollectdEncoder::new()`'s own uncapped `usize::MAX` default (every datagram then packs
-    /// past what any UDP socket can send, failing `EMSGSIZE` and reporting
-    /// `requests{class="ok"}` while delivering nothing -- rule 38's own finding, one layer in),
-    /// and `.with_diagnostics(d).with_telemetry(t).with_encoder(e)` would silently drop both
-    /// handles from the codec, killing every counter and diagnostic the codec itself emits.
+    /// Installs `encoder` with this sink's cap, diagnostics, and telemetry re-applied, so builder
+    /// order doesn't matter. A bare assignment would revert a prior `with_max_packet_bytes` to the
+    /// encoder's uncapped default (every datagram then fails `EMSGSIZE` while counting
+    /// `requests{class="ok"}`) and drop both handles, silencing the codec's own counters.
     pub fn with_encoder(mut self, encoder: CollectdEncoder) -> Self {
         self.encoder = encoder
             .with_max_packet_bytes(self.max_packet_bytes)
@@ -134,31 +100,23 @@ impl CollectdOutput {
         self
     }
 
-    /// Kept on the sink (see the field's own doc comment) and forwarded to the encoder --
-    /// [`CollectdEncoder::with_max_packet_bytes`] is encoder state ([`FramedEncoder`]'s one
-    /// `encode_into` signature has no room for a per-call cap), but this sink still needs its own
-    /// copy so a later [`CollectdOutput::with_encoder`] can re-apply it, in either builder order.
+    /// Sets the datagram cap on the encoder, keeping a copy for [`CollectdOutput::with_encoder`].
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         self.encoder = self.encoder.with_max_packet_bytes(max_packet_bytes);
         self
     }
 
-    /// Kept on this sink for its own transport-level diagnostic (`oversize_datagram`), and also fed
-    /// into the encoder -- the codec emits its own diagnostics (`no_host`, `unencodable_value`,
-    /// ...) through this same handle, so both halves of one `send` report through one component id.
-    /// Order-independent with `with_encoder` (see that method's doc comment).
+    /// Shared with the encoder, so the sink's `oversize_datagram` and the codec's `no_host` etc.
+    /// report under one component id.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag.clone();
         self.encoder = self.encoder.with_diagnostics(diag);
         self
     }
 
-    /// Kept on this sink for its own transport-level counters, and also fed into the encoder --
-    /// unlike `StatsdOutput`, whose encoder returns an `EncodeStats` for the sink to turn into
-    /// telemetry itself, `CollectdEncoder` emits its own `logit.output.*` counters directly (this
-    /// module's doc, "Telemetry"). Order-independent with `with_encoder` (see that method's doc
-    /// comment).
+    /// Shared with the encoder, which emits its own `logit.output.*` counters directly rather than
+    /// leaving them to the sink as `StatsdOutput`'s encoder does.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry.clone();
         self.encoder = self.encoder.with_telemetry(telemetry);
@@ -169,9 +127,7 @@ impl CollectdOutput {
 #[async_trait::async_trait]
 impl Output for CollectdOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // Discarded: every counter/diagnostic this produces, the encoder has already emitted
-        // itself through the `Telemetry`/`Diagnostics` handles `with_telemetry`/`with_diagnostics`
-        // fed it -- this module's doc, "Telemetry".
+        // `Stats` discarded: the encoder already reported them through its own handles.
         self.encoder.encode_into(batch, &mut self.buf);
 
         if self.buf.is_empty() {
@@ -203,19 +159,16 @@ impl Output for CollectdOutput {
         result.map(|_| ())
     }
 
-    /// `false`: a redelivered value list re-applied at the receiver double-counts every
-    /// COUNTER/DERIVE/ABSOLUTE it carries -- collectd has no idempotency key of any kind, the same
-    /// reasoning `StatsdOutput::duplicate_safe` gives for its own counters.
+    /// A redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE; there's no
+    /// idempotency key.
     fn duplicate_safe(&self) -> bool {
         false
     }
 }
 
 impl CollectdOutput {
-    /// Sends every already-packed datagram in `buf`, one `send_to` per datagram -- no packing
-    /// decision left to make here, unlike `StatsdOutput::send_udp`: `CollectdEncoder::encode_into`
-    /// already chose every datagram boundary against its own `max_packet_bytes`. Returns
-    /// `(messages sent -- value lists or notifications, datagrams sent)`.
+    /// Sends each already-packed datagram in `buf` with one `send_to`; the encoder chose every
+    /// boundary. Returns `(messages, datagrams)` sent.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
@@ -223,8 +176,7 @@ impl CollectdOutput {
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<(usize, usize)> {
-        // Resolved once per batch, not once per datagram -- see `statsd::send_udp`'s doc comment
-        // for why a non-numeric host must not be re-resolved on every call.
+        // Once per batch: a non-numeric host must not be re-resolved per datagram.
         let mut addrs = lookup_host(endpoint)
             .await
             .context("resolving collectd_out endpoint")
@@ -264,9 +216,8 @@ impl CollectdOutput {
     }
 }
 
-/// `90` is `EMSGSIZE` on Linux specifically -- see `statsd::is_message_too_large`'s doc comment
-/// (copied rather than shared: it isn't `pub`, and this sink has no other reason to reach into
-/// `crate::statsd`); this repo only ever ships/runs inside the Linux containers it builds.
+/// `90` is `EMSGSIZE` on Linux, the only platform `logit` ships for; a copy of
+/// `statsd::is_message_too_large`.
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
@@ -303,13 +254,9 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A like-relay event: `collectd.*` identity present, one gauge record, so the encoder emits it
-    /// as a single Values part with no `hostname:` fallback needed. Decode-shaped, deliberately, so
-    /// whole-`Event` equality against a real decode is a meaningful assertion rather than a
-    /// tautology: the record name is `<plugin>.<type>` (here `plugin == type`), a single-data-
-    /// source list's own naming rule (`crates/logit-proto/src/collectd/decode.rs`'s module doc) --
-    /// interning the bare `plugin` string instead would never match what `CollectdDecoder` names
-    /// the very list this event round-trips through.
+    /// A like-relay event: `collectd.*` identity and one gauge. Decode-shaped so whole-`Event`
+    /// equality against a real decode is meaningful: the record name is `<plugin>.<type>`, the
+    /// decoder's naming rule for a single-data-source list.
     fn relay_event(host: &str, plugin: &str, value: f64) -> Event {
         let mut event = Event::empty(
             TS,
@@ -327,8 +274,8 @@ mod tests {
         event
     }
 
-    /// A fallback-shaped event: no `collectd.*` identity at all, so this only survives encoding
-    /// with a configured `hostname:` -- and even then only via the fallback naming path.
+    /// A fallback-shaped event: no `collectd.*` identity, so it encodes only with a configured
+    /// `hostname:`, via the fallback naming path.
     fn counter_event(name: &str, value: f64) -> Event {
         Event::metric(
             TS,
@@ -368,10 +315,9 @@ mod tests {
         })
     }
 
-    /// The summed value of every counter point named `metric` in an already-drained `events`,
-    /// regardless of tags. Takes the drained slice rather than the `Registry` itself -- `drain`
-    /// empties the registry, so computing this for several metrics needs one shared drain, not
-    /// one per metric (each of which would find nothing after the first).
+    /// The summed value of every counter point named `metric` in an already-drained `events`, any
+    /// tags. Takes the slice because `drain` empties the registry, so several metrics need one
+    /// shared drain.
     fn metric_sum(events: &[Event], metric: &str) -> f64 {
         events
             .iter()
@@ -392,11 +338,8 @@ mod tests {
         (addr, Arc::new(socket))
     }
 
-    /// Whole-`Event` equality against the input, not a spot check of a couple of fields --
-    /// `relay_event`'s decode shape (positive timestamp, `collectd.host`/`plugin`/`type`,
-    /// `collectd.interval`) makes this a real fixed-point assertion: a bug that corrupted the
-    /// interval, the timestamp, or the record's kind/name would still pass a host-and-plugin-only
-    /// check but fails this one.
+    /// Whole-`Event` equality against the input: a fixed-point assertion that also covers the
+    /// interval, timestamp, and record kind/name.
     #[tokio::test]
     async fn a_packed_datagram_round_trips_through_a_real_collector_and_decoder() {
         let (addr, collector) = udp_collector().await;
@@ -420,11 +363,8 @@ mod tests {
         assert_eq!(events, batch.events, "decode(send(b)) must equal b, not just a few fields");
     }
 
-    /// Same whole-`Event` equality as the round-trip test above, plus a check the round-trip test
-    /// doesn't need: every datagram this sink actually put on the wire must itself fit the
-    /// configured cap -- a boundary bug that let one datagram's identity bleed into the next
-    /// (`pack_list`'s re-encode) could otherwise still decode to the right events while violating
-    /// the cap it was supposed to honor.
+    /// Whole-`Event` equality plus each datagram's size against the cap, since a packing bug can
+    /// bleed identity across datagrams and still decode correctly.
     #[tokio::test]
     async fn a_low_cap_packs_several_events_into_several_datagrams() {
         let (addr, collector) = udp_collector().await;
@@ -473,9 +413,7 @@ mod tests {
         output.send(&batch).await.expect("an all-skipped batch must not attempt any I/O");
     }
 
-    /// A fallback-shaped event has no `collectd.host`/`collectd.type`, and this sink was built with
-    /// no `hostname:` configured -- the codec drops it (`no_host`), which is still zero I/O, not a
-    /// send error, even against an address nothing is listening on.
+    /// With no host anywhere, the codec drops the event (`no_host`): zero I/O, not a send error.
     #[tokio::test]
     async fn a_batch_with_no_resolvable_host_performs_no_io_at_all() {
         let mut output = CollectdOutput::udp("127.0.0.1:1").unwrap();
@@ -485,16 +423,13 @@ mod tests {
 
     // -- Faults ---------------------------------------------------------------------------------
 
-    /// No `:port` at all -- `lookup_host` rejects this synchronously, with no DNS lookup and so no
-    /// dependency on this test environment having network access, the same failure mode a
-    /// genuinely unresolvable hostname produces one layer further in (both are `Fault::Clean`).
+    /// No `:port`: `lookup_host` rejects it without a DNS lookup, so the test needs no network.
     #[tokio::test]
     async fn an_unresolvable_endpoint_is_classified_as_a_clean_fault() {
         let mut output = CollectdOutput::udp("no-port-in-this-endpoint")
             .unwrap()
             .with_encoder(CollectdEncoder::new().with_hostname("fixture-host"));
-        // A configured hostname is what lets this fallback-shaped event survive encoding at all,
-        // so the failure below is really about endpoint resolution, not an empty batch.
+        // The hostname makes the event encode, so the failure is resolution, not an empty batch.
         let batch = batch_with(vec![counter_event("hits", 1.0)]);
         let err = output.send(&batch).await.expect_err("resolution should fail");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
@@ -506,11 +441,8 @@ mod tests {
         assert!(!output.duplicate_safe());
     }
 
-    /// `with_encoder`/`with_max_packet_bytes` must be order-independent -- `StatsdOutput::
-    /// with_encoder`'s own precedent (`the_encoder_line_cap_follows_the_transport_at_build_time`).
-    /// A cap of 8 bytes is smaller than any real value list, so in either order the single event
-    /// below is dropped whole as oversize -- zero I/O either way -- rather than only when
-    /// `with_max_packet_bytes` happens to be called last.
+    /// `with_encoder`/`with_max_packet_bytes` are order-independent: an 8-byte cap drops the event
+    /// as oversize in either order.
     #[tokio::test]
     async fn the_encoder_cap_is_order_independent_with_with_encoder() {
         let cap_then_encoder = CollectdOutput::udp("127.0.0.1:1")
@@ -527,8 +459,7 @@ mod tests {
         }
     }
 
-    /// `with_encoder` must not drop the diagnostics/telemetry handles a caller already installed
-    /// -- the other half of `StatsdOutput::with_encoder`'s precedent.
+    /// `with_encoder` must not drop the diagnostics/telemetry handles a caller already installed.
     #[tokio::test]
     async fn diagnostics_and_telemetry_survive_with_encoder_called_afterward() {
         let registry = Registry::new();
@@ -543,8 +474,7 @@ mod tests {
             .with_telemetry(registry.telemetry_for("out", "collectd_out", "sink"))
             .with_diagnostics(diag)
             .with_encoder(CollectdEncoder::new());
-        // No `collectd.host`/`host.name`/configured `hostname:` -- dropped and counted through
-        // both handles, which only happens if `with_encoder` kept feeding them into the codec.
+        // No host anywhere: `no_host` is counted through both handles, if they survived.
         let batch = batch_with(vec![counter_event("hits", 1.0)]);
         output.send(&batch).await.expect("nothing encodable means no I/O");
 
@@ -570,7 +500,7 @@ mod tests {
         output.send(&batch).await.expect("send should succeed");
         tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
 
-        // One shared drain: `metric_sum` reads an already-drained slice for exactly this reason.
+        // One shared drain for every `metric_sum` below.
         let events = registry.drain(0);
         assert!(metric_sum(&events, "logit.output.batch.bytes") > 0.0);
         assert_eq!(metric_sum(&events, "logit.output.messages"), 1.0);

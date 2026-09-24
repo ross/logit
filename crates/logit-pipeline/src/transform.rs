@@ -1,11 +1,10 @@
-//! The `Transform` trait: native (`Send`), non-Lua transform components --
-//! `logit-transforms::Aggregator` is the first implementer. Runs as an ordinary tokio task in the
-//! node runtime, unlike a Lua component, which needs its own OS thread
-//! (`docs/design/pipeline-graph.md`'s "Node kinds and the transform trait question").
+//! The `Transform` trait: native (`Send`), non-Lua transform components. A native transform
+//! runs as an ordinary tokio task in the node runtime, unlike a Lua component, which needs its own
+//! OS thread (`docs/design/pipeline-graph.md`'s "Node kinds and the transform trait question").
 //!
-//! Per-event, not per-batch, on purpose: it matches `Aggregator`'s actual accumulation contract
-//! (one event in, an absorbed-or-passed-through event out) exactly, so `impl Transform for
-//! Aggregator` needs no reshaping of its existing methods.
+//! `process` is per-event on purpose: it matches `aggregate`'s accumulation contract (one event
+//! in, absorbed or forwarded). Everything per-batch goes through the `observe_*`/`map_resource`/
+//! `end_batch` hooks, so the per-event hot path never widens for one implementer's needs.
 
 use crate::fanout::TraceContext;
 use logit_core::{Event, Provenance, Resource, Scope, SpanLink};
@@ -13,18 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// One flushed event, paired with the bounded, best-effort set of `TraceContext`s that
-/// contributed to it -- see [`Transform::flush`]'s doc comment.
+/// contributed to it (see [`Transform::flush`]).
 pub type FlushedEvent = (Event, Vec<SpanLink>);
 
 /// [`Transform::flush`]'s return type: one entry per `(resource, scope)` group, each holding
-/// every series flushed for that group. `scope` closes the `otlp_in -> aggregate -> otlp_out`
-/// scope-loss gap (`docs/plans/lossless-transit.md`'s W2): before this, `run_flush`
-/// (`crates/logit-pipeline/src/runtime.rs`) always stamped a flushed batch's scope `None`,
-/// regardless of what scope the events that fed it arrived under, because `Transform::flush` had
-/// nowhere to carry one. `Aggregator` groups by `(resource, scope)` now (`ResourceGroup`,
-/// `crates/logit-transforms/src/aggregate.rs`), same reasoning as grouping by resource value at
-/// all: two batches that happen to build their own equal-content `Arc<Scope>` describe the same
-/// instrumentation scope and should aggregate together.
+/// every series flushed for that group. `run_flush` stamps each group's scope on its outgoing
+/// batch, which is what keeps `otlp_in -> aggregate -> otlp_out` from losing scope. Group by
+/// value, not `Arc` identity: two batches that build equal-content `Arc<Scope>`s describe the
+/// same instrumentation scope and aggregate together.
 pub type FlushOutput = Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<FlushedEvent>)>;
 
 pub trait Transform: Send {
@@ -33,86 +28,53 @@ pub trait Transform: Send {
     /// event into internal state (e.g. an aggregator accumulating a mergeable metric kind) or
     /// dropped it, and the caller discards the event rather than forwarding it.
     ///
-    /// **Borrows the event on purpose**, exactly as [`crate::Router::route`] does and for exactly
-    /// the same reason: `Event` is 864 bytes (`crates/logit-core/tests/type_sizes.rs` pins the
-    /// exact `size_of`), and an owned `Event -> Option<Event>` shape memcpy'd one of those per
-    /// node hop -- per *event*, on the hot path -- to express something the trait can already say
-    /// with a bool, since `process` has never been able to emit more than one event per input.
-    /// [`crate::runtime::process_batch`] drives this with `Vec::retain_mut`, so a forwarded event
-    /// is never moved at all and an absorbed one costs no `Vec` of survivors to collect into.
+    /// Borrows the event, as [`crate::Router::route`] does: `Event` is 864 bytes
+    /// (`crates/logit-core/tests/type_sizes.rs`), and an owned `Event -> Option<Event>` shape
+    /// would memcpy one per event per node hop. [`crate::runtime::process_batch`] drives this
+    /// with `Vec::retain_mut`, so a forwarded event is never moved.
     ///
-    /// An *absorbing* transform still gets everything it needs from a `&mut`: it moves the payload
-    /// it wants out with `std::mem::take` (`crates/logit-transforms/src/aggregate.rs` takes
-    /// `event.metrics` this way) and leaves the drained shell behind for the caller to drop.
+    /// An absorbing transform moves the payload it wants out with `std::mem::take` (`aggregate`
+    /// takes `event.metrics` this way) and leaves the drained shell for the caller to drop.
     fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool;
 
-    /// Called once per incoming batch, before any of that batch's events reach `process` -- gives
-    /// a transform whose emission spans several batches (only `Aggregator` today) a chance to
-    /// record which batch contributed to whatever it's about to absorb, for
-    /// `docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking
-    /// (`crates/logit-transforms/src/aggregate.rs`). Default no-op: `Json`/`KvMetrics`/`Keep`
-    /// never flush, so they have nothing to attribute across batches and never override this.
-    /// Deliberately not a `process` parameter -- the context is per-*batch*, and widening the
-    /// per-event hot path (this trait's own doc comment: "per-event, not per-batch, on purpose")
-    /// would cost every implementer for the one that actually needs it.
+    /// Called once per incoming batch, before any of its events reach `process`. A transform
+    /// whose emission spans several batches (`aggregate`) records which batch contributed to what
+    /// it absorbs, for `docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking.
+    /// Default no-op, for a transform that never flushes.
     fn observe_batch_context(&mut self, ctx: TraceContext) {
         let _ = ctx;
     }
 
-    /// Called once per incoming batch, alongside `observe_batch_context` -- gives a transform a
-    /// chance to see which component the batch's provenance names (`origin`/`previous`,
-    /// `docs/adr/batch-provenance-on-delivered.md`) before any of that batch's events reach
-    /// `process`. A separate hook rather than widening `observe_batch_context`'s own parameter:
-    /// `Aggregator` exposes `observe_batch_context` as an inherent method its own tests call
-    /// directly with a bare `TraceContext`, and a second default no-op costs nothing rather than
-    /// forcing an unrelated signature change on every other implementer.
-    /// `crates/logit-transforms/src/provenance.rs`'s `HasProvenance`/`DropProvenance` are the
-    /// first real implementers, caching `provenance` on `self` exactly as `Aggregator` caches
-    /// `TraceContext` -- `process` reads the cached value rather than taking it as a parameter,
-    /// for the same per-batch-not-per-event reasoning `observe_batch_context`'s own doc comment
-    /// gives. Default no-op, same reasoning as `observe_batch_context`'s own doc comment.
+    /// Called once per incoming batch, alongside `observe_batch_context`, with the batch's
+    /// provenance (`origin`/`previous`, `docs/adr/batch-provenance-on-delivered.md`). An
+    /// implementer (`HasProvenance`/`DropProvenance`) caches it on `self` for `process` to read.
+    /// Default no-op.
     fn observe_provenance(&mut self, provenance: Provenance) {
         let _ = provenance;
     }
 
-    /// Called once per incoming batch, alongside `observe_batch_context`/`observe_provenance` --
-    /// gives a transform whose emission spans several batches (only `Aggregator` today) a chance
-    /// to record which scope contributed to whatever it's about to absorb, so `flush` can stamp
-    /// its own emission with it (`FlushOutput`'s own doc comment). Not a `process` parameter, same
-    /// reasoning as `observe_batch_context`'s own doc comment: scope is a per-*batch* fact (`
-    /// process_batch`, `crates/logit-pipeline/src/runtime.rs`, reads it off the incoming
-    /// `EventBatch` once, before its per-event loop), and widening the per-event hot path would
-    /// cost every implementer for the one that actually needs it. Default no-op:
-    /// `Json`/`KvMetrics`/`Keep` never flush, so they have nothing to attribute across batches and
-    /// never override this, same as `observe_batch_context`.
+    /// Called once per incoming batch, alongside `observe_batch_context`/`observe_provenance`,
+    /// with the batch's scope. `aggregate` records it so `flush` can stamp its emission with it
+    /// (see [`FlushOutput`]); `shape` measures it. Default no-op.
     fn observe_scope(&mut self, scope: Option<Arc<Scope>>) {
         let _ = scope;
     }
 
-    /// Called once per incoming batch, after `observe_batch_context` and before any of that
-    /// batch's events reach `process` -- gives a transform a chance to substitute the batch's
-    /// resource (`crates/logit-transforms::Set` is the first implementer:
-    /// `docs/adr/operator-declared-resource-attributes.md`). `None` (the default) means "forward
-    /// this batch under the resource it arrived with," costing nothing beyond the call itself --
-    /// `process_batch` (`crates/logit-pipeline/src/runtime.rs`) moves the incoming `Arc` straight
-    /// through rather than cloning it. `Some` replaces it: both `process`'s `resource` argument
-    /// and the outgoing batch use the substituted value. Not a `process` parameter for the same
-    /// reason `observe_batch_context` isn't: the substitution is per-*batch*, and widening the
-    /// per-event hot path would cost every implementer for the one that actually needs it.
+    /// Called once per incoming batch, after `observe_batch_context` and before any of its events
+    /// reach `process`, to substitute the batch's resource (`set`,
+    /// `docs/adr/operator-declared-resource-attributes.md`). `None` (the default) forwards the
+    /// batch under the resource it arrived with; `process_batch` moves that `Arc` through without
+    /// cloning it. `Some` replaces it for both `process`'s `resource` argument and the outgoing
+    /// batch.
     fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
         let _ = resource;
         None
     }
 
-    /// Called once per incoming batch, after the last of that batch's events has been through
-    /// `process` -- the closing bracket to `observe_batch_context`/`observe_scope`/`map_resource`
-    /// above. Gives a transform a place to do per-batch bookkeeping it deliberately kept out of
-    /// `process`: `KvMetrics` (`crates/logit-transforms/src/kv_metrics.rs`) is the first
-    /// implementer, tallying its `derived`/`skipped` counts in plain integers per event and
-    /// emitting them as telemetry here, once per batch, instead of paying `Telemetry::count`'s
-    /// mutex + hash-map upsert once per configured metric per event. Default no-op, same
-    /// reasoning as the other hooks: the cost is one virtual call per *batch*, not per event, and
-    /// only the implementer that needs it pays anything more.
+    /// Called once per incoming batch, after its last event has been through `process`. A place
+    /// for per-batch bookkeeping kept out of `process`: `kv_metrics` tallies counts in plain
+    /// integers per event and emits them as telemetry here, instead of paying
+    /// `Telemetry::count`'s mutex and hash-map upsert per event. Default no-op.
     fn end_batch(&mut self) {}
 
     /// `Some(interval)` if this transform has a flush contract -- a timer-driven emission
@@ -123,19 +85,14 @@ pub trait Transform: Send {
         None
     }
 
-    /// Flushes accumulated state. Only ever called for a transform whose `flush_interval`
-    /// returned `Some`; the default is unreachable in practice but returns nothing rather than
-    /// panicking, matching this project's stance on not failing loudly over an internal
-    /// invariant a caller is expected to uphold.
+    /// Flushes accumulated state. Called only for a transform whose `flush_interval` returned
+    /// `Some`; the default returns nothing rather than panicking.
     ///
-    /// Each emitted `Event` is paired with its own `Vec<SpanLink>` -- the bounded,
-    /// best-effort set of `TraceContext`s that contributed to it, per `observe_batch_context`
-    /// above (empty for a transform, like the default here, that never calls it). Paired rather
-    /// than a parallel same-length array so there's no index correspondence to get wrong.
-    /// `run_flush` (`crates/logit-pipeline/src/runtime.rs`) unions every group's links onto the
-    /// one flush span it records for this call
-    /// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), bounded the same
-    /// way any other span's links are (`MAX_LINKS_PER_SPAN`).
+    /// Each emitted `Event` is paired with the bounded, best-effort set of `TraceContext`s that
+    /// contributed to it (from `observe_batch_context`; empty if the transform never records
+    /// any). `run_flush` unions every group's links onto the one flush span it records for this
+    /// call, capped at `MAX_LINKS_PER_SPAN`
+    /// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
     fn flush(&mut self, now: i64) -> FlushOutput {
         let _ = now;
         Vec::new()

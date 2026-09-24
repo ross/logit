@@ -1,6 +1,4 @@
-//! `MetricsData` from OTLP/JSON. See `super`'s module doc for the dialect rules this leans on, and
-//! for the `exemplars` JSON shape this module parses (`../metrics.rs`'s own module doc has the
-//! codec-level table of which point kinds carry them).
+//! `MetricsData` from OTLP/JSON, under `super`'s dialect rules.
 
 use super::{
     array_field, bool_field, enum_field, f64_field, f64_field_opt, get, hex_bytes, i32_field,
@@ -47,8 +45,7 @@ fn scope_metrics(v: &JsonValue) -> Result<pb::ScopeMetrics, CodecError> {
 
 fn metric(v: &JsonValue) -> Result<pb::Metric, CodecError> {
     let obj = require_object(v, "a metric")?;
-    // `metadata` (proto field 12) is parsed nowhere here -- nothing in `../metrics.rs`'s
-    // `decode_metric` reads it, the same reason `exemplars` is skipped (module doc).
+    // `metadata` isn't parsed: `decode_metric` drops it for both encodings.
     let data = if let Some(g) = object_field(obj, "gauge", "gauge")? {
         Some(pb::metric::Data::Gauge(gauge(g)?))
     } else if let Some(s) = object_field(obj, "sum", "sum")? {
@@ -121,10 +118,8 @@ fn summary(obj: &JsonMap) -> Result<pb::Summary, CodecError> {
     Ok(pb::Summary { data_points })
 }
 
-/// One JSON `Exemplar` object: `timeUnixNano`, `asDouble`/`asInt` (the same oneof shape as a
-/// `numberDataPoint`'s own value), `spanId`/`traceId` as case-insensitive hex (the same
-/// `hex_bytes` a `Span`'s own ids use, not base64 -- see `super`'s module doc), and
-/// `filteredAttributes` via the same `key_values` helper every other attribute list uses.
+/// One JSON `Exemplar`: `timeUnixNano`, `asDouble`/`asInt`, `spanId`/`traceId` as hex (not
+/// base64), and `filteredAttributes`.
 fn exemplar(v: &JsonValue) -> Result<pb::Exemplar, CodecError> {
     let obj = require_object(v, "an exemplar")?;
     let value = if let Some(x) = get(obj, "asDouble", "as_double") {
@@ -174,11 +169,9 @@ fn number_data_point(v: &JsonValue) -> Result<pb::NumberDataPoint, CodecError> {
     })
 }
 
-// A `null` *element* is deliberately still an error, unlike a `null` field (see `super`'s module
-// doc): `bucketCounts`/`explicitBounds` are positional and length-coupled
-// (`bucket_counts.len() == explicit_bounds.len() + 1`, which `../metrics.rs` relies on to
-// reconstruct boundaries), so there is no "this element is absent" reading -- coercing a null to 0
-// would invent a real bucket observation out of a producer bug instead of surfacing it.
+// A `null` *element* is an error, unlike a `null` field: `bucketCounts`/`explicitBounds` are
+// positional and length-coupled (`bucket_counts.len() == explicit_bounds.len() + 1`), so a null
+// has no "absent" reading, and coercing it to 0 would invent a bucket observation.
 fn u64_array(obj: &JsonMap, camel: &str, snake: &str, field: &str) -> Result<Vec<u64>, CodecError> {
     array_field(obj, camel, snake)?.iter().map(|x| parse_u64(x, field)).collect()
 }
@@ -194,7 +187,7 @@ fn histogram_data_point(v: &JsonValue) -> Result<pb::HistogramDataPoint, CodecEr
         start_time_unix_nano: u64_field(obj, "startTimeUnixNano", "start_time_unix_nano")?,
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
         count: u64_field(obj, "count", "count")?,
-        // `Option<f64>` -- an absent key must stay `None`, not become `Some(0.0)` (module doc).
+        // An absent key stays `None`, not `Some(0.0)`.
         sum: f64_field_opt(obj, "sum", "sum")?,
         bucket_counts: u64_array(obj, "bucketCounts", "bucket_counts", "bucketCounts[]")?,
         explicit_bounds: f64_array(obj, "explicitBounds", "explicit_bounds", "explicitBounds[]")?,
@@ -223,7 +216,7 @@ fn exponential_histogram_data_point(
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
         count: u64_field(obj, "count", "count")?,
         sum: f64_field_opt(obj, "sum", "sum")?,
-        // Signed -- `scale`/`Buckets.offset` may be negative (module: "the negative range").
+        // Signed: `scale` and `Buckets.offset` may be negative.
         scale: i32_field(obj, "scale", "scale")?,
         zero_count: u64_field(obj, "zeroCount", "zero_count")?,
         positive,
@@ -254,8 +247,7 @@ fn summary_data_point(v: &JsonValue) -> Result<pb::SummaryDataPoint, CodecError>
         start_time_unix_nano: u64_field(obj, "startTimeUnixNano", "start_time_unix_nano")?,
         time_unix_nano: u64_field(obj, "timeUnixNano", "time_unix_nano")?,
         count: u64_field(obj, "count", "count")?,
-        // Required (plain `f64`, not `Option`) -- unlike Histogram's `sum`, a Summary's `sum` has
-        // no "unset" state in the proto (`SummaryDataPoint.sum` is a bare `double`, field 5).
+        // Unlike Histogram's, a Summary's `sum` is a bare `double` with no "unset" state.
         sum: f64_field(obj, "sum", "sum")?,
         quantile_values,
         flags: u32_field(obj, "flags", "flags")?,

@@ -14,52 +14,40 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
-# otlp_out's hand-rolled gRPC-over-HTTP/2 client (docs/adr/hand-rolled-grpc-over-hyper.md);
-# HTTP framing itself rides on `reqwest`, above.
+# otlp_out's hand-rolled gRPC client (docs/adr/hand-rolled-grpc-over-hyper.md); its OTLP/HTTP
+# transport uses `reqwest`.
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-# otlp_out's optional gzip request compression (docs/adr/otlp-compression-and-decompression-bounds.md).
+# otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
-# prometheus_out's remote-write sender Snappy-block-compresses every request body -- the one
-# `Content-Encoding` both remote-write specs define (docs/adr/prometheus-remote-write.md).
+# prometheus_out's remote-write bodies: Snappy block format, the one `Content-Encoding` both
+# remote-write specs define (docs/adr/prometheus-remote-write.md).
 snap.workspace = true
-# TLS for otlp_out, both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
-# `rustls-pki-types` build a `rustls::ClientConfig` from config-supplied PEM; `hyper-rustls` wraps
-# `hyper-util`'s pooled client (the gRPC transport's connection manager) in it; `webpki-roots` is
-# the same bundled Mozilla trust root the HTTP transport already gets from `reqwest` by default.
+# otlp_out TLS on both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): a
+# `rustls::ClientConfig` from config PEM, wrapped around `hyper-util`'s pooled gRPC client by
+# `hyper-rustls`; `webpki-roots` is the Mozilla root set `reqwest` bundles for the HTTP side.
 rustls.workspace = true
 rustls-pki-types.workspace = true
 hyper-rustls.workspace = true
 webpki-roots.workspace = true
-# A real (non-dev) dependency: `StreamOutput` (`stdio.rs`) writes via `tokio::io`/`tokio::fs`.
-# `InfluxDbOutput::send` no longer retries on its own (that moved to `logit-pipeline`'s generic
-# writer, `docs/adr/buffered-sink-delivery.md`) and so no longer needs `tokio::time` itself.
 tokio.workspace = true
-# `logit_out` (`logit.rs`) dials a raw TCP(+TLS) connection itself, unlike `otlp_out`'s
-# HTTP-framed transports -- promoted from a dev-dependency (it used to back only otlp.rs's canned
-# TLS test servers) to a real one, same version already in Cargo.lock.
+# TLS for the raw-TCP sinks (`logit_out`, `syslog_out`, `statsd_out`), which don't go through
+# `reqwest`/`hyper`; tests' TLS servers use it too.
 tokio-rustls.workspace = true
 
 [dev-dependencies]
-# `prometheus.rs`'s remote-write sender tests decode the request body they captured as the real
-# vendored prompb message (`logit_proto::prometheus::generated`), rather than asserting against
-# this codec's own view of what it wrote.
+# Remote-write sender tests decode the captured body as the vendored prompb message, not this
+# codec's own view of it.
 prost.workspace = true
-# Only for the end-to-end regression test that a Lua enrichment stage doesn't silently change an
-# attribute's InfluxDB tag-inclusion behavior -- see
-# bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage below.
+# influxdb.rs's test that a Lua stage doesn't change an attribute's tag inclusion
+# (`bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage`).
 logit-script.workspace = true
-# `syslog.rs`'s relay test (decodes with a real `SyslogDecoder`) and `logit.rs`'s round-trip
-# tests (drive a real `LogitInput` rather than hand-rolling the wire protocol on both ends).
+# Relay and round-trip tests decode with the real listeners' decoders and `LogitInput`.
 logit-inputs.workspace = true
-# `syslog.rs`'s TLS tests assert on the `insecure_skip_verify` warning itself, which
-# `Diagnostics::warn` reports through `tracing` and nothing else -- so a test needs a subscriber
-# to capture it. Dev-only, and `logit-outputs` still never picks a subscriber itself; same shape
-# and same reason as `logit-inputs`' own override.
+# TLS tests assert on the `insecure_skip_verify` warning, which reaches only `tracing`. Dev-only:
+# `logit-outputs` never installs a subscriber itself.
 tracing-subscriber.workspace = true
-# `syslog.rs`'s pure-codec fixed-point property test (docs/plans/lossless-transit.md's W5):
-# generates small RFC 5424 STRUCTURED-DATA grammars and asserts
-# `decode(encode(decode(x))) == decode(x)`.
+# Codec fixed-point property tests (`decode(encode(decode(x))) == decode(x)`).
 proptest.workspace = true

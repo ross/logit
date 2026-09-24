@@ -1,97 +1,75 @@
-//! The `Output` trait -- moved here from `logit-outputs`, same reasoning as [`crate::input`]. Also
-//! home to [`Fault`]/[`DeliveryPosture`]/[`is_retryable`], the classification and policy pieces the
-//! generic writer (`crate::runtime::write_loop`) needs to decide whether a failed `send` is worth
-//! retrying. See `docs/adr/buffered-sink-delivery.md`.
+//! The `Output` trait, plus [`Fault`]/[`DeliveryPosture`]/[`is_retryable`]: the classification
+//! and policy the generic writer (`crate::runtime::write_loop`) uses to decide whether a failed
+//! `send` is worth retrying. See `docs/adr/buffered-sink-delivery.md`.
 
 use crate::fanout::BatchContext;
 use logit_core::EventBatch;
 
-/// A sink component: takes batches and delivers them somewhere. Buffering between the pipeline
-/// and delivery is the **runtime's** responsibility, not this trait's -- `run_output`
-/// (`runtime.rs`) splits into a drain half and a writer half joined around a `SinkQueue`
-/// (`queue.rs`), so a sink's own inbox keeps draining while a slow or backing-off delivery
-/// attempt is in flight. See `docs/adr/buffered-sink-delivery.md`. `Output::send` itself
-/// only ever sees one batch at a time, exactly as before this existed. A sink has at least one
-/// source and is never itself a source of anything else (`docs/design/pipeline-graph.md`'s arity
-/// table).
+/// A sink component: takes batches and delivers them somewhere. It has at least one source and is
+/// never a source itself (`docs/design/pipeline-graph.md`'s arity table).
 ///
-/// Takes `&EventBatch`, not an owned one -- a sink only ever reads a batch to encode/write it, and
-/// this is the half of `docs/adr/arc-eventbatch-copy-on-write.md`'s copy-on-write design that
-/// actually realizes the fan-out saving: `run_output` (`runtime.rs`) can hand a `Delivered::Shared`
-/// branch straight through as a reference, with no `Arc::try_unwrap`/clone ever needed for a
-/// read-only `Output` consumer, regardless of how many sibling branches still hold their own
-/// handle to the same batch.
+/// Buffering is the runtime's job: `run_output` splits into a drain half and a writer half joined
+/// around a [`crate::SinkQueue`], so the inbox keeps draining while a slow or backing-off delivery
+/// is in flight (`docs/adr/buffered-sink-delivery.md`). `send` sees one batch at a time.
 ///
-/// **Retry is not this trait's job either.** A sink implements `send` as a single attempt and
-/// reports what a failure means via [`Fault`] (`.context(fault)` on the returned error); the
-/// generic writer (`crate::runtime::write_loop`) owns retry timing, budget, and the
-/// retryable/permanent decision, driven by [`is_retryable`] and this sink's [`Output::duplicate_safe`].
-/// This is what every sink gets retry for free, rather than reimplementing its own loop --
-/// `InfluxDbOutput` used to have one; it doesn't any more.
+/// `send` takes `&EventBatch` so `run_output` can hand a `Delivered::Shared` branch through by
+/// reference, with no `Arc::try_unwrap` or clone however many sibling branches share it
+/// (`docs/adr/arc-eventbatch-copy-on-write.md`).
+///
+/// Retry is the runtime's job too. `send` is a single attempt that reports what a failure means
+/// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing,
+/// budget, and the retryable/permanent decision, from [`is_retryable`] and
+/// [`Output::duplicate_safe`]. A sink never runs its own retry loop.
 #[async_trait::async_trait]
 pub trait Output {
-    /// Opens whatever this sink has to open *before* it can serve or deliver anything -- a
-    /// listening socket, in practice. Called by `crate::runtime::run_with_telemetry` for **every**
-    /// output, in sorted id order, in the same pre-spawn pass that already binds every input
-    /// ([`crate::Input::bind`]) -- so a `bind:` address already in use, or a privileged port
-    /// without the capability for it, fails startup with nothing else running yet rather than
-    /// surfacing as the first `JoinSet` error once every sibling is already live.
+    /// Opens whatever this sink must open before it can serve anything: a listening socket, in
+    /// practice. `crate::runtime::run_with_telemetry` calls it for every output, in sorted id
+    /// order, in the pre-spawn pass that binds every input ([`crate::Input::bind`]), so an address
+    /// in use fails startup with nothing else running.
     ///
-    /// The default is a no-op, and that is what almost every sink wants: a sink that only ever
-    /// *connects outward* (`influxdb_out`, `otlp_out`, `statsd_out`, `logit_out`) has no socket to
-    /// open at startup, and `write_loop`'s retry already owns the "destination isn't up yet" case.
-    /// `prometheus_out` is the one implementer today -- the first sink that *listens*, and so the
-    /// first with an input's startup failure mode rather than a sink's
+    /// The default is a no-op, right for a sink that only connects outward: `write_loop`'s retry
+    /// owns the "destination isn't up yet" case. A listening sink (`prometheus_out`) overrides it
     /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`").
     ///
-    /// Two obligations on an override, identical to [`crate::Input::bind`]'s:
-    /// - **Idempotent.** A second call must be harmless (return `Ok(())` without re-opening).
-    /// - **`send`/`flush` must still work if nobody called this first.** `run_output`
-    ///   (`crate::runtime`) calls `bind` itself before opening the sink's store, so a caller
-    ///   outside the node runtime (a direct unit test, `logit-outputs`' own) still gets "one call
-    ///   and it works."
+    /// Two obligations on an override, the same as [`crate::Input::bind`]'s:
+    /// - **Idempotent.** A second call must return `Ok(())` without re-opening.
+    /// - **`send`/`flush` must still work if nobody called this first.** `run_output` calls
+    ///   `bind` itself before opening the sink's store, so a caller outside the node runtime (a
+    ///   direct unit test) needs only one call.
     async fn bind(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
 
-    /// Called once per batch, immediately before each delivery attempt in `write_loop`
-    /// (`crates/logit-pipeline/src/runtime.rs`) -- including retries, so a sink that saves the
-    /// value off for `send` to use sees the same one on every attempt at one batch. Default
-    /// no-op: most sinks have no use for a batch's `BatchContext` (trace id/span id, and which
-    /// component created/last handled it, `docs/adr/batch-provenance-on-delivered.md`).
-    /// `logit_out` is the one implementer today, threading provenance across the wire. A separate
-    /// hook rather than widening `Output::send`'s own signature: `send` is implemented by every
-    /// sink and takes `&EventBatch` specifically so a read-only fan-out consumer never needs an
-    /// `Arc::try_unwrap`/clone (`docs/adr/arc-eventbatch-copy-on-write.md`) -- widening it would
-    /// cost every implementer for the one that actually needs this.
+    /// Called immediately before each delivery attempt in `write_loop`, retries included, so a
+    /// sink that saves the value for `send` sees the same one on every attempt at one batch.
+    /// `BatchContext` is the trace/span id plus which component created and last handled the
+    /// batch (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the
+    /// wire. Default no-op.
     fn observe_batch(&mut self, ctx: BatchContext) {
         let _ = ctx;
     }
 
-    /// Called once after the last batch has been delivered or dropped and no more will follow.
-    /// Default no-op -- most sinks (e.g. `InfluxDbOutput`, which writes synchronously with nothing
-    /// buffered internally) need nothing here; this exists for a sink that does. Closes ADR `service-lifecycle-and-output-retry`'s
-    /// residual "no `Output` close hook" gap, now load-bearing since a sink can hold unwritten data
-    /// at shutdown (`docs/adr/buffered-sink-delivery.md`'s shutdown-grace section).
+    /// Called once after the last batch has been delivered or dropped and no more will follow,
+    /// for a sink that holds unwritten data at shutdown (`docs/adr/buffered-sink-delivery.md`'s
+    /// shutdown-grace section). Default no-op, for a sink with nothing buffered internally.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Whether re-delivering an already-delivered batch is safe for this destination. Drives the
-    /// default delivery posture (see [`DeliveryPosture`]); config can still override it per
-    /// component (`logit_config::BufferConfig::delivery`, resolved in `write_loop`). Default
-    /// `false` -- the safer default for a sink that hasn't opted in.
+    /// default [`DeliveryPosture`]; config can override it per component
+    /// (`logit_config::BufferConfig::delivery`). Defaults to `false`, the safe choice for a sink
+    /// that hasn't opted in.
     fn duplicate_safe(&self) -> bool {
         false
     }
 }
 
-/// What a `send` failure means about whether the destination actually received the batch -- only
-/// the sink can tell, so it travels back out of `send` as `anyhow` context rather than a signature
-/// change (`.context(Fault::Ambiguous)`, read back via [`classify`] -- see that function's doc
-/// comment for exactly how). See `docs/adr/buffered-sink-delivery.md`.
+/// What a `send` failure says about whether the destination received the batch. Only the sink
+/// can tell, so it travels out of `send` as `anyhow` context (`.context(Fault::Ambiguous)`), read
+/// back by [`classify`]. See `docs/adr/buffered-sink-delivery.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
     /// The destination provably never saw the batch (connect refused, DNS failure). Safe to retry
@@ -116,39 +94,30 @@ impl std::fmt::Display for Fault {
 }
 
 /// Reads `err` for an attached [`Fault`] marker (a sink's `.context(fault)`), defaulting to
-/// [`Fault::Permanent`] when none is found -- never retry a failure the sink didn't recognize
-/// (`docs/adr/buffered-sink-delivery.md`).
+/// [`Fault::Permanent`] when none is found: never retry a failure the sink didn't recognize.
 ///
-/// **Not** `err.chain().find_map(|e| e.downcast_ref::<Fault>())`, even though that's the more
-/// obvious-looking spelling: each link `chain()` yields is a `&dyn std::error::Error` whose
-/// *concrete* type is anyhow's own internal `ContextError<Fault, _>` wrapper, not `Fault` itself,
-/// so the standard `dyn Error::downcast_ref::<Fault>()` never matches at any link and this would
-/// silently always fall through to `Permanent`. `anyhow::Error::downcast_ref` is a different,
-/// anyhow-specific inherent method (not the `std::error::Error` trait method) that knows how to
-/// look inside its own context wrapper -- and recurses through further `.context(...)` layers
-/// stacked on top, so this still finds `Fault` even if a caller later adds more context (e.g.
-/// `write_loop`'s own `.with_context(|| format!("component '{id}'"))`).
+/// Not `err.chain().find_map(|e| e.downcast_ref::<Fault>())`: each link's concrete type is
+/// anyhow's internal `ContextError<Fault, _>`, so `dyn Error::downcast_ref` never matches and
+/// every error would classify `Permanent`. The inherent `anyhow::Error::downcast_ref` looks
+/// inside its context wrappers, through any further `.context(...)` layers stacked on top (such
+/// as `write_loop`'s `component '{id}'`).
 pub fn classify(err: &anyhow::Error) -> Fault {
     err.downcast_ref::<Fault>().copied().unwrap_or(Fault::Permanent)
 }
 
-/// Whether `err` carries an **explicit** `Fault::Permanent` marker from the sink itself, as
-/// opposed to [`classify`]'s conservative default when no `Fault` was found at all. Only an
-/// explicit classification should ever count toward `write_loop`'s sustained-permanent-failure
-/// exit window -- an unclassified error (a sink that hasn't opted into `Fault` at all, e.g.
-/// `StreamOutput`'s bare I/O errors) is correctly treated as non-retryable by [`classify`]'s
-/// default, but must never be mistaken for a *positively identified* configuration error that
-/// should eventually end the process. A `StreamOutput` hitting a transient disk-full condition
-/// forever is a very different situation from `InfluxDbOutput` hitting a bad token forever, and
-/// only the latter should ever trip that window.
+/// Whether `err` carries an explicit `Fault::Permanent` marker from the sink, as opposed to
+/// [`classify`]'s default when no `Fault` is attached. Only an explicit marker counts toward
+/// `write_loop`'s sustained-permanent-failure exit window: an unclassified error (`StreamOutput`'s
+/// bare I/O errors, say a full disk) is non-retryable but is not a positively identified
+/// configuration error (a bad token) that should end the process.
 pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Fault>(), Some(Fault::Permanent))
 }
 
 /// Whether re-delivering an already-delivered batch is an acceptable risk for a sink's
-/// destination. Drives which [`Fault`]s are worth retrying (see [`is_retryable`]); config can
-/// override the derived default per component (`logit_config::BufferConfig::delivery`, resolved
-/// into `WriteLoopConfig::delivery_override` by `logit-cli::pipeline::write_config`).
+/// destination. Decides which [`Fault`]s are retried (see [`is_retryable`]). Config can override
+/// the derived default per component (`logit_config::BufferConfig::delivery`, resolved into
+/// `WriteLoopConfig::delivery_override` by `logit-cli::pipeline::write_config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryPosture {
     AtLeastOnce,
@@ -156,9 +125,8 @@ pub enum DeliveryPosture {
 }
 
 impl DeliveryPosture {
-    /// The default posture derived purely from [`Output::duplicate_safe`]: `true` means
-    /// re-delivery is an acceptable risk, so retry as aggressively as fault classification allows
-    /// (`AtLeastOnce`); `false` is the conservative default (`AtMostOnce`).
+    /// The default posture from [`Output::duplicate_safe`]: `true` gives `AtLeastOnce`, `false`
+    /// gives `AtMostOnce`.
     pub fn from_duplicate_safe(duplicate_safe: bool) -> Self {
         if duplicate_safe {
             DeliveryPosture::AtLeastOnce
@@ -168,8 +136,8 @@ impl DeliveryPosture {
     }
 }
 
-/// Whether `fault` is worth retrying under `posture` -- the crux of the whole duplicate-safety
-/// argument (`docs/adr/buffered-sink-delivery.md`'s table, reproduced here):
+/// Whether `fault` is worth retrying under `posture` (`docs/adr/buffered-sink-delivery.md`'s
+/// table):
 ///
 /// | `Fault` | `AtMostOnce` | `AtLeastOnce` |
 /// |---|---|---|
@@ -177,10 +145,9 @@ impl DeliveryPosture {
 /// | `Ambiguous` | no retry | retry |
 /// | `Permanent` | no retry | no retry |
 ///
-/// `Clean` is always safe to retry under either posture, since the destination never actually saw
-/// the batch in the first place -- there is nothing to duplicate. `Ambiguous` is only safe once
-/// the sink itself has said duplicates are tolerable (`AtLeastOnce`). `Permanent` is a
-/// configuration error, not a transient condition, so it is never retried regardless of posture.
+/// `Clean` never reached the destination, so there is nothing to duplicate. `Ambiguous` retries
+/// only once duplicates are tolerable (`AtLeastOnce`). `Permanent` is a configuration error, not
+/// a transient condition.
 pub fn is_retryable(fault: Fault, posture: DeliveryPosture) -> bool {
     match (fault, posture) {
         (Fault::Clean, _) => true,
@@ -194,9 +161,7 @@ pub fn is_retryable(fault: Fault, posture: DeliveryPosture) -> bool {
 mod tests {
     use super::*;
 
-    /// Exhaustive, all 6 `(Fault, DeliveryPosture)` combinations -- this table is the crux of the
-    /// whole duplicate-safety argument (`docs/adr/buffered-sink-delivery.md`), so it's pinned
-    /// directly rather than trusted to a handful of spot checks.
+    /// Pins all 6 `(Fault, DeliveryPosture)` combinations of the ADR's table.
     #[test]
     fn is_retryable_matches_the_adr_table_exhaustively() {
         use DeliveryPosture::*;
@@ -239,9 +204,8 @@ mod tests {
 
     #[test]
     fn an_unclassified_error_is_never_explicitly_permanent() {
-        // classify()'s default-to-Permanent is a retry decision, not a claim that the sink
-        // positively identified a configuration error -- an unclassified error must not count
-        // toward write_loop's sustained-permanent-failure exit window.
+        // classify()'s default is a retry decision, not a positively identified configuration
+        // error, so it must not count toward write_loop's permanent-failure exit window.
         let err = anyhow::anyhow!("boom, no fault attached");
         assert_eq!(classify(&err), Fault::Permanent, "still non-retryable by default");
         assert!(!is_explicitly_permanent(&err), "but not an explicit classification");
@@ -261,9 +225,7 @@ mod tests {
 
     #[test]
     fn classify_finds_a_fault_attached_underneath_further_context() {
-        // A real call site may layer more context on top (e.g. `with_context(|| "component
-        // 'out'")`) after the sink itself attaches its `Fault` -- `classify` has to walk the whole
-        // chain, not just look at the outermost layer.
+        // write_loop layers more context on top of the sink's `Fault`.
         let err = anyhow::anyhow!("boom").context(Fault::Clean).context("component 'out'");
         assert_eq!(classify(&err), Fault::Clean);
     }

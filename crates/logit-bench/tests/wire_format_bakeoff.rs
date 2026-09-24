@@ -1,27 +1,22 @@
-//! The fidelity gate for the native-wire-format bake-off (`docs/design/wire-protocol.md`'s
-//! "Encoding: decide with a benchmark, not up front", `docs/adr/native-wire-format-encoding.md`).
+//! The fidelity gate for the native-wire-format bake-off
+//! (`docs/adr/native-wire-format-encoding.md`).
 //!
 //! Each arm ([`logit_bench::bakeoff`]) must round-trip every representative fixture losslessly
-//! *before* any timing number from it is trusted -- a fast, lossy codec isn't a candidate. This
-//! file is that gate, run as ordinary tests so a regression fails `script/test`, not just a
-//! benchmark report nobody reads. The version-skew gate (an unrecognized field/value tag decoding
-//! gracefully) lives closer to what it tests, in `crates/logit-proto/src/native/{value,record}.rs`'s
-//! own unit tests -- only the native format claims that property, so there's nothing to compare it
-//! against here.
+//! *before* any timing number from it is trusted; a fast, lossy codec isn't a candidate. These are
+//! ordinary tests, so a regression fails `script/test`. The version-skew gate (an unrecognized
+//! field or value tag decoding gracefully) is in the unit tests of
+//! `crates/logit-proto/src/native/{value,record}.rs`: only the native format claims that
+//! property, so there's nothing to compare here.
 //!
-//! **Native/postcard/rkyv are exact codecs** (`docs/plans/lossless-transit.md`'s W1): `EventBatch`
-//! now derives `PartialEq`, so these three arms compare with a plain `assert_eq!` on the whole
-//! batch rather than a hand-rolled field walk. **OTLP is exact too, now** -- W4 closed every field
-//! W1 left lossy (`scope`, metric `description`/`start_timestamp`/`exemplars`/`flags`, log
-//! `event_name`/`observed_timestamp`/dropped counts, span `flags`/`ext`) -- **except for a named
-//! list of cross-protocol degradations, which are not codec bugs**: `Samples`/`Distribution`
-//! degrade to a `Summary` (OTLP has no raw-observations or DDSketch wire shape),
-//! `Set`/`SetMembers`/`GaugeDelta` are skipped outright (no wire shape at all),
-//! `Value::U64`/`Value::Timestamp` collapse to `Value::I64` (`AnyValue` has neither variant), a
-//! multi-payload `Event` shatters into up to three separate batches (OTLP's wire protocol splits
+//! **Native, postcard, and rkyv are exact codecs**, compared with `assert_eq!` on the whole batch.
+//! **OTLP is exact too, except for a named list of cross-protocol degradations, which are not codec
+//! bugs**: `Samples`/`Distribution` degrade to a `Summary` (OTLP has no raw-observations or
+//! DDSketch wire shape), `Set`/`SetMembers`/`GaugeDelta` are skipped outright (no wire shape at
+//! all), `Value::U64`/`Value::Timestamp` collapse to `Value::I64` (`AnyValue` has neither variant),
+//! a multi-payload `Event` shatters into up to three separate batches (OTLP's wire protocol splits
 //! by signal), and a `Summary` point's own `exemplars` are dropped (`SummaryDataPoint` has no wire
-//! field for them). Those tests stay field-level, documenting precisely what's still lossy;
-//! everything else now compares whole-value.
+//! field for them). Those tests stay field-level, documenting what's lossy; everything else
+//! compares whole-value.
 
 use bytes::Bytes;
 use logit_bench::{bakeoff, fixtures};
@@ -42,8 +37,8 @@ fn metric_batch(kind: MetricKind) -> EventBatch {
     single_event_batch(Event::metric(0, AttrMap::new(), record))
 }
 
-/// [`fixtures::nginx_batch`], with a populated [`Scope`] attached -- exercises the new batch-level
-/// section through every arm.
+/// [`fixtures::nginx_batch`], with a populated [`Scope`] attached, to exercise the batch-level
+/// scope section through every arm.
 fn scoped_nginx_batch() -> EventBatch {
     let mut batch = fixtures::nginx_batch(2);
     let mut scope_attrs = AttrMap::new();
@@ -58,7 +53,7 @@ fn scoped_nginx_batch() -> EventBatch {
     batch
 }
 
-/// [`fixtures::span_event`], with a populated [`SpanExt`] attached -- exercises the boxed,
+/// [`fixtures::span_event`], with a populated [`SpanExt`] attached, to exercise the boxed,
 /// rarely-populated half of span fidelity through every arm.
 fn span_with_ext_batch() -> EventBatch {
     let mut event = fixtures::span_event();
@@ -81,8 +76,8 @@ fn otlp_exemplar(trace: Option<TraceRef>) -> Exemplar {
     Exemplar { timestamp: 1_700_000_000_100_000_000, value: 3.5, trace, filtered_attributes }
 }
 
-/// A `Gauge` flagged `FLAG_NO_RECORDED_VALUE` -- the "point kept, flagged, not skipped" shape W4
-/// adds (`crates/logit-core/src/metric.rs`'s `MetricRecord::flags`).
+/// A `Gauge` flagged `FLAG_NO_RECORDED_VALUE`: the "point kept, flagged, not skipped" shape
+/// (`crates/logit-core/src/metric.rs`'s `MetricRecord::flags`).
 fn flagged_metric_batch() -> EventBatch {
     let record = MetricRecord {
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
@@ -95,7 +90,7 @@ fn flagged_metric_batch() -> EventBatch {
 }
 
 /// A `Sum` carrying `description`/`start_timestamp`/two exemplars (one with a trace, one
-/// without) -- the metric-fidelity fields W4 closes.
+/// without): the metric-fidelity fields.
 fn metric_with_description_and_exemplars_batch() -> EventBatch {
     let record = MetricRecord {
         description: Some(logit_core::interner::intern("a fully described metric")),
@@ -125,10 +120,10 @@ fn metric_with_description_and_exemplars_batch() -> EventBatch {
 }
 
 /// A log with `event_name`/a non-zero `observed_timestamp`/a dropped-attribute count, plus the
-/// `otel.severity_number`/`otel.severity_text` attributes a real OTLP decode stamps -- the
-/// log-fidelity fields W4 closes. Built already in the shape a real decode produces (see
-/// `crates/logit-proto/tests/otlp_fixed_point.rs`'s own module doc for why that matters for the
-/// OTLP round-trip tests below).
+/// `otel.severity_number`/`otel.severity_text` attributes a real OTLP decode stamps: the
+/// log-fidelity fields. Built already in the shape a real decode produces
+/// (`crates/logit-proto/tests/otlp_fixed_point.rs`'s module doc says why that matters for the OTLP
+/// round-trip tests below).
 fn log_with_fidelity_fields_batch() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("otel.severity_number", Value::I64(10));
@@ -145,11 +140,11 @@ fn log_with_fidelity_fields_batch() -> EventBatch {
     single_event_batch(Event::log(1_700_000_000_000_000_000, attrs, log))
 }
 
-/// Every fixture this gate runs each arm against -- deliberately the same shapes
-/// `crates/logit-bench/src/fixtures.rs`'s own doc comment argues for (mixed, logs-only,
-/// wide-JSON, distribution-heavy, span), per `AGENTS.md`'s "don't generalize a measurement from
-/// one event shape", plus one batch per new W1 metric kind, one for a populated `Set` (W2's real
-/// `HyperLogLog`), and one each for a populated `Scope`/`SpanExt`.
+/// Every fixture this gate runs each arm against: the shapes `crates/logit-bench/src/fixtures.rs`'s
+/// doc argues for (mixed, logs-only, wide-JSON, distribution-heavy, span), per `AGENTS.md`'s "don't
+/// generalize a measurement from one event shape"; one batch per model-v2 metric kind; a populated
+/// `Set` (a real `HyperLogLog`); a populated `Scope` and `SpanExt`; and the metric- and
+/// log-fidelity batches.
 fn representative_batches() -> Vec<EventBatch> {
     vec![
         fixtures::nginx_batch(3),
@@ -270,8 +265,8 @@ fn native_postcard_and_rkyv_preserve_the_timestamp_type_not_just_its_number() {
 
 /// The disqualifying finding for OTLP as an *internal* transport, pinned as a test: `AnyValue` has
 /// no timestamp variant and no unsigned-64 variant at all (`crates/logit-proto/src/otlp/common.rs`'s
-/// own module doc), so both round-trip lossy through the OTLP codec that already ships. Not a
-/// hypothetical -- this exercises the real `OtlpEncoder`/`OtlpDecoder`.
+/// module doc), so both round-trip lossy through the shipped OTLP codec, exercised here through
+/// the real `OtlpEncoder`/`OtlpDecoder`.
 #[test]
 fn otlp_collapses_timestamp_to_i64_and_loses_u64_above_i64_max() {
     let mut attrs = AttrMap::new();
@@ -298,8 +293,8 @@ fn otlp_collapses_timestamp_to_i64_and_loses_u64_above_i64_max() {
         Some(&Value::I64(1_725_091_200_123_456_789)),
         "OTLP has no Timestamp variant -- decodes back as a plain I64"
     );
-    // u64::MAX exceeds f64's 2^53 exact-integer range, so it round-trips as an approximation --
-    // assert it's *not* exact, which is the actual, documented failure mode.
+    // u64::MAX exceeds f64's 2^53 exact-integer range, so it round-trips as an approximation.
+    // Assert it's *not* exact: the documented failure mode.
     assert_ne!(
         event.attributes.get("big"),
         Some(&Value::U64(u64::MAX)),
@@ -307,10 +302,10 @@ fn otlp_collapses_timestamp_to_i64_and_loses_u64_above_i64_max() {
     );
 }
 
-// -- OTLP fidelity: exact now, except a named list of cross-protocol degradations ---------------
+// -- OTLP fidelity: exact, except a named list of cross-protocol degradations --------------------
 
-/// `description`/`start_timestamp`/`exemplars`/`flags` all round-trip exactly now (W4) --
-/// `crates/logit-proto/src/otlp/metrics.rs`'s own module doc has the mapping.
+/// `description`/`start_timestamp`/`exemplars`/`flags` all round-trip exactly;
+/// `crates/logit-proto/src/otlp/metrics.rs`'s module doc has the mapping.
 #[test]
 fn otlp_preserves_metric_description_start_timestamp_exemplars_and_flags() {
     let record = MetricRecord {
@@ -352,8 +347,8 @@ fn otlp_preserves_metric_description_start_timestamp_exemplars_and_flags() {
     assert_eq!(out.flags, record.flags, "flags should round-trip through OTLP");
 }
 
-/// `EventBatch::scope` round-trips whole-value now (W4 closed the scope-grouping gap) --
-/// `crates/logit-proto/src/otlp/mod.rs`'s module doc's "Nesting" section.
+/// `EventBatch::scope` round-trips whole-value (`crates/logit-proto/src/otlp/mod.rs`'s module
+/// doc, "Nesting" section).
 #[test]
 fn otlp_preserves_scope_whole_value() {
     let batch = scoped_nginx_batch();
@@ -366,9 +361,9 @@ fn otlp_preserves_scope_whole_value() {
     );
 }
 
-/// `SpanRecord` round-trips exactly through OTLP now, `flags`/`ext` (status message, trace
-/// state, three dropped counts) and every link/event field included --
-/// `crates/logit-proto/src/otlp/traces.rs`'s module doc.
+/// `SpanRecord` round-trips exactly through OTLP, `flags`/`ext` (status message, trace state,
+/// three dropped counts) and every link/event field included
+/// (`crates/logit-proto/src/otlp/traces.rs`'s module doc).
 #[test]
 fn otlp_preserves_span_ext_flags_links_and_events_exactly() {
     let batch = span_with_ext_batch();
@@ -382,8 +377,8 @@ fn otlp_preserves_span_ext_flags_links_and_events_exactly() {
 }
 
 /// `event_name`/`observed_timestamp`/`dropped_attributes_count` and the raw
-/// `otel.severity_number`/`otel.severity_text` attributes all round-trip through OTLP now --
-/// `crates/logit-proto/src/otlp/logs.rs`'s module doc.
+/// `otel.severity_number`/`otel.severity_text` attributes all round-trip through OTLP
+/// (`crates/logit-proto/src/otlp/logs.rs`'s module doc).
 #[test]
 fn otlp_preserves_log_event_name_observed_timestamp_dropped_count_and_severity_attrs() {
     let batch = log_with_fidelity_fields_batch();
@@ -399,8 +394,8 @@ fn otlp_preserves_log_event_name_observed_timestamp_dropped_count_and_severity_a
     );
 }
 
-/// `Samples` degrades into an OTLP `Summary` (same lossy path `Distribution` already took);
-/// `SetMembers` is skipped outright, exactly like `Set` already was.
+/// `Samples` degrades into an OTLP `Summary` (the same lossy path as `Distribution`);
+/// `SetMembers` is skipped outright, like `Set`.
 #[test]
 fn otlp_degrades_samples_to_a_summary_and_skips_set_members() {
     let samples_batch = metric_batch(MetricKind::Samples(Samples::new([1.0, 2.0, 3.0])));
@@ -474,9 +469,9 @@ fn native_postcard_and_rkyv_keep_a_log_metric_and_span_together_as_one_event() {
 /// The disqualifying finding for OTLP's wire *shape*: one `EventBatch` carrying a log, a metric,
 /// and a span at once (ADR `multi-payload-events`) shatters into up to three independent OTLP
 /// payloads on the way out, and decodes back as up to three separate batches with no single event
-/// carrying all three -- there is no "one event, several payload kinds" shape OTLP's wire protocol
-/// can express (`crates/logit-proto/src/otlp/mod.rs`'s own module doc: "OTLP's wire protocol does
-/// [split by signal]: logs, metrics, and traces are three separate RPCs").
+/// carrying all three. OTLP's wire protocol has no "one event, several payload kinds" shape
+/// (`crates/logit-proto/src/otlp/mod.rs`'s module doc: "OTLP's wire protocol does [split by
+/// signal]: logs, metrics, and traces are three separate RPCs").
 #[test]
 fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
     let batch = single_event_batch(multi_payload_event());
@@ -485,8 +480,7 @@ fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
     for b in &decoded {
         assert_eq!(b.events.len(), 1);
         let event = &b.events[0];
-        // No decoded batch's event carries more than one of the three payload kinds -- the whole
-        // point being demonstrated.
+        // No decoded batch's event carries more than one of the three payload kinds.
         let payload_kinds = event.log.is_some() as u8
             + (!event.metrics.is_empty()) as u8
             + event.span.is_some() as u8;
@@ -496,9 +490,9 @@ fn otlp_shatters_a_multi_payload_event_across_separate_batches() {
 
 // -- Metrics OTLP can't express at all: GaugeDelta and Set ---------------------------------------
 
-/// Matches the encode-side gap already tabulated in `docs/known-gaps.md`'s "Cross-protocol
-/// semantic gaps" entry -- exercised here as a bake-off comparison rather than re-derived, since
-/// `crates/logit-proto/src/otlp/metrics.rs` already has its own unit tests for the OTLP side
+/// The encode-side gap `docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry tabulates,
+/// exercised here as a bake-off comparison; `crates/logit-proto/src/otlp/metrics.rs` has its own
+/// unit tests for the OTLP side
 /// (`a_gauge_delta_is_skipped_and_reports_its_own_diagnostic_key`,
 /// `a_set_metric_is_skipped_and_counted_rather_than_encoded_wrongly`).
 #[test]
@@ -516,7 +510,7 @@ fn native_postcard_and_rkyv_preserve_gauge_delta_and_set_identity_that_otlp_drop
         }
 
         // The OTLP control arm: encode_signals produces no Metrics payload at all for a batch
-        // whose only metric is a kind it can't express -- the record simply disappears.
+        // whose only metric is a kind it can't express, so the record disappears.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads = encoder.encode_signals(&batch).expect("otlp encode");
         assert!(
@@ -540,10 +534,9 @@ fn an_empty_batch_round_trips_through_every_arm() {
     );
 }
 
-/// Not a fidelity assertion -- a sanity check that `native`'s own on-disk story (a plain frame
-/// concatenation, `docs/design/wire-protocol.md`) actually holds for a batch this test file
-/// exercises the same way the others do, so the bake-off's evidence base covers the file case too,
-/// not just the in-memory one.
+/// Not a fidelity assertion: a check that `native`'s on-disk form (a plain frame concatenation,
+/// `docs/design/wire-protocol.md`) holds for this file's fixtures, so the bake-off's evidence
+/// covers the file case as well as the in-memory one.
 #[test]
 fn native_frames_from_several_batches_concatenate_into_one_decodable_buffer() {
     let mut file = Vec::new();

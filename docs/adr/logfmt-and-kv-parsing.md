@@ -73,13 +73,13 @@ is empty after trimming is skipped and counted. If no segment anywhere contains 
 line fails exactly like `logfmt`'s `NoPairs` case.
 
 **Both are rejected at graph-validation time when `kv`'s separators can only ever misbehave**
-(new rule 29, `crates/logit-pipeline/src/graph.rs`): an empty `pair_sep` or `kv_sep`, identical
+(new rule 30, `crates/logit-pipeline/src/graph.rs`): an empty `pair_sep` or `kv_sep`, identical
 `pair_sep`/`kv_sep`, or a `kv_sep` that contains `pair_sep`. Each is a certain no-op (an empty
 separator splits between every byte; identical separators mean every segment is split away from
 its own separator, so no line could ever produce a pair) or a certain garbage result (a `kv_sep`
 containing `pair_sep` can never appear intact inside a segment, since the `pair_sep` split always
 runs first) -- exactly the "can only ever be a no-op" family `kv_metrics`/`scale`/`set` already
-established (rules 10-12, 19, 20).
+established (rules 10-12, 20).
 
 **Values are always `Value::Str` -- never numeric coercion, ever**, unlike `json`'s type-by-JSON-
 syntax rule. `crate::numeric` (already shared by `scale`/`kv_metrics`) accepts a `Value::Str` that

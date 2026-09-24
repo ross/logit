@@ -6,61 +6,51 @@
 #        script/vm build <ref|dir|tarball>... [--allow-identical]
 #        script/vm push <local-path>... [--to <remote-dir>]
 #        script/vm pull [<remote-path>...] [--to <local-dir>]
-# Creates, uses, and destroys a disposable Azure VM for perf measurement
-# (docs/adr/disposable-azure-perf-vm.md). The laptop can't give a trustworthy number: its
-# heterogeneous cores make an unpinned `script/perf run` come out bimodal depending on which core
-# type the worker threads land on, and thermal throttling plus whatever else the machine is doing
-# move the answer again. This provisions eight homogeneous full physical AMD EPYC cores
-# (Standard_F8as_v6, SMT disabled), measures on them, and deletes the whole thing.
 #
-# `down` DELETES THE RESOURCE GROUP. There is deliberately no stop/deallocate/start path and no
-# snapshot path: zero cost when the machine isn't in use is the requirement, and a stopped VM
-# still bills for its disk while a snapshot bills forever. The price is a cold ~15-20 minute
-# provision-and-build at the start of every session, paid knowingly.
-#
-# The one script/* command that runs on the HOST and needs the Azure CLI rather than the dev
-# container. It sources common.sh for ROOT (so script/vm-cloud-init.yaml resolves regardless of
-# cwd) and for `set -e`, but never uses run/build_image/COMPOSE/DOCKER -- those drive the local
-# Docker daemon and there is nothing local to drive here.
-#
-# SSH is left open to the internet on purpose -- see allow_cidr() below and the ADR's
-# "Networking" section. What actually protects the box is key-only auth, a single authorized
-# key, and a lifetime measured in hours.
-#
-# Who runs what: the OPERATOR runs `up` and `down` -- the billable begin/end of a session belongs
-# under a human's own prompt, and (separately) an auto-mode permission classifier denies an
-# agent's `script/vm up`/`down` outright ("Modify Shared Resources"). An agent does everything in
-# between: `build`, `push`, `pull`, `shell`, `status`. See the ADR's "Who runs what" section.
+# Creates, uses, and destroys a disposable Azure VM for perf measurement. Runs on the host and
+# needs the Azure CLI; with no subcommand, runs `status`. The operator runs `up` and `down`, and an
+# agent runs everything else. `down` deletes the resource group, the only way back to $0: there is
+# no stop, deallocate, or snapshot path. Each LOGIT_VM_* variable overrides a default.
+# See docs/adr/disposable-azure-perf-vm.md.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+# Only ROOT and `set -e` come from common.sh; nothing here drives a local Docker daemon.
 source "${SCRIPT_PATH}/common.sh"
 
 usage() {
-    sed -n '2,9p' "${SCRIPT_PATH}/vm" | sed 's/^# //; s/^#//'
+    cat <<'EOF'
+Usage: script/vm up
+       script/vm shell [remote command...]
+       script/vm status
+       script/vm down [-y|--yes]
+       script/vm build <ref|dir|tarball>... [--allow-identical]
+       script/vm push <local-path>... [--to <remote-dir>]
+       script/vm pull [<remote-path>...] [--to <local-dir>]
+
+Creates, uses, and destroys a disposable Azure VM for perf measurement. Runs on the host and
+needs the Azure CLI; with no subcommand, runs `status`. The operator runs `up` and `down`, and an
+agent runs everything else. `down` deletes the resource group, the only way back to $0: there is
+no stop, deallocate, or snapshot path. Each LOGIT_VM_* variable overrides a default.
+See docs/adr/disposable-azure-perf-vm.md.
+EOF
 }
 
-# --- configuration: everything account-specific is an env var with a default ---------------
+# --- configuration ---------------------------------------------------------------------------
 
-# Empty by default = whatever `az account show` says. This script never runs `az account set`,
-# so it can't disturb the default subscription someone else's work depends on -- every az call
-# below carries --subscription only when this is set, and every subcommand prints the resolved
-# subscription first so it's never a surprise.
+# Empty uses `az account show`'s subscription. This script never runs `az account set`; an az call
+# carries --subscription only when this is set.
 LOGIT_VM_SUBSCRIPTION="${LOGIT_VM_SUBSCRIPTION:-}"
 
 LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-westus2}"
 LOGIT_VM_ZONE="${LOGIT_VM_ZONE:-1}"
-# 8 vCPU = 8 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
-# The reference size: enough room that a fan-out/router/parallel-parser scenario or a driven UDP
-# scenario's sender+child+telemetry leg don't contend with each other for a core the way they did
-# on the 4-vCPU size this replaced (see the ADR's "The size, and why N vCPUs is N cores" section).
+# SMT is off for this series (vCPUsPerCore: 1), so 8 vCPU is 8 physical cores. See the ADR's
+# "The size, and why N vCPUs is N cores" section.
 LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F8as_v6}"
-# check_quota() derives the vCPU count it checks for from this, in case LOGIT_VM_SIZE is ever
-# pointed outside the Fasv6 family -- overrides LOGIT_VM_SIZE's own name-derived count.
+# check_quota() infers the vCPU count from a Standard_F<N>as_v6 name; set this for any other size.
 LOGIT_VM_VCPUS="${LOGIT_VM_VCPUS:-}"
-# gen2 only for this series; verified present in westus2 (and eastus, centralus). Pin an
-# explicit version instead of `latest` to compare across sessions -- logit-vm-metadata.txt
-# records whichever version `latest` actually resolved to.
+# This series needs a gen2 image. To compare across sessions, pin the version that
+# ~/logit-vm-metadata.txt says `latest` resolved to.
 LOGIT_VM_IMAGE="${LOGIT_VM_IMAGE:-Debian:debian-13:13-gen2:latest}"
 # The image default (30 GiB) doesn't fit rust:1.98.1-bookworm + logit-dev:local + a warm
 # CARGO_HOME + a release target/.
@@ -69,43 +59,32 @@ LOGIT_VM_STORAGE_SKU="${LOGIT_VM_STORAGE_SKU:-Premium_LRS}"
 
 LOGIT_VM_RESOURCE_GROUP="${LOGIT_VM_RESOURCE_GROUP:-logit-perf}"
 LOGIT_VM_NAME="${LOGIT_VM_NAME:-logit-perf-vm}"
-# Not "azureuser"/"admin": Azure rejects a list of reserved usernames, and a name that can't
-# collide with anything an image might already have baked in keeps the uid-1000 assertion in
-# vm-cloud-init.yaml honest.
+# Not "azureuser" or "admin": Azure rejects a list of reserved usernames, and a name no image
+# ships keeps the uid-1000 assertion in vm-cloud-init.yaml meaningful.
 LOGIT_VM_ADMIN_USER="${LOGIT_VM_ADMIN_USER:-logit}"
 
-# Distinct from az vm create's own 10.0.0.0/24 default so it can't collide with a 192.168/16 home
-# LAN or Docker's 172.17/172.18 bridges.
+# Clear of a 192.168/16 home LAN and Docker's 172.17/172.18 bridges.
 LOGIT_VM_VNET_PREFIX="${LOGIT_VM_VNET_PREFIX:-10.42.0.0/16}"
 LOGIT_VM_SUBNET_PREFIX="${LOGIT_VM_SUBNET_PREFIX:-10.42.0.0/24}"
 
 LOGIT_VM_REPO_URL="${LOGIT_VM_REPO_URL:-https://github.com/ross/logit.git}"
-# A branch, a tag, or a SHA -- vm-cloud-init.yaml clones plainly and resolves/checks this out
-# afterward (see its own comment for why a plain `git checkout <name>` can't always do it).
+# A branch, a tag, or a SHA. vm-cloud-init.yaml resolves it to a commit before checking it out.
 LOGIT_VM_REPO_REF="${LOGIT_VM_REPO_REF:-main}"
-# Comma-separated extra refs/SHAs to build, alongside `up`'s own cache-warming build of
-# LOGIT_VM_REPO_REF -- so a multi-ref session's builds happen inside the operator's provisioning
-# wait rather than after the first `shell`. Empty by default: most sessions measure one ref at a
-# time, added later with `script/vm build`. Each is built exactly the way `script/vm build` builds
-# it (`script/vm-build-refs`) -- this is a convenience over calling that afterward, not a
-# different mechanism.
+# Comma-separated extra refs that `up` builds after its warm-up, inside the operator's
+# provisioning wait. Same result as running `script/vm build` on them afterward.
 LOGIT_VM_REPO_REFS="${LOGIT_VM_REPO_REFS:-}"
-# Passed through to `script/vm build`'s remote side (`script/vm-build-refs`): give every git-ref
-# source its own `CARGO_TARGET_DIR` instead of sharing the clone's, at the cost of a full rebuild
-# per ref. Off by default because sequential `git checkout`s in one clone already keep cargo's own
-# mtime fingerprinting honest (see vm-build-refs's header comment) -- this is belt-and-braces
-# isolation for anyone who wants it anyway.
+# Non-empty gives each git-ref build its own CARGO_TARGET_DIR, at the cost of a full rebuild per
+# ref. Off by default: sequential checkouts in one clone keep cargo's mtime fingerprinting correct
+# (see script/vm-build-refs).
 LOGIT_VM_TARGET_PER_REF="${LOGIT_VM_TARGET_PER_REF:-}"
 
-# Dedicated, never shared, never added to an agent, never in ~/.ssh/authorized_keys, and NEVER
-# deleted by `down` -- so the fingerprint is stable across sessions even though the VM isn't.
+# Dedicated to this VM, never added to an agent, and never deleted by `down`, so its fingerprint
+# stays stable across sessions.
 LOGIT_VM_SSH_KEY="${LOGIT_VM_SSH_KEY:-${HOME}/.ssh/logit-perf-vm}"
 LOGIT_VM_KNOWN_HOSTS="${LOGIT_VM_KNOWN_HOSTS:-${HOME}/.ssh/logit-perf-vm.known_hosts}"
 
-# VM + 128GiB Premium SSD + a Standard static public IP, westus2 PAYG Linux -- for status's
-# running-cost line. A rough nag, not a bill. Azure retail-price API, 2026-09-20: F8as_v6 compute
-# alone is $0.546/hr (exactly 2x F4as_v6's $0.273/hr); +$0.032/hr for the disk/IP overhead the
-# F4as_v6 estimate this replaced (0.305) already carried, since neither scales with vCPU count.
+# VM plus OS disk plus static IP, for `status`'s running-cost line. An estimate, not a bill:
+# update it when LOGIT_VM_SIZE, LOGIT_VM_LOCATION, or the disk changes.
 LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.58}"
 
 VNET="${LOGIT_VM_RESOURCE_GROUP}-vnet"
@@ -117,16 +96,11 @@ PIP="${LOGIT_VM_RESOURCE_GROUP}-ip"
 AZ=(az)
 [ -n "${LOGIT_VM_SUBSCRIPTION}" ] && AZ+=(--subscription "${LOGIT_VM_SUBSCRIPTION}")
 
-# -F /dev/null: this host's own ~/.ssh/config carries a global `Host *` block (an IdentityAgent
-# pointing at a key agent socket) and a top-level ControlMaster/ControlPath. A disposable VM with
-# a brand-new host key and a brand-new public IP every session is exactly the case where an
-# external key agent and a cached mux socket turn a clear failure into a confusing one, so every
-# option this needs is stated here instead of inherited.
+# -F /dev/null: the host's ~/.ssh/config sets a global IdentityAgent and ControlMaster, which turn
+# a new host key or IP into a confusing failure, so every option is stated here, not inherited.
 #
-# StrictHostKeyChecking=accept-new, not "no": first contact records the key in a known_hosts file
-# used by nothing else, and a key that *changes* mid-session is still a hard error. `down` removes
-# that file wholesale, so every session starts from a clean first contact and ~/.ssh/known_hosts
-# is never touched.
+# accept-new, not "no": first contact records the key in a known_hosts file nothing else uses, and
+# a key that changes mid-session is still a hard error. ~/.ssh/known_hosts is never touched.
 SSH_OPTS=(
     -F /dev/null
     -i "${LOGIT_VM_SSH_KEY}"
@@ -157,10 +131,10 @@ preflight() {
     echo "subscription:  ${account}"
 }
 
-# Regional and per-family vCPU headroom for however many LOGIT_VM_SIZE wants.
+# Regional and per-family vCPU headroom for LOGIT_VM_SIZE.
 #
-# `az vm list-usage` returns currentValue and limit as JSON *strings*, so a JMESPath numeric
-# filter on them crashes the CLI outright -- pulled out as text and compared in the shell instead.
+# `az vm list-usage` returns currentValue and limit as JSON strings, and a JMESPath numeric filter
+# on them crashes the CLI, so they're compared in the shell.
 check_quota() {
     local vcpus="${LOGIT_VM_VCPUS}"
     if [ -z "${vcpus}" ]; then
@@ -171,11 +145,8 @@ check_quota() {
             exit 2
         fi
     fi
-    # `[0].[currentValue, limit]` returns a bare 2-element array, and `-o tsv` prints a bare
-    # array one element per line, not tab-joined -- so a single `read var1 var2 <<<...` only ever
-    # captured the first element, leaving the second empty and the arithmetic below silently
-    # comparing against 0. Shaping the query as a one-row object instead
-    # (`{u:...currentValue, l:...limit}`) is what actually gets both values onto one TSV line.
+    # A one-row object, not `[0].[currentValue, limit]`: `-o tsv` prints a 2-element array one
+    # element per line, so `read a b` would leave `b` empty and the check would compare against 0.
     local family_used family_limit core_used core_limit
     read -r family_used family_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
         --query "{u:[?name.value=='StandardFasv6Family']|[0].currentValue, l:[?name.value=='StandardFasv6Family']|[0].limit}" -o tsv)"
@@ -191,10 +162,8 @@ check_quota() {
 ensure_key() {
     mkdir -p -m 700 "${HOME}/.ssh"
     if [ -f "${LOGIT_VM_SSH_KEY}" ]; then return; fi
-    # No passphrase: this key grants access to a machine that holds nothing but a clone of a
-    # public repo and exists for hours. A passphrase would mean either an agent (awkward given
-    # the host's own IdentityAgent config above) or a prompt on each of the several ssh calls
-    # `up` makes.
+    # No passphrase: the VM holds only a public-repo clone and lives for hours, and a passphrase
+    # would mean an agent or a prompt on each of `up`'s ssh calls.
     echo "creating ${LOGIT_VM_SSH_KEY} (ed25519, no passphrase)"
     ssh-keygen -q -t ed25519 -N '' -C "logit-perf-vm" -f "${LOGIT_VM_SSH_KEY}"
 }
@@ -219,13 +188,9 @@ public_ip_or_die() {
 # --- subcommands ------------------------------------------------------------------------------
 
 vm_up() {
-    # Templated, and the checkout it came from printed, before any `az` call or other
-    # precondition check -- so a moved/edited source tree fails in under a second, not after
-    # network scaffolding is already billing. The first `up` this tooling saw run failed exactly
-    # this way: the operator switched branches in the same worktree while `up` ran in the
-    # background, and vm-cloud-init.yaml vanished out from under the `sed` templating step below
-    # after the vnet/NSG/IP had already been created -- a wasted provisioning cycle and a
-    # permission round-trip to clean up, for something this ordering makes impossible.
+    # Template cloud-init before any `az` call. Switching branches in this checkout while `up`
+    # runs can remove vm-cloud-init.yaml, and this order makes that fail in under a second
+    # instead of after the vnet, NSG, and IP exist.
     echo "checkout:      ${ROOT} ($(cd "${ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo "not a git checkout"))"
     local cloud_init
     cloud_init="$(mktemp -t logit-vm-cloud-init.XXXXXXXX.yaml)"
@@ -262,13 +227,11 @@ vm_up() {
         --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${NSG}" \
         --location "${LOGIT_VM_LOCATION}" --output none
 
-    # One inbound Allow is all that's needed: the NSG's own default rules already deny
-    # everything else inbound from Internet (DenyAllInBound) and already allow all outbound
-    # (AllowInternetOutBound), which apt, download.docker.com, crates.io and Docker Hub all need.
+    # One inbound Allow is enough: the NSG's default rules deny all other inbound traffic and
+    # allow all outbound, which apt, download.docker.com, crates.io, and Docker Hub need.
     #
-    # Open to the internet, deliberately -- see the header comment and the ADR. What actually
-    # protects the box is key-only auth (asserted in vm-cloud-init.yaml as ssh_pwauth: false),
-    # exactly one authorized key, and a lifetime measured in hours.
+    # Port 22 is open to the internet; key-only auth protects it. See the ADR's "SSH is open to
+    # the internet, deliberately" section.
     if "${AZ[@]}" network nsg rule show --resource-group "${LOGIT_VM_RESOURCE_GROUP}" \
             --nsg-name "${NSG}" --name "${NSG_RULE}" --output none 2>/dev/null; then
         : # already present from a previous `up`; nothing to reconcile
@@ -282,8 +245,8 @@ vm_up() {
             --output none
     fi
 
-    # No --zone: a Standard SKU IP created without one is zone-redundant, which attaches to a VM
-    # in any zone. A *zonal* IP in a different zone than the VM would be a create failure.
+    # No --zone: a Standard IP created without one is zone-redundant and attaches to a VM in any
+    # zone. A zonal IP in a different zone than the VM fails the create.
     "${AZ[@]}" network public-ip create \
         --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${PIP}" \
         --location "${LOGIT_VM_LOCATION}" \
@@ -296,8 +259,7 @@ vm_up() {
             --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${LOGIT_VM_NAME}" \
             --query "instanceView.statuses[?starts_with(code,'PowerState/')].code|[0]" -o tsv)"
         if [ "${power}" != "PowerState/running" ]; then
-            # No start/deallocate path here (see the header and the ADR): a stopped VM is an
-            # accident from somewhere else, and `down` then `up` is a defined, cheap recovery.
+            # No start path: `down` then `up` recovers a VM something else stopped.
             echo "${LOGIT_VM_NAME} exists but is ${power}. Run 'script/vm down' then 'script/vm up'." >&2
             exit 1
         fi
@@ -332,8 +294,8 @@ vm_up() {
     local ip
     ip="$(public_ip_or_die)"
 
-    # Only on the just-created path -- a re-run of `up` against a live VM must NOT wipe
-    # known_hosts, since that's precisely the record that would catch a changed host key.
+    # Only for a new VM: re-running `up` against a live one must keep known_hosts, the record
+    # that catches a changed host key.
     if [ "${created_vm}" -eq 1 ]; then
         rm -f "${LOGIT_VM_KNOWN_HOSTS}"
     fi
@@ -354,9 +316,9 @@ vm_up() {
         exit 1
     fi
 
-    # cloud-init exits 0 for done, 2 for "degraded" (a recoverable module error), 1 for a real
-    # failure. Degraded is surfaced as a warning rather than a stop: the machine is usable and
-    # whichever module complained is in the log.
+    # cloud-init exits 0 for done, 2 for "degraded" (a recoverable module error), and 1 for a
+    # failure. Degraded is a warning, not a stop: the machine is usable and the log names the
+    # module.
     echo "waiting for cloud-init (package install, docker, sysctls, clone)..."
     local rc=0
     ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@${ip}" 'sudo cloud-init status --wait --long' || rc=$?
@@ -370,28 +332,18 @@ vm_up() {
         echo "warning: cloud-init reports 'degraded' -- see /var/log/cloud-init-output.log on the VM" >&2
     fi
 
-    # The cache warm runs here, over ssh, rather than inside cloud-init: this is the step that
-    # takes most of the wall clock (the base image pull, Dockerfile.dev's cargo installs, then a
-    # release build of the workspace), and its output belongs in front of whoever is waiting for
-    # it, not buried in a log that's only read after something breaks. Same division script/setup
-    # already makes locally: the image build is a script you watch.
-    #
-    # DOCKER=docker is passed explicitly (as well as being set in the VM's /etc/environment) so
-    # this doesn't depend on the pam_env mechanism that makes an interactive `script/vm shell`
-    # pick it up automatically.
+    # The cache warm runs over ssh, not in cloud-init, so its long output streams to whoever is
+    # waiting. DOCKER=docker is passed explicitly so it doesn't depend on pam_env reading the
+    # VM's /etc/environment.
     echo "warming caches: script/bootstrap..."
     ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" \
         'cd ~/logit && DOCKER=docker script/bootstrap'
-    # One real scenario, not just a build: this is what actually produces the release logit-cli
-    # binary the harness spawns, and it proves the whole path -- dev image, cargo, release
-    # build, spawn, wait4, results file -- before anyone starts trusting a number from this box.
-    # perf/results/ is gitignored, so the artifact costs nothing to leave behind.
+    # A real scenario, not only a build: it builds the release binary the harness spawns and
+    # proves the whole path, from dev image to results file, before anyone trusts a number.
     echo "warming caches: script/perf run --scenario passthrough..."
     ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" \
         'cd ~/logit && DOCKER=docker script/perf run --scenario passthrough --repeat 1 --label vm-warmup'
 
-    # Built here, inside the operator's own provisioning wait, rather than left for the first
-    # `script/vm build` after handing the session off -- the whole point of naming refs up front.
     if [ -n "${LOGIT_VM_REPO_REFS}" ]; then
         echo "building extra refs: ${LOGIT_VM_REPO_REFS}"
         local -a extra_refs=()
@@ -441,9 +393,8 @@ vm_down() {
         return
     fi
 
-    # This subscription has other, unrelated resource groups -- refuse to delete anything this
-    # script didn't tag as its own, so a mistyped LOGIT_VM_RESOURCE_GROUP can't take one of them
-    # out.
+    # Refuse to delete a group this script didn't tag, so a mistyped LOGIT_VM_RESOURCE_GROUP
+    # can't delete an unrelated group in the subscription.
     local purpose
     purpose="$("${AZ[@]}" group show --name "${LOGIT_VM_RESOURCE_GROUP}" \
         --query "tags.purpose" -o tsv 2>/dev/null || true)"
@@ -454,9 +405,8 @@ vm_down() {
     fi
 
     if [ "${assume_yes}" -eq 0 ]; then
-        # The tty test comes first and is its own error: under `set -e`, a `read` on a closed
-        # stdin returns non-zero and kills the script with no message at all, which is the safe
-        # direction but a baffling one to debug.
+        # Test for a tty first: under `set -e`, a `read` on a closed stdin exits the script with
+        # no message.
         if [ ! -t 0 ]; then
             echo "script/vm down: no tty to confirm on. Pass --yes to delete without asking." >&2
             exit 1
@@ -473,33 +423,23 @@ vm_down() {
         esac
     fi
 
-    # Blocking, deliberately: no --no-wait. `down` exiting 0 has to mean the resources are
-    # actually gone and billing has actually stopped -- a fire-and-forget delete that silently
-    # failed (a resource lock, a policy) would leave a running VM behind a command that reported
-    # success.
+    # No --no-wait: exit 0 must mean the resources are gone and billing has stopped. A delete that
+    # fails on a lock or a policy must fail this command.
     echo "deleting ${LOGIT_VM_RESOURCE_GROUP} (a few minutes)..."
     "${AZ[@]}" group delete --name "${LOGIT_VM_RESOURCE_GROUP}" --yes --output none
 
-    # Every entry in this file named a VM that no longer exists, and only ever this one -- so
-    # removing it whole is simpler and more correct than ssh-keygen -R. ~/.ssh/known_hosts is
-    # never touched either way. The keypair is kept: it isn't a secret worth rotating per
-    # session, and regenerating it each time would churn nothing but noise.
+    # Every entry named a VM that no longer exists, so remove the whole file rather than
+    # `ssh-keygen -R`. The keypair is kept.
     rm -f "${LOGIT_VM_KNOWN_HOSTS}"
     echo "gone. ${LOGIT_VM_SSH_KEY} kept for next time; cost is now zero."
 }
 
-# Runs `script/vm-build-refs` against an already-up VM at `ip`, fed on stdin so it can never be
-# stale against the checkout that invoked it (the same relationship this script has to
-# vm-cloud-init.yaml). Shared by `vm_build` and `vm_up`'s own optional LOGIT_VM_REPO_REFS build,
-# so the two ways of triggering a build stay identical rather than drifting apart.
+# Runs script/vm-build-refs on the VM at `ip`, fed on stdin so it can't go stale against this
+# checkout. Shared by `build` and `up`'s LOGIT_VM_REPO_REFS so the two stay identical.
 #
-# `LOGIT_VM_TARGET_PER_REF` is passed as a leading `VAR=value` on the remote command line, not
-# through ssh's `SendEnv`/`AcceptEnv` (usually disabled server-side, and not asserted here) --
-# every other env var this tooling needs on the far side (`DOCKER=docker`) already reaches it the
-# same way. Each source is quoted with `%q` before being appended to that command line, since
-# unlike `vm_shell`'s pass-through (which documents that the *caller* must quote its own remote
-# command), a source name here is an ordinary positional argument no caller should have to
-# shell-escape by hand.
+# LOGIT_VM_TARGET_PER_REF goes as a leading VAR=value on the remote command line, not through
+# SendEnv, which servers usually disable. Each source is `%q`-quoted: unlike `shell`'s
+# pass-through, a caller never shell-escapes a source name.
 vm_build_remote() {
     local ip="$1"
     shift
@@ -531,12 +471,8 @@ vm_build() {
     vm_build_remote "${ip}" "${sources[@]}" "${flags[@]}"
 }
 
-# scp, not a hand-rolled transfer: `SSH_OPTS` is nothing but ordinary OpenSSH client options
-# (`-F`/`-i`/`-o`), which scp accepts identically to ssh, so the same dedicated key and
-# known_hosts file protect this the same way every other subcommand is protected. `-r -p`
-# throughout -- a single file, a directory, or a tarball all just work, and timestamps survive the
-# copy (relevant for a tarball `script/vm build` will later `tar -xm` anyway, but harmless either
-# way).
+# scp accepts SSH_OPTS as ssh does, so push and pull use the same key and known_hosts file.
+# `-r -p` copies a file, a directory, or a tarball and keeps timestamps.
 vm_push() {
     preflight
     local ip
@@ -554,8 +490,8 @@ vm_push() {
         usage >&2
         exit 2
     fi
-    # A bare "user@host:" (no path) is scp's own way of naming the home directory -- the default,
-    # matching `script/vm build`'s own directory/tarball sources, which are read relative to it.
+    # A bare "user@host:" names the home directory, which `script/vm build` resolves relative
+    # directory and tarball sources against.
     local dest="${LOGIT_VM_ADMIN_USER}@${ip}:"
     [ -n "${remote_dir}" ] && dest="${dest}${remote_dir}/"
     echo "pushing to ${dest}"
@@ -574,9 +510,8 @@ vm_pull() {
             *) remote_paths+=("$1"); shift ;;
         esac
     done
-    # The common case needs no arguments at all: bring perf/results/ back, following the repo's
-    # own "perf artifacts never enter the repo" convention (docs/plans/udp-intake.md) by landing
-    # it under tmp/, timestamped so a second pull in the same session doesn't overwrite the first.
+    # With no arguments, pull perf/results/ into a timestamped tmp/perf/vm/ directory: perf
+    # artifacts stay out of the repo, and a second pull doesn't overwrite the first.
     if [ "${#remote_paths[@]}" -eq 0 ]; then
         remote_paths=("logit/perf/results")
     fi
@@ -598,8 +533,8 @@ vm_shell() {
     if [ "$#" -eq 0 ]; then
         exec ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" 'cd ~/logit && exec bash -l'
     fi
-    # Pass-through escape hatch: quote the whole remote command yourself, since ssh joins these
-    # with spaces and the remote shell re-parses them, e.g.
+    # Quote the whole remote command yourself: ssh joins these with spaces and the remote shell
+    # re-parses them, for example
     #   script/vm shell 'DOCKER=docker script/perf run --scenario json-parse --repeat 5'
     exec ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" "cd ~/logit && $*"
 }

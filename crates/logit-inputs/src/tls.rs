@@ -1,19 +1,15 @@
-//! Shared server-side TLS construction for every listener that terminates TLS -- `otlp_in`
-//! (`crates/logit-inputs/src/otlp.rs`) and `logit_in` (`crates/logit-inputs/src/logit.rs`) both
-//! build a `rustls::ServerConfig` from the same operator-facing settings via
-//! [`build_server_config`]. Extracted from `otlp.rs` (`docs/plans/native-transport.md` workstream
-//! B) -- a pure refactor, no behaviour change for `otlp_in`.
+//! Shared TLS construction for this crate's listeners and its one HTTP client.
 //!
-//! [`TlsClientSettings`]/[`apply_client_tls`] are the opposite direction: `prometheus_in`
-//! (`crates/logit-inputs/src/prometheus.rs`) is a client, not a listener, so it needs client-side
-//! TLS tuning instead of a `ServerConfig` to terminate on. Deliberately built on `reqwest`'s own
-//! `Certificate`/`Identity`/`danger_accept_invalid_certs` rather than hand-rolling a
-//! `rustls::ClientConfig` the way `crates/logit-outputs/src/tls.rs`'s `build_client_config` does
-//! for `otlp_out`/`logit_out`: those two sinks already build and swap a whole
-//! `hyper_util`/`hyper-rustls` gRPC connector, where a raw `rustls::ClientConfig` is the natural
-//! seam, but `prometheus_in`'s only client is a plain `reqwest::Client` -- `reqwest`'s own PEM
-//! loaders are the smaller, equally-correct way to get there, and keep every line of `rustls` type
-//! plumbing out of this crate's HTTP-client path entirely.
+//! [`build_server_config`] builds the `rustls::ServerConfig` every TLS-terminating listener uses:
+//! `otlp_in`, `logit_in`, `prometheus_in`'s remote-write receiver, and the stream listeners in
+//! `crate::tcp`.
+//!
+//! [`TlsClientSettings`]/[`apply_client_tls`] are the client direction, for `prometheus_in`'s
+//! scrape client. They use `reqwest`'s own `Certificate`/`Identity` loaders rather than a
+//! hand-built `rustls::ClientConfig` like `logit_outputs::tls::build_client_config`: those sinks
+//! swap a whole `hyper-rustls` connector, where a `ClientConfig` is the natural seam, but a plain
+//! `reqwest::Client` is smaller to configure through `reqwest` and keeps `rustls` types out of
+//! this crate's HTTP-client path.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,30 +18,26 @@ use anyhow::Context;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-/// Server-side TLS for a listener's `tls:` config block. Mirrors `logit_config::TlsServerConfig`
-/// -- this crate doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout); `logit-cli::pipeline::build_spec` converts one into the other at construction time.
-/// Its mere presence on a listener turns TLS on -- there is no separate on/off flag.
+/// Server-side TLS for a listener's `tls:` config block, mirroring
+/// `logit_config::TlsServerConfig` (this crate doesn't depend on `logit-config`;
+/// `logit-cli::pipeline::build_spec` converts). Its presence turns TLS on; there's no separate
+/// flag.
 #[derive(Debug, Clone)]
 pub struct TlsServerSettings {
     /// Certificate chain (PEM) this listener presents to every client.
     pub cert_file: String,
     /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.
     pub key_file: String,
-    /// PEM bundle of CAs. When set, every connecting client must present a certificate chaining
-    /// to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake
-    /// itself completes.
+    /// PEM bundle of CAs. When set, every client must present a certificate chaining to one of
+    /// them (mutual TLS); when absent, any client that completes the handshake is accepted.
     pub client_ca_file: Option<String>,
 }
 
-/// Builds a `rustls::ServerConfig` from `settings`, advertising `alpn` as this listener's ALPN
-/// protocol list -- `otlp_in` passes `[b"h2", b"http/1.1"]` under `protocol: http` (so a TLS
-/// client's own negotiation picks the same protocol `hyper_util::server::conn::auto` would
-/// otherwise have to sniff from plaintext bytes) or `[b"h2"]` under `protocol: grpc`; `logit_in`
-/// passes `&[]` -- it isn't an HTTP-shaped protocol and has nothing for a client to negotiate down
-/// to (the same "no ALPN" shape `logit_outputs::tls::build_client_config`'s client side already
-/// uses). Every path in `settings` is resolved against `base_dir`, same as that client-side
-/// counterpart.
+/// Builds a `rustls::ServerConfig` from `settings`, with every path resolved against `base_dir`.
+///
+/// `alpn` is the advertised protocol list. An HTTP listener passes `[b"h2", b"http/1.1"]` (so the
+/// client's negotiation picks what `hyper_util::server::conn::auto` would otherwise sniff from
+/// plaintext) or `[b"h2"]` for gRPC; a non-HTTP protocol passes `&[]`.
 pub(crate) fn build_server_config(
     settings: &TlsServerSettings,
     base_dir: &Path,
@@ -89,12 +81,9 @@ pub(crate) fn build_server_config(
     Ok(cfg)
 }
 
-/// Client-side TLS tuning for `prometheus_in`'s `tls:` config block. Mirrors
-/// `logit_outputs::tls::TlsClientSettings` field-for-field (this crate doesn't depend on
-/// `logit-config`, `docs/design/pipeline-graph.md`'s crate layout; `logit-cli::pipeline::
-/// build_spec` converts one into the other at construction time) but is built into a
-/// `reqwest::ClientBuilder` directly rather than a `rustls::ClientConfig` -- see this module's own
-/// doc comment for why.
+/// Client-side TLS for `prometheus_in`'s scrape client. Mirrors
+/// `logit_outputs::tls::TlsClientSettings` field for field (`logit-cli::pipeline::build_spec`
+/// converts from config), but is applied to a `reqwest::ClientBuilder`; the module doc says why.
 #[derive(Debug, Clone, Default)]
 pub struct TlsClientSettings {
     /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set.
@@ -103,14 +92,13 @@ pub struct TlsClientSettings {
     pub cert_file: Option<String>,
     /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
     pub key_file: Option<String>,
-    /// Disables server-certificate verification entirely -- the connection is still encrypted,
-    /// but accepts any certificate the peer presents, self-signed or otherwise.
+    /// Disables server-certificate verification: still encrypted, but any certificate is
+    /// accepted.
     pub insecure_skip_verify: bool,
 }
 
 impl TlsClientSettings {
-    /// `true` if every field is at its default -- a "was a `tls:` block actually set" check,
-    /// mirroring `logit_outputs::tls::TlsClientSettings::is_empty`.
+    /// `true` if every field is at its default, meaning no `tls:` block was set.
     pub fn is_empty(&self) -> bool {
         self.ca_file.is_none()
             && self.cert_file.is_none()
@@ -119,10 +107,8 @@ impl TlsClientSettings {
     }
 }
 
-/// Applies `settings` to `builder`, resolving every path against `base_dir` (same rule as
-/// [`build_server_config`]'s). A no-op (`builder` returned unchanged) when `settings.is_empty()`
-/// -- `reqwest` already trusts the bundled Mozilla root set for an `https://` target without this
-/// ever being called.
+/// Applies `settings` to `builder`, resolving every path against `base_dir`. Returns `builder`
+/// unchanged when `settings.is_empty()`: `reqwest` trusts the bundled Mozilla roots by default.
 pub(crate) fn apply_client_tls(
     mut builder: reqwest::ClientBuilder,
     settings: &TlsClientSettings,
@@ -140,22 +126,17 @@ pub(crate) fn apply_client_tls(
             .with_context(|| format!("reading tls.ca_file {}", path.display()))?;
         let cert = reqwest::Certificate::from_pem(&pem)
             .with_context(|| format!("parsing tls.ca_file {}", path.display()))?;
-        // `add_root_certificate` alone is additive -- the bundled Mozilla root set stays trusted
-        // alongside `cert`, so a server whose leaf happens to chain to any public root would still
-        // verify even though the operator named a specific CA to trust "instead of" it (this
-        // struct's own doc comment, and `logit_config::TlsClientConfig::ca_file`'s). Disabling the
-        // built-in roots first is what actually makes `ca_file` a replacement, matching
-        // `logit_outputs::tls::build_client_config`'s `RootCertStore::empty()` starting point.
+        // `add_root_certificate` alone is additive: the Mozilla roots would stay trusted, and a
+        // server chaining to any public root would verify. Disabling the built-in roots makes
+        // `ca_file` a replacement, as `logit_outputs::tls::build_client_config`'s
+        // `RootCertStore::empty()` does.
         builder = builder.tls_built_in_root_certs(false).add_root_certificate(cert);
     }
     if let (Some(cert_file), Some(key_file)) = (&settings.cert_file, &settings.key_file) {
         let cert_path = base_dir.join(cert_file);
         let key_path = base_dir.join(key_file);
-        // `reqwest::Identity::from_pem` wants one PEM blob carrying both the certificate chain and
-        // its private key -- concatenated here rather than asking the operator to pre-combine the
-        // two files themselves, matching `cert_file`/`key_file` staying two separate config fields
-        // everywhere else in this project (`TlsServerSettings`, `logit_outputs::tls::
-        // TlsClientSettings`).
+        // `reqwest::Identity::from_pem` wants the chain and key in one PEM blob; concatenated
+        // here so `cert_file`/`key_file` stay two fields, as everywhere else.
         let mut pem = std::fs::read(&cert_path)
             .with_context(|| format!("reading tls.cert_file {}", cert_path.display()))?;
         let key_pem = std::fs::read(&key_path)

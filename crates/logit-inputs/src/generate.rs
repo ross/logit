@@ -1,7 +1,7 @@
-//! `generate_in`: a synthetic event source, the listener end of the perf harness
-//! (`docs/plans/load-test-harness.md`). No socket and no decoder -- it renders a declarative
-//! event template as fast as `count`/`rate` allow, so a scenario measures the runtime and the
-//! components under test rather than a load-generator process and a kernel socket buffer.
+//! `generate_in`: a synthetic event source, the listener end of the load-test harness
+//! (`docs/adr/load-test-harness.md`). No socket and no decoder: it renders a declarative event
+//! template as fast as `count`/`rate` allow, so a scenario measures the runtime and the
+//! components under test, not a load generator and a kernel socket buffer.
 //!
 //! ```yaml
 //! gen:
@@ -16,62 +16,49 @@
 //!     metric: { name: requests, kind: sum, value: 1 }   # sum | gauge | distribution
 //! ```
 //!
-//! `count` is **exact**: the last batch is short (`count % batch`) rather than rounded up to a
-//! whole batch, so a harness deriving events/s and CPU-per-event divides by the number actually
-//! produced. When `count` is reached [`Input::run`] returns `Ok(())`, its `Fanout` drops, and the
-//! existing listener-exit cascade flushes and shuts the process down cleanly
-//! (`crates/logit-pipeline/src/runtime.rs`).
+//! `count` is **exact**: the last batch is short (`count % batch`), not rounded up, so a harness
+//! deriving events/s and CPU per event divides by the number produced. Once `count` is reached,
+//! [`Input::run`] returns `Ok(())` and drops its `Fanout`, and the runtime's listener-exit cascade
+//! flushes downstream and ends the process. Without `count`, generation never ends on its own.
 //!
-//! # Two render paths
+//! # Placeholders and the two render paths
 //!
-//! Placeholders are for *cardinality*, never decoration -- each one costs a rendering and a copy
-//! per event, and which path this input takes is decided by whether there is a single one anywhere
-//! in the template:
+//! A template field may use `{seq}` (the run's 0-based event counter, continuing across batches)
+//! or `{seq%N}` (that counter modulo `N >= 1`, the cardinality knob); `{{`/`}}` escape a brace
+//! (`logit_core::template`). Placeholders cost a render and a copy per event, and whether any
+//! field has one picks the path:
 //!
-//! - **Prototype** (no placeholder in any field): one [`Event`] is rendered once, at first use,
-//!   and `clone`d per generated event with only its `timestamp` overwritten. Every field's bytes
-//!   are the *same* refcounted buffer on every event -- a refcount bump, not a copy.
-//! - **Per event** (at least one placeholder anywhere): each templated field is rendered into a
-//!   reused `String` scratch and copied out with one `Bytes::copy_from_slice` -- exactly one
-//!   allocation per templated field per event, and none for the literal fields alongside it,
-//!   which still clone the bytes rendered once at construction. A templated *metric name* is the
-//!   one exception: it is interned rather than copied, so it pays `interner::intern`'s cost per
-//!   event and permanently grows the interner by one entry per distinct rendering (`{seq%1000}` in
-//!   a metric name means a thousand interned names -- see `docs/design/memory.md` §4). That is why
-//!   a metric name may use `{seq%N}` but **not** a bare `{seq}`, which would intern a fresh,
-//!   never-freed name per event: rejected at construction here and by graph rule 42 in config.
+//! - **Prototype** (no placeholder anywhere): one [`Event`] is rendered on first use and cloned
+//!   per event with only `timestamp` overwritten. Every field's bytes are one shared refcounted
+//!   buffer: a refcount bump per event, not a copy.
+//! - **Per event** (any placeholder): each templated field is rendered into a reused `String` and
+//!   copied out with one `Bytes::copy_from_slice`, one allocation per templated field per event.
+//!   Literal fields still clone their construction-time bytes. A templated metric name is instead
+//!   interned: `interner::intern`'s cost per event, and one never-freed interner entry per
+//!   distinct rendering (`docs/design/memory.md` §4). So a metric name may use `{seq%N}` but not
+//!   a bare `{seq}`, rejected here and by graph rule 42.
 //!
-//! `now_nanos()` is read once per batch, not per event, the same way every decoder amortizes it
-//! across a datagram.
+//! `now_nanos()` is read once per batch, not per event: every event in a batch shares a
+//! timestamp.
 //!
-//! The **resource** is a third case, because it is batch-level rather than per event: an
-//! all-literal resource is built once at construction and `Arc`-shared by every batch forever,
-//! and a templated one is rebuilt once per batch. **In resource position `seq` is the batch
-//! ordinal** (0, 1, 2, ...), not the event counter -- rendering from the event counter would
-//! advance by `batch` each time and collapse `{seq%10}` under `batch: 100` to a single value. So
-//! `resource: { host: "h{seq%10}" }` really is ten resources cycling per batch, costing one
-//! `AttrMap` and one `Arc<Resource>` per batch and nothing per event. See
-//! [`GenerateInput::with_resource`].
+//! The **resource** is batch-level: an all-literal one is built once and `Arc`-shared by every
+//! batch, a templated one is rebuilt per batch. **In resource position `seq` is the batch
+//! ordinal**, not the event counter; see [`GenerateInput::with_resource`].
 //!
 //! # Rate pacing
 //!
-//! `rate` is held against the *wall clock*, never a fixed `interval(batch / rate)` timer: before
-//! sending a batch this input sleeps until `start + sent / rate`, recomputed from the run's own
-//! start every time, so a batch that ran late doesn't shift every later deadline. The average
-//! rate over a run holds instead of drifting, and the first batch goes out immediately rather
-//! than waiting out a batch-interval nothing has been generated in yet. Above roughly a thousand
-//! batches per second the sleep granularity makes it bursty within any given millisecond --
-//! accurate on average, ~1 ms granular in the small (`docs/known-gaps.md`).
+//! `rate` is events per second, held against the wall clock: before each batch this input sleeps
+//! until `start + sent / rate`, recomputed from the run's start, so a late batch doesn't shift
+//! later deadlines and the average rate doesn't drift. The first batch goes out immediately.
+//! Above roughly 1k batches/s pacing is accurate on average but bursty within a millisecond
+//! (`docs/known-gaps.md`). Without `rate`, downstream backpressure is the only limit.
 //!
 //! # Telemetry
 //!
-//! **Layer 2 only** -- this input records no points of its own. The runtime's uniform
-//! per-component instrumentation already counts what this node sent on its fanout edge, and
-//! `logit.component.events.sent` *is* the generated count, so a second counter here would only
-//! restate it (`docs/design/internal-telemetry.md`). What it does add is one `Diagnostics` key,
-//! mirrored as `logit.component.diagnostics{key}` by the bridge: `rate_behind`, for a generator
-//! that cannot hold the `rate` it was configured with -- the signal that a rate-limited scenario
-//! has quietly become a throughput one.
+//! **Layer 2 only**: no points of its own, since the runtime's `logit.component.events.sent`
+//! already is the generated count (`docs/design/internal-telemetry.md`). One `Diagnostics` key,
+//! mirrored as `logit.component.diagnostics{key}`: `rate_behind`, a generator 1s or more behind
+//! its `rate` schedule, meaning a rate-limited scenario has become a throughput one.
 
 use crate::Input;
 use bytes::Bytes;
@@ -88,53 +75,43 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// A placeholder name resolved into what rendering it actually needs -- the `V` in
-/// [`Template::compile`], so the hot path walks pre-resolved segments with no string matching per
-/// event.
+/// A resolved placeholder: the `V` in [`Template::compile`], so the hot path does no string
+/// matching per event.
 ///
-/// The set is deliberately tiny, and deliberately the same set `logit-pipeline`'s graph rule 42
-/// accepts at validation time (`generate_var_is_valid`). Those two live in different crates on
-/// purpose -- an implementation crate may not depend on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout) -- so they are kept in step by being small
-/// enough to compare by eye. See [`resolve_var`].
+/// Must stay the same set graph rule 42 accepts (`logit_pipeline::graph`'s
+/// `generate_var_is_valid`); the two can't share code across the crate layout
+/// (`docs/design/pipeline-graph.md`), so they stay small enough to compare by eye.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenVar {
     /// `{seq}` -- the generator's 0-based event counter.
     Seq,
-    /// `{seq%N}` -- that counter modulo `N`, a scenario's cardinality knob. `N >= 1`, so the
-    /// modulo can never divide by zero.
+    /// `{seq%N}` -- that counter modulo `N`, a scenario's cardinality knob. `N >= 1`.
     SeqMod(u64),
 }
 
 /// Which `logit_core::MetricKind` a generated metric carries.
 ///
-/// A local mirror of `logit_config::GenerateMetricKind` -- `logit-inputs` must not depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), the same reason
-/// `logit_outputs::file::RotatePolicy` mirrors `logit_config::RotateConfig`;
-/// `crates/logit-cli/src/pipeline.rs::build_spec` is the sole place a config value crosses into
-/// this type.
+/// A local mirror of `logit_config::GenerateMetricKind`, since `logit-inputs` must not depend on
+/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout); `logit-cli`'s
+/// `generate_metric_kind` converts between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GenerateMetricKind {
-    /// A delta, monotonic `Sum` -- `MetricKind::counter`, the cheapest shape to generate.
+    /// A delta, monotonic `Sum` (`MetricKind::counter`).
     #[default]
     Sum,
     Gauge,
-    /// Raw `Samples` carrying the one configured value -- **never** a pre-built `DdSketch`. A
-    /// listener that pre-summarized would be exactly the shape
-    /// `docs/adr/lossless-transit.md`'s "a decoder never pre-summarizes what an explicit
-    /// `aggregate` stage should decide about" rule forbids, and a scenario measuring the
-    /// sketch-merging path wants that merge to happen in `aggregate`, where it really does.
+    /// Raw `Samples` of the one configured value, never a pre-built `DdSketch`: summarization is
+    /// `aggregate`'s job (`docs/adr/lossless-transit.md`), and a scenario measuring sketch merges
+    /// needs them to happen there.
     Distribution,
 }
 
 /// Resolves one placeholder name, rejecting anything `generate_in` doesn't substitute.
 ///
-/// **Mirrors `logit_pipeline::graph`'s `generate_var_is_valid` exactly**, including its
-/// digits-only modulus rule: `u64::from_str` would also accept a leading `+`, so `{seq%+5}` is
-/// rejected here rather than becoming a second spelling of `{seq%5}`. Graph rule 42 rejects an
-/// unknown name at validation time, so in a `logit run` this never fires -- it is still an error
-/// rather than a panic, because a direct caller of this module's builders (a unit test,
-/// `logit-bench`) has no rule 42 in front of it.
+/// Mirrors `logit_pipeline::graph`'s `generate_var_is_valid`, including its digits-only modulus:
+/// `u64::from_str` accepts a leading `+`, which would make `{seq%+5}` a second spelling of
+/// `{seq%5}`. An error, not a panic: a direct caller (`logit-bench`, a test) has no rule 42 in
+/// front of it.
 fn resolve_var(name: &str) -> anyhow::Result<GenVar> {
     if name == "seq" {
         return Ok(GenVar::Seq);
@@ -154,16 +131,10 @@ fn resolve_var(name: &str) -> anyhow::Result<GenVar> {
     )
 }
 
-/// [`resolve_var`], minus the unbounded one, for the one field whose rendering is **interned**
-/// rather than copied: `event.metric.name`.
+/// [`resolve_var`] without bare `{seq}`, for `event.metric.name`, whose rendering is interned.
 ///
-/// A bare `{seq}` there would intern a fresh, never-freed `Symbol` for every event a run
-/// generates -- a million-event scenario would leave a million metric names in the process-wide
-/// interner (`docs/design/memory.md` §4: interning is monotonic, nothing is ever removed), which
-/// is a leak in the shape of a feature rather than a cardinality knob. `{seq%N}` is bounded by
-/// `N` and stays allowed; that is what a scenario wanting metric-name cardinality actually means.
-/// Graph rule 42 rejects the same thing at validation time, for a `logit run` that never reaches
-/// this.
+/// Interning never frees (`docs/design/memory.md` §4), so a bare `{seq}` would leak one metric
+/// name per generated event; `{seq%N}` is bounded by `N`. Graph rule 42 rejects the same.
 fn resolve_metric_name_var(name: &str) -> anyhow::Result<GenVar> {
     match resolve_var(name)? {
         GenVar::SeqMod(modulus) => Ok(GenVar::SeqMod(modulus)),
@@ -175,8 +146,7 @@ fn resolve_metric_name_var(name: &str) -> anyhow::Result<GenVar> {
     }
 }
 
-/// Appends one placeholder's rendering. `write!` into a `String` is infallible, so the `Result`
-/// is discarded rather than propagated.
+/// Appends one placeholder's rendering. `write!` into a `String` is infallible.
 fn write_var(var: GenVar, seq: u64, out: &mut String) {
     let value = match var {
         GenVar::Seq => seq,
@@ -188,8 +158,8 @@ fn write_var(var: GenVar, seq: u64, out: &mut String) {
 /// One configured string field, in the form the render path wants it.
 #[derive(Debug, Clone)]
 enum Field {
-    /// No placeholder: the bytes were rendered once, at construction. Every event gets a
-    /// `clone` of *these* bytes -- a refcount bump.
+    /// No placeholder: rendered once at construction; each event clones these bytes (a refcount
+    /// bump).
     Literal(Bytes),
     /// At least one placeholder: rendered per event.
     Templated(Compiled<GenVar>),
@@ -207,9 +177,8 @@ impl Field {
         matches!(self, Field::Literal(_))
     }
 
-    /// This field's bytes for event `seq`. A literal costs a refcount bump; a template costs one
-    /// render into `scratch` plus one `Bytes::copy_from_slice` -- the single allocation per
-    /// templated field per event this module's doc comment pins.
+    /// This field's bytes for event `seq`: a refcount bump for a literal, one render into
+    /// `scratch` plus one `Bytes::copy_from_slice` (one allocation) for a template.
     fn render(&self, seq: u64, scratch: &mut String) -> Bytes {
         match self {
             Field::Literal(bytes) => bytes.clone(),
@@ -222,9 +191,8 @@ impl Field {
     }
 }
 
-/// A generated metric's name. Split from [`Field`] because a metric name is *interned*, not
-/// copied: the literal case resolves to a `Symbol` once, at construction, and never touches the
-/// interner again.
+/// A generated metric's name: interned, not copied, so separate from [`Field`]. A literal name is
+/// interned once, at construction.
 #[derive(Debug, Clone)]
 enum MetricName {
     Fixed(Symbol),
@@ -236,8 +204,7 @@ enum MetricName {
 struct MetricSpec {
     name: MetricName,
     kind: GenerateMetricKind,
-    /// Constant, deliberately: a varying value would measure the generator's own arithmetic
-    /// rather than the pipeline's.
+    /// Constant, so a scenario measures the pipeline rather than the generator's arithmetic.
     value: f64,
 }
 
@@ -266,32 +233,25 @@ impl MetricSpec {
     }
 }
 
-/// How a batch gets its [`Resource`] -- the batch-level mirror of [`RenderPath`], and independent
-/// of it: a templated resource on an all-literal event template still takes the prototype path
-/// for its events.
+/// How a batch gets its [`Resource`]; independent of [`RenderPath`], so a templated resource over
+/// an all-literal event template still takes the prototype path for its events.
 #[derive(Debug, Clone)]
 enum ResourceSpec {
-    /// Every value is literal, which is the usual case: the resource was built once, at
-    /// construction, and every batch this input ever sends shares *this* `Arc`. Rebuilding it per
-    /// batch would re-intern every key and reallocate an `AttrMap` for a value that cannot
-    /// change; `InternalInput::resource` carries the same reasoning.
+    /// Every value literal: built once, and every batch shares this `Arc`.
     Fixed(Arc<Resource>),
-    /// At least one value has a placeholder: rebuilt once per batch from that batch's *ordinal*,
-    /// so one `AttrMap` and one `Arc<Resource>` per batch and nothing per event. See
-    /// [`GenerateInput::with_resource`] for why the ordinal and not the event counter.
+    /// Any placeholder: rebuilt per batch from the batch ordinal, one `AttrMap` and one
+    /// `Arc<Resource>` per batch ([`GenerateInput::with_resource`]).
     Templated(Vec<(Symbol, Field)>),
 }
 
-/// Which of this module's two render paths applies -- settled on first use rather than in
-/// [`GenerateInput::new`], since a `with_*` builder may still add a templated field afterwards.
+/// Which render path applies. Settled on first use, not in [`GenerateInput::new`], since a
+/// `with_*` builder may still add a templated field.
 #[derive(Debug, Clone)]
 enum RenderPath {
     Undecided,
-    /// Every field is literal: this event is `clone`d per generated event, `timestamp`
-    /// overwritten. `Box`ed because an `Event` is several hundred bytes and the other two
-    /// variants carry nothing, so inlining it would make every `GenerateInput` that big
-    /// (clippy's `large_enum_variant`). The indirection costs one allocation per process and is
-    /// never on the per-event path -- what is cloned per event is the `Event`, not the `Box`.
+    /// Every field literal: this event is cloned per generated event, `timestamp` overwritten.
+    /// `Box`ed to satisfy clippy's `large_enum_variant`; the box is one allocation per process,
+    /// and the per-event clone is of the `Event`, not the `Box`.
     Prototype(Box<Event>),
     /// Something is templated: every event is rendered field by field.
     PerEvent,
@@ -302,30 +262,26 @@ enum RenderPath {
 pub struct GenerateInput {
     /// `None` means unbounded -- a soak run, or one a profiler attaches to.
     count: Option<u64>,
-    /// Events per generated batch. Clamped to at least 1 by [`GenerateInput::new`]: graph rule 42
-    /// already rejects `batch: 0` in config, but a direct caller has no rule 42 in front of it and
-    /// a zero-sized batch would loop forever generating nothing.
+    /// At least 1 ([`GenerateInput::new`] clamps it): a direct caller has no rule 42, and a
+    /// zero-sized batch would loop forever generating nothing.
     batch: usize,
-    /// `None` means unthrottled -- as fast as downstream backpressure allows.
+    /// Events per second; `None` means unthrottled, limited only by downstream backpressure.
     rate: Option<u64>,
     log: Option<Field>,
-    /// Keys interned once, here; values rendered per event (or once, for a literal). A `Vec`
-    /// rather than a map: the keys are already distinct (they came from a `BTreeMap`) and this is
-    /// only ever iterated, never looked up.
+    /// Keys interned once. A `Vec`, not a map: the keys are already distinct and it's only
+    /// iterated.
     attributes: Vec<(Symbol, Field)>,
     metric: Option<MetricSpec>,
     resource: ResourceSpec,
     path: RenderPath,
-    /// One reused render buffer, `clear`ed per templated field -- it stops allocating entirely
-    /// once it has grown to the widest rendering it has seen
-    /// (`logit_core::template::Compiled::render`).
+    /// Reused render buffer; allocates nothing once grown to the widest rendering.
     scratch: String,
     diag: Diagnostics,
 }
 
 impl GenerateInput {
-    /// A generator with no payload at all: a timestamp and an empty resource, which is exactly
-    /// what a "runtime floor" scenario wants to measure. Every `with_*` builder adds to that.
+    /// A generator with no payload: a timestamp and an empty resource, a "runtime floor"
+    /// scenario. `count: None` never ends on its own.
     pub fn new(count: Option<u64>, batch: usize) -> Self {
         Self {
             count,
@@ -343,35 +299,31 @@ impl GenerateInput {
 
     /// Target events per second. `None` (the default) is unthrottled.
     ///
-    /// `Some(0)` is folded to `None` rather than stored: graph rule 42 rejects `rate: 0` in
-    /// config, but a direct caller has no rule 42 in front of it, and a zero rate would make
-    /// [`GenerateInput::pace`]'s `sent / rate` infinite -- which `Duration::from_secs_f64`
-    /// panics on. Same shape as `new`'s `batch.max(1)`.
+    /// `Some(0)` becomes `None`: a direct caller has no rule 42, and a zero rate would make
+    /// [`GenerateInput::pace`]'s `sent / rate` infinite, which `Duration::from_secs_f64` panics
+    /// on.
     pub fn with_rate(mut self, rate: Option<u64>) -> Self {
         self.rate = rate.filter(|rate| *rate > 0);
         self
     }
 
-    /// The log body every generated event carries. Omitted entirely means the event carries no
-    /// `LogRecord` at all -- a metrics-only scenario.
+    /// The log body every generated event carries. Without it, events carry no `LogRecord`.
     pub fn with_log(mut self, template: Template) -> anyhow::Result<Self> {
         self.log = Some(Field::new(&template)?);
         self.path = RenderPath::Undecided;
         Ok(self)
     }
 
-    /// One event attribute: a literal key (interned here, once) and a templated value.
+    /// One event attribute: a literal key (interned once) and a templated value.
     pub fn with_attribute(mut self, key: &str, template: Template) -> anyhow::Result<Self> {
         self.attributes.push((intern(key), Field::new(&template)?));
         self.path = RenderPath::Undecided;
         Ok(self)
     }
 
-    /// The metric stamped on every generated event. Omitted means no metrics -- a logs-only
-    /// scenario.
+    /// The metric stamped on every generated event. Without it, events carry no metrics.
     ///
-    /// `name` may use `{seq%N}` but **not** a bare `{seq}`: a metric name is interned, and an
-    /// interned `Symbol` lives for the life of the process. See [`resolve_metric_name_var`].
+    /// `name` may use `{seq%N}` but not a bare `{seq}` ([`resolve_metric_name_var`]).
     pub fn with_metric(
         mut self,
         name: Template,
@@ -387,30 +339,19 @@ impl GenerateInput {
         Ok(self)
     }
 
-    /// The resource every batch carries. Values may name placeholders, and the unit a resource
-    /// template renders at is **one batch**, not one event: the resource is batch-level and
-    /// `Arc`-shared by every event in the batch (`logit_core::EventBatch::resource`), so a
-    /// per-event rendering would have nowhere to go.
+    /// The resource every batch carries. Values may use placeholders, rendered once per batch,
+    /// since the resource is batch-level (`logit_core::EventBatch::resource`).
     ///
-    /// **In resource position `seq` is the batch ordinal** -- 0, 1, 2, ... -- not the event
-    /// counter. That distinction is the whole feature: the event counter advances by `batch` per
-    /// batch, so `{seq%N}` over it would only ever produce `N / gcd(N, batch)` distinct values,
-    /// and for the overwhelmingly common case of a `batch` that is a multiple of `N` (`batch:
-    /// 100`, `{seq%10}`) that is exactly one -- a "cardinality knob" silently stuck on its first
-    /// setting. Rendering from the ordinal instead makes `resource: { host: "h{seq%10}" }` mean
-    /// what it reads as: ten distinct resources, cycling per batch.
+    /// **In resource position `seq` is the batch ordinal** (0, 1, 2, ...), not the event counter.
+    /// The event counter advances by `batch` per batch, so `{seq%N}` over it yields only
+    /// `N / gcd(N, batch)` values: one, for `batch: 100` and `{seq%10}`. From the ordinal,
+    /// `resource: { host: "h{seq%10}" }` is ten resources cycling per batch.
     ///
-    /// So this is a real multi-resource cardinality knob at zero per-event cost -- one `AttrMap`
-    /// and one `Arc<Resource>` per batch, nothing per event -- which is what a scenario measuring
-    /// resource grouping (`aggregate`'s `logit.transform.resource.groups`, a sink that keys on
-    /// the resource) actually needs. Two consequences worth knowing: a batch is the granularity,
-    /// so every event in one batch shares one resource no matter how large `batch` is; and an
-    /// all-literal resource keeps the strictly cheaper path, built once at construction and
-    /// `Arc`-shared by every batch forever ([`ResourceSpec`]).
+    /// That costs one `AttrMap` and one `Arc<Resource>` per batch, nothing per event. Every event
+    /// in a batch shares one resource. An all-literal resource is built once and shared by every
+    /// batch ([`ResourceSpec`]).
     ///
-    /// Takes raw strings rather than parsed [`Template`]s, unlike every other builder here: a
-    /// resource value's parse is startup-only either way, so there is nothing for a caller to
-    /// pre-parse on its behalf.
+    /// Takes raw strings, unlike the other builders: the parse is startup-only either way.
     pub fn with_resource(mut self, resource: BTreeMap<String, String>) -> anyhow::Result<Self> {
         let mut fields = Vec::with_capacity(resource.len());
         for (key, value) in &resource {
@@ -432,14 +373,11 @@ impl GenerateInput {
         Ok(self)
     }
 
-    /// Attaches this component's own telemetry handle.
+    /// Attaches this component's telemetry handle, used only to bridge `rate_behind` into
+    /// `logit.component.diagnostics{key}` (module doc's "Telemetry").
     ///
-    /// `generate_in` records **no layer-3 points** -- see this module's "Telemetry" section for
-    /// why the runtime's `logit.component.events.sent` already is the generated count -- so the
-    /// handle's only job here is the `Diagnostics` bridge, which mirrors every `rate_behind`
-    /// occurrence into `logit.component.diagnostics{key}`. Call this *after*
-    /// [`GenerateInput::with_diagnostics`]: it attaches to whatever `Diagnostics` this input is
-    /// holding at the time.
+    /// Call this *after* [`GenerateInput::with_diagnostics`]: it attaches to whatever
+    /// `Diagnostics` this input holds at the time.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.diag = self.diag.clone().with_telemetry(telemetry);
         self
@@ -450,21 +388,16 @@ impl GenerateInput {
         self
     }
 
-    /// Builds one batch of `n` events numbered `first_seq..first_seq + n`, every one stamped
-    /// `now` (Unix nanoseconds), under batch ordinal `batch_index` (0 for a run's first batch).
+    /// Builds one batch of `n` events numbered `first_seq..first_seq + n`, all stamped `now`
+    /// (Unix nanoseconds), under batch ordinal `batch_index` (0 for a run's first batch).
     ///
-    /// `batch_index` is what a resource template's `{seq}`/`{seq%N}` renders from, and it is a
-    /// separate argument rather than derived from `first_seq` deliberately: `first_seq / batch`
-    /// would be a second, silently-wrong definition the moment a caller drove `build_batch`
-    /// with anything but exact multiples of `batch` -- which `logit-bench` and this module's own
-    /// tests both do.
+    /// `batch_index` is what a resource template renders from. It's an argument rather than
+    /// `first_seq / batch`, which would be wrong for a caller not stepping by exact multiples of
+    /// `batch`, as `logit-bench` and this module's tests do.
     ///
-    /// Public so `logit-bench` can drive both render paths directly -- no runtime, no channel,
-    /// nothing between the measurement and the code it is measuring, which is what keeps that
-    /// crate's allocation counts trustworthy (`crates/logit-bench/benches/pipeline.rs`'s module
-    /// doc, `docs/design/memory.md`'s "Fixtures" section). The first call also settles which
-    /// render path applies, and (on the prototype path) renders the prototype -- so a caller
-    /// measuring allocations must warm it, exactly like every other measurement in that crate.
+    /// Public so `logit-bench` can drive both render paths with no runtime in between
+    /// (`docs/design/memory.md`'s "Fixtures" section). The first call settles the render path and
+    /// renders any prototype, so a caller counting allocations must warm it first.
     pub fn build_batch(
         &mut self,
         batch_index: u64,
@@ -473,17 +406,15 @@ impl GenerateInput {
         now: i64,
     ) -> EventBatch {
         self.settle_render_path();
-        // Taken out and put back so the renders below can borrow it mutably while everything they
-        // render *from* is borrowed immutably -- and so its grown capacity survives across
-        // batches, which is what makes a warm scratch allocate nothing.
+        // Taken out and put back so the renders can borrow it mutably while borrowing `self`,
+        // keeping its grown capacity across batches.
         let mut scratch = std::mem::take(&mut self.scratch);
         let resource = self.render_resource(batch_index, &mut scratch);
         let mut events = Vec::with_capacity(n);
         if let RenderPath::Prototype(prototype) = &self.path {
             for _ in 0..n {
-                // `(**prototype)`, not `prototype.clone()`: the latter would clone the `Box`
-                // itself, paying an allocation per event for the indirection the variant's own
-                // doc comment explains is a once-per-process cost.
+                // `(**prototype)`, not `prototype.clone()`, which would also allocate a `Box`
+                // per event.
                 let mut event = (**prototype).clone();
                 event.timestamp = now;
                 events.push(event);
@@ -497,10 +428,8 @@ impl GenerateInput {
         EventBatch { resource, scope: None, events }
     }
 
-    /// This batch's resource: the one shared `Arc` when every value is literal, or a fresh one
-    /// rendered from the **batch ordinal** when any value is templated. See
-    /// [`GenerateInput::with_resource`] for why that, and not the event counter, is what `{seq}`
-    /// means in resource position.
+    /// The shared `Arc` for an all-literal resource, else a fresh one rendered from the batch
+    /// ordinal ([`GenerateInput::with_resource`]).
     fn render_resource(&self, batch_index: u64, scratch: &mut String) -> Arc<Resource> {
         match &self.resource {
             ResourceSpec::Fixed(resource) => resource.clone(),
@@ -522,8 +451,7 @@ impl GenerateInput {
             self.path = RenderPath::PerEvent;
             return;
         }
-        // Rendered at `seq = 0` with a throwaway scratch: an all-literal template never reads
-        // either, and this runs once per process.
+        // An all-literal template reads neither `seq` nor the scratch.
         let prototype = self.render_one(0, 0, &mut String::new());
         self.path = RenderPath::Prototype(Box::new(prototype));
     }
@@ -542,9 +470,7 @@ impl GenerateInput {
         let log = self.log.as_ref().map(|field| LogRecord {
             message: Value::Str(field.render(seq, scratch)),
             severity: None,
-            // `Raw`, never `Json`, even when the body plainly is JSON: parsing is composed
-            // downstream by an ordinary `json` stage, which is the whole point of generating a
-            // body as text rather than as a shape enum.
+            // `Raw` even for a JSON body: parsing belongs to a downstream `json` stage.
             body_format: BodyFormat::Raw,
             trace: None,
             event_name: None,
@@ -561,8 +487,7 @@ impl GenerateInput {
         Event { timestamp: now, attributes, log, metrics, span: None }
     }
 
-    /// Holds `rate` against the wall clock -- see this module's "Rate pacing" section for why the
-    /// deadline is recomputed from `started` rather than slept for in fixed increments.
+    /// Sleeps until `started + sent / rate` (module doc's "Rate pacing").
     async fn pace(&mut self, started: Instant, sent: u64, rate: u64) {
         let due_at = started + Duration::from_secs_f64(sent as f64 / rate as f64);
         let now = Instant::now();
@@ -570,10 +495,8 @@ impl GenerateInput {
             tokio::time::sleep_until(due_at).await;
             return;
         }
-        // Behind the pace, and no amount of not-sleeping will fix it: the scenario is measuring
-        // something slower than the rate it asked for, which silently turns a rate-limited
-        // measurement into a throughput one. Reported only once the deficit passes a whole
-        // second's worth of events, so ordinary millisecond-scale jitter stays quiet.
+        // Behind schedule: the rate-limited measurement has become a throughput one. Reported
+        // only from 1s behind, so millisecond jitter stays quiet.
         let behind = now - due_at;
         if behind >= Duration::from_secs(1) {
             self.diag.warn_throttled(
@@ -594,7 +517,7 @@ impl Input for GenerateInput {
         let mut sent: u64 = 0;
         let mut batches: u64 = 0;
         loop {
-            // The last batch is short rather than rounded up, which is what makes `count` exact.
+            // The last batch is short, not rounded up: `count` is exact.
             let n = match self.count {
                 Some(count) if sent >= count => break,
                 Some(count) => (count - sent).min(self.batch as u64) as usize,
@@ -608,9 +531,8 @@ impl Input for GenerateInput {
             sent += n as u64;
             batches += 1;
         }
-        // The line a harness watches for: it marks the end of generation (as distinct from the end
-        // of the process, which is whatever the downstream flush takes afterwards), and carries the
-        // count a derived events/s divides by (`docs/plans/load-test-harness.md`).
+        // `logit-perf` watches for this line: the end of generation (not of the process, which
+        // waits on the downstream flush), carrying the count its events/s divides by.
         tracing::info!(
             target: "logit",
             events = sent,
@@ -662,8 +584,7 @@ mod tests {
         assert_eq!(batches.iter().map(|b| b.events.len()).sum::<usize>(), 300);
     }
 
-    /// `count` is exact, not rounded up to a whole batch -- the property a harness's derived
-    /// events/s and CPU-per-event divide by.
+    /// `count` is exact, not rounded up to a whole batch.
     #[tokio::test]
     async fn a_count_that_does_not_divide_by_batch_ends_with_a_short_batch() {
         let batches = run_to_completion(GenerateInput::new(Some(250), 100)).await;
@@ -681,9 +602,7 @@ mod tests {
         assert!(event.attributes.is_empty());
     }
 
-    /// The prototype path's whole point: an all-literal template renders its bytes once and every
-    /// event shares *that* buffer, so the message costs a refcount bump per event rather than a
-    /// copy. Asserted on the pointer, not on equality -- equal bytes would pass either way.
+    /// An all-literal template's events share one buffer (asserted by pointer, not equality).
     #[tokio::test]
     async fn literal_templates_share_one_message_buffer_across_events() {
         let input = GenerateInput::new(Some(2), 2)
@@ -711,8 +630,7 @@ mod tests {
         assert_eq!(attribute_ptr(&events[0]), attribute_ptr(&events[1]));
     }
 
-    /// Every event on the prototype path still gets the batch's own timestamp, not the one the
-    /// prototype was rendered with.
+    /// Prototype-path events get the batch's timestamp, not the prototype's.
     #[tokio::test]
     async fn the_prototype_path_overwrites_the_timestamp_per_batch() {
         let mut input = GenerateInput::new(Some(4), 2).with_log(parse("fixed").unwrap()).unwrap();
@@ -749,7 +667,7 @@ mod tests {
         assert_eq!(hosts, vec!["web-0", "web-1", "web-0", "web-1"]);
     }
 
-    /// `seq` keeps counting across batches -- it is the run's event counter, not a per-batch index.
+    /// `seq` is the run's event counter, continuing across batches.
     #[tokio::test]
     async fn seq_continues_across_batch_boundaries() {
         let input = GenerateInput::new(Some(4), 2).with_log(parse("{seq}").unwrap()).unwrap();
@@ -798,8 +716,7 @@ mod tests {
         assert_eq!(batches[0].events[0].metrics[0].kind, MetricKind::Gauge(7.5));
     }
 
-    /// A distribution generates *raw* `Samples`, never a pre-built `DdSketch` -- summarization
-    /// stays `aggregate`'s job (`docs/adr/lossless-transit.md`).
+    /// A distribution generates raw `Samples`, never a `DdSketch`.
     #[tokio::test]
     async fn a_distribution_metric_is_raw_samples_not_a_sketch() {
         let input = GenerateInput::new(Some(1), 1)
@@ -829,8 +746,7 @@ mod tests {
         assert_eq!(names, vec!["series.0", "series.1"]);
     }
 
-    /// An **all-literal** resource is built once and `Arc`-shared by every batch -- not rebuilt
-    /// per batch, which would re-intern every key for a value that cannot change.
+    /// An all-literal resource is one `Arc` shared by every batch.
     #[tokio::test]
     async fn every_batch_shares_one_resource_arc() {
         let input = GenerateInput::new(Some(4), 2)
@@ -848,11 +764,8 @@ mod tests {
         );
     }
 
-    /// A **templated** resource renders once per batch, from the batch *ordinal* -- so
-    /// `h{seq%10}` really does cycle through ten resources, one per batch, and comes back round
-    /// on the eleventh. Driven through a whole real run at the shipped example's own `batch: 100`
-    /// specifically because that is the shape the event counter gets wrong: `sent` advances by
-    /// 100 per batch, so `sent % 10` would be `0` forever and the knob would be silently stuck.
+    /// A templated resource cycles per batch on the batch ordinal. `batch: 100` is the case the
+    /// event counter gets wrong: `sent % 10` would be `0` forever.
     #[tokio::test]
     async fn a_templated_resource_cycles_per_batch_on_the_batch_ordinal() {
         let input = GenerateInput::new(Some(1100), 100)
@@ -874,14 +787,11 @@ mod tests {
             !Arc::ptr_eq(&batches[0].resource, &batches[1].resource),
             "a templated resource is a fresh Arc per batch, not the shared one"
         );
-        // ...and the eleventh batch renders the same *text* as the first without being the same
-        // `Arc`: this knob is a fresh resource per batch, not a cache keyed on the rendering.
+        // Same text as the first batch, but a fresh `Arc`: no cache keyed on the rendering.
         assert!(!Arc::ptr_eq(&batches[0].resource, &batches[10].resource));
     }
 
-    /// The cost side of the same rule: a templated resource is rendered once per *batch*, never
-    /// once per event -- every event in a batch reads the very same `Arc`, which is what keeps
-    /// this knob free on the per-event path.
+    /// A templated resource renders once per batch, from `batch_index`, not `first_seq`.
     #[test]
     fn a_templated_resource_is_rendered_once_for_a_whole_batch() {
         let mut input = GenerateInput::new(None, 100)
@@ -896,10 +806,8 @@ mod tests {
         assert_eq!(batch.events.len(), 4);
     }
 
-    /// `rate` paces against the wall clock: a batch waits until the events already *sent* are due
-    /// at the configured rate, so the first goes out immediately and the second waits out the
-    /// 100 events the first carried. Paused clock, so this asserts the real arithmetic rather
-    /// than a sleep's accuracy.
+    /// A batch waits until the events already sent are due at `rate`: the first is immediate,
+    /// the second waits out the first's 100 events. Paused clock, so this checks the arithmetic.
     #[tokio::test(start_paused = true)]
     async fn rate_paces_batches_against_the_wall_clock() {
         let mut input = GenerateInput::new(Some(200), 100).with_rate(Some(1000));
@@ -925,7 +833,7 @@ mod tests {
         );
     }
 
-    /// No `rate` means no pacing at all -- the throughput case, which must not sleep.
+    /// No `rate` means no pacing at all.
     #[tokio::test(start_paused = true)]
     async fn an_unthrottled_generator_sends_every_batch_immediately() {
         let started = Instant::now();
@@ -942,9 +850,7 @@ mod tests {
         assert!(format!("{err}").contains("{hostname}"), "got: {err}");
     }
 
-    /// The digits-only modulus rule `logit_pipeline::graph`'s `generate_var_is_valid` enforces,
-    /// mirrored here: `u64::from_str` would accept the `+`, so without the digit check this would
-    /// become a second spelling of `{seq%5}`.
+    /// `{seq%+5}` is rejected, not a second spelling of `{seq%5}` (see [`resolve_var`]).
     #[test]
     fn a_signed_modulus_is_rejected_at_construction() {
         assert!(GenerateInput::new(Some(1), 1)
@@ -952,9 +858,7 @@ mod tests {
             .is_err());
     }
 
-    /// A metric name is interned, and an interned `Symbol` is never freed -- so a bare `{seq}`
-    /// there would leave one never-reclaimed name per generated event in the process-wide
-    /// interner. Rejected at construction, and by graph rule 42 before that in a `logit run`.
+    /// A bare `{seq}` in the interned metric name is rejected.
     #[test]
     fn a_bare_seq_in_a_metric_name_is_rejected_at_construction() {
         let err = GenerateInput::new(Some(1), 1)
@@ -965,7 +869,7 @@ mod tests {
         assert!(err.contains("{seq%N}"), "got: {err}");
     }
 
-    /// ...while a *bounded* one is exactly what metric-name cardinality means, and stays allowed.
+    /// A bounded `{seq%N}` in a metric name is allowed.
     #[test]
     fn a_bounded_seq_modulo_in_a_metric_name_is_accepted() {
         assert!(GenerateInput::new(Some(1), 1)
@@ -973,9 +877,7 @@ mod tests {
             .is_ok());
     }
 
-    /// The same reasoning does *not* apply to a log body or an attribute value: those are copied
-    /// per event, not interned, so an unbounded `{seq}` costs one allocation and frees with the
-    /// event.
+    /// A bare `{seq}` is fine in a log body or attribute value: copied, not interned.
     #[test]
     fn a_bare_seq_is_still_allowed_outside_a_metric_name() {
         assert!(GenerateInput::new(Some(1), 1).with_log(parse("{seq}").unwrap()).is_ok());
@@ -984,9 +886,7 @@ mod tests {
             .is_ok());
     }
 
-    /// Rule 42 rejects `rate: 0` in config, but a direct caller has no rule 42 in front of it --
-    /// and `0` would make `pace`'s `sent / rate` infinite, which `Duration::from_secs_f64`
-    /// panics on. Folded to "unthrottled" instead, the same shape as `batch`'s clamp.
+    /// A direct caller's `rate: 0` means unthrottled, not a `Duration::from_secs_f64` panic.
     #[tokio::test(start_paused = true)]
     async fn a_zero_rate_means_unthrottled_rather_than_a_panic() {
         let started = Instant::now();
@@ -1010,16 +910,14 @@ mod tests {
             .is_err());
     }
 
-    /// Graph rule 42 rejects `batch: 0` in config, but a direct caller has no rule 42 in front of
-    /// it -- and a zero-sized batch would otherwise loop forever generating nothing.
+    /// A direct caller's `batch: 0` is clamped to 1 rather than looping forever.
     #[tokio::test]
     async fn a_zero_batch_is_clamped_to_one_rather_than_looping_forever() {
         let batches = run_to_completion(GenerateInput::new(Some(2), 0)).await;
         assert_eq!(batches.iter().map(|b| b.events.len()).collect::<Vec<_>>(), vec![1, 1]);
     }
 
-    /// `build_batch` is the seam `logit-bench` measures through, so it has to be usable with no
-    /// runtime and no channel at all.
+    /// `build_batch`, `logit-bench`'s seam, works with no runtime and no channel.
     #[test]
     fn build_batch_renders_without_a_runtime() {
         let mut input = GenerateInput::new(None, 100)
@@ -1036,7 +934,7 @@ mod tests {
             .map(|event| event.log.as_ref().unwrap().message.as_str().unwrap())
             .collect();
         assert_eq!(messages, vec!["path=/x/0", "path=/x/1", "path=/x/0"]);
-        // The literal attribute still shares one buffer even on the per-event path.
+        // A literal attribute shares one buffer even on the per-event path.
         let ptr = |event: &Event| match event.attributes.get("host").unwrap() {
             Value::Str(bytes) => bytes.as_ptr(),
             other => panic!("expected a Str attribute, got {other:?}"),

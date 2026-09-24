@@ -1,14 +1,13 @@
-//! `flatten`: rewrites a nested `Value::Map`/`Value::Array` attribute into flat, dot-joined keys
-//! -- `{"foo": {"key": "bar"}}` becomes `foo.key = "bar"`, `{"tags": ["a","b"]}` becomes
+//! `flatten`: rewrites a nested `Value::Map`/`Value::Array` attribute into flat, dot-joined keys:
+//! `{"foo": {"key": "bar"}}` becomes `foo.key = "bar"`, `{"tags": ["a","b"]}` becomes
 //! `tags.0`/`tags.1`, and the two compose (`{"items": [{"name": "x"}]}` becomes `items.0.name`).
 //! See `docs/adr/flatten-transform.md`.
 //!
-//! Effectively stateless -- like `keep_values`/`scale`, only `process`/`map_resource` are
-//! overridden, and `flush_interval`/`flush` keep the `Transform` trait's defaults -- but unlike
-//! them it carries reused per-instance scratch buffers ([`Scratch`]) rather than nothing at all,
-//! because the walk itself needs somewhere to build a path and memoize interned keys across
-//! events. `json`'s `JsonParser` is the model for both, applied here to a walk over an
-//! already-parsed `Value` rather than a parser's own input.
+//! **Never deletes an attribute**: every source value it removes is written back, as leaves or
+//! whole. A key collision is last write wins, with no diagnostic. There is no cap on how many keys
+//! one value expands into; [`MAX_DEPTH`] is the only bound (`docs/known-gaps.md`).
+//!
+//! No flush state; it reuses per-instance [`Scratch`] buffers for the path and interned keys.
 
 use logit_core::interner::{intern, resolve, KeyCache};
 use logit_core::{AttrMap, Event, Resource, Symbol, Telemetry, Value};
@@ -16,32 +15,25 @@ use logit_pipeline::Transform;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-/// A hard stack-safety bound on how deep `flatten` will descend into one nested value -- not a
-/// policy cap (there is deliberately no `max_keys`-style config knob bounding how many keys one
-/// value may expand into; see `docs/adr/flatten-transform.md`'s Consequences). Mirrors
-/// `logit_proto::native::value::MAX_VALUE_DEPTH`'s reasoning (a decode-time depth cap exists for
-/// the same reason: unbounded recursion on a hostile or self-similar document is a stack
-/// overflow) at a smaller depth -- this walk also builds a path string and mints a `Symbol` per
-/// level, so it costs more per level than a decode-only walk, and the deepest shape
-/// `docs/design/data-shapes.md`'s survey measured is 5 (CloudTrail's `userIdentity` chain), so
-/// this refuses nothing observed. A value that hits the wall is written back whole, still nested,
-/// at the path reached -- never half-expanded -- and counted
-/// `logit.transform.values.unflattened{reason="max_depth"}`.
+/// A stack-safety bound on recursion depth into one value, not a policy cap.
+///
+/// Like `logit_proto::native::value::MAX_VALUE_DEPTH`, it stops a hostile document overflowing the
+/// stack; it's smaller because each level here also builds a path and mints a `Symbol`. The
+/// deepest shape `docs/design/data-shapes.md` measured is 5, so it refuses nothing observed. A
+/// value that hits it is written back whole at the path reached, never half-expanded, and counted
+/// as `logit.transform.values.unflattened{reason="max_depth"}`.
 const MAX_DEPTH: usize = 32;
 
-/// Mirrors `logit_config::FlattenArrays` -- `logit-transforms` deliberately doesn't depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the same
-/// pattern `Normalize`/`MatchMode` already follow.
+/// Mirrors `logit_config::FlattenArrays`; `logit-cli` converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arrays {
     Index,
     Skip,
 }
 
-/// Which top-level attributes (or resource attributes) to expand -- mirrors
-/// `logit_config::FlattenFields`/`FlattenKeyword`, the config-facing shape [`Flatten::new`]
-/// takes. Compiled once, at construction, into [`CompiledFields`] -- a named entry costs an
-/// `intern` only the one time the component is built, never per event.
+/// Which top-level attributes (or resource attributes) to expand.
+///
+/// Mirrors `logit_config::FlattenFields`/`FlattenKeyword`; compiled once into [`CompiledFields`].
 #[derive(Debug, Clone)]
 pub enum Fields {
     All,
@@ -49,14 +41,11 @@ pub enum Fields {
     Named(Vec<String>),
 }
 
-/// [`Fields`], compiled: a named entry's `Symbol`s, interned once at construction
-/// ([`Flatten::new`]) -- [`crate::KeepValues`]'s `Clamp` reasoning applied to field selection
-/// instead of a value allow-list.
+/// [`Fields`] with named entries interned once, in [`Flatten::new`].
 enum CompiledFields {
     All,
     None,
-    /// Config order, not sorted -- a linear scan beats a set at the sizes this is configured for
-    /// (a handful of named attributes), the same call `Clamp::allow` already makes.
+    /// Config order, scanned linearly: a handful of names beats a set.
     Named(Vec<Symbol>),
 }
 
@@ -84,23 +73,17 @@ impl CompiledFields {
     }
 }
 
-/// Reused across every event/batch this component sees, never reallocated in steady state.
+/// Buffers reused across every event and batch; no reallocation in steady state.
 #[derive(Default)]
 struct Scratch {
-    /// The top-level entries selected for expansion this call, **owned** -- every selected value
-    /// is removed from the map before any of them is expanded, so an expansion can never consume
-    /// a value another selected entry is still waiting on. `AttrMap` has no
-    /// `iter_mut`/`retain`/`drain` and can't be mutated while `iter()` borrows it, so selecting
-    /// and taking are two passes over this one buffer rather than one: a selected entry is pushed
-    /// with a `Value::Null` stand-in that the taking pass replaces. One buffer, not two, so the
-    /// per-call allocation profile is unchanged from collecting bare `Symbol`s.
+    /// This call's selected top-level entries, owned: all are taken out of the map before any is
+    /// expanded (see [`flatten_map`]). Selecting and taking are two passes over this one buffer,
+    /// with a `Value::Null` stand-in between, so it costs no more than collecting bare `Symbol`s.
     pending: Vec<(Symbol, Value)>,
-    /// One buffer for the whole walk; a child path is built by appending onto the parent's and
-    /// truncated back on the way out (`push`/`truncate`, not `format!`), so no allocation happens
-    /// below the buffer's high-water mark.
+    /// The current path, appended to and truncated back (`push`/`truncate`, not `format!`), so
+    /// nothing allocates below its high-water mark.
     path: String,
-    /// `path -> Symbol` memo. A stable input shape produces the same paths in the same order on
-    /// every event, which is exactly `KeyCache`'s steady-state case.
+    /// `path -> Symbol` memo; a stable input shape repeats the same paths in the same order.
     keys: KeyCache,
 }
 
@@ -109,8 +92,7 @@ pub struct Flatten {
     resource_fields: CompiledFields,
     arrays: Arrays,
     scratch: Scratch,
-    /// A one-entry cache of the last resource this component mapped, keyed by `Arc::ptr_eq` on
-    /// the input -- [`crate::KeepValues::map_resource`]'s caching idiom.
+    /// The last `(input, output)` resource pair, matched by `Arc::ptr_eq` on the input.
     cache: Option<(Arc<Resource>, Arc<Resource>)>,
     telemetry: Telemetry,
 }
@@ -127,17 +109,15 @@ impl Flatten {
         }
     }
 
-    /// Attaches a telemetry handle -- see [`crate::Keep::with_telemetry`] for why there's no
-    /// `Diagnostics` builder alongside it: flattening an already-decoded value can't fail.
+    /// Attaches a telemetry handle; flattening a decoded value can't fail, so no `Diagnostics`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
 }
 
-/// Whether a value is worth removing and re-expanding at all -- a non-empty `Map`, or a non-empty
-/// `Array` when arrays expand by index. Everything else (a scalar, an empty container, or an
-/// array under `arrays: skip`) is left exactly where it is, untouched and uncounted.
+/// Whether a top-level value gets removed and expanded: a non-empty `Map`, or a non-empty `Array`
+/// under `arrays: index`. Anything else stays where it is, uncounted.
 fn expandable(value: &Value, arrays: Arrays) -> bool {
     match value {
         Value::Map(m) => !m.is_empty(),
@@ -146,25 +126,18 @@ fn expandable(value: &Value, arrays: Arrays) -> bool {
     }
 }
 
-/// Expands every selected, expandable top-level attribute in `attrs` in place. Shared by
-/// `process` (`event.attributes`) and `map_resource` (a rebuilt `Resource`'s attributes).
+/// Expands every selected, expandable top-level attribute in `attrs` in place, for both event and
+/// resource attributes.
 ///
-/// Three-phase, because `AttrMap` has no `iter_mut`/`retain`/`drain` and can't be mutated while
-/// iterated: phase 1 only *reads* `attrs` to decide which top-level keys to expand, phase 2
-/// removes all of them, and only then does phase 3 expand each in turn.
+/// Three phases, because `AttrMap` has no `iter_mut`/`retain`/`drain` and can't be mutated while
+/// iterated: select (read only), take every selected value out, then expand each.
 ///
-/// Taking every selected value before expanding any of them is what keeps the result independent
-/// of the order [`AttrMap::iter`] happens to yield keys in -- that order is `Symbol` order, which
-/// is process-global first-intern order, not document order, so anything depending on it depends
-/// on what some unrelated component interned first. The case that makes the difference visible is
-/// an event carrying both a nested `a = {"b": 9}` and a literal, still-nested sibling
-/// `a.b = {"x": 1}`: expanding `a` writes a leaf at `a.b`, and were `a.b`'s own value still
-/// sitting in the map at that point it would be overwritten and its subtree lost before it was
-/// ever walked -- and the leaf then removed and rewritten a second time when phase 2 reached the
-/// now-stale entry, counting `logit.transform.values.flattened` twice for one leaf. Taken up
-/// front, both expand from values this function owns and land side by side (`a.b` and `a.b.x`)
-/// whichever is visited first. Two expansions that produce the same final leaf *path* still
-/// collide; that one is `docs/adr/flatten-transform.md`'s deliberate, documented last-write-wins.
+/// Taking all selected values before expanding any keeps the result independent of
+/// [`AttrMap::iter`]'s order, which is process-global intern order, not document order. With a
+/// nested `a = {"b": 9}` and a literal sibling `a.b = {"x": 1}`, expanding `a` first would
+/// overwrite `a.b`'s subtree before it was walked. Taken up front, both land side by side
+/// (`a.b` and `a.b.x`) in either order. Two expansions producing the same leaf path still
+/// collide, last write wins (`docs/adr/flatten-transform.md`).
 fn flatten_map(
     attrs: &mut AttrMap,
     fields: &CompiledFields,
@@ -173,17 +146,15 @@ fn flatten_map(
     telemetry: &Telemetry,
 ) {
     scratch.pending.clear();
-    // Phase 1 -- select. Reads only: the value can't be taken while `iter()` borrows the map, so
-    // `Value::Null` stands in until phase 2 replaces it. A real `Value::Null` is never
-    // `expandable`, so a stand-in can't be confused for selected data.
+    // Phase 1: select. `Value::Null` stands in until phase 2 takes the value; a real `Null` is
+    // never `expandable`, so it can't be confused with a stand-in.
     for (sym, value) in attrs.iter() {
         if fields.selects(sym) && expandable(value, arrays) {
             scratch.pending.push((sym, Value::Null));
         }
     }
-    // Phase 2 -- take. Every selected value leaves `attrs` here, before phase 3 writes anything
-    // back into it. `retain_mut` rather than an `expect`: an entry the map no longer holds is
-    // simply not expanded, instead of being argued impossible in a panic message.
+    // Phase 2: take, before phase 3 writes anything. An entry the map no longer holds is dropped
+    // from `pending` rather than panicking.
     scratch.pending.retain_mut(|entry| match attrs.remove_sym(entry.0) {
         Some(value) => {
             entry.1 = value;
@@ -191,8 +162,7 @@ fn flatten_map(
         }
         None => false,
     });
-    // Phase 3 -- expand. By index, taking each value back out as it goes, because `expand` needs
-    // `scratch` itself and so can't run while `pending` is borrowed.
+    // Phase 3: expand, by index, because `expand` needs `scratch` while `pending` is in it.
     for i in 0..scratch.pending.len() {
         let sym = scratch.pending[i].0;
         let value = std::mem::replace(&mut scratch.pending[i].1, Value::Null);
@@ -202,9 +172,10 @@ fn flatten_map(
     }
 }
 
-/// Recursively writes `value` into `attrs` at `scratch.path`, descending into a `Map`/`Array`
-/// (index mode) up to [`MAX_DEPTH`], and writing everything else -- a genuine leaf, an empty
-/// container, or a value that hit the depth wall -- back whole at the path reached.
+/// Writes `value` into `attrs` at `scratch.path`, recursing into a non-empty `Map`/`Array` (index
+/// mode) up to [`MAX_DEPTH`].
+///
+/// A leaf, an empty container, or a value at the depth bound is written back whole.
 fn expand(
     value: Value,
     depth: usize,
@@ -235,16 +206,13 @@ fn expand(
             for (i, child) in items.into_iter().enumerate() {
                 let mark = scratch.path.len();
                 scratch.path.push('.');
-                // Writes the decimal digits straight into the warm `path` buffer -- no
-                // intermediate `String` the way `format!("{i}")` would allocate one.
+                // Straight into `path`; `format!("{i}")` would allocate a `String`.
                 let _ = write!(scratch.path, "{i}");
                 expand(child, depth + 1, arrays, attrs, scratch, telemetry);
                 scratch.path.truncate(mark);
             }
         }
-        // A genuine leaf (any non-container value), an empty `Map`/`Array` reached mid-walk, or
-        // (via the two `MAX_DEPTH` arms above) a non-empty container that hit the depth wall --
-        // all three are written back whole at the current path.
+        // A non-container value, an empty `Map`/`Array`, or an `Array` under `arrays: skip`.
         leaf => {
             let sym = scratch.keys.get_or_intern(&scratch.path);
             attrs.insert_sym(sym, leaf);
@@ -293,9 +261,7 @@ impl Transform for Flatten {
             &mut self.scratch,
             &self.telemetry,
         );
-        // `dropped_attributes_count`/`schema_url` aren't configurable through `flatten` -- carry
-        // them over from the input resource explicitly, `KeepValues::map_resource`'s reasoning
-        // exactly.
+        // Carry `dropped_attributes_count`/`schema_url` over, as `Set::map_resource` does.
         let out = Arc::new(Resource {
             attributes: attrs,
             dropped_attributes_count: resource.dropped_attributes_count,
@@ -489,7 +455,6 @@ mod tests {
 
     #[test]
     fn a_value_deeper_than_max_depth_is_written_back_whole_and_counted() {
-        // Build a chain nested MAX_DEPTH+2 levels deep so the wall is guaranteed to bite.
         let mut value = Value::I64(1);
         for i in 0..(MAX_DEPTH + 2) {
             let mut m = AttrMap::new();
@@ -502,7 +467,6 @@ mod tests {
         let resource = default_resource();
         let mut event = event_with_attrs(&[("deep", value)]);
         assert!(f.process(&resource, &mut event));
-        // The top-level attribute was removed and rewritten somewhere -- not left at "deep".
         assert_eq!(event.attributes.get("deep"), None);
         assert_eq!(event.attributes.len(), 1, "exactly one attribute survives, wherever it landed");
 
@@ -579,14 +543,9 @@ mod tests {
 
     // -- dotted siblings ----------------------------------------------------------------------
 
-    /// A nested attribute and a literal attribute named after one of the paths it expands into
-    /// are both selected, and neither may destroy the other: expanding `fsib1` writes a leaf at
-    /// `fsib1.b`, which is itself a selected source key whose value is still nested. Both names
-    /// are interned by this test and nowhere else in the crate, so the order `AttrMap::iter`
-    /// yields them in is decided here rather than by whatever the process interned first -- this
-    /// one pins the nested-key-first order, and
-    /// [`the_same_dotted_sibling_pair_survives_in_the_other_intern_order`] the mirror. The result
-    /// must be identical either way.
+    /// With the nested key interned first, expanding `fsib1` into `fsib1.b` doesn't destroy the
+    /// literal `fsib1.b` sibling's subtree. The names are unique to this test, so it controls
+    /// intern (and so iteration) order.
     #[test]
     fn a_nested_attribute_and_a_dotted_sibling_both_survive() {
         let registry = Registry::new();
@@ -614,9 +573,7 @@ mod tests {
         );
     }
 
-    /// [`a_nested_attribute_and_a_dotted_sibling_both_survive`] with the two source keys interned
-    /// in the opposite order, which is the order `AttrMap::iter` -- and so the expansion order --
-    /// follows. Same assertions: the outcome must not depend on it.
+    /// `a_nested_attribute_and_a_dotted_sibling_both_survive` with the intern order reversed.
     #[test]
     fn the_same_dotted_sibling_pair_survives_in_the_other_intern_order() {
         let registry = Registry::new();

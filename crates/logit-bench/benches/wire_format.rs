@@ -2,23 +2,19 @@
 //! (`docs/design/wire-protocol.md`'s "Encoding: decided — hand-rolled",
 //! `docs/adr/native-wire-format-encoding.md`). Run with `script/bench wire_format`.
 //!
-//! Every arm here already passed the fidelity gate in
-//! `crates/logit-bench/tests/wire_format_bakeoff.rs` -- a fast, lossy codec isn't measured here at
-//! all. Two representative shapes ([`Shape::NginxMixed`], the reference mixed workload, and
-//! [`Shape::DistributionHeavy`], the shape that most directly exercises the sketch-carrying claim
-//! this format exists to make) at three batch sizes each, per
-//! `docs/design/memory.md` §0's "don't generalize a measurement from one event shape" and
-//! `docs/design/wire-protocol.md`'s own note that a dictionary amortizes across a batch, so a
-//! 1-event batch is every dictionary-based arm's worst case and a 1000-event batch its best. The
-//! fidelity gate's `representative_batches()` covers the other three shapes (logs-only, wide-JSON,
-//! span) for correctness; narrowed here to keep this bench's run time and output reasonable for a
-//! `script/bench` invocation someone actually reads.
+//! Every arm is held to the fidelity gate in `crates/logit-bench/tests/wire_format_bakeoff.rs`
+//! first (the OTLP control modulo its named degradations); a fast, lossy codec isn't a candidate.
+//! Two shapes: [`Shape::NginxMixed`], the reference
+//! mixed workload, and [`Shape::DistributionHeavy`], the one that most directly exercises the
+//! sketch-carrying claim this format exists to make. Each runs at three batch sizes, because a
+//! dictionary amortizes across a batch (`docs/design/wire-protocol.md`): a 1-event batch is every
+//! dictionary-based arm's worst case and a 1000-event batch its best. The fidelity gate's
+//! `representative_batches()` also covers logs-only, wide-JSON, and span shapes; they are left out
+//! here to keep a `script/bench` run short and its output readable.
 //!
-//! **Encoded size**, not just wall-clock, is reported: `*_encoded_bytes` benches do no timing at
-//! all (`Bencher::bench_local` isn't used) -- they run once and report through `println!`, since
-//! divan has no built-in "report a number, not a duration" mode and this crate's own conventions
-//! (`docs/design/memory.md`) favor exact, reproducible measurements over inventing a fake timing
-//! column for a non-time quantity.
+//! **Encoded size** is reported beside wall-clock: `encoded_bytes` prints sizes through
+//! `println!`, because divan has no "report a number, not a duration" mode. Read its stdout rows,
+//! not its time column.
 
 use divan::{AllocProfiler, Bencher};
 use logit_bench::{bakeoff, fixtures};
@@ -169,11 +165,9 @@ fn postcard_decode_100(bencher: Bencher, shape: Shape) {
 
 // -- encoded size, every arm, every shape and size ---------------------------------------------------
 //
-// Not a timing bench: runs once (`#[divan::bench]` with no `Bencher` parameter runs the function
-// body directly, once per registration) and prints a size table row. `script/bench wire_format`'s
-// own stdout is the report; there's no divan column for "bytes produced", so this is the
-// established `--no-capture` pattern this crate's allocation tests already use for a
-// non-timing number.
+// Not a timing bench: each call prints one size-table row per batch size to stdout, the
+// print-a-number pattern this crate's allocation tests use under `--no-capture`. divan still calls
+// it once per timed iteration, so the (deterministic) rows repeat. Its time column means nothing.
 
 #[divan::bench(args = SHAPES)]
 fn encoded_bytes(shape: Shape) {

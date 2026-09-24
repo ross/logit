@@ -264,457 +264,88 @@ runnable version of the config above is `examples/fan-out-central.yaml`.
 
 ## Validation
 
-`graph::resolve` (`crates/logit-pipeline/src/graph.rs`) runs these rules in order; `logit-cli`'s
-`validate_semantics` (`crates/logit-cli/src/pipeline.rs`) is a thin wrapper around it. Several
-rules share one principle, stated once here and cited by number below: **a config that can only
-be a no-op, a black hole, or an impossible bound is an error**, and so is a setting that would be
+`graph::resolve` (`crates/logit-pipeline/src/graph.rs`) enforces these rules; `logit-cli`'s
+`validate_semantics` (`crates/logit-cli/src/pipeline.rs`) is a thin wrapper around it. The
+canonical list, with each rule's reasoning, is `graph.rs`'s module doc; each rule is enforced at
+its `// Rule N` label in `resolve`. Each entry below names what is rejected; the numbers are
+identifiers, not execution order. Several rules share one principle: **a config that can only be
+a no-op, a black hole, or an impossible bound is an error**, and so is a setting that would be
 silently ignored. `0` for a count or duration bound is usually impossible, not small.
 
-1. At least one component.
-2. Every id in any `sources` list resolves to a defined component.
-3. No self-reference (a component listing itself as a source). This is a special case of 5, with
-   its own message because it's the most common typo shape.
-4. No duplicate source within one component's `sources` list. A repeated id would push the same
-   consumer onto that source's outbound edge list twice, giving its `Fanout` two live `Sender`
-   clones into the same inbox. Every batch would arrive twice, doubling telemetry and every count
-   through an `aggregate` component, instead of being rejected as the typo it almost certainly is.
-5. **No cycles.** A cycle plus bounded `mpsc` channels is a deadlock, not a slow pipeline. The
-   check is Kahn's algorithm; the nodes left unresolved when it runs out of zero-indegree
-   candidates are the cycle *plus* everything downstream of it. The error walks that set back to
-   one concrete cycle path before reporting it, so a downstream victim is never named as part of
-   the cycle.
-6. Arity per kind, per the table above: a listener with `sources`, a sink with none, or a sink
-   named as another component's source is rejected.
-7. Every non-sink component has ≥1 consumer. This catches the silent black hole of a transform
-   whose only consumer was renamed or deleted, still accumulating state or running Lua for
-   nothing.
-8. The kind is implemented — the pre-graph `require_implemented_input`/
-   `require_implemented_output`/`require_implemented_transform` trio, unified into one check over
-   `ComponentKind`.
-9. No zero-length `interval` on any kind that has one (`lua`, `lua_file`, `aggregate`, `internal`,
-   `shape`, `prometheus_in`; `graph.rs`'s `interval()` table).
-10. A `kv_metrics` with `counters`, `gauges`, and `distributions` all empty is rejected: it can only
-    be a no-op, the same silent black hole rule 7 catches.
-11. A `kv_metrics` distribution entry with no `field` is rejected: a distribution of nothing is
-    meaningless (`docs/adr/kv-metrics-semantics.md`).
-12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected, because
-    `influxdb_out` can't encode a metric with no measurement name
-    (`docs/adr/kv-metrics-semantics.md`). (Numbering note: `crates/logit-pipeline/src/graph.rs`'s
-    rule comments no longer match this list one-to-one. The code folds this check under one
-    "Rules 10 + 11" comment with the two above, and reuses the number 12 for `set`'s no-op check.
-    The rules themselves are unchanged.)
-13. At most one `internal` component. Two would each drain, and so split, the same process-wide
-    telemetry `Registry`, silently halving whichever one a consumer wasn't reading.
-14. A non-default `buffer:` block on a non-sink component is rejected. `buffer:`
-    (`docs/adr/buffered-sink-delivery.md`) configures a sink's delivery queue, which only a sink
-    has, so on a listener or transform it is a misplaced block, not a setting to ignore silently.
-15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected: no batch could ever be
-    queued.
-16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]`. Out-of-range is a config
-    error, not something to clamp silently.
-17. A non-default `receive:` block is rejected on any kind that is not one of these:
-    - a **datagram listener** (`docs/adr/decoupled-listener-io.md`): `collectd_in`, and
-      `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`;
-    - a **stream listener** (one shared driver, `docs/adr/syslog-tcp-ingress-and-tls.md` plus
-      `docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment): `syslog_in`/`graphite_in`/
-      `statsd_in` under `transport: tcp`;
-    - a **tail listener** (`docs/adr/file-tailing-and-docker-json-logs.md`): `tail_in`/`docker_in`.
-
-    The rule is deliberately not "any non-listener": `internal` and `generate_in` are listeners by
-    role but have no socket, queue, or decoder, so `receive:` on either would be exactly the
-    silently ignored setting rule 14 guards against on the sink side.
-
-    A tail listener has no receive *queue* (the tailed file is its own durable buffer), so only
-    `receive.batch_max_events`, `batch_max_bytes`, `batch_flush_interval`, and `shutdown_grace`
-    apply. The queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) and
-    `read_batch` — which sizes one `recvmmsg(2)` read and the matching `pop_many` off that queue
-    ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md))
-    — are rejected by name. A stream listener has no receive queue either, for a different reason:
-    the TCP connection's own flow control *is* the backpressure, so a blocked `Fanout::send` stops
-    the socket being read and the peer's window closes. The same five queue fields are rejected by
-    name, with a message that says so, and the four batch/shutdown fields apply **per connection**
-    rather than per listener (N live connections can hold up to N × `batch_max_events` in flight).
-18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, `receive.read_batch`, or
-    `receive.batch_max_events` of `0` is rejected — the twin of rule 15. (`read_batch: 0` is a
-    `recvmmsg` `vlen` of zero, which reads nothing, forever; rule 57 owns its upper end.)
-    `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer." A tail or
-    stream listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way;
-    the queue-only bounds don't apply to either (rule 17).
-19. (The code's numbering has drifted here too; see the note on 12.) A `set` with both `resource`
-    and `attributes` empty is rejected, as is an empty key in either map. A `trace_context` with an
-    empty `trace_id` field name is rejected. Both apply rules 10-12's no-op reasoning to later
-    components (`docs/adr/operator-declared-resource-attributes.md`,
-    `docs/adr/log-record-trace-context.md`).
-20. A `scale` with an empty `fields` map, an empty field name, or a non-finite factor is rejected
-    (`docs/adr/scale-transform.md`).
-21. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected, and
-    `keep_signals`/`drop_signals` also reject naming all three signals. Which of those two shapes is
-    the black hole (no event gets through) and which is the no-op (every event forwarded untouched)
-    is *opposite* between the two kinds: an allowlist naming nothing keeps nothing, and naming
-    everything keeps everything; a denylist is the mirror. Both shapes are rejected, and the error
-    names the right one. `keep`'s empty `fields` list stays legal: "drop every attribute" is a real
-    operation, "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
-22. An `otlp_out` `headers:` entry may not name a header the protocol sets itself (`content-type`,
-    `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any
-    `grpc-*` header, an empty name, or an HTTP/2 pseudo-header starting with `:`), compared
-    case-insensitively.
-23. `otlp_out`'s `paths:` is HTTP-only. gRPC method names are fixed by the `.proto` service
-    definitions, so a non-empty `paths:` under `protocol: grpc` is rejected rather than ignored
-    (rule 14's reasoning).
-24. An `otlp_out` `tls:` block: `cert_file`/`key_file` must be set together (mutual TLS needs
-    both); `insecure_skip_verify` together with `ca_file` is contradictory; and a non-empty `tls:`
-    under a plain `http://`/`grpc://` endpoint is rejected. TLS is selected by `endpoint`'s scheme
-    (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so that block would be silently ignored.
-25. A `trace_context` `span:` block with an empty `name` (OTLP requires every span to have one) or a
-    `max_skew` of `0s` (every span would be rejected as skewed) is rejected
-    (`docs/adr/trace-context-span-lifting.md`). Rule 19 also covers an empty `span_id`/`flags`
-    field name on the same component, since those default to `span.id`/`trace.flags`: `null`
-    disables a lookup, `""` is a typo.
-26. `tail_in`'s `paths:` must name at least one file, no entry may be empty, and a `*` wildcard is
-    allowed only in the final path component (`/var/log/app/*.log`, not `/var/*/app.log`). That is
-    the glob subset `PathPattern` implements; a wildcard in a directory position would silently
-    never match (`docs/adr/file-tailing-and-docker-json-logs.md`).
-27. `docker_in`'s `containers:` must be non-empty or `discover: true` must be set. Explicit
-    selection is the default, so a config with neither would silently tail nothing (rule 7's black
-    hole). `containers:`/`labels:` may not contain an empty entry, `containers:` may not repeat
-    one, and `root:` must be non-empty.
-28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0` is
-    rejected: either interval at `0s` would busy-loop (rule 9's reasoning), and
-    `max_line_bytes: 0` would drop every line (`docs/adr/file-tailing-and-docker-json-logs.md`).
-29. A `file_out` whose `rotate:` block sets neither `max_bytes` nor `interval` is rejected: it would
-    never rotate, and `stdio_out` already covers deliberate never-rotate. `rotate.max_bytes: 0`
-    (every batch would rotate) and `rotate.max_files: 0` (would delete the file it just rotated)
-    are impossible bounds, like rules 9/15/18/28 (`docs/adr/rotating-file-output.md`).
-30. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep` that
-    *contains* `pair_sep` is rejected: each is a certain no-op or a certain garbage result
-    (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule: past `bare_keys`, its only field
-    is a `bool`, which can't be malformed.
-31. A `regex` with an empty `field` name, a `pattern` that fails to compile, or a `pattern` with no
-    named capture group is rejected. The first is useless, the second a config mistake, the third a
-    certain no-op (`docs/adr/regex-transform.md`).
-32. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
-    rejected (the no-op rule, and rule 4's "a repeated entry silently doubles" applied to columns).
-    So is a `delimiter` that is `"` (RFC 4180's quote character), `\n`/`\r` (already consumed as
-    line framing by every input), or non-ASCII (`docs/adr/csv-positional-columns.md`).
-33. `stdio_out`/`file_out`'s `compression:` is rejected when set to anything but `none` under the
-    default `format: human`. Compression is `NativeEncoder`'s knob, so it would do nothing
-    (`docs/adr/file-output-native-format.md`).
-34. A `logit_out` `tls:` block: `cert_file`/`key_file` must be set together, and
-    `insecure_skip_verify` together with `ca_file` is contradictory — rule 24's first two checks.
-    There is no scheme check: `logit_out`'s `endpoint` is a bare `host:port`, so the presence of
-    `tls:` is the only signal and always turns TLS on. Separately, a `logit_in` `max_frame_bytes`,
-    when set, must be nonzero and at most 64 MiB — `logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`,
-    the ceiling `read_frame`/`read_frame_with_header` enforce whatever a listener configures.
-35. A sink's `buffer.disk:` block (`docs/adr/disk-backed-sink-buffer.md`) is rejected alongside a
-    non-default `buffer.max_batches`/`max_bytes`: disk replaces the in-memory bound rather than
-    sizing alongside it, so the set value would be ignored (rule 33's reasoning).
-    `buffer.disk.segment_bytes`/`max_bytes` of `0` are impossible bounds, and `segment_bytes` may
-    not exceed `max_bytes`. Two sinks may not declare the same literal `buffer.disk.path`. The
-    comparison is on the path as written, not resolved against the config directory;
-    `DiskQueue`'s own exclusive lock catches an aliased path the comparison can't see.
-36. `has_attributes`/`drop_attributes`: at least one of `resource`/`attributes` must be non-empty,
-    every key must be non-empty, and every value must be a finite number
-    (`docs/adr/attribute-filtering-components.md`). Which empty config is the black hole and which
-    the no-op is *inverted* from rule 21: `resource:`/`attributes:` is a map of conjunctions, not a
-    list of alternatives, so zero pairs is vacuously true. An empty `has_attributes` matches, and
-    so forwards, every event (a no-op); its exact complement `drop_attributes` also matches every
-    event, and so drops them all (a black hole). The same key in both `resource:` and `attributes:`
-    is legal, because they address different objects.
-37. `has_provenance`/`drop_provenance`: at least one of `origin`/`previous` must be non-empty, and
-    neither list may contain an empty or duplicate entry
-    (`docs/adr/provenance-filtering-components.md`). The empty-config orientation matches rule 36,
-    not rule 21, even though each field is a list of alternatives: an empty `origin:`/`previous:`
-    means "this field isn't part of the match" (vacuously true), not "match zero alternatives". The *field*, not the list,
-    decides. So with both empty, `has_provenance` matches every batch (a no-op) and
-    `drop_provenance` drops every one (a black hole). Deliberately *not* validated: that a
-    configured id names a component in this graph. `origin`/`previous` are as likely to name a
-    component in another process's graph, relayed unchanged across `logit_out`/`logit_in`.
-38. A `statsd_out`, `collectd_out`, or `graphite_out` `max_packet_bytes: 0` is rejected, like rule
-    15: every metric line or value list would overflow and be dropped whole
-    (`docs/adr/statsd-output.md`, `docs/adr/collectd-binary-relay.md`,
-    `docs/adr/graphite-carbon-relay.md`). `collectd_out` also rejects any value outside
-    `1024..=65535`, collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`).
-    Above it every datagram fails `EMSGSIZE` at the socket, which `collectd_out` counts as a
-    per-datagram drop rather than a `Fault`, so it would report `requests{class="ok"}` while
-    delivering nothing. `statsd_out` and `graphite_out` make no range claim in their ADRs, so they
-    keep only the zero check.
-39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
-    windows, not a duration) and `max_retained_series >= 1`. Those bounds keep a running total
-    alive across the window boundary; with either at `0`, no accumulator survives a flush and each
-    window would emit its own increment labeled as a cumulative total. `series_retention: 0` stays
-    legal under the default `temporality: delta`, where it is the documented opt-out from gauge
-    retention (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
-40. A **scrape-mode** `prometheus_in`'s scrape settings. The rule applies only when
-    `scrape_targets` is non-empty and says nothing about a `bind:` receiver; rule 55 owns the mode
-    itself, including the neither-mode case
-    ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)).
-    - Each `scrape_targets` entry must be an absolute `http://`/`https://` URL with a non-empty
-      authority. `logit-pipeline` doesn't depend on `reqwest`/`url` (see "Crate layout"), so this
-      is a small hand-rolled scheme/authority check, not a full URL parse.
-    - `timeout: 0s` is rejected (rule 9's reasoning; rule 9 itself covers `interval: 0s`).
-    - A `scrape_tls:` block must have `cert_file`/`key_file` together and no
-      `insecure_skip_verify` alongside `ca_file` (rule 24's checks, as rule 34 makes for
-      `logit_out`). It is rejected outright unless at least one target is `https://`: TLS is
-      selected per target by scheme, so the block would otherwise be silently ignored (rule 24's
-      third check).
-    - `headers` may not name a header this input sets itself (`accept`, `user-agent`, and the
-      other protocol-owned names) or collide with another entry, compared case-insensitively —
-      rule 22's check for `otlp_out` (`docs/adr/prometheus-scrape-and-exposition.md`).
-
-    `receive:` on `prometheus_in` is rejected by rule 17: it's a listener by role, but uses neither
-    driver that rule permits.
-41. A `prometheus_out` `path:` must start with `/`, and `max_series` must be ≥ 1
-    (`docs/adr/prometheus-scrape-and-exposition.md`). A request URI's path is always absolute, so
-    a relative or empty `path:` could never match and every scrape would 404 against an endpoint
-    that looks configured. `max_series: 0` would evict every series on arrival, leaving the
-    endpoint always empty (rule 38's impossible bound).
-42. A `generate_in`'s bounds and templates (`docs/plans/load-test-harness.md`):
-    - `count`, `batch`, and `rate` must each be at least 1 where set. `0` generates nothing;
-      omitting `count`/`rate` is how "unbounded"/"unthrottled" is written.
-    - A `metric` must have a non-empty `name` and a finite `value`. No `event.attributes` or
-      `resource` key may be empty.
-    - Every template string — `event.log`, every `event.attributes` value, every `resource`
-      value, and `event.metric.name` — must parse as a `logit_core::template` and may name only the
-      placeholders `generate_in` substitutes: `seq`, or `seq%N` with `N >= 1`. An unknown
-      placeholder is rejected rather than rendered literally or as nothing, because a mistyped
-      `{seg}` would silently collapse a scenario's cardinality to one series — the difference
-      between measuring an aggregation window and measuring nothing.
-    - **`event.metric.name` allows only `{seq%N}`, never a bare `{seq}`.** A metric name is
-      *interned*, and `logit_core::interner` never removes a `Symbol` (`docs/design/memory.md`
-      §4), so an unbounded name would leak one never-reclaimed entry per generated event. A log
-      body or attribute value is copied onto the event and freed with it, so `{seq}` is legal
-      there.
-
-    The placeholder check lives in a small pure `generate_var_is_valid` helper in `graph.rs`, so
-    `logit-inputs`' own `compile` resolver can mirror it exactly without depending on
-    `logit-config` (see "Crate layout"). `receive:` on a `generate_in` is rejected by rule 17: it
-    has no socket, queue, or decoder for `receive:` to configure.
-43. A listener with a `tls:` block must use a stream transport: `transport: tcp` on a `syslog_in`
-    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), a `graphite_in`
-    ([ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s 2026-09-14 amendment, which
-    put it on the same driver), or a `statsd_in` (the syslog ADR's own amendment, the driver's
-    third listener). TLS needs a reliable, ordered byte stream, and its datagram sibling DTLS is
-    out of scope throughout this project (RFC 6012 for syslog; neither carbon nor statsd has a DTLS
-    receiver), so a `tls:` block under `transport: udp` could never take effect. It is rejected,
-    as rule 24 rejects a `tls:` block under a plaintext `otlp_out` endpoint: an operator who wrote
-    one meant the connection encrypted, and running it in the clear anyway is the worst outcome.
-    A plaintext TCP listener is unaffected.
-
-    **One rule, not one per listener.** The check, message, and reasoning are identical on every
-    kind; only the kind's `transport` spelling differs. A listener that gains a stream transport
-    joins by adding an arm to this rule's match, not by taking a new rule number. The *sink* rules
-    (24/34/44/52) are the opposite, one per sink, because each also checks that sink's own `tls:`
-    internals.
-44. A `syslog_out` `tls:` block must have `cert_file`/`key_file` together and no
-    `insecure_skip_verify` alongside `ca_file` — rule 34's two checks for `logit_out` (and rule
-    24's for `otlp_out`). As with `logit_out`, the endpoint is a bare `host:port`, so the presence
-    of `tls:` is the only "TLS is wanted" signal and there's no wrong-scheme case. One check is
-    unique to this rule: `tls:` together with `transport: udp` is rejected
-    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS is
-    RFC 5425, TLS over *TCP*, and DTLS is out of scope, so accepting the block would leave an
-    operator who asked for encryption on a plaintext datagram socket.
-    `logit_outputs::syslog::SyslogOutput::with_tls` re-checks that last one itself, since
-    `graph::resolve` isn't the only possible caller.
-
-45. A `handshake_timeout` must be greater than `0s` on every kind that has one — `syslog_in`,
-    `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` — and must stay at its default where it can
-    never take effect: a `syslog_in`, `graphite_in`, or `statsd_in` with `transport: udp`.
-    - `0s` is impossible, not tight: no TLS accept, first-byte read, or `Hello` read completes in
-      zero time, so the listener would close every connection immediately and receive nothing
-      (rules 9/15/18/28).
-    - The UDP check is rule 43's reasoning applied to this field, in rule 33's "only means
-      anything under X" shape: a UDP listener has no connection to hand shake, so a set value
-      would be silently ignored.
-    - Only a *non-default* value is rejected, so the default stays legal everywhere. `graph.rs`
-      imports `logit_config::default_handshake_timeout` to tell the two apart rather than
-      mirroring the number, and `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine`
-      deserializes a real config rather than constructing the variant, so it exercises the same
-      `serde` defaulting path the comparison must agree with.
-
-    **`otlp_in` appears only in the `0s` check.** Its budget bounds both the TLS accept and the
-    wait for a plaintext connection's first byte — a `TcpStream::peek` under the same budget,
-    which consumes nothing and so leaves hyper's own version sniff untouched
-    (`crates/logit-inputs/src/otlp.rs`,
-    [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)'s
-    2026-09-14 amendment). The value is live with or without `tls:`, so there's no context to
-    reject it in.
-
-46. A `graphite_in`'s and `graphite_out`'s protocol/transport pair and size bounds
-    ([ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)):
-    - `protocol: pickle` requires `transport: tcp` on both kinds. Carbon frames a pickle batch
-      with a 4-byte big-endian length prefix (Twisted's `Int32StringReceiver`), which has no
-      meaning inside a self-delimiting datagram, so the combination could only mis-frame.
-    - A zero `max_line_bytes` (`graphite_in`, plaintext+tcp), `max_frame_bytes` (either kind,
-      pickle), or `connect_timeout` (`graphite_out`, tcp) is rejected. `max_line_bytes: 0` would
-      drain every byte as one endless oversize line; `max_frame_bytes: 0` couldn't fit even
-      carbon's two-opcode empty-list pickle frame; `connect_timeout: 0s` could never connect.
-    - `max_frame_bytes` must be within `1024..=16 MiB` on both kinds. Below 1024 no real carbon
-      batch fits; above 16 MiB a frame's *declared* length is a larger allocation than any sender
-      has reason to ask for. This is rule 38's "a bound the transport can't honestly carry is a
-      silent failure, not a generous setting," applied to a length-prefixed frame.
-    - `graphite_out`'s `max_packet_bytes: 0` is rule 38's zero check. There is no collectd-style
-      range clamp: an oversize packed datagram is already counted `oversize_datagram` and skipped,
-      as in `statsd_out`'s `EMSGSIZE` handling.
-47. A non-empty `targets:` is legal only on a `lua`/`lua_file` component
-    ([ADR `target-components`](../adr/target-components.md)); on any other kind it is rejected by
-    name (rule 14's shape). A `route` declares its targets through `routes:`' values, and no other
-    kind can direct an event anywhere, so the list would be silently ignored.
-48. Every id in `graph::targets_of` — a `lua`/`lua_file`'s `targets:` entries, a `route`'s
-    `routes:` values — must resolve to a defined component, must not be the router itself, and must
-    name a `target` kind. Directing at an ordinary component would be a `sources:` entry written on
-    the wrong side of the edge (the inversion ADR `component-graph-configuration`'s "named outlets"
-    rejection was about), and the message says so. A `lua`/`lua_file` `targets:` list may not
-    repeat an id (rule 4, one hop over: two `Fanout`s into one target would deliver every routed
-    batch twice). A `route` mapping several `routes:` values onto one target is legal and collapses
-    to one slot; that many-to-one is what the kind is for. Rule 51's `routes:` shape checks run
-    *before* this rule, so an empty `routes:` value is reported as empty rather than as an
-    unresolved target id.
-49. A `target` declares no `sources`: routers feed it, and it never names anything itself (checked
-    in rule 6's arity match). Rule 7 still requires at least one consumer, and at least one router
-    must direct at it — rule 7's mirror, since a target nothing routes to is the same black hole
-    from the other end, and its consumers would wait forever.
-50. Rule 7 is relaxed for routers only: a component with a non-empty `graph::targets_of` may have
-    no consumers. A router's ordinary consumers receive its *unrouted* events, so without any those
-    events are dropped and counted (`logit.component.events.dropped{reason="unrouted"}`), never
-    silently.
-51. A `route` needs a non-empty `routes:` map (rules 10/20's no-op reasoning), with no empty key
-    (it could never match a real value) and no empty value (it could never name a real target).
-    Under `by: {attribute: k}`/`{resource: k}`, `k` must be non-empty (rules 19/20's empty field
-    name, applied to the one key a `route` reads).
-52. A `statsd_out` `tls:` block gets rule 44's three checks, with its messages verbatim:
-    `cert_file`/`key_file` together, no `insecure_skip_verify` alongside `ca_file`, and no `tls:`
-    together with `transport: udp`, since DTLS is out of scope here too
-    ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment). This sink also dials a bare
-    `host:port`, where `tls:`'s presence is the only "TLS is wanted" signal. It is one rule per
-    *sink* (24/34/44/52), unlike rule 43, because each sink also checks its own `tls:` internals.
-    `logit_outputs::statsd::StatsdOutput::with_tls` re-checks the `transport: udp` case itself,
-    since `graph::resolve` isn't the only possible caller.
-53. An `idle_timeout`, where set, must be greater than `0s` on every kind that has one —
-    `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in`, `prometheus_in` — and must not
-    be set at all where it can never take effect: a `syslog_in`, `graphite_in`, or `statsd_in` with
-    `transport: udp`, which has no connection to time out
-    ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)). `0s` is impossible for a
-    different reason than in rule 45: a connection is idle whenever the listener waits for its next
-    byte, so a zero budget would close each one the moment it paused. The UDP check is rule 43's
-    reasoning in rule 45's shape.
-
-    **One rule, six kinds, and no default to exempt.** Like rule 43, and unlike the per-sink rules
-    24/34/44/52, the check, message, and reasoning are identical on every kind, so a listener joins
-    by adding an arm to the match. Unlike rule 45's `handshake_timeout`, this field is an `Option`:
-    absent *is* "no idle timeout", so every `Some` is a set value and the UDP check rejects any of
-    them. That is also why the zero message names the fix — "omit the field to disable the idle
-    timeout" — rather than a legal value. `prometheus_in` has the field for its `bind:` receiver
-    only. In *scrape* mode there is no connection to time out either, but that is a wrong-*mode*
-    field rather than a wrong-*transport* one, so rule 55 rejects it instead of this rule growing
-    a second axis.
-54. A `keep_values` with neither `resource` nor `attributes` configured is rejected (rule 12's
-    no-op reasoning), as is an empty field name in either map (rules 19/20). An empty `allow` list
-    is rejected, and the message names the alternatives: `set` (with `other:`) or `remove`
-    (without it) already mean "clamp everything on this field." A non-finite `F64` literal in
-    `allow`/`other` is rejected (rule 36), since it could never compare equal under the coercing
-    matcher. Under a field's `normalize: [lower]`, a `Str` literal in `allow`/`other` that isn't
-    already ASCII-lowercase is rejected by name, because `lower` could never produce it; a
-    duplicate step in one `normalize:` list is rejected as a no-op. An *empty* `normalize:` list is
-    legal: it's the default, meaning no normalization
-    ([ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md)).
-55. A `prometheus_in` is in exactly one mode, and every field must belong to the mode it's written
-    under ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A non-empty
-    `scrape_targets:` makes it a scrape client; `bind:` makes it a remote-write receiver accepting
-    1.0 and 2.0 on one listener. Both is two components' config in one, and neither is a listener
-    that can never produce an event (rules 7/12's no-op reasoning); each fails with a message
-    rather than a process listening on nothing.
-    - A non-default `interval`, `timeout`, `headers`, or `scrape_tls` alongside `bind:` is
-      rejected, because a receiver performs no scrape.
-    - A non-default `path`, `bind_tls`, `idle_timeout`, or `metadata_cache` alongside
-      `scrape_targets:` is rejected: a scrape client binds nothing, and it reads the `# TYPE` line
-      in every response instead of remembering one.
-
-    This is rules 45 and 53's shape one kind over, for their reason: a setting that silently does
-    nothing is worse than a startup failure naming it. Only *non-default* values are rejected,
-    which lets `interval` keep its default in bind mode and satisfy rule 9's `interval: 0s`
-    rejection without a mode-specific carve-out. In bind mode, `path` must start with `/` (rule
-    41's check and reason: a relative or empty path could never match, and every write would `404`
-    against a listener that looks configured). `metadata_cache.ttl` must be greater than `0s` (rule
-    9's reasoning: an entry that expires as it's written makes a cache that does nothing but still
-    sweeps on every request). `metadata_cache: {max_families: 0}` is how the cache is turned off,
-    so that pairing, where `ttl` governs nothing, is the one case the zero check allows.
-
-56. A `prometheus_out` has exactly one of `bind:` (serve an exposition) and `endpoint:` (write to a
-    remote-write receiver) — never both, never neither
-    ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A **non-default** value
-    of a field that belongs to the other mode is rejected rather than ignored: `path`,
-    `expire_after`, or `max_series` alongside `endpoint:`; `version`, `timeout`, `headers`, or
-    `endpoint_tls` alongside `bind:`. This is rules 45 and 53's shape and reason, and like rule 45
-    it compares against `logit_config`'s own default functions rather than mirroring their values,
-    so the default stays legal in both modes. Rule 41's `path`/`max_series` checks run in registry
-    mode only, for the same reason: two rules with one gate each, rather than rule 41 taking on a
-    second job. In sender mode the remaining checks are rule 40's, restated for this kind:
-    - `endpoint` must be an absolute `http://`/`https://` URL, path included (a remote-write
-      receiver's write path, typically `/api/v1/write`, goes there, not in `path:`).
-    - `timeout: 0s` is rejected (rule 9's reasoning).
-    - `headers` may not be empty-named, `:`-prefixed (an HTTP/2 pseudo-header), collide with
-      another entry once case is ignored, or name one this output sets itself: `content-type`,
-      `content-encoding`, `content-length`, `x-prometheus-remote-write-version`, `user-agent`, the
-      five in `graph::RESERVED_REMOTE_WRITE_HEADERS`.
-    - The `endpoint_tls:` block must have `cert_file`/`key_file` together and no
-      `insecure_skip_verify` alongside `ca_file` (rules 24/34/44/52's two checks, since it is a
-      sink's own TLS block).
-    - A non-default `endpoint_tls:` under a plain `http://` endpoint is rejected — rule 40's
-      *scheme* check, since the endpoint's scheme selects TLS and the block would be ignored.
-57. A datagram listener's `receive.read_batch` above `1024` is rejected
-    ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
-    `read_batch` is `recvmmsg(2)`'s `vlen`, and `1024` is `UIO_MAXIOV`'s value, but the ceiling is
-    `logit`'s, not the kernel's: `do_recvmmsg` clamps no `vlen` at all (`UIO_MAXIOV` bounds
-    `msg_iovlen` within one `msghdr`, which this read path sets to 1). The ceiling bounds the
-    per-listener receive slab and the loss on the shutdown path, which both grow linearly with
-    `read_batch`. Rule 18 owns the `0` end, the same split those two rules have for
-    `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
-    **legal**: `push_many` handles a batch bigger than the whole queue (evict or block per policy,
-    per item, exactly as a sequence of single `push` calls would), so a rule against it would only
-    refuse a configuration that works. The rule covers datagram listeners only: rule 17 already
-    rejects a non-default `read_batch` on every other kind, so any other kind reaching this check
-    has the default and passes.
-58. A `shape`'s `max_tracked_keys` or `max_tracked_keysets` of `0` is rejected
-    ([ADR `shape-observer-component`](../adr/shape-observer-component.md)), the impossible-bound
-    shape of rules 9/15/18/28/45. A cap of `0` tracks nothing, so `logit.shape.distinct_keys` and
-    `.distinct_keysets` would read `0`, and `logit.shape.tracking_overflow` `1`, forever. There is
-    deliberately no way to turn the table off: the cumulative gauges are half of what `shape` is
-    for, so an operator who doesn't want them removes the component. `shape`'s `interval` is
-    covered by rule 9.
-59. A `flatten` with `attributes: none` and `resource: none` is rejected (rules 7/12/54's no-op
-    reasoning). An empty named list on either field is rejected, and the message names both
-    keywords: `none` means nothing, `all` means every nested attribute. An empty field name in a
-    named list is rejected (rules 19/20/54), and so is a name repeated within one list (no-op).
-    `attributes: all` (the default) and a field name containing `.` are deliberately legal: the
-    former is the useful default, and the latter names a literal attribute, as rule 54's
-    `keep_values` fields may ([ADR `flatten-transform`](../adr/flatten-transform.md)).
-60. `http_access` validation
-    ([ADR `http-access-normalization`](../adr/http-access-normalization.md)):
-    - Every `routes[].match` and `user_agent_rules[].match` must compile as a regex (rule 31).
-    - An empty `match`, `route`, `class`, `route_other`, or `redact_query` entry is rejected (rules
-      19/20/54). An empty `match` would match every path and hide every rule after it.
-    - Each `routes` entry must be exactly `builtin`, or `match` together with `route`. The error
-      names the missing half or the extra key, which is why an entry is one flat struct rather
-      than an untagged enum (whose failure names no key). A repeated `builtin:` set is rejected,
-      because the second can never match anything the first didn't.
-    - A `max_length` key must name a field in `logit_config::CAPPED_FIELDS`, and the error lists
-      them; a limit of `0` is rejected (rules 9/15/18/58).
-    - `forwarded: {trust: false}` is rejected in favor of omitting the block, so "don't trust
-      `X-Forwarded-For`" has one spelling.
-
-    There is deliberately **no** "nothing configured" clause: a bare `type: http_access` still
-    coerces, caps, derives, and classifies with the built-in tables.
-61. `sample` validation
-    ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)):
-    - `rate` must be finite and within `[0, 1]` (rule 16's reasoning, since `sampling::keep`
-      shares `trace_is_sampled`'s "NaN keeps everything" fallback).
-    - `rate: 1` is rejected (it keeps every event), and so is `rate: 0` without `always_keep` (it
-      keeps nothing — that's `null_out`); rules 7/12/54/59's no-op reasoning. `rate: 0` *with*
-      `always_keep` is the "only flagged events" debugging mode and is allowed.
-    - An empty `key:` or `always_keep:` field name is rejected (rules 19/20).
-    - `always_keep` must name exactly one of `attribute`/`resource`, and a non-finite
-      `always_keep.value` is rejected, since it can never match anything (rules 36/54).
-    - `missing:` without `key:` is rejected: there's no key to be missing.
+1. No components at all.
+2. A `sources` id naming no defined component.
+3. A component listing itself as a source.
+4. A repeated id in one `sources` list, which would deliver every batch twice.
+5. A cycle, through `sources` or router -> target edges; the error names one concrete cycle.
+6. Wrong arity for the kind's role (the table above), or a sink named as a source.
+7. A non-sink component with no consumer.
+8. A kind that isn't implemented.
+9. A zero `interval` on a kind that has one.
+10. A `kv_metrics` with no counters, gauges, or distributions.
+11. A `kv_metrics` distribution with no `field`, or an entry with an empty `name`.
+12. A `set` with neither `resource` nor `attributes`, or with an empty key.
+13. More than one `internal` component.
+14. A non-default `buffer:` on a non-sink.
+15. A sink `buffer.max_batches` or `buffer.max_bytes` of `0`.
+16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`.
+17. A non-default `receive:` outside a datagram, stream, or tail listener, or a receive-queue field
+    on a stream or tail listener.
+18. A `0` receive-queue or batch-assembly bound (`batch_flush_interval: 0s` is legal).
+19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name.
+20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
+21. An empty `signals:` list, or all three signals on `keep_signals`/`drop_signals`.
+22. An `otlp_out` header the transport sets itself, or two that differ only in case.
+23. An `otlp_out` `paths:` under `protocol: grpc`.
+24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.
+25. A `trace_context` `span:` with an empty `name` or a `0s` `max_skew`.
+26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component.
+27. A `docker_in` that would tail nothing, or with an empty or duplicate entry or an empty `root`.
+28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
+29. A `file_out` that would never rotate, or a `rotate.max_bytes`/`max_files` of `0`.
+30. A `kv` with an empty, identical, or overlapping `pair_sep`/`kv_sep`.
+31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named group.
+32. A `csv` with no `columns`, an empty or duplicate column name, or an unusable `delimiter`.
+33. A `stdio_out`/`file_out` `compression:` outside `format: native`.
+34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
+35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
+    `disk.path`.
+36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
+    value.
+37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
+    An id isn't checked against this graph: it may name a component in another process.
+38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, or a `collectd_out`
+    value outside `1024..=65535`.
+39. A cumulative `aggregate` with a `series_retention` or `max_retained_series` of `0`.
+40. A scrape-mode `prometheus_in` with a bad target URL, `timeout: 0s`, a bad `scrape_tls:`, or a
+    reserved or colliding header.
+41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
+42. A `generate_in` count of `0`, an empty key or metric name, a non-finite metric value, or an
+    unknown or unbounded template placeholder.
+43. A `tls:` on a UDP `syslog_in`, `graphite_in`, or `statsd_in`.
+44. An inconsistent `syslog_out` `tls:`, or one under `transport: udp`.
+45. A `0s` `handshake_timeout`, or a non-default one on a UDP listener.
+46. A `graphite_in`/`graphite_out` pickle over UDP, a zero size or timeout bound, or an
+    out-of-range `max_frame_bytes`.
+47. A `targets:` list on anything but `lua`/`lua_file`.
+48. A router target that is unresolved, the router itself, or not a `target`, or a repeated `lua`
+    target.
+49. A `target` with `sources`, or one no router directs to.
+50. Not a rejection: a router is exempt from rule 7.
+51. A `route` with no `routes:`, an empty key or value, or an empty `by:` key.
+52. An inconsistent `statsd_out` `tls:`, or one under `transport: udp`.
+53. A `0s` `idle_timeout`, or any `idle_timeout` on a UDP listener.
+54. A `keep_values` with nothing configured, an empty name or `allow`, a non-finite literal, a
+    literal `normalize: [lower]` can't produce, or a repeated step.
+55. A `prometheus_in` with both or neither mode, or a field set for the other mode.
+56. A `prometheus_out` with both or neither mode, a field set for the other mode, or a bad sender
+    setting.
+57. A datagram listener's `receive.read_batch` above 1024.
+58. A `shape` `max_tracked_keys` or `max_tracked_keysets` of `0`.
+59. A `flatten` that selects nothing, or has an empty list or an empty or repeated name.
+60. An `http_access` with an empty or invalid pattern, an empty label, a malformed or repeated
+    route rule, a bad `max_length`, or `forwarded: {trust: false}`.
+61. A `sample` rate outside `[0, 1)` (`0` needs `always_keep`), an empty field name, a malformed
+    `always_keep`, or `missing:` without `key:`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

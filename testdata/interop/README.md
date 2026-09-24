@@ -1,31 +1,43 @@
 # Recorded interop fixtures
 
-Real wire traffic captured once from real third-party producers (syslog senders, collectd, OTel
-SDKs, carbon senders, Prometheus, statsd/DogStatsD clients) and committed here, so `logit`'s
-decoders (`crates/logit-inputs/src/syslog.rs`, `crates/logit-inputs/src/statsd.rs`,
-`crates/logit-proto/src/collectd/`,
-`crates/logit-proto/src/otlp/`, `crates/logit-proto/src/graphite/`,
-`crates/logit-proto/src/prometheus/remote_write.rs`) get checked against what those producers
-actually put on the wire -- not only against this team's own reading of RFC 3164/5424, collectd's
-`network.c`, the OTLP spec or the remote-write spec, and not only against `logit`'s own encoder,
-which will happily agree with itself even if both sides share the same misunderstanding. See
-[`docs/plans/recorded-interop-fixtures.md`](../../docs/plans/recorded-interop-fixtures.md)
-for the full design and rationale; this file and the ones below it are the provenance record
-[ADR `committed-pregenerated-otlp-protobuf`](../../docs/adr/committed-pregenerated-otlp-protobuf.md)
-and `testdata/tls/README.md` both establish for committed, regeneratable test artifacts.
+This directory holds real wire traffic, captured once from real third-party producers and
+committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus, and
+statsd/DogStatsD clients. The fixtures check `logit`'s decoders against what those producers put on
+the wire:
 
-**Not used at runtime** -- nothing under `crates/` reads this directory outside `#[cfg(test)]`
-code, same as `testdata/tls/`.
+- `crates/logit-inputs/src/syslog.rs`
+- `crates/logit-inputs/src/statsd.rs`
+- `crates/logit-proto/src/collectd/`
+- `crates/logit-proto/src/otlp/`
+- `crates/logit-proto/src/graphite/`
+- `crates/logit-proto/src/prometheus/remote_write.rs`
+
+Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
+`network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
+and decoder that share a misunderstanding agree with each other and pass.
+
+For the design and rationale, see
+[`docs/plans/recorded-interop-fixtures.md`](../../docs/plans/recorded-interop-fixtures.md). This
+file and the READMEs below it are the provenance record for committed, regeneratable test
+artifacts that [ADR `committed-pregenerated-otlp-protobuf`](../../docs/adr/committed-pregenerated-otlp-protobuf.md)
+and `testdata/tls/README.md` both establish.
+
+**Not used at runtime.** Nothing under `crates/` reads this directory outside `#[cfg(test)]` code,
+the same as `testdata/tls/`.
 
 ## Layout
+
+Each subdirectory has a README with a provenance table for its fixtures.
 
 ```
 testdata/interop/
   syslog/README.md     -- provenance table for syslog/*.raw
-  syslog/*.raw         -- raw captured UDP datagrams, exactly as received, one file per message
+  syslog/*.raw         -- raw captured syslog messages, exactly as received, one file per message:
+                          UDP datagrams, plus one TCP connection stream (rsyslog-tcp-000.raw)
   collectd/README.md   -- provenance table for collectd/*.raw
   collectd/*.raw       -- raw captured UDP datagrams from collectd's own binary `network` plugin,
-                          one file per datagram (each one packs many value lists)
+                          one file per datagram (each collectd-00N.raw packs many value lists;
+                          collectd-notification-000.raw carries a `threshold` notification)
   otlp/README.md       -- provenance table for otlp/*.json
   otlp/*.json          -- OTLP/JSON as re-emitted by the Collector's own `file` exporter
   graphite/README.md   -- provenance table for graphite/*.raw
@@ -47,58 +59,72 @@ testdata/interop/
                           `crates/logit-cli/tests/fixtures/statsd/` deliberately don't
 ```
 
-`syslog/*.raw`/`collectd/*.raw`/`graphite/*.raw`, `otlp/*.json` and `prometheus/*.bin` are captured
-differently on purpose, not inconsistently -- an HTTP exchange needs a response before the sender
-will send anything more, so the Prometheus corpus comes from `raw_capture.py --proto http`, which
-answers `204`, rather than from the read-only UDP/TCP sinks the `*.raw` corpora use. See each
-subdirectory's own README for the rest.
+The capture methods differ on purpose. The `*.raw` corpora come from read-only UDP and TCP sinks.
+The Prometheus corpus (`prometheus/*.bin`) comes from `raw_capture.py --proto http`, which answers
+`204`, because an HTTP sender won't send another request until it gets a response. The OTLP corpus
+(`otlp/*.json`) is the Collector's own re-emitted output. Each subdirectory's README has the
+details.
 
 ## Regenerating
 
-`script/record-fixtures [producer ...]` -- see that script's own header comment for the full
-producer list and how to add one. Like `script/protogen` and `testdata/tls/regen.sh`, this is a
-**deliberate, reviewed act**, not part of `script/cibuild`: it pulls real third-party images from
-Docker Hub/ghcr.io and runs them against the internet-facing package mirrors those images
-themselves use (the `rsyslog` and `collectd` producers each do a fresh `apt-get install` every run,
-and the `statsd` producer a fresh `pip install`), which is exactly the kind of non-determinism CI
-should never re-run on every push. Run it by hand, read `git diff testdata/interop/` (`git diff
---stat` for `collectd/*.raw`, which is the one genuinely binary corner of this directory), and
-commit.
+Run `script/record-fixtures [producer ...]`. That script's header comment lists every producer and
+explains how to add one.
 
-Re-running won't reproduce these exact bytes -- container hostnames, timestamps, trace/span ids,
-every value collectd actually measured, and (for OTLP) telemetrygen's synthetic attribute values
-all change between runs; collectd's own packing even changes how many value lists land in which
-datagram, so the *file sizes* move too. That's expected and fine: the point of a fixture is that
-it's *a* real capture from *a* real producer, not a byte-stable golden file: see "Consuming these
-fixtures" below.
+Recording is a **deliberate, reviewed act**, not part of `script/cibuild`, like `script/protogen`
+and `testdata/tls/regen.sh`. It pulls real third-party images from Docker Hub and ghcr.io, and runs
+them against the internet-facing package mirrors those images use: the `rsyslog`, `collectd`, and
+`graphite` producers each run a fresh `apt-get install`, and the `statsd` producer a fresh
+`pip install`. CI shouldn't repeat that non-determinism on every push.
+
+To regenerate:
+
+1. Run `script/record-fixtures` by hand.
+2. Review `git diff testdata/interop/`. For the binary fixtures (`collectd/*.raw`, the graphite
+   pickle captures, and `prometheus/*.bin`), use `git diff --stat`.
+3. Commit.
+
+A re-run doesn't reproduce these exact bytes. Container hostnames, timestamps, trace and span IDs,
+every value collectd measured, and telemetrygen's synthetic OTLP attribute values all change
+between runs. collectd's packing also changes which value lists land in which datagram, so file
+sizes move too. That's expected: a fixture is *a* real capture from *a* real producer, not a
+byte-stable golden file. See [Consuming these fixtures](#consuming-these-fixtures).
 
 ## Size discipline
 
-Every fixture here is a handful of syslog datagrams, one collectd datagram, or a few KB of
-OTLP/JSON -- there's no reason for one to be bigger. As a rule of thumb: **a few hundred bytes per
-syslog fixture, ~1.3 KB per collectd fixture -- one packed datagram, just under collectd's
-1452-byte `MaxPacketSize` -- low
-single-digit KB per OTLP fixture, ~12 KB for the whole statsd corpus (56 small datagrams, and it
-needs several because its subject is the *distribution* of datagram sizes rather than one message
-shape), and this whole directory should stay well under 100 KB total**
-(it's a few KB as of this writing). If a producer's natural output is bigger than that (a verbose
-OTLP payload with many spans, say), trim it at record time -- `script/record-fixtures`'s OTLP
-producer already does this (`--traces=3`/`--logs=3`/`--metrics=3`, not an open-ended `--duration`)
-rather than committing everything a producer happens to emit. This corpus exists to exercise
-decoder *paths*, not to be a load-testing dataset -- one or two representative messages per
-construct is the right size, and a growing per-fixture size is a sign something needless is
-creeping in (padding, verbose repeated attributes, an accidentally-large `--count`).
+This corpus exercises decoder *paths*; it isn't a load-testing dataset. One or two representative
+messages per construct is the right size. Keep fixtures to these rough sizes:
+
+- **syslog:** a few hundred bytes per fixture.
+- **collectd:** ~1.3 KB per value-list fixture, one packed datagram just under collectd's
+  1452-byte `MaxPacketSize`.
+- **OTLP:** low single-digit KB per fixture.
+- **statsd:** ~12 KB for the whole corpus. It needs 56 small datagrams, because its subject is the
+  *distribution* of datagram sizes rather than one message shape.
+- **Whole directory:** well under 100 KB total. As of 2026-09-23, the fixtures, excluding READMEs,
+  total about 34 KB.
+
+If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
+at record time instead of committing everything the producer emits. `script/record-fixtures`'s
+OTLP producer does this with `--traces=3`/`--logs=3`/`--metrics=3` instead of an open-ended
+`--duration`. A growing per-fixture size signals something needless creeping in, such as padding,
+verbose repeated attributes, or an accidentally large `--count`.
 
 ## Consuming these fixtures
 
-Tests that read these files should assert on **identifiable decoded values** (the message content,
-a hostname, a trace id, a span name) rather than on the raw bytes changing or not changing --
-see `crates/logit-inputs/src/syslog.rs`'s, `crates/logit-inputs/src/collectd.rs`'s and
-`crates/logit-inputs/src/graphite/mod.rs`'s `interop_fixture_*` tests for the pattern (the
-collectd ones assert a list's data-source count and kinds, its `collectd.*` identity and its
-interval; the graphite ones assert a decoded path prefix, that every kind is a bare `Gauge`, and
-the pickle fixtures' exact datapoints -- never a measured value, which is different every run).
-The fixtures
-themselves are allowed to change shape on a re-record (different container hostname, different
-timestamp); a test asserting byte-for-byte fixture equality would be testing this directory's own
-stability, not `logit`'s decoder.
+Tests that read these files must assert on **identifiable decoded values**, such as the message
+content, a hostname, a trace ID, or a span name, not on whether the raw bytes changed. The
+fixtures can change shape on a re-record (a different container hostname or timestamp). A test
+asserting byte-for-byte fixture equality tests this directory's stability, not `logit`'s decoder.
+
+For the pattern, see the `interop_fixture_*` tests in these files:
+
+- `crates/logit-inputs/src/syslog.rs`
+- `crates/logit-inputs/src/collectd.rs`: they assert a value list's data-source count and kinds,
+  its `collectd.*` identity, and its interval.
+- `crates/logit-inputs/src/graphite/mod.rs`: they assert a decoded path prefix, that every kind is
+  a bare `Gauge`, and the pickle fixtures' exact datapoints.
+- `crates/logit-inputs/src/statsd.rs`
+
+None of them asserts a measured value, which differs on every run.
+`crates/logit-proto/tests/prometheus_remote_write_interop.rs` follows the same rule for the
+Prometheus corpus.

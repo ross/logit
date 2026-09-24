@@ -225,8 +225,9 @@ follow-up.
 - **`json-parse`** (0.904 µs/event) and **`lua`** (2.001 µs/event) are no longer close to tied.
   `json-parse` dropped sharply from the laptop's 2.054 µs/event because the interner key-cache and
   in-place `Transform::process` work landed since (`docs/adr/in-place-transform-process.md`).
-  `lua`'s LuaJIT round trip had no equivalent optimization, so the "Lua costs more than a native
-  transform" relationship `docs/known-gaps.md` documents holds by a larger factor now.
+  `lua`'s LuaJIT round trip had no equivalent optimization, so the gap between a `lua` stage and a
+  native transform that [`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)
+  documents holds by a larger factor now.
   `json-parse-x3` (2.248 µs/event, three parallel parsers sharing the interner) sits close to
   `lua`, consistent with its purpose: showing shared-interner contention, not a single parse.
 - **`encode-human-devnull`** vs **`encode-native-devnull`** (1.098 vs 0.995 µs/event): the native
@@ -629,10 +630,11 @@ for reasons that have nothing to do with the code:
   two runs that differ only in *when* they ran. A delta smaller than that drift is reported as "no
   signal," not as an improvement.
 - **A box-state checklist gates whether a number is worth writing down**: `perf/load/README.md`'s
-  "Box state" table (AC power, not battery; the `performance` governor, not `powersave`; a
-  non-power-saving energy-performance preference; thermal headroom, meaning a rested box and gaps
-  between repeats; nothing else building). `logit-perf run` records what it can into the results
-  file's `box_state` and warns before the first scenario on `powersave` or battery.
+  "Box state" table (nothing else running on the VM; a VM freshly provisioned this session; gaps
+  between repeats for host-maintenance headroom; sender and child pinned). `logit-perf run` still
+  records governor, EPP, platform profile, and AC power best-effort into the results file's
+  `box_state` and warns before the first scenario on `powersave` or battery, but the Azure guest
+  exposes none of those sysfs nodes, so on the VM `box_state` is an empty `{}`.
 - **The denominator is events *delivered* to `null_out`, and the telemetry leg that counts them
   runs inside the measured process** (§0's "Driven scenarios" has both, and the self-checks). So a
   driven scenario's absolute CPU µs/event is comparable only to its own history, never to a
