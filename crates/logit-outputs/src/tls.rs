@@ -1,12 +1,9 @@
-//! Shared client-side TLS construction for every sink that dials out over TLS -- `otlp_out`
-//! (`crates/logit-outputs/src/otlp.rs`) and `logit_out` (`crates/logit-outputs/src/logit.rs`)
-//! both build a `rustls::ClientConfig` from the same operator-facing settings via
-//! [`build_client_config`]. Extracted from `otlp.rs` (`docs/plans/native-transport.md` workstream
-//! B) -- a pure refactor, no behaviour change for `otlp_out`.
+//! Client-side TLS shared by every sink that dials out over TLS: [`build_client_config`] turns
+//! the operator-facing [`TlsClientSettings`] into a `rustls::ClientConfig`.
 //!
-//! Also home to the TLS-adjacent pieces every raw-TCP sink shares regardless of whether TLS is
-//! actually on: [`AsyncStream`], [`host_only`], and [`poll_pending_close`], the one-poll probe
-//! each pooled sink runs on a reused connection before writing to it.
+//! Also the pieces raw-TCP sinks share whether or not TLS is on: [`AsyncStream`], [`host_only`],
+//! and [`poll_pending_close`], the one-poll probe a pooled sink runs on a reused connection before
+//! writing to it.
 
 use std::future::poll_fn;
 use std::path::Path;
@@ -20,22 +17,17 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::PrivateKeyDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait so a sink's connection
-/// field doesn't need to be generic (a sink field can't be, without making the whole sink type
-/// generic in a way `logit-cli::pipeline::build_spec` would have to know about). Lives here
-/// rather than in either sink: `logit_out` (`crates/logit-outputs/src/logit.rs`) and `syslog_out`
-/// (`crates/logit-outputs/src/syslog.rs`) both dial raw TCP that may or may not be TLS-wrapped,
-/// and both want the identical erasure.
+/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait, so a sink's connection
+/// field isn't generic (a generic field would make the sink type generic, which
+/// `logit-cli::pipeline::build_spec` would have to know about). Shared by every sink that dials a
+/// raw TCP connection that may be TLS-wrapped.
 pub(crate) trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
-/// The host part of a bare `host:port` endpoint -- the SNI/`ServerName` to hand `rustls` when the
-/// endpoint carries no scheme to parse (`logit_out`'s and `syslog_out`'s shape; `otlp_out`'s
-/// URL-shaped endpoint has `reqwest`/`hyper` do this instead). `rsplit_once` so a bracketed IPv6
-/// literal's own colons don't confuse this (an IPv6 endpoint here would need brackets,
-/// `[::1]:1234`, the same convention every other bare `host:port` field in this codebase leaves
-/// to the operator to write correctly; this only avoids splitting on the wrong colon, not
-/// validating the address itself).
+/// The host part of a bare `host:port` endpoint: the SNI `ServerName` for an endpoint with no
+/// scheme to parse (a URL endpoint gets this from `reqwest`/`hyper`). `rsplit_once`, so a
+/// bracketed IPv6 literal (`[::1]:1234`) splits on the port's colon. The brackets are the
+/// operator's to write; this doesn't validate the address.
 pub(crate) fn host_only(endpoint: &str) -> &str {
     endpoint
         .rsplit_once(':')
@@ -45,20 +37,17 @@ pub(crate) fn host_only(endpoint: &str) -> &str {
         .trim_end_matches(']')
 }
 
-/// What one poll of a pooled stream found -- [`poll_pending_close`]'s answer.
+/// What one poll of a pooled stream found ([`poll_pending_close`]'s answer).
 pub(crate) enum PendingClose {
-    /// Nothing readable at this instant. On every protocol these sinks speak the peer is silent
-    /// unless it is answering something, so this is the healthy case: the connection is still
-    /// there and the write can go ahead.
+    /// Nothing readable now. Every protocol these sinks speak has a peer that is silent unless
+    /// answering, so this is the healthy case: write.
     Open,
-    /// The peer closed its end (an immediate end-of-file), or the poll failed outright -- the two
-    /// are the same thing to a caller about to write: this connection is finished.
+    /// The peer closed its end (an immediate EOF), or the poll failed; either way the connection
+    /// is finished.
     Eof,
-    /// The peer sent something unprompted. On `logit_in` that is a `Reject{GOING_AWAY}` -- the
-    /// close-is-coming signal, from a graceful shutdown or an idle timeout
-    /// (`docs/adr/idle-connection-timeout.md`); on the line-oriented sinks there is nothing a
-    /// receiver ever sends at all. Either way the pooled connection is not one to write a batch
-    /// into.
+    /// The peer sent something unprompted: from `logit_in`, a `Reject{GOING_AWAY}` before a
+    /// graceful shutdown or idle close; a line-oriented receiver never sends anything. Either
+    /// way, don't write a batch into it.
     Bytes(usize),
 }
 
@@ -72,30 +61,24 @@ impl std::fmt::Display for PendingClose {
     }
 }
 
-/// Polls `stream` for readability **exactly once** and reports what it found, without ever
-/// waiting: the check every pooled sink runs on a *reused* connection before the first write of a
-/// send attempt, so a batch is not written into a socket whose peer already closed it
-/// (`docs/adr/idle-connection-timeout.md`'s "The client-side probe" decision).
+/// Polls `stream` for readability **once**, never waiting: the check a pooled sink runs on a
+/// *reused* connection before a send attempt's first write, so a batch isn't written into a socket
+/// the peer already closed (`docs/adr/idle-connection-timeout.md`'s "The client-side probe"
+/// section).
 ///
-/// **Why one `poll_read` and not `tokio::time::timeout(stream.read(..))`.** A timeout around a
-/// real read is a *cancellable* read: when the timer wins, the read future is dropped, and on a
-/// TLS stream that can discard a partially-received record that `tokio_rustls` had already taken
-/// off the socket -- bytes gone from the kernel and from the session both. The same hazard
-/// applies through the `Box<dyn AsyncStream>` these sinks hold, where the caller cannot even tell
-/// which kind of stream it has. One `poll_read` that returns `Poll::Pending` has, by contrast,
-/// consumed nothing: `Pending` is precisely "no bytes were available," so the [`PendingClose::Open`]
-/// answer -- the one where the connection is kept and written to -- is the one answer that
-/// provably takes nothing off the stream. The two answers that *may* consume something
-/// ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both end with the connection dropped, so
-/// there is nothing left to have corrupted.
+/// **Why one `poll_read` and not `tokio::time::timeout(stream.read(..))`.** A timed-out read is
+/// cancelled, and on a TLS stream dropping the read future can discard a partial record
+/// `tokio_rustls` already took off the socket, gone from kernel and session both. Behind a
+/// `Box<dyn AsyncStream>` the caller can't tell which kind of stream it has. A `poll_read` that
+/// returns `Pending` has consumed nothing, so [`PendingClose::Open`], the one answer that keeps
+/// the connection, takes nothing off the stream. The answers that may consume bytes
+/// ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both drop the connection.
 ///
-/// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works as directly as a `&mut
-/// TcpStream` does -- the sinks hold both shapes.
+/// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works like a `&mut TcpStream`.
 ///
-/// This is inherently point-in-time: a FIN arriving between this poll and the write that follows
-/// is unchanged from today (`Fault::Ambiguous` for `logit_out`, silent for the line-oriented
-/// sinks). What it closes is the common case -- a peer that closed some time ago and whose FIN is
-/// already sitting in this host's receive queue.
+/// Point-in-time only: a FIN arriving between this poll and the write is still missed
+/// (`Fault::Ambiguous` for `logit_out`, undetected for the line-oriented sinks). It catches the
+/// common case, a FIN already in this host's receive queue.
 pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
     stream: &mut S,
     buf: &mut [u8],
@@ -112,10 +95,9 @@ pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
     .await
 }
 
-/// Client-side TLS tuning for a sink's `tls:` config block. Mirrors `logit_config::
-/// TlsClientConfig` -- this crate doesn't depend on `logit-config` (`docs/design/
-/// pipeline-graph.md`'s crate layout); `logit-cli::pipeline::build_spec` converts one into the
-/// other at construction time.
+/// Client-side TLS settings for a sink's `tls:` block. Mirrors `logit_config::TlsClientConfig`,
+/// since this crate doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate
+/// layout" section); `logit-cli::pipeline::build_spec` converts between them.
 #[derive(Debug, Clone, Default)]
 pub struct TlsClientSettings {
     /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set.
@@ -124,14 +106,13 @@ pub struct TlsClientSettings {
     pub cert_file: Option<String>,
     /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
     pub key_file: Option<String>,
-    /// Disables server-certificate verification entirely -- the connection is still encrypted,
-    /// but accepts any certificate the peer presents, self-signed or otherwise.
+    /// Skips server-certificate verification: still encrypted, but any certificate is accepted.
     pub insecure_skip_verify: bool,
 }
 
 impl TlsClientSettings {
-    /// `true` if every field is at its default -- a "was a `tls:` block actually set" check,
-    /// mirroring `logit_config::TlsClientConfig::is_empty`.
+    /// `true` if every field is at its default (`logit_config::TlsClientConfig::is_empty`). Not a
+    /// "TLS is off" test for a sink where a `tls:` block's presence alone turns TLS on.
     pub fn is_empty(&self) -> bool {
         self.ca_file.is_none()
             && self.cert_file.is_none()
@@ -140,8 +121,8 @@ impl TlsClientSettings {
     }
 }
 
-/// Builds a `rustls::ClientConfig` from `settings`. Every path is resolved against `base_dir`,
-/// same as `logit_inputs::tls::build_server_config`'s server-side counterpart.
+/// Builds a `rustls::ClientConfig` from `settings`, resolving every path against `base_dir` (as
+/// `logit_inputs::tls::build_server_config` does).
 pub(crate) fn build_client_config(
     settings: &TlsClientSettings,
     base_dir: &Path,
@@ -151,14 +132,10 @@ pub(crate) fn build_client_config(
         .with_safe_default_protocol_versions()
         .expect("the ring crypto provider always supports TLS 1.2/1.3");
 
-    // Both arms land in the same `WantsClientCert` builder state -- `with_root_certificates` and
-    // `dangerous().with_custom_certificate_verifier` are just two different ways to supply a
-    // verifier -- so client-cert material (below) is layered on identically either way. A caller
-    // whose own graph validation rejects `insecure_skip_verify` together with `ca_file` (rule 24
-    // for `otlp_out`, the mirrored rule for `logit_out`) never reaches this function with both
-    // set; `insecure_skip_verify` together with a client certificate is legal (mTLS with no
-    // server verification) and reaches the `with_client_auth_cert` branch below like any other
-    // case.
+    // Both arms reach the same `WantsClientCert` state, so the client certificate below layers on
+    // either way. Graph rules 24, 34, 44, 52, and 56 (`endpoint_tls`) reject
+    // `insecure_skip_verify` with `ca_file` for their sinks; with a client certificate it is legal
+    // (mTLS, no server verification).
     let builder = if settings.insecure_skip_verify {
         builder
             .dangerous()
@@ -195,12 +172,8 @@ pub(crate) fn build_client_config(
     }
 }
 
-/// A [`rustls::client::danger::ServerCertVerifier`] that accepts any certificate the peer
-/// presents -- `tls.insecure_skip_verify`'s implementation. The connection is still encrypted;
-/// only the "is this actually who I meant to talk to" check is skipped. Still verifies the
-/// handshake *signature* itself via `provider`'s own algorithms (`verify_tls12_signature`/
-/// `verify_tls13_signature`) -- only certificate-chain and hostname validation are skipped, not
-/// cryptographic signature verification.
+/// `tls.insecure_skip_verify`'s [`rustls::client::danger::ServerCertVerifier`]: skips chain and
+/// hostname validation, but still verifies the handshake signature with the provider's algorithms.
 #[derive(Debug)]
 struct AcceptAnyServerCert(rustls::crypto::CryptoProvider);
 
