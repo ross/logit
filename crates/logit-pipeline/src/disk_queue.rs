@@ -31,8 +31,9 @@
 //! [`HeldWriteFile`]), and the next push repairs through it (see [`State::needs_repair`]).
 //!
 //! **`commit` is synchronous**, like `SinkQueue::commit`: it mutates in-memory cursor state and
-//! occasionally makes one small blocking cursor write (with two `fsync`s) and one file deletion,
-//! never a segment read or write.
+//! never waits on the disk. A cursor persist (with its two `fsync`s) and the unlinks of the
+//! segments a roll leaves run on the spool's one persist worker thread (see [`PersistJob`]), in
+//! the order they were queued.
 //!
 //! **Every filesystem failure is observed.** A failed cursor write, segment `create`, `flush`,
 //! `fsync`, torn-tail `truncate`, or unlink counts `logit.component.buffer.disk.errors{op}` and is
@@ -46,7 +47,7 @@ use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -304,7 +305,7 @@ fn load_cursor(dir: &Path, diag: &mut Diagnostics) -> Option<(u64, u64)> {
 /// Persists the read cursor through [`atomic_write::write_file_durably`]: two `fsync`s, so never
 /// call it holding the state lock. On failure the previous cursor stays in place (unless only the
 /// directory `fsync` failed), so the cost is replay, never loss. Callers report a failure with
-/// [`report_cursor_error`].
+/// [`report_cursor_error`]. After [`DiskQueue::open`], only [`run_persist_job`] calls it.
 fn persist_cursor(dir: &Path, segment: u64, offset: u64) -> Result<(), AtomicWriteError> {
     let doc = CursorFile { version: CURSOR_VERSION, segment, offset };
     let bytes = serde_json::to_vec(&doc).expect("a CursorFile of plain integers always serializes");
@@ -321,6 +322,120 @@ fn report_cursor_error(
     telemetry.count(DISK_ERRORS, 1.0, &[("op", "cursor")]);
     let path = dir.join(CURSOR_FILE_NAME);
     diag.warn_throttled("cursor_error", format!("writing cursor {}: {err}", path.display()));
+}
+
+/// One unit of work for the spool's persist worker: persist `cursor` durably, then unlink each
+/// segment in `unlink`, then signal `done`. Queued under the state lock by the code that moved the
+/// cursor, so jobs reach the worker in cursor order and each carries a cursor at or past the one
+/// before it: the cursor on disk never moves backward. Allocated only on a segment roll, an
+/// interval checkpoint, or `finish`, never on the common `push`/`peek` path.
+///
+/// One thread runs every job for one spool, so a segment is unlinked only after the cursor that
+/// leaves it is durable (or its persist failed and was counted;
+/// `docs/adr/durable-checkpoint-writes-and-fault-injection.md`'s decision 5). A crash before a job
+/// runs leaves an older cursor and every segment it would have unlinked: replay, never loss. A
+/// crash after its persist but before its unlinks leaves segments behind the cursor, which
+/// [`DiskQueue::open`] removes.
+struct PersistJob {
+    /// `(segment, offset)` to persist. `None` only for a test barrier
+    /// (`DiskQueue::wait_for_persists`), which persists nothing.
+    cursor: Option<(u64, u64)>,
+    unlink: Vec<u64>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Runs one [`PersistJob`], counting and diagnosing every failure as the inline persist and
+/// unlink did before the worker existed: `disk.errors{op="cursor"}` under `cursor_error`, and
+/// `disk.errors{op="unlink"}` under `disk_fs_error`.
+fn run_persist_job(dir: &Path, job: PersistJob, telemetry: &Telemetry, diag: &mut Diagnostics) {
+    if let Some((segment, offset)) = job.cursor {
+        if let Err(err) = persist_cursor(dir, segment, offset) {
+            report_cursor_error(&err, dir, diag, telemetry);
+        }
+    }
+    for seq in job.unlink {
+        let path = segment_path(dir, seq);
+        if let Err(err) = fault_io!(SEGMENT_UNLINK, &path, seq, std::fs::remove_file(&path)) {
+            telemetry.count(DISK_ERRORS, 1.0, &[("op", "unlink")]);
+            diag.warn_throttled("disk_fs_error", format!("deleting segment {seq}: {err}"));
+        }
+    }
+    if let Some(done) = job.done {
+        // A waiter that gave up (its future was dropped) needs no signal.
+        done.send(()).ok();
+    }
+}
+
+/// Waits for the persist worker to signal `done`, on a blocking-pool thread rather than by
+/// awaiting the receiver. A runtime with a paused clock (`tokio::test(start_paused = true)`)
+/// advances time whenever it is idle, and a signal from a thread outside the runtime doesn't count
+/// as work, so a plain `.await` would let every timer in such a test fire while the worker runs.
+/// A pending `spawn_blocking` task inhibits that auto-advance (tokio 1.53.1,
+/// `src/runtime/blocking/schedule.rs`).
+async fn wait_for_worker(done: tokio::sync::oneshot::Receiver<()>) {
+    // `Err` only if the worker died without running the job, which only a panic in it does.
+    tokio::task::spawn_blocking(move || done.blocking_recv().ok()).await.ok();
+}
+
+/// Test control over the persist worker, checked before each job: a paused worker
+/// ([`DiskQueue::pause_persists`]) holds the job, so a test can observe `commit` returning with
+/// its job still queued, and an abandoned one ([`DiskQueue::abandon_queued_persists`]) discards
+/// every job still queued, as a `kill -9` would.
+#[cfg(test)]
+#[derive(Default)]
+struct PersistGate {
+    state: Mutex<GateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct GateState {
+    paused: bool,
+    abandoned: bool,
+}
+
+#[cfg(test)]
+impl PersistGate {
+    /// Waits while paused; returns whether the job may run.
+    fn admit(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.paused && !state.abandoned {
+            state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        !state.abandoned
+    }
+
+    fn update(&self, f: impl FnOnce(&mut GateState)) {
+        f(&mut self.state.lock().unwrap_or_else(|p| p.into_inner()));
+        self.changed.notify_all();
+    }
+}
+
+/// Starts the spool's persist worker: one `std::thread` that runs each [`PersistJob`] in the order
+/// it was queued, and exits once its sender is gone and the queue is drained. A dedicated thread
+/// rather than `spawn_blocking`, so a job never waits for a blocking-pool slot and the channel
+/// alone decides the order.
+fn spawn_persist_worker(
+    dir: PathBuf,
+    telemetry: Telemetry,
+    mut diag: Diagnostics,
+    #[cfg(test)] gate: Arc<PersistGate>,
+) -> io::Result<mpsc::Sender<PersistJob>> {
+    let (tx, rx) = mpsc::channel::<PersistJob>();
+    std::thread::Builder::new().name("logit-spool-persist".into()).spawn(move || {
+        for job in rx {
+            #[cfg(test)]
+            if !gate.admit() {
+                if let Some(done) = job.done {
+                    done.send(()).ok();
+                }
+                continue;
+            }
+            run_persist_job(&dir, job, &telemetry, &mut diag);
+        }
+    })?;
+    Ok(tx)
 }
 
 /// Whether `path` names an existing file. Only on a failure path: a blocking `stat`.
@@ -423,6 +538,10 @@ struct State {
     rotation_started: bool,
     read_file: Option<(u64, tokio::fs::File)>,
     last_checkpoint: Instant,
+    /// The persist worker's queue (see [`PersistJob`]). Sent to only under this lock, which is
+    /// what keeps jobs in cursor order. `None` after [`DiskQueue::finish`], which lets the worker
+    /// exit; a later job runs inline on the caller.
+    persist_tx: Option<mpsc::Sender<PersistJob>>,
     diag: Diagnostics,
 }
 
@@ -436,9 +555,8 @@ pub struct DiskQueue {
     compression: Compression,
     checkpoint_interval: Duration,
     inner: Mutex<State>,
-    /// Held across a cursor write (see [`DiskQueue::checkpoint_cursor`]). Always taken before
-    /// `inner`, never while holding it.
-    cursor_write: Mutex<()>,
+    #[cfg(test)]
+    persist_gate: Arc<PersistGate>,
     not_empty: tokio::sync::Notify,
     not_full: tokio::sync::Notify,
     closed: AtomicBool,
@@ -624,6 +742,19 @@ impl DiskQueue {
             }
         }
 
+        // Only now: `open`'s own persist and cleanup above ran inline, and from here on the worker
+        // is the only writer of `cursor.json`.
+        #[cfg(test)]
+        let persist_gate = Arc::new(PersistGate::default());
+        let persist_tx = spawn_persist_worker(
+            config.dir.clone(),
+            telemetry.clone(),
+            diag.clone(),
+            #[cfg(test)]
+            Arc::clone(&persist_gate),
+        )
+        .context("starting the disk buffer's cursor persist thread")?;
+
         let total_bytes: u64 = segments.iter().map(|s| s.len).sum();
         let segment_count = segments.len();
 
@@ -639,6 +770,7 @@ impl DiskQueue {
             rotation_started: false,
             read_file: None,
             last_checkpoint: Instant::now(),
+            persist_tx: Some(persist_tx),
             diag,
         };
 
@@ -650,7 +782,8 @@ impl DiskQueue {
             compression: config.compression,
             checkpoint_interval: config.checkpoint_interval,
             inner: Mutex::new(state),
-            cursor_write: Mutex::new(()),
+            #[cfg(test)]
+            persist_gate,
             not_empty: tokio::sync::Notify::new(),
             not_full: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -1237,10 +1370,13 @@ impl DiskQueue {
     /// `read_seq` once a later `push` rotates that segment away, and `peek` would wait on
     /// `not_empty` forever against a segment that never grows again.
     ///
-    /// After a roll, and outside the lock, persists the cursor, then deletes the segments it left
-    /// and notifies `not_full`. The cursor is durable before any segment it left is unlinked. A
-    /// segment whose unlink fails still leaves memory and `total_bytes` (the cursor has left it,
-    /// so it holds nothing to deliver), and [`DiskQueue::open`] removes it next time.
+    /// After a roll, queues one [`PersistJob`] carrying the new cursor and the segments it left,
+    /// then notifies `not_full`. The persist worker makes that cursor durable before it unlinks
+    /// any of those segments; the caller waits for neither. The segments leave memory and
+    /// `total_bytes` at once (the cursor has left them, so they hold nothing to deliver), whether
+    /// or not their unlink later succeeds, and [`DiskQueue::open`] removes any that a crash or a
+    /// failed unlink left behind. The job is queued under the state lock, so a later job, from
+    /// this task or another, always carries a cursor at or past this one's.
     /// Allocates nothing when no boundary is crossed. Returns whether the cursor now points at
     /// readable bytes.
     fn roll_read_cursor(&self) -> bool {
@@ -1283,26 +1419,21 @@ impl DiskQueue {
         let offset = state.read_offset;
         let readable =
             state.segments.iter().find(|s| s.seq == seq).map(|s| offset < s.len).unwrap_or(false);
-        drop(state);
         // The no-crossing case must not allocate: it is on `peek`'s cached-hit path
         // (`disk_queue_peek_cached_costs_nothing`).
-        if !to_delete.is_empty() {
-            self.checkpoint_cursor();
-            for seq in to_delete {
-                let path = segment_path(&self.dir, seq);
-                if let Err(err) = fault_io!(SEGMENT_UNLINK, &path, seq, std::fs::remove_file(&path))
-                {
-                    self.count_fs_error("unlink", format_args!("deleting segment {seq}"), &err);
-                }
-            }
-            self.not_full.notify_one();
+        if to_delete.is_empty() {
+            return readable;
         }
+        state.last_checkpoint = Instant::now();
+        let job = PersistJob { cursor: Some((seq, offset)), unlink: to_delete, done: None };
+        self.queue_persist(state, job);
+        self.not_full.notify_one();
         readable
     }
 
     /// Advances the read cursor past `record_len` bytes, clears the head reservation, rolls
-    /// across any segment boundary crossed, and persists the cursor if `checkpoint_interval` has
-    /// elapsed. Sync: its only I/O is a small cursor write and occasional file removals.
+    /// across any segment boundary crossed, and queues a cursor persist if `checkpoint_interval`
+    /// has elapsed. Sync, and does no I/O: the persist worker does it.
     fn advance_read_cursor(&self, record_len: u64) {
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1312,7 +1443,7 @@ impl DiskQueue {
         self.after_cursor_advance();
     }
 
-    /// Rolls across any segment boundary the cursor just crossed, and persists the cursor if
+    /// Rolls across any segment boundary the cursor just crossed, and queues a cursor persist if
     /// `checkpoint_interval` has elapsed.
     fn after_cursor_advance(&self) {
         if !self.roll_read_cursor() {
@@ -1321,34 +1452,32 @@ impl DiskQueue {
             // will wake it.
             self.not_full.notify_one();
         }
-        let due = {
-            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            state.last_checkpoint.elapsed() >= self.checkpoint_interval
-        };
-        if due {
-            self.checkpoint_cursor();
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if state.last_checkpoint.elapsed() >= self.checkpoint_interval {
+            state.last_checkpoint = Instant::now();
+            let cursor = Some((state.read_seq, state.read_offset));
+            self.queue_persist(state, PersistJob { cursor, unlink: Vec::new(), done: None });
         }
     }
 
-    /// Persists the current read cursor, records the checkpoint time, and reports a failure. The
-    /// write runs outside the state lock, so its two `fsync`s never stall a `push` or `peek`.
-    ///
-    /// `cursor_write` serializes concurrent calls (the consumer's `commit`, and a `DropOldest`
-    /// producer's roll or eviction), and each reads the cursor only once the previous write has
-    /// finished. The cursor only moves forward, so what lands on disk never moves backward, and a
-    /// roll's call persists a cursor at or past the one it computed.
-    fn checkpoint_cursor(&self) {
-        let _serial = self.cursor_write.lock().unwrap_or_else(|p| p.into_inner());
-        let (seq, offset) = {
-            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            (state.read_seq, state.read_offset)
+    /// Hands `job` to the persist worker, sending while `state` is still held so jobs queue in
+    /// the order the cursor moved (see [`PersistJob`]). With no worker (after
+    /// [`DiskQueue::finish`]), runs it inline once the lock is released.
+    fn queue_persist(&self, mut state: MutexGuard<'_, State>, job: PersistJob) {
+        let job = match &state.persist_tx {
+            Some(tx) => match tx.send(job) {
+                Ok(()) => return,
+                // The worker is gone, which only a panic in it can do.
+                Err(mpsc::SendError(job)) => {
+                    state.persist_tx = None;
+                    job
+                }
+            },
+            None => job,
         };
-        let result = persist_cursor(&self.dir, seq, offset);
-        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.last_checkpoint = Instant::now();
-        if let Err(err) = result {
-            report_cursor_error(&err, &self.dir, &mut state.diag, &self.telemetry);
-        }
+        let mut diag = state.diag.clone();
+        drop(state);
+        run_persist_job(&self.dir, job, &self.telemetry, &mut diag);
     }
 
     /// The head, without removing it. Cached, and reserved against `DropOldest` eviction, until
@@ -1431,15 +1560,33 @@ impl DiskQueue {
         self.not_full.notify_waiters();
     }
 
-    /// Persists the cursor durably regardless of `checkpoint_interval`, flushes and `fsync`s the
-    /// active segment, `fsync`s the directory, and closes files. Each failure is counted and
-    /// diagnosed. Drops nothing: what is queued delivers after the next open.
+    /// Persists the cursor durably regardless of `checkpoint_interval`, after every persist and
+    /// unlink already queued, then flushes and `fsync`s the active segment, `fsync`s the
+    /// directory, and closes files. Stops the persist worker, so a later persist runs inline.
+    /// Each failure is counted and diagnosed. Drops nothing: what is queued delivers after the
+    /// next open.
     ///
     /// Doesn't repair a torn tail. The flush, through the retained handle, waits for any write a
     /// cancelled push left running, and whatever it leaves past the last whole record is
     /// [`DiskQueue::open`]'s to truncate.
     pub async fn finish(&self) {
-        self.checkpoint_cursor();
+        // The one place the sink task waits on the worker: at shutdown, behind at most a few
+        // queued jobs.
+        let (done, persisted) = tokio::sync::oneshot::channel();
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.last_checkpoint = Instant::now();
+            let cursor = Some((state.read_seq, state.read_offset));
+            let job = PersistJob { cursor, unlink: Vec::new(), done: Some(done) };
+            // Taking the sender lets the worker exit once it has run this last job.
+            let tx = state.persist_tx.take();
+            if let Some(tx) = tx {
+                self.queue_persist_to(state, &tx, job);
+            } else {
+                self.queue_persist(state, job);
+            }
+        }
+        wait_for_worker(persisted).await;
         let mut held = self.hold_write_file();
         let active_seq = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1472,6 +1619,67 @@ impl DiskQueue {
         }
         // Closes the handle rather than returning it to the state.
         drop(held.file.take());
+    }
+
+    /// [`DiskQueue::queue_persist`] through a sender already taken out of the state.
+    fn queue_persist_to(
+        &self,
+        state: MutexGuard<'_, State>,
+        tx: &mpsc::Sender<PersistJob>,
+        job: PersistJob,
+    ) {
+        if let Err(mpsc::SendError(job)) = tx.send(job) {
+            let mut diag = state.diag.clone();
+            drop(state);
+            run_persist_job(&self.dir, job, &self.telemetry, &mut diag);
+        }
+    }
+
+    /// Waits until the persist worker has run every job queued before this call. A no-op after
+    /// [`DiskQueue::finish`], when persists run inline.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_persists(&self) {
+        if let Some(rx) = self.queue_barrier() {
+            wait_for_worker(rx).await;
+        }
+    }
+
+    /// [`DiskQueue::wait_for_persists`] for a test outside an async context.
+    #[cfg(test)]
+    pub(crate) fn wait_for_persists_blocking(&self) {
+        if let Some(rx) = self.queue_barrier() {
+            rx.blocking_recv().ok();
+        }
+    }
+
+    #[cfg(test)]
+    fn queue_barrier(&self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = state.persist_tx.as_ref()?;
+        let (done, rx) = tokio::sync::oneshot::channel();
+        tx.send(PersistJob { cursor: None, unlink: Vec::new(), done: Some(done) }).ok()?;
+        Some(rx)
+    }
+
+    /// Holds the persist worker before its next job until [`DiskQueue::resume_persists`].
+    #[cfg(test)]
+    pub(crate) fn pause_persists(&self) {
+        self.persist_gate.update(|g| g.paused = true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_persists(&self) {
+        self.persist_gate.update(|g| g.paused = false);
+    }
+
+    /// Discards every job still queued for the persist worker, and every later one, then returns
+    /// once the worker is idle, as a `kill -9` leaves the spool: a job already running finishes,
+    /// and nothing after it runs. Call it before dropping a queue that a test then reopens, so
+    /// the old worker can't touch the directory under the new queue.
+    #[cfg(test)]
+    pub(crate) fn abandon_queued_persists(&self) {
+        self.persist_gate.update(|g| g.abandoned = true);
+        self.wait_for_persists_blocking();
     }
 }
 
@@ -1913,8 +2121,8 @@ mod tests {
         assert_eq!(marker_of(&peeked), "a");
         q.commit().unwrap();
 
-        // `commit` deletes synchronously; the yield guards against a future scheduling change.
-        tokio::task::yield_now().await;
+        // `commit` only queues the deletion; the persist worker runs it.
+        q.wait_for_persists().await;
         assert_eq!(
             list_segments(&dir).unwrap(),
             vec![1],
@@ -2057,6 +2265,7 @@ mod tests {
             .expect("d should be delivered");
         assert_eq!(marker_of(&peeked), "d");
         q.commit().unwrap();
+        q.wait_for_persists().await;
         assert_eq!(
             list_segments(&dir).unwrap(),
             vec![1],
@@ -2219,6 +2428,8 @@ mod tests {
         metric_sum(&registry.drain(0), DISK_ERRORS, Some(("op", op)))
     }
 
+    /// Peeks and commits each of `labels` in order, then waits for the persist worker, so the
+    /// caller's disk assertions see every cursor persist and unlink those commits queued.
     async fn deliver(q: &DiskQueue, labels: &[&str]) {
         for label in labels {
             let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
@@ -2228,6 +2439,7 @@ mod tests {
             assert_eq!(marker_of(&peeked), *label);
             q.commit().unwrap();
         }
+        q.wait_for_persists().await;
     }
 
     #[tokio::test]
@@ -2486,6 +2698,7 @@ mod tests {
             events.extend(drained);
             q.close();
             assert!(peek_within(&q).await.is_none());
+            q.wait_for_persists().await;
             events.extend(registry.drain(0));
 
             let corrupt = |metric| metric_sum(&events, metric, Some(("reason", "disk_corrupt")));
@@ -2914,6 +3127,7 @@ mod tests {
 
         // Evicting `a` or `b` frees nothing: space comes back only when segment 0 is deleted.
         q.push((batch("g"), ctx())).await;
+        q.wait_for_persists().await;
 
         let events = registry.drain(0);
         let evicted = |metric| metric_sum(&events, metric, Some(("reason", "overflow_oldest")));
@@ -2947,6 +3161,7 @@ mod tests {
         registry.drain(0);
 
         q.push((batch("d"), ctx())).await;
+        q.wait_for_persists().await;
 
         let events = registry.drain(0);
         assert_eq!(
@@ -2970,7 +3185,8 @@ mod tests {
     // a full spool with nothing queued (F5).
     // -----------------------------------------------------------------------------------------
 
-    /// Closes `q` and drains it, returning every delivered marker in order.
+    /// Closes `q` and drains it, returning every delivered marker in order, once the persist
+    /// worker has run every job the drain queued.
     async fn drain_all(q: &DiskQueue) -> Vec<String> {
         q.close();
         let mut delivered = Vec::new();
@@ -2978,6 +3194,7 @@ mod tests {
             delivered.push(marker_of(&batch));
             q.commit().unwrap();
         }
+        q.wait_for_persists().await;
         delivered
     }
 
@@ -3030,6 +3247,7 @@ mod tests {
         let scope = fault::scope(&probe);
         scope.record();
         q.commit().unwrap();
+        q.wait_for_persists().await;
         let points = crash_points(&scope.hits());
         drop(scope);
         drop(q);
@@ -3043,6 +3261,7 @@ mod tests {
             let scope = fault::scope(&dir);
             scope.crash_at(point, n);
             q.commit().unwrap();
+            q.wait_for_persists().await;
             assert!(scope.crashed(), "{point:?} #{n} was reached");
             drop(q);
             drop(scope);
@@ -3083,6 +3302,7 @@ mod tests {
         let scope = fault::scope(&dir);
         scope.record();
         q.commit().unwrap();
+        q.wait_for_persists().await;
         assert_unlinks_follow_a_durable_cursor(&scope.hits(), "commit");
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
@@ -3100,6 +3320,7 @@ mod tests {
         let scope = fault::scope(&dir);
         scope.record();
         q.push((batch("e"), ctx())).await;
+        q.wait_for_persists().await;
         assert_unlinks_follow_a_durable_cursor(&scope.hits(), "drop_oldest eviction");
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
@@ -3119,6 +3340,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), q.push((batch("d"), ctx())))
             .await
             .expect("a push with nothing queued must not wait for a consumer");
+        q.wait_for_persists().await;
         assert_unlinks_follow_a_durable_cursor(&scope.hits(), "rotation to make room");
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
@@ -3307,6 +3529,7 @@ mod tests {
         .expect("neither the push nor the peek may wait on the other forever");
         assert_eq!(marker_of(&peeked.unwrap().0), "d");
         q.commit().unwrap();
+        q.wait_for_persists().await;
 
         assert_eq!(list_segments(&dir).unwrap(), vec![1], "the consumed segment is reclaimed");
         let events = registry.drain(0);
@@ -3421,6 +3644,178 @@ mod tests {
             "a spool with nothing queued has room once its consumed segment is gone"
         );
         assert_eq!(drain_all(&q).await, vec!["d", "e"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The persist worker: a roll's cursor persist and unlinks run off the committing task, in
+    // queue order, and a crash anywhere in them costs replay, never loss.
+    // -----------------------------------------------------------------------------------------
+
+    /// The cursor persist's four steps and every segment unlink, in the order they ran.
+    fn persist_ops(hits: &[fault::Hit]) -> Vec<(Point, u64)> {
+        hits.iter()
+            .filter(|h| h.point.site == sites::SPOOL_CURSOR || h.point == SEGMENT_UNLINK)
+            .map(|h| (h.point, h.arg))
+            .collect()
+    }
+
+    fn cursor_step(op: Op) -> (Point, u64) {
+        (Point::new(sites::SPOOL_CURSOR, op), 0)
+    }
+
+    const DURABLE_CURSOR: [Op; 4] = [Op::Write, Op::SyncFile, Op::Rename, Op::SyncDir];
+
+    fn on_disk_cursor(dir: &Path) -> Option<(u64, u64)> {
+        load_cursor(dir, &mut Diagnostics::new("test"))
+    }
+
+    #[tokio::test]
+    async fn a_segment_roll_returns_before_its_cursor_is_durable_and_unlinks_after_it_is() {
+        let dir = scratch_dir("roll-off-task");
+        let q = roll_setup(&dir).await;
+        let scope = fault::scope(&dir);
+        scope.record();
+        q.pause_persists();
+
+        // Committing `b` rolls the cursor out of segment 1.
+        q.commit().unwrap();
+        assert_eq!(
+            persist_ops(&scope.hits()),
+            vec![],
+            "commit returns before any step of the roll's persist or unlink runs"
+        );
+        assert!(segment_path(&dir, 1).exists(), "segment 1 outlives the commit");
+
+        q.resume_persists();
+        q.wait_for_persists().await;
+        let mut expected: Vec<(Point, u64)> = DURABLE_CURSOR.map(cursor_step).to_vec();
+        expected.push((SEGMENT_UNLINK, 1));
+        assert_eq!(persist_ops(&scope.hits()), expected, "persist, then unlink");
+        assert!(!segment_path(&dir, 1).exists());
+        assert_eq!(on_disk_cursor(&dir), Some((2, 0)));
+        drop(scope);
+        assert_eq!(drain_all(&q).await, vec!["c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_crash_before_the_worker_persists_replays_and_loses_nothing() {
+        let dir = scratch_dir("crash-before-worker-persist");
+        let q = roll_setup(&dir).await;
+        let scope = fault::scope(&dir);
+        q.pause_persists();
+        q.commit().unwrap(); // `b`: queues the cursor into segment 2 and segment 1's unlink
+        scope.crash_at(Point::new(sites::SPOOL_CURSOR, Op::Write), 1);
+        q.resume_persists();
+        q.wait_for_persists().await;
+        assert!(scope.crashed(), "the worker reached its cursor write");
+        assert!(segment_path(&dir, 1).exists(), "a frozen worker unlinks nothing");
+        drop(q);
+        drop(scope);
+
+        // The cursor on disk still names segment 1, so `b` replays ahead of `c`.
+        let reopened = open(dir.clone());
+        let delivered = drain_all(&reopened).await;
+        assert_no_loss(&delivered, &["a", "b"], &["c"], "the worker's cursor write");
+        assert_eq!(delivered, vec!["b", "c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open() {
+        let dir = scratch_dir("crash-before-worker-unlink");
+        let q = roll_setup(&dir).await;
+        let scope = fault::scope(&dir);
+        scope.crash_at(SEGMENT_UNLINK, 1);
+        q.commit().unwrap();
+        q.wait_for_persists().await;
+        assert!(scope.crashed(), "the worker reached its unlink");
+        assert_eq!(on_disk_cursor(&dir), Some((2, 0)), "the cursor was durable first");
+        assert!(segment_path(&dir, 1).exists(), "the crash left segment 1 behind the cursor");
+        drop(q);
+        drop(scope);
+
+        let scope = fault::scope(&dir);
+        scope.record();
+        let reopened = open(dir.clone());
+        assert!(scope.hits().iter().any(|h| h.point == SEGMENT_UNLINK && h.arg == 1));
+        assert!(!segment_path(&dir, 1).exists(), "open removes it");
+        drop(scope);
+        assert_eq!(drain_all(&reopened).await, vec!["c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn finish_waits_for_every_queued_persist() {
+        let dir = scratch_dir("finish-waits-for-worker");
+        let q = roll_setup(&dir).await;
+        let scope = fault::scope(&dir);
+        scope.record();
+        q.pause_persists();
+        q.commit().unwrap(); // queues the roll out of segment 1
+        q.close();
+
+        {
+            let mut finish = std::pin::pin!(q.finish());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), finish.as_mut()).await.is_err(),
+                "finish must wait for the queued roll"
+            );
+            assert_eq!(persist_ops(&scope.hits()), vec![], "nothing ran while the worker was held");
+            q.resume_persists();
+            tokio::time::timeout(Duration::from_secs(5), finish).await.expect("finish completes");
+        }
+
+        // The roll's persist and unlink, then finish's own persist, then its segment fsync.
+        let mut expected: Vec<(Point, u64)> = DURABLE_CURSOR.map(cursor_step).to_vec();
+        expected.push((SEGMENT_UNLINK, 1));
+        expected.extend(DURABLE_CURSOR.map(cursor_step));
+        assert_eq!(persist_ops(&scope.hits()), expected);
+        let hits = scope.hits();
+        let last_cursor_step =
+            hits.iter().rposition(|h| h.point.site == sites::SPOOL_CURSOR).unwrap();
+        let segment_sync = hits.iter().position(|h| h.point == SEGMENT_SYNC).unwrap();
+        assert!(last_cursor_step < segment_sync, "the persists finish before the segment fsync");
+        assert!(!segment_path(&dir, 1).exists());
+        assert_eq!(on_disk_cursor(&dir), Some((2, 0)));
+        drop(scope);
+        drop(q);
+
+        let reopened = open(dir.clone());
+        assert_eq!(drain_all(&reopened).await, vec!["c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn persist_jobs_never_move_the_cursor_backwards() {
+        let dir = scratch_dir("persist-order");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1; // one record per segment: every commit rolls
+        let q = open_with(cfg);
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        let scope = fault::scope(&dir);
+        scope.record();
+        q.pause_persists();
+        // Two rolls queue two jobs: the cursor into segment 1, then into segment 2.
+        for label in ["a", "b"] {
+            let (peeked, _) = peek_within(&q).await.unwrap();
+            assert_eq!(marker_of(&peeked), label);
+            q.commit().unwrap();
+        }
+        q.resume_persists();
+        q.wait_for_persists().await;
+
+        let mut expected: Vec<(Point, u64)> = DURABLE_CURSOR.map(cursor_step).to_vec();
+        expected.push((SEGMENT_UNLINK, 0));
+        expected.extend(DURABLE_CURSOR.map(cursor_step));
+        expected.push((SEGMENT_UNLINK, 1));
+        assert_eq!(persist_ops(&scope.hits()), expected, "the jobs ran in queue order");
+        assert_eq!(on_disk_cursor(&dir), Some((2, 0)), "the later cursor landed last");
+        drop(scope);
+        assert_eq!(drain_all(&q).await, vec!["c"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

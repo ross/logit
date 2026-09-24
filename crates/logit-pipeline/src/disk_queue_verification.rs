@@ -779,6 +779,7 @@ fn drive_spool_model(
                     m.depth += 1.0;
                     // A write lands in the active segment only once any rotation a cancelled
                     // push started is finished: nothing on disk is newer than it.
+                    q.wait_for_persists_blocking();
                     let newest = list_segments(dir).unwrap().last().copied();
                     prop_assert_eq!(
                         newest,
@@ -845,6 +846,10 @@ fn drive_spool_model(
             SpoolOp::Reopen(finish) => {
                 if *finish {
                     rt.block_on(q.finish());
+                } else {
+                    // A process exit kills the persist worker too: whatever it hadn't started
+                    // never runs, and it can't touch the directory under the reopened queue.
+                    q.abandon_queued_persists();
                 }
                 drop(q);
                 // Dropping the runtime waits for every blocking write already handed off, as
@@ -886,6 +891,7 @@ fn drive_spool_model(
         let (batch, _) = q.commit().expect("commit what was just peeked");
         on_commit(&mut m, id_of(&marker_of(&batch)))?;
     }
+    q.wait_for_persists_blocking();
     corrupt += corrupt_count(&registry.drain(0));
     for (id, pushed) in m.pushes.iter().enumerate() {
         if *pushed == Pushed::Queued {

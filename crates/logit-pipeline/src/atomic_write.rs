@@ -5,7 +5,7 @@
 //! [`write_file_durably`] writes a sibling tmp file, `fsync`s it, renames it over the target, then
 //! `fsync`s the directory. A crash at any step leaves either the old document or the new one, and
 //! after a power loss the rename can't land ahead of the bytes it names. Synchronous `std::fs`:
-//! the spool calls it inline from `commit`, the tail through `spawn_blocking`.
+//! the spool calls it on its persist worker thread, the tail through `spawn_blocking`.
 
 use std::ffi::OsString;
 use std::fmt;
