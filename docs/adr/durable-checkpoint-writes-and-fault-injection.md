@@ -269,7 +269,33 @@ script is needed. This list is filled in as each workstream lands.
 - **`dur/w4`, the spool write path (DISK-03, DISK-05):** to be listed when `dur/w4` lands.
 - **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):** to be listed when `dur/w5`
   lands.
-- **`dur/w6`, the tail checkpoint (TAIL-05):** to be listed when `dur/w6` lands.
+- **`dur/w6`, the tail checkpoint (TAIL-05):**
+  - `crates/logit-inputs/src/tail/checkpoint.rs`:
+    - `an_empty_checkpoint_is_unusable_not_missing`,
+      `a_truncated_checkpoint_document_is_unusable_and_counted`,
+      `an_unreadable_checkpoint_is_unusable`, `a_wrong_version_checkpoint_is_unusable`, and
+      `a_missing_checkpoint_with_a_stray_tmp_beside_it_is_unusable`: decision 4's unusable shapes,
+      each counted `op="load"` and diagnosed once.
+    - `a_missing_checkpoint_alone_is_missing`: the first-run case stays silent.
+    - `checkpoints_differing_only_in_extension_never_share_a_tmp`: `state.json` and `state.yaml`
+      write distinct tmp files.
+    - `a_failed_write_at_any_step_leaves_the_store_dirty_and_the_next_write_lands`: an `EIO` at
+      each of the helper's four steps counts `op="write"`, keeps the store dirty, and the next
+      unforced write lands.
+    - `a_crash_at_any_step_of_a_write_leaves_the_previous_checkpoint_loadable`: a freeze at each
+      step, then a reload, finds the old checkpoint (the new one after the directory `fsync`).
+    - `a_checkpoint_write_fsyncs_the_file_before_the_rename_and_the_directory_after`: decision 1's
+      order at the `tail.checkpoint` site, from recorded hits.
+  - `crates/logit-inputs/src/tail/driver.rs`:
+    - `an_unusable_checkpoint_starts_every_preexisting_file_at_the_beginning_even_under_read_from_end`:
+      empty, truncated, wrong-version, and stray-tmp checkpoints each replay every pre-existing
+      line, and shutdown's forced write replaces the unusable document.
+    - `a_missing_checkpoint_still_honours_read_from_end`: no checkpoint and no tmp still skips.
+    - `a_crash_between_checkpoint_write_and_rename_resumes_from_the_previous_checkpoint_with_duplicates_only`:
+      a freeze at the rename, then a restart under `read_from: end`, redelivers the line read
+      since the last checkpoint and skips nothing.
+  - `crates/logit-pipeline/src/graph.rs`: `two_tailing_listeners_sharing_a_checkpoint_path_are_rejected`
+    (rule 62) and `tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine`.
 - **`dur/w7`, `file_out` rotation (DISK-10):** to be listed when `dur/w7` lands.
 
 ## Consequences

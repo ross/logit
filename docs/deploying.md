@@ -981,6 +981,15 @@ one, a newly selected container) always starts at its beginning, since it has no
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
 file it names.
 
+**A checkpoint that exists but can't be used replays every file from its beginning.** If
+`checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
+while `<checkpoint_path>.tmp` sits beside it (a crash before the first checkpoint landed), every
+file present at the first scan starts at offset 0, even under `read_from: end`. A previous run read
+those files, so skipping to their end would lose whatever they gained while `logit` was down.
+Expect a burst of duplicates; `logit.input.checkpoint.errors{op="load"}` and a `checkpoint_error`
+diagnostic say why. Only a missing checkpoint with no `.tmp` beside it is a first run that
+`read_from` decides.
+
 **Set `checkpoint_path` for `docker_in`.** It is optional and unset by default, in which case every
 restart re-applies `read_from` as if every file were newly discovered. A long-running container's
 log easily holds more than a restart reading from `end` would silently skip. **Put the checkpoint
@@ -992,6 +1001,12 @@ close and at shutdown, never per line. A crash between two writes can therefore 
 `checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
+directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
+one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
+tick. Give each `tail_in`/`docker_in` its own `checkpoint_path`: validation rejects two components
+that name the same one.
 
 ### `watch: auto | inotify | poll`
 

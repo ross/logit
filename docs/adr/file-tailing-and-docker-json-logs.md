@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-21
+updated: 2026-09-24
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -412,3 +412,37 @@ trade-off, not hidden in a compose file comment alone.
   (`NGINX_ENTRYPOINT_QUIET_LOGS: "1"`, dropping its `syslog:` `access_log` destination) and adds a
   `docker_in` leg reading it, replacing the `syslog_in` leg that previously carried it — the
   concrete end-to-end proof this design is built to support.
+
+## Amendment: an unusable checkpoint replays, and checkpoint writes are durable (2026-09-24)
+
+The "Checkpoints" section above promises "strictly duplicates on restart, never loss". Two gaps
+broke that promise, and both are now closed, so it holds after a power loss and after corruption
+as well as after a process crash.
+
+**An unusable checkpoint starts every file at its beginning.** `CheckpointStore::load` used to treat
+a checkpoint that was present but unreadable, malformed, empty, or the wrong version the same as a
+missing one, so every file present at the first scan fell back to `read_from`. Under the default
+`read_from: end`, that skipped everything the files gained while `logit` was down, with only a
+diagnostic to show for it. Such a checkpoint proves a previous run read these files, so `load` now
+returns `Loaded::Unusable`, and the first scan starts every file it finds at offset 0, whatever
+`read_from` says. A missing checkpoint with a stray `<checkpoint_path>.tmp` beside it is unusable
+too: that's a crash before the very first checkpoint's rename. It's counted
+`logit.input.checkpoint.errors{op="load"}` and diagnosed `checkpoint_error`. A missing checkpoint
+with no tmp file is still the first-run case, and `read_from` still decides. The cost is a
+duplicate burst of every pre-existing file's content, in place of silent loss.
+
+**Every checkpoint write is durable.** `CheckpointStore::write` is `async` and runs
+`logit_pipeline::atomic_write::write_file_durably` on the blocking pool: write
+`<checkpoint_path>.tmp`, `fsync` it, rename it over `checkpoint_path`, `fsync` the directory. Before,
+there was no `fsync`, so a power loss could leave the renamed checkpoint empty or truncated, which
+the old `load` then turned into loss. A failed write keeps the store dirty, so the next
+`checkpoint_interval` tick retries it, and counts `logit.input.checkpoint.errors{op="write"}`. See
+ADR [`durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md),
+decisions 1 to 4.
+
+**The tmp file appends `.tmp` to the full file name.** It used to replace the extension, so
+`state.json` and `state.yaml` shared `state.tmp`. Graph rule 62 now also rejects two `tail_in`/
+`docker_in` components that set the same literal `checkpoint_path`: each would overwrite the
+other's offsets on every write, and each would resume from whichever wrote last. Like rule 35's
+`disk.path` check, the rule compares literal strings, so two spellings of one path (`./a.json` and
+`a.json`) still pass.

@@ -175,7 +175,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs:525-628` | unreviewed |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs:636-661` | unreviewed |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs:77-162` | unreviewed |
-| [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs:59-158` | in-progress (dur/w6) |
+| [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs:59-158` | findings → dur/w6 |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs:141-154` | unreviewed |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | in-progress (dur/w3) |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | in-progress (dur/w3) |
@@ -1564,6 +1564,20 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   fallback should be `Beginning` rather than `read_from`.
 - **Priority:** P0 — this is the durability boundary, and its failure mode currently points at loss
   rather than duplication.
+- **Verified 2026-09-24** (dur/w6): the loss lead is confirmed and fixed. Against the old code, an
+  empty, truncated, wrong-version, or stray-tmp checkpoint under `read_from: end` delivered none of
+  the pre-existing lines
+  (`an_unusable_checkpoint_starts_every_preexisting_file_at_the_beginning_even_under_read_from_end`
+  timed out); `CheckpointStore::load` now returns `Loaded::Unusable` for each, and the first scan
+  starts every file at 0, counted `logit.input.checkpoint.errors{op="load"}`. Every write goes
+  through `logit_pipeline::atomic_write::write_file_durably` on the blocking pool, so the missing
+  `fsync`s, the runtime-thread I/O, and the `with_extension` tmp collision are gone; a freeze or
+  an `EIO` at each of its four steps leaves the old (or, after the rename, the new) checkpoint
+  loadable and the store dirty for the next tick (`a_crash_at_any_step_of_a_write_leaves_the_previous_checkpoint_loadable`,
+  `a_failed_write_at_any_step_leaves_the_store_dirty_and_the_next_write_lands`). Graph rule 62
+  rejects two tailing listeners sharing a literal `checkpoint_path`. The flush-before-write and
+  close-flush-write shutdown orderings are unchanged and still covered by the driver tests above;
+  `load` stays a blocking read at bind, an accepted startup cost.
 
 ### TAIL-06 — Shutdown ordering and final flush of held state
 - **Location:** `crates/logit-inputs/src/tail/driver.rs:312-321` (loop exit, then close/flush/
