@@ -1,6 +1,8 @@
 //! APM stats: tracers' `/v0.6/stats` `ClientStatsPayload` and the intake's `/api/v0.2/stats`
-//! `StatsPayload`, both msgpack under the Go field names (`w2b-wire-shapes.md` §B4/§B5), and the
-//! DDSketch protobuf their `OkSummary`/`ErrorSummary` carry. The mapping tables are in
+//! `StatsPayload`, both msgpack under the Go field names, and the DDSketch protobuf their
+//! `OkSummary`/`ErrorSummary` carry. The message shapes are `datadog-agent` 7.83.3's
+//! `pkg/proto/datadog/trace/stats.proto` (vendored under `crates/logit-proto/proto/datadog/`); the
+//! msgpack key names are that tag's `pkg/proto/pbgo/trace/stats_gen.go`. The mapping tables are in
 //! [`super`]'s "APM stats" section.
 //!
 //! The msgpack walk reads into the prost types in [`crate::datadog::generated::trace`] (used here
@@ -93,7 +95,7 @@ pub const STATS_BIN_LIMIT: u32 = 2048;
 /// Written when non-empty on decode, read back as `Str` on encode. `ATTR_SERVICE_NAME` /
 /// `ATTR_RESOURCE_NAME` / `ATTR_SPAN_TYPE` / `ATTR_SPAN_KIND` carry the group's `Service` /
 /// `Resource` / `Type` / `SpanKind`, under the names a span carries them by (ADR
-/// `datadog-agent-and-intake-relay` decision 6); they're [`super`]'s constants, shared with
+/// `datadog-agent-and-intake-relay` decision 7); they're [`super`]'s constants, shared with
 /// [`super::traces`].
 const GROUP_STRINGS: [&str; 10] = [
     ATTR_SERVICE_NAME,
@@ -385,7 +387,7 @@ fn next_value<'a>(buf: &'a [u8], r: &mut Reader<'a>) -> Result<&'a [u8], Msgpack
     Ok(&buf[start..buf.len() - r.remaining()])
 }
 
-/// One `ClientGroupedStats` map (`w2b-wire-shapes.md` §B4); unknown keys are skipped.
+/// One `ClientGroupedStats` map (`stats_gen.go`'s keys); unknown keys are skipped.
 fn read_group(buf: &[u8]) -> Result<ClientGroupedStats, MsgpackError> {
     let mut r = Reader::new(buf);
     let mut g = ClientGroupedStats::default();
@@ -907,6 +909,12 @@ impl DatadogEncoder {
         if !(v.is_finite() && v >= 0.0) {
             self.stats_out_degraded("bad_count");
             return 0;
+        }
+        // `u64::MAX as f64` is exactly 2^64, which is what a wire `u64::MAX` decodes to, so that
+        // round trip stays silent; only a value strictly above it saturates lossily.
+        if v > u64::MAX as f64 {
+            self.stats_out_degraded("count_overflow");
+            return u64::MAX;
         }
         let r = v.round();
         if r != v {
@@ -1656,6 +1664,9 @@ mod tests {
             vec![
                 MetricRecord::new(intern(METRIC_HITS), MetricKind::counter(2.5)),
                 MetricRecord::new(intern(METRIC_ERRORS), MetricKind::counter(-1.0)),
+                MetricRecord::new(intern(METRIC_TOP_LEVEL_HITS), MetricKind::counter(2e19)),
+                // Exactly 2^64, what a wire `u64::MAX` decodes to: saturates without a count.
+                MetricRecord::new(intern(METRIC_DURATION), MetricKind::counter(u64::MAX as f64)),
                 MetricRecord::new(intern("other"), MetricKind::Gauge(1.0)),
                 MetricRecord::new(intern(METRIC_OK_SUMMARY), MetricKind::Distribution(agent)),
             ],
@@ -1677,6 +1688,7 @@ mod tests {
         };
         assert_eq!(n("logit.output.stats.degraded", "fractional_count"), 1.0);
         assert_eq!(n("logit.output.stats.degraded", "bad_count"), 1.0);
+        assert_eq!(n("logit.output.stats.degraded", "count_overflow"), 1.0, "2e19 only");
         assert_eq!(n("logit.output.stats.degraded", "agent_mapping"), 1.0);
         assert_eq!(n("logit.output.stats.skipped", "unrecognized_record"), 1.0);
         assert_eq!(n("logit.output.tags.dropped", "no_wire_form"), 1.0);
@@ -1685,6 +1697,23 @@ mod tests {
         let m = &back.events[0].metrics;
         assert_eq!(m[0].kind, MetricKind::counter(3.0), "2.5 rounds half away from zero");
         assert_eq!(m[1].kind, MetricKind::counter(0.0));
+        let by_name = |name: &str| m.iter().find(|r| resolve(r.name) == name).unwrap().kind.clone();
+        assert_eq!(by_name(METRIC_TOP_LEVEL_HITS), MetricKind::counter(u64::MAX as f64));
+        assert_eq!(by_name(METRIC_DURATION), MetricKind::counter(u64::MAX as f64));
+
+        // A wire `u64::MAX` decodes to 2^64 and re-encodes to `u64::MAX` without a count.
+        let (mut e2, registry2) = encoder();
+        let out2 = e2.encode_client_stats_v06(&back).unwrap();
+        let overflowed = registry2
+            .drain(0)
+            .iter()
+            .filter(|ev| {
+                ev.attributes.get("reason").and_then(Value::as_str) == Some("count_overflow")
+            })
+            .count();
+        assert_eq!(overflowed, 0);
+        let again = DatadogDecoder::new().decode_client_stats_v06(&out2, 0).unwrap();
+        assert_eq!(again.events[0].metrics, back.events[0].metrics);
     }
 
     #[test]

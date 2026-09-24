@@ -18,8 +18,10 @@
 //!    level, which catches an encoder that writes two byte strings for what its own decoder calls
 //!    one batch. Asserted on every route.
 //!
-//! The hand-written vectors start from `w2a-wire-shapes.md`'s examples, including the Agent's v1
-//! field set and a `Dogsketch` with negative, zero, positive, and above-65535 counts. The
+//! The hand-written vectors follow `DataDog/agent-payload` v5.0.211's
+//! `proto/metrics/agent_payload.proto` (vendored under `crates/logit-proto/proto/datadog/`) and the
+//! v1 JSON field set in `logit_proto::datadog`'s module doc. They include a `Dogsketch` with
+//! negative, zero, positive, and above-65535 counts. The
 //! `proptest`s below generate series and sketch payloads from a grammar (values, tags with bare
 //! and repeated keys, every type, resources) and assert both properties on every route.
 

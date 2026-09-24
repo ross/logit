@@ -1,5 +1,6 @@
 //! A hand-rolled MessagePack reader and writer (https://github.com/msgpack/msgpack/blob/master/spec.md),
-//! for the Datadog codecs' `series`, `sketches`, and `check_run` payloads.
+//! for the Datadog traces and APM stats codecs (`crate::datadog::traces_msgpack`,
+//! `crate::datadog::stats`).
 //!
 //! ## Why this is hand-rolled
 //!
@@ -310,6 +311,20 @@ impl<'a> Reader<'a> {
                     Err(MsgpackError::Type { expected: "u64", found: Type::Int })
                 }
             }
+        }
+    }
+
+    /// Accepts any int format and returns its 64 bits as a `u64`, wrapping a negative value the
+    /// way Go's `uint64(v)` cast does (`-1` reads as `u64::MAX`). A caller that wants an `i64`
+    /// casts the result back, which wraps a `uint64` above `i64::MAX` the same way.
+    ///
+    /// This exists because [`Reader::read_u64`] and [`Reader::read_i64`] consume the int before
+    /// they range-check it: once either errs, the value is gone, so retrying with the other
+    /// reader reads the *next* value instead. This reads the int once and never errs on range.
+    pub fn read_int_wrapping(&mut self) -> Result<u64, MsgpackError> {
+        match self.read_int_repr()? {
+            IntRepr::Unsigned(v) => Ok(v),
+            IntRepr::Signed(v) => Ok(v as u64),
         }
     }
 
@@ -855,6 +870,21 @@ mod tests {
     #[test]
     fn writes_negative_fixint() {
         assert_eq!(written(|w| w.write_i64(-1)), vec![0xff]);
+    }
+
+    #[test]
+    fn read_int_wrapping_casts_any_int_format_to_u64_without_erring() {
+        let mut int64_min = vec![0xd3];
+        int64_min.extend_from_slice(&i64::MIN.to_be_bytes());
+        let mut uint64_big = vec![0xcf];
+        uint64_big.extend_from_slice(&(u64::MAX - 1).to_be_bytes());
+        for (bytes, want) in
+            [(vec![0xff], u64::MAX), (int64_min, i64::MIN as u64), (uint64_big, u64::MAX - 1)]
+        {
+            let mut r = Reader::new(&bytes);
+            assert_eq!(r.read_int_wrapping().unwrap(), want, "{bytes:02x?}");
+            assert_eq!(r.remaining(), 0, "the int is consumed exactly once");
+        }
     }
 
     #[test]

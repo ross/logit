@@ -12,9 +12,14 @@
 //!    can carry (no `meta_struct`, links, or events) and no chunk or payload carriers, which v0.4
 //!    and v0.5 have no field for.
 //!
-//! The hand-written vectors follow `w2b-wire-shapes.md`'s examples: a span with `_dd.p.tid`,
-//! links with `trace_id_high`, events with every `AttributeAnyValue` type, `meta_struct`, a chunk
-//! with priority/origin/dropped_trace, and an `AgentPayload` with two tracer payloads. The
+//! The hand-written vectors follow `datadog-agent` 7.83.3's wire shapes. The messages are
+//! `pkg/proto/datadog/trace/{span,tracer_payload,agent_payload}.proto` (vendored under
+//! `crates/logit-proto/proto/datadog/`). The msgpack key names are that tag's
+//! `pkg/proto/pbgo/trace/{span,tracer_payload}_gen.go`. The v0.4/v0.5 forms are
+//! `pkg/trace/api/version.go` and `pkg/proto/pbgo/trace/decoder_v05.go`. The vectors cover a span
+//! with `_dd.p.tid`, links with `trace_id_high`, events with every `AttributeAnyValue` type,
+//! `meta_struct`, a chunk with priority/origin/dropped_trace, and an `AgentPayload` with two tracer
+//! payloads. The
 //! `proptest` generates `AgentPayload`s (prost's own encoder, an independent writer) of random
 //! spans and asserts all three properties from them.
 
@@ -281,7 +286,8 @@ fn agent_payload() -> AgentPayload {
     }
 }
 
-/// `w2b-wire-shapes.md` §B1's minimal v0.4 example, verbatim.
+/// A minimal v0.4 body: one trace of one span, keyed as `span_gen.go` keys it, in the v0.4 form
+/// `pkg/trace/api/version.go` describes (`datadog-agent` 7.83.3).
 fn minimal_v04() -> Vec<u8> {
     let mut w = Writer::new();
     w.write_array_len(1);

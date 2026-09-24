@@ -5,8 +5,9 @@
 //!
 //! Decoding follows the Agent's generated `UnmarshalMsg` (`span_gen.go`, `tracer_payload_gen.go`)
 //! and `decoder_v05.go`: an unknown map key is skipped, an absent or `nil` field is its zero
-//! value, any int format satisfies an integer field (a negative one read as a `uint64` wraps, as
-//! Go's cast does), and a string field also accepts `bin`. One malformed span (or trace, or
+//! value, any int format satisfies an integer field, read once and cast as Go's `uint64(v)`/`int64(v)`
+//! would (a negative int in a `uint64` field wraps, as does a `uint64` above `i64::MAX` in an
+//! `int64` field), and a string field also accepts `bin`. One malformed span (or trace, or
 //! chunk) is dropped and counted while the rest of the body decodes, because each is first
 //! skipped structurally and then parsed from its own slice; a body whose structure itself is
 //! broken is `CodecError::Malformed`.
@@ -117,22 +118,14 @@ fn u64_any(r: &mut Reader<'_>) -> Res<u64> {
     if is_nil(r)? {
         return Ok(0);
     }
-    Ok(match r.read_u64() {
-        Ok(v) => v,
-        Err(MsgpackError::Type { .. }) => r.read_i64()? as u64,
-        Err(e) => return Err(e.into()),
-    })
+    Ok(r.read_int_wrapping()?)
 }
 
 fn i64_any(r: &mut Reader<'_>) -> Res<i64> {
     if is_nil(r)? {
         return Ok(0);
     }
-    Ok(match r.read_i64() {
-        Ok(v) => v,
-        Err(MsgpackError::Type { .. }) => r.read_u64()? as i64,
-        Err(e) => return Err(e.into()),
-    })
+    Ok(r.read_int_wrapping()? as i64)
 }
 
 fn i32_any(r: &mut Reader<'_>) -> Res<i32> {
@@ -1120,6 +1113,86 @@ mod tests {
         assert!(reasons(&registry).contains(&"malformed".to_string()));
         assert!(d.decode_traces_v04(b"\x91", 0).is_err(), "a truncated body is malformed");
         assert!(d.decode_traces_v04(b"\x80", 0).is_err(), "a map body is malformed");
+    }
+
+    #[test]
+    fn a_negative_fixint_trace_id_wraps_and_the_rest_of_the_v04_span_decodes() {
+        let (mut d, _, registry) = with_registry();
+        let body = v04(3, |w| {
+            w.write_str("trace_id");
+            w.write_i64(-1); // negative fixint 0xff
+            w.write_str("span_id");
+            w.write_u64(2);
+            w.write_str("service");
+            w.write_str("web");
+        });
+        assert_eq!(body[3..12], *b"\xa8trace_id");
+        assert_eq!(body[12], 0xff);
+        let batch = d.decode_traces_v04(&body, 0).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        let e = &batch.events[0];
+        let s = e.span.as_ref().unwrap();
+        let mut want = [0u8; 16];
+        want[8..].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(s.trace_id, want, "-1 wraps to u64::MAX, as Go's uint64 cast does");
+        assert_eq!(s.span_id, 2u64.to_be_bytes());
+        assert_eq!(e.attributes.get(ATTR_SERVICE_NAME), Some(&Value::str("web")));
+        assert!(!reasons(&registry).contains(&"malformed".to_string()));
+    }
+
+    #[test]
+    fn a_negative_fixint_trace_id_keeps_every_later_v05_element_in_place() {
+        let (mut d, _, registry) = with_registry();
+        let body = span_bytes(|w| {
+            w.write_array_len(2);
+            w.write_array_len(2);
+            w.write_str("");
+            w.write_str("web");
+            w.write_array_len(1);
+            w.write_array_len(1);
+            w.write_array_len(12);
+            for v in [1u64, 1, 0] {
+                w.write_u64(v);
+            }
+            w.write_i64(-1); // trace_id as negative fixint 0xff
+            for v in [2u64, 3, 4, 5, 0] {
+                w.write_u64(v);
+            }
+            w.write_map_len(0);
+            w.write_map_len(0);
+            w.write_u64(1);
+        });
+        let batch = d.decode_traces_v05(&body, 0).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        let e = &batch.events[0];
+        let s = e.span.as_ref().unwrap();
+        assert_eq!(s.trace_id[8..], u64::MAX.to_be_bytes());
+        assert_eq!(s.span_id, 2u64.to_be_bytes());
+        assert_eq!(s.parent_span_id, Some(3u64.to_be_bytes()));
+        assert_eq!(e.timestamp, 4);
+        assert_eq!(s.end_timestamp, 9);
+        assert_eq!(s.status, SpanStatus::Unset);
+        assert_eq!(e.attributes.get(ATTR_SERVICE_NAME), Some(&Value::str("web")));
+        assert_eq!(e.attributes.get(ATTR_SPAN_TYPE), Some(&Value::str("web")));
+        assert!(!reasons(&registry).contains(&"malformed".to_string()));
+    }
+
+    #[test]
+    fn a_uint64_start_above_i64_max_wraps_and_the_span_is_kept() {
+        let (mut d, _, registry) = with_registry();
+        let body = v04(2, |w| {
+            w.write_str("start");
+            w.write_u64(u64::MAX); // 0xcf + eight 0xff bytes
+            w.write_str("span_id");
+            w.write_u64(7);
+        });
+        assert_eq!(body[9], 0xcf);
+        let batch = d.decode_traces_v04(&body, 0).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        let e = &batch.events[0];
+        assert_eq!(e.timestamp, -1, "u64::MAX wraps to -1, as Go's int64 cast does");
+        assert_eq!(e.span.as_ref().unwrap().span_id, 7u64.to_be_bytes());
+        assert!(!reasons(&registry).contains(&"malformed".to_string()));
     }
 
     #[test]

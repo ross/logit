@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-09-24
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -78,7 +78,18 @@ Three facts from the survey drive the shape of the decision:
    map), the pickle precedent; `agent-payload`'s protos are vendored at a pinned tag and generated
    by `script/protogen` ([ADR `committed-pregenerated-otlp-protobuf`](committed-pregenerated-otlp-protobuf.md)).
 
-6. **Attribute vocabulary.** `datadog.*` for raw encodings (`datadog.type`, `datadog.interval`,
+6. **Protobuf is decoded through prost and encoded by hand for the two map-bearing families.**
+   Every Datadog protobuf is decoded with prost's generated types. `AgentPayload` and the DDSketch
+   protobuf are encoded by hand instead (`crates/logit-proto/src/datadog/traces_proto.rs`,
+   `stats.rs`). prost holds a map field as a `HashMap`, whose iteration order makes its bytes
+   non-deterministic, and the fixed-point tests need `encode(decode(encode(d))) == encode(d)` on
+   bytes. The hand-written encoders write fields in tag order, skip proto3 defaults as prost does,
+   and sort every map by key. Each has a unit test proving prost decodes its bytes to the same
+   message. This narrows
+   [ADR `committed-pregenerated-otlp-protobuf`](committed-pregenerated-otlp-protobuf.md)'s
+   rejection of hand-rolled protobuf to decoding, and to families without maps.
+
+7. **Attribute vocabulary.** `datadog.*` for raw encodings (`datadog.type`, `datadog.interval`,
    `datadog.resources`, `datadog.source_type_name`, `datadog.origin.*`, `datadog.chunk.*`,
    `datadog.tracer.*`, `datadog.agent.*`, `datadog.stats.*`); Datadog's own OTLP-honored names for
    span fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
@@ -86,10 +97,10 @@ Three facts from the survey drive the shape of the decision:
    Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with `datadog.type: rate`,
    not a `Sum`, because folding a per-second value into a delta multiplies and rounds.
 
-7. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
+8. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
    bits plus `_dd.p.tid` when the high bits are nonzero.
 
-8. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
+9. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
    never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
    than Datadog's windows (1 h for metrics, 18 h for logs, 10 min for checks) before sending.
 
@@ -114,6 +125,11 @@ Three facts from the survey drive the shape of the decision:
 - **Port the Agent's `Sketch.Quantile` interpolation.** Rejected: it can miss a single-bin
   population by `γ^1.5 - 1` (2.35%), it isn't what Datadog shows for a shipped sketch, and the
   bin-center estimator keeps the documented bound.
+- **Encode through prost and compare decoded values rather than bytes.** Rejected: it would keep
+  one protobuf path, but a value-level fixed point can't catch an encoder that writes two byte
+  strings for one batch, and the other Datadog routes and every other lossless pair assert on
+  bytes. Two hand-written encoders, each checked against prost's decoder, cost less than a
+  weaker contract for these routes alone.
 - **Decide trace readiness by batch provenance (`origin == datadog_in`).** Rejected in favor of
   the `_top_level` mark so a future transform that does the Agent's processing makes the same
   data ready by writing the same mark, with no change to `datadog_out`.

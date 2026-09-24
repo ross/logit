@@ -376,7 +376,7 @@
 //! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
 //! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's | `skipped{reason="interpolation"}` |
 //! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `skipped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
-//! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 6), when non-empty | -- |
+//! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 7), when non-empty | -- |
 //! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
 //! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
 //! | `HTTPStatusCode` | `datadog.stats.http_status_code` (`U64`), when nonzero | -- |
@@ -403,7 +403,7 @@
 //! |---|---|---|
 //! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.dropped{reason="unrepresentable"}` |
 //! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per batch) |
-//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}` |
+//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}`; above 2^64: `u64::MAX`, `degraded{reason="count_overflow"}` |
 //! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
 //! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
 //! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | skipped | `logit.output.stats.skipped{reason="unrecognized_record"}` |
@@ -495,7 +495,7 @@ pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
 pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
 /// `service.name` / `resource.name` / `span.type` / `span.kind`: a span's `service`, `resource`,
 /// `type`, and (a `meta` key, kept verbatim, that also sets `SpanRecord::kind`) `span.kind` — the
-/// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 6). An
+/// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 7). An
 /// APM stats group's `Service`/`Resource`/`Type`/`SpanKind` carry the same names, so these live
 /// here rather than in [`traces`] or [`stats`] alone.
 pub const ATTR_SERVICE_NAME: &str = "service.name";
