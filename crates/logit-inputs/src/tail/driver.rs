@@ -990,6 +990,20 @@ mod tests {
         })
     }
 
+    /// The sum of every buffered `Sum` point of counter `name`. Drains `registry`.
+    fn counter_total(registry: &Registry, name: &str) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value,
+                _ => 0.0,
+            })
+            .sum()
+    }
+
     // -- `Tailer::bind` --
 
     /// `bind()` runs the initial scan before `run_until_shutdown`.
@@ -1178,35 +1192,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Under `inotify`, a rotation's replacement is discovered and read without the 30s poll.
+    /// A `TailConfig` in which only an inotify wake runs `drain` within a test's timeout: no
+    /// 15ms flush tick (`Outcome::Flush` drains too), a 30s poll, and one event per batch, so a
+    /// line is emitted by the `drain` that reads it.
+    fn inotify_only_config() -> TailConfig {
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.watch = WatchMode::Inotify;
+        config.poll_interval = Duration::from_secs(30);
+        config.batching.flush_interval = Duration::from_secs(60);
+        config.batching.max_events = 1;
+        config
+    }
+
+    /// Binds before spawning, so the initial scan has armed every watch before the test writes.
+    /// No `drain` follows `bind`, so the test's files start empty and every line arrives by a
+    /// wake.
+    async fn spawn_bound_tailer(
+        mut tailer: Tailer<LineDecoder, LineFactory>,
+        sink: Fanout,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        tailer.bind().await.expect("bind should succeed");
+        spawn_tailer(tailer, sink)
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    /// Under `inotify`, a rotation's replacement is discovered and read, and then followed by its
+    /// own watch, all without the 30s poll.
     #[tokio::test]
     async fn under_inotify_a_rotation_registers_a_fresh_watch_on_the_new_inode() {
         let dir = scratch_dir("inotify-rotation-watch");
         let path = dir.join("app.log");
-        std::fs::write(&path, b"before\n").unwrap();
+        std::fs::write(&path, b"").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
-        let mut config = fast_config(ReadFrom::Beginning);
-        config.watch = WatchMode::Inotify;
-        config.poll_interval = Duration::from_secs(30);
-        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, inotify_only_config());
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        append(&path, b"before\n");
+        let events = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+            .await
+            .expect("the original file's own watch should deliver this well within 3s");
         assert_eq!(messages(&events), vec!["before"]);
 
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+            .await
+            .expect("the directory watch should discover the replacement well within 3s");
         assert_eq!(messages(&events2), vec!["after"]);
 
-        // The new inode's watch raises `IN_MODIFY`, but the 15ms flush tick also runs `drain`,
-        // so prompt delivery here doesn't prove the watch fired.
-        {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"more\n").unwrap();
-        }
+        append(&path, b"more\n");
         let events3 =
             tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
                 "the new inode's own watch should deliver this well within 3s, nowhere near the \
@@ -1754,29 +1794,30 @@ mod tests {
     }
 
     /// Under `inotify`, a write to a tracked file arrives well inside the 30s `poll_interval`.
-    /// The 15ms flush tick also runs `drain`, so this doesn't isolate `Wake::Data`.
+    /// An `O_APPEND` write raises only `IN_MODIFY` on the file's own watch, and
+    /// [`inotify_only_config`] leaves no other `drain` within the timeout, so only `Wake::Data`
+    /// can deliver it.
     #[tokio::test]
     async fn under_inotify_a_write_to_an_already_tracked_file_is_delivered_promptly() {
         let dir = scratch_dir("inotify-data-wake");
         let path = dir.join("app.log");
-        std::fs::write(&path, b"first\n").unwrap();
+        std::fs::write(&path, b"").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
-        let mut config = fast_config(ReadFrom::Beginning);
-        config.watch = WatchMode::Inotify;
-        config.poll_interval = Duration::from_secs(30);
-        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("*.log"))],
+            LineFactory,
+            inotify_only_config(),
+        );
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        let first = expect_events(&mut rx, 1).await;
+        append(&path, b"first\n");
+        let first = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+            .await
+            .expect("the file's own watch should deliver this well within 3s");
         assert_eq!(messages(&first), vec!["first"]);
 
-        // `O_APPEND`, so the only event is `IN_MODIFY` on the file's own watch.
-        {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"second\n").unwrap();
-        }
-
+        append(&path, b"second\n");
         let second =
             tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
                 "a write to an already-tracked file should be delivered well within 3s, nowhere \
@@ -1789,34 +1830,52 @@ mod tests {
     }
 
     /// Under `inotify`, an in-place truncation is noticed through the file's own `IN_MODIFY`:
-    /// `DIR_MASK` has no content bits, and `drain` alone never rewinds. `std::fs::write`'s
-    /// `O_TRUNC` open and its write each raise `IN_MODIFY`; this can't tell which woke it.
+    /// `DIR_MASK` has no content bits, and `drain` alone never rewinds.
+    ///
+    /// The truncation's wake is handled on its own before the replacement is written, and the
+    /// replacement is longer than the original. If that wake rewinds the file, the tailer reads
+    /// from `0` and delivers the whole replacement line. If it doesn't, the write's wake sees a
+    /// length at or past the old offset, doesn't rewind, and the tailer delivers the fragment past
+    /// that offset. A replacement shorter than the original would let the write's own wake
+    /// rewind, hiding which wake did it.
     #[tokio::test]
     async fn under_inotify_a_truncation_is_noticed_via_the_files_own_watch() {
         let dir = scratch_dir("inotify-truncate-data-wake");
         let path = dir.join("app.log");
-        // Longer than the replacement: truncation means length below the offset read.
-        std::fs::write(&path, b"a-longer-first-line\n").unwrap();
+        std::fs::write(&path, b"").unwrap();
 
+        let registry = Registry::new();
         let (fanout, mut rx) = recording_fanout(8);
-        let mut config = fast_config(ReadFrom::Beginning);
-        config.watch = WatchMode::Inotify;
-        config.poll_interval = Duration::from_secs(30);
-        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("*.log"))],
+            LineFactory,
+            inotify_only_config(),
+        )
+        .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        let first = expect_events(&mut rx, 1).await;
-        assert_eq!(messages(&first), vec!["a-longer-first-line"]);
+        append(&path, b"first\n");
+        let first = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+            .await
+            .expect("the file's own watch should deliver this well within 3s");
+        assert_eq!(messages(&first), vec!["first"]);
 
-        // `O_TRUNC` on the existing path: same inode, shorter length.
-        std::fs::write(&path, b"short\n").unwrap();
+        // `ftruncate(2)`: same inode, length 0, one `IN_MODIFY`.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        append(&path, b"a-much-longer-replacement-line\n");
 
         let second =
             tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
-                "the truncation should be noticed well within 3s via the file's own watch, \
+                "the replacement should be delivered well within 3s via the file's own watch, \
                  nowhere near the 30s poll_interval",
             );
-        assert_eq!(messages(&second), vec!["short"]);
+        assert_eq!(
+            messages(&second),
+            vec!["a-much-longer-replacement-line"],
+            "the truncation's own wake should have rewound the file to 0"
+        );
+        assert_eq!(counter_total(&registry, "logit.input.files.truncated"), 1.0);
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
