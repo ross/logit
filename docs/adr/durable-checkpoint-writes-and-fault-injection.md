@@ -273,8 +273,9 @@ script is needed. This list is filled in as each workstream lands.
   - `crates/logit-inputs/src/tail/checkpoint.rs`:
     - `an_empty_checkpoint_is_unusable_not_missing`,
       `a_truncated_checkpoint_document_is_unusable_and_counted`,
-      `an_unreadable_checkpoint_is_unusable`, `a_wrong_version_checkpoint_is_unusable`, and
-      `a_missing_checkpoint_with_a_stray_tmp_beside_it_is_unusable`: decision 4's unusable shapes,
+      `an_unreadable_checkpoint_is_unusable`, `a_wrong_version_checkpoint_is_unusable`,
+      `a_missing_checkpoint_with_a_stray_tmp_beside_it_is_unusable`, and
+      `an_unreadable_tmp_beside_a_missing_checkpoint_is_unusable`: decision 4's unusable shapes,
       each counted `op="load"` and diagnosed once.
     - `a_missing_checkpoint_alone_is_missing`: the first-run case stays silent.
     - `checkpoints_differing_only_in_extension_never_share_a_tmp`: `state.json` and `state.yaml`

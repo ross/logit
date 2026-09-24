@@ -78,7 +78,8 @@ impl CheckpointStore {
     /// Loads `path`. Never fatal to the component.
     ///
     /// Unreadable, malformed, empty, or wrong-version is [`Loaded::Unusable`], and so is a
-    /// missing checkpoint with its tmp file beside it (a crash before the first rename landed).
+    /// missing checkpoint with its tmp file beside it (a crash before the first rename landed), or
+    /// with a tmp path that can't be checked.
     /// Each counts `logit.input.checkpoint.errors{op="load"}` and is diagnosed `checkpoint_error`.
     /// A blocking read: it runs once, at bind.
     pub fn load(path: PathBuf, diag: &mut Diagnostics, telemetry: &Telemetry) -> (Self, Loaded) {
@@ -101,11 +102,16 @@ impl CheckpointStore {
                 Err(err) => format!("malformed: {err}"),
             },
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Not `exists()`, which reads any stat error as "absent": a tmp that can't be
+                // checked can't be ruled out as a crash's leftover.
                 let tmp = atomic_write::tmp_path(&path);
-                if !tmp.exists() {
-                    return (Self { path, dirty: false }, Loaded::Missing);
+                match std::fs::symlink_metadata(&tmp) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        return (Self { path, dirty: false }, Loaded::Missing);
+                    }
+                    Ok(_) => format!("missing, but {} exists beside it", tmp.display()),
+                    Err(err) => format!("missing, and {} is unreadable: {err}", tmp.display()),
                 }
-                format!("missing, but {} exists beside it", tmp.display())
             }
             Err(err) => format!("unreadable: {err}"),
         };
@@ -330,6 +336,24 @@ mod tests {
         let dir = scratch_dir("checkpoint-stray-tmp");
         let path = dir.join("checkpoint.json");
         std::fs::write(tmp_path(&path), br#"{"version":1,"files":[]}"#).unwrap();
+        assert_unusable(&path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tmp file that can't be checked might be a crash's leftover, so it can't be ruled out as
+    /// one. A permission error needs a non-root test; `ENAMETOOLONG` doesn't: a 252-byte name is
+    /// missing (`ENOENT`), and its 256-byte tmp name fails `lstat` outright.
+    #[test]
+    fn an_unreadable_tmp_beside_a_missing_checkpoint_is_unusable() {
+        let dir = scratch_dir("checkpoint-tmp-unstattable");
+        let path = dir.join("c".repeat(252));
+        assert_eq!(
+            std::fs::read(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "the checkpoint itself must read as missing"
+        );
+        let stat = std::fs::symlink_metadata(tmp_path(&path)).unwrap_err();
+        assert_ne!(stat.kind(), io::ErrorKind::NotFound, "the tmp must fail to stat: {stat}");
         assert_unusable(&path);
         std::fs::remove_dir_all(&dir).ok();
     }
