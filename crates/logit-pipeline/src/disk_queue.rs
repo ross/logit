@@ -2623,38 +2623,69 @@ mod tests {
         }))
     }
 
-    #[tokio::test]
-    async fn a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push() {
+    /// Polls `fut` once on `rt`, which must have one blocking thread, with that thread held, so
+    /// nothing the poll hands off can finish during it; then lets everything it handed off run to
+    /// completion. The future only moves on at the next poll, so a caller can stop at an exact
+    /// step. Returns whether the future is still pending.
+    fn poll_one_step<F: std::future::Future>(
+        rt: &tokio::runtime::Runtime,
+        fut: std::pin::Pin<&mut F>,
+    ) -> bool {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
+        let pending = poll_once_in(rt, fut);
+        release.send(()).unwrap();
+        // One blocking thread runs its queue in order, so this finishes after the handed-off work.
+        rt.block_on(rt.spawn_blocking(|| ())).unwrap();
+        pending
+    }
+
+    /// The push is polled once on a second runtime whose one blocking thread the test holds, so
+    /// its write can't land while it's polled and the push must be parked at its `flush`. Once
+    /// released, the write lands with the push never polled again, so it can't complete, and it's
+    /// dropped with its bytes on disk.
+    #[test]
+    fn a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push() {
         let dir = scratch_dir("cancel-after-landing");
         let mut cfg = config(dir.clone());
         cfg.segment_bytes = 1024 * 1024;
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stalled = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        stalled.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
         let q = open_with(cfg);
-        q.push((batch("a"), ctx())).await;
+        main.block_on(q.push((batch("a"), ctx())));
         let path = segment_path(&dir, 0);
         let before = std::fs::metadata(&path).unwrap().len();
         let record_len = raw_record(&batch("cancelled"), ctx()).len() as u64;
 
         {
             let mut push = std::pin::pin!(q.push((batch("cancelled"), ctx())));
-            // Poll only while the bytes haven't landed. The write goes to the blocking pool on
-            // the first poll, which then parks at the `flush` await until it completes.
+            assert!(poll_once_in(&stalled, push.as_mut()), "the write is parked behind the gate");
+            release.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while std::fs::metadata(&path).unwrap().len() < before + record_len {
                 assert!(Instant::now() < deadline, "the write never landed");
-                let pending = std::future::poll_fn(|cx| {
-                    std::task::Poll::Ready(push.as_mut().poll(cx).is_pending())
-                })
-                .await;
-                assert!(pending, "the push must still be parked at its flush");
                 std::thread::sleep(Duration::from_millis(1));
             }
         } // dropped at the `flush` await, its bytes on disk
+        drop(stalled);
 
-        q.push((batch("b"), ctx())).await;
-        assert_segments_match_disk(&q, &dir);
-        deliver(&q, &["a", "b"]).await;
-        q.close();
-        assert!(peek_within(&q).await.is_none(), "the cancelled record was truncated away");
+        main.block_on(async {
+            q.push((batch("b"), ctx())).await;
+            assert_segments_match_disk(&q, &dir);
+            deliver(&q, &["a", "b"]).await;
+            q.close();
+            assert!(peek_within(&q).await.is_none(), "the cancelled record was truncated away");
+        });
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3289,79 +3320,89 @@ mod tests {
     /// `segment_bytes`, so only the unfinished rotation says the next write must rotate first.
     /// The next push runs on the closed store, as the shutdown sweep's does, so it never takes
     /// the make-room path itself.
-    #[tokio::test]
-    async fn a_rotation_cancelled_after_its_create_is_finished_by_the_next_write_never_appending_to_the_old_segment(
+    ///
+    /// The cancelled push is stepped with [`poll_one_step`], so it stops right after the create
+    /// lands, never racing past it.
+    #[test]
+    fn a_rotation_cancelled_after_its_create_is_finished_by_the_next_write_never_appending_to_the_old_segment(
     ) {
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stepped = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
         let dir = scratch_dir("cancelled-make-room");
         let one = raw_record(&batch("x"), ctx()).len() as u64;
         let mut cfg = config(dir.clone());
         cfg.segment_bytes = 1024 * 1024;
         cfg.max_bytes = 3 * one;
         let (q, registry, _diag) = open_observed(cfg);
-        for label in ["a", "b", "c"] {
-            q.push((batch(label), ctx())).await;
-        }
-        deliver(&q, &["a", "b", "c"]).await;
+        main.block_on(async {
+            for label in ["a", "b", "c"] {
+                q.push((batch(label), ctx())).await;
+            }
+            deliver(&q, &["a", "b", "c"]).await;
+        });
 
         {
             let mut push = std::pin::pin!(q.push((batch("cancelled"), ctx())));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !segment_path(&dir, 1).exists() {
+            for _ in 0..100 {
+                if segment_path(&dir, 1).exists() {
+                    break;
+                }
                 assert!(
-                    Instant::now() < deadline,
-                    "the make-room rotation never created segment 1"
+                    poll_one_step(&stepped, push.as_mut()),
+                    "the push must still be inside its rotation"
                 );
-                let pending = std::future::poll_fn(|cx| {
-                    std::task::Poll::Ready(push.as_mut().poll(cx).is_pending())
-                })
-                .await;
-                assert!(pending, "the push must still be inside its rotation");
-                std::thread::sleep(Duration::from_millis(1));
             }
+            assert!(segment_path(&dir, 1).exists(), "the make-room rotation created segment 1");
         } // cancelled with segment 1 on disk but not yet active
+        drop(stepped);
+        main.block_on(async {
+            // A retry whose create fails can't fall back to segment 0 with segment 1 on disk.
+            registry.drain(0);
+            let scope = fault::scope(&dir);
+            scope.fail_nth(SEGMENT_CREATE, 1, errno::EIO);
+            q.push((batch("refused"), ctx())).await;
+            drop(scope);
+            let events = registry.drain(0);
+            assert_eq!(
+                metric_sum(
+                    &events,
+                    SINK_QUEUE_METRICS.items_dropped,
+                    Some(("reason", "disk_io_error"))
+                ),
+                1.0
+            );
+            assert_eq!(std::fs::metadata(segment_path(&dir, 0)).unwrap().len(), 3 * one);
 
-        // A retry whose create fails can't fall back to segment 0 with segment 1 on disk.
-        registry.drain(0);
-        let scope = fault::scope(&dir);
-        scope.fail_nth(SEGMENT_CREATE, 1, errno::EIO);
-        q.push((batch("refused"), ctx())).await;
-        drop(scope);
-        let events = registry.drain(0);
-        assert_eq!(
-            metric_sum(
-                &events,
-                SINK_QUEUE_METRICS.items_dropped,
-                Some(("reason", "disk_io_error"))
-            ),
-            1.0
-        );
-        assert_eq!(std::fs::metadata(segment_path(&dir, 0)).unwrap().len(), 3 * one);
+            q.close();
+            q.push((batch("swept"), ctx())).await;
 
-        q.close();
-        q.push((batch("swept"), ctx())).await;
-
-        let tracked: Vec<u64> = segment_lengths(&q, &dir).iter().map(|s| s.0).collect();
-        assert_eq!(
-            list_segments(&dir).unwrap(),
-            tracked,
-            "every file on disk is a tracked segment"
-        );
-        assert_segments_match_disk(&q, &dir);
-        assert_eq!(
-            std::fs::metadata(segment_path(&dir, 0)).unwrap().len(),
-            3 * one,
-            "nothing is appended to the segment the rotation was leaving"
-        );
-        assert_eq!(
-            std::fs::metadata(segment_path(&dir, 1)).unwrap().len(),
-            raw_record(&batch("swept"), ctx()).len() as u64,
-            "the next write lands in the segment the rotation created"
-        );
-        drop(q);
-        // The cursor last persisted inside segment 0, so its committed records may replay.
-        let reopened = open(dir.clone());
-        let delivered = drain_all(&reopened).await;
-        assert_no_loss(&delivered, &["a", "b", "c"], &["swept"], "reopen");
+            let tracked: Vec<u64> = segment_lengths(&q, &dir).iter().map(|s| s.0).collect();
+            assert_eq!(
+                list_segments(&dir).unwrap(),
+                tracked,
+                "every file on disk is a tracked segment"
+            );
+            assert_segments_match_disk(&q, &dir);
+            assert_eq!(
+                std::fs::metadata(segment_path(&dir, 0)).unwrap().len(),
+                3 * one,
+                "nothing is appended to the segment the rotation was leaving"
+            );
+            assert_eq!(
+                std::fs::metadata(segment_path(&dir, 1)).unwrap().len(),
+                raw_record(&batch("swept"), ctx()).len() as u64,
+                "the next write lands in the segment the rotation created"
+            );
+            drop(q);
+            // The cursor last persisted inside segment 0, so its committed records may replay.
+            let reopened = open(dir.clone());
+            let delivered = drain_all(&reopened).await;
+            assert_no_loss(&delivered, &["a", "b", "c"], &["swept"], "reopen");
+        });
         std::fs::remove_dir_all(&dir).ok();
     }
 
