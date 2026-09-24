@@ -175,10 +175,12 @@ actual code; each is resolved as follows.
    `disk.path` strings as written, sorted for a deterministic error message the way rule 13
    already does for `internal` components. `DiskQueue::open`'s exclusive lock catches the aliased
    case (`./spool` vs `spool`) at startup instead.
-4. **A torn write is repaired on the next push, not left to `resync` alone.** There is exactly one
-   producer per spool, so `DiskQueue` tracks a `write_in_flight` flag and the last known-good
-   segment length; a push that finds the flag set truncates back to that length before appending.
-   `frame::resync` remains the crash-time fallback, where no in-memory state survived.
+4. **A torn write is repaired on the next push, not left to `resync` alone.** A push that finds
+   an unconfirmed write truncates the active segment back to its length before that write, through
+   the segment's one retained write handle, before appending anything. `frame::resync` remains the
+   crash-time fallback, where no in-memory state survived. See
+   [Amendment: one retained write handle, and what a failed repair does](#amendment-one-retained-write-handle-and-what-a-failed-repair-does-2026-09-24)
+   for why the handle matters and what a failed truncate does.
 5. **An oversized frame is rejected at push, never written.** See "Push cost" above.
 
 ## Alternatives considered
@@ -326,3 +328,50 @@ already named another file, which was then counted twice.
 a complete, CRC-valid spool record could be read as a phantom record after corruption before it.
 That needs a batch carrying a whole frame as data, and it was already true of the resync before
 this change.
+
+## Amendment: one retained write handle, and what a failed repair does (2026-09-24)
+
+Correction 4 above, and the `write_in_flight` sentence under "Bound and overflow", described a
+repair that truncated the active segment through a freshly opened file descriptor and ignored the
+result. Both halves could leave a segment longer on disk than in memory, and the reader skips
+everything past the in-memory length when it rolls to the next segment.
+
+**A cancelled push's write keeps running.** `tokio::fs::File::poll_write` copies the bytes, hands
+the write to a blocking thread with `spawn_mandatory_blocking`, and returns `Ready` at once
+(tokio 1.53.1, `src/fs/file.rs:728-770`). `run_output`'s `select!` can drop `drain_inbox` with a
+push parked at its `flush` await, and nothing recalls that write. Only `flush`, `sync_data`, and
+`set_len` on the *same* `File` wait for it (`complete_inflight`, `file.rs:354`, `:392`, `:1086`).
+A truncate through another descriptor can run first, and the orphaned write then lands after it
+at the file's new end (the segment is `O_APPEND`). A failed orphaned write is also stored in the
+handle and returned by the next write on it (`last_write_err`, `file.rs:737`, `:1096`).
+
+**The active segment has one write handle.** `DiskQueue` keeps it in `State::write_file`. A push
+takes it for its write inside a `HeldWriteFile` guard whose `Drop` puts it back, so a cancelled push
+leaves the handle, and tokio's record of its in-flight write, for the next push. Every `.await` on
+the active segment goes through it: the repair, the write, the flush, and rotation's `fsync` of the
+old segment. Rotation opens the next segment with `create` and `append` but not `truncate`, so a
+file left by a cancelled rotation is reused, and the new file becomes the retained handle only
+once it's recorded as the active segment. `finish` flushes through the handle, which waits for an
+orphaned write, and leaves any torn tail for `DiskQueue::open` to truncate.
+
+**The repair waits, then truncates through that handle.** `State::needs_repair` holds the active
+segment's length before any write that wasn't confirmed. The next push flushes the retained handle
+and discards the result (this waits for an orphaned write and clears a stored error), then
+`set_len`s back through the same handle. It opens a handle, `append` without `create`, only if
+none is retained.
+
+**A failed repair drops the batch and writes nothing.** A failed truncate is counted
+`logit.component.buffer.disk.errors{op="truncate"}`, diagnosed under `disk_fs_error`, and drops
+the push that attempted it as `batches.dropped{reason="disk_full"}` (`ENOSPC`) or
+`reason="disk_io_error"`. `needs_repair` stays set, and until a later push's repair succeeds the
+spool neither writes nor rotates. Nothing is ever appended after unrepaired bytes, so only the
+active segment can have a torn tail, the property "Recovery" relies on.
+
+**`drop_oldest` reclaims a whole segment at a time.** This follows from the rejected
+deferred-skip-cursor design under "Alternatives considered": `total_bytes` shrinks only when a
+consumed segment is deleted. One push against a full spool can evict, reading and decoding each,
+every record in the oldest segment before space comes back. When that segment is the active one,
+which `segment_bytes` close to `max_bytes` allows, the push evicts every queued record, then writes
+past `max_bytes`. `docs/deploying.md` advises keeping `segment_bytes` well under `max_bytes`.
+[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+"Running it" section lists the tests that pin all of this.

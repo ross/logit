@@ -35,9 +35,10 @@
 //! never a segment read or write.
 //!
 //! **Every filesystem failure is observed.** A failed cursor write, segment `create`, `flush`,
-//! `fsync`, or unlink counts `logit.component.buffer.disk.errors{op}` and is diagnosed
-//! (`cursor_error` for the cursor, `disk_fs_error` for the rest). Each mutating operation is
-//! preceded by a [`crate::fault`] check, so tests can fail or freeze it.
+//! `fsync`, torn-tail `truncate`, or unlink counts `logit.component.buffer.disk.errors{op}` and is
+//! diagnosed (`cursor_error` for the cursor, `disk_fs_error` for the rest). A failed truncate also
+//! drops the push that attempted it. Each mutating operation is preceded by a [`crate::fault`]
+//! check, so tests can fail or freeze it.
 
 use std::collections::VecDeque;
 use std::fmt;

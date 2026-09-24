@@ -255,7 +255,31 @@ script is needed. This list is filled in as each workstream lands.
     - `a_segment_file_whose_name_is_not_zero_padded_is_ignored`: unpadded and signed names.
     - `a_second_open_of_the_same_spool_directory_fails_at_the_lock`: and leaves the spool
       untouched.
-- **`dur/w4`, the spool write path (DISK-03, DISK-05):** to be listed when `dur/w4` lands.
+- **`dur/w4`, the spool write path (DISK-03, DISK-05):**
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push`: a push dropped at
+      its `flush` await once its bytes are on disk is truncated away, and never delivered.
+    - `an_orphaned_write_that_lands_after_the_next_push_began_never_desynchronizes_the_segment`:
+      a second runtime whose one blocking thread is held parks a cancelled push's write until the
+      next push is repairing, the order a fresh-descriptor truncate can't survive.
+    - `cancelling_pushes_at_every_await_never_desynchronizes_the_segment`: pushes cancelled after
+      1 to 8 polls, their blocking work delayed by a varying amount, across rotations. Every
+      segment's on-disk length matches its in-memory one after each push.
+    - `a_failed_torn_tail_truncate_drops_and_counts_the_batch_and_never_writes_past_the_torn_bytes`:
+      `op="truncate"`, a `disk_io_error` drop, nothing appended, and the next push repairs.
+    - `a_failed_repair_never_rotates_so_only_the_active_segment_can_be_torn`: no new segment while
+      a repair keeps failing.
+    - `every_configurable_disk_compression_is_encodable_by_write_frame`: pins the `expect` on
+      `write_frame` to `logit_config::Compression`'s variants.
+    - `drop_oldest_reclaims_space_a_whole_head_segment_at_a_time_and_counts_every_eviction` and
+      `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_writes_over_bound`:
+      `drop_oldest`'s whole-segment reclamation and its worst case.
+  - `crates/logit-pipeline/src/disk_queue_verification.rs`:
+    - `spool_model_every_push_is_delivered_dropped_or_queued`: a model-based proptest over pushes,
+      cancelled pushes, peeks, commits, injected failures, and crash-reopens. Every push counted
+      queued is delivered, each push counts exactly one of queued or dropped, duplicates and
+      unconfirmed pushes appear only after a reopen, first deliveries are FIFO, no peek stops
+      responding, and the depth gauge matches.
 - **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):** to be listed when `dur/w5`
   lands.
 - **`dur/w6`, the tail checkpoint (TAIL-05):** to be listed when `dur/w6` lands.

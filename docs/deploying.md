@@ -287,6 +287,13 @@ real `write` per batch (a `logit_proto::native` encode plus one file append) tha
 queue never pays. Validation rejects a non-default `buffer.max_batches`/`buffer.max_bytes`
 alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it.
 
+**Keep `segment_bytes` well under `max_bytes`,** as the defaults (64MiB and 1GiB) do. The spool
+frees space only by deleting a whole consumed segment. Under `overflow: drop_oldest`, one push
+against a full spool can evict every record in the oldest segment, each counted
+`batches.dropped{reason="overflow_oldest"}`, before any space comes back. When the oldest segment
+is also the one being written, which a `segment_bytes` close to `max_bytes` allows, that push
+evicts every queued record and then writes past `max_bytes`.
+
 **Put the spool directory on a volume that survives the container.** An ephemeral container
 filesystem defeats the point, as it would for any durable state (`tail_in`'s checkpoint file in
 `crates/logit-inputs/src/tail/checkpoint.rs`, a database's data directory).
@@ -328,7 +335,10 @@ disk-backed sink never emits `reason="shutdown"`, because it drops nothing at sh
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
   of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a
-  restart; a failed `fsync` means a power loss can lose more.
+  restart; a failed `fsync` means a power loss can lose more. A failed `truncate` also drops the
+  batch whose push attempted it (`batches.dropped{reason="disk_full"|"disk_io_error"}`): the spool
+  couldn't cut away the bytes a failed or cancelled write left, and appends nothing until a later
+  push succeeds at it.
 
 ## Listener intake
 
