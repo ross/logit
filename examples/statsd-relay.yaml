@@ -1,20 +1,12 @@
 # A statsd/DogStatsD relay: receive on one edge, aggregate, forward to a central statsd/DogStatsD
-# agent -- the topology `statsd_out` exists for (docs/adr/statsd-output.md). Counters, gauges, raw
-# timers/histograms/distributions, raw sets, and DogStatsD events/service checks all round-trip
-# losslessly through the real decoder on the other end (docs/adr/lossless-transit.md) -- an event
-# (a log, no metrics) passes straight through `aggregate` untouched; a service check (a `Gauge`
-# metric under the hood) is absorbed and retained like any other gauge, then re-emitted in
-# canonical `_sc` field order, `d:`/`m:` included, once the window flushes. The `windowed`
-# aggregate below uses its default
-# summarizing config (`distributions: sketch`, `sets: estimate`), which still turns every timer/set
-# metric into a sketch/estimate that `statsd_out` has no lossless wire form for and drops, counted
-# (docs/known-gaps.md) -- that's `aggregate`'s choice to summarize, not a `statsd_out` limitation:
-# configure it with `distributions: samples`/`sets: members` instead to relay the raw shapes
-# through unsummarized.
+# agent (docs/adr/statsd-output.md). Counters, gauges, raw timers/histograms/distributions, raw
+# sets, and DogStatsD events/service checks round-trip through the real decoder on the other end,
+# modulo the normalizations docs/adr/lossless-transit.md permits. Change `endpoint` to your
+# central agent.
 #
-# Config is a flat graph of components (docs/design/pipeline-graph.md,
-# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
-# a fixed inputs/transforms/outputs pipeline.
+# `windowed` runs `aggregate`'s default `distributions: sketch`/`sets: estimate`, which summarizes
+# every timer and set into a sketch `statsd_out` has no lossless wire form for and drops, counted
+# (docs/known-gaps.md). Configure `distributions: samples`/`sets: members` to relay those raw.
 components:
   statsd_in:
     type: statsd_in
@@ -29,30 +21,16 @@ components:
     type: statsd_out
     sources: [windowed]
     endpoint: central-statsd:8125
-    # Every field below defaults -- an omitted field is exactly the value shown here, commented
-    # out purely as a reference for tuning a real deployment.
-    # transport: udp             # udp | tcp -- classic statsd/DogStatsD is udp
+    # Every field below is its default; omit it for the same effect.
+    # transport: udp             # udp | tcp
     # format: dogstatsd          # dogstatsd | statsd -- statsd omits the "|#tag:value,..." segment
-    #                            # entirely, for a plain-statsd receiver that would otherwise reject it
-    # relative_gauges: false     # encode a GaugeDelta (statsd's own "+n"/"-n" relative-gauge syntax)
-    #                            # natively instead of dropping it with a gauge_delta_unresolved
-    #                            # diagnostic -- see docs/adr/relative-gauge-adjustments.md; on by
-    #                            # convention only when relaying gauges through with no `aggregate`
-    #                            # resolving them first
-    # max_packet_bytes: "1432"   # bounds one UDP datagram's worth of packed lines, not a single
-    #                            # line's length -- ignored under transport: tcp
-    # connect_timeout: 5s        # tcp only -- bounds the connect and, under tls:, the handshake as
-    #                            # two separate phases, so a TLS connect can take up to twice this
-    # tls:                       # presence turns TLS on and makes it *required* -- `endpoint` is a
-    #                            # bare host:port with no scheme to read a TLS signal from, unlike
-    #                            # otlp_out. transport: tcp only (rule 52); no statsd client speaks
-    #                            # TLS, so this is a logit-to-logit or stunnel-shaped relay hop.
-    #                            # A TLS write failure is never retried (docs/adr/statsd-output.md's
-    #                            # TLS amendment) -- a redelivered counter would double-count.
+    # relative_gauges: false     # encode a GaugeDelta natively instead of dropping it, counted; for
+    #                            # relaying gauges with no `aggregate` resolving them first
+    # max_packet_bytes: "1432"   # one UDP datagram's worth of packed lines; ignored under tcp
+    # connect_timeout: 5s        # tcp only -- bounds the connect and the TLS handshake separately
+    # tls:                       # presence turns TLS on and makes it required; tcp only
     #   ca_file: ca.pem
     #   cert_file: client.pem    # cert_file/key_file together, for mutual TLS
     #   key_file: client.key
     #   insecure_skip_verify: false
-    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
-    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
-    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering)
+    # buffer: (all defaults; examples/statsd-to-influxdb.yaml has the full block)

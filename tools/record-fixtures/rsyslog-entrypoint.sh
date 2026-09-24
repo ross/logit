@@ -1,9 +1,7 @@
 #!/bin/bash
-# Entrypoint for script/record-fixtures's `rsyslog` producer container (debian:bookworm-slim,
-# with rsyslog installed fresh at record time -- see record_rsyslog's comment in
-# script/record-fixtures for why there's no pre-baked image). Installs rsyslog, starts it against
-# the mounted rsyslog.conf (which forwards everything to the "capture" container), gives it a
-# moment to bind its Unix domain socket, then logs one message through the system `logger(1)`.
+# Entrypoint for script/record-fixtures's rsyslog producers (debian:bookworm-slim): installs
+# rsyslog, runs it against the config mounted at /etc/rsyslog-fixture.conf, which forwards to the
+# "capture" container, waits for it to bind its Unix socket, then logs one message via logger(1).
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null

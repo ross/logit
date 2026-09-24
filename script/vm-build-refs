@@ -1,48 +1,33 @@
 #!/bin/bash
-# Fed to the perf VM on stdin by `script/vm build <source>...`
-# (`ssh ... 'bash -s -- <source>...' < script/vm-build-refs`) -- never installed on the VM, so it
-# can never be stale against the checkout that invoked it, the same "two files edited together"
-# relationship script/vm has to script/vm-cloud-init.yaml.
+# Usage: script/vm build <ref|dir|tarball>... [--allow-identical]
 #
-# Builds one release `logit` binary per source and stashes each one at
-# ~/logit/perf/bins/<slug>/logit, with a `<slug>/logit.json` sidecar next to it that
-# `logit-perf run --logit-bin`'s own sidecar reader (`crates/logit-perf/src/run.rs`) picks up for
-# provenance. A source is one of three things (docs/adr/disposable-azure-perf-vm.md):
+# Runs on the perf VM, fed on stdin by script/vm (`ssh ... 'bash -s -- <source>...'`), so it
+# can't go stale against the checkout that invoked it; edit the two together. Builds one release
+# `logit` per source into ~/logit/perf/bins/<slug>/logit, beside a `logit.json` sidecar that
+# `logit-perf run --logit-bin` reads for provenance. See docs/adr/disposable-azure-perf-vm.md's
+# "Multiple sources, one VM" section.
 #
-#   a git ref/SHA   built in ~/logit, the one clone `up` already made -- checked out in turn,
-#                   never several checkouts at once, which is what makes cargo's own mtime
-#                   fingerprinting trustworthy (see "why sequential" below).
-#   a directory     already unpacked on the VM's disk -- built in place, with its own isolated
-#                   CARGO_TARGET_DIR (never the clone's).
-#   a tarball       extracted to ~/src/<slug>/ first (tar -xm, so cargo sees fresh mtimes, never
-#                   the archive's own commit-time ones), then built the same way a directory is.
+#   a git ref/SHA   checked out in turn in ~/logit, the clone `up` made, and built there.
+#   a directory     already on the VM, built in place with its own CARGO_TARGET_DIR.
+#   a tarball       extracted to ~/src/<slug>/ with `tar -xm`, then built like a directory.
 #
-# The directory/tarball forms exist so work that was never committed or pushed can still be
-# measured -- `script/vm push` is how it gets onto the VM in the first place; a host-side
-# `git archive`/`tar` one-liner for building the archive is documented in the ADR.
-#
-# Why sequential, one clone: the session this tooling grew out of hit a real hazard by hand --
-# three source trees extracted around the same wall-clock time against one *shared*
-# CARGO_TARGET_DIR let cargo's mtime fingerprinting treat the second ref's sources as unchanged,
-# producing a byte-identical binary under a different label. `git checkout` in one clone stamps
-# every file it touches with the current time, which is what makes a later ref's fingerprint
-# always newer than an earlier one's build; a directory/tarball source has no git driving its
-# mtimes forward at all, so it always gets its own target dir (never the clone's, and never
-# shared with another path source) rather than relying on timing.
+# Cargo fingerprints by mtime, so trees extracted at about the same time into one shared target
+# dir can build a stale, identical binary under a different label. A `git checkout` in one clone
+# stamps each changed file with the current time, so ref builds share the clone's target dir
+# safely; a directory or tarball source has no such guarantee and always gets its own. Exits
+# non-zero if any source fails or two sources build the identical binary.
 
 set -e -o pipefail
 
 LOGIT_HOME="${HOME}/logit"
 BINS_DIR="${LOGIT_HOME}/perf/bins"
 SRCS_DIR="${HOME}/src"
-# Matches script/vm up's own reasoning for passing this explicitly on every ssh call: a non-login,
-# non-interactive shell (which `ssh host 'bash -s -- ...'` is) never sources /etc/profile, and this
-# must not depend on pam_env having done its job either.
+# `ssh host 'bash -s'` is a non-login shell that never sources /etc/profile, and this must not
+# depend on pam_env reading /etc/environment.
 export DOCKER=docker
 
-# Asserted rather than assumed: a relative directory source (`script/vm build wip`, matching
-# `push`'s own default remote directory) is read relative to this, so it has to be right rather
-# than whatever ssh happened to start the shell in.
+# `push` copies into $HOME by default, so a relative directory source (`script/vm build wip`)
+# resolves against it rather than wherever ssh started the shell.
 cd "${HOME}"
 
 ALLOW_IDENTICAL=0
@@ -67,24 +52,19 @@ mkdir -p "${BINS_DIR}" "${SRCS_DIR}"
 
 # --- classification ----------------------------------------------------------------------------
 
-# A source is a path if it names something that already exists on the VM, or looks enough like a
-# path/archive to be unambiguous even before it exists (an absolute path, one starting `./`/`~/`,
-# or an archive extension) -- everything else is read as a git ref. `--ref`/`--src` are not
-# implemented as a forcing override here: no shipped ref name collides with a path shape, and
-# adding the flag before anything has needed it would be speculative.
+# A source is a path if it exists on the VM or has a path shape (absolute, `./`, `~/`, or an
+# archive extension); anything else is a git ref. There's no flag to force either reading.
 is_path_source() {
-    # `\~/*`, not `~/*`: an *unescaped* tilde in a case pattern is itself tilde-expanded (to this
-    # process's own $HOME) before matching, which would silently fail to match the literal string
-    # "~/..." a caller typed -- the usual bash gotcha. The backslash keeps it literal.
+    # `\~/*`, not `~/*`: bash tilde-expands an unescaped tilde in a case pattern to $HOME, which
+    # then fails to match the literal "~/..." a caller typed.
     case "$1" in
         /*|./*|\~/*|*.tar|*.tar.gz|*.tgz) return 0 ;;
     esac
     [ -e "$1" ]
 }
 
-# A ref keeps its whole name, since a branch's own `/` is meaningful (`udp/w3` -> `udp-w3`) --
-# everything outside `[A-Za-z0-9_-]` maps to `-`, and a bare 7-40 hex string (a SHA) shortens to
-# its first 12 characters instead.
+# A ref keeps its whole name with each character outside `[A-Za-z0-9_-]` mapped to `-`
+# (`udp/w3` -> `udp-w3`); a 7-40 character hex string (a SHA) shortens to 12 characters.
 slug_for_ref() {
     local raw="$1"
     if [[ "${raw}" =~ ^[0-9a-f]{7,40}$ ]]; then
@@ -94,9 +74,7 @@ slug_for_ref() {
     fi
 }
 
-# A path or tarball slugs from its own basename, with any archive suffix stripped first --
-# `~/w3.tar.gz` -> `w3`, `~/src/wip` -> `wip`. The directory it lives under isn't part of the
-# source's identity the way a ref's namespace is.
+# A path slugs from its basename minus any archive suffix (`~/w3.tar.gz` -> `w3`).
 slug_for_path() {
     local raw="$1" base
     base="$(basename -- "${raw}")"
@@ -110,11 +88,9 @@ slug_for_path() {
 
 # --- one container invocation, target dir chosen by the caller ---------------------------------
 
-# compose.yaml gives `logit_cargo_home`/`logit_target_cache` fixed global `name:`s, so every
-# checkout on this box -- the clone, or any unpacked source tree -- shares the same warm cargo
-# registry/git cache regardless of which directory's compose.yaml launched the container; only
-# CARGO_TARGET_DIR ever needs overriding per source, which `common.sh`'s own `run()` helper has no
-# way to do (it takes no extra `-e`), so this calls compose directly instead of going through it.
+# compose.yaml gives `logit_cargo_home`/`logit_target_cache` fixed global `name:`s, so every tree
+# on the VM shares one warm cargo cache. Only CARGO_TARGET_DIR changes per source, and common.sh's
+# `run()` takes no extra `-e`, so this calls compose directly.
 container_build_and_stash() {
     local tree_dir="$1" target_dir="$2" slug="$3"
     (
@@ -128,18 +104,13 @@ container_build_and_stash() {
     )
 }
 
-# Backslash and double-quote only -- the two characters that would otherwise break the JSON
-# `printf` builds below. A directory/tarball path or ref name is operator-supplied, not
-# attacker-supplied, but this costs nothing and means a stray `"` never produces invalid JSON.
+# Escapes backslash and double quote, the two characters that break the JSON write_sidecar builds.
 json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
-# Writes `<slug>/logit.json`, the sidecar `logit-perf run --logit-bin`'s own reader
-# (`crates/logit-perf/src/run.rs::read_binary_sidecar`) looks for next to the binary. Built with
-# `printf`, deliberately not a heredoc: an unquoted heredoc runs command substitution over its own
-# body, so a source string containing a backtick or `$(...)` would otherwise execute rather than
-# just being recorded.
+# Writes the sidecar `crates/logit-perf/src/run.rs::read_binary_sidecar` reads. `printf`, not an
+# unquoted heredoc, which would execute a backtick or `$(...)` in a source string.
 write_sidecar() {
     local slug="$1" source_desc sha sha256 sha_json
     source_desc="$(json_escape "$2")"
@@ -177,10 +148,8 @@ build_ref() {
     ( cd "${LOGIT_HOME}" && git checkout --detach "${sha}" --quiet )
     LAST_REF_SEEN="${ref}"
 
-    # Every ref build shares the clone's own target dir by default, since `git checkout` between
-    # builds is what keeps cargo's fingerprinting honest here (see the header comment) --
-    # LOGIT_VM_TARGET_PER_REF opts into full isolation instead, at the cost of a full rebuild per
-    # ref.
+    # Ref builds share the clone's target dir (see the header); LOGIT_VM_TARGET_PER_REF isolates
+    # each one at the cost of a full rebuild.
     local target_dir="/work/target"
     if [ -n "${LOGIT_VM_TARGET_PER_REF:-}" ]; then
         target_dir="/work/target/refs/${slug}"
@@ -209,19 +178,15 @@ build_path() {
             [ -f "${given}" ] || { echo "   FAILED: no such file: ${given}" >&2; return 1; }
             rm -rf "${tree_dir}"
             mkdir -p "${tree_dir}"
-            # A single top-level directory in the archive is stripped, so `git archive
-            # --prefix=logit/ ...` and a bare `tar czf ... .` both land the repo's own files
-            # directly under tree_dir rather than one level down.
+            # Strip a single top-level directory, so `git archive --prefix=logit/` and a bare
+            # `tar czf ... .` both land the repo's files directly under tree_dir.
             local top_entries strip_args=()
             top_entries="$(tar -tf "${given}" | sed -e 's#/.*##' -e '/^$/d' | sort -u)"
             if [ "$(printf '%s\n' "${top_entries}" | wc -l)" -eq 1 ]; then
                 strip_args=(--strip-components=1)
             fi
-            # -m: stamp every extracted file with the current time. `git archive` sets each
-            # file's mtime to its *commit* time, and without -m tar would restore that,
-            # handing cargo a tree that looks older than a fingerprint it already recorded --
-            # exactly the hazard the header comment describes, just for one tree instead of
-            # three.
+            # -m stamps each file with the current time. `git archive` records commit times,
+            # which would make the tree look older than a fingerprint cargo already has.
             tar -xm "${strip_args[@]}" -f "${given}" -C "${tree_dir}"
             ;;
         *)
@@ -239,15 +204,13 @@ build_path() {
         fi
     done
 
-    # Isolated unconditionally, unlike a ref build: nothing here is git-driven, so nothing
-    # guarantees this tree's mtimes are newer than whatever last built in the clone's shared
-    # target dir.
+    # Always isolated: no `git checkout` guarantees this tree's mtimes are newer than the last
+    # build in a shared target dir.
     local target_dir="/work/target/srcs/${slug}"
     mkdir -p "${BINS_DIR}/${slug}"
     container_build_and_stash "${tree_dir}" "${target_dir}" "${slug}"
-    # container_build_and_stash writes into <tree_dir>/perf/bins/<slug>/logit (its own bind
-    # mount); copy that into the clone's own perf/bins/, which is what `--logit-bin` and every
-    # other `script/vm` subcommand actually looks under.
+    # The build lands under <tree_dir>/perf/bins/; copy it into the clone's perf/bins/, where
+    # `--logit-bin` and script/vm look.
     if [ "${tree_dir}" != "${LOGIT_HOME}" ]; then
         cp "${tree_dir}/perf/bins/${slug}/logit" "${BINS_DIR}/${slug}/logit"
     fi
