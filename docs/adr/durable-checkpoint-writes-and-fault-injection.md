@@ -62,21 +62,31 @@ reviewer can check.
    `write_file_durably(path, bytes, site)`. It runs, in this order: write the bytes to the tmp
    path, fsync the tmp file, rename it over `path`, fsync `path`'s parent directory (`.` when
    `path` names none). A failure returns `AtomicWriteError { step, source }`, where `step` is one
-   of `Write`, `SyncFile`, `Rename`, or `SyncDir`, and leaves the previous document at `path`
-   untouched. The tmp path is the full file name with `.tmp` appended (`cursor.json.tmp`), never
+   of `Write`, `SyncFile`, `Rename`, or `SyncDir`. A failure at `Write`, `SyncFile`, or `Rename`
+   leaves the previous document at `path` untouched. A failure at `SyncDir` happens after the
+   rename, so `path` already holds the new document, not yet durable;
+   `AtomicWriteError::replaced()` says which case a caller is in. The tmp path is the full file name with `.tmp` appended (`cursor.json.tmp`), never
    `with_extension`. `persist_cursor` and `CheckpointStore::write` both call it, and neither keeps
    its own tmp+rename code. The helper is synchronous.
 
-2. **Where each caller runs it.** The spool calls the helper inline from `persist_cursor`, which
-   `DiskQueue::commit` reaches through `advance_read_cursor` and `roll_read_cursor`, but never
-   under the queue's state lock: it copies the cursor under the lock, releases the lock, runs the
-   helper, then locks again to record the result. A persist's two fsyncs therefore stall only the
-   committing sink task, never a concurrent `push` or `peek` waiting on the state mutex. That is
-   the blocking write `commit` already makes, now with two fsyncs. It stays inline because it runs
-   at most once per `checkpoint_interval` (1s by default) and once per segment roll, and because
-   keeping `commit` synchronous is what keeps `write_loop`'s delivery path free of a new `.await`
-   (the disk ADR's correction 2). The tail calls the helper through
-   `tokio::task::spawn_blocking`, and `CheckpointStore::write` becomes `async`.
+2. **Where each caller runs it, and how spool persists are serialized.** The spool calls the
+   helper inline from `DiskQueue::checkpoint_cursor`, never under the queue's state lock. Two
+   tasks can persist the cursor: the write-loop task through `commit` and `peek`, and, under
+   `overflow: drop_oldest`, the drain task through `push` (`push` → `roll_read_cursor`, and
+   `push` → `evict_oldest` → `advance_read_cursor`). Unserialized, two persists would share
+   `cursor.json.tmp`: one rename could fail with `ENOENT`, a truncated tmp could be renamed into
+   place, or an older cursor could land last. So `checkpoint_cursor` holds a dedicated
+   `cursor_write` mutex across the helper. It always takes `cursor_write` before the state lock
+   and never while holding it; after taking it, it locks state only long enough to read the
+   current cursor, releases state, runs the helper, then locks state again to record the result.
+   Because each persist reads the cursor after taking `cursor_write`, and the cursor only moves
+   forward, the cursor on disk never moves backwards. A persist's two fsyncs therefore stall only
+   the task persisting (and another persist waiting behind it), never a `push` or `peek` waiting
+   on the state mutex alone. It stays inline because it runs at most once per
+   `checkpoint_interval` (1s by default) and once per segment roll, and because keeping `commit`
+   synchronous is what keeps `write_loop`'s delivery path free of a new `.await` (the disk ADR's
+   correction 2). The tail calls the helper through `tokio::task::spawn_blocking`, and
+   `CheckpointStore::write` becomes `async`.
 
 3. **Observed failures, with these names.**
    - Spool: `logit.component.buffer.disk.errors` (count), tagged `op` = `cursor`, `flush`,
@@ -98,9 +108,10 @@ reviewer can check.
 
 5. **The spool unlinks even after a failed cursor persist.** `roll_read_cursor` counts the failed
    persist and still unlinks the segments the cursor left. This is safe because the cursor on disk
-   is then an older one, and at the next `DiskQueue::open` an older cursor either still names a
-   surviving segment (replaying from there) or names a deleted one (falling back to the oldest
-   surviving segment at offset 0). Both cost duplicates, never loss.
+   is then an older one, or the new one not yet durable (a `SyncDir` failure, decision 1). At the
+   next `DiskQueue::open` an older cursor either still names a surviving segment (replaying from
+   there) or names a deleted one (falling back to the oldest surviving segment at offset 0), and
+   the new one resumes where it says. Every case costs duplicates, never loss.
 
 6. **`file_out` makes no durability promise.** It doesn't fsync the active file, the staging
    file, or the directory. Its renames are atomic against a process crash, not a power loss. This
@@ -109,11 +120,14 @@ reviewer can check.
 
 7. **`Delivery::Dropped` commits the batch for a disk-backed sink too.** `write_loop` keeps
    calling `store.commit()` on a drop, whatever the store. The spool bounds loss across a process
-   restart; `buffer.retry_budget` bounds loss across a destination outage. A destination down
-   longer than the retry budget loses the spooled batches it couldn't accept, counted
-   `batches.dropped{reason="send_failed"}`, as does a batch whose failure is permanent. This is
-   [ADR `buffered-sink-delivery`](buffered-sink-delivery.md)'s rule inherited unchanged, recorded
-   as an amendment to the disk ADR and in `docs/deploying.md`.
+   restart; `buffer.retry_budget` bounds loss across a destination outage, for the faults the
+   sink's delivery posture retries. Per `output::is_retryable`, a batch is dropped when its fault
+   isn't retryable under that posture (a permanent fault, or an ambiguous one such as a timeout
+   under `at_most_once`), or when a retryable fault is still failing once `buffer.retry_budget`
+   runs out. Either way it's counted `batches.dropped{reason="send_failed"}` and doesn't replay
+   after a restart. This is
+   [ADR `buffered-sink-delivery`](buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)'s
+   rule inherited unchanged, recorded as an amendment to the disk ADR and in `docs/deploying.md`.
 
 8. **A `fault-injection` seam, compiled out of the release binary.**
    `crates/logit-pipeline/src/fault.rs` (`pub mod fault`) defines
@@ -146,9 +160,10 @@ reviewer can check.
      `cargo tree -p logit-cli -e normal,features` mentions `fault-injection`.
 
 9. **`file_out`'s `max_files` has a ceiling of 1000.** `logit_config::MAX_ROTATE_FILES = 1000`
-   sits next to `RotateConfig`, and graph rule 29 rejects a larger value. One rotation makes
-   about two syscalls per retained file, so 1000 keeps a rotation in the milliseconds and still
-   covers more than two years of daily files or six weeks of hourly ones.
+   sits next to `RotateConfig`, and graph rule 29 rejects a larger value. `max_files` counts the
+   active file, so 1000 retains 999 rotated files: about 2.7 years of daily files, or about 41
+   days of hourly ones. One rotation makes about two syscalls per retained file, so 1000 keeps a
+   rotation in the milliseconds.
 
 ## Alternatives considered
 
@@ -225,9 +240,10 @@ script is needed. This list is filled in as each workstream lands.
   though `logit-bench` never asks for it. `disk_queue_push_one_batch` and
   `disk_queue_peek_cached_costs_nothing` must stay exact with the seam present. A change to the
   disarmed path that allocates or takes a lock fails those pins; that is the pins working.
-- **Each cursor persist costs two fsyncs more than today,** inline in `commit`, outside the state
-  lock, at most once per `checkpoint_interval` plus once per segment roll. Today's persist runs
-  under that lock, so moving it out is part of the change. A `logit-perf` disk-spool scenario is the
+- **Each cursor persist costs two fsyncs more than today,** inline in the persisting task,
+  serialized by `cursor_write` and outside the state lock, at most once per
+  `checkpoint_interval` plus once per segment roll. Today's persist runs under the state lock, so
+  moving it out, and adding `cursor_write`, is part of the change. A `logit-perf` disk-spool scenario is the
   follow-up if it shows up in delivery latency.
 - **The tail checkpoint write moves off the runtime thread** (decision 2); `CheckpointStore::load`
   stays a blocking read at bind, an accepted startup cost.
