@@ -1,33 +1,32 @@
-//! `prometheus_out`: the Prometheus sink, in either of its two shapes -- an **exposition**
-//! endpoint a Prometheus scrapes (`bind:`), or a **remote-write sender** that POSTs each batch to
-//! a receiver (`endpoint:`). Exactly one is set; graph rule 56 rejects both and neither. The
-//! mirror of `logit_inputs::prometheus`, which is the same pair the other way round (scrape a
-//! target, or receive remote-write on a bind), and the fourth like-protocol pair under
+//! `prometheus_out`: the Prometheus sink, in one of two modes. An **exposition** endpoint a
+//! Prometheus scrapes (`bind:`), or a **remote-write sender** that POSTs each batch to a receiver
+//! (`endpoint:`). Exactly one is set; graph rule 56 rejects both and neither. It mirrors
+//! `logit_inputs::prometheus` and is the fourth like-protocol pair under
 //! [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md). Both wire syntaxes and the
-//! whole model<->families mapping live in `logit_proto::prometheus` ([`text::write`],
+//! model-to-families mapping live in `logit_proto::prometheus` ([`text::write`],
 //! [`remote_write::encode`], [`events_to_families`]); nothing here knows what a sample line or a
 //! `TimeSeries` looks like.
 //!
-//! **This module doc is the spec** (house convention, see [`crate::statsd`]'s). The authorities
+//! **This module doc is the spec** (house convention; see [`crate::statsd`]'s). The authorities
 //! are [ADR `prometheus-scrape-and-exposition`](../../../docs/adr/prometheus-scrape-and-exposition.md)
-//! -- "Exposition state and expiry", "Dialects and negotiation", "`Output::bind`" -- and
-//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md) -- "Sender
+//! ("Exposition state and expiry", "Dialects and negotiation", "`Output::bind`") and
+//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md) ("Sender
 //! behaviour: one request per batch, no retry in the sink", "Decode and encode work in timestamp
-//! groups", "Timestamps: received without the marker, sent always".
+//! groups", "Timestamps: received without the marker, sent always").
 //!
 //! ## Config
 //!
-//! Registry mode -- [`ExposeOutput`]:
+//! Registry mode, [`ExposeOutput`]:
 //!
 //! ```yaml
 //! kind: prometheus_out
 //! bind: "127.0.0.1:9464"   # loopback in every example -- see "Security posture"
-//! path: /metrics           # default
+//! path: /metrics           # default; must start with `/` (rule 41)
 //! expire_after: 5m         # a series not updated within this window stops being exposed; 0s off
-//! max_series: 100000       # hard cap; least-recently-updated evicted first
+//! max_series: 100000       # hard cap, least-recently-updated evicted first; 0 rejected (rule 41)
 //! ```
 //!
-//! Sender mode -- [`RemoteWriteOutput`]:
+//! Sender mode, [`RemoteWriteOutput`]:
 //!
 //! ```yaml
 //! kind: prometheus_out
@@ -39,23 +38,22 @@
 //! endpoint_tls: {}                           # https:// only -- see `TlsClientConfig`
 //! ```
 //!
-//! A field of the mode that isn't set is a config error rather than a setting that silently does
-//! nothing (rule 56). `buffer:` works unchanged on both -- it is a sibling of `kind:` on every
-//! sink. It matters rather more in sender mode, which is the only one of the two whose `send` can
-//! actually fail.
+//! Setting the other mode's field is a config error, not a no-op (rule 56). `buffer:` works in
+//! both modes, as a sibling of `kind:`; it matters more in sender mode, the only one whose `send`
+//! can fail.
 //!
 //! ## Dialect negotiation (registry mode)
 //!
-//! One endpoint, two dialects, chosen per request from the client's own `Accept`:
+//! One endpoint, two dialects, chosen per request from the client's `Accept`:
 //!
 //! | Request | Response `Content-Type` |
 //! |---|---|
 //! | `Accept` contains `application/openmetrics-text` | `application/openmetrics-text; version=1.0.0; charset=utf-8` |
-//! | anything else, including no `Accept` at all and a bare `*/*` | `text/plain; version=0.0.4; charset=utf-8` |
+//! | anything else, including no `Accept` and a bare `*/*` | `text/plain; version=0.0.4; charset=utf-8` |
 //!
-//! Both spellings come from [`Dialect::content_type`], so the scraper's `Accept` and this
-//! response's `Content-Type` are never two independent copies of the same string. `Accept-Encoding:
-//! gzip` gets a gzip-compressed body and `Content-Encoding: gzip`; a `gzip;q=0` does not.
+//! Both strings come from [`Dialect::content_type`], so the scraper's `Accept` and the response's
+//! `Content-Type` never drift apart. `Accept-Encoding: gzip` gets a gzipped body and
+//! `Content-Encoding: gzip`; `gzip;q=0` doesn't.
 //!
 //! ## Routes (registry mode)
 //!
@@ -65,42 +63,39 @@
 //! | any method on any other path | `404` -- `logit.output.scrapes{class="not_found"}` |
 //! | any other method on `path` | `405` + `Allow: GET, HEAD` -- `logit.output.scrapes{class="method"}` |
 //!
-//! `HEAD` routes exactly like `GET` and builds the identical body, so `content-length` agrees with
-//! what a `GET` would have returned (RFC 9110 §9.3.2) -- hyper suppresses the bytes themselves.
-//! Path is matched before method, so an unknown path is a `404` regardless of method: "no such
-//! resource" outranks "wrong verb for the resource you didn't ask for".
+//! `HEAD` builds the same body as `GET`, so `content-length` matches (RFC 9110 §9.3.2); hyper
+//! drops the bytes. Path is matched before method, so an unknown path is a `404` whatever the
+//! method.
 //!
 //! ## State: upsert, expiry, cardinality (registry mode)
 //!
-//! [`ExposeOutput::send`] converts the batch with [`events_to_families`] (every lossy path --
-//! delta temporality, `ExponentialHistogram`, an unrepresentable label -- is counted by the codec's
-//! own [`PrometheusEncoder`], not here) and **upserts** each series into the registry: keyed by
-//! family name, then by the series' rendered, sorted label set, latest value wins. That is
-//! cumulative-series semantics, not a stream of deliveries: a scrape renders the current registry,
-//! so re-sending the same batch simply writes the same values again.
+//! [`ExposeOutput::send`] converts the batch with [`events_to_families`] (the codec's
+//! [`PrometheusEncoder`] counts every lossy path: delta temporality, `ExponentialHistogram`, an
+//! unrepresentable label) and **upserts** each series into the registry, keyed by family name and
+//! then by the rendered, sorted label set; latest value wins. These are cumulative-series
+//! semantics: a scrape renders the current registry, so re-sending a batch rewrites the same
+//! values.
 //!
-//! - `expire_after` (default 5m, Prometheus's own staleness horizon): a series whose last update is
-//!   older than this is dropped, counted `logit.output.series.evicted{reason="expired"}`. `0s`
-//!   disables expiry. The sweep runs after every `send` **and on every request**, so a sink that
-//!   has gone quiet still stops exposing stale series rather than freezing its last state forever.
-//! - `max_series` (default 100000): a hard cap. Over it, the least-recently-updated series is
-//!   evicted first, counted `logit.output.series.evicted{reason="cardinality"}` -- the same
-//!   least-recently-used shape `aggregate`'s `max_retained_gauge_series` uses for window state.
+//! - `expire_after` (default 5m, Prometheus's staleness horizon): a series last updated longer ago
+//!   is dropped, counted `logit.output.series.evicted{reason="expired"}`; `0s` disables expiry.
+//!   The sweep runs after every `send` **and on every request**, so a quiet sink stops exposing
+//!   stale series instead of freezing its last state.
+//! - `max_series` (default 100000): a hard cap. Over it, the least-recently-updated series go
+//!   first, counted `logit.output.series.evicted{reason="cardinality"}`: the same shape as
+//!   `aggregate`'s `max_retained_series`.
 //!
-//! **Type conflicts.** The exposition grammar allows exactly one `# TYPE` per family name, so a
-//! record arriving as a `gauge` for a name already registered as a `counter` cannot be represented
-//! alongside the old interpretation. The new type wins: the family's type is replaced, every series
-//! already stored under the old type is evicted, and `logit.output.metrics.type_conflict` is
-//! counted. Keeping the old type instead would mean silently dropping live data in favour of data
-//! that may already have expired.
+//! **Type conflicts.** The exposition grammar allows one `# TYPE` per family name, so a `gauge`
+//! arriving for a name registered as a `counter` can't sit beside it. The new type wins: the
+//! family's type is replaced, every series stored under the old type is evicted, and
+//! `logit.output.metrics.type_conflict` is counted. Keeping the old type would drop live data in
+//! favour of data that may already have expired.
 //!
 //! ## The wire (sender mode)
 //!
-//! One `send` is **one `POST`**, and a batch that produces no series at all sends **no request** --
-//! not an empty `WriteRequest`. Four headers are `insert`ed *over* a clone of the operator's
-//! `headers:` map, so a protocol-owned name always wins whatever config said (rule 56 rejects one
-//! at config time as well; this is the defense in depth behind it, and the same merge order
-//! `otlp_out`'s HTTP transport uses):
+//! One `send` is **one `POST`**, and a batch that produces no series sends **no request**, not an
+//! empty `WriteRequest`. Four headers are `insert`ed over a clone of the operator's `headers:`, so
+//! a protocol-owned name always wins (rule 56 also rejects one at config time; `otlp_out`'s HTTP
+//! transport uses the same merge order):
 //!
 //! | Header | Value |
 //! |---|---|
@@ -109,34 +104,31 @@
 //! | `X-Prometheus-Remote-Write-Version` | [`remote_write::Version::header_version`] -- `0.1.0` for 1.0 (the spec's own historical number), `2.0.0` for 2.0 |
 //! | `User-Agent` | `logit/<version>` |
 //!
-//! There is no negotiation and no fallback between versions: the operator picks the one their
-//! receiver speaks, exactly as they already pick an exposition dialect.
+//! No negotiation and no fallback between versions: the operator picks the one their receiver
+//! speaks, as they pick an exposition dialect.
 //!
-//! **Timestamp partition → merged `TimeSeries`.** A remote-write `TimeSeries` is one label set and
+//! **Timestamp partition, merged `TimeSeries`.** A remote-write `TimeSeries` is one label set and
 //! N samples; a `Series` is one label set and one point. So [`RemoteWriteOutput::send`] partitions
 //! the batch's events by `Event::timestamp` (ascending, stable within a timestamp), runs
-//! [`events_to_families`] once per partition, and hands the whole list of groups to
-//! [`remote_write::encode`], which merges identical label sets **across** groups into one
-//! `TimeSeries` whose samples are in timestamp order. A batch holding five scrapes of one target
-//! therefore becomes one `TimeSeries` with five samples, which is both what the format is for and
-//! what a receiver's in-order check expects. The partition is also what keeps a classic
-//! histogram's `_bucket`/`_sum`/`_count` samples -- which by construction share one timestamp --
-//! in front of one assembler at the far end.
+//! [`events_to_families`] once per partition, and hands the groups to [`remote_write::encode`],
+//! which merges identical label sets across groups into one `TimeSeries` with samples in
+//! timestamp order. Five scrapes of one target in a batch become one `TimeSeries` with five
+//! samples, which is what a receiver's in-order check expects. The partition also keeps a classic
+//! histogram's `_bucket`/`_sum`/`_count` samples, which share one timestamp, in front of one
+//! assembler at the far end.
 //!
-//! The encoder runs with `with_timestamps_always(true)`, because the wire has no way to omit a
-//! timestamp and a series without one would be silently skipped, and with
-//! `with_stale_markers(true)`, so a record flagged `FLAG_NO_RECORDED_VALUE` is written as
-//! Prometheus's own stale marker (a NaN with bit pattern `0x7ff0000000000002`) rather than skipped.
-//! That last one covers `Gauge`, `Sum` and marker-untyped records only: a flagged
-//! `Histogram`/`Summary`/sketch expands to several derived series and one flag says nothing about
-//! which of them existed, so it stays skipped and counted (`docs/known-gaps.md`).
+//! The encoder runs `with_timestamps_always(true)`, since the wire can't omit a timestamp and a
+//! series without one would be skipped, and `with_stale_markers(true)`, so a record flagged
+//! `FLAG_NO_RECORDED_VALUE` is written as Prometheus's stale marker (a NaN with bit pattern
+//! `0x7ff0000000000002`) instead of skipped. That covers `Gauge`, `Sum`, and marker-untyped
+//! records only: a flagged `Histogram`/`Summary`/sketch expands to several series and one flag
+//! doesn't say which existed, so it stays skipped and counted (`docs/known-gaps.md`).
 //!
 //! ## Faults, retries and duplicate safety (sender mode)
 //!
-//! **One `send` is one attempt.** There is no retry loop here; retry is `write_loop`'s job
-//! (`docs/adr/buffered-sink-delivery.md`) and this sink's whole contribution is classifying the
-//! outcome, attached to the error with `.context(fault)` -- the identical table `otlp_out`'s HTTP
-//! transport uses, shared with it as code in [`crate::http`] rather than copied:
+//! **One `send` is one attempt.** Retry is `write_loop`'s job
+//! (`docs/adr/buffered-sink-delivery.md`); this sink classifies the outcome with
+//! `.context(fault)`, by the table `otlp_out`'s HTTP transport uses, shared in [`crate::http`]:
 //!
 //! | Outcome | Result |
 //! |---|---|
@@ -146,33 +138,29 @@
 //! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
-//! **Redirects are not followed** ([`crate::http::build_client`] turns `reqwest`'s own
-//! `limited(10)` default off), which is what puts `3xx` on that table at all. Remote-write defines
-//! no redirect, and following one would break the table's premise that one request went to the
-//! configured URL: a `301`/`302`/`303` is replayed as a body-less `GET`, so a batch nothing wrote
-//! would be acked by whatever answered that, and a `307`/`308` would carry the operator's
-//! `headers:` -- a tenant header, an `Authorization` on a same-host scheme downgrade -- to the
-//! `Location` host, past rule 56's `https://` check. So a redirect is reported against the URL the
-//! operator actually configured, which is where the misconfiguration is.
+//! **Redirects aren't followed** ([`crate::http::build_client`] turns off `reqwest`'s default
+//! `limited(10)`), which is why `3xx` is on that table. Remote-write defines no redirect, and
+//! following one breaks the premise that the request went to the configured URL: a
+//! `301`/`302`/`303` replays as a body-less `GET`, so a batch nothing wrote would be acked by
+//! whatever answered, and a `307`/`308` would carry the operator's `headers:` (a tenant header,
+//! an `Authorization` on a same-host scheme downgrade) to the `Location` host, past rule 56's
+//! `https://` check. The redirect is reported against the configured URL, where the
+//! misconfiguration is.
 //!
-//! **The rejection body is read bounded, not read whole and then trimmed.** At most 256 bytes
-//! (plus a character's slack) leave the socket into this sink's memory, so a receiver answering
-//! `500` with an endless body costs a snippet rather than a connection's worth of allocation on
-//! every retry -- see [`crate::http::read_body_prefix`].
+//! **The rejection body is read bounded.** At most 256 bytes (plus a character's slack) leave the
+//! socket, so a receiver answering `500` with an endless body costs a snippet per retry, not a
+//! connection's worth of allocation ([`crate::http::read_body_prefix`]).
 //!
-//! [`RemoteWriteOutput::duplicate_safe`] is **`true`**, and load-bearing rather than incidental. A
-//! sample's identity at a remote-write receiver is `(label set, timestamp)`, so replaying an
-//! identical request is an idempotent overwrite, never a double count -- which is what makes
-//! `true` honest. And `true` is what selects `DeliveryPosture::AtLeastOnce`
-//! (`logit_pipeline::output`), which is the *only* posture under which a `Fault::Ambiguous` is
-//! retried at all: setting it `false` would not make delivery safer, it would silently turn every
-//! 5xx into a dropped batch.
+//! [`RemoteWriteOutput::duplicate_safe`] is **`true`**. A sample's identity at a remote-write
+//! receiver is `(label set, timestamp)`, so replaying an identical request is an idempotent
+//! overwrite, never a double count. And `true` selects `DeliveryPosture::AtLeastOnce`
+//! (`logit_pipeline::output`), the only posture that retries a `Fault::Ambiguous`: `false` would
+//! turn every 5xx into a dropped batch, not make delivery safer.
 //!
-//! **Ordering is the topology's, not this sink's.** Samples go out in batch order and nothing here
-//! reorders across batches. Two upstream branches writing the same series can therefore draw
-//! out-of-order `400`s from a receiver with no out-of-order window -- a property of the pipeline
-//! that was built, not a bug in the sink. A single chain into one `prometheus_out` does not have
-//! it.
+//! **Ordering is the topology's, not this sink's.** Samples go out in batch order and nothing
+//! reorders across batches. Two upstream branches writing the same series can draw out-of-order
+//! `400`s from a receiver with no out-of-order window; a single chain into one `prometheus_out`
+//! can't.
 //!
 //! ## Telemetry
 //!
@@ -190,57 +178,51 @@
 //!
 //! | Point | Meaning |
 //! |---|---|
-//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request. `otlp_out`'s vocabulary exactly ([`crate::http::status_class`]), with no `429` class of its own -- a 429 is a `4xx`, and splitting it out would contradict [`crate::http::is_retryable_http_status`], which reads the same status to pick the `Fault`. No `timeout` class either: a timeout is a transport error, so it lands in `network_error`. And no `signal` tag, which `otlp_out` does carry -- this sink has exactly one signal, and hard-coding a tag that never varies is noise |
-//! | `logit.output.request.duration` | one timer per request actually issued -- the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` already use |
-//! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. The mirror of `prometheus_in`'s own `logit.input.samples`, so the two ends of a remote-write relay are comparable |
+//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request, in `otlp_out`'s vocabulary ([`crate::http::status_class`]). No `429` class: a 429 is a `4xx`, and splitting it out would contradict [`crate::http::is_retryable_http_status`], which picks the `Fault` from the same status. No `timeout` class: a timeout is a transport error, so `network_error`. No `signal` tag, unlike `otlp_out`: this sink has one signal |
+//! | `logit.output.request.duration` | one timer per request issued, the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` use |
+//! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. Mirrors `prometheus_in`'s `logit.input.samples`, so the two ends of a relay compare |
 //!
-//! plus, in **both** modes, everything the codec counts on the [`PrometheusEncoder`] the sink hands
-//! it: `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
-//! `logit.output.labels.normalized{reason="multi_value"}` -- a `Value::Array` attribute (a repeated
-//! DogStatsD tag key relayed in from `statsd_in`) collapsed to its last representable element,
-//! since a Prometheus label set is a map and has no multi-value label. Unlike every other
-//! `*.normalized` reason in `docs/design/internal-telemetry.md`, which report a
-//! lossless-but-different rendering of the same information, that one is **lossy**: the non-last
-//! elements are discarded, not re-spelled. It reads as `normalized` rather than `dropped` because
-//! the label itself survives and the series still exposes. A delta `Sum` reaching either mode is
-//! the common one -- skipped, counted `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with
-//! a throttled `delta_temporality_unresolved` diagnostic naming the fix (an `aggregate` with
-//! `temporality: cumulative` in front of the sink). Remote-write does not change that: the format
-//! carries cumulative series, so a delta `Sum` has no more of a spelling there than it has in an
-//! exposition.
+//! Both modes also get everything the codec counts on the sink's [`PrometheusEncoder`]:
+//! `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
+//! `logit.output.labels.normalized{reason="multi_value"}`. That last one is a `Value::Array`
+//! attribute (a repeated DogStatsD tag key relayed from `statsd_in`) collapsed to its last
+//! representable element, since a Prometheus label set has no multi-value label. Unlike the other
+//! `*.normalized` reasons in `docs/design/internal-telemetry.md`, it's **lossy**: the non-last
+//! elements are discarded. It's `normalized` rather than `dropped` because the label survives.
 //!
-//! **Both directions count under one encoder** in registry mode. `send` and a render share a single
-//! [`PrometheusEncoder`], so the drops each side reaches -- `send`'s unrepresentable labels and
-//! skipped kinds, a render's `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from
-//! [`text::write_with`] -- add up as this component's totals rather than splitting across two
-//! encoder identities for the same sink. The lock order that implies (encoder before registry) is
-//! on [`ExposeOutput::encoder`]. Sender mode needs none of that: it has one direction and one
-//! `&mut self`, so its encoder is a plain field.
+//! A delta `Sum` is the common skip in either mode: counted
+//! `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with a throttled
+//! `delta_temporality_unresolved` diagnostic naming the fix, an `aggregate` with
+//! `temporality: cumulative` in front of the sink. This sink never accumulates a delta itself;
+//! remote-write carries cumulative series too, so it has no spelling for one either.
+//!
+//! **Registry mode counts both directions on one encoder.** `send` and a render share a single
+//! [`PrometheusEncoder`], so `send`'s drops and a render's
+//! `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from [`text::write_with`] add up as one
+//! component's totals. The lock order that implies (encoder before registry) is on
+//! [`ExposeOutput::encoder`]. Sender mode has one direction and `&mut self`, so its encoder is a
+//! plain field.
 //!
 //! ## Security posture: no TLS, no auth on `bind:`
 //!
-//! The registry-mode server serves the **entire registry** -- every label on every series it
-//! currently holds -- to anything that connects to `bind:`, with no credential check and no
-//! transport encryption. That is the same posture
+//! Registry mode serves the **entire registry**, every label on every series, to anything that
+//! connects to `bind:`, with no credential check and no transport encryption. That's the posture
 //! [ADR `admin-readiness-endpoint`](../../../docs/adr/admin-readiness-endpoint.md) accepted for
-//! `/readyz`, with one difference that matters: the payload is a metric surface rather than a
-//! lifecycle word. So: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example
-//! does) and let something that does have TLS and auth front it. An operator who needs this
-//! reachable from off-host is making that choice deliberately, not inheriting it from an example.
-//! Tracked in `docs/known-gaps.md` next to `admin:`'s own row.
+//! `/readyz`, except the payload is a metric surface rather than a lifecycle word. So bind
+//! loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with
+//! something that has TLS and auth. Exposing it off-host is an operator's explicit choice, not
+//! an example's default. Tracked in `docs/known-gaps.md` next to `admin:`'s row.
 //!
-//! Sender mode is the opposite posture and always has been: it dials out, an `https://` endpoint
-//! gets real TLS with the bundled Mozilla roots by default, and `endpoint_tls:` tunes that -- a
-//! private CA, a client certificate for mutual TLS, or (deliberately awkward to ask for)
-//! `insecure_skip_verify`, which logs a startup warning. The receiver getting TLS does not
-//! retroactively give the exposition server any.
+//! Sender mode is the opposite: it dials out, an `https://` endpoint gets TLS with the bundled
+//! Mozilla roots by default, and `endpoint_tls:` adds a private CA, a client certificate for
+//! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). None of that gives the
+//! exposition server TLS.
 
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
     status_class, ERROR_BODY_SNIPPET_BYTES,
 };
-/// The sender's `endpoint_tls:`, re-exported at this path the way `otlp_out`, `logit_out`,
-/// `syslog_out` and `statsd_out` each re-export the one shared type.
+/// The sender's `endpoint_tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
 use anyhow::Context;
 use bytes::Bytes;
@@ -263,48 +245,39 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-/// The default `path:` -- what every Prometheus scrape config assumes when a target's own
-/// `metrics_path` is left unset.
+/// The default `path:`, what a Prometheus scrape config assumes when `metrics_path` is unset.
 pub const DEFAULT_PATH: &str = "/metrics";
 
-/// The default `expire_after:`, matching Prometheus's own staleness horizon -- see the module doc.
+/// The default `expire_after:`, Prometheus's staleness horizon.
 pub const DEFAULT_EXPIRE_AFTER: Duration = Duration::from_secs(300);
 
 /// The default `max_series:` cap.
 pub const DEFAULT_MAX_SERIES: usize = 100_000;
 
-/// A scrape endpoint answers one cheap `GET` at a time -- the same bound `logit-cli`'s admin
-/// server uses, and for the same reason: this caps the worst case at a handful of stuck
-/// connections rather than an unbounded accept loop.
+/// Concurrent scrape connections, the bound `logit-cli`'s admin server uses: a handful of stuck
+/// connections at worst, not an unbounded accept loop.
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
-/// How long a client has to finish sending its request headers. Hyper's own knob (it needs a timer
-/// installed, hence the [`hyper_util::rt::TokioTimer`] on the builder), and the right place for the
-/// slowloris bound that an all-encompassing connection deadline used to carry: a client that opens
-/// a socket and dribbles -- or never finishes -- must not hold one of the 16 slots, and *that* is
-/// cheap to bound tightly because a scrape request is a few hundred bytes of headers.
+/// How long a client has to send its request headers: the slowloris bound, tight because a
+/// scrape request is a few hundred bytes. Hyper's knob, which needs the
+/// [`hyper_util::rt::TokioTimer`] on the builder.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The floor for a whole connection, response body included. Deliberately well past Prometheus's
-/// own default `scrape_timeout` of 10s: the response here is not a probe's few hundred bytes but up
-/// to `max_series` series, and a deadline shorter than the scraper's own would drop hyper mid-body
-/// and hand the client a short read against the `Content-Length` it already trusted -- while this
-/// sink had already counted the scrape a success. `admin.rs`'s 5s is right for `admin.rs`'s payload;
-/// it is not right here.
+/// The floor for a whole connection, body included, well past Prometheus's default 10s
+/// `scrape_timeout`. The body can be `max_series` series, and a shorter deadline would cut it
+/// mid-write: a short read against a trusted `Content-Length`, already counted a success.
 const RESPONSE_TIMEOUT_BASE: Duration = Duration::from_secs(30);
 
-/// Added to [`RESPONSE_TIMEOUT_BASE`] per 1000 series of *configured capacity*, so a deployment that
-/// raised `max_series` raises its own write deadline with it rather than having to know this
-/// constant exists. At the default 100 000 cap that is 40s total.
+/// Added to [`RESPONSE_TIMEOUT_BASE`] per 1000 series of configured `max_series`, so raising the
+/// cap raises the deadline. 40s total at the default.
 const RESPONSE_TIMEOUT_PER_1K_SERIES: Duration = Duration::from_millis(100);
 
-/// How long the accept loop pauses after an `accept()` failure that is not one client's own
-/// accident -- fd exhaustion (`EMFILE`/`ENFILE`) being the realistic case, which neither clears
-/// instantly nor persists forever. Without it a sustained one spins a core.
+/// The accept loop's pause after an `accept()` failure that isn't one client's accident (fd
+/// exhaustion, realistically). Without it a sustained one spins a core.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// [`RESPONSE_TIMEOUT_BASE`] plus [`RESPONSE_TIMEOUT_PER_1K_SERIES`] per 1000 of `max_series`,
-/// saturating rather than panicking on an absurd configured cap.
+/// saturating on an absurd cap.
 fn response_timeout(max_series: usize) -> Duration {
     let thousands = u32::try_from(max_series / 1_000).unwrap_or(u32::MAX);
     RESPONSE_TIMEOUT_BASE.saturating_add(
@@ -312,46 +285,39 @@ fn response_timeout(max_series: usize) -> Duration {
     )
 }
 
-/// The default `timeout:` for one remote-write request -- the same 10s `otlp_out` and
-/// `prometheus_in`'s scrape both use for one HTTP request.
+/// The default `timeout:` for one remote-write request, the 10s `otlp_out` and `prometheus_in`'s
+/// scrape use.
 pub const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `User-Agent` every remote-write request carries. Reserved in config (rule 56) so an
-/// operator can't replace it: a receiver's own logs are frequently the only place a misbehaving
-/// sender is identified from, and this is the identification.
+/// The `User-Agent` on every remote-write request. Reserved in config (rule 56): a receiver's
+/// logs are often the only place a misbehaving sender is identified from.
 const USER_AGENT: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 
 const SCRAPES: &str = "logit.output.scrapes";
-/// Response body bytes as *rendered* (post-gzip when the client asked for it), counted when the
-/// body is built rather than when its last byte is acknowledged -- a `Full<Bytes>` response has no
-/// body-completion hook to count from, so a connection dropped mid-write is still counted here and
-/// still counted `scrapes{class="ok"}`.
+/// Response body bytes as rendered (post-gzip if asked), counted when the body is built: a
+/// `Full<Bytes>` has no completion hook, so a connection dropped mid-write still counts, here and
+/// as `scrapes{class="ok"}`.
 const SCRAPE_BYTES: &str = "logit.output.scrape.bytes";
 const SERIES: &str = "logit.output.series";
 const SERIES_EVICTED: &str = "logit.output.series.evicted";
 const TYPE_CONFLICT: &str = "logit.output.metrics.type_conflict";
 
-// Sender mode's three. See the module doc's telemetry table for why `requests` carries no
-// `signal` tag and no `429`/`timeout` class of its own.
+// Sender mode's three; the module doc's "Telemetry" has why `requests` has no `signal` tag.
 const REQUESTS: &str = "logit.output.requests";
 const REQUEST_DURATION: &str = "logit.output.request.duration";
-/// Samples in the request body, as the codec counted them -- not families, and not series: one
-/// `Series` is one sample for a gauge and several for a histogram.
+/// Samples in the request body as the codec counted them: several per histogram `Series`.
 const SAMPLES: &str = "logit.output.samples";
 
-/// What reads "now" for the expiry sweep. A closure rather than a bare `Instant::now` so the
-/// expiry and cardinality tests can advance time by hand instead of sleeping -- the sweep is the
-/// one piece of this sink whose behaviour is a function of wall-clock elapsed time, and a test that
-/// slept through a real `expire_after` would be both slow and flaky.
+/// What reads "now" for the expiry sweep, a closure so tests can advance time by hand instead of
+/// sleeping through a real `expire_after`.
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// The rendered, sorted label set of a series -- the registry's per-family key. Rendered, not the
-/// event's own `AttrMap`: sanitization is many-to-one (ADR "Names and sanitization"), so two
-/// distinct attribute sets can be one wire series, and the wire is what a scraper sees.
+/// A series' rendered, sorted label set: the registry's per-family key. Rendered, not the
+/// `AttrMap`, because sanitization is many-to-one (ADR "Names and sanitization") and the wire
+/// series is what a scraper sees.
 type LabelKey = Vec<(String, String)>;
 
-/// One series' current value plus when it last arrived. The label set is the map key, not a field
-/// here; [`StoredFamily::families`] rebuilds a [`Series`] from the pair at render time.
+/// One series' current value and when it last arrived; the label set is its map key.
 #[derive(Debug, Clone)]
 struct Stored {
     point: Point,
@@ -361,7 +327,7 @@ struct Stored {
     updated_at: Instant,
 }
 
-/// One family: exactly one `# TYPE`, one metadata pair, and its series keyed by label set.
+/// One family: one `# TYPE`, one metadata pair, and its series keyed by label set.
 #[derive(Debug, Clone)]
 struct StoredFamily {
     kind: FamilyType,
@@ -370,9 +336,8 @@ struct StoredFamily {
     series: BTreeMap<LabelKey, Stored>,
 }
 
-/// The exposition state: what a scrape renders. `BTreeMap` at both levels, so a render is already
-/// in the canonical order [`text::write`] wants (families by name, series by label set) with no
-/// sort pass of its own.
+/// What a scrape renders. `BTreeMap` at both levels, so iteration is already [`text::write`]'s
+/// canonical order (families by name, series by label set).
 #[derive(Debug, Default)]
 struct Registry {
     families: BTreeMap<String, StoredFamily>,
@@ -383,9 +348,8 @@ impl Registry {
         self.families.values().map(|f| f.series.len()).sum()
     }
 
-    /// One family's worth of series into the registry, latest wins. A type change replaces the
-    /// family's type and drops every series stored under the old one -- see the module doc's
-    /// "Type conflicts".
+    /// Upserts one family's series, latest wins. A type change drops every series stored under
+    /// the old type (module doc's "Type conflicts").
     fn upsert(&mut self, family: MetricFamily, now: Instant, telemetry: &Telemetry) {
         let MetricFamily { name, kind, help, unit, series } = family;
         let entry = self.families.entry(name).or_insert_with(|| StoredFamily {
@@ -399,9 +363,7 @@ impl Registry {
             entry.series.clear();
             telemetry.count(TYPE_CONFLICT, 1.0, &[]);
         }
-        // Latest wins for metadata too, not just for values: `# HELP`/`# UNIT` come from the
-        // record's own `description`/`unit`, so a change here means the producer changed its mind,
-        // and a scrape should see what the producer last said.
+        // Latest wins for `# HELP`/`# UNIT` too: a scrape shows what the producer last said.
         entry.help = help;
         entry.unit = unit;
         for series in series {
@@ -412,9 +374,8 @@ impl Registry {
         }
     }
 
-    /// Drops every series whose last update is older than `expire_after` (a zero duration disables
-    /// expiry entirely), plus any family left with no series at all -- an empty family would
-    /// otherwise render as a bare `# TYPE`/`# HELP` pair with nothing under it.
+    /// Drops every series last updated more than `expire_after` ago (zero disables expiry), and
+    /// any family left empty, which would otherwise render as a bare `# TYPE`/`# HELP`.
     fn sweep(&mut self, expire_after: Duration, now: Instant, telemetry: &Telemetry) {
         if expire_after.is_zero() {
             return;
@@ -435,21 +396,17 @@ impl Registry {
         }
     }
 
-    /// Evicts least-recently-updated series until at most `max_series` remain, in **one pass over
-    /// the registry** regardless of how many have to go.
+    /// Evicts least-recently-updated series until at most `max_series` remain, in **one pass**
+    /// however many go.
     ///
-    /// Being over the cap is not a rare accident -- it is the steady state the cap exists for, so
-    /// this runs under load, holding the lock a render also needs. Hence: borrow
-    /// `(updated_at, &name, &labels)` for every series once (no allocation per candidate),
-    /// [`select_nth_unstable_by`](slice::select_nth_unstable_by) to partition the `k` oldest into
-    /// the front of that slice in O(N) without sorting the rest, clone only those `k` keys, and
-    /// remove them. A `while len() > max` loop calling `min_by` instead would re-scan and
-    /// re-allocate every candidate `k` times over -- at the default cap of 100 000 that is `k` full
-    /// allocating scans per `send`, exactly when cardinality is the thing being diagnosed.
+    /// Over the cap is the steady state the cap exists for, so this runs under load, holding the
+    /// lock a render needs. It borrows `(updated_at, &name, &labels)` per series once,
+    /// [`select_nth_unstable_by`](slice::select_nth_unstable_by) moves the `k` oldest to the front
+    /// in O(N), and only those `k` keys are cloned. A `while len() > max` loop over `min_by` would
+    /// make `k` allocating full scans per `send`, just when cardinality is being diagnosed.
     ///
-    /// The tie-break past `updated_at` is the series' own key (family name, then label set), so
-    /// which of two series updated in the same batch goes is a function of the data rather than of
-    /// `Instant` resolution or map iteration order.
+    /// Ties on `updated_at` break on the series key (family name, then label set), so which of
+    /// two same-batch series goes depends on the data, not `Instant` resolution or map order.
     fn enforce_cap(&mut self, max_series: usize, telemetry: &Telemetry) {
         let total = self.len();
         if total <= max_series {
@@ -463,8 +420,7 @@ impl Registry {
                 candidates.push((stored.updated_at, name.as_str(), labels));
             }
         }
-        // `excess <= total` (`excess = total - max_series`) and `total > 0` here, so
-        // `excess - 1` is a valid index into `candidates`.
+        // `1 <= excess <= total` here, so `excess - 1` indexes `candidates`.
         let order = |a: &(Instant, &str, &LabelKey), b: &(Instant, &str, &LabelKey)| {
             a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)).then_with(|| a.2.cmp(b.2))
         };
@@ -486,7 +442,7 @@ impl Registry {
         telemetry.count(SERIES_EVICTED, excess as f64, &[("reason", "cardinality")]);
     }
 
-    /// The registry as the codec's own family list -- the seam [`text::write`] renders from.
+    /// The registry as the codec's family list, which [`text::write`] renders.
     fn families(&self) -> Vec<MetricFamily> {
         self.families
             .iter()
@@ -510,12 +466,9 @@ impl Registry {
             .collect()
     }
 
-    /// Renders through [`text::write_with`], not the no-telemetry [`text::write`] convenience, so
-    /// the writer's own drops land under this component's identity: an exemplar with no line left
-    /// to sit on and a `# UNIT` whose unit doesn't suffix the family name are counted
-    /// `logit.output.metrics.degraded{reason="exemplar_dropped"|"unit_not_suffix"}` by the same
-    /// encoder `send` hands `events_to_families`. Family-name collisions after sanitization are
-    /// that encoder's to skip and count too, never this registry's to special-case.
+    /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
+    /// (`degraded{reason="exemplar_dropped"|"unit_not_suffix"}`) count on the encoder `send`
+    /// uses. Post-sanitization family-name collisions are that encoder's to skip and count too.
     fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
         text::write_with(&self.families(), dialect, &mut out, encoder);
@@ -523,33 +476,25 @@ impl Registry {
     }
 }
 
-/// Everything one request handler needs, behind one `Arc` so the accept loop clones a refcount per
-/// connection rather than four fields.
+/// What a request handler needs, behind one `Arc` cloned per connection.
 struct ServerState {
     registry: Arc<Mutex<Registry>>,
-    /// The *same* encoder `send` uses, not a second one built from the same handles: one component,
-    /// one encoder identity, so `logit.output.metrics.degraded` reads as this sink's total however
-    /// the drop was reached. See [`ExposeOutput::encoder`] for the lock ordering it implies.
+    /// The same encoder `send` uses, so its counters are the sink's totals. Lock order is on
+    /// [`ExposeOutput::encoder`].
     encoder: Arc<Mutex<PrometheusEncoder>>,
     path: String,
     expire_after: Duration,
-    /// Derived from `max_series` once, at bind time, by [`response_timeout`] -- the whole-connection
-    /// deadline, separate from hyper's own [`HEADER_READ_TIMEOUT`].
+    /// The whole-connection deadline, [`response_timeout`] of `max_series` at bind time.
     response_timeout: Duration,
     telemetry: Telemetry,
     clock: Clock,
 }
 
-/// `prometheus_out`, in whichever of its two shapes the config selected -- see the module doc for
-/// the whole spec. One enum rather than two unrelated sinks because it is one `kind:` with one
-/// name in `docs/design/pipeline-graph.md`'s table, one `buffer:`, and one set of encoder
-/// counters; graph rule 56 is what guarantees the choice is unambiguous, so `build_spec` picks a
-/// variant and nothing downstream branches again.
-// The two variants differ in size by a few hundred bytes (`RemoteWriteOutput` carries a
-// `reqwest::Client` and a `HeaderMap`), which is what clippy is pointing at -- and it costs
-// nothing here: exactly one of these exists per configured component, built once at startup and
-// immediately boxed as `NodeSpec::Output`'s `Box<dyn Output>`. Boxing a variant to even them out
-// would add an indirection to every `send` to save a one-off allocation of the larger size.
+/// `prometheus_out` in the mode the config selected (see the module doc). One enum, not two
+/// sinks, because it's one `kind:`, one `buffer:`, and one set of encoder counters; rule 56 makes
+/// the choice unambiguous, so `build_spec` picks a variant and nothing branches again.
+// `RemoteWriteOutput` is a few hundred bytes larger, but there's one per component, boxed as
+// `Box<dyn Output>` at startup; boxing a variant would add an indirection to every `send`.
 #[allow(clippy::large_enum_variant)]
 pub enum PrometheusOutput {
     /// `bind:` -- the exposition endpoint.
@@ -570,8 +515,7 @@ impl From<RemoteWriteOutput> for PrometheusOutput {
     }
 }
 
-/// Pure delegation -- every method's contract, including [`Output::duplicate_safe`]'s, is the
-/// selected mode's and is documented there. Nothing is decided at this level.
+/// Pure delegation: every contract, [`Output::duplicate_safe`]'s included, is the mode's.
 #[async_trait::async_trait]
 impl Output for PrometheusOutput {
     async fn bind(&mut self) -> anyhow::Result<()> {
@@ -603,36 +547,31 @@ impl Output for PrometheusOutput {
     }
 }
 
-/// The `bind:` half: `logit_pipeline::Output` for the exposition endpoint -- see the module doc.
+/// The `bind:` mode: `logit_pipeline::Output` for the exposition endpoint.
 pub struct ExposeOutput {
     bind: String,
     path: String,
     expire_after: Duration,
     max_series: usize,
     registry: Arc<Mutex<Registry>>,
-    /// The address actually bound, once [`ExposeOutput::bind`] has run -- and the reason
-    /// `bind` is where the socket is opened rather than lazily on first request: a test binds
-    /// `127.0.0.1:0` and reads the real port back from here.
+    /// The address bound, once [`ExposeOutput::bind`] has run; how a `:0` test learns its port.
     local_addr: Option<SocketAddr>,
-    /// The accept loop. `Some` is also this sink's "already bound" flag, which is what makes
-    /// [`Output::bind`] idempotent; the [`TcpListener`] itself is owned by that task, so aborting
-    /// it (in [`Output::flush`]) closes the port.
+    /// The accept loop, which owns the [`TcpListener`]; aborting it closes the port. `Some` is
+    /// also the "already bound" flag that makes [`Output::bind`] idempotent.
     server: Option<JoinHandle<()>>,
-    /// Shared with the request handler, because both sides of this sink encode: `send` converts a
-    /// batch with `events_to_families`, and a render counts what [`text::write_with`] has to drop.
-    /// **Lock order is encoder before registry**, the one order both paths take -- `send` releases
-    /// the encoder before touching the registry, and a render holds both in that order.
+    /// Shared with the request handler: `send` converts through it, and a render counts
+    /// [`text::write_with`]'s drops on it. **Lock order is encoder before registry**: `send`
+    /// releases the encoder before taking the registry, and a render takes both in that order.
     encoder: Arc<Mutex<PrometheusEncoder>>,
-    /// The source of truth the encoder is rebuilt from by each builder below, and separately the
-    /// handle the accept loop reports its own `accept_failed` under.
+    /// The encoder is rebuilt from this by the builders; the accept loop also reports its
+    /// `prometheus_accept_failed` under it.
     diag: Diagnostics,
     telemetry: Telemetry,
     clock: Clock,
 }
 
 impl ExposeOutput {
-    /// `bind` is `host:port`, resolved when [`Output::bind`] runs, not at config-load time -- the
-    /// same `syslog_out`/`statsd_out` precedent for an address in config.
+    /// `bind` is `host:port`, resolved when [`Output::bind`] runs, not at config load.
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             bind: bind.into(),
@@ -654,7 +593,7 @@ impl ExposeOutput {
         self
     }
 
-    /// `Duration::ZERO` disables expiry -- see the module doc.
+    /// `Duration::ZERO` disables expiry.
     pub fn with_expire_after(mut self, expire_after: Duration) -> Self {
         self.expire_after = expire_after;
         self
@@ -665,9 +604,9 @@ impl ExposeOutput {
         self
     }
 
-    /// Reaches the codec's encoder, which is what actually reports the throttled
-    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics -- and the accept loop,
-    /// whose own `accept_failed` is an independent throttle key.
+    /// Reaches the codec's encoder, which reports the throttled
+    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics, and the accept loop's
+    /// `prometheus_accept_failed`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self.rebuild_encoder();
@@ -680,11 +619,9 @@ impl ExposeOutput {
         self
     }
 
-    /// `telemetry`/`diag` are the source of truth; the encoder is derived from them. Replacing the
-    /// whole encoder (rather than mutating through the lock) keeps
-    /// `PrometheusEncoder`'s own `mut self -> Self` builders usable as written, and every call is a
-    /// builder running before `bind` -- so the `Arc` the handler later clones always holds the
-    /// finished article.
+    /// Derives the encoder from `telemetry`/`diag`. Replacing it whole keeps `PrometheusEncoder`'s
+    /// `mut self -> Self` builders usable; every caller is a builder that runs before `bind`, so
+    /// the handler's `Arc` clone gets the finished encoder.
     fn rebuild_encoder(&mut self) {
         self.encoder = Arc::new(Mutex::new(
             PrometheusEncoder::new()
@@ -693,17 +630,15 @@ impl ExposeOutput {
         ));
     }
 
-    /// Overrides what the expiry sweep reads as "now" -- see [`Clock`]. Tests only: production has
-    /// exactly one clock, and offering a second in the public API would invite a sink whose
-    /// `expire_after` quietly means something else.
+    /// Overrides the sweep's "now" ([`Clock`]). Tests only: a public second clock would invite a
+    /// sink whose `expire_after` means something else.
     #[cfg(test)]
     fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
     }
 
-    /// The address actually bound, or `None` before [`Output::bind`] has run. `127.0.0.1:0` in
-    /// config plus this is how a test learns which ephemeral port to scrape.
+    /// The address bound, or `None` before [`Output::bind`] has run.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
     }
@@ -711,14 +646,11 @@ impl ExposeOutput {
 
 #[async_trait::async_trait]
 impl Output for ExposeOutput {
-    /// Opens the exposition socket and starts serving it. Idempotent (a second call sees
-    /// `self.server` already `Some` and returns), which is what lets the runtime's pre-spawn pass
-    /// and `run_output`'s own lazy call both happen without binding twice -- see
-    /// [`Output::bind`]'s contract.
+    /// Opens the socket and starts serving. Idempotent, so the runtime's pre-spawn pass and
+    /// `run_output`'s lazy call don't bind twice ([`Output::bind`]'s contract).
     ///
-    /// The server starts here, before any batch has arrived, rather than on the first `send`: a
-    /// scraper polling a freshly-started `logit` should get an empty `200` (nothing has been
-    /// delivered yet) rather than a connection refused it cannot distinguish from a crash.
+    /// Serving starts before the first batch, so a scraper polling a fresh `logit` gets an empty
+    /// `200` rather than a connection refused it can't tell from a crash.
     async fn bind(&mut self) -> anyhow::Result<()> {
         if self.server.is_some() {
             return Ok(());
@@ -727,11 +659,9 @@ impl Output for ExposeOutput {
             .await
             .with_context(|| format!("binding prometheus_out on '{}'", self.bind))?;
         let local_addr = listener.local_addr().context("reading prometheus_out's bound address")?;
-        // The same `bound` lifecycle line every listener emits from its own `bind`
-        // (`logit_inputs::udp`, `logit_inputs::otlp`) -- a sink that listens advances to
-        // `NodeState::Bound` through the same pre-spawn pass, so it must not do so silently.
-        // `local_addr`, not `self.bind`: a configured `:0` is the one case where what was asked for
-        // and what was opened differ, and the port actually listening is the useful one.
+        // The `bound` lifecycle line every listener emits: this sink reaches `NodeState::Bound`
+        // through the same pre-spawn pass. `local_addr`, not `self.bind`, so a `:0` shows the
+        // real port.
         self.diag.info("bound", format_args!("serving {} on {local_addr}", self.path));
         self.local_addr = Some(local_addr);
         let state = Arc::new(ServerState {
@@ -747,21 +677,19 @@ impl Output for ExposeOutput {
         Ok(())
     }
 
-    /// Upserts the batch into the registry and brings it back within `expire_after`/`max_series`.
-    /// Never fails: there is no I/O here at all, only a lock and a `BTreeMap`.
+    /// Upserts the batch and brings the registry back within `expire_after`/`max_series`. Never
+    /// fails: no I/O, only a lock and a `BTreeMap`.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let resource = batch.resource.as_ref();
-        // Encoder first, registry second -- the one lock order both this and a render take. The
-        // encoder is released here, before the registry is touched, so a scrape holding both never
-        // waits on a conversion.
+        // Encoder before registry, and released first, so a scrape holding both never waits on
+        // a conversion.
         let families = {
             let mut encoder = lock(&self.encoder);
             events_to_families(batch.events.iter().map(|event| (resource, event)), &mut encoder)
         };
         let now = (self.clock)();
-        // One critical section for the whole batch: upsert, then bring the registry back within
-        // both bounds, so a scrape racing this `send` never observes a registry that is over its
-        // cap or still holding series past their `expire_after`.
+        // One critical section, so a racing scrape never sees the registry over its cap or
+        // holding expired series.
         let held = {
             let mut registry = lock(&self.registry);
             for family in families {
@@ -775,11 +703,9 @@ impl Output for ExposeOutput {
         Ok(())
     }
 
-    /// Stops serving. Aborting the accept task is the whole teardown: it owns the [`TcpListener`],
-    /// so dropping its future closes the port, and each in-flight connection is already bounded by
-    /// [`response_timeout`]. Nothing is buffered here to flush -- `send` has already committed every
-    /// batch to the registry by the time it returns. [`Drop`] does the same thing, for the paths
-    /// that never reach a graceful `flush` at all.
+    /// Stops serving by aborting the accept task, which owns the [`TcpListener`]; in-flight
+    /// connections are bounded by [`response_timeout`]. Nothing is buffered: `send` commits to the
+    /// registry before returning. [`Drop`] does the same for paths that never reach `flush`.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(server) = self.server.take() {
             server.abort();
@@ -787,24 +713,17 @@ impl Output for ExposeOutput {
         Ok(())
     }
 
-    /// `true`: `send` is an idempotent replace into an in-memory registry and touches no network,
-    /// so a redelivered batch writes the same values a second time and changes nothing. Unlike
-    /// `statsd_out`, there is no counter at a destination to double.
+    /// `true`: `send` is an idempotent replace into an in-memory registry, so a redelivered batch
+    /// changes nothing.
     fn duplicate_safe(&self) -> bool {
         true
     }
 }
 
-/// Aborts the accept loop when the sink itself is dropped, not only when `flush` runs. `flush` is
-/// the *graceful* teardown and the runtime calls it on every path it finishes a sink on -- but not on
-/// the startup-failure path: if a later component's `bind` fails, `run_with_telemetry` returns
-/// `RunError::Startup` and drops every spec without flushing anything, which would leave this
-/// listener holding its port for the rest of the runtime's life. Moot under the CLI (the process is
-/// exiting anyway) and real for in-process use and for any test that binds a sink and then fails
-/// startup, so the listener gets the same non-`flush` teardown `logit-cli`'s own admin listener has.
-///
-/// `abort` rather than an await: `Drop` cannot be async, and abort is all `flush` does anyway -- the
-/// task owns the `TcpListener`, so dropping its future closes the port.
+/// Aborts the accept loop on drop, not only on `flush`. On the startup-failure path (a later
+/// component's `bind` fails) `run_with_telemetry` returns `RunError::Startup` and drops every spec
+/// unflushed, which would leave the port held. Moot under the CLI, which exits; real in-process
+/// and in tests. `logit-cli`'s admin listener has the same teardown.
 impl Drop for ExposeOutput {
     fn drop(&mut self) {
         if let Some(server) = self.server.take() {
@@ -813,40 +732,31 @@ impl Drop for ExposeOutput {
     }
 }
 
-/// The `endpoint:` half: a stateless remote-write sender -- see the module doc for the wire, the
-/// `Fault` table, and why [`RemoteWriteOutput::duplicate_safe`] is `true`.
+/// The `endpoint:` mode: a stateless remote-write sender (module doc's "The wire" and "Faults,
+/// retries and duplicate safety").
 ///
-/// Nothing is retained between batches, which is what makes this the opposite shape from
-/// [`ExposeOutput`]: no registry, no expiry sweep, no cardinality cap, no lock. `send` takes
-/// `&mut self`, so the encoder is a plain field rather than the `Arc<Mutex<..>>` a shared request
-/// handler forces on the other mode.
+/// Nothing is retained between batches: no registry, sweep, cap, or lock. `send` takes
+/// `&mut self`, so the encoder is a plain field.
 pub struct RemoteWriteOutput {
-    /// The absolute write URL, path included. Never parsed here -- `reqwest` does that per
-    /// request, and graph rule 56 has already checked the scheme and authority.
+    /// The absolute write URL. `reqwest` parses it per request; rule 56 has checked the scheme
+    /// and authority.
     endpoint: String,
     version: remote_write::Version,
     request_timeout: Duration,
     client: reqwest::Client,
-    /// The operator's `headers:`, built into a `HeaderMap` once at construction rather than per
-    /// request. The protocol's own four are inserted *over* a clone of this on each request --
-    /// see [`RemoteWriteOutput::request_headers`].
+    /// The operator's `headers:`, built once; see [`RemoteWriteOutput::request_headers`].
     headers: HeaderMap,
-    /// `Some` only once [`RemoteWriteOutput::with_tls`] has built one from `endpoint_tls:`;
-    /// `None` leaves `reqwest`'s own default trust (the bundled Mozilla root set) in place, which
-    /// is already correct for an ordinary `https://` receiver.
+    /// Built by [`RemoteWriteOutput::with_tls`] from `endpoint_tls:`. `None` keeps `reqwest`'s
+    /// default trust (the bundled Mozilla roots).
     tls: Option<rustls::ClientConfig>,
-    /// Rebuilt from `telemetry`/`diag` by the builders below, exactly as [`ExposeOutput`] does --
-    /// the encoder is derived state, and `PrometheusEncoder`'s own `mut self -> Self` builders
-    /// stay usable as written that way.
+    /// Rebuilt from `telemetry`/`diag` by the builders, as in [`ExposeOutput`].
     encoder: PrometheusEncoder,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl RemoteWriteOutput {
-    /// `endpoint` is the receiver's absolute write URL, path included -- resolved at request time,
-    /// never at config-load time, the same `otlp_out`/`syslog_out` precedent for an address in
-    /// config.
+    /// `endpoint` is the receiver's absolute write URL, path included, resolved per request.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -861,30 +771,25 @@ impl RemoteWriteOutput {
         }
     }
 
-    /// Which remote-write message this sender writes (`version:` in config). No negotiation and no
-    /// fallback -- see the module doc.
+    /// Which remote-write message to send (`version:`). No negotiation, no fallback.
     pub fn with_version(mut self, version: remote_write::Version) -> Self {
         self.version = version;
         self
     }
 
-    /// Per-request timeout (`timeout:` in config). Rebuilds the client, since that is where
-    /// `reqwest`'s own client-wide default lives; the per-request `.timeout(..)` in `send` is what
-    /// actually bounds a request either way, so the two are kept in step rather than left to
-    /// disagree.
+    /// Per-request timeout (`timeout:`). The per-request `.timeout(..)` in `send` is what bounds
+    /// a request; the client is rebuilt so its default agrees.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self.client = build_client(timeout, self.tls.as_ref());
         self
     }
 
-    /// The extra headers sent on every request (`headers:` in config). Fails if a name or value
-    /// isn't a legal HTTP header (graph rule 56 rejects a protocol-owned name before construction
-    /// ever sees it; this catches the lexical shape `graph` can't -- illegal bytes, embedded
-    /// newlines), and if two names collide once `HeaderName` normalizes their case, which
-    /// `HeaderMap::insert` would otherwise resolve by whichever of the two the `HashMap` happened
-    /// to iterate last. Both are the same defense-in-depth relationship `otlp_out::with_headers`
-    /// has with its own rule.
+    /// The extra headers on every request (`headers:`).
+    ///
+    /// Fails on a name or value that isn't legal HTTP (rule 56 rejects protocol-owned names; this
+    /// catches illegal bytes and embedded newlines), and on two names that collide once case is
+    /// normalized, which `HeaderMap::insert` would resolve by `HashMap` iteration order.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());
         for (name, value) in headers {
@@ -904,12 +809,9 @@ impl RemoteWriteOutput {
         Ok(self)
     }
 
-    /// Client-side TLS tuning (`endpoint_tls:` in config) -- a private CA, a client certificate
-    /// for mutual TLS, or disabling verification entirely. A no-op if `settings` is empty:
-    /// `reqwest` already defaults to a working TLS configuration (the bundled Mozilla root set)
-    /// for an `https://` endpoint without this ever being called. Graph rule 56 rejects a
-    /// non-empty block on a non-`https://` endpoint and requires `cert_file`/`key_file` together
-    /// before this ever runs -- this method still loads and validates every file itself, since
+    /// Client TLS tuning (`endpoint_tls:`): a private CA, a client certificate, or no
+    /// verification. A no-op when `settings` is empty, since `reqwest` already does TLS for
+    /// `https://`. Rule 56 checks the block's shape; the files load and validate here, since
     /// `graph::resolve` never touches the filesystem.
     pub fn with_tls(
         mut self,
@@ -932,9 +834,9 @@ impl RemoteWriteOutput {
         Ok(self)
     }
 
-    /// Reaches the codec's encoder, which is what reports the throttled
-    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics -- and this sink's own
-    /// `remote_write_rejected`, an independent throttle key.
+    /// Reaches the codec's encoder, which reports the throttled
+    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics, and this sink's
+    /// `remote_write_rejected`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self.encoder = new_sender_encoder(&self.telemetry, &self.diag);
@@ -947,11 +849,9 @@ impl RemoteWriteOutput {
         self
     }
 
-    /// The batch's events grouped by `Event::timestamp`, ascending, stable within a group -- the
-    /// partition [`remote_write::encode`] inverts back into one `TimeSeries` per label set. A
-    /// `BTreeMap` rather than a sort: a real batch carries one or two distinct timestamps, so this
-    /// is a couple of map lookups per event rather than a comparison sort over all of them, and
-    /// ascending order comes out of the map rather than out of a sort key.
+    /// The batch's events grouped by `Event::timestamp`, ascending, stable within a group; the
+    /// partition [`remote_write::encode`] merges back into one `TimeSeries` per label set. A
+    /// `BTreeMap`, not a sort: a real batch has one or two distinct timestamps.
     fn partition(batch: &EventBatch) -> BTreeMap<i64, Vec<&Event>> {
         let mut groups: BTreeMap<i64, Vec<&Event>> = BTreeMap::new();
         for event in &batch.events {
@@ -960,10 +860,9 @@ impl RemoteWriteOutput {
         groups
     }
 
-    /// The operator's headers with the protocol's own four `insert`ed over them, so a
-    /// protocol-owned name always wins whatever `headers:` said. `insert` (not `RequestBuilder`'s
-    /// append-semantics `.header(..)`), and one `.headers(..)` call at the call site, for exactly
-    /// the reason `otlp_out::send_http` spells out: mixing the two would undo this guarantee.
+    /// The operator's headers with the protocol's four `insert`ed over them, so a protocol name
+    /// always wins. `insert` and one `.headers(..)` at the call site, never `RequestBuilder`'s
+    /// appending `.header(..)`, which would undo that (`otlp_out::send_http` has the same).
     fn request_headers(&self) -> HeaderMap {
         let mut headers = self.headers.clone();
         headers.insert(
@@ -983,11 +882,9 @@ impl RemoteWriteOutput {
     }
 }
 
-/// One encoder configured the way this transport needs it, in one place so `new` and both
-/// telemetry builders cannot drift: `with_timestamps_always` because the wire has no way to omit a
-/// timestamp and a series without one would be silently skipped and counted; `with_stale_markers`
-/// because remote-write *does* have a spelling for "this series is gone" and an exposition of the
-/// same data does not. See the module doc's "The wire".
+/// The sender's encoder, built in one place so `new` and the builders can't drift (module doc's
+/// "The wire"): `with_timestamps_always` because the wire can't omit a timestamp,
+/// `with_stale_markers` because remote-write, unlike an exposition, can say "this series is gone".
 fn new_sender_encoder(telemetry: &Telemetry, diag: &Diagnostics) -> PrometheusEncoder {
     PrometheusEncoder::new()
         .with_stale_markers(true)
@@ -998,14 +895,13 @@ fn new_sender_encoder(telemetry: &Telemetry, diag: &Diagnostics) -> PrometheusEn
 
 #[async_trait::async_trait]
 impl Output for RemoteWriteOutput {
-    /// Nothing to bind: this sink dials out per request. `Ok(())` rather than the trait's default
-    /// so the whole `Output` surface reads from one place in this file.
+    /// Nothing to bind: this sink dials out per request.
     async fn bind(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// One batch, one request -- see the module doc's "The wire" and "Faults, retries and
-    /// duplicate safety". Exactly one attempt: retry is `write_loop`'s job.
+    /// One batch, one request, one attempt (module doc's "The wire" and "Faults, retries and
+    /// duplicate safety").
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let resource = batch.resource.as_ref();
         let groups: Vec<Vec<MetricFamily>> = Self::partition(batch)
@@ -1017,20 +913,16 @@ impl Output for RemoteWriteOutput {
                 )
             })
             .collect();
-        // No request at all for a batch that produced nothing -- a batch of logs reaching a
-        // metrics sink, or one whose every record was skipped and counted. An empty `WriteRequest`
-        // is a legal message, but sending one would turn a no-op into network traffic and into a
-        // `requests{class="2xx"}` an operator would read as a delivery.
+        // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but it
+        // would count a `requests{class="2xx"}` an operator reads as a delivery.
         if groups.iter().all(Vec::is_empty) {
             return Ok(());
         }
         let (body, samples) =
             remote_write::encode_counted(&groups, self.version, &mut self.encoder);
-        // Snappy *block* format (`snap::raw`), which is what both specs mean by
-        // `Content-Encoding: snappy` -- never the framed format `snap::write` produces.
-        // Infallible in practice: `compress_vec` only errors on an input past `u32::MAX`, which a
-        // batch cannot reach, but it is reported rather than unwrapped so an absurd one fails the
-        // batch instead of the process.
+        // Snappy block format (`snap::raw`), what both specs mean by `Content-Encoding: snappy`,
+        // never the framed `snap::write`. Errors only past `u32::MAX`; reported, not unwrapped,
+        // so an absurd batch fails alone.
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&body)
             .context("snappy-compressing a remote-write request body")?;
@@ -1060,10 +952,8 @@ impl Output for RemoteWriteOutput {
                 } else {
                     Fault::Permanent
                 };
-                // The body, not just the status: a Prometheus-style `400` names the offending
-                // series (`out of order sample`, `duplicate sample for timestamp`, a label that
-                // failed validation), and that is the only actionable thing in the exchange.
-                // Read truncated, not read whole and then truncated -- see `read_body_prefix`.
+                // The body names the offending series in a Prometheus-style `400` (`out of order
+                // sample`, a bad label): the only actionable part. Read bounded.
                 let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
                 let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
                 self.diag.warn_throttled(
@@ -1080,44 +970,38 @@ impl Output for RemoteWriteOutput {
         }
     }
 
-    /// Nothing is buffered here: `send` has already issued (or deliberately not issued) its one
-    /// request by the time it returns.
+    /// Nothing is buffered: `send` has issued its request, if any, before returning.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// `true`, and load-bearing -- see the module doc's "Faults, retries and duplicate safety".
-    /// A sample's identity at a remote-write receiver is `(label set, timestamp)`, and this sink
-    /// re-encodes a retried batch from the same events, so a replayed request is an idempotent
-    /// overwrite rather than a second sample. And `true` is what selects
-    /// `DeliveryPosture::AtLeastOnce` (`logit_pipeline::output`'s `from_duplicate_safe` and
-    /// `is_retryable`), the only posture under which the `Fault::Ambiguous` a 5xx produces is
-    /// retried at all: `false` here would silently turn every 5xx into a dropped batch.
+    /// `true`. A sample's identity at a receiver is `(label set, timestamp)` and a retry
+    /// re-encodes the same events, so a replay is an idempotent overwrite. `true` also selects
+    /// `DeliveryPosture::AtLeastOnce` (`logit_pipeline::output`'s `from_duplicate_safe`), the only
+    /// posture that retries a 5xx's `Fault::Ambiguous`; `false` would drop every 5xx batch.
     fn duplicate_safe(&self) -> bool {
         true
     }
 }
 
-/// Poisoning cannot lose data here -- a panic while holding this lock would have to come from
-/// inside `BTreeMap`, and the registry is rebuilt by the next `send` regardless -- so a poisoned
-/// lock is recovered rather than propagated, exactly as `logit_core::Registry` does with its own.
+/// Recovers a poisoned lock rather than propagating it, as `logit_core::Registry` does: a panic
+/// under the registry or encoder lock still leaves a valid value, and the next `send` upserts
+/// over the registry.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The accept loop, mirroring `logit-cli::admin::serve_on`: one spawned task per connection,
-/// permit acquired *after* accept so the kernel backlog absorbs a burst, and a per-connection
-/// timeout. Returns nothing because no failure here has anywhere to go -- this task is only ever
-/// aborted, never joined, so an `Err` would vanish unread.
+/// The accept loop, as in `logit-cli::admin::serve_on`: a task per connection, the permit taken
+/// after accept so the kernel backlog absorbs a burst, and a per-connection timeout. Returns `()`:
+/// the task is only aborted, never joined, so an `Err` would go unread.
 async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnostics) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _peer)) => stream,
             Err(err) => {
-                // One failed `accept()` must never end this loop -- see admin.rs's own comment for
-                // the full reasoning. A client's own accident is retried immediately; anything
-                // else (fd pressure) gets a short pause first so it cannot spin a core.
+                // A failed `accept()` never ends the loop (see admin.rs). A client's accident
+                // retries at once; anything else (fd pressure) pauses so it can't spin a core.
                 diag.warn_throttled(
                     "prometheus_accept_failed",
                     format_args!("accepting a scrape connection failed: {err}"),
@@ -1143,10 +1027,9 @@ async fn serve(listener: TcpListener, state: Arc<ServerState>, mut diag: Diagnos
                 let state = Arc::clone(&state);
                 async move { handle(req, state) }
             });
-            // Two deadlines, not one: hyper bounds how long request *headers* may take to
-            // arrive (the slowloris case, cheap to bound tightly), while the outer timeout bounds
-            // the whole connection including the body write, which scales with `max_series` and
-            // must outlast the scraper's own `scrape_timeout`.
+            // Two deadlines: hyper's tight one on request headers (slowloris), and the outer one
+            // on the whole connection, which scales with `max_series` to outlast the scraper's
+            // `scrape_timeout`.
             let serve = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(HEADER_READ_TIMEOUT)
@@ -1177,10 +1060,8 @@ fn handle(
     let dialect = negotiate(req.headers().get(http::header::ACCEPT).and_then(header_str));
     let gzip = accepts_gzip(req.headers().get(http::header::ACCEPT_ENCODING).and_then(header_str));
 
-    // The sweep runs here as well as in `send` so a sink that has gone quiet still stops exposing
-    // series past their `expire_after`, rather than freezing whatever it last held. Cheap: one
-    // `Instant` comparison per series, under a lock nothing else contends for between scrapes.
-    // Rendered under the same lock, then released before the response is built.
+    // Sweep here too, so a quiet sink still expires series. One `Instant` compare per series;
+    // both locks are released before the response is built.
     let body = {
         let mut encoder = lock(&state.encoder);
         let mut registry = lock(&state.registry);
@@ -1189,18 +1070,15 @@ fn handle(
     };
 
     let body = if gzip { gzip_encode(&body) } else { body };
-    // Counted here, when the body is *rendered*, not when the last byte reaches the client: the
-    // response is a `Full<Bytes>`, which offers no body-completion hook to count from, so a
-    // connection that dies mid-write still lands as `ok`. See `SCRAPE_BYTES`' own doc comment.
+    // Counted at render; see `SCRAPE_BYTES`.
     state.telemetry.count(SCRAPES, 1.0, &[("class", "ok")]);
     state.telemetry.count(SCRAPE_BYTES, body.len() as f64, &[]);
 
     let mut builder = http::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", dialect.content_type())
-        // The representation genuinely varies on both, and the module doc tells operators to front
-        // this endpoint with a proxy -- without `Vary` a caching intermediary is entitled to hand a
-        // text-0.0.4 scraper an OpenMetrics (or gzipped) body it never asked for.
+        // Operators are told to front this with a proxy; without `Vary` a cache may hand a
+        // text-0.0.4 scraper an OpenMetrics or gzipped body.
         .header("vary", "Accept, Accept-Encoding");
     if gzip {
         builder = builder.header("content-encoding", "gzip");
@@ -1208,17 +1086,14 @@ fn handle(
     Ok(builder.body(Full::new(Bytes::from(body))).expect("a well-formed response always builds"))
 }
 
-/// A header value as `&str`, or `None` for one that isn't valid ASCII -- an `Accept` this codec
-/// cannot read is treated as absent (text 0.0.4), never as an error: a scrape must not fail over a
-/// malformed negotiation header.
+/// A header value as `&str`, or `None` if it isn't visible ASCII. An unreadable `Accept` counts
+/// as absent (text 0.0.4): a scrape never fails over a negotiation header.
 fn header_str(value: &http::HeaderValue) -> Option<&str> {
     value.to_str().ok()
 }
 
-/// OpenMetrics only when the client actually asks for it; text 0.0.4 for everything else,
-/// including no header at all and a bare `*/*` -- the same default Prometheus's own server applies.
-/// A substring match rather than a full `Accept` parse: `q` weights between the two exposition
-/// dialects are not a thing any real scraper sends, and naming the type at all is the ask.
+/// OpenMetrics only when asked for by name; text 0.0.4 otherwise, as Prometheus's own server
+/// does. A substring match, not an `Accept` parse: no real scraper weights the two dialects.
 fn negotiate(accept: Option<&str>) -> Dialect {
     const OM: &str = "application/openmetrics-text";
     match accept {
@@ -1232,8 +1107,8 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Whether `Accept-Encoding` offers `gzip` at a non-zero weight. `gzip;q=0` is an explicit refusal
-/// (RFC 9110 §12.5.3), so it must not be read as an offer just because the token is present.
+/// Whether `Accept-Encoding` offers `gzip` at a non-zero weight; `gzip;q=0` is a refusal (RFC
+/// 9110 §12.5.3).
 fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
     let Some(value) = accept_encoding else { return false };
     value.split(',').any(|entry| {
@@ -1252,8 +1127,7 @@ fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
 fn gzip_encode(body: &[u8]) -> Vec<u8> {
     use std::io::Write as _;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    // Both calls write into a `Vec`, which cannot fail; `expect` rather than a fallible signature
-    // so the handler has no error branch that can never be taken.
+    // Writing into a `Vec` can't fail, so the handler gets no dead error branch.
     encoder.write_all(body).expect("writing into a Vec never fails");
     encoder.finish().expect("finishing a Vec-backed gzip stream never fails")
 }
@@ -1306,10 +1180,9 @@ mod tests {
         MetricKind::Sum(Sum { value, temporality: Temporality::Cumulative, monotonic: true })
     }
 
-    /// One of every shape the exposition format can carry, as the exposition-fixture batch every
-    /// byte-exact test below renders: a cumulative counter whose model name lacks `_total`, a
-    /// gauge, a cumulative histogram, a summary, an `info`-typed gauge, and a series carrying its
-    /// own wire timestamp.
+    /// One of every shape the exposition format carries, rendered by every byte-exact test: a
+    /// cumulative counter whose model name lacks `_total`, a gauge, a cumulative histogram, a
+    /// summary, an `info`-typed gauge, and a series with its own wire timestamp.
     fn fixture_batch() -> EventBatch {
         let mut histogram = MetricRecord::new(
             intern("latency_seconds"),
@@ -1358,8 +1231,7 @@ mod tests {
         )
     }
 
-    /// A bound sink plus the base URL to scrape it at. `expire_after: 0s` unless a test says
-    /// otherwise, so nothing expires out from under a byte-exact assertion.
+    /// A bound sink plus the base URL to scrape it at.
     async fn bound(sink: ExposeOutput) -> (ExposeOutput, String) {
         let mut sink = sink;
         sink.bind().await.expect("binding an ephemeral port should succeed");
@@ -1367,6 +1239,8 @@ mod tests {
         (sink, format!("http://{addr}"))
     }
 
+    /// [`fixture_batch`] sent to a bound sink, with `expire_after: 0s` so nothing expires out from
+    /// under a byte-exact assertion.
     async fn fixture_sink() -> (ExposeOutput, String) {
         let mut sink = ExposeOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
         sink.send(&fixture_batch()).await.expect("send never fails");
@@ -1375,8 +1249,7 @@ mod tests {
 
     async fn get(url: &str, headers: &[(&str, &str)]) -> reqwest::Response {
         let client = reqwest::Client::builder()
-            // Off, so a gzip body arrives exactly as this sink wrote it rather than being
-            // transparently inflated (and its `content-encoding` stripped) by the client.
+            // So a gzip body arrives as written, not inflated with `content-encoding` stripped.
             .no_gzip()
             .build()
             .expect("a default client always builds");
@@ -1571,8 +1444,7 @@ mod tests {
 
     // -- state: upsert, expiry, cardinality, type conflict ----------------------------------
 
-    /// Cumulative semantics: the second delivery of a series replaces the first, it does not
-    /// accumulate and it does not appear twice.
+    /// A second delivery of a series replaces the first: no accumulation, no duplicate.
     #[tokio::test]
     async fn a_resent_series_replaces_its_stored_value_rather_than_adding_to_it() {
         let mut sink = ExposeOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
@@ -1585,8 +1457,7 @@ mod tests {
         );
     }
 
-    /// A hand-advanced clock, so this pins the `expire_after` boundary itself rather than waiting
-    /// on one: at exactly the window the series is still live, past it it is gone and counted.
+    /// At exactly `expire_after` a series is live; past it, it's gone and counted.
     #[tokio::test]
     async fn a_series_not_updated_within_expire_after_stops_being_exposed_and_is_counted() {
         let start = Instant::now();
@@ -1631,10 +1502,8 @@ mod tests {
         );
     }
 
-    /// The cap evicts the *least recently updated* series, not an arbitrary one. The oldest series
-    /// is deliberately `id="z"`, which sorts **last** in the registry's `BTreeMap`: an
-    /// implementation that evicted the first series in iteration order would keep `z` and drop `a`,
-    /// so this distinguishes LRU from map order rather than passing on a coincidence.
+    /// The cap evicts the least recently updated series. The oldest is `id="z"`, last in map
+    /// order, so evicting by iteration order would fail.
     #[tokio::test]
     async fn the_max_series_cap_evicts_the_least_recently_updated_series_and_counts_it() {
         let start = Instant::now();
@@ -1675,9 +1544,8 @@ mod tests {
         assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), 1.0);
     }
 
-    /// The regime the cap actually operates in: thousands of series, hundreds over the cap, evicted
-    /// in **one** pass. Pins *which* ones go -- the oldest, by `updated_at` -- not just how many, so
-    /// a one-pass rewrite cannot quietly evict the wrong half.
+    /// Thousands of series, hundreds over the cap, evicted in one pass: pins which go (the
+    /// oldest, then by key), not only how many.
     #[tokio::test]
     async fn a_batch_far_over_the_cap_evicts_exactly_the_oldest_series_in_one_pass() {
         const OLD: usize = 3_000;
@@ -1710,8 +1578,7 @@ mod tests {
         sink.send(&batch(series("old", OLD))).await.unwrap();
         assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), 0.0);
 
-        // A later batch of NEW fresh series takes the total to CAP + NEW, so exactly NEW have to
-        // go -- and every `old_*` is strictly older than every `new_*`.
+        // NEW fresh series take the total to CAP + NEW, and every `old_*` is older than them.
         *lock(&now) = start + Duration::from_secs(1);
         sink.send(&batch(series("new", NEW))).await.unwrap();
         assert_eq!(counter(&registry, SERIES_EVICTED, "reason", "cardinality"), NEW as f64);
@@ -1719,8 +1586,7 @@ mod tests {
         let (_sink, url) = bound(sink).await;
         let body = get(&format!("{url}/metrics"), &[]).await.text().await.unwrap();
         assert_eq!(body.lines().filter(|l| l.starts_with("hits_total{")).count(), CAP);
-        // Every `old_*` shares one `updated_at`, so the documented key tie-break decides between
-        // them: the evicted set is exactly the NEW lowest `old_*` keys.
+        // The `old_*` share one `updated_at`, so the key tie-break picks the NEW lowest keys.
         for i in 0..NEW {
             assert!(
                 !body.contains(&format!("id=\"old_{i:05}\"")),
@@ -1738,8 +1604,7 @@ mod tests {
         }
     }
 
-    /// One name cannot carry two `# TYPE` lines, so the newer type wins and the old series go --
-    /// a gauge arriving for a name registered as a counter must not leave a counter behind.
+    /// A gauge arriving for a counter's name replaces the family and its old series.
     #[tokio::test]
     async fn a_type_conflict_replaces_the_family_and_evicts_its_old_series() {
         let registry = logit_core::Registry::new();
@@ -1764,8 +1629,7 @@ mod tests {
         assert_eq!(counter(&registry, TYPE_CONFLICT, "component", "out"), 1.0);
     }
 
-    /// The codec owns every lossy path, and this proves the sink's own encoder is wired to the
-    /// component's real `Telemetry` so those counters actually reach the pipeline.
+    /// The sink's encoder is wired to the component's `Telemetry`, so codec skips are counted.
     #[tokio::test]
     async fn a_delta_sum_is_skipped_and_counted_through_the_sinks_own_telemetry() {
         let registry = logit_core::Registry::new();
@@ -1792,11 +1656,9 @@ mod tests {
         );
     }
 
-    /// A render's own drops count under the sink's identity, not a throwaway encoder's: only one
-    /// exemplar fits a counter's single `_total` line, so the second is dropped and counted. The
-    /// drop happens in the *writer*, which is exactly what `text::write_with` exists to report --
-    /// scraping as text 0.0.4 would drop both uncounted (a dialect choice, not a lossy mapping), so
-    /// this asks for OpenMetrics.
+    /// A render's drops count on the sink's encoder: one `_total` line fits one exemplar, so the
+    /// second is dropped and counted. OpenMetrics, since text 0.0.4 drops exemplars uncounted by
+    /// dialect.
     #[tokio::test]
     async fn a_render_that_has_to_drop_an_exemplar_counts_it_under_the_sinks_own_telemetry() {
         let registry = logit_core::Registry::new();
@@ -1827,9 +1689,7 @@ mod tests {
 
     // -- lifecycle --------------------------------------------------------------------------
 
-    /// `Output::bind`'s idempotency obligation: the second call must not try to open the port
-    /// again (which would fail, since the first call is holding it), and must not leave a second
-    /// accept loop behind.
+    /// A second `bind` neither reopens the port nor starts a second accept loop.
     #[tokio::test]
     async fn binding_twice_is_a_no_op_that_keeps_the_first_address() {
         let mut sink = ExposeOutput::new("127.0.0.1:0");
@@ -1849,8 +1709,7 @@ mod tests {
         assert!(err.to_string().contains(&addr.to_string()), "got: {err}");
     }
 
-    /// `flush` is the sink's teardown, and this sink's teardown is "stop serving": the port must
-    /// actually close, not merely stop being refreshed.
+    /// `flush` closes the port.
     #[tokio::test]
     async fn flush_stops_the_server_and_closes_the_port() {
         let (mut sink, url) = fixture_sink().await;
@@ -1860,17 +1719,14 @@ mod tests {
         assert!(refused.is_err(), "the port should be closed after flush, got {refused:?}");
     }
 
-    /// The startup-failure path in miniature: a bound sink that is *dropped* without a graceful
-    /// `flush` -- which is exactly what `run_with_telemetry` does to every spec when a later
-    /// component's `bind` fails -- must not leave its accept loop holding the port.
+    /// Dropping a bound sink without `flush`, as the startup-failure path does, frees the port.
     #[tokio::test]
     async fn dropping_an_unflushed_bound_sink_closes_the_port() {
         let (sink, url) = bound(ExposeOutput::new("127.0.0.1:0")).await;
         assert_eq!(get(&format!("{url}/metrics"), &[]).await.status(), 200);
 
         drop(sink); // no flush, exactly as a startup failure would
-                    // The abort has to be observed by the runtime before the listener is really gone; a
-                    // scrape that still connects retries until it doesn't, rather than racing on one attempt.
+                    // The abort takes effect asynchronously, so retry until connecting fails.
         let mut refused = None;
         for _ in 0..100 {
             tokio::task::yield_now().await;
@@ -1885,8 +1741,7 @@ mod tests {
         assert!(refused.is_some(), "dropping the sink should have closed the port");
     }
 
-    /// Nothing has been delivered yet, and a scraper polling a freshly-started process must be
-    /// able to tell "up, no data" from "not listening".
+    /// Before any delivery a scrape gets an empty `200`: "up, no data", not "not listening".
     #[tokio::test]
     async fn a_scrape_before_any_batch_arrives_is_an_empty_200() {
         let (_sink, url) = bound(ExposeOutput::new("127.0.0.1:0")).await;
@@ -1975,8 +1830,7 @@ mod tests {
 
     // -- assertion helpers ------------------------------------------------------------------
 
-    /// Sums `name`'s counter points carrying `tag=value` out of a *drained* event list -- for a
-    /// test that drains once and then asks several questions of the result.
+    /// Sums `name`'s counter points tagged `tag=value` in an already-drained event list.
     fn tagged(events: &[Event], name: &str, tag: &str, value: &str) -> f64 {
         events
             .iter()
@@ -1997,14 +1851,13 @@ mod tests {
 
     // -- sender mode: a canned remote-write receiver ------------------------------------------
 
-    /// One request as a canned receiver saw it -- enough to assert everything the wire contract
-    /// promises without either side sharing code with the other.
+    /// One request as a canned receiver saw it, independent of the sink's code.
     #[derive(Debug, Clone)]
     struct CapturedRequest {
         method: Method,
         path: String,
         headers: http::HeaderMap,
-        /// Still Snappy-compressed, exactly as it arrived.
+        /// Still Snappy-compressed, as it arrived.
         body: Vec<u8>,
     }
 
@@ -2013,9 +1866,8 @@ mod tests {
             self.headers.get(name).and_then(|v| v.to_str().ok())
         }
 
-        /// The decompressed protobuf body -- Snappy *block* format, which is what both specs mean
-        /// by `Content-Encoding: snappy`. A test asserting this decompresses at all is asserting
-        /// the sink didn't reach for the framed encoder.
+        /// The body decompressed as Snappy block format, so decoding at all proves the sink didn't
+        /// use the framed format.
         fn decompressed(&self) -> Vec<u8> {
             snap::raw::Decoder::new()
                 .decompress_vec(&self.body)
@@ -2038,8 +1890,7 @@ mod tests {
     enum Canned {
         /// A status, a fixed body, and an optional `Location` header.
         Fixed(StatusCode, &'static str, Option<&'static str>),
-        /// A status whose body never ends -- what a *bounded* error-body read has to survive and
-        /// an unbounded one would sit on until the request deadline fired.
+        /// A status whose body never ends, which only a bounded read survives.
         Endless(StatusCode),
     }
 
@@ -2047,9 +1898,8 @@ mod tests {
 
     const ENDLESS_CHUNK: &[u8] = &[b'x'; 1024];
 
-    /// A body that never ends: `poll_frame` always has another kilobyte. A client that has read
-    /// enough simply drops the connection, which is precisely what a bounded read does -- so this
-    /// needs no cooperation from the reader and no length to agree on.
+    /// A body that never ends: `poll_frame` always has another kilobyte. A bounded reader just
+    /// drops the connection.
     struct EndlessBody;
 
     impl hyper::body::Body for EndlessBody {
@@ -2066,10 +1916,8 @@ mod tests {
         }
     }
 
-    /// A real HTTP/1.1 receiver answering `canned` and recording every request it saw. A real
-    /// server rather than a raw-socket canned response (`otlp.rs`'s pattern) because these
-    /// assertions are about the *request*: the headers, the path, and a body this test then
-    /// decompresses and prost-decodes.
+    /// A real HTTP/1.1 receiver answering `canned` and recording every request, since these tests
+    /// assert on the request's headers, path, and decoded body.
     async fn canned_receiver(
         status: StatusCode,
         body: &'static str,
@@ -2077,11 +1925,9 @@ mod tests {
         serve_canned(Canned::Fixed(status, body, None)).await
     }
 
-    /// A receiver that answers `status` with a `Location` -- and a body naming it, the way a real
-    /// ingress's redirect page does, since `Location` itself is a header and the sink quotes the
-    /// body. `location` is deliberately *relative*: `reqwest` resolves it against the request URL,
-    /// so a client that follows redirects comes straight back here and this receiver's own request
-    /// count is the evidence.
+    /// A receiver answering `status` with a `Location` and a body naming it, as an ingress's
+    /// redirect page does. `location` is relative, so a client that followed it would come back
+    /// here and show in the request count.
     async fn canned_redirect_receiver(
         status: StatusCode,
         location: &'static str,
@@ -2227,8 +2073,7 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// `logit-outputs` lives at `crates/logit-outputs`; the fixtures live at the repo root's
-    /// `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+    /// The repo root's `testdata/tls` (`testdata/tls/README.md`).
     fn testdata_tls_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
@@ -2294,8 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_operator_header_rides_along_and_a_protocol_owned_one_is_overridden() {
-        // Rule 56 rejects `content-type` in `headers:` at config time -- this proves the
-        // defense-in-depth guarantee directly, bypassing that rule via `with_headers`.
+        // Rule 56 rejects this at config time; `with_headers` bypasses it to test the sink.
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
         let mut sink = sender(&url)
             .with_headers(&HashMap::from([
@@ -2338,14 +2182,13 @@ mod tests {
         );
     }
 
-    /// The timestamp partition, inverted: three events at three instants for one series become
-    /// **one** `TimeSeries` with three samples in ascending timestamp order, not three series.
+    /// Three events at three instants for one series become one `TimeSeries` with three samples
+    /// in ascending order.
     #[tokio::test]
     async fn a_multi_timestamp_batch_becomes_one_timeseries_with_ordered_samples() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
         let mut sink = sender(&url);
-        // Deliberately out of order in the batch: ascending order is the partition's, not the
-        // caller's.
+        // Out of order in the batch: ascending order is the partition's doing.
         sink.send(&batch(vec![
             Event::metric(
                 3_000_000_000,
@@ -2375,8 +2218,8 @@ mod tests {
         );
     }
 
-    /// `with_stale_markers(true)`: a `FLAG_NO_RECORDED_VALUE` gauge is Prometheus's own stale
-    /// marker on the wire, not a skipped series. The exposition path would skip and count it.
+    /// A `FLAG_NO_RECORDED_VALUE` gauge goes out as a stale marker, not skipped as an exposition
+    /// would.
     #[tokio::test]
     async fn a_flagged_gauge_is_sent_as_a_stale_nan_sample() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
@@ -2397,8 +2240,7 @@ mod tests {
         );
     }
 
-    /// Delta temporality has no spelling in remote-write either -- skipped and counted, with the
-    /// same named fix the exposition path gives.
+    /// A delta `Sum` is skipped and counted in sender mode too, with the same named fix.
     #[tokio::test]
     async fn a_delta_sum_is_skipped_and_counted_with_no_request_left_to_send() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
@@ -2443,8 +2285,7 @@ mod tests {
         let registry = logit_core::Registry::new();
         let mut sink =
             sender(&url).with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
-        // Two series at two timestamps: four samples, which is neither the family count (2) nor
-        // the event count (4 records over 2 events) by accident.
+        // Two series at two timestamps: four samples, not the family or series count (2).
         sink.send(&batch(vec![
             Event::metric(
                 1_000_000_000,
@@ -2519,8 +2360,7 @@ mod tests {
         }
     }
 
-    /// A `400` is permanent, and its body is the useful half of the exchange -- Prometheus names
-    /// the offending series in it.
+    /// A `400` is permanent and its body, which names the offending series, is reported.
     #[tokio::test]
     async fn a_400_is_permanent_and_carries_the_response_body_in_its_message() {
         let (url, _seen) =
@@ -2536,15 +2376,12 @@ mod tests {
         assert!(message.contains("out of order sample"), "got: {message}");
     }
 
-    /// The bounded read, end to end: a receiver answering `500` with a body that never ends must
-    /// cost this sink a snippet, not a connection's worth of allocation, and must not turn a
-    /// classifiable `5xx` into a timeout. `crate::http`'s own tests cover the cutting rules; this
-    /// one covers that the *read* stops, which `Response::text()` would not have.
+    /// A `500` with an endless body still classifies as a `5xx` promptly: the read stops.
+    /// `crate::http`'s tests cover the cutting rules.
     #[tokio::test]
     async fn an_endless_rejection_body_is_read_only_as_far_as_the_snippet_needs() {
         let (url, _seen) = canned_endless_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
-        // Well under the time an unbounded read of an endless body would take to hit any
-        // deadline, so a regression fails as a timeout rather than hanging this test.
+        // An unbounded read would fail this timeout rather than hang the test.
         let mut sink = sender(&url).with_timeout(Duration::from_secs(30));
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2569,10 +2406,7 @@ mod tests {
         );
     }
 
-    /// Redirects are off (`crate::http::build_client`): a `3xx` is a non-2xx like any other, not
-    /// a second request to wherever `Location` pointed. Without the policy the sink would replay
-    /// this as a body-less `GET`, and whatever answered *that* would become its verdict on a batch
-    /// nothing ever wrote -- so the request count at this receiver is the assertion that matters.
+    /// A `3xx` is a failure, not a followed redirect; the receiver's request count is the proof.
     #[tokio::test]
     async fn a_redirect_is_not_followed_and_is_a_permanent_fault() {
         let (url, seen) = canned_redirect_receiver(StatusCode::FOUND, "/api/v1/write").await;
@@ -2609,8 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connection_is_clean() {
-        // Bound and immediately dropped, so the port is (almost certainly) unused and closed --
-        // `influxdb.rs`'s own "nothing is listening" pattern.
+        // Bound and dropped, so (almost certainly) nothing listens there.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -2688,8 +2521,7 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "neither hook touches the network");
     }
 
-    /// `true` is what selects `AtLeastOnce`, which is the only posture under which the
-    /// `Fault::Ambiguous` a 5xx produces is retried -- see the module doc.
+    /// `true`, which selects `AtLeastOnce`, the only posture that retries a 5xx.
     #[test]
     fn the_sender_is_duplicate_safe_and_that_selects_at_least_once() {
         let sink = RemoteWriteOutput::new("http://mimir:8080/api/v1/push");
@@ -2702,8 +2534,7 @@ mod tests {
 
     #[test]
     fn a_header_name_that_is_not_a_legal_http_header_is_rejected_at_construction() {
-        // `let ... else`, not `expect_err`: the `Ok` side is a whole sink, which has no reason to
-        // be `Debug` just so a test can name it.
+        // `let ... else`, not `expect_err`, which would need the sink to be `Debug`.
         let Err(err) = RemoteWriteOutput::new("http://mimir:8080/api/v1/push")
             .with_headers(&HashMap::from([("bad header".to_string(), "x".to_string())]))
         else {

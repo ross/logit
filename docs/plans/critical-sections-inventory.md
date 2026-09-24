@@ -5677,7 +5677,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   - The single UTF-8 validity check on the whole message (csv.rs:101-107) is claimed sufficient to
     guarantee every subsequently-sliced field is also valid UTF-8, reasoning that `delimiter`/`"`
     are single ASCII bytes and never fall inside a multi-byte sequence -- verify this reasoning
-    against `logit_config`'s actual validation of `delimiter` (rule 29) rather than assuming it
+    against `logit_config`'s actual validation of `delimiter` (rule 32) rather than assuming it
     holds for every configured byte value.
   - `unescape`'s two-pass length-then-fill matches exactly (the `debug_assert_eq!(out.len(),
     out.capacity())` at csv.rs:273 is *not* checked in a release build) -- a mismatch would only
@@ -5837,7 +5837,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   a configured target isn't in the resolved target list, and again if there are more than 65535
   targets for one router (`try_into::<u16>().expect(...)`) -- both are documented as "should be
   impossible after graph validation," i.e. a construction-time panic guarded entirely by another
-  crate's (`logit-pipeline::graph`) validation rules 44/47/48/51. This is a real, if narrow,
+  crate's (`logit-pipeline::graph`) validation rules 48/51. This is a real, if narrow,
   cross-crate coupling: a future change to graph validation that weakens those rules would turn
   into a runtime panic here rather than a graceful config-rejection, with no local test catching
   the regression (only an integration-level one would).
@@ -5847,7 +5847,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   `kv-metrics-semantics.md`, `scale-transform.md`, `value-allowlist-cardinality-clamp.md`,
   `target-components.md`.
 - **Suggested verification approach:** none warranted beyond ordinary code review; if anything,
-  confirm `logit-pipeline::graph`'s rules 44/47/48/51 (referenced by `route.rs`) are still enforced
+  confirm `logit-pipeline::graph`'s rules 48/51 (referenced by `route.rs`) are still enforced
   and tested on that side, since `route.rs` itself has no defense if they aren't.
 - **Priority:** P2 -- simple, well-tested, config-bounded; the `route.rs` panic-on-graph-bug
   coupling is the only item worth a cross-crate note rather than a re-review of this file alone.

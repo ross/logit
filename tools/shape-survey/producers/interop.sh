@@ -1,28 +1,16 @@
 # The `interop` producer: replay every recorded corpus under testdata/interop/ at the listener
 # that decoded it, measure the result with `shape`, and check the statsd half against numbers
-# derived independently from the same bytes.
+# check_interop.py derives independently from the same bytes. That check is the harness's
+# acceptance test; see README "The acceptance test".
 #
-# Sourced by script/shape-survey, which discovers this file by glob -- everything specific to this
-# producer lives here and in tools/shape-survey/configs/interop.yaml, and nothing about it is
-# mentioned in lib.sh or the dispatcher. See tools/shape-survey/README.md's "Adding a producer".
-#
-# First, and free (docs/plans/data-shape-survey.md's W2): these captures already exist, already
-# came from real third-party producers, and cost nothing but a container to replay. They are also
-# the survey's **acceptance test** -- testdata/interop/statsd/README.md's lines-per-datagram and
-# tags-per-line figures were counted by somebody else, so `shape` either reproduces them or it is
-# not measuring what this survey thinks it is (tools/shape-survey/check_interop.py).
-#
-# What this does NOT claim: a recorded corpus is a handful of messages caught from a producer's
-# first few seconds, so it says a great deal about *shape* (how a client packs a datagram, how wide
-# a line is, which carriers a decoder stamps) and nothing at all about volume, mix, or steady-state
-# behaviour. In docs/plans/data-shape-survey.md's grading, these rows are Measured/Default.
+# A corpus is a few seconds of each producer, so it is evidence about grammar and packing, not
+# volume or mix (README "Representativeness is structural").
 
 # Which corpus goes where. One line per replay: <protocol> <target> <globs...>
 #
-# The syslog corpus is split by transport rather than replayed wholesale -- `rsyslog-tcp-000.raw`
-# is a captured TCP *connection stream* with its own RFC 6587 non-transparent framing, and sending
-# it as a datagram would measure this script's mistake rather than rsyslog's behaviour. The same
-# reasoning splits graphite's plaintext connection from its pickle frames.
+# The syslog corpus is split by transport: `rsyslog-tcp-000.raw` is a TCP connection stream with
+# its own RFC 6587 framing, and sending it as a datagram would measure this script's mistake. The
+# same reasoning splits graphite's plaintext connection from its pickle frames.
 survey_interop_replays() {
     cat <<'EOF'
 udp|logit:8125|/corpus/statsd/*.raw
@@ -45,11 +33,6 @@ survey_interop() {
     config="${ROOT}/tools/shape-survey/configs/interop.yaml"
     corpus="${ROOT}/testdata/interop"
 
-    # The representativeness line summarize.py turns into summary.md's banner. These captures are
-    # real third-party producers (rsyslog, collectd, a real Prometheus, Datadog's and the
-    # plain-statsd client, the OpenTelemetry Collector) -- but each was recorded driving a small
-    # synthetic workload for a few seconds, so what they are evidence *about* is grammar, carriers
-    # and a client's packing decisions, not what mix or volume of traffic a real deployment sends.
     survey_provenance interop \
         "recorded real producers running synthetic workloads -- grammar/packing evidence, not traffic mix"
     {
@@ -67,7 +50,7 @@ survey_interop() {
         echo "-- replaying ${files} -> ${proto} ${target}"
         case "${proto}" in
         udp | tcp)
-            # shellcheck disable=SC2086 -- `files` is a deliberate multi-glob word list
+            # shellcheck disable=SC2086 -- `files` is a multi-glob word list
             survey_python "replay" \
                 --network "${SURVEY_NET}" -v "${corpus}:/corpus:ro,z" -- \
                 python3 /tools/replay.py --proto "${proto}" \
@@ -91,15 +74,12 @@ survey_interop() {
         esac
     done < <(survey_interop_replays)
 
-    # A settle before SIGTERM: a listener's own batch-assembly timer is 100ms and the pipeline is
-    # asynchronous end to end, so stopping the instant the last POST returns would race the last
-    # batch into `shape`. Three seconds is two orders of magnitude of headroom on a corpus this
-    # size; the flush that actually produces the capture is the one SIGTERM triggers.
+    # Settle before SIGTERM: a listener's batch-assembly timer is 100ms and the pipeline is
+    # asynchronous, so stopping when the last POST returns would race the last batch into `shape`.
     sleep 3
     stop_logit
 
-    # The acceptance test. The producer fails if this fails -- a summary built on an instrument
-    # that cannot reproduce a counted corpus is worse than no summary, because it looks like data.
+    # The acceptance test. If it fails, the instrument, the decoder, or the derivation is wrong.
     echo "-- check_interop.py (statsd corpus, independently derived)"
     survey_python "check" -v "${corpus}:/corpus:ro,z" -- \
         python3 /tools/check_interop.py --corpus /corpus/statsd --shape-log /out/shape.log ||

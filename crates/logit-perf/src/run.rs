@@ -1,29 +1,25 @@
-//! `logit-perf run`: builds the release binary once, then spawns it once per scenario per repeat,
-//! deriving throughput/CPU/RSS from its stderr and `wait4` (docs/adr/load-test-harness.md,
-//! docs/plans/load-test-harness.md's "Harness" section).
+//! `logit-perf run`: builds the binary under test once, then spawns it once per scenario per
+//! repeat, deriving throughput, CPU, and RSS from its stderr and `wait4`
+//! (docs/adr/load-test-harness.md).
 //!
 //! ## Two shapes of run
 //!
-//! A [`Workload::Generated`] scenario generates its own events and announces when it's finished
-//! (`generation complete`), which is what bounds the measurement. A [`Workload::Driven`] one
-//! ([ADR `udp-intake-batching-and-socket-visibility`](../../../docs/adr/udp-intake-batching-and-socket-visibility.md))
-//! has no generator at all: the harness waits for the child's `ready` line, blasts it over a real
-//! UDP socket from `crate::load`, and the blast returning is what bounds the measurement.
-//! [`Drive`] is that fork; everything after it -- settle, SIGTERM, `wait4` -- is the same path
-//! both take.
+//! A [`Workload::Generated`] scenario makes its own events; its `generation complete` line ends
+//! the measurement. A [`Workload::Driven`] one has no generator: the harness waits for the
+//! child's `ready` line, blasts it over a real UDP socket from `crate::load`, and the sender
+//! returning ends the measurement (docs/adr/udp-intake-batching-and-socket-visibility.md).
+//! [`Drive`] is that fork; settle, SIGTERM, and `wait4` are shared.
 //!
-//! **A driven scenario's denominator is events *delivered*, never events sent.** This is the first
-//! scenario family in which those two can honestly differ: a real socket may lose datagrams in the
-//! kernel before `logit` ever sees them, and denominating over sent would silently understate the
-//! per-event cost by exactly the drop rate -- in the very regime the baseline is deliberately tuned
-//! into. The delivered count comes out of the child's own `logit.component.events.received` through
-//! the `crate::telemetry_leg` dump, attached at run time and never shipped in the scenario YAML.
+//! **A driven scenario's denominator is events *delivered*, never events sent.** The kernel can
+//! drop datagrams before `logit` sees them, and the baseline is tuned into that regime, so
+//! denominating over sent would understate per-event cost by the drop rate. The delivered count
+//! is the child's own `logit.component.events.received`, read from the `crate::telemetry_leg`
+//! dump attached at run time (never shipped in the scenario YAML).
 //!
-//! **Every driven run self-checks before its numbers are believed.** `sent == received + kernel
-//! drops` has to close (on loopback there is nowhere else for a datagram to go), and the decoder
-//! must report no malformed lines -- otherwise the scenario would be quietly benchmarking the
-//! error path. `--verify` adds the stricter form: a paced, zero-drop run must deliver *exactly* the
-//! event count the load spec's ring says it sent.
+//! **Every driven run self-checks before its numbers are believed** (see [`self_check`]):
+//! `sent == received + kernel drops` must close, and the decoder must report no malformed lines,
+//! or the run would be benchmarking the error path. `--verify` also requires a zero-drop run to
+//! deliver the ring's event count.
 
 use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
 use crate::result::{BinaryInfo, BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
@@ -43,21 +39,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The shortest settle a driven scenario ever uses, regardless of `--settle`.
 ///
-/// A generated scenario's settle only has to cover the in-process drain after the last event is
-/// produced, and `--settle`'s 1 s default has always been ample for that. A driven one has three
-/// slower things to wait for, in order: whatever the kernel still holds in the socket's receive
-/// queue after the blast stops, the listener's **guaranteed final `SO_MEMINFO` sample** (taken once
-/// the read loop exits, so the last interval of `logit.input.kernel.drops` isn't lost), and
-/// `internal`'s own final drain on shutdown, which is what carries both of those into the dump.
+/// A generated scenario's settle covers only the in-process drain, which `--settle`'s 1 s default
+/// covers. A driven one waits, in order, for the kernel's receive queue to drain after the blast,
+/// the listener's guaranteed final `SO_MEMINFO` sample (taken when the read loop exits, so the
+/// last interval of `logit.input.kernel.drops` isn't lost), and `internal`'s final drain on
+/// shutdown, which carries both into the dump.
 ///
-/// The floor is 3 s because the first two of those are bounded by a 1 s sampling interval and the
-/// third by the leg's own `--interval` (1 s by default), so anything at or below 1 s is racing two
-/// timers it has no reason to beat. It is not a tuned number — what makes it *checked* rather than
-/// hoped for is [`self_check`]: if a settle is ever too short, the datagram accounting does not
-/// close and the run fails saying so, rather than quietly reporting a drop rate inflated by
-/// datagrams that were still in the receive queue when the process was signalled.
+/// 3 s because the first two are bounded by a 1 s sampling interval and the third by the leg's
+/// `--interval` (1 s by default); at or below 1 s the settle races both timers. It isn't tuned:
+/// [`self_check`] fails a run whose settle was too short, because the datagram accounting doesn't
+/// close, rather than reporting a drop rate inflated by datagrams still queued at SIGTERM.
 ///
-/// `--settle` above this is honoured as given.
+/// A longer `--settle` is honoured as given.
 const DRIVEN_SETTLE_FLOOR: Duration = Duration::from_secs(3);
 
 pub struct RunArgs {
@@ -68,31 +61,26 @@ pub struct RunArgs {
     pub settle: Duration,
     pub no_build: bool,
     pub profile: String,
-    /// Measure this binary instead of building one. Implies `--no-build`; a relative path is
-    /// resolved against the repo root, not the process's cwd, so it means the same thing typed on
-    /// the host or inside the dev container. The enabling change for a multi-source VM session
-    /// (`docs/adr/disposable-azure-perf-vm.md`'s `script/vm build`): each source gets its own
-    /// stashed binary under `perf/bins/<slug>/logit`, and this is what points a run at one of
-    /// them without the `docker cp`-into-the-target-volume choreography that used to require.
+    /// Measure this binary instead of building one. Implies `--no-build`; a relative path resolves
+    /// against the repo root, not the cwd, so it means the same on the host and in the dev
+    /// container. A multi-source VM session points this at the `perf/bins/<slug>/logit` that
+    /// `script/vm build` stashed (docs/adr/disposable-azure-perf-vm.md).
     pub logit_bin: Option<PathBuf>,
     /// How long to wait for a scenario's `generation complete` line (generated) or `ready` line
     /// (driven) before giving up on it as hung.
     pub timeout: Duration,
-    /// How long to wait for the process to actually exit after `--settle`/SIGTERM (or, for a
+    /// How long to wait for the process to exit after `--settle`/SIGTERM (or, for a
     /// self-exiting scenario, after the completion line) before force-killing it.
     pub shutdown_timeout: Duration,
     /// The run-time telemetry leg's drain cadence, for driven scenarios only.
     pub interval: Duration,
     pub pin_sender: Option<CpuSet>,
     pub pin_child: Option<CpuSet>,
-    /// Hold every driven scenario to the strict expectation: zero drops, and an exactly-equal
-    /// delivered event count. Meant to be run against a paced spec -- an unpaced blast is tuned to
-    /// drop on purpose and will (correctly) fail this.
+    /// Hold every driven scenario to zero drops and an exact delivered event count. Meant for a
+    /// paced spec; an unpaced blast is tuned to drop and fails this.
     pub verify: bool,
-    /// Multiplies every driven spec's `rate`. `None` means "whatever the run implies": 1.0
-    /// ordinarily, `load::VERIFY_RATE_SCALE` under `--verify`. Set explicitly it wins over both,
-    /// which is what lets a `--verify` run be paced by hand if the default derate is wrong for a
-    /// particular box.
+    /// Multiplies every driven spec's `rate`. `None` means 1.0, or `load::VERIFY_RATE_SCALE` under
+    /// `--verify`; an explicit value wins over both, so a `--verify` run can be paced by hand.
     pub rate_scale: Option<f64>,
 }
 
@@ -115,9 +103,8 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         bail!("no scenarios to run");
     }
 
-    // Read and reported *before* the first scenario, not only into the results file: a run taken
-    // under `powersave` or on battery is worth aborting and restarting, and finding that out ten
-    // minutes later from the JSON is finding it out too late.
+    // Reported before the first scenario, not only in the results file: a run under `powersave`
+    // or on battery is worth aborting before it starts.
     let state = box_state();
     for warning in state.warnings() {
         eprintln!("warning: {warning}");
@@ -147,10 +134,8 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
             scenario.workload.describe(),
             if scenario.needs_sigterm { "needs SIGTERM" } else { "self-exits" }
         );
-        // The ring is rendered once per scenario, not once per repeat: it is deterministic from
-        // the spec's seed, so every repeat would render the same bytes, and rendering tens of
-        // thousands of datagrams inside the measured window would be work the measurement isn't
-        // about.
+        // Rendered once per scenario: the ring is deterministic from the spec's seed, and
+        // rendering it per repeat would put that work near the measured window.
         let plan = match &scenario.workload {
             Workload::Generated { .. } => None,
             Workload::Driven(_) => match driven_plan(scenario, &args) {
@@ -184,10 +169,8 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut samples = Vec::with_capacity(args.repeat as usize);
         let mut scenario_failed = false;
         for repeat in 1..=args.repeat {
-            // Fresh spool every repeat, not just every invocation -- `crate::spool`'s own doc
-            // comment has the mechanism (`DiskQueue::open`'s O(segment size) startup scan,
-            // `docs/known-gaps.md`'s `buffered` entry): left alone, the second repeat already
-            // re-validates the first repeat's spool, and it only grows from there.
+            // Every repeat, not every invocation: otherwise each repeat's startup re-validates
+            // every earlier repeat's spool (`crate::spool`).
             if let Err(err) = crate::spool::clear(root, scenario) {
                 eprintln!("   repeat {repeat}/{}: FAILED: {err:#}", args.repeat);
                 scenario_failed = true;
@@ -223,9 +206,8 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
         let median = crate::result::median_sample(&samples);
         let min = crate::result::min_sample(&samples);
-        // The scenario's own denominator, recorded so a results file is self-describing: events
-        // generated for a generated scenario, **lines sent** for a driven one. Lines, not
-        // datagrams: a line is one metric, which is the unit the scenario's event counts are in.
+        // Recorded so a results file is self-describing: events generated for a generated
+        // scenario, lines sent for a driven one. Lines, not datagrams: a line is one metric.
         let count = match &scenario.workload {
             Workload::Generated { count } => *count,
             Workload::Driven(_) => median.udp.map(|udp| udp.sent_lines).unwrap_or_default(),
@@ -264,8 +246,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     print_udp_table(&report);
     println!("\nwrote {}", path.display());
 
-    // Every driven repeat removed its own dump on success and kept it on failure, so this takes
-    // the scratch directory with it exactly when there is nothing left in it worth keeping.
+    // Driven repeats keep their dump only on failure, so an empty directory has nothing to keep.
     telemetry_leg::remove_workdir_if_empty("run");
 
     if any_failed {
@@ -274,14 +255,13 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads a driven scenario's sidecar spec and renders its ring, applying whatever rate scale the
-/// run asked for (`LoadPlan::scale_rate` has why one would).
+/// Reads a driven scenario's sidecar spec and renders its ring at the run's rate scale.
 fn driven_plan(scenario: &Scenario, args: &RunArgs) -> anyhow::Result<LoadPlan> {
     let source = std::fs::read_to_string(&scenario.path)
         .with_context(|| format!("reading {}", scenario.path.display()))?;
     let mut plan = LoadPlan::build(&scenario.load_spec_path()?, &source)?;
-    // An explicit `--rate-scale` wins over `--verify`'s own default, so a box where a quarter is
-    // still not enough headroom (or is more than needed) can be paced by hand.
+    // An explicit `--rate-scale` wins over `--verify`'s default, for a box where a quarter is the
+    // wrong headroom.
     let scale = args.rate_scale.unwrap_or(if args.verify { load::VERIFY_RATE_SCALE } else { 1.0 });
     if scale != 1.0 {
         let scaled = plan.scale_rate(scale)?;
@@ -299,26 +279,23 @@ fn driven_plan(scenario: &Scenario, args: &RunArgs) -> anyhow::Result<LoadPlan> 
 
 /// Something the child announced about itself on stderr, in the order the reader thread saw it.
 ///
-/// Split out of what used to be one `Completion` message because the two kinds of scenario wait
-/// for different things: a generated one measures `ready` → `generation complete`, a driven one
-/// measures `ready` → *the sender* finishing, and never sees a completion line at all.
+/// A generated scenario measures `ready` to `generation complete`; a driven one measures `ready`
+/// to the sender finishing and never sees a completion line.
 enum ChildEvent {
-    /// `tracing::info!(target: "logit", "ready")` -- logged once the bind pass has opened every
-    /// listener's socket and every node has been spawned (`crates/logit-pipeline/src/runtime.rs`).
-    /// For a driven scenario this is a hard precondition, not a nicety: sending before the socket
-    /// exists would be measured as loss that never happened.
+    /// The `ready` log line, emitted once every listener's socket is bound and every node spawned
+    /// (`crates/logit-pipeline/src/runtime.rs`). A driven scenario must wait for it: sending
+    /// before the socket exists would be measured as loss.
     Ready(Instant),
-    /// `generate_in`'s own completion line, with the `events` count it carried (`None` if that
-    /// field was missing or not an unsigned integer -- a format this harness can't trust).
+    /// `generate_in`'s completion line, with its `events` count (`None` if missing or not an
+    /// unsigned integer).
     Complete { at: Instant, events: Option<u64> },
 }
 
-/// `None` if `line` isn't the completion line at all; `Some(events)` if it is -- `generate_in`'s
-/// own line (`docs/plans/load-test-harness.md`) is `{"message":"generation complete", "events":
-/// ..., "batches": ..., "elapsed": ...}` alongside `--log-format json`'s usual fields, so this
-/// parses the whole line as JSON and checks `message` for an *exact* match, not a substring: a
-/// human-readable field elsewhere in the line quoting the same words must never be mistaken for
-/// the real signal.
+/// `None` if `line` isn't the completion line; `Some(events)` if it is.
+///
+/// `generate_in` logs `{"message":"generation complete", "events": ..., "batches": ...,
+/// "elapsed": ...}` under `--log-format json`. The whole line is parsed and `message` must match
+/// exactly, so another field quoting the same words can't pass for the signal.
 fn parse_completion_line(line: &str) -> Option<Option<u64>> {
     let json: serde_json::Value = serde_json::from_str(line).ok()?;
     if json.get("message").and_then(serde_json::Value::as_str) != Some("generation complete") {
@@ -327,17 +304,16 @@ fn parse_completion_line(line: &str) -> Option<Option<u64>> {
     Some(json.get("events").and_then(serde_json::Value::as_u64))
 }
 
-/// Whether `line` is the process's own readiness line, matching [`parse_completion_line`]'s own
-/// reasoning: the whole line parsed as JSON, an *exact* `message` match rather than a substring.
+/// Whether `line` is the readiness line, matched as [`parse_completion_line`] matches: the whole
+/// line parsed, `message` compared exactly.
 fn is_ready_line(line: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     json.get("message").and_then(serde_json::Value::as_str) == Some("ready")
 }
 
-/// Accumulates a child's stderr, capped to the last 64 KiB -- a hung or unexpectedly chatty
-/// scenario must never let one failed repeat's error message grow without bound. Trims whole
-/// lines from the front rather than truncating raw bytes, so what's kept is always valid UTF-8
-/// and never a fragment of a line.
+/// Accumulates a child's stderr, capped to the last 64 KiB so a chatty scenario can't grow a
+/// failed repeat's error message without bound. Trims whole lines from the front, so what's kept
+/// is valid UTF-8 and never a line fragment.
 struct StderrCapture {
     lines: VecDeque<String>,
     total_bytes: usize,
@@ -367,18 +343,15 @@ impl StderrCapture {
 }
 
 /// Reads a child's stderr to its end, announcing the `ready`/`generation complete` lines on
-/// `events` as they go past and keeping the tail for an error message. Returns what was captured
-/// and, in words, **why the stream ended** -- which is what a driven blast's abort message quotes.
+/// `events` and keeping the tail for an error message.
 ///
-/// **Decoded lossily, never fallibly.** `BufRead::lines` yields `Err(InvalidData)` for a line that
-/// isn't UTF-8, which is indistinguishable at the call site from the stream ending -- so a single
-/// stray byte in the child's stderr (a panic message with a truncated multi-byte character, a
-/// library writing raw bytes) used to stop the reader early and, worse, tell a running blast the
-/// child had exited. Reading delimited bytes and running them through `from_utf8_lossy` means such
-/// a line is captured with replacement characters and the loop carries on; only a real EOF or a
-/// real I/O error ends it, and the two are reported apart.
+/// Returns the capture and, in words, why the stream ended; a driven blast's abort message quotes
+/// it.
 ///
-/// Split out of `spawn_and_measure` so exactly that can be tested without a child process.
+/// **Decoded lossily, never fallibly.** `BufRead::lines` yields `Err(InvalidData)` for a non-UTF-8
+/// line, indistinguishable at the call site from the stream ending, so one stray byte would stop
+/// the reader and tell a running blast the child had exited. `from_utf8_lossy` keeps such a line
+/// with replacement characters; only a real EOF or I/O error ends the loop, reported apart.
 fn read_child_stderr(stderr: impl io::Read, events: &mpsc::Sender<ChildEvent>) -> (String, String) {
     let mut reader = io::BufReader::new(stderr);
     let mut capture = StderrCapture::new();
@@ -414,9 +387,10 @@ fn read_child_stderr(stderr: impl io::Read, events: &mpsc::Sender<ChildEvent>) -
     (capture.into_string(), end.to_string())
 }
 
-/// Kills and reaps a still-running child, then joins both reader threads -- every error path that
-/// bails before the ordinary settle/SIGTERM/`wait4` sequence has run calls this, so a failed
-/// repeat never leaves a live process, a zombie, or a detached reader thread behind.
+/// Kills and reaps a still-running child, then joins both reader threads.
+///
+/// Every error path that bails before settle/SIGTERM/`wait4` calls this, so a failed repeat
+/// leaves no live process, zombie, or detached reader thread.
 fn kill_and_reap(
     child: &mut Child,
     stdout_drain: JoinHandle<()>,
@@ -427,9 +401,8 @@ fn kill_and_reap(
     drain_and_join(stdout_drain, stderr_reader)
 }
 
-/// Joins both reader threads -- used once the child is already known to have exited (reaped
-/// either by [`kill_and_reap`] or by `wait4` on the ordinary path), since each thread's own loop
-/// ends when its pipe's write end closes.
+/// Joins both reader threads. Call only once the child has exited: each thread's loop ends when
+/// its pipe's write end closes.
 fn drain_and_join(stdout_drain: JoinHandle<()>, stderr_reader: JoinHandle<String>) -> String {
     let _ = stdout_drain.join();
     stderr_reader.join().unwrap_or_default()
@@ -437,34 +410,30 @@ fn drain_and_join(stdout_drain: JoinHandle<()>, stderr_reader: JoinHandle<String
 
 /// What bounds one measurement, and how the load gets there.
 pub(crate) enum Drive<'a> {
-    /// Wait for `generate_in`'s completion line and check it reported exactly `count` events.
+    /// Wait for `generate_in`'s completion line and check it reported `count` events.
     Generated { count: u64 },
     /// Wait for `ready`, then blast `plan` from this process and stop when the sender returns.
     Driven { plan: &'a LoadPlan, pin_sender: Option<&'a CpuSet> },
 }
 
-/// One spawn-measure-shutdown cycle's inputs. A struct rather than a pile of positional
-/// parameters because three callers share it: [`run_one_generated`]/[`run_one_driven`],
-/// `crate::attribute` (the same scenario rewritten with a telemetry leg appended), and
-/// `crate::flamegraph` (the scenario as it ships, under `perf record`).
+/// One spawn-measure-shutdown cycle's inputs, shared by `run`, `crate::attribute` (the scenario
+/// with a telemetry leg appended), and `crate::flamegraph` (the scenario under `perf record`).
 pub(crate) struct SpawnConfig<'a> {
     pub logit_bin: &'a Path,
-    /// An argv prefix to run `logit` *under*, with the `logit run <config>` command line appended
-    /// to it -- `["perf", "record", .., "--"]` for `flamegraph`. Empty for a plain run.
+    /// An argv prefix to run `logit` under, such as `["perf", "record", .., "--"]` for
+    /// `flamegraph`. Empty for a plain run.
     ///
-    /// When it isn't empty the spawned process is the wrapper, not `logit`: the reported rusage
-    /// covers both, and a SIGTERM on the settle path goes to the wrapper (which is what `perf
-    /// record` wants -- it finalizes `perf.data` and stops its workload).
+    /// When set, the spawned process is the wrapper: the rusage covers both, and the settle-path
+    /// SIGTERM goes to the wrapper, which `perf record` needs to finalize `perf.data`.
     pub wrapper: &'a [String],
-    /// The config to hand `logit run` -- a scenario file, or a rewritten copy of one.
+    /// The config to hand `logit run`: a scenario file, or a rewritten copy of one.
     pub config: &'a Path,
     pub drive: Drive<'a>,
-    /// CPUs to pin the child to, applied **between `fork` and `exec`** so it never runs a single
-    /// instruction unpinned -- see [`spawn_and_measure`].
+    /// CPUs to pin the child to, applied between `fork` and `exec` so it never runs unpinned (see
+    /// [`spawn_and_measure`]).
     pub pin_child: Option<&'a CpuSet>,
-    /// Whether this graph will still be running after the load stops -- when true the measurement
-    /// is followed by `settle`, then SIGTERM, rather than waiting for the process to exit on its
-    /// own. Always true for a driven scenario, which is a socket listener by construction.
+    /// Whether the graph keeps running after the load stops. When true, the measurement is
+    /// followed by `settle`, then SIGTERM. Always true for a driven scenario.
     pub needs_sigterm: bool,
     pub settle: Duration,
     pub timeout: Duration,
@@ -473,14 +442,12 @@ pub(crate) struct SpawnConfig<'a> {
 
 /// The raw result of one spawn-measure-shutdown cycle, before a denominator has been chosen.
 ///
-/// Deliberately *not* a [`Sample`]: a driven scenario's denominator isn't known until the child's
-/// own telemetry has been decoded, which happens after this returns. Handing back the pieces keeps
-/// that choice at the one call site that can make it correctly.
+/// Not a [`Sample`]: a driven scenario's denominator comes from the child's telemetry, decoded
+/// after this returns, so the caller picks it.
 pub(crate) struct Measured {
     pub startup: Option<Duration>,
     pub usage: Usage,
-    /// What the sender actually put on the wire -- `None` for a generated scenario, which has no
-    /// sender.
+    /// What the sender put on the wire; `None` for a generated scenario.
     pub load: Option<LoadOutcome>,
 }
 
@@ -490,8 +457,7 @@ impl Measured {
         cpu * 1_000_000.0 / events as f64
     }
 
-    /// `ready` -> the load stopping. Carried on the `wait4` result because that is where it was
-    /// handed in (`rusage::wait4(pid, wall)`), rather than duplicated on this struct.
+    /// `ready` to the load stopping, carried on the `wait4` result (`rusage::wait4(pid, wall)`).
     pub fn wall(&self) -> Duration {
         self.usage.wall
     }
@@ -546,9 +512,8 @@ fn run_one_driven(
 
     let workdir = telemetry_leg::make_workdir("run")?;
     let dump_path = workdir.join(format!("{}.native", scenario.name));
-    // Unlike `attribute`, which refuses a pre-existing dump, `run` expects one: every repeat of
-    // every scenario in one invocation writes here. It's this process's own pid-named directory,
-    // so removing last repeat's file is removing our own, not somebody else's.
+    // Unlike `attribute`, which refuses a pre-existing dump, `run` expects one: every repeat
+    // writes here, in this process's own pid-named directory.
     let _ = std::fs::remove_file(&dump_path);
 
     let rewritten = telemetry_leg::rewrite_scenario(&source, args.interval, &dump_path)
@@ -565,8 +530,7 @@ fn run_one_driven(
         config: &config_path,
         drive: Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
         pin_child: args.pin_child.as_ref(),
-        // Always: a driven graph is a socket listener with a telemetry leg attached, so neither
-        // half of it can ever decide on its own that it's finished.
+        // A socket listener plus a telemetry leg never exits on its own.
         needs_sigterm: true,
         settle: args.settle.max(DRIVEN_SETTLE_FLOOR),
         timeout: args.timeout,
@@ -577,9 +541,7 @@ fn run_one_driven(
     let outcome = (|| -> anyhow::Result<Sample> {
         let events = telemetry_leg::decode_dump(&dump_path, true)?;
         let nodes = crate::attribute::aggregate(&events);
-        // The terminal sink, not the peak receiver -- `delivered_at_sink`'s own doc has why the
-        // two agree today and would stop agreeing the moment a driven scenario grew a transform
-        // that drops.
+        // The terminal sink, not the busiest node (`attribute::delivered_at_sink` has why).
         let delivered = crate::attribute::delivered_at_sink(&nodes, spec.sink.as_deref())?;
         let input = input_stats(&events, &spec.target);
 
@@ -593,8 +555,7 @@ fn run_one_driven(
             events_delivered: delivered,
             send_errors: load.send_errors,
             kernel_rcvbuf_utilization_max: input.rcvbuf_utilization_max,
-            // What the blast actually paced at, after `--rate-scale`/`--verify` -- not the spec's
-            // own `rate:`, which is what it would have been.
+            // The pace after `--rate-scale`/`--verify`, not the spec file's `rate:`.
             effective_rate: plan.spec.rate,
         };
         self_check(scenario, plan, &udp, &input, args.verify)?;
@@ -614,10 +575,8 @@ fn run_one_driven(
     })();
 
     match &outcome {
-        // A per-repeat artifact of a run that worked, and `run` may do dozens of these in one
-        // invocation -- left alone they fill the temp directory for no reason. Mirrors
-        // `attribute`: removed on success, kept and named on failure, since a failed repeat's dump
-        // is the one thing anyone debugging it would want to look at.
+        // As in `attribute`: removed on success, since one invocation may run dozens of repeats,
+        // and kept and named on failure for debugging.
         Ok(_) => {
             let _ = std::fs::remove_file(&dump_path);
         }
@@ -626,42 +585,42 @@ fn run_one_driven(
     outcome
 }
 
-/// The listener-side counters a driven run needs, folded out of the decoded telemetry dump for one
-/// component. Kept here rather than in `crate::attribute`'s `NodeStats`: those are the uniform
-/// per-node metrics every component emits, these are `logit.input.*`/UDP-specific and only a
-/// driven scenario has any use for them (`docs/design/internal-telemetry.md`'s listener tables).
+/// The listener-side counters a driven run needs, folded out of the telemetry dump for one
+/// component.
+///
+/// Separate from `crate::attribute`'s `NodeStats`, which holds the per-node metrics every
+/// component emits; these are the UDP listener's `logit.input.*` metrics
+/// (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct InputStats {
-    /// `logit.input.datagrams` -- every datagram the listener actually received.
+    /// `logit.input.datagrams`: every datagram the listener received.
     datagrams: u64,
-    /// `logit.input.reads` -- read syscalls made. `datagrams / reads` is the mean fill of one
+    /// `logit.input.reads`: read syscalls made. `datagrams / reads` is the mean fill of one
     /// `recvmmsg(2)` batch (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
     reads: u64,
-    /// `logit.input.kernel.drops` -- what the kernel discarded before `recv_from` could return it.
-    /// A delta per sample, summed here; not emitted at all when zero, so an absent metric is 0.
+    /// `logit.input.kernel.drops`: datagrams the kernel discarded before a read returned them. A
+    /// delta per sample, summed here; not emitted when zero, so an absent metric is 0.
     kernel_drops: u64,
-    /// `logit.component.datagrams.dropped{reason=overflow_*}` -- `ReceiveQueue` eviction, i.e.
-    /// loss `logit` chose and counted itself, downstream of the kernel's.
+    /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction, loss
+    /// `logit` chose and counted, downstream of the kernel's.
     queue_dropped: u64,
-    /// The high-water mark of `logit.input.receive_buffer.utilization`. 1.0 is not "nearly full":
-    /// it is exactly where the kernel starts dropping, and a reading a little above it is normal
-    /// under load (the kernel charges an arriving packet and then tests the total).
+    /// The high-water mark of `logit.input.receive_buffer.utilization`. 1.0 is where the kernel
+    /// starts dropping, and a reading a little above it is normal under load (the kernel charges an
+    /// arriving packet, then tests the total).
     rcvbuf_utilization_max: f64,
     /// Whether the kernel socket sampler ever produced a reading at all.
     ///
-    /// Tracked as **presence of a sample**, never as a value: every one of the numbers it reports
-    /// is legitimately zero at times, so `== 0.0` cannot tell "the sampler said zero" from "the
-    /// sampler never ran". `used.bytes` and `utilization` are the two the sampler alone emits
-    /// (`receive_buffer.bytes` is also written once at bind, so its presence proves nothing).
+    /// Tracked as the presence of a sample, never a value: each number the sampler reports is
+    /// legitimately zero at times. Only `used.bytes` and `utilization` come from the sampler alone
+    /// (`receive_buffer.bytes` is also written once at bind).
     ///
-    /// `false` with datagrams received means `getsockopt(SO_MEMINFO)` was unavailable and W1's
-    /// sampler disabled itself for the process -- a `diag.warn`, which emits no counter, so this
-    /// is the only evidence of it the dump carries. `self_check` has to notice, or it blames a
-    /// `--settle` that was never the problem.
+    /// `false` with datagrams received means `getsockopt(SO_MEMINFO)` was unavailable and the
+    /// listener's sampler disabled itself with a `diag.warn`, which emits no counter; this is the
+    /// dump's only evidence. `self_check` must notice, or it blames `--settle`.
     kernel_sampled: bool,
-    /// `logit.component.diagnostics{key=...}` -- every throttled warning the component raised.
-    /// `bad_line` (a statsd line that didn't parse) and `bad_datagram` (a datagram that wasn't
-    /// UTF-8) are the two that would mean the scenario is measuring the error path.
+    /// `logit.component.diagnostics{key=...}`: every throttled warning the component raised.
+    /// `bad_line` (a statsd line that didn't parse) and `bad_datagram` (not UTF-8) mean the
+    /// scenario is measuring the error path.
     diagnostics: BTreeMap<String, u64>,
 }
 
@@ -692,9 +651,8 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
                     stats.kernel_sampled = true;
                     stats.rcvbuf_utilization_max = stats.rcvbuf_utilization_max.max(*value)
                 }
-                // Read for its *presence* only: the sampler emits it unconditionally on every
-                // successful `SO_MEMINFO` read, including when the utilization above can't be
-                // computed because the granted buffer came back as zero.
+                // Presence only: the sampler emits it on every successful `SO_MEMINFO` read,
+                // even when a zero granted buffer leaves utilization uncomputable.
                 (RCVBUF_USED, MetricKind::Gauge(_)) => stats.kernel_sampled = true,
                 (DIAGNOSTICS, MetricKind::Sum(sum)) => {
                     let key = event
@@ -714,19 +672,17 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
 
 /// Everything a driven run has to be true for its numbers to mean anything.
 ///
-/// 1. **The accounting closes.** On loopback a datagram either arrives or the kernel drops it --
-///    there is no lossy link, no fragmentation, no middlebox. `sent == received + kernel drops` is
-///    therefore an equality, not an inequality, and a mismatch means something this harness
-///    believes about the run is wrong (a settle too short for the receive queue to drain, a final
-///    socket sample that never landed, a datagram sent after the child was signalled) rather than
-///    an interesting measurement.
-/// 2. **Nothing was malformed.** A load spec that renders lines the decoder rejects would benchmark
-///    the error path and look perfectly healthy doing it -- fast, even, since a rejected line never
-///    becomes an event. Any decode diagnostic at all fails the run.
-/// 3. **Under `--verify`, the delivered count is exact.** With a paced spec that drops nothing,
-///    every line the ring sent has to come out the other end as the exact number of events the
-///    ring says it contains -- which is not the same as the number of lines, since a multi-value
-///    counter or gauge line decodes to one event per value.
+/// 0. **The kernel sampler reported.** Without it `kernel_dropped` reads as 0 and the accounting
+///    can't close.
+/// 1. **The accounting closes.** On loopback a datagram either arrives or the kernel drops it, so
+///    `sent == received + kernel drops` is an equality. A mismatch means a harness assumption is
+///    wrong (a settle too short for the receive queue to drain, a final socket sample that never
+///    landed, a datagram sent after SIGTERM), not an interesting measurement.
+/// 2. **Nothing was malformed.** Lines the decoder rejects never become events, so the run would
+///    benchmark the error path and look fast doing it. Any decode diagnostic fails the run.
+/// 3. **Under `--verify`, the delivered count is exact.** A zero-drop run must deliver the ring's
+///    event count, which differs from its line count: a multi-value counter or gauge line decodes
+///    to one event per value.
 fn self_check(
     scenario: &Scenario,
     plan: &LoadPlan,
@@ -734,11 +690,9 @@ fn self_check(
     input: &InputStats,
     verify: bool,
 ) -> anyhow::Result<()> {
-    // Checked before the accounting, because without a kernel sampler the accounting *cannot*
-    // close -- `kernel_dropped` is unknowable, reads as 0, and every repeat would fail blaming a
-    // `--settle` that was never the problem. W1's sampler disables itself for the process after
-    // one failed `getsockopt(SO_MEMINFO)` and says so through `Diagnostics::warn`, which emits no
-    // counter, so the absence of a reading is the only evidence in the dump.
+    // Before the accounting, which can't close without a kernel sampler and would blame
+    // `--settle` instead. The sampler disables itself after one failed `getsockopt(SO_MEMINFO)`
+    // via `Diagnostics::warn`, which emits no counter; a missing reading is the only evidence.
     if udp.received_datagrams > 0 && !input.kernel_sampled {
         bail!(
             "{}: the kernel's per-socket counters were never reported -- {} datagrams arrived but \
@@ -810,9 +764,8 @@ fn self_check(
     Ok(())
 }
 
-/// Spawns one `logit run <config>`, drives it to completion, shuts the process down, and reports
-/// its `wait4` rusage. The whole spawn/reader-thread/SIGTERM/`wait4` lifecycle lives here, once,
-/// for every subcommand that needs to run a scenario.
+/// Spawns one `logit run <config>`, drives it to completion, shuts it down, and reports its
+/// `wait4` rusage. Every subcommand that runs a scenario goes through this.
 pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measured> {
     let SpawnConfig {
         logit_bin,
@@ -840,12 +793,9 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         .stderr(Stdio::piped());
 
     if let Some(pin) = pin_child {
-        // `pre_exec`, not a `sched_setaffinity` on the returned pid: pinning after spawn leaves a
-        // window in which the child has already started binding sockets and spawning worker
-        // threads on whatever CPU the scheduler picked, and a thread created before the affinity
-        // change keeps the *old* mask -- so a post-spawn pin can silently miss exactly the threads
-        // the measurement is about. Setting it between `fork` and `exec` means every thread the
-        // process ever creates inherits the mask.
+        // `pre_exec`, not `sched_setaffinity` on the returned pid: after spawn, the child may
+        // already have spawned worker threads, and a thread created before the affinity change
+        // keeps the old mask. Set between `fork` and `exec`, every thread inherits it.
         let mask = pin.to_raw();
         // SAFETY: `pre_exec` runs in the forked child between `fork` and `exec`, where only
         // async-signal-safe work is allowed. The closure does exactly one thing --
@@ -869,9 +819,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 
     let mut child = command
         .spawn()
-        // Both halves named: which program actually failed to spawn (the wrapper, when there is
-        // one) and which binary it was going to run, since "no such file" is equally plausible
-        // for either and the message has to say which.
+        // Names both the wrapper and the binary: "no such file" fits either.
         .with_context(|| match wrapper.first() {
             Some(program) => format!("spawning {program} around {}", logit_bin.display()),
             None => format!("spawning {}", logit_bin.display()),
@@ -879,9 +827,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
     let spawned_at = Instant::now();
     let pid = child.id() as libc::pid_t;
 
-    // Stdout is the pipeline's own event stream (null_out discards it downstream, but the
-    // process still owns the fd) -- drained on its own thread purely so a full pipe buffer can
-    // never make the child block on a write nobody is reading.
+    // Drained so a full pipe buffer can't block the child on a write nobody reads.
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let stdout_drain = std::thread::spawn(move || {
         let _ = std::io::copy(&mut stdout, &mut std::io::sink());
@@ -889,12 +835,10 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 
     let stderr = child.stderr.take().expect("stderr was piped");
     let (event_tx, event_rx) = mpsc::channel::<ChildEvent>();
-    // Filled in once the child's stderr ends, which for a healthy `logit` means the process exited
-    // -- it never closes the stream itself. The cheapest honest liveness signal available here: no
-    // extra thread, no `try_wait` poll, and the stream is already being watched for other reasons.
-    // A driven blast reads it between batches, so a child that dies mid-run stops the sender
-    // instead of letting it finish several seconds of traffic into a socket whose peer is gone.
-    // The errno path cannot do this job -- see `crate::load::MAX_CONSECUTIVE_SEND_ERRORS`.
+    // Set when the child's stderr ends, which for `logit` means the process exited: it never
+    // closes the stream itself. A driven blast checks it between batches, so a child that dies
+    // mid-run stops the sender. The errno path can't do this (see
+    // `crate::load::MAX_CONSECUTIVE_SEND_ERRORS`).
     let child_end = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
     let child_end_writer = std::sync::Arc::clone(&child_end);
     let stderr_reader = std::thread::spawn(move || -> String {
@@ -903,10 +847,8 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         captured
     });
 
-    // Wall is measured from `ready`, not from spawn: spawn -> ready is process startup (loading
-    // the binary, opening every listener's socket in the bind pass, spawning every node), which
-    // no load even begins arriving at until it's done -- folding it into `wall` would count it as
-    // part of the graph's own per-event cost.
+    // Wall starts at `ready`, not spawn: startup (loading, binding, spawning nodes) happens before
+    // any load arrives and isn't per-event cost. It's reported separately as `startup_s`.
     let deadline = Instant::now() + timeout;
     let mut ready_at: Option<Instant> = None;
     let mut load = None;
@@ -930,9 +872,8 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                 );
             };
             if ready_at.is_none() {
-                // `ready` missing at all (a binary built without the log line, or a race this
-                // harness doesn't expect) falls back to the old spawn -> completion measurement,
-                // loudly, rather than silently reporting a startup-inflated number.
+                // No `ready` line: fall back to spawn-to-completion, with a warning, rather than
+                // silently reporting a startup-inflated number.
                 eprintln!(
                     "warning: no `ready` line observed before the completion line -- wall_s falls \
                      back to spawn -> completion, and startup_s is not recorded for this repeat"
@@ -958,9 +899,8 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
             wall_ends_at = at;
         }
         Drive::Driven { plan, pin_sender } => {
-            // Hard-required, not best-effort: a driven scenario has no completion line to fall
-            // back on, and sending before the listener's socket exists would be recorded as loss
-            // that never happened (or, on a connected socket, as a burst of `ECONNREFUSED`).
+            // Required: there's no completion line to fall back on, and sending before the
+            // socket exists would record false loss (or `ECONNREFUSED` on a connected socket).
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match event_rx.recv_timeout(remaining) {
@@ -968,9 +908,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                         ready_at = Some(at);
                         break;
                     }
-                    // A driven scenario has no generator, so this can't happen -- but ignoring it
-                    // rather than matching exhaustively-by-panic keeps a surprise in the child's
-                    // logging from taking down the harness.
+                    // No generator, so this shouldn't happen; ignored rather than a panic.
                     Ok(ChildEvent::Complete { .. }) => continue,
                     Err(_) => {
                         let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
@@ -1014,10 +952,8 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
         }
     }
 
-    // `wait4` blocks with no timeout of its own, so it runs on its own thread; the main thread
-    // polls that thread's completion against `shutdown_timeout` and force-kills (SIGKILL) if the
-    // process is still alive past it -- a hung drain, or a scenario whose graceful-shutdown path
-    // is itself broken, would otherwise hang `logit-perf run` forever.
+    // `wait4` has no timeout, so it runs on its own thread and this one SIGKILLs the child past
+    // `shutdown_timeout`; otherwise a hung drain hangs the harness.
     let wait_thread = std::thread::spawn(move || rusage::wait4(pid, wall));
     let deadline = Instant::now() + shutdown_timeout;
     while !wait_thread.is_finished() && Instant::now() < deadline {
@@ -1025,9 +961,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
     }
     if !wait_thread.is_finished() {
         let _ = child.kill();
-        // The kill above should let the blocked `wait4` return promptly now; joined (not
-        // dropped) so the syscall still completes and the child is actually reaped rather than
-        // left a zombie.
+        // Joined, not dropped, so `wait4` completes and reaps the child.
         let _ = wait_thread.join();
         let stderr_text = drain_and_join(stdout_drain, stderr_reader);
         bail!(
@@ -1044,13 +978,10 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
     match usage.exit_code() {
         Some(0) => {}
         Some(code) => bail!("exited with status {code}; stderr:\n{stderr_text}"),
-        // A wrapper dying by the SIGTERM this harness itself sent is a completed run, not a
-        // failure -- verified against `perf record --scenario native-relay`, where perf forwards
-        // the signal to `logit` (which drains and exits 0 on its own), waits for it, writes
-        // `perf.data`, and then re-raises SIGTERM on itself, which is how a signal-terminated
-        // process is *supposed* to report that it stopped on request. Deliberately not extended
-        // to the no-wrapper case: `logit` installs its own SIGTERM handler and exits 0, so a
-        // signal death there is a real regression in the shutdown path and must stay loud.
+        // A wrapper dying by the harness's own SIGTERM is a completed run: `perf record`
+        // forwards it to `logit` (which drains and exits 0), waits, writes `perf.data`, then
+        // re-raises SIGTERM on itself. Not extended to the no-wrapper case: `logit` handles
+        // SIGTERM and exits 0, so a signal death there is a shutdown-path regression.
         None if !wrapper.is_empty()
             && needs_sigterm
             && usage.termination_signal() == Some(libc::SIGTERM) => {}
@@ -1060,16 +991,13 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
     Ok(Measured { startup, usage, load })
 }
 
-/// Builds `logit` under `profile` (unless `no_build`) and returns the path to the binary,
-/// failing loudly if it isn't there afterwards. Shared by `run`, `attribute`, and `flamegraph` --
-/// all three measure the *same* binary and must agree on which one that is.
+/// Builds `logit` under `profile` (unless `no_build`) and returns the binary's path, failing if
+/// it isn't there. `run`, `attribute`, and `flamegraph` all locate the binary through this.
 ///
-/// `logit_bin_override` is `--logit-bin`, honoured by `run`/`attribute` only (`flamegraph` always
-/// passes `None`: it measures the `profiling` profile for its symbols, and a stashed release
-/// binary would produce a useless capture). It **implies skipping the build** regardless of
-/// `no_build` -- there is nothing to build toward, the binary is already named -- and a relative
-/// path is resolved against `root`, not the process's cwd, so `--logit-bin perf/bins/foo/logit`
-/// means the same thing typed on the host or inside the dev container.
+/// `logit_bin_override` is `--logit-bin`, honoured by `run`/`attribute` only; `flamegraph` passes
+/// `None` because it needs the `profiling` profile's symbols. An override skips the build
+/// regardless of `no_build`, and a relative path resolves against `root`, not the cwd, so it
+/// means the same on the host and in the dev container.
 pub(crate) fn build_and_locate(
     root: &Path,
     profile: &str,
@@ -1097,12 +1025,12 @@ pub(crate) fn build_and_locate(
     Ok(logit_bin)
 }
 
-/// What `<bin>.json` records next to a binary `script/vm build` produced
-/// (`docs/adr/disposable-azure-perf-vm.md`) -- the source string the operator/agent gave `build`
-/// (a git ref, or a directory/tarball path for work that was never pushed), the commit it
-/// resolved to when there was one, and when it was built. Parsed with serde's default
-/// unknown-field tolerance, not `deny_unknown_fields`: the sidecar is free to carry more than
-/// this crate reads (`script/vm build`'s own `sha256`/`profile`, say) without breaking this side.
+/// The `<bin>.json` sidecar `script/vm build` writes beside a binary
+/// (`docs/adr/disposable-azure-perf-vm.md`).
+///
+/// It records the source given to `build` (a git ref, or a directory/tarball path), the commit it
+/// resolved to if any, and the build time. Unknown fields are tolerated: the sidecar carries more
+/// than this reads (its own `sha256`/`profile`).
 #[derive(serde::Deserialize)]
 struct BinarySidecar {
     #[serde(default)]
@@ -1113,9 +1041,8 @@ struct BinarySidecar {
     built_at: Option<String>,
 }
 
-/// Reads `<logit_bin>.json` if it exists and parses -- absence is silent (an ordinary in-tree
-/// build never has one), but a file that exists and doesn't parse warns and is otherwise ignored:
-/// bad provenance metadata must never be able to fail a measurement over it.
+/// Reads `<logit_bin>.json` if present. Absence is silent (an in-tree build has none); a file that
+/// doesn't parse warns and is ignored, so bad provenance never fails a measurement.
 fn read_binary_sidecar(logit_bin: &Path) -> Option<BinarySidecar> {
     let sidecar_path = logit_bin.with_extension("json");
     let contents = std::fs::read_to_string(&sidecar_path).ok()?;
@@ -1131,9 +1058,8 @@ fn read_binary_sidecar(logit_bin: &Path) -> Option<BinarySidecar> {
     }
 }
 
-/// `sha256sum`'s own algorithm output for `path` -- shelled out to rather than pulling in a hash
-/// crate, the same "no new dependency for W5" reasoning `format_rfc3339_utc_seconds` already
-/// documents, and `sha256sum` is already on every image this runs in (coreutils).
+/// `path`'s sha256, from `sha256sum` (coreutils, in every image this runs in) rather than a hash
+/// crate dependency.
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let output = Command::new("sha256sum")
         .arg(path)
@@ -1149,9 +1075,8 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
         .context("sha256sum produced no output")
 }
 
-/// The identity recorded for the binary a run actually spawns -- always populated, `--logit-bin`
-/// or not, so a results file never leaves "what did this measure" to be inferred from `git`/
-/// `profile` alone (`result::BinaryInfo`'s own doc has why the two can differ).
+/// The identity of the binary a run spawns, recorded with or without `--logit-bin`
+/// (`result::BinaryInfo` has why `git` alone isn't enough).
 fn binary_info(logit_bin: &Path) -> BinaryInfo {
     let sha256 = sha256_file(logit_bin).unwrap_or_else(|err| {
         eprintln!("warning: could not sha256 {}: {err:#}", logit_bin.display());
@@ -1167,24 +1092,19 @@ fn binary_info(logit_bin: &Path) -> BinaryInfo {
     }
 }
 
-/// The first 12 characters of a hex sha (git or sha256) -- the one truncation convention this
-/// crate uses everywhere a full hash would be unreadable clutter.
+/// The first 12 characters of a hex sha (git or sha256), this crate's one truncation.
 fn short12(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
 /// The short-sha component of a results filename.
 ///
-/// **`logit_bin_overridden` is what actually decides this, not merely whether `binary` carries a
-/// `source_sha`.** For an ordinary build (`--logit-bin` not given) the checkout's own `git.sha` is
-/// exactly what was measured, and naming the file after it is the existing, stable convention --
-/// changing it to `binary.sha256` instead would rename every ordinary run's results after a hash
-/// that isn't even guaranteed to reproduce across two builds of the *same* commit, breaking
-/// filename-based correlation for no benefit. `--logit-bin` is the one case `git.sha` can honestly
-/// diverge from what was measured (a stashed binary from a different ref, or no ref at all), which
-/// is exactly when the binary's own identity has to win: its sidecar's resolved commit
-/// (`source_sha`) when the source was a git ref, else its `sha256` (a tarball or dirty-tree source
-/// has no commit, but it is still its own identity).
+/// **`logit_bin_overridden` decides this, not whether `binary` carries a `source_sha`.** Without
+/// `--logit-bin`, the checkout's `git.sha` is what was measured and names the file; a
+/// `binary.sha256` there wouldn't even reproduce across two builds of one commit. With
+/// `--logit-bin`, `git.sha` can diverge from the binary (a stashed build of another ref, or of no
+/// ref), so the binary's identity wins: its sidecar's `source_sha` for a git-ref source, else its
+/// `sha256` (a tarball or dirty-tree source has no commit).
 fn short_provenance_sha(report: &RunReport, logit_bin_overridden: bool) -> String {
     if logit_bin_overridden {
         if let Some(binary) = &report.binary {
@@ -1197,8 +1117,8 @@ fn short_provenance_sha(report: &RunReport, logit_bin_overridden: bool) -> Strin
     report.git.sha.as_deref().map(short12).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `perf/results/<compact-utc-timestamp>-<short-sha>[-<label>].json` -- see
-/// [`short_provenance_sha`] for which sha wins, and `run`'s own doc for the label suffix.
+/// `perf/results/<compact-utc-timestamp>-<short-sha>[-<label>].json`; see
+/// [`short_provenance_sha`] for which sha wins.
 fn result_filename(
     report: &RunReport,
     now_unix_seconds: i64,
@@ -1226,13 +1146,10 @@ fn build(root: &Path, profile: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where `cargo build --profile <profile> -p logit-cli` puts the binary. `dev` is cargo's one
-/// irregular case (`target/debug`, not `target/dev`); every other profile name, `release`
-/// included, is used as its own directory name verbatim.
+/// Where `cargo build --profile <profile> -p logit-cli` puts the binary. `dev` maps to
+/// `target/debug`; every other profile is its own directory name.
 ///
-/// `target_dir_override` is `$CARGO_TARGET_DIR` when set, read once by the caller -- kept as a
-/// plain parameter rather than read from the environment in here so this stays a pure function
-/// tests can call directly, with no process-global env mutation needed to exercise the override.
+/// `target_dir_override` is `$CARGO_TARGET_DIR`, read by the caller so tests need no env mutation.
 fn logit_binary_path(root: &Path, profile: &str, target_dir_override: Option<&Path>) -> PathBuf {
     let target_dir =
         target_dir_override.map(Path::to_path_buf).unwrap_or_else(|| root.join("target"));
@@ -1242,21 +1159,15 @@ fn logit_binary_path(root: &Path, profile: &str, target_dir_override: Option<&Pa
 
 /// The commit and dirty-state of the binary under test. Two sources, preferred in order:
 ///
-/// 1. `LOGIT_PERF_GIT_SHA`/`LOGIT_PERF_GIT_DIRTY` -- set by `script/perf` itself, computed on the
-///    *host* and passed as `env VAR=... cargo run ...` argv ahead of the `cargo run` it execs
-///    into the dev container, not through `compose.yaml`'s `environment:` block: `run()`'s
-///    `sudo docker compose run` strips the calling shell's own environment before `docker
-///    compose` ever gets to interpolate a `${VAR}` there, so an `environment:` entry can never
-///    see a value exported in `script/perf`, while argv reaches the container (or, in CI, the
-///    directly-exec'd process) unchanged either way. This is the reliable path: a git-worktree
-///    checkout's `.git` file points at an absolute host path the dev container's bind mount
-///    doesn't include, so `git` run *inside* the container against a worktree checkout routinely
-///    can't answer at all.
-/// 2. Shelling out to `git` against `root` directly -- works for an ordinary (non-worktree)
-///    checkout, or when running `logit-perf` outside the dev container entirely.
+/// 1. `LOGIT_PERF_GIT_SHA`/`LOGIT_PERF_GIT_DIRTY`, computed by `script/perf` on the host and
+///    passed as `env VAR=... cargo run ...` argv into the dev container. A worktree checkout's
+///    `.git` file points at an absolute host path the container's bind mount doesn't include, so
+///    `git` inside the container can't answer for it. Argv, not `compose.yaml`'s `environment:`:
+///    `run()`'s `sudo docker compose run` strips the calling shell's environment before compose
+///    interpolates `${VAR}`, while argv arrives unchanged.
+/// 2. `git` run against `root`, which works for a non-worktree checkout or outside the container.
 ///
-/// `None` (rendered as JSON `null`, printed as "unknown") if neither source has an answer, rather
-/// than a confident-looking default.
+/// `None` (JSON `null`, printed "unknown") if neither answers, rather than a guessed default.
 fn git_info(root: &Path) -> GitInfo {
     let sha = non_empty_env("LOGIT_PERF_GIT_SHA").or_else(|| git_rev_parse_head(root));
     let dirty = env_git_dirty().or_else(|| git_status_dirty(root));
@@ -1308,8 +1219,8 @@ fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-/// Reads a sysfs one-liner, or `None` if it isn't there / isn't readable. Everything
-/// [`box_state`] wants is optional by construction, so a missing file is an answer, not an error.
+/// Reads a sysfs one-liner, or `None` if it's missing or unreadable; everything [`box_state`]
+/// reads is optional.
 fn sysfs_line(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -1317,11 +1228,10 @@ fn sysfs_line(path: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// The box's power/thermal policy, best-effort -- see [`BoxState`] for why it's recorded.
+/// The box's power/thermal policy, best-effort; see [`BoxState`] for why it's recorded.
 ///
-/// Checked against this repo's own dev container: the two `cpufreq` files are visible inside it,
-/// `/sys/firmware/acpi/platform_profile` does not exist on this box at all, and the mains supply
-/// is `ACAD` rather than `AC` -- hence the scan by `type` below rather than a hard-coded name.
+/// The mains supply is found by `type`, not name: it isn't always `AC` (`ACAD` on some boxes),
+/// and `platform_profile` may not exist at all.
 fn box_state() -> BoxState {
     let mains = std::fs::read_dir("/sys/class/power_supply")
         .ok()
@@ -1380,13 +1290,9 @@ fn now_unix_seconds() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ`, second precision -- the harness's own results only ever need to be
-/// ordered and human-legible, not sub-second precise. Hand-rolled rather than pulling in a
-/// date/time crate: no new dependency is authorized for this workstream (docs/plans/load-test-
-/// harness.md's W5 row lists `clap`/`serde`/`serde_json`/`serde_norway`/`anyhow`/`libc` only),
-/// and `crates/logit-core/src/time.rs` already sets the precedent for hand-rolling this exact
-/// civil-from-days algorithm (Howard Hinnant's) rather than reaching for one; not shared with it
-/// directly since this crate deliberately doesn't depend on `logit-core` for W5.
+/// `YYYY-MM-DDTHH:MM:SSZ`, second precision: results need only order and legibility.
+/// Hand-rolled with Hinnant's civil-from-days, as `crates/logit-core/src/time.rs` does, rather
+/// than a date/time crate dependency.
 fn format_rfc3339_utc_seconds(unix_seconds: i64) -> String {
     let days = unix_seconds.div_euclid(86_400);
     let secs_of_day = unix_seconds.rem_euclid(86_400);
@@ -1411,8 +1317,7 @@ fn compact_utc_now(unix_seconds: i64) -> String {
 
 /// Howard Hinnant's `civil_from_days`
 /// (<http://howardhinnant.github.io/date_algorithms.html#civil_from_days>), exact over the full
-/// `i64` day range -- see `crates/logit-core/src/time.rs`'s copy of the same algorithm for the
-/// derivation this mirrors.
+/// `i64` day range; `crates/logit-core/src/time.rs` has the derivation.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -1444,9 +1349,8 @@ fn print_table(report: &RunReport) {
     }
 }
 
-/// The socket-side half of a driven scenario's story, printed only when there is one. A separate
-/// table rather than more columns on the first: seven of these nine numbers are `null` for every
-/// generated scenario, and a table two-thirds empty reads worse than two tables.
+/// The driven scenarios' socket-side table, printed only when there is one; a separate table
+/// because a generated scenario has none of these numbers.
 fn print_udp_table(report: &RunReport) {
     let driven: Vec<(&String, &UdpSample)> = report
         .scenarios
@@ -1456,10 +1360,8 @@ fn print_udp_table(report: &RunReport) {
     if driven.is_empty() {
         return;
     }
-    // The rate is in the table, not only in the JSON: two runs at different `--rate-scale`s are
-    // different points on the load curve, and reading a drop rate without knowing what pace
-    // produced it is reading half the result. An unscaled run has to print it too, or the only
-    // time the number is visible is the time it was changed.
+    // The rate is printed on every run, scaled or not: a drop rate means little without the pace
+    // that produced it.
     println!(
         "\n{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>8} {:>9} {:>11}",
         "scenario",
@@ -1492,8 +1394,7 @@ fn print_udp_table(report: &RunReport) {
     }
 }
 
-/// The per-repeat line's UDP tail: only the two numbers worth reading at a glance while a run is
-/// still going, with the full picture left to [`print_udp_table`].
+/// The per-repeat line's UDP tail; the full picture is [`print_udp_table`]'s.
 fn format_udp_suffix(udp: UdpSample) -> String {
     format!(
         ", {} sent / {} delivered ({:.2}% dropped)",
@@ -1503,8 +1404,7 @@ fn format_udp_suffix(udp: UdpSample) -> String {
     )
 }
 
-/// Renders an optional startup time the way every "unknown" numeric field in this crate's output
-/// reads -- never a bare Rust `None`. Shared by the per-repeat line and the summary table.
+/// Renders an optional startup time as `n/a` when unknown, never a bare `None`.
 fn format_startup(startup_s: Option<f64>) -> String {
     startup_s.map(|s| format!("{s:.3}s")).unwrap_or_else(|| "n/a".to_string())
 }
@@ -1569,12 +1469,7 @@ mod tests {
         assert!(!is_ready_line("not json at all"));
     }
 
-    /// A line that isn't UTF-8 must not look like the child exiting.
-    ///
-    /// `BufRead::lines` returns `Err(InvalidData)` for one, which the old reader could only treat
-    /// as the end of the stream -- so a single stray byte (a panic message cut mid-character, a
-    /// library writing raw bytes) both truncated the capture and told a running blast the child had
-    /// died. The `ready` line *after* the bad one is the part that proves the loop carried on.
+    /// A non-UTF-8 line must not look like the child exiting; the later `ready` proves it.
     #[test]
     fn a_non_utf8_line_is_captured_lossily_and_does_not_end_the_stream() {
         let (tx, rx) = mpsc::channel::<ChildEvent>();
@@ -1758,9 +1653,7 @@ mod tests {
         }
     }
 
-    /// An `InputStats` from a run whose kernel sampler worked -- the ordinary case. The `Default`
-    /// has `kernel_sampled: false`, which now means "`SO_MEMINFO` was unavailable" and is its own
-    /// failure, so every test about a *later* check has to start from a sampled run.
+    /// An `InputStats` whose kernel sampler reported, the baseline for tests of later checks.
     fn sampled() -> InputStats {
         InputStats { kernel_sampled: true, ..InputStats::default() }
     }
@@ -1954,11 +1847,8 @@ mod tests {
 
     #[test]
     fn short_provenance_sha_ignores_binary_info_when_logit_bin_was_not_used() {
-        // The ordinary, overwhelmingly common case: no --logit-bin, so the checkout's own git.sha
-        // is exactly what was measured, and the filename convention every existing doc/tool
-        // expects must not change. `binary` is populated here too (it always is), but it must
-        // not win -- and specifically must not be read at all, since even its *presence* used to
-        // be enough to change the answer before this test existed.
+        // No --logit-bin: the checkout's git.sha is what was measured. `binary` is always
+        // populated, but its presence must not change the answer.
         let report = report_with_binary(
             Some("checkoutsha1234"),
             Some(BinaryInfo {

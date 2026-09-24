@@ -83,7 +83,7 @@ by, so it deliberately makes no attempt to guess. A `Value::Bytes` message carri
 guarantee (an OTLP body's `bytes_value` decodes straight into one), while every field this
 transform produces is handed to `Value::Str`, whose invariant *is* valid UTF-8 -- so the whole
 message is validated as UTF-8 once, up front, before any field is sliced out of it. One check
-suffices for every field: `delimiter` is a single ASCII byte and `"` is ASCII (rule 29), so every
+suffices for every field: `delimiter` is a single ASCII byte and `"` is ASCII (rule 32), so every
 boundary `split_row` computes lands on an ASCII byte and never inside a multi-byte sequence, and
 `unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
 

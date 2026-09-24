@@ -1,31 +1,26 @@
-//! Exposes the incoming batch's trace context to Lua as a plain global table, mirroring
-//! `crate::telemetry`'s install-once-mutate-later shape. See `docs/design/lua-api.md`'s "Reading
-//! trace context" section and `docs/adr/trace-context-propagation-on-delivered.md`.
+//! Exposes the incoming batch's trace context to Lua as a plain global `trace` table. See
+//! `docs/design/lua-api.md`'s "Reading trace context" section and
+//! `docs/adr/trace-context-propagation-on-delivered.md`.
 //!
-//! Unlike `telemetry`, this is installed unconditionally in [`crate::ScriptWorker::new`], not as
-//! an opt-in builder: propagation is a property of the pipeline every Lua node runs in, not
-//! something a config turns on, so every script gets `trace.trace_id`/`trace.span_id` whether it
-//! reads them or not -- the same "always present, cheap either way" shape `EventProxy`'s
-//! `has_span` already has. Two primitive byte arrays cross this boundary, not `TraceContext`
-//! itself: `logit-script` doesn't depend on `logit-pipeline` (where that type lives), and there's
-//! nothing this module needs from it beyond the two arrays.
+//! Installed unconditionally in [`crate::ScriptWorker::new`]: propagation is a property of every
+//! pipeline, not something a config turns on. Two byte arrays cross this boundary rather than
+//! `TraceContext`, which lives in `logit-pipeline`, a crate `logit-script` doesn't depend on.
 //!
-//! **Installed *before* the script's source runs, not after like `telemetry`.** `telemetry`
-//! getting away with installing late relies on a real but narrow property: a *function body's*
-//! global lookup resolves at call time, so `telemetry.count(...)` inside `process()` sees it
-//! correctly however late `install` ran, right up until the first call. A script's top-level code
-//! (which runs once, during `Lua::load(source).exec()`) doesn't get that -- an ordinary top-level
-//! alias like `local ctx = trace` captures whatever `trace` *is at that instant*, once, forever.
-//! `ScriptWorker::new` installs this before `.exec()` specifically because of that: installing
-//! after would make every such alias permanently `nil`, caught in review by exactly that script
-//! shape failing on every event.
+//! A plain table is writable: a script's write to `trace.trace_id` is accepted and only
+//! overwritten by the next batch's [`set_context`]. `crate::provenance` is userdata for that
+//! reason.
+//!
+//! **Installed before the script's source runs.** A global lookup inside a function body
+//! resolves at call time, which is why `telemetry` can install after loading. Top-level code runs
+//! once, during `Lua::load(source).exec()`, so an alias like `local ctx = trace` captures whatever
+//! `trace` is at that instant; installing after `.exec()` would leave every such alias `nil`.
+//! `crate::resource`, `crate::scope`, and `crate::provenance` install early for the same reason.
 
 use mlua::{Lua, RegistryKey, Table};
 use std::fmt::Write;
 
-/// Creates the `trace` global (both fields initialized to the all-zero hex `TraceContext::default()`
-/// would render, since no batch has been seen yet) and returns the `RegistryKey` [`set_context`]
-/// later mutates in place.
+/// Creates the `trace` global, both fields all-zero hex until the first batch, and returns the key
+/// [`set_context`] mutates it through.
 pub fn install(lua: &Lua) -> mlua::Result<RegistryKey> {
     let table = lua.create_table()?;
     table.set("trace_id", "0".repeat(32))?;
@@ -34,12 +29,8 @@ pub fn install(lua: &Lua) -> mlua::Result<RegistryKey> {
     lua.create_registry_value(table)
 }
 
-/// Overwrites the installed `trace` table's fields in place with `trace_id`/`span_id`, hex-encoded
-/// (matching `crates/logit-outputs/src/stdio.rs`'s existing rendering of the same shape of id).
-/// Lua resolves a global lookup inside a function body at call time, not at the point the function
-/// was defined (the same property `telemetry::install`'s doc comment relies on), so a script's
-/// `process()` sees whatever was last set here regardless of exactly when between two calls this
-/// runs.
+/// Overwrites the `trace` table's fields in place with lowercase hex, matching `stdio_out`'s
+/// rendering of the same ids.
 pub fn set_context(
     lua: &Lua,
     table: &RegistryKey,

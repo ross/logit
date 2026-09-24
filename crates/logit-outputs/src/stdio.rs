@@ -1,42 +1,28 @@
-//! A general-purpose, human-facing debug sink: dumps a whole pipeline's events as readable text
-//! to stdout (default), stderr, or a file -- the dev loop for this project, and the first thing
-//! anyone getting started with `logit` reaches for before standing up a real backend like
-//! InfluxDB. Also the home of [`StreamOutput`], the sink `file_out` builds on too (`crate::file`)
-//! for the rotating-file case: `stdio_out`'s file target *is* `file_out` with an empty rotation
-//! policy, not a second implementation next to it -- see `docs/adr/rotating-file-output.md`.
+//! `stdio_out`: a human-facing debug sink that writes a pipeline's events as readable text to
+//! stdout (default), stderr, or a file. Also home of [`StreamOutput`], which `file_out`
+//! (`crate::file`) builds on: `stdio_out`'s file target is `file_out` with an empty rotation
+//! policy, not a second implementation (`docs/adr/rotating-file-output.md`).
 //!
-//! **This deliberately renders a readable text block, not one JSON object per event.** The
-//! original `docs/plans/nginx-integration.md` sketch called for JSON before workstream A
-//! landed (`Event` carrying `log`/`metrics`/`span` independently, ADR `multi-payload-events`); once building this
-//! for real, a block a person can read at a glance in a terminal won -- this is a debugging/
-//! dev-loop sink for a human, not a machine-parseable export format (that's what
-//! `logit-outputs::influxdb`'s line protocol is for, and an NDJSON `Format` variant remains a
-//! reasonable future addition if a real consumer needs one). See that plan document's workstream D
-//! section (marked superseded there) and `docs/known-gaps.md` for the accepted consequences.
+//! **The render is a readable text block per event, not JSON.** It's for a person at a terminal,
+//! not an export format; an NDJSON [`Format`] variant is the extension point if a consumer needs
+//! one. See `docs/plans/nginx-integration.md`'s workstream D and `docs/known-gaps.md` for the
+//! accepted consequences. `tools/shape-survey/summarize.py` parses this render, [`render_value`]'s
+//! arrays and maps included, so a change to how anything renders must be mirrored there.
 //!
-//! Split the way `InfluxDbOutput`/`InfluxLineEncoder` are (`crates/logit-outputs/src/influxdb.rs`):
-//! a pure [`EventDump`] encoder (`&EventBatch` -> readable text, no file descriptor anywhere) plus
-//! the thin [`StreamOutput`] that owns the open target and writes/flushes it. Every format test
-//! below runs against the encoder alone. `EventDump` also implements `logit_proto::Encoder`
-//! (`&EventBatch` -> `Bytes`) -- the same seam `InfluxLineEncoder` is already on -- which is what
-//! lets `StreamOutput` be generic over its encoder rather than hardcoding this one. [`StreamEncoder`]
-//! is that seam realized: `format: native` (`docs/adr/file-output-native-format.md`) selects
-//! `logit_proto::native::NativeEncoder` instead, with no change to `Target`/`FileTarget` at all --
-//! the destination half never knew or cared what shape the bytes it writes came from.
+//! Split like `InfluxDbOutput`/`InfluxLineEncoder`: a pure [`EventDump`] encoder with no file
+//! descriptor (every format test runs against it alone), and the thin [`StreamOutput`] that owns
+//! the target. [`StreamEncoder`] picks `EventDump` or `logit_proto::native::NativeEncoder`
+//! (`format: native`, `docs/adr/file-output-native-format.md`); `Target`/`FileTarget` never see
+//! which.
 //!
-//! The text encoder is deliberately built around a [`Format`] enum with a single variant today
-//! (`Format::Human`), and the per-value/per-metric rendering (`render_value`/`render_metric`) is
-//! kept as free functions rather than inlined into one big match -- a future user-supplied
-//! `format:` template string (or an NDJSON variant) is explicitly designed *for* here (a new
-//! `Format` variant plus a renderer that calls the same free functions) but not built now.
+//! [`Format`] has one variant, and `render_value`/`render_metric` stay free functions, so a future
+//! `format:` template or NDJSON variant is a new `Format` arm calling the same renderers.
 //!
-//! Every string rendered here -- a value, but also an attribute/map key or a metric/unit name, all
-//! of which can originate from attacker-influenced input (a syslog line, a JSON body) rather than
-//! trusted local config -- goes through [`render_quoted_str`] or [`render_key`], which escape
-//! every C0 control character (including ESC, so an embedded terminal escape/OSC sequence can't
-//! repaint or otherwise hijack the viewer's terminal) and DEL, and quote any key that isn't a
-//! plain identifier-shaped string (so a key containing a space, `=`, or newline can't be
-//! misread as extra tokens or an injected fake line).
+//! Every string rendered here (a value, an attribute/map key, a metric or unit name) can come from
+//! attacker-influenced input such as a syslog line or a JSON body, so each goes through
+//! [`render_quoted_str`] or [`render_key`]. They escape every C0 control character and DEL, so an
+//! embedded ESC can't drive the viewer's terminal, and quote any key that isn't identifier-shaped,
+//! so a space, `=`, or newline can't forge extra tokens or a fake line.
 
 use crate::file::{FileTarget, RotateOutcome, RotatePolicy};
 use crate::Output;
@@ -53,23 +39,20 @@ use logit_proto::frame::Compression as NativeCompression;
 use logit_proto::native::NativeEncoder;
 use logit_proto::{CodecError, Encoder};
 use std::cmp::Ordering;
-// `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
-// instead of building an intermediate `String` per number via `to_string()`/`format!`
-// (`docs/design/memory.md`), the same reason `logit-outputs::influxdb` uses it.
+// For `write!` straight into the output buffer, never a per-number `to_string()`/`format!`
+// (`docs/design/memory.md`).
 use std::fmt::Write;
 use std::path::Path;
 use tokio::io::{self, AsyncWriteExt};
 
-/// The output format [`EventDump`] renders. One variant today; see the module doc comment for why
-/// this is a `match`-ready enum rather than a single hardcoded function.
+/// The output format [`EventDump`] renders. One variant; the module doc says why it's an enum.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     #[default]
     Human,
 }
 
-/// Renders an [`EventBatch`] as readable text. Pure -- no file descriptor, no I/O -- so every
-/// format test runs directly against this, with no target of any kind involved.
+/// Renders an [`EventBatch`] as readable text. Pure: no file descriptor, no I/O.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EventDump {
     format: Format,
@@ -80,30 +63,19 @@ impl EventDump {
         Self { format }
     }
 
-    /// Renders `batch` as one readable block per event, in batch order. Never fails and never
-    /// panics -- a debug sink's whole job is staying up when everything else is falling over, so
-    /// even a non-finite/absurd numeric value renders *something* rather than erroring. `Set`
-    /// renders its `HyperLogLog` estimate (`docs/plans/lossless-transit.md`'s W2 -- real now,
-    /// no longer a stub); `SetMembers`/`ExponentialHistogram` still have no rendering asked for
-    /// here beyond what their own match arms already do.
+    /// Renders `batch` as one readable block per event, in batch order.
     ///
-    /// Deliberately still `&self`, with no scratch buffers held on [`EventDump`] the way
-    /// `InfluxLineEncoder` holds `line`/`fields`/`tag_suffix`/`scratch` (`docs/design/memory.md`).
-    /// Those exist because that encoder builds a line into a *separate* buffer before committing
-    /// it (so a later rejection can't leave a half-written line in the output) and formats a
-    /// non-string tag value into its own scratch space before borrowing it back out. Every
-    /// `render_*` function below writes straight into `out` -- the same buffer this returns --
-    /// with no intermediate buffer at any point, so there is nothing left to hoist onto the
-    /// struct; the fix here was removing the per-event `AttrMap` clone (see
-    /// [`render_merged_attrs`]) and the per-value `format!`/`to_string()` calls, not adding
-    /// reusable state. `out` itself is still a fresh `String` per call, exactly as
-    /// `InfluxLineEncoder::encode`'s `buf` is -- see that function's doc comment for why the
-    /// per-batch output buffer is left as is.
+    /// Never fails and never panics: a debug sink has to stay up when everything else is falling
+    /// over, so even a non-finite numeric value renders something.
     ///
-    /// Named `render`, not `encode`, specifically so it doesn't collide with
-    /// `Encoder::encode` below -- Rust resolves an inherent method over a trait method of the
-    /// same name with no ambiguity error, which would silently keep every `dump.encode(..)` call
-    /// site on this `String`-returning method even after `EventDump` implements `Encoder`.
+    /// `&self` with no scratch buffers on [`EventDump`], unlike `InfluxLineEncoder`
+    /// (`docs/design/memory.md`): that encoder stages a line before committing it, but every
+    /// `render_*` here writes straight into `out`, so there is nothing to hoist. `out` is a fresh
+    /// `String` per call, as `InfluxLineEncoder::encode`'s `buf` is.
+    ///
+    /// Named `render`, not `encode`: Rust resolves an inherent method over a same-named trait
+    /// method with no ambiguity error, so an inherent `encode` would keep every `dump.encode(..)`
+    /// call site on this `String`-returning method instead of `Encoder::encode`.
     pub fn render(&self, batch: &EventBatch) -> String {
         match self.format {
             Format::Human => {
@@ -120,27 +92,21 @@ impl EventDump {
     }
 }
 
-/// `EventDump` is the same seam `InfluxLineEncoder` is already on (`logit-outputs::influxdb`) --
-/// joining it is what lets [`StreamOutput`] be generic over its encoder instead of hardcoding this
-/// one. The trait's `&mut self` is satisfied trivially: [`EventDump::render`] needs only `&self`.
-/// Always returns `Ok` -- `render` "never fails and never panics" by its own contract, so there is
-/// no `CodecError` this could ever produce.
+/// What lets [`StreamOutput`] be generic over its encoder. Always `Ok`: [`EventDump::render`]
+/// never fails.
 impl Encoder for EventDump {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         Ok(Bytes::from(self.render(batch).into_bytes()))
     }
 }
 
-/// Which encoder [`StreamOutput`] writes through -- `Human` is [`EventDump`]'s existing text
-/// render, `Native` is `logit_proto::native::NativeEncoder` (`docs/adr/file-output-native-format.md`).
-/// An enum, not `Box<dyn Encoder>`: both implementors are `Copy` with no state that persists
-/// across calls (`NativeEncoder`'s own "dictionary-first" framing is rebuilt fresh inside every
-/// `encode()`, not carried on the encoder -- the whole point being that every frame it writes is
-/// independently decodable, which is exactly what lets `file_out` rotate mid-stream without
-/// stranding a reader), so delegation costs nothing a trait object wouldn't also cost. This keeps
-/// `StreamOutput<StreamEncoder>` the one concrete type `build_spec` ever constructs -- the same
-/// shape `syslog_out`'s `Conn` and `otlp_out`'s `OtlpTransport` already use for a runtime choice
-/// between a small, closed set of implementations.
+/// Which encoder [`StreamOutput`] writes through: [`EventDump`]'s text render, or
+/// `logit_proto::native::NativeEncoder` (`docs/adr/file-output-native-format.md`).
+///
+/// An enum, not `Box<dyn Encoder>`, so `StreamOutput<StreamEncoder>` is the one concrete type
+/// `build_spec` constructs. Both encoders are `Copy` and carry no state across calls:
+/// `NativeEncoder` rebuilds its dictionary inside every `encode()`, so each frame decodes on its
+/// own, which is what lets `file_out` rotate mid-stream without stranding a reader.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamEncoder {
     Human(EventDump),
@@ -167,15 +133,13 @@ impl Encoder for StreamEncoder {
 }
 
 /// One event's block: a timestamp/log line, then `attrs`/`metric`/`span` lines, each omitted when
-/// the event carries nothing for that section. Always ends with `\n` after its last line, and
-/// always emits at least the timestamp line -- a completely empty event (legal under
-/// `docs/adr/multi-payload-events.md`) still gets one, since silently printing nothing would
-/// be worse for a sink whose whole purpose is visibility.
+/// the event carries nothing for that section. Always ends with `\n`, and always emits the
+/// timestamp line, so an empty event (legal under `docs/adr/multi-payload-events.md`) is still
+/// visible.
 ///
-/// `attrs` merges `resource`'s attributes underneath the event's own, the same precedence
-/// `logit-outputs::influxdb`'s `render_tag_suffix` uses: without this, two batches from different
-/// resources (different hosts/services) whose events otherwise match produce byte-identical debug
-/// output, defeating a big part of what a human reads this sink's output to tell apart.
+/// `attrs` merges `resource`'s attributes underneath the event's own, as influxdb's
+/// `render_tag_suffix` does; otherwise events from different hosts or services would render
+/// byte-identically.
 fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
     out.push_str(&format_rfc3339_utc(event.timestamp));
     if let Some(log) = &event.log {
@@ -184,10 +148,8 @@ fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
         out.push_str(severity);
         out.push_str("] ");
         render_value(out, &log.message);
-        // The log's own application trace context (`docs/adr/log-record-trace-context.md`),
-        // distinct from this node's internal `span`/`span_event`/`span_link` sections below --
-        // present only when something (a codec decode, `trace_context`, or a script) actually set
-        // it, so an untouched log line is unaffected.
+        // The log's application trace context (`docs/adr/log-record-trace-context.md`), not the
+        // `span` section below; absent unless a decoder, `trace_context`, or a script set it.
         if let Some(trace) = log.trace {
             out.push_str(" trace_id=");
             push_hex(out, &trace.trace_id);
@@ -231,8 +193,8 @@ fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
     }
 }
 
-/// `AttrMap`'s own iteration order (sorted by interned `Symbol`) is deterministic already -- don't
-/// re-sort, just render `key=value` pairs space-separated in that order.
+/// Space-separated `key=value` pairs in `AttrMap`'s own (sorted-by-`Symbol`, deterministic)
+/// order; don't re-sort.
 fn render_attrs(out: &mut String, attrs: &AttrMap) {
     for (i, (key, value)) in attrs.iter().enumerate() {
         if i > 0 {
@@ -245,15 +207,11 @@ fn render_attrs(out: &mut String, attrs: &AttrMap) {
 }
 
 /// Renders `resource`'s attributes merged with `event`'s as space-separated `key=value` pairs,
-/// the event's value winning on a key collision -- see [`render_event_block`]'s doc comment for
-/// why the merge happens at all.
+/// the event's value winning on a key collision.
 ///
-/// **Merge-joined rather than combined by cloning `resource`'s `AttrMap` and inserting `event`'s
-/// over the top.** Both already iterate in sorted-`Symbol` order (`AttrMap::iter`'s doc comment),
-/// so walking them in lockstep and preferring the event's value on an equal key produces exactly
-/// the same sequence the clone-and-insert did -- without copying an `AttrMap` per event, and
-/// without the `resolve` -> `intern` round trip re-inserting every key required. Mirrors
-/// `logit-outputs::influxdb`'s `render_tag_suffix`, which fixed the same pattern there first.
+/// A merge-join, not a clone of `resource` with `event` inserted over it: both iterate in
+/// sorted-`Symbol` order, so walking them in lockstep gives the same sequence with no per-event
+/// `AttrMap` copy and no `resolve` -> `intern` round trip. Mirrors influxdb's `render_tag_suffix`.
 fn render_merged_attrs(out: &mut String, resource: &AttrMap, event: &AttrMap) {
     let mut resource_attrs = resource.iter().peekable();
     let mut event_attrs = event.iter().peekable();
@@ -287,9 +245,8 @@ fn render_merged_attrs(out: &mut String, resource: &AttrMap, event: &AttrMap) {
     }
 }
 
-/// Shared by `Histogram`/`ExponentialHistogram`'s render arms: a trailing ` sum=/min=/max=`
-/// appended only for whichever of the three is actually `Some` -- a debug sink must never print a
-/// bare `sum=` for a metric that carried no sum, so absence renders as absence, not `sum=None`.
+/// Trailing ` sum=`/` min=`/` max=` for whichever of the three is `Some`; an absent field renders
+/// as nothing, never `sum=None`.
 fn render_optional_sum_min_max(
     out: &mut String,
     sum: Option<f64>,
@@ -308,18 +265,16 @@ fn render_optional_sum_min_max(
 }
 
 /// `<name> <kind-specific fields>`, plus a trailing ` unit=<unit>` when the metric has one.
-/// Single-valued kinds (`counter`/`gauge`) render as `kind=value`; multi-field kinds render the
-/// kind name followed by space-separated `field=value` pairs, matching the module doc comment's
-/// example block.
+/// Most kinds lead with `<kind>=` (`sum=`, `gauge=`, `gauge_delta=`, `set=`, `samples=[..]`,
+/// `set_members=[..]`); `distribution`, `histogram`, `exp_histogram`, and `summary` lead with the
+/// bare kind name. Any further fields follow as space-separated `field=value` pairs.
 fn render_metric(out: &mut String, metric: &MetricRecord) {
     render_key(out, resolve(metric.name));
     out.push(' ');
     if metric.is_no_recorded_value() {
-        // OTLP `NO_RECORDED_VALUE`: this point has no genuine reading. Unlike `influxdb_out`/
-        // `statsd_out` (which drop and count it), a debug sink never drops -- it renders the flag
-        // itself rather than the kind's otherwise-meaningless default value
-        // (`docs/adr/lossless-transit.md`, `crates/logit-core/src/metric.rs`'s `flags` doc,
-        // `docs/known-gaps.md`'s cross-protocol table).
+        // OTLP `NO_RECORDED_VALUE`: never dropped, since a debug sink must show it. Render the
+        // flag, not the kind's meaningless default value (`docs/known-gaps.md`'s cross-protocol
+        // table, `crates/logit-core/src/metric.rs`'s `flags` doc).
         out.push_str("no_recorded_value");
         if let Some(unit) = metric.unit {
             out.push_str(" unit=");
@@ -342,15 +297,11 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             let _ = write!(out, "{v}");
         }
         MetricKind::GaugeDelta(v) => {
-            // Rendered distinguishably from a resolved `Gauge` (`gauge_delta`, not `gauge`), and
-            // with an explicit sign, so an operator can see at a glance that this is an
-            // *unresolved* relative adjustment (`docs/adr/relative-gauge-adjustments.md`) --
-            // a debug sink must never silently print it as though it were an absolute value.
+            // `gauge_delta`, with an explicit sign, so an unresolved relative adjustment never
+            // reads as an absolute value (`docs/adr/relative-gauge-adjustments.md`).
             out.push_str("gauge_delta=");
-            // `is_sign_positive`, not `*v >= 0.0` -- `-0.0 >= 0.0` is true in IEEE-754 comparison,
-            // but `f64`'s `Display` still renders `-0.0` as `"-0"`, so `>= 0.0` would double the
-            // sign into the malformed `+-0`. `is_sign_positive` reads the sign bit directly and
-            // excludes negative zero, matching what `Display` is about to print.
+            // `is_sign_positive`, not `*v >= 0.0`: `-0.0 >= 0.0` is true, but `Display` prints
+            // `-0`, so the comparison would produce `+-0`.
             if v.is_sign_positive() {
                 out.push('+');
             }
@@ -376,9 +327,8 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             let _ = write!(out, "] rate={}", s.sample_rate);
         }
         MetricKind::SetMembers(members) => {
-            // Members are arbitrary wire bytes (the native decoder accepts any blob), so each one
-            // goes through the same quoting/escaping every other string this sink writes does --
-            // see the module doc: an embedded newline would otherwise forge a second output line.
+            // Members are arbitrary wire bytes, so each is quoted and escaped like any other
+            // string (module doc); an embedded newline would otherwise forge an output line.
             out.push_str("set_members=[");
             for (i, m) in members.iter().enumerate() {
                 if i > 0 {
@@ -415,9 +365,7 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
             let _ = write!(out, " count={} sum={}", s.count, s.sum);
         }
         MetricKind::Set(hll) => {
-            // `HyperLogLog` is real now (`logit_core::metric::HyperLogLog`, `docs/plans/
-            // lossless-transit.md`'s W2) -- render its estimate, the same "one representative
-            // number" shape `Distribution`'s own `count=` leads with.
+            // The `HyperLogLog` estimate: one representative number, as `Distribution`'s `count=`.
             out.push_str("set=");
             let _ = write!(out, "{}", hll.estimate());
         }
@@ -429,9 +377,8 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
 }
 
 /// `name=... trace_id=<hex> span_id=<hex> [parent_span_id=<hex>] kind=... status=... duration=...`.
-/// `event_timestamp` is the span's start time (`Event::timestamp` -- a span has no start time of
-/// its own; see `logit_core::SpanRecord`'s doc comment), so duration is computed here rather than
-/// stored anywhere.
+/// `event_timestamp` is the span's start time (a `SpanRecord` has none of its own), so duration
+/// is computed here.
 fn render_span(out: &mut String, event_timestamp: i64, span: &SpanRecord) {
     out.push_str("name=");
     render_value(out, &span.name);
@@ -448,15 +395,12 @@ fn render_span(out: &mut String, event_timestamp: i64, span: &SpanRecord) {
     out.push_str(" status=");
     out.push_str(span.status.as_str());
     out.push_str(" duration=");
-    // `saturating_sub`: a span with a corrupt/out-of-order `end_timestamp` before its own start
-    // must still render *something* rather than panicking or wrapping to a nonsense huge value.
+    // `saturating_sub`: an `end_timestamp` before the start must render, not panic or wrap.
     let _ = write!(out, "{}", span.end_timestamp.saturating_sub(event_timestamp));
     out.push_str("ns");
 }
 
-/// `name=... at=<rfc3339> [attrs ...]` for one of a span's `events` (`SpanRecord::events`) --
-/// omitted previously, which meant two spans differing only in their annotations rendered
-/// identically.
+/// `name=... at=<rfc3339> [attrs ...]` for one of a span's `events` (`SpanRecord::events`).
 fn render_span_event(out: &mut String, span_event: &SpanEvent) {
     out.push_str("name=");
     render_value(out, &span_event.name);
@@ -468,8 +412,7 @@ fn render_span_event(out: &mut String, span_event: &SpanEvent) {
     }
 }
 
-/// `trace_id=<hex> span_id=<hex> [attrs ...]` for one of a span's `links` (`SpanRecord::links`) --
-/// same omission as `render_span_event`, same fix.
+/// `trace_id=<hex> span_id=<hex> [attrs ...]` for one of a span's `links` (`SpanRecord::links`).
 fn render_span_link(out: &mut String, link: &SpanLink) {
     out.push_str("trace_id=");
     push_hex(out, &link.trace_id);
@@ -481,17 +424,13 @@ fn render_span_link(out: &mut String, link: &SpanLink) {
     }
 }
 
-/// Renders one [`Value`]. `Bytes` renders as a byte count, never a lossy UTF-8 decode (arbitrary
-/// bytes may not be valid text at all); `Str` is quoted with escapes; `Timestamp` goes through the
-/// same [`format_rfc3339_utc`] the event's own timestamp line uses; `Array`/`Map` render compactly
-/// and recursively.
+/// Renders one [`Value`]: `Str` quoted and escaped; `Bytes` as `<N bytes>`, never a lossy UTF-8
+/// decode; `Timestamp` as RFC 3339 ([`format_rfc3339_utc`]); `Array` as `[a, b]` and `Map` as
+/// `{k=v, k2=v2}`, recursively. `tools/shape-survey/summarize.py`'s `parse_value` scans exactly
+/// these forms.
 ///
-/// `pub(crate)`, not private: `logit_outputs::syslog`'s message-body rendering reuses this for a
-/// `Value::Map`/`Value::Array` log message (its own container-encoding fallback, not a case worth
-/// a second implementation) -- but deliberately does **not** route `Value::Str` through it, since
-/// this function quotes and escapes a string for a human reading a terminal
-/// ([`render_quoted_str`]), which would wrap a syslog MSG's raw JSON body in quotes and double
-/// its backslashes. See `syslog.rs`'s module doc for the full reasoning.
+/// `pub(crate)` for `syslog_out`'s container fallback (a `Map` or `Array` value); syslog never
+/// routes a `Str` here, since the quoting would mangle a raw MSG body (`syslog.rs`'s module doc).
 pub(crate) fn render_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
@@ -511,8 +450,7 @@ pub(crate) fn render_value(out: &mut String, value: &Value) {
             let _ = write!(out, "<{} bytes>", b.len());
         }
         Value::Str(s) => {
-            // `Value::Str` is constructed only from valid UTF-8 (see its own doc comment and
-            // `Value::as_str`), so this cannot panic.
+            // `Value::Str` is constructed only from valid UTF-8, so this cannot panic.
             let text = std::str::from_utf8(s).expect("Value::Str is always valid UTF-8");
             render_quoted_str(out, text);
         }
@@ -542,14 +480,10 @@ pub(crate) fn render_value(out: &mut String, value: &Value) {
     }
 }
 
-/// Renders a map/attribute key, or a metric/unit name: bare when it's a "plain" identifier-shaped
-/// string (letters, digits, `.`, `_`, `-` -- everything every built-in producer today actually
-/// emits), quoted and escaped like any other string otherwise. Keys reaching this sink aren't
-/// necessarily trusted local config -- a `json`-parsed access-log body can hand an event an
-/// attribute keyed on arbitrary attacker-influenced text -- so a key containing a space, `=`, or
-/// newline must be quoted rather than written bare: written bare, it would either misparse
-/// visually (`a b=1` reads as two space-separated tokens) or, with an embedded newline, inject a
-/// fake extra output line.
+/// Renders a map/attribute key or a metric/unit name: bare when identifier-shaped (letters,
+/// digits, `.`, `_`, `-`), quoted and escaped otherwise. A `json`-parsed body can key an attribute
+/// on attacker-influenced text, and written bare, `a b=1` reads as two tokens and an embedded
+/// newline forges a line.
 fn render_key(out: &mut String, key: &str) {
     if is_plain_key(key) {
         out.push_str(key);
@@ -562,19 +496,14 @@ fn is_plain_key(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Quotes and escapes `s`. Beyond the usual `"`/`\`/`\n`/`\r`/`\t`, every other C0 control
-/// character (`0x00..=0x1F`) and DEL (`0x7F`) is escaped as `\xHH` too -- this is a human-facing
-/// *terminal* sink, and a value or key holding a raw ESC (`0x1B`) can otherwise emit a real
-/// OSC/CSI escape sequence that repaints or otherwise takes over the viewer's terminal, not just
-/// garbled text. Since a value can come from attacker-influenced input (a syslog line, a
-/// `json`-parsed body) rather than trusted local config, this has to hold for every string this
-/// sink ever writes, not just the visibly obvious ones.
+/// Quotes and escapes `s`. Beyond `"`/`\`/`\n`/`\r`/`\t`, every other C0 control (`0x00..=0x1F`)
+/// and DEL (`0x7F`) becomes `\xHH`: a raw ESC (`0x1B`) would otherwise emit a real OSC/CSI
+/// sequence that takes over the viewer's terminal. This must hold for every string the sink
+/// writes, since any of them can come from attacker-influenced input.
 ///
-/// Copies runs of characters that need no escaping directly into `out` with one `push_str`,
-/// rather than pushing one character at a time -- the same `push_escaped` shape
-/// `logit-outputs::influxdb` uses (`docs/design/memory.md`). Every character this escapes is
-/// ASCII (a C0 control, DEL, or one of `"`/`\`/newline/CR/tab), so the byte offset `find` returns
-/// is always exactly one character wide, never a UTF-8 continuation byte.
+/// Copies each unescaped run with one `push_str`, like influxdb's `push_escaped`
+/// (`docs/design/memory.md`). Every escaped character is ASCII, so the byte offset `find` returns
+/// is one character wide, never a UTF-8 continuation byte.
 fn render_quoted_str(out: &mut String, s: &str) {
     out.push('"');
     let mut rest = s;
@@ -591,8 +520,7 @@ fn needs_str_escape(c: char) -> bool {
     matches!(c, '"' | '\\' | '\n' | '\r' | '\t') || (c as u32) < 0x20 || c as u32 == 0x7f
 }
 
-/// Escapes the one byte `needs_str_escape` matched. `write!`'s `\xHH` fallback formats straight
-/// into `out` -- no intermediate `String` the way `format!` would build one.
+/// Escapes the one byte `needs_str_escape` matched, formatting `\xHH` straight into `out`.
 fn push_escaped_char(out: &mut String, b: u8) {
     match b {
         b'"' => out.push_str("\\\""),
@@ -606,12 +534,9 @@ fn push_escaped_char(out: &mut String, b: u8) {
     }
 }
 
-/// The open destination [`StreamOutput`] writes to. An enum rather than a boxed `dyn AsyncWrite`:
-/// there are exactly three shapes, known up front, and a `match` in `send` costs nothing an
-/// indirect call wouldn't also cost. `File` carries a [`FileTarget`] rather than a bare
-/// `tokio::fs::File` -- the file case always has a [`RotatePolicy`], `stdio_out`'s plain file
-/// target simply uses [`RotatePolicy::never`], which is what makes "`stdio_out`'s file target is
-/// `file_out` without rotation" true in the type system rather than only in a doc comment.
+/// The open destination [`StreamOutput`] writes to. `File` always carries a [`FileTarget`] with a
+/// [`RotatePolicy`] ([`RotatePolicy::never`] for `stdio_out`), which is what makes `stdio_out`'s
+/// file target `file_out` without rotation in the type system.
 #[derive(Debug)]
 enum Target {
     Stdout(io::Stdout),
@@ -619,24 +544,16 @@ enum Target {
     File(FileTarget),
 }
 
-/// `logit_pipeline::Output`, generic over its [`Encoder`] -- what `stdio_out` and `file_out` are
-/// both built from (`docs/adr/rotating-file-output.md`), differing only in `target`: `stdio_out`
-/// never rotates ([`RotatePolicy::never`]), `file_out` always carries a real policy. Built via
-/// [`StreamOutput::stdout`], [`StreamOutput::stderr`], [`StreamOutput::open_path`], or
-/// [`StreamOutput::rotating`] -- never a bare constructor, since which one is legal to call
-/// depends on which config resolved to it (`crates/logit-cli/src/pipeline.rs::build_spec`).
+/// The `stdio_out` and `file_out` sink, generic over its [`Encoder`]
+/// (`docs/adr/rotating-file-output.md`). The two differ only in `target`: `stdio_out` never
+/// rotates, `file_out` carries a real policy. `build_spec` picks the constructor from the config.
 #[derive(Debug)]
 pub struct StreamOutput<E> {
     target: Target,
     encoder: E,
     telemetry: Telemetry,
-    /// Unlike most other shipped outputs, only ever used for a rotating file target's two
-    /// non-fatal failure modes (`FileTarget::rotate`'s `rotate_failure`/`retention_failure`) --
-    /// every other write error here still propagates as a fatal `anyhow::Error`, matching
-    /// `InfluxDbOutput`'s hard-failure stance for a non-transient sink error (see
-    /// `docs/design/internal-telemetry.md`'s `keep`/`remove` note for the same reasoning). A
-    /// `stdio_out`/unrotated `file_out` target never exercises either key, so this is additive,
-    /// not a behavior change, for the target this module used to be built around alone.
+    /// Only for a rotating file target's two non-fatal failures, `FileTarget::rotate`'s
+    /// `rotate_failure`/`retention_failure`; every other failure returns `Err` from `send`.
     diagnostics: Diagnostics,
 }
 
@@ -659,19 +576,16 @@ impl StreamOutput<StreamEncoder> {
         }
     }
 
-    /// Opens (creating if necessary) `path` in append mode, eagerly -- called from `build_spec` at
-    /// config-build time, not lazily on the first `send`, so a bad path or a permissions error is a
-    /// config error that fails before anything starts listening, exactly as an unset `!env`
-    /// variable or a missing `lua_file` already do. `path` is used exactly as given -- resolving a
-    /// relative `StdioTarget::Path` against the config file's directory (rather than the process's
-    /// current working directory) is `build_spec`'s job, the same way it resolves `LuaFile`'s
-    /// script path, not this constructor's. Never rotates ([`RotatePolicy::never`]).
+    /// Opens (creating if needed) `path` for append, never rotating ([`RotatePolicy::never`]).
+    ///
+    /// Eager, at config-build time, so a bad path or permissions error fails startup before
+    /// anything listens. `path` is used as given; `build_spec` resolves a relative one against the
+    /// config file's directory.
     pub fn open_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         Self::rotating(path, RotatePolicy::never())
     }
 
-    /// The `file_out` constructor: opens `path` exactly as [`Self::open_path`] does, but under a
-    /// real [`RotatePolicy`]. `path` resolution is `build_spec`'s job here too.
+    /// The `file_out` constructor: [`Self::open_path`] under a real [`RotatePolicy`].
     pub fn rotating(path: impl AsRef<Path>, policy: RotatePolicy) -> anyhow::Result<Self> {
         let file = FileTarget::open(path, policy)?;
         Ok(Self {
@@ -682,12 +596,8 @@ impl StreamOutput<StreamEncoder> {
         })
     }
 
-    /// Selects which encoder writes through this sink, overriding the `human()` default every
-    /// constructor above starts with -- `build_spec` calls this for `format: native`
-    /// (`docs/adr/file-output-native-format.md`). Kept off the generic `impl<E>` block below since
-    /// `StreamEncoder` is the only encoder `build_spec` ever chooses between at config time; a
-    /// direct `StreamOutput<EventDump>`/`StreamOutput<NativeEncoder>` built by a test still swaps
-    /// encoders the ordinary way, by constructing a fresh value.
+    /// Replaces the `human()` default every constructor starts with; `build_spec` calls this for
+    /// `format: native` (`docs/adr/file-output-native-format.md`).
     pub fn with_format(mut self, encoder: StreamEncoder) -> Self {
         self.encoder = encoder;
         self
@@ -701,8 +611,7 @@ impl<E> StreamOutput<E> {
         self
     }
 
-    /// Attaches a diagnostics handle -- see the `diagnostics` field's doc comment for exactly
-    /// which two keys this can ever report.
+    /// Attaches a diagnostics handle for the two rotation keys the `diagnostics` field names.
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = diagnostics;
         self
@@ -712,34 +621,21 @@ impl<E> StreamOutput<E> {
 #[async_trait::async_trait]
 impl<E: Encoder + Send> Output for StreamOutput<E> {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // Checked on `batch.events` directly, before encoding at all -- not on the encoded
-        // `Bytes` afterward. The two used to coincide by accident: `EventDump` renders an empty
-        // batch to `""`, so checking the output was equivalent to checking the input. That stopped
-        // being true once a second encoder existed -- `NativeEncoder::encode` always produces a
-        // real, non-empty frame (a header plus a dictionary and resource, even for zero events),
-        // so an output-side check would never fire under `format: native` and every empty batch
-        // would still write a small real frame to disk. Checking the input instead is correct for
-        // any encoder, and also means never asking one to do work for nothing.
+        // Check the input, not the encoded bytes: `NativeEncoder` emits a non-empty frame
+        // (header, dictionary, resource) even for zero events.
         if batch.events.is_empty() {
             return Ok(());
         }
         let bytes = self.encoder.encode(batch).context("encoding batch")?;
 
-        // Rotation is decided *before* the write, never mid-batch -- a batch is always written
-        // whole into whichever file it lands in, never split across a rotation boundary. See
-        // `FileTarget::should_rotate`'s doc comment for what "a threshold, not a hard cap" means
-        // for a batch bigger than `max_bytes`.
+        // Rotation is decided before the write, so a batch is never split across files
+        // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
         if let Target::File(file) = &mut self.target {
             let now = crate::file::now_unix();
             if file.should_rotate(now, bytes.len()) {
                 let outcome = file.rotate(&mut self.diagnostics).await?;
-                // Counted here, not inside `FileTarget::rotate` -- `FileTarget` holds no
-                // `Telemetry` handle of its own, only the `Diagnostics` its two non-fatal failure
-                // keys need. Keeping telemetry on `StreamOutput` alone is what lets
-                // `crate::file`'s pure `should_rotate`/`note_written` stay free of it too. Only
-                // counted on an actual `RotateOutcome::Rotated` -- a failed active-file rename
-                // (`RotateOutcome::NotRotated`) left nothing on disk touched, so it must not be
-                // reported as a rotation that happened.
+                // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means the
+                // active-file rename failed and nothing on disk changed, so it isn't a rotation.
                 if outcome == RotateOutcome::Rotated {
                     self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
                 }
@@ -748,12 +644,11 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         }
 
         self.telemetry.count("logit.output.batch.bytes", bytes.len() as f64, &[]);
-        // One `write_all` plus one `flush` per batch: this guarantees nothing sits buffered in
-        // `tokio`'s (or the OS's) write path between batches, on top of `Output::flush`'s own
-        // shutdown-time call. A write error propagates as an `anyhow::Error`, matching
-        // `InfluxDbOutput` -- a sink whose file has gone away should fail the process, not
-        // silently discard. No retry: unlike an HTTP 5xx, a broken stdio/file target isn't a
-        // transient condition worth waiting out.
+        // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
+        // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
+        // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
+        // the permanent-failure exit either (`logit_pipeline::output::is_explicitly_permanent`).
+        // A failed re-open after rotation is the exception: `Fault::Clean` (`FileTarget::rotate`).
         match &mut self.target {
             Target::Stdout(w) => {
                 w.write_all(&bytes).await?;
@@ -771,11 +666,8 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         Ok(())
     }
 
-    /// Explicit rather than the default no-op, mirroring `SyslogOutput::flush`'s reasoning: `send`
-    /// already flushes after every batch, so this is normally a no-op in practice too -- but
-    /// spelling it out means `finish_and_flush`'s one guaranteed call at shutdown
-    /// (`crates/logit-pipeline/src/runtime.rs`) still holds even if that per-batch discipline ever
-    /// changes.
+    /// Not the default no-op: `send` flushes every batch anyway, but this keeps the runtime's
+    /// shutdown flush (`finish_and_flush`) meaningful if that ever changes.
     async fn flush(&mut self) -> anyhow::Result<()> {
         match &mut self.target {
             Target::Stdout(w) => w.flush().await.context("flushing stdout")?,
@@ -974,11 +866,7 @@ mod tests {
         assert_eq!(out, "1970-01-01T00:00:00.000000000Z\n");
     }
 
-    /// Without merging the batch's `Resource` in, two batches from different resources whose
-    /// events otherwise match would render byte-identical output -- defeating a big part of what
-    /// a human reads a debug sink's output to tell apart. `render_tag_suffix`
-    /// (`logit-outputs::influxdb`) established the precedent this follows: resource attributes
-    /// underneath the event's own, event wins on a key collision.
+    /// Resource attributes merge underneath the event's own; the event wins a key collision.
     #[test]
     fn resource_attributes_are_included_and_the_event_overrides_on_collision() {
         let mut resource = Resource::default();
@@ -994,8 +882,7 @@ mod tests {
         assert!(!out.contains("staging"), "got: {out}");
     }
 
-    /// Two otherwise-identical events differing only in which resource produced them must not
-    /// render identically -- the concrete regression this guards against.
+    /// Events differing only in their resource must not render identically.
     #[test]
     fn two_batches_from_different_resources_render_differently() {
         let mut resource_a = Resource::default();
@@ -1111,9 +998,8 @@ mod tests {
         assert!(out.contains("set_members=[\"a\",\"b\"]"), "got: {out}");
     }
 
-    /// A set member is arbitrary wire bytes; the sink's escaping invariant (module doc) applies
-    /// to it exactly as to any attribute value -- a newline must not forge a second `metric`
-    /// line, and a raw ESC must never reach the output.
+    /// A set member's newline can't forge a second `metric` line, and a raw ESC never reaches the
+    /// output.
     #[test]
     fn set_members_are_escaped_not_emitted_raw() {
         let out = encode(vec![metric_event(
@@ -1169,10 +1055,8 @@ mod tests {
         assert!(out.contains("unique.users set=2"), "got: {out}");
     }
 
-    /// A debug sink never drops (unlike `influxdb_out`/`statsd_out`, which skip and count a
-    /// `NO_RECORDED_VALUE`-flagged point) -- it renders the flag itself rather than the kind's
-    /// otherwise-meaningless default value. Fix 3 in PR #123's review
-    /// (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s cross-protocol table).
+    /// A `NO_RECORDED_VALUE` point renders as the flag, never dropped and never as the kind's
+    /// default value (`docs/known-gaps.md`'s cross-protocol table).
     #[test]
     fn a_no_recorded_value_point_renders_the_flag_instead_of_a_value() {
         let mut event = metric_event(0, "conns", MetricKind::Gauge(0.0));
@@ -1182,9 +1066,7 @@ mod tests {
         assert!(!out.contains("gauge="), "must not also render a value: {out}");
     }
 
-    /// `gauge_delta`, not `gauge` -- an unresolved relative adjustment must be visually
-    /// distinguishable from a resolved absolute value (`docs/adr/relative-gauge-adjustments.md`),
-    /// with an explicit sign so a positive delta doesn't read as a bare number.
+    /// A `GaugeDelta` renders as `gauge_delta` with an explicit sign, distinct from a `Gauge`.
     #[test]
     fn gauge_delta_renders_distinguishably_with_an_explicit_sign() {
         let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(5.0))]);
@@ -1194,8 +1076,7 @@ mod tests {
         assert!(out.contains("conns gauge_delta=-5"), "got: {out}");
     }
 
-    /// `-0.0 >= 0.0` is true (IEEE-754), but `Display` still renders negative zero as `"-0"` -- a
-    /// naive `>= 0.0` sign check would double the sign into `+-0`. Regression for that.
+    /// Negative zero renders `-0`, not `+-0`.
     #[test]
     fn gauge_delta_negative_zero_does_not_double_the_sign() {
         let out = encode(vec![metric_event(0, "conns", MetricKind::GaugeDelta(-0.0))]);
@@ -1265,8 +1146,7 @@ mod tests {
         assert!(out.contains(r#"nested={k="v"}"#), "got: {out}");
     }
 
-    /// W9: a relayed multi-valued statsd tag (`team: Array[Str("a"), Str("b")]`) renders through
-    /// the existing `Array` arm, one bracketed comma-separated list in array order.
+    /// A multi-valued statsd tag renders as one bracketed list in array order.
     #[test]
     fn a_multi_valued_statsd_tag_attribute_renders_as_a_bracketed_list() {
         let mut event = Event::empty(0, AttrMap::new());
@@ -1283,10 +1163,7 @@ mod tests {
         assert!(out.contains(r#"msg="line1\nline2\t\"quoted\"\\backslash""#), "got: {out}");
     }
 
-    /// A raw ESC byte in a value must never reach the terminal unescaped -- a real
-    /// `\x1b[2J` (clear-screen) or other OSC/CSI sequence embedded in attacker-influenced input
-    /// (a syslog line, a `json`-parsed body) would otherwise be interpreted by the viewer's
-    /// terminal, not just displayed as text.
+    /// A raw ESC in a value never reaches the terminal unescaped.
     #[test]
     fn escape_and_other_control_characters_in_a_value_are_escaped_not_emitted_raw() {
         let mut event = Event::empty(0, AttrMap::new());
@@ -1299,8 +1176,7 @@ mod tests {
         assert!(!out.contains('\x07'), "a raw BEL byte must never reach the output: {out:?}");
     }
 
-    /// A key containing a space, `=`, or a newline must be quoted rather than written bare --
-    /// bare, it would either misparse visually or, with a newline, inject a fake extra line.
+    /// A key containing a space, `=`, or a newline is quoted, not written bare.
     #[test]
     fn a_key_that_is_not_a_plain_identifier_is_quoted_and_escaped() {
         let mut event = Event::empty(0, AttrMap::new());
@@ -1311,12 +1187,8 @@ mod tests {
 
     #[test]
     fn attributes_come_out_in_attrmaps_sorted_order() {
-        // `AttrMap` sorts by *interned `Symbol`*, not lexicographically by string content (see its
-        // own doc comment) -- and `Symbol` order depends on process-wide intern history, which a
-        // unit test can't pin to a specific alphabetical outcome without coupling to global state.
-        // What this test actually needs to prove is narrower and robust to that: the encoder
-        // renders attributes in whatever order `AttrMap::iter` already gives, rather than
-        // re-sorting (or scrambling) them itself.
+        // `Symbol` order depends on process-wide intern history, so assert only that the render
+        // follows `AttrMap::iter`'s order, not any alphabetical one.
         let mut attrs = AttrMap::new();
         attrs.insert("zebra", "z");
         attrs.insert("apple", "a");
@@ -1396,8 +1268,7 @@ mod tests {
 
     #[test]
     fn open_path_reports_a_clear_path_naming_error_for_an_unopenable_path() {
-        // A path inside a directory that doesn't exist can never be opened, regardless of
-        // permissions -- a reliable, environment-independent way to trigger the open failure.
+        // A missing parent directory fails regardless of permissions.
         let path = std::env::temp_dir().join("logit-stdio-out-test-no-such-dir").join("x.log");
         let err = StreamOutput::open_path(&path).expect_err("expected an error");
         assert!(format!("{err:?}").contains(&path.display().to_string()), "got: {err:?}");
@@ -1417,8 +1288,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The layer-3 example (`docs/design/internal-telemetry.md`): `logit.output.batch.bytes`
-    /// should match the actual encoded length written to the file, not just be present.
+    /// `logit.output.batch.bytes` equals the encoded length written to the file.
     #[tokio::test]
     async fn send_records_batch_bytes_matching_the_actual_encoded_length() {
         let dir = std::env::temp_dir();
@@ -1454,9 +1324,7 @@ mod tests {
         assert_eq!(recorded, contents.len() as f64);
     }
 
-    /// `stdio_out`'s file target is `file_out` with `RotatePolicy::never()` -- this pins that the
-    /// unification actually holds end to end through `send`, not just at the type level: writing
-    /// well past what would be a rotation threshold under any real policy must never rotate.
+    /// `stdio_out`'s file target never rotates through `send`, however much is written.
     #[tokio::test]
     async fn open_path_never_rotates_no_matter_how_much_is_written() {
         let dir = std::env::temp_dir();
@@ -1480,10 +1348,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `file_out`'s end-to-end path: `StreamOutput::rotating`, driven through real `send` calls
-    /// rather than calling `FileTarget::rotate` directly (that's `file.rs`'s own test module) --
-    /// this is what actually exercises `send`'s should_rotate/rotate/note_written sequencing and
-    /// the `logit.output.file.rotations` metric.
+    /// `send`'s should_rotate/rotate/note_written sequencing and `logit.output.file.rotations`.
     #[tokio::test]
     async fn rotating_via_stream_output_rotates_and_counts_the_rotation() {
         let dir = std::env::temp_dir();
@@ -1536,9 +1401,7 @@ mod tests {
         std::fs::remove_file(&rotated).ok();
     }
 
-    /// A failed active-file rename (`RotateOutcome::NotRotated`, `crate::file`'s own tests cover
-    /// the mechanism) must not be miscounted as a rotation here, at the one place that actually
-    /// increments `logit.output.file.rotations`.
+    /// A failed active-file rename (`RotateOutcome::NotRotated`) isn't counted as a rotation.
     #[tokio::test]
     async fn a_rotation_that_could_not_rename_the_active_file_is_never_counted_as_a_rotation() {
         let dir = std::env::temp_dir();
@@ -1558,8 +1421,7 @@ mod tests {
             .await
             .expect("send should succeed");
 
-        // Unlink the active file out from under the still-open handle -- the fd stays valid, but
-        // the rename `rotate` is about to attempt now has nothing at `path` to rename.
+        // The fd stays valid, but `rotate`'s rename now has nothing at `path`.
         std::fs::remove_file(&path).ok();
 
         output
@@ -1583,9 +1445,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // ---------------------------------------------------------------------------------------
-    // StreamEncoder -- delegation, and a real round-trip through the native decoder.
-    // ---------------------------------------------------------------------------------------
+    // --- StreamEncoder ---
 
     #[test]
     fn stream_encoder_human_delegates_to_event_dump() {
@@ -1597,10 +1457,7 @@ mod tests {
         assert!(text.contains("x sum=1 temporality=delta monotonic=true"), "got: {text}");
     }
 
-    /// Not just "it doesn't panic" -- decodes the frame with the real
-    /// `logit_proto::frame::read_frame` + `logit_proto::native::decode_batch` pair (the same one a
-    /// standalone reader would use, per that crate's own tests), confirming `StreamEncoder::Native`
-    /// really is `NativeEncoder` and not some other byte shape.
+    /// `StreamEncoder::Native`'s output decodes through `read_frame` + `decode_batch`.
     #[test]
     fn stream_encoder_native_round_trips_through_the_real_native_decoder() {
         let mut encoder = StreamEncoder::native(NativeCompression::None);
@@ -1620,10 +1477,7 @@ mod tests {
         }
     }
 
-    /// The regression this fix exists for: before it, `send`'s short-circuit checked the *encoded*
-    /// bytes, which happened to be empty only for `EventDump`. `NativeEncoder::encode` always
-    /// produces a real, non-empty frame (header + dictionary + resource) even for zero events, so
-    /// under the old check an empty batch would still have written a small real frame to disk.
+    /// An empty batch writes nothing under `format: native`, whose encoder emits a frame anyway.
     #[tokio::test]
     async fn send_on_an_empty_batch_writes_nothing_under_native_format_either() {
         let dir = std::env::temp_dir();
@@ -1641,11 +1495,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// The concrete proof of this design's core claim (`docs/adr/file-output-native-format.md`):
-    /// `file_out`'s rotate-to-independent-files model and native's self-contained-frame model
-    /// were built for exactly this pairing. Rotates once under `format: native`, then decodes
-    /// **both** the just-rotated `.1` and the fresh active file independently -- neither needs the
-    /// other to be readable.
+    /// Under `format: native`, the rotated `.1` and the fresh active file each decode on their own
+    /// (`docs/adr/file-output-native-format.md`).
     #[tokio::test]
     async fn rotating_under_native_format_leaves_both_files_independently_decodable() {
         let dir = std::env::temp_dir();

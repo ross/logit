@@ -1,12 +1,10 @@
-//! The readiness/liveness HTTP endpoint (`docs/plans/operator-surface.md`, workstream C; ADR
-//! `admin-readiness-endpoint.md`). Serves exactly two routes -- `GET /readyz`, `GET /healthz` --
-//! nothing else: no `/metrics` (rejected per ADR `internal-telemetry-as-pipeline-events`), no
-//! config dump. HTTP/1.1 only, no TLS: this is a loopback/pod-local endpoint, not one meant to
-//! cross a network boundary (`docs/deploying.md`).
+//! The readiness/liveness HTTP endpoint (docs/adr/admin-readiness-endpoint.md).
 //!
-//! The accept loop below mirrors `logit_inputs::otlp::OtlpInput::run`'s shape (permit-gated
-//! concurrency, one spawned task per connection) at a much smaller scale -- an admin probe
-//! answers one cheap GET at a time, nowhere near `otlp_in`'s connection budget.
+//! Two routes, `GET /readyz` and `GET /healthz`, and nothing else: no `/metrics` (ADR
+//! `internal-telemetry-as-pipeline-events` rejects it), no config dump. HTTP/1.1 only, no TLS:
+//! it's a loopback/pod-local endpoint (`docs/deploying.md`). The accept loop has
+//! `logit_inputs::otlp::OtlpInput::run`'s shape (permit-gated, one task per connection) at a
+//! smaller scale.
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -20,53 +18,39 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-/// An admin probe answers one cheap GET at a time -- nowhere near `otlp_in`'s
-/// `MAX_CONCURRENT_CONNECTIONS` (1024). Bounds this server's worst case to a handful of stuck
-/// connections, not an unbounded accept loop.
+/// Far below `otlp_in`'s 1024: a probe is one cheap GET, and this bounds the worst case to a
+/// handful of stuck connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
-/// How long one connection (from accept to the response finishing) may take before this server
-/// gives up on it and closes it -- a slow or hung client (or a port-scanner) must not pin one of
-/// the 16 connection slots forever. Generous for a same-host probe.
+/// Accept-to-response budget per connection, so a hung client or port scanner can't pin a
+/// connection slot forever. Generous for a same-host probe.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the accept loop pauses after an `accept()` failure that is not one client's own
-/// accident -- fd exhaustion (`EMFILE`/`ENFILE`) is the realistic case, and it neither clears
-/// instantly nor persists forever. Long enough that a sustained one cannot spin a core; short
-/// enough that a probe arriving just after it clears is not noticeably delayed.
+/// Pause after a process-wide `accept()` failure (fd exhaustion, `EMFILE`/`ENFILE`): long enough
+/// that a sustained one can't spin a core, short enough not to delay a probe once it clears.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Serves `/readyz`/`/healthz` off `readiness` on an already-bound `listener`, for as long as the
-/// process lives. Takes a bound listener, not a `bind` address, so the caller
-/// (`logit-cli::pipeline::run_pipelines`) can bind *synchronously* and map a failure there to
-/// `RunError::Startup` before spawning anything else -- mirroring `Input::bind`'s own pre-pass,
-/// rather than duplicating a second bind-then-serve wrapper nothing else calls. Spawned alongside
-/// the existing kill-switch task, and aborted the same way once the pipeline itself returns --
-/// deliberately the *only* teardown. A shutdown signal must **not** close this port: the drain it
-/// starts is precisely the window `/readyz` exists to answer `503 draining` in
-/// (`docs/plans/operator-surface.md`), and a closed port during that window is
-/// indistinguishable, to any orchestrator, from a process that crashed.
+/// Serves `/readyz`/`/healthz` off `readiness` on `listener` for the life of the process.
 ///
-/// Returns nothing, rather than `anyhow::Result<()>`: no failure here has anywhere to go. A
-/// failed `accept()` is logged and retried (below), and the caller only ever `abort()`s this
-/// task -- never joins it -- so an `Err` return would vanish unread instead of being reported.
+/// Takes a bound listener, not an address, so `run_pipelines` binds before spawning anything and
+/// maps a failure to `RunError::Startup`, as `Input::bind`'s pre-pass does. The caller aborts this
+/// task once the pipeline returns, and that's the only teardown: a shutdown signal must not close
+/// the port, because the drain it starts is the window `/readyz` answers `503 draining` in, and a
+/// closed port then looks to an orchestrator like a crash.
+///
+/// Returns `()`: the caller only aborts this task, never joins it, so an `Err` would go unread.
 pub async fn serve_on(listener: TcpListener, readiness: watch::Receiver<PipelineState>) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _peer)) => stream,
             Err(err) => {
-                // One failed `accept()` must never end this loop. This task's `JoinHandle` is
-                // only ever aborted, never awaited, so returning here would take the admin
-                // endpoint down permanently and *silently* -- turning a healthy process into an
-                // endless restart loop under any orchestrator polling `/readyz`, with no
-                // diagnostic trail at all. `ConnectionAborted`/`ConnectionReset`/`Interrupted`
-                // are one client's own accident (it hung up between SYN and accept; a signal
-                // interrupted the syscall) and cost nothing to retry immediately. Anything else
-                // -- `EMFILE`/`ENFILE` under fd pressure being the realistic case -- is a
-                // process-wide condition that clears on its own timescale, so it gets a short
-                // pause first; without one, a sustained fd exhaustion spins this loop hot
-                // against a listener that stays readable and keeps failing.
+                // A failed `accept()` never ends this loop: nothing awaits this task, so returning
+                // would take the endpoint down unreported and put a healthy process into a restart
+                // loop under any orchestrator polling `/readyz`. `ConnectionAborted`/
+                // `ConnectionReset`/`Interrupted` are one client's accident and retry at once;
+                // anything else (fd exhaustion, realistically) is process-wide and gets
+                // `ACCEPT_ERROR_BACKOFF` first, or a readable-but-failing listener spins hot.
                 tracing::warn!(target: "logit", error = %err, "admin: accept failed");
                 if !matches!(
                     err.kind(),
@@ -80,9 +64,8 @@ pub async fn serve_on(listener: TcpListener, readiness: watch::Receiver<Pipeline
             }
         };
 
-        // Acquired *after* accept, same reasoning as `otlp_in`'s own accept loop: the kernel's
-        // own backlog absorbs a burst while every permit is held, rather than refusing the
-        // connection outright.
+        // Acquired after accept, as in `otlp_in`: while every permit is held, the kernel's
+        // backlog absorbs a burst instead of the connection being refused.
         let permit =
             connection_limit.clone().acquire_owned().await.expect("this semaphore is never closed");
         let readiness = readiness.clone();
@@ -100,12 +83,9 @@ async fn handle(
     req: http::Request<hyper::body::Incoming>,
     readiness: watch::Receiver<PipelineState>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
-    // `HEAD` routes exactly like `GET`, and the full body is built either way: hyper's own HTTP/1
-    // server suppresses a HEAD response's body bytes on the wire while still deriving
-    // `content-length` from the body it was handed -- which is precisely RFC 9110 §9.3.2's "the
-    // same header fields that would have been sent to a GET". Handing it an empty body instead
-    // suppresses the header entirely, so `HEAD /readyz` and `GET /readyz` disagree about a length
-    // the client is entitled to trust.
+    // `HEAD` routes like `GET` and gets the full body: hyper's HTTP/1 server drops a HEAD
+    // response's body bytes but derives `content-length` from the body it's handed, which is
+    // RFC 9110 §9.3.2's "same header fields". An empty body would drop the header instead.
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     }
@@ -118,9 +98,8 @@ async fn handle(
     })
 }
 
-/// `Phase` -> the wire word `/readyz` actually returns -- deliberately not the same spelling as
-/// `Phase::as_str()` (`ready` -> `ok`, `failed` -- degraded`): this mapping is an HTTP-response
-/// concern, `Phase`'s own vocabulary is the runtime's.
+/// `Phase` -> `/readyz`'s status and wire word, which differs from `Phase::as_str()` (`ready` ->
+/// `ok`, `failed` -> `degraded`): the wire word is an HTTP concern, `Phase`'s is the runtime's.
 fn readyz_wire(phase: Phase) -> (StatusCode, &'static str) {
     match phase {
         Phase::Ready => (StatusCode::OK, "ok"),
@@ -139,8 +118,7 @@ fn readyz_response(snapshot: &PipelineState, json: bool) -> http::Response<Full<
     }
 }
 
-/// Always `200 ok`: this only proves the admin task itself can answer (the tokio runtime is
-/// alive), deliberately not the pipeline's own state -- that's `/readyz`'s job.
+/// Always `200 ok`: proves only that the tokio runtime can answer. Pipeline state is `/readyz`'s.
 fn healthz_response(json: bool) -> http::Response<Full<Bytes>> {
     if json {
         json_response(StatusCode::OK, serde_json::json!({"status": "ok"}))
@@ -215,14 +193,11 @@ mod tests {
         assert!(value["since"].as_str().unwrap().ends_with('Z'), "since should be RFC3339 UTC");
     }
 
-    // `serve_on`/`handle`'s routing and permit logic, driven end to end over real TCP sockets --
-    // `handle` itself takes `hyper::body::Incoming`, which (unlike every other body type this
-    // crate deals with) has no public constructor outside an actual accepted connection, so
-    // there is no cheaper way to exercise the dispatch than a real request.
+    // The tests below go over real TCP: `hyper::body::Incoming` has no public constructor, so
+    // `handle` can't be called directly.
 
-    /// Sends a raw HTTP/1.1 request and returns (status code, headers block, body) -- the same
-    /// raw-socket idiom `crates/logit-inputs/src/otlp.rs`'s own tests (`post_raw`) use, since
-    /// this server's whole point is not depending on `logit-cli` having its own HTTP client.
+    /// Sends a raw HTTP/1.1 request; returns (status code, headers block, body). The raw-socket
+    /// idiom of `logit-inputs`' otlp tests (`post_raw`): `logit-cli` has no HTTP client of its own.
     async fn request_raw(addr: &str, method: &str, path: &str) -> (u16, String, String) {
         let mut stream = TcpStream::connect(addr).await.expect("the listener is already bound");
         let request =
@@ -252,11 +227,8 @@ mod tests {
     }
 
     async fn spawn_server() -> Server {
-        // Bound here, synchronously, before the task is even spawned -- exactly
-        // `run_pipelines`'s own "bind first, fail startup on error" shape, and what makes
-        // `request_raw` above able to connect immediately with no bind-race retry loop needed:
-        // a client can connect into the kernel's accept backlog before `serve_on`'s task ever
-        // runs its first `.accept()`.
+        // Bound before spawning, as `run_pipelines` does, so a client can connect into the
+        // accept backlog at once with no bind-race retry.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (readiness, rx) = Readiness::channel();
@@ -291,7 +263,7 @@ mod tests {
     async fn healthz_is_always_200_regardless_of_readiness() {
         let server = spawn_server().await;
         server.readiness.begin(&[]);
-        // Not `ready()`d -- still `Starting`, and `/healthz` must not care.
+        // Still `Starting`.
         let (code, _head, body) = request_raw(&server.addr, "GET", "/healthz").await;
         assert_eq!(code, 200);
         assert_eq!(body, "ok");
@@ -324,11 +296,7 @@ mod tests {
         server.handle.abort();
     }
 
-    /// RFC 9110 §9.3.2: a `HEAD` response carries the header fields a `GET` would have sent --
-    /// `content-length` included, naming the length of the body the `GET` *would* have returned
-    /// -- while sending no body bytes at all. hyper's own HTTP/1 encoder does the suppression
-    /// (`can_have_body(HEAD, ..)` forces a zero-length encoder) off the *real* body it is handed,
-    /// which is why `handle` builds the full body for `HEAD` and lets hyper drop it.
+    /// RFC 9110 §9.3.2: `HEAD` gets `GET`'s headers, `content-length` included, and no body.
     #[tokio::test]
     async fn head_mirrors_gets_headers_and_sends_no_body() {
         let server = spawn_server().await;
@@ -354,10 +322,7 @@ mod tests {
         server.handle.abort();
     }
 
-    /// A 17th concurrent connection waits on the permit rather than being refused or erroring --
-    /// proven by holding all 16 slots open with idle (request-less) connections, confirming a
-    /// 17th gets no response yet, then freeing one slot and confirming it's served immediately
-    /// after.
+    /// A 17th concurrent connection waits for a permit rather than being refused.
     #[tokio::test]
     async fn a_17th_concurrent_connection_waits_for_a_free_permit() {
         let server = spawn_server().await;

@@ -1,27 +1,19 @@
-//! Decoding carbon plaintext lines or one pickle batch payload into events -- the
-//! `| Wire | Model |` half of [`super`]'s module doc, which is the spec for everything here.
+//! Decoding carbon plaintext lines or one pickle batch payload into events: the decode half of
+//! [`super`]'s module doc, which is the spec for everything here.
 //!
-//! Both protocols converge on one function: whatever produced a `(path-field, value, timestamp)`
-//! triple, [`push_datapoint`] is what turns it into an [`Event`]. The two decode paths differ only
-//! in how they get there -- splitting a line on whitespace, or walking a restricted pickle stack
-//! ([`super::pickle`]).
+//! Both protocols converge on [`push_datapoint`], which turns a `(path-field, value, timestamp)`
+//! triple into an [`Event`]; they differ only in splitting a line or walking a restricted pickle
+//! stack ([`super::pickle`]).
 //!
-//! **Framing is not this decoder's job.** `graphite_in`'s listener owns the read buffer, the
-//! `max_line_bytes` drain-to-newline state and the 4-byte pickle length prefix -- since W5 of the
-//! connection-follow-ups effort, through the shared TCP driver's `Framer`
-//! (`crates/logit-inputs/src/tcp.rs`). [`GraphiteDecoder::decode_into`] is handed either a whole
-//! datagram (UDP, which may hold several lines) or exactly one delimited message: one plaintext
-//! line, or one already-unframed pickle payload. That is why the two oversize rows of [`super`]'s
-//! decode table are counted there rather than here.
+//! **Framing is not this decoder's job.** `graphite_in`'s listener, through the shared TCP driver's
+//! `Framer` (`crates/logit-inputs/src/tcp.rs`), owns the read buffer, the `max_line_bytes` drain,
+//! and the 4-byte pickle length prefix. [`GraphiteDecoder::decode_into`] gets a whole UDP datagram
+//! (possibly several lines) or one delimited message: a plaintext line or an unframed pickle
+//! payload. Line splitting still runs, since a UDP datagram may carry several lines.
 //!
-//! Line splitting stays on regardless, and is not redundant: a UDP datagram genuinely may carry
-//! several LF-separated lines, and on the framed TCP path the split is a single iteration over a
-//! buffer with no `\n` in it.
-//!
-//! Every tag value is a zero-copy [`Bytes::slice`] of the input, so an event's attributes share the
-//! receive buffer's allocation instead of copying out of it (`docs/design/memory.md` §2) -- the
-//! same trick `crates/logit-inputs/src/statsd.rs`'s `slice_of` plays, and it works for the pickle
-//! path too because [`super::pickle::PickleReader`] yields `&str`s borrowed from that same buffer.
+//! Every tag value is a zero-copy [`Bytes::slice`] of the input (`docs/design/memory.md` §2),
+//! including on the pickle path, because [`super::pickle::PickleReader`] yields `&str`s borrowed
+//! from the same buffer.
 
 use super::pickle::PickleReader;
 use super::Protocol;
@@ -37,55 +29,40 @@ use std::sync::Arc;
 /// Nanoseconds per second -- the scale an ingress timestamp is widened by.
 const NANOS_PER_SECOND: f64 = 1e9;
 
-/// Carbon's "stamp this with receipt time" sentinel. Its own `MetricLineReceiver` treats a `-1`
-/// timestamp as "now", which is why this is a documented model mapping rather than a bad timestamp.
+/// Carbon's receipt-time sentinel: its `MetricLineReceiver` treats a `-1` timestamp as "now".
 const RECEIPT_TIME_SENTINEL: f64 = -1.0;
 
-/// Decodes carbon plaintext lines or pickle batch payloads. Split out from `graphite_in` (W2) so
-/// every grammar, tag and malformed-input test runs against this with no socket involved -- the
-/// same split [`crate::collectd`] and `crates/logit-outputs/src/statsd.rs` already use.
+/// Decodes carbon plaintext lines or pickle batch payloads, with no socket, so grammar, tag, and
+/// malformed-input tests run against it directly.
 #[derive(Debug)]
 pub struct GraphiteDecoder {
     protocol: Protocol,
-    /// One shared resource for every batch this decoder ever produces. **Not** one per sender or
-    /// per path prefix: `logit_pipeline::BatchAccumulator::absorb` keys accumulation on
-    /// `Arc::ptr_eq`, so minting a resource per datagram would split every batch
-    /// ([`crate::collectd`]'s decoder documents the same constraint).
+    /// One shared resource for every batch, **not** one per sender:
+    /// `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so a
+    /// resource per datagram would split every batch.
     resource: Arc<Resource>,
     diag: Diagnostics,
     telemetry: Telemetry,
-    /// Reusable pickle machine -- stack, arenas and memo cleared per frame, never reallocated, so a
-    /// warm pickle decode allocates only the caller's `Vec<Event>`.
+    /// Reusable pickle machine, cleared per frame, so a warm pickle decode allocates only the
+    /// caller's `Vec<Event>`.
     pickle: PickleReader,
-    /// Tag *keys* seen so far, memoised `&str -> Symbol` (`logit_core::interner::KeyCache`): a
-    /// tagged carbon stream repeats the same handful of tag names on every line, so after the
-    /// first each is one `memcmp` instead of a probe of the process-wide interner. Tag keys only
-    /// -- the metric *path* is still a plain `intern`, deliberately: paths are series names, a
-    /// stream carries thousands of distinct ones, and they would exhaust the cache's cap on the
-    /// first batch and then pay its scan on every line for nothing.
+    /// Tag *keys* seen so far, memoised `&str -> Symbol`: a tagged stream repeats a handful of
+    /// tag names, so each is one `memcmp` instead of an interner probe. Paths still use `intern`:
+    /// a stream carries thousands of distinct ones, which would fill the cache's cap and then pay
+    /// its scan on every line.
     keys: KeyCache,
 }
 
-/// Hand-written, not derived: [`PickleReader`] is a reusable *scratch* machine, and a clone must
-/// get a fresh one rather than a copy of whatever the original last left in it.
+/// Hand-written, not derived: a clone gets a fresh [`PickleReader`] and `KeyCache`, not a copy.
 ///
-/// `Clone` at all because `graphite_in` runs on the shared TCP driver
-/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section), which hands
-/// every accepted connection its own decoder -- the pickle stack, arenas and memo are per-stream
-/// state and must not be shared between connections. Deriving would be *correct* today only by
-/// accident: every one of those five `Vec`s is cleared at the start of each frame
-/// (`PickleReader::parse`'s five `clear()`s), so no cross-frame state survives to copy -- but the
-/// derive would
-/// also copy each one's spare capacity into every new connection, which is the opposite of the
-/// point, and would silently start carrying real state the day the reader keeps anything across
-/// frames. [`PickleReader::new`] instead: a connection warms its own arenas on its first frame.
+/// The shared TCP driver clones one decoder per accepted connection
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone`" section), and the pickle scratch is
+/// per-stream state. A derive would copy spare capacity into every connection, and would carry
+/// real state the day the reader keeps anything across frames.
 ///
-/// `resource` stays one shared [`Arc`], deliberately: `logit_pipeline::BatchAccumulator::absorb`
-/// keys accumulation on `Arc::ptr_eq`, so a resource per connection would stop two connections'
-/// events ever sharing a batch downstream (the `resource` field's own doc). `diag` and
-/// `telemetry` are shared handles too -- a `Diagnostics` clone shares its original's throttle
-/// counts (`logit_core::Diagnostics`' type doc), which is what makes `bad_line` throttle per
-/// listener rather than per connection.
+/// `resource` stays one shared [`Arc`] (the field's doc), and `diag`/`telemetry` are shared
+/// handles: a `Diagnostics` clone shares its throttle counts, so `bad_line` throttles per listener,
+/// not per connection.
 impl Clone for GraphiteDecoder {
     fn clone(&self) -> Self {
         Self {
@@ -94,7 +71,7 @@ impl Clone for GraphiteDecoder {
             diag: self.diag.clone(),
             telemetry: self.telemetry.clone(),
             pickle: PickleReader::new(),
-            // Fresh, like `pickle`: per-stream state, warmed by the connection's own first lines.
+            // Fresh, like `pickle`: per-stream state.
             keys: KeyCache::new(),
         }
     }
@@ -113,9 +90,8 @@ impl GraphiteDecoder {
         }
     }
 
-    /// Which carbon wire protocol this decoder reads. Decoder state rather than a per-call
-    /// argument, because [`Decoder::decode_into`] has one signature for every implementor and a
-    /// listener's protocol never changes mid-connection.
+    /// Which carbon wire protocol this decoder reads. Decoder state, since
+    /// [`Decoder::decode_into`] has one signature and a listener's protocol never changes.
     pub fn with_protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
         self
@@ -131,10 +107,8 @@ impl GraphiteDecoder {
         self
     }
 
-    /// This decoder's own diagnostics handle. Public for [`crate::collectd::CollectdDecoder::diag`]'s
-    /// reason: `graphite_in` lives in `logit-inputs` while this decoder lives here, so the
-    /// regression test that `with_diagnostics` actually *reached* the decoder cannot use a
-    /// crate-private accessor.
+    /// This decoder's diagnostics handle, public for
+    /// [`crate::collectd::CollectdDecoder::diag`]'s reason.
     pub fn diag(&self) -> &Diagnostics {
         &self.diag
     }
@@ -151,9 +125,8 @@ impl Decoder for GraphiteDecoder {
         received_at: i64,
         out: &mut Vec<Event>,
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
-        // Destructured rather than reached through `self`: the pickle path hands a closure to
-        // `PickleReader`, which already holds `&mut self.pickle`, so the closure cannot also
-        // borrow `self`. Splitting the fields once keeps both paths reading the same way.
+        // Destructured: the pickle path's closure can't borrow `self` while `PickleReader` holds
+        // `&mut self.pickle`.
         let Self { protocol, diag, telemetry, pickle, keys, .. } = self;
         let mut ctx = Ctx { telemetry, diag, keys };
 
@@ -162,26 +135,22 @@ impl Decoder for GraphiteDecoder {
             Protocol::Pickle => decode_pickle(pickle, &bytes, received_at, out, &mut ctx)?,
         }
 
-        // Carbon carries no OTLP instrumentation-scope concept -- `None`, always; and the resource
-        // is this decoder's own shared one (see the `resource` field's doc).
+        // Carbon has no instrumentation-scope concept.
         Ok((self.resource.clone(), None))
     }
 }
 
 /// Splits `bytes` into lines and decodes each independently.
 ///
-/// **Per-line isolation**, the rule every line-oriented decoder in this workspace follows
-/// (`crates/logit-inputs/src/statsd.rs`'s `decode_into`): a datagram routinely packs several
-/// unrelated metrics, so one malformed line is counted and skipped rather than failing the whole
-/// input. Splitting on the raw **bytes** rather than validating the datagram as UTF-8 first is what
-/// makes that true of a non-UTF-8 line too: it costs that line, not its neighbours.
+/// **Per-line isolation**, as in every line-oriented decoder here: one malformed line is counted
+/// and skipped. Splitting raw **bytes** before UTF-8 validation means a non-UTF-8 line costs only
+/// itself.
 fn decode_plaintext(bytes: &Bytes, received_at: i64, out: &mut Vec<Event>, ctx: &mut Ctx) {
     for raw in bytes.as_ref().split(|b| *b == b'\n') {
-        // `\r\n` framing: carbon's own Twisted `LineReceiver` delimits on either, so a `\r` here is
-        // framing, not payload (normalization 9).
+        // Carbon's `LineReceiver` accepts `\r\n`, so a `\r` is framing (normalization 9).
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         if raw.iter().all(|b| b.is_ascii_whitespace()) {
-            // Padding, a trailing newline, a keepalive. Nothing was lost, so nothing is counted.
+            // Padding, a trailing newline, a keepalive: nothing lost, nothing counted.
             continue;
         }
         let Ok(line) = std::str::from_utf8(raw) else {
@@ -194,10 +163,8 @@ fn decode_plaintext(bytes: &Bytes, received_at: i64, out: &mut Vec<Event>, ctx: 
 
 /// One plaintext line: `path[;k=v...] value timestamp`.
 ///
-/// Fields are checked in wire order -- path, value, timestamp -- so a line with more than one
-/// problem reports the leftmost. [`str::split_whitespace`] collapses runs of spaces and tabs alike
-/// (normalization 9) and splits on Unicode whitespace, matching what carbon's own
-/// `line.strip().split()` does to a decoded `str`.
+/// [`str::split_whitespace`] collapses runs (normalization 9) and splits on Unicode whitespace, as
+/// carbon's `line.strip().split()` does to a decoded `str`.
 fn decode_line(bytes: &Bytes, line: &str, received_at: i64, out: &mut Vec<Event>, ctx: &mut Ctx) {
     let mut fields = line.split_whitespace();
     let (Some(path_field), Some(value_field), Some(timestamp_field), None) =
@@ -225,10 +192,9 @@ fn decode_line(bytes: &Bytes, line: &str, received_at: i64, out: &mut Vec<Event>
 
 /// Decodes one complete, already **unframed** pickle payload.
 ///
-/// Unlike the plaintext path, a bad payload fails the whole call: there is no resync point inside a
-/// pickle stack machine, and the caller (`graphite_in`) responds by dropping the frame. A
-/// *wrong-shaped item* inside an otherwise good payload is the isolated case, and is counted
-/// `logit.input.metrics.skipped{reason="bad_shape"}` without touching its neighbours.
+/// A bad payload fails the whole call (a pickle stack machine has no resync point), and the caller
+/// drops the frame. A *wrong-shaped item* in a good payload costs only itself, counted
+/// `logit.input.metrics.skipped{reason="bad_shape"}`.
 fn decode_pickle(
     pickle: &mut PickleReader,
     bytes: &Bytes,
@@ -257,12 +223,12 @@ fn decode_pickle(
     }
 }
 
-/// Splits `path_field` into its path and `;k=v` tags, and pushes one event carrying one
-/// `Gauge` record -- the last step both protocols share.
+/// Splits `path_field` into its path and `;k=v` tags, and pushes one event carrying one `Gauge`
+/// record.
 ///
-/// A non-finite value and a malformed tag both skip the **whole** datapoint: carbon drops a NaN on
-/// receipt itself, and its own `TaggedSeries.parse` raises on a malformed tag rather than dropping
-/// the one tag (which would silently change the series identity a receiver keys on).
+/// A non-finite value or a malformed tag skips the **whole** datapoint: carbon drops a NaN on
+/// receipt, and `TaggedSeries.parse` raises on a malformed tag rather than drop it (which would
+/// change the series identity).
 fn push_datapoint(
     bytes: &Bytes,
     path_field: &str,
@@ -300,11 +266,7 @@ fn push_datapoint(
 /// `;`, or `None` when a segment is malformed (which skips the whole line).
 ///
 /// A repeated key collapses to its **last** value, counted
-/// `logit.input.tags.normalized{reason="duplicate_key"}` -- carbon's own `TaggedSeries.parse`
-/// builds a `dict`, so this reproduces the wire's semantics rather than inventing one.
-/// Deliberately *not* `statsd_in`'s fold into a [`Value::Array`]: keeping arrays out of this pair
-/// is what stops the encode side's array→last-element rule from ever firing inside it
-/// (normalization 5).
+/// `logit.input.tags.normalized{reason="duplicate_key"}` (normalization 5).
 fn parse_tags<'a>(
     bytes: &Bytes,
     field: &'a str,
@@ -351,16 +313,14 @@ fn parse_timestamp(field: &str, received_at: i64, ctx: &mut Ctx) -> Option<i64> 
     resolve_timestamp(seconds, received_at, ctx)
 }
 
-/// Carbon's timestamp rules, shared by both protocols: `-1` means receipt time, any other
-/// non-positive (or non-finite) value is a bad timestamp, and a positive one -- integral or
-/// fractional -- widens to nanoseconds.
+/// Carbon's timestamp rules, for both protocols: `-1` means receipt time, any other non-positive
+/// or non-finite value is a bad timestamp, and a positive one (integral or fractional) widens to
+/// nanoseconds.
 ///
-/// **Split arithmetic**, whole seconds and the sub-second remainder scaled separately, rather than
-/// the obvious `seconds * 1e9`: `1700000000.25 * 1e9` is `1.70000000025e18`, past `f64`'s 2⁵³ of
-/// integer precision, so the one-step product lands a few hundred nanoseconds off and a
-/// `graphite_in -> graphite_out` fixed point would drift on every hop. [`crate::collectd`]'s
-/// `cdtime_to_nanos` splits for the same reason. Both casts saturate (Rust's `as`), so a timestamp
-/// past the year 2262 clamps rather than wrapping into the past.
+/// **Split arithmetic**, whole seconds and remainder scaled separately: `1700000000.25 * 1e9` is
+/// past `f64`'s 2⁵³ integer precision, so the one-step product lands a few hundred nanoseconds off
+/// and the fixed point would drift every hop. Both casts saturate, so a timestamp past 2262 clamps
+/// rather than wrapping into the past.
 fn resolve_timestamp(seconds: f64, received_at: i64, ctx: &mut Ctx) -> Option<i64> {
     if seconds == RECEIPT_TIME_SENTINEL {
         return Some(received_at);
@@ -380,39 +340,36 @@ fn resolve_timestamp(seconds: f64, received_at: i64, ctx: &mut Ctx) -> Option<i6
     Some((whole as i64).saturating_mul(NANOS_PER_SECOND as i64).saturating_add(sub_nanos))
 }
 
-/// Reconstructs a [`Bytes`] sharing `bytes`'s allocation for `sub`, a substring derived from it by
-/// ordinary `&str` slicing. The identical trick `crates/logit-inputs/src/statsd.rs`'s `slice_of`
-/// and `syslog.rs`'s play, and it holds here for the same reason: `sub` is always obtained by
-/// slicing a `&str` that was itself validated out of `bytes`, never copied or rebuilt, so the
-/// pointer round trip always lands inside `bytes`'s own allocation.
+/// A [`Bytes`] sharing `bytes`'s allocation for `sub`.
+///
+/// Sound only because every caller's `sub` is sliced from a `&str` validated out of `bytes`, never
+/// copied, so the pointer arithmetic lands inside `bytes`. The statsd and syslog decoders have
+/// their own copies of this.
 fn slice_of(bytes: &Bytes, sub: &str) -> Bytes {
     let base = bytes.as_ref().as_ptr() as usize;
     let start = sub.as_ptr() as usize - base;
     bytes.slice(start..start + sub.len())
 }
 
-/// The telemetry/diagnostics pair every skip site needs, carried together so a skipped line is
-/// counted and reported at once and can never be one but not the other
-/// ([`crate::collectd::encode`]'s `Ctx` is the same idea on the egress side).
+/// The telemetry/diagnostics pair every skip site needs, carried together so a skip is never
+/// counted but not reported, or the reverse.
 struct Ctx<'a> {
     telemetry: &'a Telemetry,
     diag: &'a mut Diagnostics,
-    /// The decoder's tag-key cache (`GraphiteDecoder::keys`), carried here so [`parse_tags`]
-    /// reaches it the same way it reaches the skip counters.
+    /// The decoder's tag-key cache (`GraphiteDecoder::keys`).
     keys: &'a mut KeyCache,
 }
 
 impl Ctx<'_> {
     /// One skipped line/datapoint: `logit.input.metrics.skipped{reason}` plus a throttled
-    /// diagnostic under the same key, which is what makes an operator's counter and their log line
-    /// greppable by the same word.
+    /// diagnostic under the same key, so the counter and the log line grep by one word.
     fn skip(&mut self, reason: &'static str, message: impl Display) {
         self.telemetry.count("logit.input.metrics.skipped", 1.0, &[("reason", reason)]);
         self.diag.warn_throttled(reason, message);
     }
 
-    /// Several skips at once, with no diagnostic of its own -- the pickle `bad_shape` case, where
-    /// the reader already knows the count and the individual items carry nothing worth logging.
+    /// Several skips at once, with one summary diagnostic: the pickle `bad_shape` case, where the
+    /// reader returns only a count.
     fn count_skipped(&mut self, reason: &'static str, n: usize) {
         self.telemetry.count("logit.input.metrics.skipped", n as f64, &[("reason", reason)]);
         self.diag.warn_throttled(
@@ -443,8 +400,7 @@ mod tests {
         decode_counted(input).0
     }
 
-    /// Decodes `input` through a plaintext decoder wired to a fresh [`Registry`], so a test can
-    /// assert on both the events and the counters the same call produced.
+    /// Decodes `input` through a plaintext decoder wired to a fresh [`Registry`], returning both.
     fn decode_counted(input: &str) -> (Vec<Event>, Arc<Registry>) {
         let registry = Registry::new();
         let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()))
@@ -515,10 +471,8 @@ mod tests {
         assert_eq!(attr(&events[0], "host").as_deref(), Some("web-1"));
     }
 
-    /// Tag keys go through the decoder's `KeyCache`: a second line with the same tag names in
-    /// another order is all hits (the interner doesn't grow, the cache doesn't either), while the
-    /// path is a plain `intern` every time and never enters the cache. `nextest` runs each test
-    /// in its own process, so `interner::len()` reflects only this test.
+    /// Tag keys hit the decoder's `KeyCache` on a repeat line; the path never enters it.
+    /// (`nextest` runs each test in its own process, so `interner::len()` is this test's alone.)
     #[test]
     fn repeat_tag_keys_are_cache_hits_and_paths_are_not_cached() {
         let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
@@ -553,8 +507,7 @@ mod tests {
         assert_eq!(decoder.keys.len(), 2, "... but never cached");
     }
 
-    /// Carbon's own `TaggedSeries.parse` builds a `dict`, so the last occurrence wins -- and the
-    /// collapse is counted, because it is a real loss (normalization 5).
+    /// Normalization 5: the last occurrence of a repeated key wins, counted.
     #[test]
     fn a_repeated_tag_key_keeps_the_last_value_and_is_counted() {
         let (events, registry) = decode_counted("a.b;team=a;team=b 1 1700000000\n");
@@ -565,7 +518,7 @@ mod tests {
         );
     }
 
-    /// Carbon's own rule, not an invention: its `MetricLineReceiver` reads `-1` as "now".
+    /// A `-1` timestamp is receipt time, as carbon's `MetricLineReceiver` reads it.
     #[test]
     fn a_minus_one_timestamp_becomes_receipt_time() {
         let events = decode("a.b 1 -1\n");
@@ -619,8 +572,8 @@ mod tests {
         assert_eq!(skipped_total(&registry, "bad_line"), 1.0);
     }
 
-    /// Normalization 9: a run of spaces, a tab, or a mix of both separates fields exactly like one
-    /// space, and leading/trailing whitespace is framing rather than payload.
+    /// Normalization 9: any whitespace run separates fields, and leading/trailing whitespace is
+    /// framing.
     #[test]
     fn tabs_and_runs_of_spaces_separate_fields() {
         for line in ["a.b\t1\t1700000000", "a.b   1  1700000000", "  a.b 1 1700000000  "] {
@@ -638,8 +591,7 @@ mod tests {
         assert_eq!(events[0].timestamp, 1_700_000_000_000_000_000);
     }
 
-    /// Padding and a trailing newline are not losses, so they are skipped **uncounted** -- an
-    /// operator watching `metrics.skipped` must not see traffic that was never a metric.
+    /// Padding and a trailing newline are skipped **uncounted**: they were never metrics.
     #[test]
     fn empty_and_whitespace_only_lines_are_skipped_uncounted() {
         let (events, registry) = decode_counted("\n\n   \n\t\na.b 1 1700000000\n\n");
@@ -691,8 +643,7 @@ mod tests {
         );
     }
 
-    /// One shared `Arc<Resource>` per decoder, not one per datagram -- what keeps
-    /// `BatchAccumulator`'s `Arc::ptr_eq` keying from splitting a batch per packet.
+    /// One shared `Arc<Resource>` per decoder, not one per datagram.
     #[test]
     fn every_datagram_shares_one_resource() {
         let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
@@ -707,7 +658,7 @@ mod tests {
         assert!(scope.is_none(), "carbon carries no instrumentation scope");
     }
 
-    /// The zero-copy claim, pinned: a tag value must *point into* the datagram, not copy out of it.
+    /// A tag value *points into* the datagram rather than copying out of it.
     #[test]
     fn a_tag_value_slices_the_input_rather_than_copying_it() {
         let bytes = Bytes::from_static(b"a.b;host=web-1 1 1700000000\n");
@@ -757,8 +708,7 @@ mod tests {
         assert_eq!(events[1].timestamp, 1_700_000_001_000_000_000);
     }
 
-    /// A pickle path is a `&str` borrowed out of the frame, so the same zero-copy tag rule holds
-    /// on this side too.
+    /// Pickle tag values are zero-copy too.
     #[test]
     fn a_pickle_tag_value_slices_the_frame() {
         let mut payload = Vec::new();
@@ -780,9 +730,8 @@ mod tests {
         assert!(value.as_ptr() as usize + value.len() <= base + frame.len());
     }
 
-    /// `pickle.dumps([('a.b', ('1700000000', '2.5'))], protocol=2)`, generated on the host with
-    /// CPython -- a producer that read its numbers out of text and never coerced them, which carbon
-    /// accepts because it applies `float()` itself.
+    /// `pickle.dumps([('a.b', ('1700000000', '2.5'))], protocol=2)`, generated with CPython:
+    /// numeric strings, which carbon accepts because it applies `float()` itself.
     #[test]
     fn a_pickle_numeric_string_value_decodes() {
         const PAYLOAD: &[u8] = &[
@@ -797,8 +746,8 @@ mod tests {
         assert_eq!(events[0].timestamp, 1_700_000_000_000_000_000);
     }
 
-    /// `pickle.dumps([('a.b', (1, 1.0)), None, ('c.d', (2, 2.0))], protocol=2)` -- a stray `None`
-    /// costs that datapoint and nothing else.
+    /// `pickle.dumps([('a.b', (1, 1.0)), None, ('c.d', (2, 2.0))], protocol=2)`: a stray `None`
+    /// costs only that datapoint.
     #[test]
     fn a_wrong_shaped_pickle_item_is_skipped_and_counted_while_the_rest_decodes() {
         const PAYLOAD: &[u8] = &[
@@ -815,8 +764,7 @@ mod tests {
         assert_eq!(skipped_total(&registry, "bad_shape"), 1.0);
     }
 
-    /// A forbidden opcode fails the whole frame -- there is no resync point in a pickle stack
-    /// machine -- and the failure is reported under the greppable `bad_pickle` key.
+    /// A forbidden opcode fails the whole frame, reported under `bad_pickle`.
     #[test]
     fn a_forbidden_pickle_opcode_fails_the_whole_frame() {
         const GLOBAL: &[u8] = &[

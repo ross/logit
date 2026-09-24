@@ -559,6 +559,23 @@ Merged branches and PRs are never renamed to fit.
 - **A config file is always read through `logit_cli::config::load`**, never a bare
   `std::fs::read_to_string` + `serde_norway::from_str` — that's what resolves `!env` and rejects an
   unknown YAML tag (ADR `env-yaml-tag`); a call site that bypasses it silently loses both.
+- **A comment says what a maintainer would otherwise get wrong**: an invariant, a hidden
+  constraint, a workaround, a wire fact. It explains why, and what only when the code can't.
+  Concretely:
+  - No history. Nothing about what the code used to do, or which workstream, PR, review, or
+    date changed it. Git has that; an ADR link carries a long why.
+  - No hedges or intensifiers ("exactly", "actually", "genuinely", "deliberately", "simply",
+    "just", "on purpose", "load-bearing").
+  - Cite a doc by path and heading, never by line number, and code by item name.
+  - One copy of a list. A module doc that describes behavior (validation rules, a codec's
+    mapping table and permitted normalizations) is the canonical copy; docs, tests, and examples
+    summarize it and point at it.
+  - A module doc opens with what the module is for in a sentence or two, then the facts a
+    maintainer needs at the code. The rest is a pointer.
+  - `// SAFETY:` comments are required by clippy. Config field docs in `logit-config` are
+    operator docs rendered into `schema/logit.schema.json`, so they're written for an operator:
+    no rule numbers, no ADR paths, no cross-references to other doc comments.
+  - Wire samples, protocol grammar, and error strings are verbatim material. Leave them as is.
 
 ## Design constraints that aren't optional
 

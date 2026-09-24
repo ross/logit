@@ -1,23 +1,13 @@
-# The `oteldemo` producer's compose overlay: the *only* change this survey makes to the
-# OpenTelemetry Demo's own `compose.yaml`.
+# The `oteldemo` producer's compose overlay, the only change this survey makes to the demo's
+# `compose.yaml`: it attaches `otel-collector` to the survey network so it can export to `logit`.
+# Every other service stays on the demo's own bridge and can't see `logit`.
 #
-# It does one thing -- attach the demo's `otel-collector` to this producer's survey network, so it
-# can resolve the alias `logit` and export to it. Every other service stays on the demo's own
-# `opentelemetry-demo` bridge alone and cannot see `logit` at all, which is the point: the demo's
-# services talk to their collector exactly as shipped, and `logit` is a second exporter hanging off
-# that collector rather than anything the applications know about.
-#
-# The collector's *configuration* change (one `otlphttp` exporter, added to the three pipelines
-# through the demo's own `otelcol-config-extras.yml` seam) is not here: it is
-# tools/shape-survey/oteldemo/otelcol-config-extras.yml, selected by pointing the demo's own
-# `OTEL_COLLECTOR_CONFIG_EXTRAS` variable at it from the generated `survey.env` (see
-# producers/oteldemo.sh). Doing it through the variable rather than a second bind mount of the same
-# container path keeps this overlay to the one thing compose is genuinely needed for.
+# The collector's config change lives in otelcol-config-extras.yml, selected through the demo's
+# `OTEL_COLLECTOR_CONFIG_EXTRAS` variable from the generated `survey.env`.
 
 networks:
-  # `shape-survey-oteldemo-net`, created by `survey_begin` before the producer runs and torn down
-  # by `survey_cleanup` after it. Passed in by name rather than written literally so the overlay
-  # cannot drift from lib.sh's naming scheme.
+  # The producer's network, created by `survey_begin`. Passed in by name so the overlay can't
+  # drift from lib.sh's naming scheme.
   survey:
     name: ${SHAPE_SURVEY_NET:?the survey network name, from the generated survey.env}
     external: true
@@ -25,7 +15,7 @@ networks:
 services:
   otel-collector:
     networks:
-      # `default` is repeated because a service that names any network joins exactly those: leaving
-      # it out would take the collector off the demo's own bridge and every SDK export would fail.
+      # A service that names any network joins only those, so omitting `default` would take the
+      # collector off the demo's bridge and fail every SDK export.
       default: {}
       survey: {}

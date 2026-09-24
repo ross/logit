@@ -1,48 +1,46 @@
-//! `logit_out` -- the native `logit`-to-`logit` sink side (`docs/design/wire-protocol.md`'s
-//! connection protocol, `docs/plans/native-transport.md` workstream D). Opens one TCP
-//! (optionally TLS) connection, negotiates version/codec/compression via `Hello`/`HelloAck`
-//! (`logit_proto::native::control`), then sends one native frame per batch and waits for its
-//! `Ack` before this sink's `send` returns.
+//! `logit_out`: the native `logit`-to-`logit` sink (`docs/design/wire-protocol.md`'s "Connection
+//! protocol", `docs/adr/native-transport-handshake-and-ack.md`). One TCP (optionally TLS)
+//! connection; a `Hello`/`HelloAck` negotiates version, codec, compression, and the peer's
+//! `max_frame_bytes`; then one native frame per batch, whose `Ack` must arrive before `send`
+//! returns. One frame in flight, so the Nth data frame is seq N.
 //!
-//! **One attempt per `send`, exactly [`crate::Output`]'s contract.** Retry, budget, and backoff
-//! all live in `logit-pipeline`'s `write_loop`, which races every attempt against
-//! `tokio::time::timeout` -- so, like `syslog_out`'s `Conn::Tcp`, the live connection is always
-//! `take()`n into a local before any write and only put back on complete success. A cancelled
-//! attempt (the timeout firing mid-write) drops that local, closing the connection rather than
-//! leaving `self.stream` pointing at a socket some unknown number of this frame's bytes into.
+//! **One attempt per `send`** ([`crate::Output`]'s contract). `write_loop` owns retry and races
+//! each attempt against a timeout, so the connection is `take()`n into a local before any write
+//! and put back only on success. A cancelled attempt drops the local, closing the connection
+//! rather than leaving `self.stream` partway through a frame.
 //!
-//! **Lazy connect.** `LogitOutput::new` never touches the network -- a `logit_out` pointed at a
-//! peer that isn't up yet is not a config error, the same `syslog_out`/`Conn::Tcp` precedent.
+//! **Lazy connect.** `LogitOutput::new` never touches the network: a peer that isn't up yet is
+//! not a config error. A failed connection is dropped; the next `send` reconnects.
 //!
-//! **Fault classification.** Connect/handshake I/O failure -> `Clean`. A `Reject`'s own severity
-//! is decided by [`reject_is_permanent`], not by *where* it arrives: only
-//! `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` name a condition
-//! that retrying the identical `Hello`/frame would hit identically, so those alone are
-//! `Permanent`. Every other code -- `REJECT_INTERNAL` (the peer is at its connection cap) and
-//! `REJECT_GOING_AWAY` (the peer is shutting down), plus any code a newer peer adds -- is
-//! transient, and a reconnect is exactly the right response: at the handshake site (nothing of
-//! this batch has been written yet) that's `Clean`; after a data frame has left, it's
-//! `Ambiguous`, not `Clean`, since the batch may or may not have already landed. That
-//! post-send `Ambiguous` case is genuinely reachable, not just theoretical: `logit_in`'s
-//! `serve_connection` races its per-frame `select!` against shutdown only on the *header* read,
-//! so it can take the shutdown arm with a header already readable -- `GOING_AWAY` arrives in
-//! place of the `Ack` for a batch that may or may not have been forwarded. Any other I/O failure
-//! once at least one byte of a data frame has left -> `Ambiguous`; an ack timeout or a
-//! mismatched `Ack.seq` -> `Ambiguous` (the batch may have landed; this connection's state is no
-//! longer trustworthy either way, so it's dropped and the next `send` reconnects).
-//! `duplicate_safe()` is `false` -- there is no receiver-side dedupe identity
-//! (`docs/plans/native-transport.md`'s own "Explicitly out of scope" list).
+//! **Fault classification.**
+//! - Connect, TLS, or `Hello`/`HelloAck` I/O failure: `Clean`.
+//! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
+//!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
+//!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
+//!   cap; `REJECT_GOING_AWAY`, the peer shutting down; a code a newer peer adds) is transient:
+//!   `Clean` at the handshake, `Ambiguous` after a data frame left. The latter is reachable:
+//!   `logit_in`'s `serve_connection` races shutdown only against the header read, so
+//!   `GOING_AWAY` can replace the `Ack` of a batch that may have been forwarded.
+//! - A `HelloAck` naming a codec never offered: `Ambiguous`.
+//! - A batch over the sanity cap or the peer's `max_frame_bytes`: `Permanent`, nothing written.
+//! - A first write that sends nothing: `Clean`. Any failure once a byte of the frame left, an ack
+//!   timeout, or a mismatched `Ack.seq`: `Ambiguous`, and the connection is dropped.
 //!
-//! **Pooled-connection probe.** The `Ambiguous`-after-a-peer-FIN case above is the one this sink
-//! can actually do something about, and does: before the first write of a `send` on a connection
-//! it *inherited* from an earlier batch, the pooled stream gets one non-consuming
-//! `poll_read` (`crate::tls::poll_pending_close` -- see its doc comment for why exactly one poll
-//! and never a cancellable `timeout(read)`). An immediate EOF, or unsolicited bytes -- which on
-//! this protocol means a `Reject{GOING_AWAY}` from a shutdown or a `logit_in` `idle_timeout:`
-//! (`docs/adr/idle-connection-timeout.md`) -- drops that connection and opens a fresh one before
-//! anything leaves the host, so the batch takes the ordinary `Clean` reconnect path instead of
-//! being written into a socket whose peer is gone. The residual case is the FIN that arrives
-//! *between* the probe and the write, which is today's `Ambiguous`, unchanged.
+//! `duplicate_safe()` is `false`: the receiver has no dedupe identity.
+//!
+//! **Pooled-connection probe.** Before the first write on a connection inherited from an earlier
+//! batch, the stream gets one non-consuming `poll_read` (`crate::tls::poll_pending_close`, whose
+//! doc says why never a cancellable `timeout(read)`). An EOF, or unsolicited bytes (on this
+//! protocol, a `Reject{GOING_AWAY}` from a shutdown or a `logit_in` `idle_timeout:`,
+//! `docs/adr/idle-connection-timeout.md`), drops it and reconnects before anything leaves the
+//! host, the `Clean` path. A FIN arriving between the probe and the write is still `Ambiguous`.
+//!
+//! **Telemetry** (`docs/design/internal-telemetry.md`'s `logit_out` section):
+//! `logit.output.requests{class}` counts each attempt that reached the data-frame write, as `ok`
+//! or the failure's `Fault` (`clean`/`ambiguous`/`permanent`); connect, handshake, and too-large
+//! failures aren't counted there. `logit.output.reconnects` counts every successful handshake
+//! after the first, probe-driven ones included. `logit.output.ack.duration` times the ack wait
+//! alone.
 
 use crate::Output;
 use anyhow::Context;
@@ -59,65 +57,48 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-/// Connect timeout, handshake timeout, and ack-wait timeout all share this one knob -- same
-/// default as `otlp_out`'s `DEFAULT_TIMEOUT`, for the same reason (a generous but real per-attempt
-/// cap; `write_loop`'s own retry budget is the outer, much larger bound).
+/// Bounds the TCP connect, the TLS handshake, the `HelloAck` wait, and the ack wait, each
+/// separately. The `Hello` and data-frame writes have only `write_loop`'s retry budget, the outer
+/// bound.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `crate::tls::TlsClientSettings`, re-exported here for symmetry with `crate::otlp`'s own path
-/// (both sinks share the one definition in `crate::tls`).
+/// `crate::tls::TlsClientSettings`, re-exported to match `crate::otlp`'s path.
 pub use crate::tls::TlsClientSettings;
 
-// The TLS-adjacent pieces every raw-TCP sink shares, defined once in `crate::tls`: `AsyncStream`
-// erases "plain or TLS-wrapped stream" behind one object-safe trait, and `host_only` derives the
-// SNI name from a bare `host:port` endpoint.
+// Shared by every raw-TCP sink: `AsyncStream` erases plain-or-TLS, `host_only` derives the SNI
+// name from a bare `host:port`.
 use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 
-/// A live, handshaken connection -- everything about it that only exists once the handshake has
-/// actually happened.
+/// A live, handshaken connection.
 struct Conn {
     stream: Box<dyn AsyncStream>,
-    /// The listener's own frame-size ceiling, from `HelloAck.max_frame_bytes` -- a batch framed
-    /// larger than this is rejected locally (`Fault::Permanent`) rather than sent and rejected by
-    /// the peer.
+    /// The peer's `HelloAck.max_frame_bytes`. A larger batch is rejected locally as `Permanent`
+    /// rather than sent and rejected by the peer.
     peer_max_frame_bytes: u32,
-    /// The codec `HelloAck.codec` actually chose -- `CODEC_NATIVE_V2` if the peer offered it (so
-    /// provenance crosses the wire), `CODEC_NATIVE_V1` if it only understood the original format.
-    /// Validated against what this sink itself offered in `Hello.codecs`
-    /// (`connect_and_handshake`'s own doc comment): an ack naming a codec never offered is a
-    /// protocol violation, not silently trusted.
+    /// The codec `HelloAck.codec` chose: `CODEC_NATIVE_V2` (provenance crosses the wire) or
+    /// `CODEC_NATIVE_V1`. `connect_and_handshake` refuses a codec it never offered.
     codec: u8,
-    /// The negotiated compression -- the intersection of what this sink offered and what the
-    /// peer's `HelloAck` chose, which may be `None` even if this sink offered `Lz4` (the peer
-    /// doesn't support it).
+    /// The negotiated compression; `None` when the peer doesn't support what was offered.
     compression: Compression,
-    /// The sequence number of the last data frame sent on this connection -- implicit, per
-    /// `docs/plans/native-transport.md`'s "Sequence numbers" decision: the Nth data frame is
-    /// always seq N, so `Ack.seq` need only be checked for equality, never carried on the frame
-    /// itself.
+    /// The seq of the last data frame sent. Implicit: the Nth frame is seq N, so `Ack.seq` is
+    /// checked for equality and never carried on the frame.
     seq: u64,
 }
 
 pub struct LogitOutput {
     endpoint: String,
-    /// Offered in this sink's own `Hello`; the connection's actual [`Conn::compression`] may
-    /// still end up `None` if the peer doesn't support it (`docs/plans/native-transport.md`'s
-    /// "Compression" decision).
+    /// Offered in `Hello`; [`Conn::compression`] may still be `None`.
     compression: Compression,
     timeout: Duration,
     tls: Option<Arc<rustls::ClientConfig>>,
     diag: Diagnostics,
     telemetry: Telemetry,
     stream: Option<Conn>,
-    /// `true` once this sink has ever completed a handshake -- the very first connect is not a
-    /// "reconnect," only every one after it (`logit.output.reconnects`'s own doc comment on
-    /// [`LogitOutput::connect_and_handshake`]).
+    /// Set by the first handshake, so only later ones count as `logit.output.reconnects`.
     has_connected_once: bool,
-    /// The provenance of whatever batch `send` is about to be called with -- set by
-    /// `Output::observe_batch` (`write_loop`, `crates/logit-pipeline/src/runtime.rs`) immediately
-    /// before each delivery attempt, read by `send` when it encodes under `CODEC_NATIVE_V2`.
-    /// `Provenance::default()` (nothing sent) on a `CODEC_NATIVE_V1` connection, since v1 has no
-    /// trailer to carry it in. See `docs/adr/batch-provenance-on-delivered.md`.
+    /// The next batch's provenance, set by `Output::observe_batch` before each delivery attempt.
+    /// Encoded only on a `CODEC_NATIVE_V2` connection; v1 has no trailer to carry it
+    /// (`docs/adr/batch-provenance-on-delivered.md`).
     pending_provenance: Provenance,
 }
 
@@ -136,27 +117,21 @@ impl LogitOutput {
         }
     }
 
-    /// Offers `compression` in this sink's `Hello` -- the peer may still negotiate it down to
-    /// `None` (never up: a `logit_in` this sink doesn't yet know about can't be assumed to
-    /// support more than the baseline).
+    /// Offers `compression` in `Hello` alongside `None`; the peer may still choose `None`.
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
     }
 
-    /// Connect, handshake, and ack-wait timeout, all sharing this one knob. Default 10s, as
-    /// `otlp_out`.
+    /// Sets the connect, handshake, and ack-wait timeout (default 10s).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Turns on TLS for this connection (`tls:` in config) -- presence turns it on, the
-    /// `otlp_in`/`logit_in` server-side precedent, since `endpoint` here is a bare `host:port`
-    /// (the `syslog_out` shape) with no scheme to select TLS the way `otlp_out`'s URL-shaped
-    /// endpoint does. Warns via `self.diag` when `insecure_skip_verify` is set, the same
-    /// `otlp_out`/`syslog_out`/`prometheus_in` precedent (`logit-config/src/lib.rs`'s
-    /// `TlsClientConfig::insecure_skip_verify` doc comment promises this everywhere).
+    /// Turns on TLS (`tls:` in config). Presence alone turns it on: `endpoint` is a bare
+    /// `host:port` with no scheme to select it, unlike `otlp_out`. Warns when
+    /// `insecure_skip_verify` is set, as `TlsClientConfig::insecure_skip_verify`'s doc promises.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
@@ -182,10 +157,10 @@ impl LogitOutput {
         self
     }
 
-    /// Connects, performs the TLS handshake if configured, then the `Hello`/`HelloAck` protocol
-    /// handshake. Every step is raced against `self.timeout`. On success, records
-    /// `logit.output.reconnects` -- but only from the *second* successful connect onward; the
-    /// very first connection this sink ever makes isn't a "re"-connect.
+    /// Connects, performs the TLS handshake if configured, then `Hello`/`HelloAck`. The connect,
+    /// TLS handshake, and `HelloAck` wait are each bounded by `self.timeout`; the `Hello` write
+    /// only by `write_loop`'s remaining retry budget. Counts `logit.output.reconnects` from the
+    /// second success on.
     async fn connect_and_handshake(&mut self) -> anyhow::Result<Conn> {
         let tcp = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
             .await
@@ -215,10 +190,8 @@ impl LogitOutput {
 
         let hello = control::Hello {
             version: control::PROTOCOL_VERSION,
-            // v2 first: an old `logit_in` that only recognizes v1 already acks the first entry it
-            // recognizes in `Hello.codecs`, so offering v2 first costs nothing against an
-            // unmodified old listener and gains provenance against a new one -- no separate
-            // negotiation logic needed on this side beyond validating the ack below.
+            // v2 first: a v1-only `logit_in` acks the first codec it recognizes, so this costs
+            // nothing against an old listener and gains provenance against a new one.
             codecs: vec![native::CODEC_NATIVE_V2, native::CODEC_NATIVE_V1],
             compressions: vec![Compression::None as u8, self.compression as u8],
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
@@ -235,8 +208,7 @@ impl LogitOutput {
         let ack = match response {
             control::ControlMessage::HelloAck(ack) => ack,
             control::ControlMessage::Reject(reject) => {
-                // Nothing of this batch has been written yet, so a transient reject is `Clean`,
-                // not `Ambiguous` -- see this module's own "Fault classification" doc.
+                // Nothing of this batch was written, so a transient reject is `Clean`.
                 let fault =
                     if reject_is_permanent(reject.code) { Fault::Permanent } else { Fault::Clean };
                 return Err(anyhow::anyhow!(
@@ -259,13 +231,9 @@ impl LogitOutput {
         }
 
         let compression = compression_from_u8(ack.compression).unwrap_or(Compression::None);
-        // `ack.codec` must name one of the codecs this sink actually offered -- an ack naming
-        // anything else is a protocol violation from the peer, not something to trust silently.
-        // `Fault::Ambiguous`, not `Clean`: nothing about this being a bad ack tells us whether the
-        // peer is in a state worth retrying against identically, but nothing has been sent on this
-        // connection yet either, so treating it as `Clean` would also be defensible -- `Ambiguous`
-        // is the more conservative of the two, and this should never happen against a real
-        // `logit_in` in the first place.
+        // A codec never offered is a protocol violation. Nothing was sent, so `Clean` would be
+        // defensible; `Ambiguous` is the conservative choice for a case a real `logit_in` never
+        // produces.
         if ack.codec != native::CODEC_NATIVE_V1 && ack.codec != native::CODEC_NATIVE_V2 {
             return Err(anyhow::anyhow!(
                 "logit_in acked codec {}, which was never offered in this sink's Hello",
@@ -291,9 +259,7 @@ fn compression_from_u8(b: u8) -> Option<Compression> {
     }
 }
 
-/// Renders a connection's negotiated codec byte for the `logit.proto.frames` metric's `codec`
-/// tag -- `docs/design/internal-telemetry.md`'s cardinality convention wants a fixed string, not
-/// the raw byte, and the byte space isn't otherwise self-describing.
+/// The negotiated codec byte as a fixed `codec` tag string for `logit.proto.frames`.
 fn codec_tag(codec: u8) -> &'static str {
     match codec {
         native::CODEC_NATIVE_V2 => "native_v2",
@@ -317,12 +283,9 @@ fn fault_tag(fault: Fault) -> &'static str {
     }
 }
 
-/// Whether a `Reject`'s code names a condition that retrying the identical `Hello`/frame would
-/// hit identically -- the only codes that justify `Fault::Permanent`. Every other code
-/// (`REJECT_INTERNAL`, `REJECT_GOING_AWAY`, and any code a newer peer adds -- `Reject.code` is a
-/// u16 code space specifically so a reason can be added without a version bump, see
-/// `logit_proto::native::control`'s own doc comment) names a transient condition: the peer is at
-/// its connection cap or shutting down, and a reconnect is exactly the right response.
+/// Whether retrying the identical `Hello` or frame would hit this `Reject` again, the only case
+/// that justifies `Fault::Permanent`. Any other code, including one a newer peer adds
+/// (`Reject.code` is a u16 so reasons can be added without a version bump), is transient.
 fn reject_is_permanent(code: u16) -> bool {
     matches!(
         code,
@@ -334,19 +297,15 @@ fn reject_is_permanent(code: u16) -> bool {
 
 #[async_trait::async_trait]
 impl Output for LogitOutput {
-    /// Records `ctx.provenance` for `send` to encode under, once the connection's negotiated
-    /// codec is known to actually support it -- see [`LogitOutput::pending_provenance`]'s own doc
-    /// comment. `write_loop` calls this before every delivery attempt for one batch, retries
-    /// included, so the same value is used across all of them.
+    /// Records `ctx.provenance` for `send`. `write_loop` calls this before every attempt at a
+    /// batch, retries included.
     fn observe_batch(&mut self, ctx: BatchContext) {
         self.pending_provenance = ctx.provenance;
     }
 
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // Encoded once here, under v1 -- before touching the network at all, so a batch that's
-        // already too large is rejected without ever attempting a connection. v2's payload is
-        // this plus a small trailer, never smaller, so this stays a valid (if slightly
-        // conservative) pre-check regardless of which codec the eventual connection negotiates.
+        // Encoded under v1 before touching the network, so an oversized batch never connects.
+        // v2 is this plus a trailer, never smaller, so the pre-check holds for either codec.
         let v1_payload = native::encode_batch(batch);
         if v1_payload.len() as u64 > frame::MAX_SANE_UNCOMPRESSED_LEN as u64 {
             self.diag.warn_throttled(
@@ -362,22 +321,16 @@ impl Output for LogitOutput {
         }
 
         let mut conn = match self.stream.take() {
-            // A *reused* connection is polled once before this batch's first write, so a peer
-            // that closed while this sink had nothing to send costs a reconnect rather than an
-            // `Ambiguous` batch (this module's own "Pooled-connection probe" doc section).
-            // Nothing has been written yet, so replacing the connection here is the ordinary
-            // `Clean` path -- and `connect_and_handshake` counts the `logit.output.reconnects`
-            // this is.
+            // The module doc's "Pooled-connection probe": nothing is written yet, so replacing
+            // the connection is the `Clean` path, counted as a reconnect.
             Some(mut conn) => {
                 let mut probe = [0u8; 1];
                 let pending = poll_pending_close(&mut *conn.stream, &mut probe).await;
                 match pending {
                     PendingClose::Open => conn,
-                    // `Bytes` is treated exactly like `Eof`: the only message a `logit_in` ever
-                    // writes unprompted is `Reject{GOING_AWAY}` (a shutdown or an idle close,
-                    // `docs/adr/idle-connection-timeout.md`), which means the same thing here --
-                    // and the probe has already consumed a byte of it, so this connection could
-                    // not be read from coherently again even if it were worth keeping.
+                    // `Bytes` is treated like `Eof`: unprompted, `logit_in` only ever writes
+                    // `Reject{GOING_AWAY}`, and the probe consumed a byte of it, so the stream
+                    // can't be read coherently again.
                     _closed => {
                         drop(conn);
                         self.connect_and_handshake().await?
@@ -386,9 +339,7 @@ impl Output for LogitOutput {
             }
             None => self.connect_and_handshake().await?,
         };
-        // Only re-encoded on a v2 connection -- reuses `v1_payload` otherwise, so a v1 connection
-        // (an old peer, or a fresh one before any v2-capable `logit_in` exists) never pays for a
-        // second encode.
+        // Re-encoded only on a v2 connection; a v1 connection reuses `v1_payload`.
         let payload = if conn.codec == native::CODEC_NATIVE_V2 {
             native::encode_batch_v2(batch, self.pending_provenance)
         } else {
@@ -397,8 +348,7 @@ impl Output for LogitOutput {
 
         let bound = conn.peer_max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
         if payload.len() as u32 > bound {
-            // This connection is otherwise fine -- only this batch doesn't fit -- so it's kept,
-            // not dropped, and nothing is written to the socket for it at all.
+            // Only this batch doesn't fit; the connection is kept and nothing is written.
             self.stream = Some(conn);
             self.diag.warn_throttled(
                 "frame_too_large",
@@ -414,9 +364,8 @@ impl Output for LogitOutput {
         let framed = frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
             .context(Fault::Permanent)?;
 
-        // `syslog_out::send_tcp`'s two-property rule: a single `write` first to learn whether
-        // anything left at all, `write_all` only for the remainder -- never resend once any byte
-        // of this frame reached the peer.
+        // One `write` first to learn whether anything left (`Clean` if not), `write_all` only for
+        // the remainder: never resend once a byte of this frame reached the peer.
         let first_write = match conn.stream.write(&framed).await {
             Ok(0) if !framed.is_empty() => {
                 Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "wrote zero bytes"))
@@ -439,8 +388,7 @@ impl Output for LogitOutput {
                 }
             }
             Err(_) => {
-                // Nothing left this host at all -- safe to retry the whole batch fresh; this
-                // connection is dropped (not put back) so the next `send` reconnects.
+                // Nothing left the host: safe to retry. The connection is dropped.
                 self.telemetry.count(
                     "logit.output.requests",
                     1.0,
@@ -476,9 +424,7 @@ impl Output for LogitOutput {
         let ack = match ack_result {
             Ok(Ok(control::ControlMessage::Ack(ack))) => ack,
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
-                // A frame has already left on this connection, so a transient reject is
-                // `Ambiguous` (the batch may or may not have landed), not `Clean` -- see this
-                // module's own "Fault classification" doc.
+                // The frame already left, so a transient reject is `Ambiguous`.
                 let fault = if reject_is_permanent(reject.code) {
                     Fault::Permanent
                 } else {
@@ -550,10 +496,8 @@ impl Output for LogitOutput {
     }
 }
 
-/// Writes one control message, framed with [`frame::FLAG_CONTROL`] set -- mirrors
-/// `logit_inputs::logit`'s own `write_control` exactly (the two sides speak the same framing;
-/// duplicated rather than shared since sharing it would mean a new cross-crate dependency for one
-/// tiny function).
+/// Writes one control message with [`frame::FLAG_CONTROL`] set. Duplicates
+/// `logit_inputs::logit`'s `write_control` rather than add a cross-crate dependency for it.
 async fn write_control<S: AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &impl ControlEncode,
@@ -572,9 +516,8 @@ impl ControlEncode for control::Hello {
         control::Hello::encode(self)
     }
 }
-// `HelloAck`/`Reject` are only ever written by a *peer* in production (this sink only ever
-// writes `Hello`) -- these two impls exist solely so the test module's hand-rolled fake peer can
-// reuse `write_control` instead of a third copy of the framing dance.
+// Only a peer writes `HelloAck`, `Reject`, and `Ack`; these impls let the tests' fake peer reuse
+// `write_control`.
 #[cfg(test)]
 impl ControlEncode for control::HelloAck {
     fn encode(&self) -> Bytes {
@@ -587,9 +530,6 @@ impl ControlEncode for control::Reject {
         control::Reject::encode(self)
     }
 }
-// `Ack` is likewise only ever written by a peer in production -- exists for the same
-// fake-peer-reuses-`write_control` reason as `HelloAck`/`Reject` above, needed by the tests that
-// hand-roll a peer acking a data frame (the provenance/codec-negotiation tests).
 #[cfg(test)]
 impl ControlEncode for control::Ack {
     fn encode(&self) -> Bytes {
@@ -597,13 +537,9 @@ impl ControlEncode for control::Ack {
     }
 }
 
-/// Reads one whole control frame off `stream` and decodes it. Bounded against
-/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`] (this sink's own `Hello` already advertises exactly this
-/// as its `max_frame_bytes`) *before* either declared length is used to size an allocation --
-/// this matters even though a control message is always tiny in practice, because the first call
-/// (reading `HelloAck`) happens *before* the protocol handshake this sink would otherwise be
-/// trusting has actually completed: there is no trusted peer yet at that point, only a peer that
-/// completed a TCP (and, if configured, TLS) connect.
+/// Reads and decodes one control frame. Both declared lengths are checked against
+/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`] (what `Hello` advertises as `max_frame_bytes`) before
+/// sizing an allocation: the first call reads `HelloAck` from a peer not yet trusted.
 async fn read_control<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> anyhow::Result<control::ControlMessage> {
@@ -668,17 +604,12 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
     }
 
-    /// Spins up a real `LogitInput` on an ephemeral port and returns its address plus a
-    /// receiver for every batch it forwards -- the round-trip tests drive a real listener rather
-    /// than a hand-rolled one, so nothing here can drift from what `logit_in` actually does.
+    /// A real `LogitInput` on an ephemeral port, so round-trip tests can't drift from `logit_in`.
     async fn spawn_real_listener() -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
         spawn_real_listener_with_idle_timeout(None).await
     }
 
-    /// [`spawn_real_listener`] with `logit_in`'s own `idle_timeout:` set, for the probe test: a
-    /// real listener closing a real quiet connection is the condition the probe exists for, and
-    /// nothing hand-rolled here can drift from what `logit_in` actually writes on the way out
-    /// (`docs/adr/idle-connection-timeout.md`).
+    /// [`spawn_real_listener`] with `logit_in`'s `idle_timeout:` set, for the probe tests.
     async fn spawn_real_listener_with_idle_timeout(
         idle_timeout: Option<Duration>,
     ) -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
@@ -693,9 +624,7 @@ mod tests {
         (addr, rx)
     }
 
-    /// `logit.output.reconnects`' value out of a drained `Registry`, or `None` if the counter was
-    /// never touched -- which is itself the assertion for a sink that only ever connected once.
-    /// `syslog_out`'s own `reconnects_in`, one crate module over.
+    /// `logit.output.reconnects` from a drained `Registry`, or `None` if never counted.
     fn reconnects_in(events: &[logit_core::Event]) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
@@ -709,11 +638,8 @@ mod tests {
         })
     }
 
-    /// What `logit.output.requests` totals under one `class` tag, or `None` if that class was
-    /// never counted at all -- which is how a test asserts on what *didn't* happen
-    /// (`class=ambiguous`) as precisely as on what did. A sum rather than an occurrence count
-    /// because `Telemetry` coalesces repeats of one metric/tag pair into a single point per
-    /// drain.
+    /// `logit.output.requests`' total for one `class`, or `None` if never counted. A sum, since
+    /// `Telemetry` coalesces repeats into one point per drain.
     fn requests_in(events: &[logit_core::Event], class: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             if e.attributes.get("class").and_then(|v| v.as_str()) != Some(class) {
@@ -762,21 +688,11 @@ mod tests {
 
     // ---- the pooled-connection probe ---------------------------------------------------------
     //
-    // This module's "Pooled-connection probe" doc section, end to end against a real `logit_in`
-    // and then isolated against a deterministic fake peer. Real durations, never
-    // `tokio::time::pause()`: the condition under test is a listener's own timer closing a
-    // socket, which paused time cannot produce.
+    // Real durations, never `tokio::time::pause()`: a listener's own timer closing a socket is
+    // the condition under test, which paused time can't produce.
 
-    /// The headline claim of `docs/adr/idle-connection-timeout.md`'s client-probe decision: a
-    /// real `logit_in` with an `idle_timeout:` closes a connection this sink is holding between
-    /// batches, and the next batch still lands -- one counted reconnect, no `Ambiguous`, nothing
-    /// dropped.
-    ///
-    /// Without the probe this is exactly the loss the ADR describes: the write goes into a socket
-    /// whose peer is gone, the ack read then fails, and the batch is classified `Ambiguous` --
-    /// which, with `duplicate_safe()` false, the default at-most-once posture *drops*. So
-    /// `request_classes` asserting `["ok", "ok"]` is the real assertion here, not just that
-    /// `send` returned `Ok`.
+    /// A batch sent after `logit_in`'s `idle_timeout:` closed the pooled connection lands: one
+    /// reconnect and no `ambiguous` request, which at-most-once would have dropped.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost(
     ) {
@@ -789,9 +705,7 @@ mod tests {
         output.send(&sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
 
-        // Three times the listener's idle timeout: by now it has written its
-        // `Reject{GOING_AWAY}` and closed, and those bytes are sitting in this host's receive
-        // queue -- which is precisely what the probe is looking for.
+        // 3x the idle timeout: the listener's `Reject{GOING_AWAY}` and FIN are queued here.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         output
@@ -818,11 +732,7 @@ mod tests {
         );
     }
 
-    /// The same replacement, isolated from any timer: a peer that acks the first batch and then
-    /// writes an unsolicited `Reject{GOING_AWAY}` -- the only thing a `logit_in` ever sends
-    /// unprompted, from a shutdown or an idle close. This is the `PendingClose::Bytes` arm
-    /// specifically, and it must be treated exactly like an EOF: nothing of the next batch has
-    /// been written, so the pooled connection is dropped and a fresh one dialled.
+    /// An unsolicited `Reject{GOING_AWAY}` (`PendingClose::Bytes`) is replaced like an EOF.
     #[tokio::test]
     async fn a_pooled_connection_with_an_unsolicited_reject_is_replaced() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -857,8 +767,7 @@ mod tests {
                 write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
 
                 if nth == 1 {
-                    // ...and then, unprompted, the going-away signal an idle close sends,
-                    // followed by the close itself when `stream` drops.
+                    // Then, unprompted, an idle close's going-away; `stream` drops after.
                     let reject = control::Reject {
                         code: control::REJECT_GOING_AWAY,
                         message: "idle for 100ms".to_string(),
@@ -894,9 +803,7 @@ mod tests {
 
     // ---- provenance / codec negotiation ------------------------------------------------------
 
-    /// Offers both codecs; a peer that acks v2 gets a v2-framed batch carrying whatever
-    /// provenance `Output::observe_batch` was last called with -- the property the whole codec
-    /// split exists for (`docs/adr/batch-provenance-on-delivered.md`).
+    /// A peer acking v2 gets a v2 frame carrying `observe_batch`'s provenance.
     #[tokio::test]
     async fn a_peer_that_acks_v2_gets_a_v2_frame_with_provenance() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -950,9 +857,7 @@ mod tests {
         assert_eq!(provenance.previous_str(), Some("logit_out_test_previous"));
     }
 
-    /// A peer that only acks v1 gets a plain v1 frame, byte for byte what `encode_batch`
-    /// produces -- no trailer, provenance simply never sent -- proving the negotiation degrades
-    /// cleanly against an old peer rather than assuming v2.
+    /// A peer acking v1 gets a plain v1 frame with no provenance trailer.
     #[tokio::test]
     async fn a_peer_that_only_acks_v1_gets_a_plain_v1_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -980,8 +885,6 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            // A v1 payload has no trailer at all -- decoding it as v2 must fail (the same
-            // invariant `native/mod.rs`'s own `decode_batch_v2_rejects_a_plain_v1_payload` pins).
             assert!(native::decode_batch_v2(&mut payload.clone()).is_err());
             native::decode_batch(&mut payload).unwrap();
 
@@ -1000,9 +903,7 @@ mod tests {
         server.await.expect("server task should not panic");
     }
 
-    /// An ack naming a codec this sink never offered is a protocol violation from the peer, not
-    /// something to trust -- classified `Ambiguous` since nothing has actually been sent yet on
-    /// this connection either way.
+    /// A `HelloAck` naming a codec never offered is refused as `Ambiguous`.
     #[tokio::test]
     async fn an_ack_naming_a_codec_never_offered_is_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1031,10 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_send_dropped_mid_await_leaves_stream_none() {
-        // A peer that acks the handshake and then goes silent forever, so `send`'s ack read
-        // can only ever be *cancelled*, never resolve on its own -- deterministic, unlike racing
-        // against a fast, live peer where `send` might occasionally complete before the other
-        // branch of a `select!` ever gets to fire.
+        // A peer that never acks, so the ack read can only be cancelled: deterministic.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::AckThenHang {
@@ -1066,9 +964,8 @@ mod tests {
         assert_eq!(classify(&err), Fault::Clean);
     }
 
-    /// A minimal hand-rolled peer for the fault-classification cases a real `LogitInput` can't
-    /// easily be made to misbehave into (rejecting on purpose, acking nothing, closing mid-frame).
-    /// Accepts exactly one connection, reads its `Hello`, then does whatever `respond` says.
+    /// A fake peer for misbehavior a real `LogitInput` can't be made to produce: accepts one
+    /// connection, reads its `Hello`, then does what `respond` says.
     async fn fake_peer(
         listener: TcpListener,
         respond: impl FnOnce(control::Hello) -> FakePeerBehavior + Send + 'static,
@@ -1090,9 +987,7 @@ mod tests {
                     window: 1,
                 };
                 write_control(&mut stream, &ack).await.unwrap();
-                // Read (and discard) exactly one data frame, then close without acking --
-                // exercises both "ack never arrives" (a timeout) and "peer closes mid-frame"
-                // (the read simply returns EOF instead of an Ack).
+                // Read one data frame, then close without acking.
                 let mut header = [0u8; frame::HEADER_LEN];
                 if stream.read_exact(&mut header).await.is_ok() {
                     let mut header_bytes = Bytes::copy_from_slice(&header);
@@ -1101,7 +996,6 @@ mod tests {
                         let _ = stream.read_exact(&mut body).await;
                     }
                 }
-                // Drop `stream` here -- closes the connection with no `Ack` ever sent.
             }
             FakePeerBehavior::AckThenHang { ack_compression } => {
                 let ack = control::HelloAck {
@@ -1112,9 +1006,7 @@ mod tests {
                     window: 1,
                 };
                 write_control(&mut stream, &ack).await.unwrap();
-                // Never read anything else, never close -- unlike `AckThenClose`, the connection
-                // stays open and silent, so a caller's ack read can only ever be *cancelled*,
-                // never resolve (successfully or with an error) on its own.
+                // Open and silent forever: the ack read can only be cancelled.
                 std::future::pending::<()>().await;
             }
             FakePeerBehavior::AckThenReject { code } => {
@@ -1126,8 +1018,7 @@ mod tests {
                     window: 1,
                 };
                 write_control(&mut stream, &ack).await.unwrap();
-                // Read (and discard) exactly one data frame, then reject instead of acking it --
-                // exercises the post-send `Reject` arm rather than the handshake one.
+                // Read one data frame, then reject it: the post-send `Reject` arm.
                 let mut header = [0u8; frame::HEADER_LEN];
                 stream.read_exact(&mut header).await.unwrap();
                 let mut header_bytes = Bytes::copy_from_slice(&header);
@@ -1240,9 +1131,7 @@ mod tests {
         assert!(output.stream.is_none(), "a connection with an unresolved ack must not be reused");
     }
 
-    /// Same shape as the ack-timeout case above (a peer that acks nothing), but exercises the
-    /// half this test also names: the *next* `send` reconnects cleanly rather than trying to
-    /// reuse anything from the dead connection.
+    /// After an unacked batch, the next `send` reconnects from scratch.
     #[tokio::test]
     async fn a_peer_that_never_acks_is_ambiguous_and_the_next_send_reconnects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1256,8 +1145,6 @@ mod tests {
         assert_eq!(classify(&err), Fault::Ambiguous);
         assert!(output.stream.is_none());
 
-        // Point the same sink at a real listener and confirm it reconnects from scratch --
-        // nothing from the dead connection (its address, its negotiated compression) is reused.
         let (real_addr, mut rx) = spawn_real_listener().await;
         output.endpoint = real_addr;
         output
@@ -1305,13 +1192,10 @@ mod tests {
         let (addr, mut rx) = spawn_real_listener().await;
         let mut output = LogitOutput::new(addr);
 
-        // Establish a connection at the listener's default (64 MiB) frame-size ceiling first.
         output.send(&sample_batch()).await.expect("first send should succeed");
         recv_batch(&mut rx).await;
 
-        // Force the *connection's* own bound down without a second listener: reach into the
-        // live `Conn` directly (test-only, same crate) rather than standing up a second
-        // `LogitInput` with a tiny `with_max_frame_bytes` just to get a small negotiated bound.
+        // Lower the negotiated bound directly rather than stand up a second listener.
         output.stream.as_mut().unwrap().peer_max_frame_bytes = 8;
 
         let err = output.send(&sample_batch()).await.unwrap_err();
@@ -1321,7 +1205,6 @@ mod tests {
             "an oversized batch must not drop an otherwise-good connection"
         );
 
-        // The connection is still good for a batch that actually fits.
         output.stream.as_mut().unwrap().peer_max_frame_bytes = frame::MAX_SANE_UNCOMPRESSED_LEN;
         output.send(&sample_batch()).await.expect("a normal batch should still send fine");
         recv_batch(&mut rx).await;
@@ -1331,9 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_control_rejects_a_control_header_declaring_more_than_the_sanity_cap() {
-        // Hand-build a 24-byte frame header (no body follows) declaring a `compressed_len` of
-        // `u32::MAX` -- if `read_control` sized its allocation from this before checking it, this
-        // would attempt a ~4 GiB `vec![0u8; ...]`.
+        // A header declaring `compressed_len: u32::MAX`; unchecked, that's a ~4 GiB allocation.
         let mut header = BytesMut::new();
         header.extend_from_slice(&frame::MAGIC);
         header.extend_from_slice(&frame::VERSION.to_le_bytes());
@@ -1360,10 +1241,7 @@ mod tests {
 
     // -- `with_tls`'s `insecure_skip_verify` warning -------------------------------------------
 
-    /// A `tracing` subscriber that collects rendered events into a buffer, so the
-    /// `insecure_skip_verify` warning (`Diagnostics::warn`, which reports through `tracing` only
-    /// and has no telemetry counterpart) can actually be asserted on rather than assumed.
-    /// Copied from `syslog.rs`'s own `CapturedLogs`.
+    /// Collects rendered `tracing` output, since `Diagnostics::warn` has no telemetry counterpart.
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -1395,7 +1273,6 @@ mod tests {
             .finish()
             .set_default();
 
-        // `with_tls` warns at build time, before any connection is attempted -- no socket needed.
         LogitOutput::new("localhost:0")
             .with_diagnostics(Diagnostics::new("logit_out"))
             .with_tls(

@@ -1,12 +1,10 @@
 //! Embeds LuaJIT (via `mlua`, vendored) and runs user `process`/`flush` scripts against
-//! [`logit_core::Event`]. See `docs/design/lua-api.md` for the full design and, in particular,
-//! the concurrency rules below.
+//! [`logit_core::Event`]. See `docs/design/lua-api.md`, including its concurrency rules.
 //!
-//! `mlua::Lua` is neither `Send` nor `Sync` -- that is a hard constraint from the embedded VM, not
-//! a preference. [`ScriptWorker`] is the enforcement point: it owns one `Lua` instance and is
-//! itself `!Send`, so the type system stops a `Lua` from being shared across pipeline workers
-//! rather than relying on a convention nobody checks. The pipeline runs one [`ScriptWorker`] per
-//! worker thread.
+//! `mlua::Lua` is neither `Send` nor `Sync`, a hard constraint of the embedded VM. [`ScriptWorker`]
+//! owns one `Lua` and is itself `!Send`/`!Sync` through a `PhantomData<*const ()>` marker, so the
+//! type system, not a convention, stops a VM being shared across pipeline workers. The pipeline
+//! runs one [`ScriptWorker`] per worker thread. Don't remove the marker to make something compile.
 
 use logit_core::{Event, Resource, Scope, Telemetry};
 use mlua::{Lua, LuaOptions, RegistryKey, StdLib, Value as LuaValue};
@@ -34,35 +32,26 @@ pub enum ScriptError {
     MissingProcess,
 }
 
-/// The standard library surface scripts get: enough to write real transform logic (`table`,
-/// `string`, `math` -- core language functions like `pairs`/`type`/`tostring` are always
-/// available and aren't gated behind a `StdLib` flag at all), nothing that reaches the host.
-/// Deliberately explicit rather than trusting `Lua::new()`'s "safe" default's exact composition --
-/// LuaJIT's `ffi` library in particular is a genuine sandbox escape (raw memory access, arbitrary
-/// C calls) if left enabled, and mlua's docs don't commit to `Lua::new()` excluding it. No
-/// `PACKAGE`, so no `require`, either.
+/// The standard libraries scripts get: `table`, `string`, and `math`, nothing that reaches the
+/// host. The base library (`pairs`, `type`, `tostring`) isn't gated by a `StdLib` flag.
+///
+/// Listed explicitly rather than trusting `Lua::new()`'s default: LuaJIT's `ffi` is a sandbox
+/// escape (raw memory, arbitrary C calls), and mlua doesn't promise `Lua::new()` excludes it. No
+/// `PACKAGE`, so no `require`.
 fn sandbox_libs() -> StdLib {
     StdLib::TABLE | StdLib::STRING | StdLib::MATH
 }
 
-/// Lua 5.1's base library isn't gated by any `StdLib` flag at all -- the same non-gating that
-/// keeps `pairs`/`type`/`tostring` always available also keeps a handful of genuinely dangerous
-/// functions available regardless of `sandbox_libs()`. Confirmed the hard way: a review reproduced
-/// both `loadfile ~= nil` and `dofile ~= nil` in a worker built with only `TABLE | STRING | MATH`
-/// selected, meaning a script could read and execute arbitrary files readable by this process
-/// despite the documented "nothing that reaches the host" sandbox.
+/// Removes the base-library globals that escape the sandbox; `sandbox_libs` can't, because no
+/// `StdLib` flag gates the base library.
 ///
-/// Removed here, each for its own reason:
-/// - `loadfile`, `dofile` -- read and execute a file from the process's filesystem. The
-///   concretely reproduced issue.
-/// - `load`, `loadstring` -- compile and execute an arbitrary *constructed* string as Lua code.
-///   Not filesystem access, but it undermines the property that only the one script source this
-///   worker was built from ever runs.
-/// - `getfenv`, `setfenv` -- Lua 5.1-specific, well documented in the wider Lua community as
-///   sandbox-escape-adjacent: they let code inspect/replace a function's environment table, which
-///   is exactly the kind of tampering a "restricted stdlib" sandbox is meant to prevent.
+/// - `loadfile`, `dofile` read and execute a file from the process's filesystem.
+/// - `load`, `loadstring` run a constructed string as code, so more than the one script source
+///   this worker was built from could run.
+/// - `getfenv`, `setfenv` inspect and replace a function's environment table, the tampering a
+///   restricted stdlib exists to prevent.
 ///
-/// `lua.globals()` *is* `_G` (not a copy), so removing a key here removes it from `_G` too.
+/// `lua.globals()` is `_G` itself, not a copy.
 fn remove_unsandboxed_base_globals(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
     for name in ["loadfile", "dofile", "load", "loadstring", "getfenv", "setfenv"] {
@@ -71,46 +60,32 @@ fn remove_unsandboxed_base_globals(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Owns one Lua VM and runs the `process`/`flush` globals it defines, for one pipeline stage, on
-/// one worker. Not `Send`/`Sync` (via the `PhantomData<*const ()>` marker) -- see the module docs.
+/// Owns one Lua VM and runs its `process`/`flush` globals, for one pipeline stage on one worker.
+/// Not `Send`/`Sync`, via the `PhantomData<*const ()>` marker; see the module doc.
 pub struct ScriptWorker {
     lua: Lua,
-    /// `RegistryKey`s for this script's `process`/`flush` functions, resolved once here rather
-    /// than looked up from `_G` on every `process`/`flush` call (`docs/design/memory.md` §8).
-    /// `mlua::Function<'lua>` is tied to a borrow of `self.lua`, so it can't be stored directly
-    /// as a field of a struct that outlives any one call -- a `RegistryKey` is `mlua`'s `'static`
-    /// handle for exactly this "hold a Lua value across calls" case, redeemed via
-    /// `Lua::registry_value` whenever a call needs the real `Function` back. `flush` is
-    /// `Option`al because a script may not define one at all (the stateless-processor case).
+    /// The script's `process`/`flush`, resolved once at load rather than looked up in `_G` per
+    /// call (`docs/design/memory.md` §8). A `RegistryKey`, because `mlua::Function<'lua>` borrows
+    /// `self.lua` and can't be a field. `flush` is `None` for a stateless script.
     process: RegistryKey,
     flush: Option<RegistryKey>,
-    /// The installed `trace` global's table, held so [`ScriptWorker::set_trace_context`] can
-    /// mutate it in place -- see `crate::trace`'s module doc for why this is unconditional,
-    /// unlike `telemetry`'s opt-in builder.
+    /// The `trace` global's table, which [`ScriptWorker::set_trace_context`] mutates in place.
     trace_table: RegistryKey,
-    /// Shared with the installed `resource` global's userdata -- see `crate::resource`'s module
-    /// doc for why this is a plain `Rc`, not a `RegistryKey` like `trace_table`: `set_resource`/
-    /// `take_resource` need to hand a real `Arc<Resource>` back out without a `&Lua` in hand.
+    /// Shared with the `resource` global's userdata. An `Rc`, not a `RegistryKey`, so
+    /// `set_resource`/`take_resource` need no `&Lua`.
     resource_state: Rc<RefCell<resource::ResourceState>>,
-    /// Shared with the installed `scope` global's userdata -- same reasoning as `resource_state`,
-    /// and the same shape (`crate::scope`'s module doc), just for `Option<Arc<Scope>>` instead of
-    /// `Arc<Resource>`.
+    /// Shared with the `scope` global's userdata, as `resource_state`.
     scope_state: Rc<RefCell<scope::ScopeState>>,
-    /// Shared with the installed `provenance` global's userdata -- same reasoning as
-    /// `resource_state`. See `crate::provenance`'s module doc.
+    /// Shared with the `provenance` global's userdata, as `resource_state`.
     provenance_state: Rc<RefCell<provenance::ProvenanceState>>,
-    /// This component's `targets:` (`docs/adr/target-components.md`), as the name -> slot table
-    /// `event:to(id)` resolves against -- built **once** ([`ScriptWorker::with_targets`]) and
-    /// shared by `Rc` with every [`EventProxy`] this worker mints, never rebuilt per event. Empty
-    /// (the shared, allocation-free empty table -- see `proxy::no_targets`) unless
-    /// `with_targets` was called.
+    /// This component's `targets:` as the name-to-slot table `event:to(id)` resolves against
+    /// (`docs/adr/target-components.md`). Built once by [`ScriptWorker::with_targets`] and shared
+    /// by `Rc` with every [`EventProxy`]; the shared empty table (`proxy::no_targets`) until then.
     ///
-    /// Behind a `RefCell` (the `resource_state` shape) because two readers need it: `process`
-    /// here, and the `Event.new` global (`crate::construct`), installed in `new` *before*
-    /// `with_targets` can run and reading the table through this cell on every call rather than
-    /// capturing the empty one it was installed with. `process` borrows and bumps the `Rc` -- no
-    /// allocation, so `crates/logit-bench/tests/allocations.rs`'s `lua: process 1 event` pin is
-    /// unmoved by the cell.
+    /// Behind a `RefCell` because the `Event.new` global (`crate::construct`) is installed in
+    /// `new`, before `with_targets` runs, and reads the table through this cell on each call.
+    /// `process` only borrows and bumps the `Rc`, so the `lua: process 1 event` allocation pin
+    /// (`crates/logit-bench/tests/allocations.rs`) doesn't move.
     targets: Rc<RefCell<Rc<proxy::TargetTable>>>,
     _not_send_sync: PhantomData<*const ()>,
 }
@@ -118,12 +93,12 @@ pub struct ScriptWorker {
 /// What running a script's `process` returned, per the contract in `docs/design/lua-api.md`.
 ///
 /// `Emit` is boxed: `Event`'s inline attribute storage (`docs/design/data-model.md`'s small-map
-/// layout) makes it large enough that clippy flags the size gap against `Drop` otherwise.
+/// layout) makes it large enough that clippy flags the size gap against `Drop`.
 ///
-/// Every emitted event carries its own `Option<u16>` routing mark -- the target slot
-/// `event:to(id)` set on *that* event's handle, in `graph::targets_of` order, or `None` for an
-/// unrouted one. Per-event rather than per-call on purpose: `return {a:to("x"), b}` is a single
-/// `EmitMany` whose two events go two different ways (`docs/adr/target-components.md`).
+/// Every emitted event carries its own routing mark: the target slot `event:to(id)` set on that
+/// event's handle, in `graph::targets_of` order, or `None`. Per event, not per call, because
+/// `return {a:to("x"), b}` is one `EmitMany` whose events go two ways
+/// (`docs/adr/target-components.md`).
 pub enum ProcessOutcome {
     /// Pass the (possibly mutated) event through, to the slot it was marked for.
     Emit(Box<Event>, Option<u16>),
@@ -134,44 +109,28 @@ pub enum ProcessOutcome {
 }
 
 impl ScriptWorker {
-    /// Loads a script's source and sandboxes it (see [`sandbox_libs`]). Fails at load time if the
-    /// source doesn't parse/execute, doesn't define a `process` function, or defines a `flush`
-    /// global that isn't a function (or `nil`) -- a config error should surface immediately, not
-    /// at the first event, or first flush tick, that happens to flow through.
+    /// Loads and sandboxes a script (see [`sandbox_libs`]).
     ///
-    /// `process`/`flush` are resolved to `RegistryKey`s exactly once, here, rather than looked up
-    /// from `_G` on every call (see the field doc comments) -- one consequence worth being
-    /// explicit about (and written down in `docs/design/lua-api.md`): a script that reassigns
-    /// `_G.process`/`_G.flush` after this point has no effect on what actually runs. Reassigning
-    /// either mid-run isn't a documented or tested pattern to begin with, so this is very unlikely
-    /// to be a real behavior change for anything that exists, but it is a real narrowing of what
-    /// this boundary guarantees.
+    /// Fails at load, not at the first event or flush tick, if the source doesn't parse or run,
+    /// defines no `process` function, or binds `flush` to something other than a function or
+    /// `nil`.
+    ///
+    /// `process`/`flush` are resolved once, here, so a script that reassigns `_G.process` or
+    /// `_G.flush` later changes nothing that runs (`docs/design/lua-api.md` says so).
     pub fn new(source: &str) -> Result<Self, ScriptError> {
         let lua = Lua::new_with(sandbox_libs(), LuaOptions::new())?;
         remove_unsandboxed_base_globals(&lua)?;
-        // Installed *before* the script's own top-level code runs, unlike `telemetry` below --
-        // `trace` is an unconditional global (`crate::trace`'s module doc), and a script's
-        // top-level code can run arbitrary statements, including caching a global into a local
-        // (`local ctx = trace`, a completely ordinary pattern) before `process`/`flush` are even
-        // defined. Lua resolves a *function body's* global lookup at call time, which is what
-        // lets `telemetry::install` (below, after `.exec()`) get away with installing late -- but
-        // a top-level assignment happens once, during `.exec()` itself, and captures whatever
-        // `trace` was at that instant. Installing after `.exec()` would make that instant "before
-        // `trace` exists," permanently capturing `nil` -- caught in review with a script using
-        // exactly that pattern (`local incoming_trace = trace`), which then failed on every event.
+        // Every unconditional global is installed before `.exec()`: top-level code runs once,
+        // there, and a top-level alias (`local ctx = trace`) would otherwise capture `nil` for
+        // good (`crate::trace`'s module doc). Only `telemetry`, reached from function bodies at
+        // call time, installs later.
         let trace_table = trace::install(&lua)?;
-        // Same "before `.exec()`" reasoning as `trace_table` above, and the same unconditional
-        // (not opt-in) installation -- see `crate::resource`'s module doc.
         let resource_state = resource::install(&lua)?;
-        // Same "before `.exec()`" reasoning again -- see `crate::scope`'s module doc.
         let scope_state = scope::install(&lua)?;
-        // Same "before `.exec()`" reasoning again -- see `crate::provenance`'s module doc.
         let provenance_state = provenance::install(&lua)?;
-        // Same "before `.exec()`" reasoning again: `Event` is an unconditional global, and a
-        // top-level `local E = Event` must see the table, not `nil`. The constructor reads the
-        // targets *cell* at call time (`crate::construct::install`), so `with_targets` running
-        // later still holds -- an `Event.new` executed at script top level, during `.exec()`
-        // itself, sees the empty table, documented in `docs/design/lua-api.md`.
+        // `Event.new` reads the targets cell at call time, so a later `with_targets` still takes
+        // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
+        // (`docs/design/lua-api.md` says so).
         let targets = Rc::new(RefCell::new(proxy::TargetTable::empty()));
         construct::install(&lua, targets.clone())?;
         lua.load(source).exec()?;
@@ -180,15 +139,8 @@ impl ScriptWorker {
             _ => return Err(ScriptError::MissingProcess),
         };
         let process = lua.create_registry_value(process_fn)?;
-        // `Option<mlua::Function>::from_lua` maps a `nil` global to `None` (no `flush` at all --
-        // the stateless-processor case) and, for anything else, delegates to
-        // `Function::from_lua` -- which errors clearly (`error converting Lua <type> to
-        // function`) rather than silently treating a mistyped global (e.g. `flush = 5`, plausible
-        // from a copy-paste or a renamed variable) the same as "absent." That distinction matters
-        // more here than it would for a plain lookup: a script that thinks it flushes but doesn't
-        // would silently lose events at every flush tick with the eager-resolution approach below
-        // instead of erroring at load time the way the equivalent mistake on `process` already
-        // does via `MissingProcess`.
+        // `nil` becomes `None`; any other non-function (`flush = 5`) is a load error, not a
+        // silent "no flush" that loses events at every tick.
         let flush_fn: Option<mlua::Function> = lua.globals().get("flush")?;
         let flush = flush_fn.map(|f| lua.create_registry_value(f)).transpose()?;
         Ok(Self {
@@ -204,11 +156,11 @@ impl ScriptWorker {
         })
     }
 
-    /// Overwrites the `trace` global's `trace_id`/`span_id` (hex-encoded) so this worker's next
-    /// `process()`/`flush()` call reads the given context. Called once per incoming batch, before
-    /// its events reach `process`, and once before every `flush()` call with the fresh root that
-    /// flush's emission is sent under (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`,
-    /// `docs/adr/lua-flush-root-context.md`).
+    /// Sets the `trace` global's `trace_id`/`span_id` for the next `process()`/`flush()` call.
+    ///
+    /// `run_lua` calls this once per incoming batch, before its events reach `process`, and before
+    /// every `flush()` with the fresh root its emission is sent under
+    /// (`docs/adr/lua-flush-root-context.md`).
     pub fn set_trace_context(
         &self,
         trace_id: [u8; 16],
@@ -217,77 +169,59 @@ impl ScriptWorker {
         trace::set_context(&self.lua, &self.trace_table, trace_id, span_id).map_err(Into::into)
     }
 
-    /// Resets `resource` (`crate::resource`) so this worker's next `process()`/`flush()` call
-    /// reads the given resource, and clears any write left over from a previous call. Called once
-    /// per incoming batch, before its events reach `process`, and once before every `flush()`
-    /// call with an empty resource -- a flush runs in a root context, not the last batch's
-    /// (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`, `docs/adr/lua-flush-root-context.md`).
-    /// Unlike `set_trace_context`, no `&Lua` is needed, since `resource`'s state is a plain `Rc`,
-    /// not a `RegistryKey`.
+    /// Resets the `resource` global to `resource` for the next `process()`/`flush()` call,
+    /// discarding any earlier write.
+    ///
+    /// `run_lua` calls this once per incoming batch, and before every `flush()` with an empty
+    /// resource: a flush runs in a root context, not the last batch's
+    /// (`docs/adr/lua-flush-root-context.md`).
     pub fn set_resource(&self, resource: &Arc<Resource>) {
         resource::set(&self.resource_state, resource);
     }
 
-    /// `Some` if a script wrote `resource` since the last [`ScriptWorker::set_resource`] call --
-    /// `None`, the common case, if it never touched the global. See `crate::resource`'s module
-    /// doc; `run_lua` uses this both after a batch's `process()` calls and after `flush()`.
+    /// The script's write to `resource` since the last [`ScriptWorker::set_resource`], if any.
+    /// `run_lua` calls this after a batch's `process()` calls and after `flush()`.
     pub fn take_resource(&self) -> Option<Arc<Resource>> {
         resource::take(&self.resource_state)
     }
 
-    /// Resets `scope` (`crate::scope`) so this worker's next `process()`/`flush()` call reads the
-    /// given scope (or, for none, the all-clear defaults `crate::scope` documents), and clears any
-    /// write left over from a previous call. Called once per incoming batch, before its events
-    /// reach `process`, and once before every `flush()` call with `None` -- same root-context
-    /// rule, same reasoning and same plain-`Rc` shape as `set_resource`.
+    /// Resets the `scope` global to `scope` (defaults for `None`, per `crate::scope`) for the next
+    /// `process()`/`flush()` call, discarding any earlier write.
+    ///
+    /// Called as `set_resource` is, with `None` before every `flush()`.
     pub fn set_scope(&self, scope: &Option<Arc<Scope>>) {
         scope::set(&self.scope_state, scope);
     }
 
-    /// `Some` if a script wrote `scope` since the last [`ScriptWorker::set_scope`] call -- `None`,
-    /// the common case, if it never touched the global. See `crate::scope`'s module doc; `run_lua`
-    /// uses this both after a batch's `process()` calls and after `flush()`, the same two call
-    /// sites `take_resource` has.
+    /// The script's write to `scope` since the last [`ScriptWorker::set_scope`], if any. Called
+    /// where `take_resource` is.
     pub fn take_scope(&self) -> Option<Arc<Scope>> {
         scope::take(&self.scope_state)
     }
 
-    /// Overwrites the read-only `provenance` global's `origin`/`previous` fields so this worker's
-    /// next `process()`/`flush()` call reads the given provenance. Called once per incoming
-    /// batch, before its events reach `process`, and once before every `flush()` call with this
-    /// worker's own component as both `origin` and `previous` -- what the flushed batch is
-    /// stamped with (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`,
-    /// `docs/adr/lua-flush-root-context.md`). A plain `Rc<RefCell<..>>` mutation, like
-    /// `set_resource`, so unlike `set_trace_context` there's no `&Lua` call involved and nothing
-    /// that can fail.
+    /// Sets the read-only `provenance` global's `origin`/`previous` for the next
+    /// `process()`/`flush()` call.
+    ///
+    /// `run_lua` calls this once per incoming batch, and before every `flush()` with this worker's
+    /// own component as both, which is what the flushed batch is stamped with
+    /// (`docs/adr/lua-flush-root-context.md`).
     pub fn set_provenance(&self, provenance: logit_core::Provenance) {
         provenance::set(&self.provenance_state, provenance)
     }
 
-    /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics -- a
-    /// builder rather than a `new()` parameter, mirroring `with_diagnostics`/`with_timeout`/
-    /// `with_retry` everywhere else in this framework, specifically so this doesn't touch any of
-    /// this crate's existing `ScriptWorker::new(script)` call sites. Safe to call after `new`
-    /// returns (rather than needing to happen before the script's own top-level code runs): Lua
-    /// resolves a global lookup inside a function body at call time, not at the point the
-    /// function was defined, so a script's `process`/`flush` sees `telemetry` correctly regardless
-    /// of exactly when between `new` and the first call this was installed. See
-    /// `crate::telemetry` and `docs/design/lua-api.md`.
+    /// Installs a `telemetry` global so `process()`/`flush()` can emit their own metrics.
+    ///
+    /// Safe after `new`, since a function body resolves `telemetry` at call time; a top-level
+    /// alias of it captures `nil`. See `crate::telemetry` and `docs/design/lua-api.md`.
     pub fn with_telemetry(self, telemetry: Telemetry) -> Result<Self, ScriptError> {
         telemetry::install(&self.lua, telemetry)?;
         Ok(self)
     }
 
-    /// Sets `provenance.component` to this worker's own component id, for the rest of its
-    /// lifetime -- a builder, not a `new()` parameter, for the same "don't touch every existing
-    /// call site" reason as `with_telemetry` above. Safe to call any time after `new` returns,
-    /// including after a script's top-level code already ran: `provenance` is `UserData`, so a
-    /// top-level alias (`local p = provenance`) captured a *reference* to the same underlying
-    /// state this mutates, not a snapshot -- unlike `trace_table`/`resource_state`, nothing here
-    /// depends on *when* between `new` and the first `process()` call this runs, only that
-    /// `provenance` already exists as a global by the time any alias of it could be taken (which
-    /// `new` already guarantees, installing it before `.exec()`). See `crate::provenance`'s
-    /// module doc.
+    /// Sets `provenance.component` to this worker's component id for the rest of its lifetime.
+    ///
+    /// Safe any time after `new`: a top-level alias of `provenance` holds the userdata, not a
+    /// snapshot (`crate::provenance`'s module doc).
     pub fn with_component(self, id: &str) -> Self {
         provenance::set_component(&self.provenance_state, id);
         self
@@ -297,19 +231,13 @@ impl ScriptWorker {
     /// `logit_pipeline::graph::targets_of` slot order -- what `event:to(id)` resolves against, and
     /// the list an unknown id's error message names (`docs/adr/target-components.md`).
     ///
-    /// A builder, not a `new()` parameter, for the same "don't touch every existing call site"
-    /// reason as `with_telemetry`/`with_component`, and safe to call at any point after `new`
-    /// returns for the same reason `with_component` is: the table is reached only through the
-    /// `targets` cell -- by a live `EventProxy` minted per `process()` call, and by the `Event.new`
-    /// constructor (`crate::construct`), which reads the cell each time it's called rather than
-    /// capturing the table it was installed alongside. The one thing a script's top-level code
-    /// *can* do is call `Event.new` during `ScriptWorker::new`'s `.exec()`, before this can have
-    /// run; that event resolves `to(..)` against the empty table, exactly as a top-level
-    /// `resource` write sees the pre-first-batch state -- documented, not prevented. The table is
-    /// built **once**, here, and shared by `Rc` with every proxy this worker goes on to mint.
+    /// Safe any time after `new`: the table is reached only through the `targets` cell, which
+    /// `process` and `Event.new` (`crate::construct`) read per call. The one exception is an
+    /// `Event.new` in top-level code, which runs during `new` and sees the empty table. The table
+    /// is built once, here, and shared by `Rc` with every proxy.
     ///
-    /// Calling this with an empty slice is the same as never calling it: `event:to(..)` is then a
-    /// script error whatever id it names, never a silent forward.
+    /// An empty slice is the same as never calling this: `event:to(..)` is then a script error
+    /// for any id, never a silent forward.
     pub fn with_targets(self, targets: &[String]) -> Self {
         *self.targets.borrow_mut() = match targets.is_empty() {
             true => proxy::TargetTable::empty(),
@@ -318,19 +246,17 @@ impl ScriptWorker {
         self
     }
 
-    /// Bytes currently in use by this worker's Lua VM -- the strongest single signal a stateful
-    /// script is leaking state (e.g. accumulating something across `flush()` calls) has, since
-    /// nothing else in the process can see inside the VM. Wraps `mlua::Lua::used_memory`.
+    /// Bytes in use by this worker's Lua VM, the only view into a stateful script leaking state
+    /// across `flush()` calls.
     pub fn used_memory(&self) -> usize {
         self.lua.used_memory()
     }
 
-    /// Runs this worker's `process(event)` once. See `docs/design/lua-api.md` for the
-    /// proxy-vs-table-conversion tradeoff [`EventProxy`] exists to avoid.
+    /// Runs this worker's `process(event)` once.
     ///
-    /// The event reaches the script through a proxy carrying this worker's target table, so
-    /// `event:to(id)` inside `process()` resolves against the component's own `targets:` -- the
-    /// mark comes back out on the emitted event(s), never on the `Event` itself
+    /// The event reaches the script as an [`EventProxy`], not a converted table
+    /// (`docs/design/lua-api.md`). The proxy carries this worker's target table, and an
+    /// `event:to(id)` mark comes back on the outcome, never on the `Event` itself
     /// (`docs/adr/target-components.md`).
     pub fn process(&self, event: Event) -> Result<ProcessOutcome, ScriptError> {
         let process: mlua::Function = self.lua.registry_value(&self.process)?;
@@ -355,21 +281,16 @@ impl ScriptWorker {
         })
     }
 
-    /// Runs this worker's `flush()`, if the script defines one (the stateful-processor contract,
-    /// e.g. the built-in `aggregate` transform). Returns an empty `Vec` if the script has none.
+    /// Runs this worker's `flush()`, or returns nothing if the script defines none.
     ///
-    /// Each flushed event carries its own routing mark, exactly as a `process()`-emitted one does:
-    /// "a `flush()`-built event honours its mark like any other" (`docs/adr/target-components.md`).
-    /// A flush-built event is typically a `event:clone()` stashed from `process()`, and `clone`
-    /// copies both the mark and the target table, so `e:to("x")` works inside `flush()` too --
-    /// as does `Event.new(..):to("x")`, which reads the same table at call time.
+    /// Each flushed event carries its own routing mark, as a `process()`-emitted one does
+    /// (`docs/adr/target-components.md`). `event:clone()` copies the mark and the target table, so
+    /// a clone stashed in `process()` can be routed here, as can `Event.new(..):to("x")`.
     ///
-    /// `now` is the runtime's tick time (`crates/logit-pipeline/src/runtime.rs`'s `flush_now`,
-    /// the same `now_unix_nanos()` the native `aggregate` gets), handed to the script as
-    /// `flush(now)`: a decimal-nanos *string*, the same encoding `event.timestamp` uses, so a
-    /// flush-driven `Event.new{timestamp = now, ..}` has a timestamp without a general clock
-    /// (ADR `lua-event-constructor`). A script declaring `function flush()` ignores it -- plain
-    /// Lua semantics, no shim.
+    /// `now` is the runtime's tick time, the `now_unix_nanos()` a native `aggregate` gets, passed
+    /// as `flush(now)` in decimal nanos: a string, as `event.timestamp` is, so
+    /// `Event.new{timestamp = now, ..}` works with no clock in the sandbox
+    /// (`docs/adr/lua-event-constructor.md`). A `function flush()` ignores it.
     pub fn flush(&self, now: i64) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
         let Some(flush_key) = self.flush.as_ref() else {
             return Ok(Vec::new());
@@ -390,15 +311,12 @@ impl ScriptWorker {
     }
 }
 
-/// Extracts the events, each with its own `event:to(..)` routing mark, from a table a script
-/// returned from `process()` or `flush()`. `caller` names which, for the error message.
+/// Extracts the events, each with its routing mark, from a table `process()` or `flush()`
+/// returned. `caller` names which, for the error message.
 ///
-/// Validates the table is a proper contiguous `1..=n` sequence first, rather than reaching
-/// straight for `Table::sequence_values`, which stops at the first gap and never notices
-/// non-sequence keys -- a review reproduced `return {[2] = event}` silently succeeding as
-/// `EmitMany([])` (`sequence_values` finds index 1 missing and stops immediately), dropping the
-/// event with no indication anything was wrong instead of reporting the malformed return value.
-/// An empty table is a valid (empty) sequence -- equivalent to returning nothing.
+/// Validates a contiguous `1..=n` sequence rather than using `Table::sequence_values`, which
+/// stops at the first gap: `return {[2] = event}` would silently emit nothing. An empty table is
+/// valid and emits nothing.
 fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
@@ -429,9 +347,7 @@ mod tests {
         )
     }
 
-    /// An event carrying both a log and a metric -- the shape `kv_metrics` (workstream E)
-    /// produces, and the case the `has_*` accessors exist to make legible without a lossy
-    /// summary label.
+    /// An event carrying both a log and a metric, the shape `kv_metrics` produces.
     fn log_and_counter_event(name: &str, value: f64) -> Event {
         let mut event = counter_event(name, value);
         event.log = Some(LogRecord {
@@ -457,10 +373,7 @@ mod tests {
         }
     }
 
-    /// `ProcessOutcome` isn't `Debug` (see the comment further down this file), so
-    /// `Result::unwrap_err` doesn't work on `ScriptWorker::process`'s return value -- this is the
-    /// match-and-panic-on-`Ok` idiom the rest of this file already uses, wrapped up for the
-    /// several `event.log` tests that only care about the error text.
+    /// `unwrap_err` for `process`, whose `ProcessOutcome` isn't `Debug`.
     fn process_err(w: &ScriptWorker, event: Event) -> String {
         match w.process(event) {
             Err(err) => err.to_string(),
@@ -500,11 +413,7 @@ mod tests {
 
     #[test]
     fn timestamp_round_trips_exactly_as_a_string() {
-        // Lua's only numeric type is an IEEE-754 double (exact only to 2^53, ~9e15); a
-        // unix-nanos timestamp is routinely ~1.7e18. `event.timestamp` is a string specifically
-        // so this round-trips exactly instead of silently losing precision -- see the comment at
-        // its definition in proxy.rs. This test would have caught the original, wrong,
-        // Lua-number-based design (it read back as "1.7e+18" instead of the real value).
+        // A unix-nanos timestamp (~1.7e18) is past a double's exact range, hence the string.
         let w = worker(
             r#"
             function process(event)
@@ -527,10 +436,7 @@ mod tests {
 
     #[test]
     fn large_i64_attribute_round_trips_exactly() {
-        // 9_007_199_254_740_993 is exactly 2^53 + 1 -- one past the largest integer an IEEE-754
-        // double can represent exactly, and the review's own repro value: a prior version of
-        // value_to_lua always used LuaValue::Integer for I64, and this became ..._992 after
-        // nothing more than an identity assignment.
+        // 2^53 + 1, one past a double's exact range.
         let w = worker(
             r#"
             function process(event)
@@ -542,21 +448,13 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", 9_007_199_254_740_993i64);
         let out = emitted(w.process(event).unwrap());
-        // This value takes value_to_lua's string branch (it's outside the exact-integer range),
-        // and the identity assignment above hands that exact same string straight back --
-        // AttrsProxy::__newindex recognizes that as a no-op (lua_value_matches) and leaves the
-        // stored Value untouched, so the variant stays I64, not (as an earlier version of this
-        // test asserted, matching the then-real bug) Str. The precision fix itself -- no silent
-        // truncation to ..._992 -- is unaffected either way.
+        // The string branch's identity assignment is a no-op, so the variant stays I64.
         assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::I64(9_007_199_254_740_993)));
     }
 
     #[test]
     fn small_i64_attribute_stays_a_real_lua_number() {
-        // The fix for the above is conditional (a string only when a value doesn't survive an
-        // exact f64 round-trip), not a blanket string like `timestamp` -- ordinary small integer
-        // attributes should still arrive as genuine Lua numbers so scripts can do arithmetic on
-        // them directly. This is a regression test for that ergonomic, not just the precision fix.
+        // A small integer arrives as a Lua number, so a script can do arithmetic on it.
         let w = worker(
             r#"
             function process(event)
@@ -568,9 +466,7 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", 21i64);
         let out = emitted(w.process(event).unwrap());
-        // LuaJIT's dual-number mode keeps small-integer arithmetic as an integer, not a float --
-        // an even better outcome than originally assumed here (this test's first version expected
-        // F64, which was itself a wrong assumption caught by actually running it).
+        // LuaJIT's dual-number mode keeps small-integer arithmetic an integer, not a float.
         assert_eq!(out.attributes.get("doubled"), Some(&logit_core::Value::I64(42)));
     }
 
@@ -587,28 +483,17 @@ mod tests {
         let mut event = counter_event("hits", 1.0);
         event.attributes.insert("x", logit_core::Value::U64(u64::MAX));
         let out = emitted(w.process(event).unwrap());
-        // u64::MAX takes value_to_lua's string branch, and the identity assignment hands that
-        // exact string straight back -- recognized as a no-op (lua_value_matches), so the
-        // variant stays U64 rather than (as an earlier version of this test asserted, matching
-        // the then-real bug) collapsing to Str. The precision fix -- no wrapping negative -- is
-        // unaffected either way.
+        // The string branch's identity assignment is a no-op, so the variant stays U64.
         assert_eq!(out.attributes.get("x"), Some(&logit_core::Value::U64(u64::MAX)));
     }
 
-    // The tests below cover `AttrsProxy::__newindex`'s no-op-assignment rule (value.rs's
-    // `lua_value_matches`) -- the fix for the variant-collapse gap described in
-    // `docs/design/lua-value-type-preservation.md` and PR #6 review discussion_r3887008990. Before
-    // that fix, every one of these "stays X" assertions failed: an identity assignment
-    // (`event.attributes.x = event.attributes.x`) always turned the attribute into `Value::Str`
-    // (or, for the two number-branch repros the review added, `Value::I64`), regardless of what
-    // it started as.
+    // `AttrsProxy::__newindex`'s no-op-assignment rule (`lua_value_matches`), which keeps a
+    // variant through an identity assignment (`docs/design/lua-value-type-preservation.md`).
 
     #[test]
     fn bytes_attribute_with_valid_utf8_stays_bytes_through_identity_round_trip() {
-        // The headline regression: Value::Bytes whose content happens to be valid UTF-8 takes
-        // value_to_lua's plain-string branch (same as Value::Str) with nothing to mark which one
-        // it was -- this is also the concrete case logit-outputs::influxdb's tag handling treats
-        // differently (Str becomes a tag, Bytes doesn't).
+        // UTF-8 `Bytes` reaches Lua as a plain string, like `Str`; `influxdb_out` makes a `Str`
+        // a tag and a `Bytes` not, so the variant matters.
         let w = worker(
             r#"
             function process(event)
@@ -630,9 +515,7 @@ mod tests {
 
     #[test]
     fn bytes_attribute_with_invalid_utf8_still_round_trips_correctly() {
-        // Unchanged behavior, guarded: invalid-UTF-8 Bytes already round-trips correctly without
-        // this fix, because it fails lua_to_value's UTF-8 check on the way back regardless of the
-        // no-op-assignment rule. Not a case this fix needed to touch, but worth pinning down.
+        // Non-UTF-8 `Bytes` would round-trip even without the no-op rule, via `lua_to_value`.
         let w = worker(
             r#"
             function process(event)
@@ -650,8 +533,7 @@ mod tests {
 
     #[test]
     fn large_timestamp_attribute_stays_timestamp_through_identity_round_trip() {
-        // A Timestamp value large enough to take value_to_lua's string branch (unix-nanos
-        // timestamps always are, in practice).
+        // Large enough to take `value_to_lua`'s string branch, as real timestamps are.
         let w = worker(
             r#"
             function process(event)
@@ -671,10 +553,7 @@ mod tests {
 
     #[test]
     fn small_timestamp_attribute_stays_timestamp_through_identity_round_trip() {
-        // A Timestamp small enough to fit the exact-integer range takes value_to_lua's
-        // LuaValue::Integer branch instead (exact_i64_to_lua treats Timestamp exactly like I64) --
-        // covered separately from the large case above since it exercises `lua_value_matches`'s
-        // Integer arm, not its String arm.
+        // Exercises `lua_value_matches`'s Integer arm, not its String arm.
         let w = worker(
             r#"
             function process(event)
@@ -707,9 +586,7 @@ mod tests {
 
     #[test]
     fn f64_attribute_stays_f64_through_identity_round_trip() {
-        // The PR #6 review's other repro: LuaJIT's dual-number mode canonicalizes an integral
-        // Number (42.0) as an Integer, so a naive `lua_to_value` sees LuaValue::Integer(42) and
-        // silently produces Value::I64(42) instead of the original Value::F64(42.0).
+        // LuaJIT hands 42.0 back as an Integer; without the no-op rule this would become I64.
         let w = worker(
             r#"
             function process(event)
@@ -726,10 +603,7 @@ mod tests {
 
     #[test]
     fn fractional_f64_round_trips_correctly_the_contrast_case() {
-        // Unlike a whole-number float, a fractional one has no integer representation in LuaJIT
-        // to be canonicalized into, so it was never affected by the number-branch collapse the
-        // test above covers -- confirms the loss (before this fix) and the fix itself are both
-        // specific to integral floats, not floats in general.
+        // A fractional float stays a Lua number, so it never hit the integral-float collapse.
         let w = worker(
             r#"
             function process(event)
@@ -746,8 +620,7 @@ mod tests {
 
     #[test]
     fn modifying_a_bytes_attribute_still_converts_it_to_str() {
-        // The no-op rule is content-gated, not blanket: a script that genuinely builds a new
-        // string from an old value should still get Value::Str, same as before this fix.
+        // The no-op rule compares content: a new string built from an old value becomes `Str`.
         let w = worker(
             r#"
             function process(event)
@@ -766,8 +639,6 @@ mod tests {
 
     #[test]
     fn assigning_a_brand_new_string_key_produces_str() {
-        // A script constructing a genuinely new attribute must not be rejected or coerced to
-        // some other variant just because the no-op rule exists elsewhere.
         let w = worker(
             r#"
             function process(event)
@@ -782,9 +653,6 @@ mod tests {
 
     #[test]
     fn assigning_different_content_over_a_bytes_attribute_produces_str() {
-        // The rule compares content, not key: overwriting an existing key with genuinely
-        // different content is exactly as much a real change as writing a new key, and should
-        // convert the same way.
         let w = worker(
             r#"
             function process(event)
@@ -803,11 +671,8 @@ mod tests {
 
     #[test]
     fn generic_copy_all_attributes_script_preserves_every_variant() {
-        // The motivating real-world scenario from docs/design/lua-value-type-preservation.md: a
-        // script with no intention of touching a particular attribute -- here, one that just tags
-        // every event with `env` and otherwise copies attributes through via to_table(), a very
-        // ordinary pattern for a generic enrichment stage -- must not silently change that
-        // attribute's variant.
+        // The design doc's scenario: an enrichment stage copying every attribute back through
+        // `to_table()` must not change any attribute's variant.
         let w = worker(
             r#"
             function process(event)
@@ -836,12 +701,8 @@ mod tests {
 
     #[test]
     fn cross_key_copy_of_a_bytes_attribute_is_a_documented_residual_gap() {
-        // The rule this fix implements is keyed on an assignment's Lua-side content matching an
-        // *existing* attribute at the *same key* -- it can't (and isn't meant to) recognize that
-        // a value copied to a different key came from somewhere that remembers its variant, since
-        // by that point it's just a plain Lua string like any other. Asserted deliberately, as a
-        // documented contract rather than an accident -- see
-        // docs/adr/lua-value-identity-preservation.md's Consequences section.
+        // A documented gap: the no-op rule matches content at the same key only, so a copy to a
+        // new key becomes `Str` (`docs/adr/lua-value-identity-preservation.md`'s Consequences).
         let w = worker(
             r#"
             function process(event)
@@ -864,14 +725,9 @@ mod tests {
 
     #[test]
     fn nested_bytes_in_an_array_is_a_documented_residual_gap() {
-        // lua_value_matches doesn't recurse into Table: an Array/Map already round-trips
-        // correctly as a *shape* (a real Lua table, not a string), but the top-level identity
-        // check has no way to tell that a Table assignment's *contents* are unchanged without
-        // walking it -- and that walk can trigger a script-supplied __index and reenter this
-        // proxy, so it isn't attempted. The whole array is reconverted via lua_to_value, which
-        // has no memory of what the nested element used to be. Asserted deliberately, as a
-        // documented contract rather than an accident -- see
-        // docs/design/lua-value-type-preservation.md's "Known residual gaps".
+        // A documented gap: `lua_value_matches` doesn't recurse into a table, so a nested
+        // element's variant is lost (`docs/design/lua-value-type-preservation.md`'s "Known
+        // residual gaps").
         let w = worker(
             r#"
             function process(event)
@@ -898,12 +754,7 @@ mod tests {
 
     #[test]
     fn empty_table_decodes_as_map_not_array() {
-        // An empty Lua table can't carry which of Value::Array(vec![])/Value::Map(AttrMap::new())
-        // it came from -- there's nothing to inspect. An earlier version always decoded it as
-        // Array (fixing Array losing its variant by breaking Map the other way); this documents
-        // and tests the chosen default instead: an empty table becomes Map, since attributes
-        // (map-shaped) are the primary thing scripts manipulate. See value.rs's
-        // lua_table_to_value for the full reasoning.
+        // `{}` can't say which it came from; the chosen default is `Map` (`lua_table_to_value`).
         let w = worker(
             r#"
             function process(event)
@@ -923,9 +774,6 @@ mod tests {
 
     #[test]
     fn empty_map_stays_a_map() {
-        // The regression this round's review caught in the previous round's empty-array fix:
-        // Value::Map(AttrMap::new()) used to also become Array once the seq_len > 0 guard was
-        // removed. Must stay Map now that the empty case is handled explicitly.
         let w = worker(
             r#"
             function process(event)
@@ -945,13 +793,8 @@ mod tests {
 
     #[test]
     fn table_with_a_hole_and_an_extra_key_becomes_a_map_not_a_silently_truncated_array() {
-        // raw_len() (Lua's `#` operator) is undefined for a table with holes: {[1]="a", [2]="b",
-        // [4]="d", extra="c"} has 4 total pairs, and raw_len() happens to also return 4 here
-        // (LuaJIT's choice of border), so a count-based check couldn't tell this apart from a
-        // real 4-element sequence -- it used to silently decode as Array(["a","b",Null,"d"]),
-        // dropping "extra" with no error. validated_sequence_len now checks every key's actual
-        // identity, correctly recognizing "extra" makes this a non-sequence -- so it falls back
-        // to the Map branch instead, preserving all 4 entries rather than silently dropping one.
+        // LuaJIT's `#` returns 4 here, so a pair-count check would decode a truncated array and
+        // drop `extra` (`validated_sequence_len`).
         let w = worker(
             r#"
             function process(event)
@@ -987,9 +830,7 @@ mod tests {
         assert!(matches!(out.attributes.get("has_span"), Some(logit_core::Value::Bool(false))));
     }
 
-    /// The headline test for the multi-payload model (docs/adr/multi-payload-events.md): an
-    /// event carrying both a log and a metric reports both as present simultaneously, with no
-    /// lossy single "type" to check instead.
+    /// A log-and-metric event reports both present (`docs/adr/multi-payload-events.md`).
     #[test]
     fn has_metrics_and_has_log_are_both_true_on_a_mixed_event() {
         let w = worker(
@@ -1084,8 +925,6 @@ mod tests {
             end
             "#,
         );
-        // Provoke a real length mismatch to catch a copy-paste error in the fixture below rather
-        // than trusting hand-counted hex characters.
         let trace_id_hex = "ab000000000000000000000000000000";
         assert_eq!(trace_id_hex.len(), 32, "fixture bug: not a valid 16-byte trace id");
         let out = emitted(w.process(log_and_counter_event("hits", 1.0)).unwrap());
@@ -1310,11 +1149,8 @@ mod tests {
         assert!(matches!(out.attributes.get("log_is_nil"), Some(logit_core::Value::Bool(true))));
     }
 
-    /// `event.type` no longer exists (docs/adr/multi-payload-events.md) -- `__index`'s
-    /// existing catch-all still returns `nil` for any unrecognized key, so a script written
-    /// against the old field silently reads `nil` (falsy) rather than erroring. Worth pinning
-    /// down explicitly: this is a silent behavior change for any pre-existing script, not a hard
-    /// error that would surface it.
+    /// `event.type` doesn't exist (`docs/adr/multi-payload-events.md`), and reads as `nil`, not
+    /// an error, like any unknown key.
     #[test]
     fn reading_event_dot_type_is_nil_not_an_error() {
         let w = worker(
@@ -1375,9 +1211,7 @@ mod tests {
 
     #[test]
     fn non_sequence_table_return_is_a_clear_error_not_a_silent_empty_emit() {
-        // Table::sequence_values stops at the first gap: {[2] = event} has no key 1, so it used
-        // to find nothing and silently succeed as EmitMany([]), dropping the event with no
-        // indication anything was wrong. The review's exact repro.
+        // `Table::sequence_values` would stop at the missing key 1 and emit nothing.
         let w = worker("function process(event) return {[2] = event} end");
         let err = match w.process(counter_event("hits", 1.0)) {
             Ok(_) => panic!("expected process() to reject the malformed table"),
@@ -1410,13 +1244,9 @@ mod tests {
 
     #[test]
     fn stashing_and_returning_the_same_event_alias_fails_clearly_on_later_use() {
-        // AnyUserData::take empties the *shared Lua box*, not just the extracted Rust handle: a
-        // Lua userdata is a reference type, so `pending = event` doesn't clone anything at the
-        // Rust level -- `pending` and the returned value are the exact same underlying box. The
-        // review's exact repro: process() stashes the event *and* returns it in the same call;
-        // by the time flush() tries to use the stashed alias, it's already been taken/destructed.
-        // This must fail with this crate's own clear error, not mlua's internal
-        // "UserDataDestructed" terminology.
+        // `pending = event` aliases the userdata, and returning `event` takes the shared box, so
+        // using `pending` in `flush()` must fail with this crate's error, not mlua's
+        // "UserDataDestructed".
         let w = worker(
             r#"
             local pending = nil
@@ -1442,14 +1272,9 @@ mod tests {
 
     #[test]
     fn stashing_and_returning_event_attributes_fails_clearly_on_later_use() {
-        // The same failure class as the test above, discovered from a different place: caching
-        // `event.attributes` means the `AttrsProxy` handle stashed here is destructed too, once
-        // `into_inner` releases it as part of returning `event` from process() -- not just the
-        // `EventProxy` handle `take_event` catches directly. The review's exact repro: stash
-        // `event.attributes` (not `event` itself) in a Lua local, return the event, then read the
-        // stash from flush(). Before this fix, this failed with mlua's raw
-        // "a destructed callback or destructed userdata method was called" instead of this
-        // crate's own wording.
+        // As above for a stashed `event.attributes`: `into_inner` destructs the `AttrsProxy`
+        // when `event` is returned, and the later read must get this crate's wording, not mlua's
+        // "a destructed callback or destructed userdata method was called".
         let w = worker(
             r#"
             local pending_attrs = nil
@@ -1484,8 +1309,7 @@ mod tests {
 
     #[test]
     fn cloning_before_stashing_avoids_the_alias_problem() {
-        // The documented workaround for the pattern above: stash an independent clone, not the
-        // live alias, so returning the original doesn't invalidate the stashed copy.
+        // The documented workaround: stash a clone, not the live alias.
         let w = worker(
             r#"
             local pending = nil
@@ -1545,8 +1369,7 @@ mod tests {
         assert_eq!(out.attributes.get("snapshot_attr").and_then(|v| v.as_str()), Some("value"));
     }
 
-    /// `ScriptWorker` isn't `Debug` (it wraps a `Lua` VM), so `Result::unwrap_err` -- which needs
-    /// `Debug` on the `Ok` side to format its panic message -- doesn't work here.
+    /// `unwrap_err` for `ScriptWorker::new`, since `ScriptWorker` isn't `Debug`.
     fn expect_err(source: &str) -> ScriptError {
         match ScriptWorker::new(source) {
             Ok(_) => panic!("expected this script to fail to load"),
@@ -1567,12 +1390,7 @@ mod tests {
         assert!(matches!(expect_err("this is not lua ("), ScriptError::Lua(_)));
     }
 
-    /// `process`/`flush` are now resolved once at load time (a cached `RegistryKey`, not a fresh
-    /// `_G` lookup per call -- see `ScriptWorker::new`), which means a `flush` global that exists
-    /// but isn't a function (a plausible copy-paste or renamed-variable mistake, e.g. `flush = 5`)
-    /// must be rejected right here, the same way a missing `process` already is -- not resolved as
-    /// "no flush" and then silently emit nothing at every flush tick forever. The eager-resolution
-    /// review's exact repro.
+    /// `flush = 5` is a load error, not a silent "no flush".
     #[test]
     fn flush_bound_to_a_non_function_value_is_rejected_at_load_time() {
         assert!(matches!(
@@ -1617,11 +1435,8 @@ mod tests {
         assert!(matches!(out.attributes.get("has_require"), Some(logit_core::Value::Bool(true))));
     }
 
-    /// `StdLib` selection doesn't gate Lua 5.1's base library at all -- `loadfile`/`dofile`/
-    /// `load`/`loadstring`/`getfenv`/`setfenv` load unconditionally regardless of which `StdLib`
-    /// flags are set, unless explicitly removed (see `remove_unsandboxed_base_globals`). One test
-    /// per global, matching the os/io/ffi/require style above, not a combined assertion -- so a
-    /// regression in any single one fails on its own.
+    /// Asserts a base-library global `remove_unsandboxed_base_globals` removes is `nil`; one test
+    /// per global, so each fails on its own.
     fn assert_global_is_nil(global: &str) {
         let source = format!(
             "function process(event) event.attributes.present = ({global} ~= nil) return event end"
@@ -1664,9 +1479,8 @@ mod tests {
         assert_global_is_nil("setfenv");
     }
 
-    /// The one global this crate *adds* to the base set beside `telemetry`/`trace`/`resource`/
-    /// `scope`/`provenance`: `Event`, a table with the `new` constructor (`crate::construct`),
-    /// observed from inside `process()` the same way the sandbox checks above observe absence.
+    /// The `Event` global, with its `new` constructor (`crate::construct`), is visible in
+    /// `process()`.
     #[test]
     fn event_global_is_installed() {
         let w = worker(
@@ -1708,7 +1522,6 @@ mod tests {
         let flushed = w.flush(0).unwrap();
         assert_eq!(flushed.len(), 1);
 
-        // Second flush with nothing pending returns nothing.
         assert_eq!(w.flush(0).unwrap().len(), 0);
     }
 
@@ -1749,11 +1562,7 @@ mod tests {
         assert!(w.used_memory() > 0, "a loaded Lua VM should already have some memory in use");
     }
 
-    /// `trace.trace_id`/`trace.span_id` are readable inside `process()` -- installed for every
-    /// worker unconditionally (`crate::trace`'s module doc, unlike `telemetry`'s opt-in builder),
-    /// starting at the all-zero placeholder and changing once `set_trace_context` is called, the
-    /// same way `run_lua` calls it once per incoming batch
-    /// (`crates/logit-pipeline/src/runtime.rs`).
+    /// `trace` reads all-zero until `set_trace_context`, then the given ids.
     #[test]
     fn trace_context_is_readable_in_process_and_changes_after_set_trace_context() {
         let w = worker(
@@ -1790,11 +1599,8 @@ mod tests {
         );
     }
 
-    /// Regression: `trace` must be installed *before* the script's own top-level code runs
-    /// (`crate::trace`'s module doc). A top-level alias like this one runs once, during
-    /// `ScriptWorker::new`'s `Lua::load(source).exec()` -- if `trace` were installed after that
-    /// (as `telemetry` deliberately is), `incoming_trace` would capture `nil` permanently, and
-    /// every `process()` call would fail indexing it. Caught in review with exactly this script.
+    /// `trace` is installed before top-level code runs, so a top-level alias isn't `nil`
+    /// (`crate::trace`'s module doc).
     #[test]
     fn a_top_level_alias_of_trace_sees_a_real_table_not_nil() {
         let w = worker(
@@ -1816,10 +1622,7 @@ mod tests {
         );
     }
 
-    /// `scope` (`crate::scope`) is readable inside `process()`, the same as `resource` -- see
-    /// that module's own doc comment. Installed unconditionally, starting all-clear (`""`) before
-    /// any `set_scope` call, exactly like `trace_context_is_readable_in_process...` above covers
-    /// for `trace`.
+    /// `scope` is installed for every worker and reads `""` for `name` before any `set_scope`.
     #[test]
     fn scope_name_is_readable_in_process() {
         let w = worker(
@@ -1834,9 +1637,8 @@ mod tests {
         assert_eq!(out.attributes.get("scope_name").and_then(|v| v.as_str()), Some(""));
     }
 
-    /// A script writing both `scope.version` (`crate::scope`) and `resource.schema_url`
-    /// (`crate::resource`, W7) commits both independently: `ScriptWorker::take_scope`/
-    /// `take_resource` each report the new value after the same `process()` call.
+    /// Writes to `scope.version` and `resource.schema_url` in one `process()` both come back
+    /// through `take_scope`/`take_resource`.
     #[test]
     fn writing_scope_version_and_resource_schema_url_commits_through_take() {
         let w = worker(
@@ -1864,16 +1666,13 @@ mod tests {
     // Routing to a target (`docs/adr/target-components.md`, `docs/design/lua-api.md`)
     // ---------------------------------------------------------------------------------------
 
-    /// A worker whose component declares `targets:`, the way `run_lua` builds one from
-    /// `ResolvedComponent::targets` -- slot order is the declaration order here exactly as it is
-    /// there.
+    /// A worker with `targets:`, slot order being declaration order, as `run_lua` builds one.
     fn routing_worker(source: &str, targets: &[&str]) -> ScriptWorker {
         let targets: Vec<String> = targets.iter().map(|t| (*t).to_string()).collect();
         worker(source).with_targets(&targets)
     }
 
-    /// As `emitted`, keeping the routing mark `event:to(..)` set (a slot, or `None` for an
-    /// unrouted event) instead of discarding it.
+    /// As `emitted`, keeping the routing mark.
     fn emitted_with_mark(outcome: ProcessOutcome) -> (Event, Option<u16>) {
         match outcome {
             ProcessOutcome::Emit(e, target) => (*e, target),
@@ -1892,10 +1691,8 @@ mod tests {
             &["a", "b"],
         );
         let (event, mark) = emitted_with_mark(w.process(counter_event("hits", 1.0)).unwrap());
-        // A slot, not the id: `Destination::To(1)` and `targets[1]` are the same thing, and
-        // nothing on this path ever compares a string.
+        // A slot, not the id: nothing on this path compares a string.
         assert_eq!(mark, Some(1));
-        // The mark is the *only* thing `to` does -- the event itself comes back untouched.
         assert_eq!(event.metrics.len(), 1);
     }
 
@@ -1915,9 +1712,8 @@ mod tests {
         assert_eq!(mark, None, "to(nil) must send the event back to the ordinary consumers");
     }
 
-    /// "An id not in `targets:` is a script error, counted like every other script error, never a
-    /// silent forward" (`docs/adr/target-components.md`) -- and the message names the list the
-    /// operator actually configured, since the likeliest cause is a typo in one of them.
+    /// An unknown id is a script error naming the configured list, since the likeliest cause is a
+    /// typo (`docs/adr/target-components.md`).
     #[test]
     fn to_an_unknown_target_is_a_script_error_naming_the_configured_targets() {
         let w = routing_worker(
@@ -1936,9 +1732,7 @@ mod tests {
         );
     }
 
-    /// The same mistake on a component that declares no `targets:` at all -- by far the most
-    /// likely form of it (an `event:to(..)` copied into a plain `lua` component) -- says exactly
-    /// that, rather than printing an empty list.
+    /// With no `targets:`, the error says so rather than printing an empty list.
     #[test]
     fn to_on_a_component_with_no_targets_says_so() {
         let w = worker(
@@ -1952,9 +1746,7 @@ mod tests {
         assert!(err.contains("this component declares no targets"), "got: {err}");
     }
 
-    /// `return event:to("x")` has to work as one expression -- so `to` returns the *same* handle,
-    /// not a copy: mutating through the returned value is visible on the original, and the event
-    /// that comes back is the one that went in.
+    /// `to` returns the same handle, not a copy, so `return event:to("x")` works.
     #[test]
     fn to_returns_the_handle_for_chaining() {
         let w = routing_worker(
@@ -1972,9 +1764,8 @@ mod tests {
         assert_eq!(event.attributes.get("marked").and_then(|v| v.as_str()), Some("yes"));
     }
 
-    /// "A script fanning out a routed event gets two events headed the same way, and `b:to(nil)`
-    /// is how they diverge" (`docs/adr/target-components.md`): `clone` copies the mark, and the
-    /// copy shares the same target table, so it can be re-routed on its own.
+    /// `clone` copies the mark and shares the target table, so the copy can be re-routed alone
+    /// (`docs/adr/target-components.md`).
     #[test]
     fn clone_copies_the_mark() {
         let w = routing_worker(
@@ -1997,8 +1788,7 @@ mod tests {
         }
     }
 
-    /// The mark rides on the *handle*, so one `return {a, b}` can fork two ways -- the whole
-    /// reason `ProcessOutcome` carries a mark per event rather than one per call.
+    /// The mark rides on the handle, so one `return {a, b}` can fork two ways.
     #[test]
     fn a_table_return_carries_independent_marks() {
         let w = routing_worker(
@@ -2020,10 +1810,8 @@ mod tests {
         }
     }
 
-    /// "A `flush()`-built event honours its mark like any other" -- including one stashed as an
-    /// `event:clone()` during `process()` and routed at flush time, which is the stateful-router
-    /// shape the ADR describes. The clone shares its source's target table, which is what makes
-    /// `e:to("a")` resolvable from inside `flush()` at all.
+    /// A clone stashed in `process()` and routed in `flush()` keeps its mark, since it shares
+    /// its source's target table.
     #[test]
     fn flush_output_carries_marks() {
         let w = routing_worker(

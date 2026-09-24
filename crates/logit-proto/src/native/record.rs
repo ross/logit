@@ -1,34 +1,24 @@
 //! `MetricRecord`/`LogRecord`/`SpanRecord`/`SpanLink`/`SpanEvent`/`Exemplar`/`Event` wire encoding.
 //!
-//! **Every record type here is TLV-framed**, the same `tag(1) + len(varint) + payload` shape
-//! [`super::value`] uses for a `Value`: a field this reader doesn't recognize (an older reader
-//! against a newer writer) is skipped whole by byte count, never corrupting the rest of the
-//! record. `logit` is pre-release (`docs/adr/lossless-transit.md`) -- growing a record's field set
-//! or a `MetricKind`'s variant set is a straight reshape of this module, not a version-negotiated,
-//! dual-read compatibility path; skip-unknown-field framing is kept anyway as cheap hygiene against
-//! a torn write or a stray extra byte, not to support mixed-version readers and writers.
+//! **Every record type here is TLV-framed**, `tag(1) + len(varint) + payload` like a
+//! [`super::value`] `Value`, so an unrecognized field is skipped whole by byte count. `logit` is
+//! pre-release: growing a record's fields or `MetricKind`'s variants is a straight reshape of
+//! this module, and skip-unknown framing guards against a torn write, not mixed-version peers.
+//! `docs/design/wire-protocol.md`'s "Record layout" has every record's tag table.
 //!
-//! Two shared helper pairs do all the framing:
-//! - [`write_field`]/[`for_each_field`] for a record's own fields: `write_field` builds a nested,
-//!   variable-length payload (an attribute map, another TLV record, a blob whose length isn't
-//!   known until it's built) into a temporary buffer; `for_each_field` drives the read side,
-//!   calling back with each `(tag, payload)` pair and silently skipping a tag it's handed that the
-//!   caller's `match` doesn't claim.
-//! - [`write_scalar_field`] for a field whose payload has a length known *before* it's written --
-//!   a fixed-size integer, float, byte array, or dictionary index -- writes tag + len + payload
-//!   straight into the output buffer with no temporary allocation at all.
+//! Framing helpers:
+//! - [`write_field`] builds a payload whose length isn't known until it's built (an attribute
+//!   map, a nested record) in a temporary buffer; [`for_each_field`] reads fields back.
+//! - [`write_scalar_field`] writes a payload of known length (an integer, float, byte array, or
+//!   dictionary index) straight into the output, with no temporary buffer.
 //!
-//! **Only non-default field values are encoded**; an absent field decodes to that same default
-//! (`0`, `None`, empty), so a record carrying mostly-default values -- the common case -- stays
-//! small on the wire. This is safe by construction: encoding is skipped exactly when the value
-//! already equals what decoding an absent field produces, so a round trip is always exact whether
-//! or not a given field happened to be written.
+//! **Only non-default field values are encoded** (`Event.timestamp` is always written). An absent
+//! field decodes to the same default (`0`, `None`, empty), so a round trip is exact either way.
 //!
-//! A list of same-typed records (`MetricRecord::exemplars`, `SpanRecord::events`/`links`,
-//! `Event::metrics`) is `uvarint(count)` followed by `count` length-prefixed entries -- unlike a
-//! single embedded record (which gets its boundary for free from its own enclosing
-//! `write_field`/`for_each_field` frame), each entry here needs its own length prefix so its
-//! TLV-framed reader knows where to stop instead of consuming its neighbors' bytes too.
+//! A list of records (`MetricRecord::exemplars`, `SpanRecord::events`/`links`, `Event::metrics`)
+//! is `uvarint(count)` then `count` entries of `uvarint(len) + body`. A single embedded record
+//! takes its boundary from its enclosing field; a list entry needs its own length prefix so the
+//! reader stops before its neighbor.
 
 use crate::native::dict::{Dict, DictBuilder};
 use crate::native::value::{read_attr_map, read_value, write_attr_map, write_value};
@@ -43,9 +33,8 @@ use logit_core::{
 
 // -- Shared TLV framing helpers ----------------------------------------------------------------
 
-/// Writes one field as `tag(1) + len(varint) + payload`, where `build` fills the payload into a
-/// temporary buffer first -- for a payload whose length isn't known until it's built (a nested
-/// attribute map, another TLV record, a variable-length blob assembled from several parts).
+/// Writes one `tag(1) + len(varint) + payload` field, building the payload in a temporary buffer
+/// because its length isn't known up front.
 fn write_field(out: &mut BytesMut, tag: u8, build: impl FnOnce(&mut BytesMut)) {
     let mut tmp = BytesMut::new();
     build(&mut tmp);
@@ -54,11 +43,9 @@ fn write_field(out: &mut BytesMut, tag: u8, build: impl FnOnce(&mut BytesMut)) {
     out.extend_from_slice(&tmp);
 }
 
-/// Writes one field as `tag(1) + len(varint) + payload`, where the caller already knows `len`
-/// before writing a single payload byte -- a fixed-size integer, float, byte array, or dictionary
-/// index. No temporary buffer: `write_payload` appends straight into `out`. `debug_assert`s that
-/// `write_payload` wrote exactly `len` bytes, since a mismatch here would desync every field after
-/// it -- a bug in this module, not in wire input, so a debug-only check is the right cost/benefit.
+/// Writes one `tag(1) + len(varint) + payload` field whose `len` the caller knows up front,
+/// appending straight into `out`. A wrong `len` would desync every later field; it's a bug in
+/// this module, not bad input, so the check is a `debug_assert`.
 fn write_scalar_field(
     out: &mut BytesMut,
     tag: u8,
@@ -76,11 +63,8 @@ fn write_scalar_field(
     );
 }
 
-/// Drives the read side of [`write_field`]/[`write_scalar_field`]: walks `body`'s `tag(1) +
-/// len(varint) + payload` stream, handing each `(tag, payload)` pair to `visit`. A tag `visit`
-/// doesn't recognize is simply never matched by its `match` -- there is nothing else to do here,
-/// since the `len`-bounded slice was already carved out before `visit` ever saw it, so an unknown
-/// tag's bytes are silently and safely dropped along with the loop iteration that read them.
+/// Walks `body`'s fields, handing each `(tag, payload)` to `visit`. The payload is carved out
+/// before `visit` sees it, so a tag `visit` ignores is skipped with no further work.
 fn for_each_field(
     body: &mut Bytes,
     mut visit: impl FnMut(u8, &mut Bytes) -> Result<(), CodecError>,
@@ -100,9 +84,7 @@ fn for_each_field(
     Ok(())
 }
 
-/// Writes `count` then, for each item, a `len(varint) + body` entry built by `write_one` -- the
-/// shape a *list* of TLV-framed records needs (see this module's own doc comment for why a single
-/// embedded record doesn't need this but a list of them does).
+/// Writes a list of records: `count`, then a `len(varint) + body` entry per item.
 fn write_record_list<T>(
     out: &mut BytesMut,
     items: &[T],
@@ -117,12 +99,8 @@ fn write_record_list<T>(
     }
 }
 
-/// A destination [`read_record_list_into`] can decode straight into -- `reserve` up front (so the
-/// loop never reallocates more than once) then `push` per decoded item. Implemented for `Vec<T>`
-/// (what [`read_record_list`] hands back) and for [`MetricList`] directly, so `read_event`'s
-/// `FIELD_METRICS` arm can decode straight into the event's own `SmallVec` instead of building a
-/// throwaway `Vec` first and `.collect()`-ing it across -- see [`read_record_list_into`]'s doc
-/// comment for why that second step was a real, avoidable allocation.
+/// A destination [`read_record_list_into`] decodes into: `reserve` once, then `push_item` per
+/// entry. Implemented for `Vec<T>` and [`MetricList`].
 trait ListSink<T> {
     fn reserve(&mut self, additional: usize);
     fn push_item(&mut self, item: T);
@@ -139,9 +117,7 @@ impl<T> ListSink<T> for Vec<T> {
 
 impl ListSink<MetricRecord> for MetricList {
     fn reserve(&mut self, additional: usize) {
-        // Inherent `SmallVec::reserve` -- no `smallvec` dependency needed here, since calling an
-        // inherent method only requires naming the type (`MetricList`, re-exported by
-        // `logit_core`), not depending on the crate that defines it.
+        // Inherent `SmallVec::reserve`; naming `MetricList` needs no `smallvec` dependency.
         MetricList::reserve(self, additional);
     }
     fn push_item(&mut self, item: MetricRecord) {
@@ -149,15 +125,11 @@ impl ListSink<MetricRecord> for MetricList {
     }
 }
 
-/// The inverse of [`write_record_list`], decoding straight into a caller-supplied `out` rather
-/// than building a fresh collection and handing it back -- what lets `read_event`'s `FIELD_METRICS`
-/// arm decode directly into the event's `MetricList` (a `SmallVec<[MetricRecord; 1]>`) instead of
-/// collecting into an intermediate `Vec<MetricRecord>` first and `.into_iter().collect()`-ing that
-/// into the `SmallVec` -- two allocations (the `Vec`, then the `SmallVec`'s own spill) for what a
-/// single upfront `reserve` plus a push loop does in one. `count` is capped at 4096 for the
-/// `reserve` call, the same defensive pattern every other counted collection in this codec uses.
-/// [`read_record_list`] below is the `Vec`-returning convenience wrapper every other caller
-/// (exemplars, span events, span links) still uses -- its own single allocation is unchanged.
+/// The inverse of [`write_record_list`], decoding into `out`.
+///
+/// `read_event` decodes metrics straight into the event's `MetricList` (a `SmallVec`), one
+/// allocation where collecting through a `Vec` would cost two. The
+/// `reserve` is capped at 4096 against a corrupt count, like every counted collection here.
 fn read_record_list_into<T>(
     bytes: &mut Bytes,
     read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
@@ -183,8 +155,7 @@ fn read_record_list_into<T>(
     Ok(())
 }
 
-/// [`read_record_list_into`]'s `Vec`-returning convenience wrapper -- see that function's doc
-/// comment for the allocation story this split exists for.
+/// [`read_record_list_into`] into a new `Vec`.
 fn read_record_list<T>(
     bytes: &mut Bytes,
     read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
@@ -322,12 +293,10 @@ fn read_exponential_buckets(bytes: &mut Bytes) -> Result<(i32, Vec<u64>), CodecE
     Ok((offset, counts))
 }
 
-/// Writes one `MetricKind`'s payload -- see this module's own doc comment for the framing this
-/// sits inside (`MR_KIND`'s tag + len wrapper). Each variant's own byte layout is fixed and
-/// sequential, not itself TLV-framed: unlike a record's *own* fields, a `MetricKind` variant's
-/// shape is locked to its tag, so there is nothing to skip-unknown inside one -- an unrecognized
-/// *kind* tag is a hard [`CodecError::Malformed`] in [`read_metric_kind`], not a skip, since a
-/// metric with no interpretable value can't be meaningfully carried forward.
+/// Writes one `MetricKind` as a kind tag, `uvarint(len)`, and a fixed, sequential body; this sits
+/// inside `MR_KIND`'s field. A variant's layout is locked to its tag, so nothing inside is
+/// skippable, and [`read_metric_kind`] rejects an unknown kind tag as
+/// [`CodecError::Malformed`]: a metric with no interpretable value can't be carried forward.
 fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
     match kind {
         MetricKind::Sum(s) => {
@@ -367,8 +336,8 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
             out.extend_from_slice(&tmp);
         }
         MetricKind::Set(hll) => {
-            // `HyperLogLog::to_bytes()`'s blob, the same shape `Distribution`'s
-            // `DdSketch::to_java_bytes()` blob takes -- see `crates/logit-core/src/metric.rs`.
+            // `HyperLogLog::to_bytes()`'s blob, framed like `Distribution`'s. Unlike
+            // `to_java_bytes`, it's pinned to the `cardinality-estimator` version, not portable.
             let blob = hll.to_bytes();
             out.extend_from_slice(&[METRIC_SET]);
             write_uvarint(out, blob.len() as u64);
@@ -1111,7 +1080,7 @@ pub fn read_span_record(bytes: &mut Bytes, dict: &Dict) -> Result<SpanRecord, Co
     })
 }
 
-// -- Event: TLV fields, the one extensible record ------------------------------------------------
+// -- Event -------------------------------------------------------------------------------------
 
 const FIELD_TIMESTAMP: u8 = 1;
 const FIELD_ATTRIBUTES: u8 = 2;
@@ -1139,10 +1108,7 @@ pub fn write_event(dict: &mut DictBuilder, event: &Event) -> BytesMut {
     out
 }
 
-/// Decodes one event's TLV field stream. A field tag this reader doesn't recognize (a future
-/// addition to `Event`) is skipped whole -- `len` bytes consumed via `split_to`, nothing parsed --
-/// which is what lets an older reader keep decoding a newer writer's batches, per
-/// `docs/design/wire-protocol.md`'s version-skew requirement.
+/// Decodes one event's TLV field stream, skipping an unrecognized field tag whole.
 pub fn read_event(body: &mut Bytes, dict: &Dict) -> Result<Event, CodecError> {
     let mut timestamp = 0i64;
     let mut attributes = logit_core::AttrMap::new();
@@ -1159,7 +1125,7 @@ pub fn read_event(body: &mut Bytes, dict: &Dict) -> Result<Event, CodecError> {
                 read_record_list_into(field, |b| read_metric_record(b, dict), &mut metrics)?;
             }
             FIELD_SPAN => span = Some(read_span_record(field, dict)?),
-            _unknown => { /* forward compatibility -- see this function's own doc comment */ }
+            _unknown => { /* skipped whole: torn-write hygiene (module doc) */ }
         }
         Ok(())
     })?;
@@ -1325,8 +1291,7 @@ mod tests {
             }),
         ];
         for kind in kinds {
-            // Non-zero on every kind here too -- MR_FLAGS is a record-level field, orthogonal to
-            // which MetricKind variant it's attached to.
+            // MR_FLAGS is record-level, independent of the kind.
             let record = MetricRecord {
                 flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
                 ..MetricRecord::new(name, kind.clone())
@@ -1334,8 +1299,7 @@ mod tests {
             let out = dict_round_trip_metric(&record);
             match (&kind, &out.kind) {
                 (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
-                    // DDSketch has no PartialEq of its own but MetricKind's PartialEq compares
-                    // via to_java_bytes -- exercised directly here too, for clarity.
+                    // DDSketch has no PartialEq; MetricKind's compares via to_java_bytes.
                     assert_eq!(a, b);
                 }
                 (a, b) => assert_eq!(a, b, "kind mismatch for {a:?}"),
@@ -1567,9 +1531,7 @@ mod tests {
         assert!(out.span.is_none());
     }
 
-    /// The version-skew gate at the record level: an unrecognized `Event` field tag (a
-    /// hypothetical future field this reader predates) must be skipped whole, leaving every
-    /// known field around it intact.
+    /// An unrecognized `Event` field tag is skipped whole, leaving the known fields intact.
     #[test]
     fn an_unrecognized_event_field_tag_is_skipped_without_disturbing_known_fields() {
         let mut attrs = AttrMap::new();
@@ -1578,8 +1540,6 @@ mod tests {
 
         let mut dict = DictBuilder::default();
         let mut body = write_event(&mut dict, &event);
-        // Splice in a field this reader doesn't know (tag 200) with a plausible payload, as if a
-        // newer writer had added a field.
         write_field(&mut body, 200, |buf| buf.extend_from_slice(b"future field payload"));
 
         let mut dict_bytes = BytesMut::new();
@@ -1591,8 +1551,7 @@ mod tests {
         assert_eq!(out.attributes.get("k").and_then(|v| v.as_str()), Some("v"));
     }
 
-    /// Same guarantee, one level down: an unrecognized tag *inside* a metric record must be
-    /// skipped, leaving the record's known fields intact.
+    /// The same inside a metric record.
     #[test]
     fn an_unrecognized_metric_record_field_tag_is_skipped() {
         let name = logit_core::interner::intern("record_test_skip_metric");
@@ -1611,7 +1570,7 @@ mod tests {
         assert_eq!(out, record);
     }
 
-    /// Same guarantee inside a span record.
+    /// The same inside a span record.
     #[test]
     fn an_unrecognized_span_record_field_tag_is_skipped() {
         let span = full_span_record();

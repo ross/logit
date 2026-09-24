@@ -383,8 +383,8 @@ to ignore the one warning that matters.
 - `Cargo.toml`/`crates/logit-inputs/Cargo.toml`: `socket2` promoted to a direct dependency (already
   present transitively).
 - `crates/logit-config/src/lib.rs`: new `ReceiveConfig`, a sibling field of `Component::buffer`;
-  new `human_bytes::option` codec. `crates/logit-pipeline/src/graph.rs`: validation rules 16
-  (datagram-listener-only) and 17 (zero-bound rejection, `batch_flush_interval: 0s` exempted).
+  new `human_bytes::option` codec. `crates/logit-pipeline/src/graph.rs`: validation rules 17
+  (datagram-listener-only) and 18 (zero-bound rejection, `batch_flush_interval: 0s` exempted).
   `crates/logit-cli/src/pipeline.rs`: `build_spec` derives `UdpListenerConfig`/`InputRuntimeConfig`
   from `component.receive`.
 - New telemetry: `logit.component.receive.{datagrams,bytes,utilization,push.blocked.duration,latency,flushed}`,

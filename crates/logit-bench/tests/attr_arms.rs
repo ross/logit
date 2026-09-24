@@ -1,14 +1,14 @@
 //! The equivalence gate and the allocation counts for the attribute-sizing bake-off's bench-only
-//! arms (`docs/plans/event-sizing.md`'s **W3b**, [`logit_bench::bakeoff::attr_arms`]).
+//! arms ([`logit_bench::bakeoff::attr_arms`]).
 //!
 //! Two jobs, in the order they matter:
 //!
 //! 1. **Equivalence.** Every arm must produce the same sorted `(Symbol, Value)` sequence the
-//!    shipped `AttrMap` produces from the same input -- **including a repeated key, where the last
-//!    write wins**. A faster map that quietly keeps a different duplicate, or iterates in a
-//!    different order, is not a candidate: `attrs::merged`, `SeriesKey`, `keep`, the native
-//!    encoder's dictionary and Lua's `AttrsProxy` all depend on both properties. This is the same
-//!    discipline `tests/wire_format_bakeoff.rs` applies to the wire arms -- fidelity before
+//!    shipped `AttrMap` produces from the same input, **including a repeated key, where the last
+//!    write wins**. A faster map that keeps a different duplicate, or iterates in a different
+//!    order, is not a candidate: `attrs::merged`, `SeriesKey`, `keep`, the native encoder's
+//!    dictionary and Lua's `AttrsProxy` all depend on both properties.
+//!    `tests/wire_format_bakeoff.rs` applies the same rule to the wire arms: fidelity before
 //!    timing.
 //! 2. **Allocation counts and bytes**, through [`logit_bench::alloc::CountingAlloc`] wrapping
 //!    `System`. Counts are allocator-independent, so they belong here rather than in
@@ -16,12 +16,11 @@
 //!    (`docs/design/memory.md` §7).
 //!
 //! The counts below are **not** pinned the way `tests/allocations.rs` pins the shipped pipeline's:
-//! these are mirrors of types nothing ships yet, so an exact constant would be pinning a
-//! bench-only decision. What is asserted is the *relationships* the arms are being judged on --
-//! that today's clone asks for more bytes than it needs, that a thin nested map allocates less
-//! than a boxed one, that a key-set cache hit allocates once. Every measurement is printed as
-//! well, so `cargo nextest run -p logit-bench --no-capture -E 'test(attr_arms)'` produces the
-//! table W4 re-takes on the perf VM.
+//! these mirror types nothing ships, so an exact constant would pin a bench-only decision. What is
+//! asserted is the *relationships* the arms are judged on: that the shipped clone asks for more
+//! bytes than it needs, that a thin nested map allocates less than a boxed one, that a key-set
+//! cache hit allocates once. Every measurement is printed as well, so
+//! `cargo nextest run -p logit-bench --no-capture -E 'test(attr_arms)'` prints the table.
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::bakeoff::attr_arms::clone_arms::{is_scalar, MirrorMap, PodFlagMap};
@@ -31,7 +30,7 @@ use logit_bench::bakeoff::attr_arms::thin::{self, ThinMap, ThinValue};
 use logit_core::interner::{intern, Symbol};
 use logit_core::{AttrMap, Value};
 
-/// Installed for this test binary only -- no other crate's tests pay the counting overhead.
+/// Installed for this test binary only, so no other crate's tests pay the counting overhead.
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new(std::alloc::System);
 
@@ -83,7 +82,7 @@ fn every_arm_matches_attrmap_on_every_survey_shape() {
                 "key-set map at {width}/{mix:?}"
             );
             let mut cache = KeySetCache::new(64);
-            // Once to learn the shape, once to take the hit path -- both must agree.
+            // Once to learn the shape, once to take the hit path; both must agree.
             assert_eq!(pairs(cache.build(scratch.clone()).iter()), expected, "key-set miss path");
             assert_eq!(pairs(cache.build(scratch.clone()).iter()), expected, "key-set hit path");
             assert_eq!(cache.hits, 1, "the second build should hit");
@@ -93,7 +92,7 @@ fn every_arm_matches_attrmap_on_every_survey_shape() {
 
 /// A repeated key is the case that separates a correct bulk build from a fast one.
 /// `AttrMap::insert` is last-write-wins, so an arm that sorts unstably, or dedups keeping the
-/// first entry, produces a *different event* -- and real parsers do repeat keys (`statsd_in`'s
+/// first entry, produces a *different event*, and real parsers do repeat keys (`statsd_in`'s
 /// tags, `syslog_in`'s SD params).
 #[test]
 fn a_repeated_key_keeps_the_last_value_in_every_arm() {
@@ -128,8 +127,8 @@ fn a_repeated_key_keeps_the_last_value_in_every_arm() {
 }
 
 /// Every arm-C candidate must produce a map equal to the one the shipped clone produces, on every
-/// mix -- the bitwise-copy paths especially, since those are the ones that could silently duplicate
-/// a `Bytes` without bumping its refcount.
+/// mix: the bitwise-copy paths especially, since they could duplicate a `Bytes` without bumping
+/// its refcount.
 #[test]
 fn every_clone_candidate_equals_the_baseline_clone() {
     for width in shapes::WIDTHS {
@@ -151,8 +150,8 @@ fn every_clone_candidate_equals_the_baseline_clone() {
     }
 }
 
-/// A cloned `Value::Str` must share its buffer with the original, not copy it -- the property
-/// every bitwise-copy candidate has to preserve, and the one a bug in [`is_scalar`] would break.
+/// A cloned `Value::Str` must share its buffer with the original, not copy it: the property every
+/// bitwise-copy candidate has to preserve, and the one a bug in [`is_scalar`] would break.
 #[test]
 fn a_cloned_string_value_still_shares_its_buffer() {
     let map = MirrorMap::from_scratch(&shapes::scratch("share", 4, Mix::AllStr));
@@ -175,7 +174,8 @@ fn a_cloned_string_value_still_shares_its_buffer() {
 }
 
 /// `is_scalar` decides whether a bitwise copy is sound, so it is checked against every variant
-/// rather than trusted. A new `Value` variant makes this test fail to compile, which is the point.
+/// rather than trusted. A new `Value` variant fails to compile in `is_scalar`'s exhaustive match;
+/// add a case here when classifying it.
 #[test]
 fn is_scalar_classifies_every_value_variant() {
     let cases = [
@@ -221,7 +221,7 @@ fn the_thin_map_matches_attrmap_semantics() {
 }
 
 /// The nested fixtures must reproduce `docs/design/data-shapes.md` §5.3's measured pino-http
-/// shape -- 10 top-level attributes, four maps at median width 3, depth 2 -- or arm E's numbers
+/// shape (10 top-level attributes, four maps at median width 3, depth 2), or arm E's numbers
 /// describe some other record.
 #[test]
 fn the_nested_fixtures_match_the_measured_pino_shape() {
@@ -251,8 +251,8 @@ fn the_nested_fixtures_match_the_measured_pino_shape() {
     assert_eq!(thin_keys, today_keys, "same keys, same order");
 }
 
-/// Arm K's shape transitions, cached and not, must land in the same place -- and the cached one
-/// must actually reuse a key-set rather than rebuilding one that merely compares equal.
+/// Arm K's shape transitions, cached and not, must land in the same place, and the cached one
+/// must reuse a key-set rather than rebuild one that compares equal.
 #[test]
 fn a_cached_shape_transition_reuses_the_key_set() {
     let scratch = shapes::scratch("trans", 12, Mix::Mostly);
@@ -356,21 +356,20 @@ fn build_allocations_by_arm() {
         assert_eq!(uncached.len(), width);
         assert_eq!(hit_map.len(), width);
 
-        // The one relationship worth asserting: today's build allocates nothing inside the inline
-        // capacity and exactly once past it, while both bulk arms allocate whatever their width
-        // needs at any width above zero. That asymmetry is arm S's whole subject.
+        // The one relationship worth asserting: the shipped build allocates nothing inside the
+        // inline capacity and once past it, while both bulk arms allocate whatever their width
+        // needs at any width above zero. That asymmetry is arm S's subject.
         if width <= 8 {
             assert_eq!(attr.allocs, 0, "an inline `AttrMap` build allocates nothing at w={width}");
         } else {
             assert_eq!(attr.allocs, 1, "one spill at w={width}");
         }
-        // A cache hit costs the values vector and nothing else -- no key-set, no permutation.
+        // A cache hit costs the values vector and nothing else: no key-set, no permutation.
         assert_eq!(hit.allocs, 1, "a key-set cache hit allocates once at w={width}");
     }
 }
 
-/// What each arm allocates to **clone** one, and -- the finding this test exists for -- how many
-/// bytes it asks for.
+/// What each arm allocates to **clone** one, and how many bytes it asks for.
 ///
 /// smallvec's `reserve` rounds `len + additional` up to the next power of two, and `Clone` goes
 /// through it, so cloning a 9- or 12-entry `AttrMap` asks for **16 × 48 = 768 bytes** and a 17- or
@@ -405,13 +404,13 @@ fn clone_allocations_and_bytes_by_arm() {
             assert_eq!(exact.bytes, width as u64 * 48, "exactly `width` entries");
         }
         // Arm K clones an `Arc` (free) plus a values vector (one allocation at any non-zero
-        // width) -- where today's clone allocates only past the inline capacity.
+        // width), where the shipped clone allocates only past the inline capacity.
         assert_eq!(ks.allocs, u64::from(width > 0), "one values vector at w={width}");
     }
 }
 
 /// Arm E, case 1: a nested map as `Value::Map(Box<AttrMap>)` against an inline, exactly-sized one.
-/// Four boxed maps of three entries each is W1's costliest survey shape.
+/// Four boxed maps of three entries each is the costliest survey shape to clone.
 #[test]
 fn nested_map_allocations_today_versus_thin() {
     for shape in ["pino", "1map", "4map"] {
@@ -443,9 +442,9 @@ fn nested_map_allocations_today_versus_thin() {
     }
 }
 
-/// Arm E, case 2: `Scope` and `Resource` widths. A `Scope`'s median is 0 attributes, where today's
-/// embedded `SmallVec` still costs its full inline footprint and a `Vec`-backed one costs three
-/// words and allocates nothing.
+/// Arm E, case 2: `Scope` and `Resource` widths. A `Scope`'s median is 0 attributes, where the
+/// shipped embedded `SmallVec` still costs its full inline footprint and a `Vec`-backed one costs
+/// three words and allocates nothing.
 #[test]
 fn embedding_allocations_by_width() {
     for width in [0usize, 5, 17, 29] {
@@ -476,9 +475,9 @@ fn embedding_allocations_by_width() {
 // The gateway distribution and its cache
 // ---------------------------------------------------------------------------------------------
 
-/// The synthesized gateway must reproduce the two numbers `docs/design/data-shapes.md` §4 reports
-/// -- 196 distinct key-sets, top-1 9%, top-5 36% -- or arm K's adversarial case is adversarial in
-/// some other way. See `shapes::Gateway` for why it is a two-component distribution and not a Zipf.
+/// The synthesized gateway must reproduce the numbers `docs/design/data-shapes.md` §5.4 reports
+/// (196 distinct key-sets, top-1 9%, top-5 36%), or arm K's adversarial case is adversarial in
+/// some other way. `shapes::Gateway` says why it is a two-component distribution, not a Zipf.
 #[test]
 fn the_gateway_distribution_matches_the_surveys_numbers() {
     let gateway = Gateway::new(20_000);
@@ -501,9 +500,9 @@ fn the_gateway_distribution_matches_the_surveys_numbers() {
     assert!((top5 - 0.36).abs() < 0.02, "top-5 should be ~36%, got {top5:.3}");
 }
 
-/// What a bounded cache actually achieves on that distribution -- the number every gateway timing
-/// has to be read beside. 64 entries against 196 shapes is the survey's own comparison
-/// (`logit_core::interner::KeyCache` is 64 entries).
+/// What a bounded cache achieves on that distribution: the miss rate every gateway timing has to
+/// be read beside. 64 entries against 196 shapes is the survey's own comparison
+/// (`docs/design/data-shapes.md` §6; `logit_core::interner::KeyCache` is 64 entries).
 #[test]
 fn the_bounded_key_set_cache_misses_on_the_gateway_tail() {
     let gateway = Gateway::new(2000);

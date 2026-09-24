@@ -521,7 +521,7 @@ so both, plus `unwrap_batch`, are measured in `crates/logit-bench/tests/allocati
 | `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
-| `process` reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`) | **11** | not the 9 a naive add-up predicts (4 baseline + 1 `Box` + 3 for `MetricsProxy`'s own first-access create-and-cache + 1 for the "one small allocation" `MetricProxy`'s doc comment assumes a per-index handle costs) — measured directly (`lua_process_one_event_reading_metric_value`) against a script that indexes `event.metrics[1]` but never reads `.value` (still 11, so the field read itself is free, the same reason `event.span.name` below is) and one that indexes it *twice* (14, exactly +3 more) — a fresh, uncached `MetricProxy` costs the same 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for create-**and**-cache via a `RegistryKey`, even though it never caches one; see §8 item 6 and `crates/logit-bench/tests/allocations.rs`'s comment for the full finding |
+| `process` reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`) | **11** | not the 9 a naive add-up predicts (4 baseline + 1 `Box` + 3 for `MetricsProxy`'s own first-access create-and-cache + 1 for the per-index `MetricProxy` handle, if it cost the one allocation its size suggests) — measured directly (`lua_process_one_event_reading_metric_value`) against a script that indexes `event.metrics[1]` but never reads `.value` (still 11, so the field read itself is free, the same reason `event.span.name` below is) and one that indexes it *twice* (14, exactly +3 more) — a fresh, uncached `MetricProxy` costs the same 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for create-**and**-cache via a `RegistryKey`, even though it never caches one; see §8 item 6 and `crates/logit-bench/tests/allocations.rs`'s comment for the full finding |
 | `process` reading `event.metrics[1].value`, event has a **spilled** (9-attribute) `AttrMap` | **11** | identical to the row above, and to that same script's own passthrough baseline on this fixture (**5**, `lua_process_one_event_passthrough_on_a_spilled_event`) plus 6 — the regression guard for `MetricProxy::event` being a `Weak<RefCell<Event>>` rather than a strong `Rc` (`crates/logit-script/src/proxy.rs`): a strong `Rc` left alive by an uncollected `event.metrics[1]` temporary would make `EventProxy::into_inner`'s `Rc::try_unwrap` fall back to a real `Event::clone` here, a cost `sum_metric_event`'s own empty, inline `AttrMap` could never make visible above (`lua_process_one_event_reading_metric_value_on_a_spilled_event`) |
 | `process` reading `#event.metrics` only (`MetricsProxy`, no index) | **8** | 4 baseline + 1 `Box` + 3 for `MetricsProxy`'s first-access create-and-cache, and nothing more — confirms the row above's extra 3 comes entirely from indexing, not from touching `event.metrics` at all (`lua_process_one_event_reading_metric_len`) |
 | `process` reading `event.span.name` (`SpanProxy`) | **8** | 4 baseline + 1 `Box` + 3 for `SpanProxy`'s first-access create-and-cache, the same bucket `AttrsProxy`/`LogProxy`/`MetricsProxy` pay for theirs; the `Value::Str` read itself costs nothing (`lua_process_one_event_reading_span_name`) |
@@ -835,12 +835,12 @@ tokio scheduling, never in between and never the pre-`Arc` code's flat 3. If the
 handle is still alive, it clones (4). Two tests pin each ordering
 (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
 
-**1 is the likelier outcome, since [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md).**
-Before it, `run_output` held its `Arc` handle for all of `output.send`, typically real I/O and
-slower than a `Transform`'s local work, so the clone was likelier. Now `drain_inbox` drops its
-handle as soon as it matches the received `Delivered`, independent of how long the paired
-`write_loop`'s `output.send` takes, so the race is between two comparably cheap local operations.
-That is an expectation about typical scheduling, not a guarantee; both outcomes stay reachable.
+**4 is the likelier outcome.** `drain_inbox` moves the `Output` branch's handle into the sink's
+store (`SinkStore::push`). A `Memory` store holds it until `write_loop` commits the batch after
+`output.send`, typically real I/O and slower than a `Transform`'s local work, so the mutating
+branch usually finds the handle alive and clones. A `Disk` store drops it once the record is
+written, which shortens the window but doesn't close it. That is an expectation about typical
+scheduling, not a guarantee; both outcomes stay reachable.
 
 **An `Output` branch pays one more hop past `Fanout::send`.** The table measures `Fanout::send`
 alone. A sink's batch then goes through `drain_inbox` (`runtime.rs`,
@@ -1252,8 +1252,9 @@ The pattern for a new shape, in order of preference:
 
 Synthetic doesn't mean guessed. A literal should carry **provenance**: which software and config
 produced this shape, and when it was last checked against the real thing. `NGINX_SYSLOG_LINE` was
-derived from `examples/nginx/nginx.conf`'s `access_json_syslog` format and confirmed against a live
-nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly).
+derived from the `access_json_syslog` format `examples/nginx/nginx.conf` used before it became
+`access_semconv` (the fixture keeps the older shape so the pins stay comparable) and confirmed
+against a live nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly).
 Exploring real software is the right way to *inform* a fixture; the fixture is what gets committed.
 
 **Warm a directly-constructed `Event`'s message `Bytes`, or the count measures the fixture, not the
@@ -1294,7 +1295,7 @@ survey measures record count and attribute width over the same corpus but doesn'
 on one list), and `pino_http_log_event`'s per-map widths are a choice consistent with the measured
 median of 3, not a recorded shape.
 
-**Four of the six are built through the leg that really produces them**: a `tail_in`-shaped log
+**Three of the six are built through the leg that really produces them**: a `tail_in`-shaped log
 event (one `log.file.path` attribute and a JSON body) handed to the real `json` transform, not
 constructed attribute by attribute. So the code under measurement produces the width these
 fixtures pin, at the total count §5.3 measured on that leg. It also gives
@@ -1369,9 +1370,9 @@ other docs cite items by number.
      show: one allocation for the new value and one for the `take_*`-time `Arc::new(..)` commit.
      The copy-on-write clone itself measured free when the fixture's `Bytes` fields are `'static`
      and its `attributes` map starts empty and inline.
-   - **The exception is `event.metrics[i]` indexing.** `MetricProxy`'s doc comment says a per-index
-     handle isn't worth caching because it's "one small allocation," but it measures the *same* 3
-     allocations a cached, registry-keyed proxy costs, paid on *every* index. It is reported, not
+   - **The exception is `event.metrics[i]` indexing.** A per-index `MetricProxy` handle isn't
+     cached, and it measures the *same* 3 allocations a cached, registry-keyed proxy costs, paid on
+     *every* index (`MetricsProxy`'s doc comment records the number). It is reported, not
      fixed, per this file's rule to report an avoidable-looking cost in `logit-script` instead of
      fixing it here: a per-event cache trades a `RegistryKey` slot for scripts that never touch
      `event.metrics` against one for scripts that index it repeatedly, a real design trade-off.

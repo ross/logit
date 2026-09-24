@@ -16,29 +16,22 @@ async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 regex.workspace = true
-# `run_lua`'s remaining `eprintln!`s go through `Diagnostics`, and its own lifecycle events
-# (`ready`, `shutdown signal received`, `drain complete`, `degraded`/`recovered`) go straight
-# through `tracing` (docs/plans/operator-surface.md).
+# The runtime's lifecycle events (`ready`, `shutdown signal received`, `drain complete`,
+# `degraded`/`recovered`) go through `tracing` (docs/adr/tracing-for-self-logging.md).
 tracing.workspace = true
-# The disk-backed sink buffer's cursor.json (crates/logit-pipeline/src/disk_queue.rs), the same
-# tmp+rename JSON idiom crates/logit-inputs/src/tail/checkpoint.rs already uses for its own
-# same-sized checkpoint file.
+# `disk_queue`'s cursor.json, written with the tmp+rename idiom of
+# crates/logit-inputs/src/tail/checkpoint.rs.
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads -- Linux-only socket
-# options, so a Linux-only dependency, exactly as `logit-inputs` already declares `libc` for its
-# inotify wake source. Already present transitively at this exact version, so this adds no new
-# entry to the dependency tree.
+# `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads: Linux-only socket
+# options, so a Linux-only dependency.
 libc.workspace = true
 
 [dev-dependencies]
-# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) is enabled per
-# crate that has paused-clock tests, here and in `logit-inputs` -- a `dev-dependencies` override
-# of the same workspace dependency applies just to test/bench/example builds, not the normal
-# library build. It has to be declared in each such crate rather than inherited: a
+# `test-util` enables paused-clock tests. Declare it in each crate that has them: a
 # `cargo test -p <crate>` builds that package's feature set alone, so a sibling's override
-# doesn't carry over even though a `--workspace` build's feature unification hides that.
+# doesn't carry over, though a `--workspace` build's feature unification hides that.
 tokio = { workspace = true, features = ["test-util"] }
