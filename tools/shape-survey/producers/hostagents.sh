@@ -1,62 +1,46 @@
-# The `hostagents` producer: collectd and Telegraf, each from its own official distribution in
-# DEFAULT configuration, driving `logit` over every wire this repo has a listener for -- collectd's
-# binary protocol, carbon plaintext (twice, once per agent), a Prometheus scrape, and OTLP/gRPC.
-# See tools/shape-survey/configs/hostagents.yaml's header for the wire map and why the collectd leg
-# is this survey's only live measurement of metrics-per-event, and
-# tools/shape-survey/hostagents/{collectd,telegraf}/ for the agent images/config.
+# The `hostagents` producer: collectd and Telegraf, each from its official distribution in default
+# configuration, over five wires at once: collectd binary, carbon plaintext from each agent, a
+# Telegraf Prometheus scrape, and Telegraf OTLP/gRPC. configs/hostagents.yaml's header has the
+# wire map; tools/shape-survey/hostagents/ has the agent image and config.
 #
-# Sourced by script/shape-survey, which discovers this file by glob -- everything specific to this
-# producer lives here, under tools/shape-survey/hostagents/, and in
-# tools/shape-survey/configs/hostagents*.yaml. See tools/shape-survey/README.md's "Adding a
-# producer".
+# Representativeness and caveats: README "Producers" and "Caveats each author recorded".
 #
-# TWO RUNS, ONE PAIR OF LONG-LIVED AGENTS
+# Two runs against one pair of long-lived agents; only `logit` restarts in between, and the two
+# configs differ only in which side of the accumulator a batch is measured from:
 #
-# collectd and Telegraf start once and run for the whole producer; `logit` restarts once in the
-# middle, wire.yaml/main.yaml only differing in which side of the accumulator a batch is measured
-# from (hostagents.yaml's header has the full reasoning):
-#
-#   start collectd, telegraf (pushing/exposing against a not-yet-up "logit" -- their first flush
-#   may be lost, same as any agent started before its collector)
-#   start_logit hostagents.yaml             (default batching)
-#   capture SHAPE_SURVEY_DURATION (default 600s)
+#   start_logit hostagents.yaml, then start collectd and telegraf     (default batching)
+#   capture SHAPE_SURVEY_DURATION (default 600s); stop_logit; summarize
+#   start_logit hostagents-wire-grouped.yaml   (batch_max_events: 1 on accumulator-fronted legs)
+#   capture SHAPE_SURVEY_HOSTAGENTS_WIRE_DURATION (default 180s: it measures batch shape only)
 #   stop_logit; summarize
-#   start_logit hostagents-wire-grouped.yaml (batch_max_events: 1 on the accumulator-fronted legs)
-#   capture SHAPE_SURVEY_HOSTAGENTS_WIRE_DURATION (default 180s -- this run exists to look at
-#     batch shape, not to accumulate a second full-length capture)
-#   stop_logit; summarize
+#
+# Between the two runs no `logit` container exists, so whatever the agents push then is lost and
+# outside either capture.
 
 SHAPE_SURVEY_HOSTAGENTS_DURATION_DEFAULT=600
 SHAPE_SURVEY_HOSTAGENTS_WIRE_DURATION_DEFAULT=180
 
-# Builds the collectd image (tools/shape-survey/hostagents/collectd/) and echoes its tag. Not
-# tracked by survey_image/SHAPE_SURVEY_SKIP_IMAGE -- that machinery is for the one shared
-# `logit:shape-survey` tag two concurrent producers race on; this is a small, producer-local image
-# nobody else touches, so it just rebuilds (fast once Docker's own layer cache is warm).
+# Builds the collectd image and echoes its tag. SHAPE_SURVEY_SKIP_IMAGE doesn't apply: this image
+# is producer-local, so no concurrent run races on it, and it rebuilds from the layer cache.
 survey_hostagents_collectd_image() {
     local img="shape-survey-hostagents-collectd:local"
     ${DOCKER} build -t "${img}" "${ROOT}/tools/shape-survey/hostagents/collectd" >/dev/null
     echo "${img}"
 }
 
-# Starts collectd and Telegraf as long-lived services under this producer's network, and appends
-# both agents' versions and image identities to the CURRENT ${SURVEY_RUN_DIR}/provenance.txt
-# (survey_start_service already does the image half; this adds the version numbers the
-# representativeness line quotes). Called once; both configs' pipelines read from the same two
-# containers.
+# Starts collectd and Telegraf once for both runs, and appends their versions to the current
+# run's provenance.txt (`survey_start_service` already appends the images).
 survey_hostagents_services() {
     local collectd_img
     collectd_img="$(survey_hostagents_collectd_image)"
 
-    # No readiness probe the image has a binary for (no procps in Debian's collectd install) --
-    # collectd runs as PID 1 in the foreground (`collectd -f`, the Dockerfile's CMD), so
-    # /proc/1/comm is the cheapest positive proof it is that process and not a crash loop.
+    # The image has no procps; collectd runs as PID 1 in the foreground (the Dockerfile's CMD), so
+    # /proc/1/comm proves it is running and not crash-looping.
     survey_start_service collectd --ready-cmd 'test "$(cat /proc/1/comm)" = collectd' -- \
         "${collectd_img}"
 
-    # The official image's own /etc/telegraf/telegraf.conf (default [agent] + default-enabled
-    # inputs) plus this producer's outputs-only drop-in, merged via --config-directory rather than
-    # a custom image -- see tools/shape-survey/hostagents/telegraf/outputs.conf's header.
+    # The official image's own telegraf.conf plus this producer's outputs-only drop-in, merged via
+    # --config-directory rather than a custom image (see hostagents/telegraf/outputs.conf).
     survey_start_service telegraf --ready-http http://telegraf:9273/metrics -- \
         -v "${ROOT}/tools/shape-survey/hostagents/telegraf/outputs.conf:/etc/telegraf/telegraf.d/outputs.conf:ro,z" \
         telegraf:1.32-alpine \
@@ -72,10 +56,8 @@ survey_hostagents_services() {
     } >>"${SURVEY_RUN_DIR}/provenance.txt"
 }
 
-# Both agents' version/image identity, re-appended to whichever run directory is current --
-# survey_start_service/the block above only wrote them into the FIRST run directory
-# (survey_hostagents_services runs once; survey_out_dir runs twice). Called again before the
-# second (wire-grouped) run so its provenance.txt is self-contained too.
+# Re-appends both agents' versions for the second run, whose provenance.txt would otherwise lack
+# them: the agents start once, but `survey_out_dir` runs twice.
 survey_hostagents_reprovenance() {
     {
         echo "collectd package version: $(${DOCKER} exec "$(survey_container_name collectd)" \
@@ -86,16 +68,14 @@ survey_hostagents_reprovenance() {
     } >>"${SURVEY_RUN_DIR}/provenance.txt"
 }
 
-# This producer's own section of summary.md (tools/shape-survey/README.md's "Your own summary
-# section"), shared by both runs -- reads only /out/summary.json, never shape.log.
+# This producer's own summary.md section, shared by both runs, computed from summary.json alone.
 survey_hostagents_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
 """Renders the `hostagents` producer's section of summary.md from /out/summary.json.
 
-The headline: `logit.shape.metrics` on the collectd leg is this survey's only live measurement of
-metrics-per-event, because every other input here (and every metrics input in this repo except
-collectd_in) emits one metric per event.
+`logit.shape.metrics` on the collectd leg is the survey's only live measurement of
+metrics-per-event: every other metrics input in this repo emits one metric per event.
 """
 
 import json
@@ -293,12 +273,9 @@ print("hostagents: wrote /out/section.md")
 PYEOF
 }
 
-# Runs one logit config against the already-running collectd/telegraf pair for `duration` seconds,
-# into a freshly created run directory, and writes that directory's provenance + representativeness
-# + summary (with this producer's section appended). `first` (1/0) selects whether
-# survey_hostagents_services (which also appends the agents' versions to provenance.txt) has
-# already run -- the wire-grouped run instead calls survey_hostagents_reprovenance, since the
-# agents are not restarted between the two.
+# Runs one logit config for `duration` seconds into a new run directory, with its provenance and
+# summary. `first` is 1 to start the agents after `logit`, or 0 when they're already running and
+# only their versions need re-appending.
 survey_hostagents_run() {
     local config="$1" duration="$2" representativeness="$3" note="$4" first="$5"
     local run_dir
@@ -338,9 +315,8 @@ survey_hostagents() {
         "variant: default batching (accumulator regroups across datagrams/lines; see the sibling hostagents-wire-grouped run directory for the wire's own grouping)" \
         1
 
-    # Snapshot both agents' logs from the default-batching phase before the second logit run
-    # overwrites SURVEY_RUN_DIR -- survey_cleanup's automatic capture at the very end only reaches
-    # whichever run directory is current then (the wire-grouped one).
+    # Snapshot the agents' logs into the first run directory now: cleanup's automatic capture
+    # reaches only the run directory current at the end.
     survey_service_logs collectd
     survey_service_logs telegraf
 
