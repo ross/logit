@@ -991,10 +991,16 @@ components:
 
 - **Raise `max_packet_bytes:` to `8192`.** The `1432` default is sized for a UDP path MTU; DogStatsD
   clients pack up to 8192 bytes into a Unix-socket packet, which is also the Agent's default read
-  buffer. Lines are packed into packets exactly as into UDP datagrams, on both Unix transports.
+  buffer. Lines are packed into packets as into UDP datagrams, on both Unix transports.
 - **A full Agent queue makes a `unix` send wait, not drop.** Unlike UDP, a Unix datagram socket
   pushes back on the sender. Each datagram's wait is bounded by `connect_timeout:` (default `5s`);
   past it the send fails and the batch is retried or dropped under the sink's usual rules.
+- **`unix` connects its socket to the path and follows a restarted Agent.** A connected sender
+  waits for room without spinning. When the Agent restarts and rebinds the path, the next send is
+  refused on the old connection. If that's a batch's first datagram, `statsd_out` reconnects and
+  sends it again at once, so a restart between batches loses nothing; later in a batch, the batch
+  fails under the sink's usual rules and the next send reconnects. Each reconnect counts
+  `logit.output.reconnects`.
 - **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
   4-byte little-endian integer (unverified against a real Agent,
   [`known-gaps.md`](known-gaps.md)). A write that fails having accepted zero bytes is retried once

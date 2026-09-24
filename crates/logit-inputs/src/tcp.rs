@@ -10,13 +10,13 @@
 //! `syslog_in`, LF-delimited lines for a line protocol whose messages may *start* with a digit
 //! (`graphite_in` plaintext, `statsd_in`), carbon's 4-byte big-endian length prefix
 //! (`docs/adr/graphite-carbon-relay.md`), or DogStatsD's 4-byte little-endian one (`statsd_in`'s
-//! `transport: unix_stream`). A builder rather than a [`TcpListenerConfig`] field:
-//! that struct is the image of the `receive:` config block, and framing is not something an
-//! operator sets.
+//! `transport: unix_stream`; ADR `datadog-agent-and-intake-relay`, decision 12). A builder rather
+//! than a [`TcpListenerConfig`] field: that struct is the image of the `receive:` config block, and
+//! framing is not something an operator sets.
 //!
 //! **A Unix stream socket runs on the same loop.** [`TcpListener::unix`] binds a `SOCK_STREAM`
 //! Unix socket (`statsd_in`'s `transport: unix_stream`) through [`crate::unix`] and serves each
-//! connection exactly as a plaintext TCP one: the same cap, first-byte and idle deadlines, framing,
+//! connection as a plaintext TCP one: the same cap, first-byte and idle deadlines, framing,
 //! and batching. Two things don't carry over: TLS ([`TcpListener::with_tls`] refuses it, since a
 //! Unix socket is local and plaintext), and the accept-queue gauges ([`AcceptQueueSampler`] reads
 //! `TCP_INFO`, which a Unix socket has no counterpart for).
@@ -173,9 +173,8 @@ pub enum FramingMode {
     /// which is how carbon frames a pickle batch (`crates/logit-proto/src/graphite/pickle.rs`).
     LengthPrefixed,
     /// A 4-byte **little-endian** payload length, then that many bytes: DogStatsD's stream Unix
-    /// socket, where the payload is one datagram's worth of newline-separated lines. That is what
-    /// the Datadog Agent's `pkg/dogstatsd/listeners/uds_stream.go` reads and `datadog-go`'s stream
-    /// writer sends; UNVERIFIED against either (`docs/known-gaps.md`).
+    /// socket, where the payload is one datagram's worth of newline-separated lines. UNVERIFIED;
+    /// ADR `datadog-agent-and-intake-relay`, decision 12, has the source.
     LengthPrefixedLe,
 }
 
