@@ -1,31 +1,30 @@
-//! Timings for the attribute-sizing bake-off's bench-only arms -- `docs/plans/event-sizing.md`'s
-//! **W3b**, over [`logit_bench::bakeoff::attr_arms`]. Arm **C** (the clone path), arm **E**
-//! (per-embedding capacity) and arm **K** (a shared key-set) each have a module below; the arms
-//! themselves, and every simplification their mirrors make, are documented where they are defined.
+//! Timings for the attribute-sizing bake-off's bench-only arms, over
+//! [`logit_bench::bakeoff::attr_arms`]. Arm **C** (the clone path), arm **E** (per-embedding
+//! capacity) and arm **K** (a shared key-set) each have a module below; each arm's design, and
+//! every simplification its mirror makes, is documented where it is defined.
 //!
-//! **Allocator: real jemalloc, no counting wrapper**, for `benches/size_vs_alloc.rs`'s reasons --
+//! **Allocator: real jemalloc, no counting wrapper**, for `benches/size_vs_alloc.rs`'s reasons:
 //! production runs jemalloc ([ADR `jemalloc-global-allocator`](../../../docs/adr/jemalloc-global-allocator.md)),
-//! and a counter increment inside the timed region distorts exactly the operation in question. So
-//! there is no allocation column here; the counts for these same arms and shapes live in
-//! `tests/attr_arms.rs`.
+//! and a counter increment inside the timed region distorts the operation being timed. So there
+//! is no allocation column here; the counts for these arms and shapes are in `tests/attr_arms.rs`.
 //!
-//! **Everything is measured in the "consumed" shape**, and that is not incidental. divan stores
-//! each iteration's return value in a pre-allocated slot when the output needs dropping
-//! (`divan-0.1.21`'s `benchmark/mod.rs`), so a bench that *returns* a ~400-byte
-//! `SmallVec<[(Symbol, Value); 8]>` writes 400 bytes into a fresh slot of a large buffer every
-//! iteration -- memory traffic the benched code never performs. Every comparison below therefore
-//! builds or clones, `black_box`es a *reference*, and returns `()`, which puts the drop inside the
-//! timed region and the output write nowhere. [`clone_c::artifact`] measures the same clone both
-//! ways so the size of that distortion is on the record, and [`clone_c::drop_only`] isolates the
-//! drop so "clone + drop" can be split.
+//! **Everything is measured in the "consumed" shape.** divan stores each iteration's return value
+//! in a pre-allocated slot when the output needs dropping (`divan-0.1.21`'s `benchmark/mod.rs`),
+//! so a bench that *returns* a ~400-byte `SmallVec<[(Symbol, Value); 8]>` writes 400 bytes into a
+//! fresh slot of a large buffer every iteration: memory traffic the benched code never performs.
+//! Every comparison below builds or clones, `black_box`es a *reference*, and returns `()`, which
+//! puts the drop inside the timed region and the output write nowhere. [`clone_c::artifact`]
+//! measures the same clone both ways to size that distortion, and [`clone_c::drop_only`] isolates
+//! the drop so "clone + drop" can be split.
 //!
-//! **Run it pinned**, on the perf VM (`docs/design/performance.md` §0):
+//! **Run it pinned**, on the perf VM (`docs/design/performance.md` §0); unpinned runs on
+//! heterogeneous cores are bimodal:
 //!
 //! ```sh
 //! taskset -c 2 cargo bench -p logit-bench --bench attr_arms
 //! ```
 //!
-//! **None of these numbers belong in a repository document.**
+//! Record numbers in `docs/design/performance.md` §8 from VM runs only.
 
 use divan::counter::ItemsCount;
 use divan::{black_box, Bencher};
@@ -38,7 +37,7 @@ use logit_core::interner::{intern, Symbol};
 use logit_core::{Event, Value};
 use logit_pipeline::Transform;
 
-/// The real allocator, unwrapped -- see this file's module doc.
+/// The shipped allocator, unwrapped; see the module doc.
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -48,9 +47,9 @@ fn main() {
 
 /// Consumes a value **inside** the timed region: makes it opaque to the optimizer, then drops it.
 ///
-/// This is the "consumed" shape this file's module doc describes, and every comparison below uses
-/// it. Returning `()` -- a zero-sized output that needs no drop -- is what keeps divan on its
-/// cheap sample loop instead of writing each iteration's result into a defer slot.
+/// The "consumed" shape the module doc describes, used by every comparison below. Returning `()`,
+/// a zero-sized output that needs no drop, keeps divan on its cheap sample loop instead of writing
+/// each iteration's result into a defer slot.
 #[inline]
 fn consume<T>(value: T) {
     black_box(&value);
@@ -75,7 +74,7 @@ fn mix(label: &str) -> Mix {
     }
 }
 
-/// **Arm C -- the clone path.**
+/// **Arm C: the clone path.**
 mod clone_c {
     use super::*;
 
@@ -123,9 +122,10 @@ mod clone_c {
         }
     }
 
-    /// The same candidates at the commonest log width, across the value mixes -- all scalars (the
-    /// only mix a bitwise copy is legal on, and the one W2 measured), 75% strings (the middle of
-    /// the survey's band), and all strings (an atomic increment per entry).
+    /// The same candidates at the commonest log width, across the value mixes: all scalars (the
+    /// only mix a bitwise copy is legal on, and the one `size_vs_alloc.rs`'s `attr_clone`
+    /// measures), 75% strings (the middle of the survey's band), and all strings (an atomic
+    /// increment per entry).
     mod by_mix {
         use super::*;
 
@@ -160,27 +160,27 @@ mod clone_c {
         }
     }
 
-    /// The shipped `AttrMap::clone` itself, as a control on the mirror: if these two disagree past
-    /// noise, the mirror is not measuring what it claims to.
+    /// The shipped `AttrMap::clone`, as a control on the mirror: if this and `by_width::baseline`
+    /// disagree past noise, the mirror isn't measuring what it claims to.
     #[divan::bench(args = WIDTHS)]
     fn real_attrmap(bencher: Bencher, width: usize) {
         let map = shapes::attr_map(&shapes::scratch("c", width, Mix::Mostly));
         bencher.bench_local(|| consume(black_box(&map).clone()));
     }
 
-    /// Dropping a clone, with the clone itself generated outside the timed region -- subtract this
-    /// from any bench above to get the clone alone.
+    /// Dropping a clone, with the clone generated outside the timed region. Subtract this from any
+    /// bench above to get the clone alone.
     #[divan::bench(args = WIDTHS)]
     fn drop_only(bencher: Bencher, width: usize) {
         let map = mirror(width, Mix::Mostly);
         bencher.with_inputs(|| map.clone_baseline()).bench_local_values(drop);
     }
 
-    /// **The measurement artifact, on the record.** The identical clone, consumed in place versus
-    /// returned into divan's defer slot. The gap is the per-iteration write of a ~400-byte output
-    /// into a multi-megabyte buffer, and it is the reason W2's §6 read ~190 ns for what a 392-byte
-    /// copy should cost single-digit nanoseconds -- and the reason its §3 build comparison, where
-    /// one arm returns an `AttrMap` and the other a 24-byte `Vec`, is not like-for-like.
+    /// **The measurement artifact.** The identical clone, consumed in place against returned into
+    /// divan's defer slot. The gap is the per-iteration write of a ~400-byte output into a
+    /// multi-megabyte buffer. It inflates `size_vs_alloc.rs`'s `attr_clone`, which returns its
+    /// clone, and skews `build_shape`, where one arm returns an `AttrMap` and the other a 24-byte
+    /// `Vec`.
     mod artifact {
         use super::*;
 
@@ -197,13 +197,12 @@ mod clone_c {
         }
     }
 
-    /// **What a clone of a map with (almost) nothing in it costs.** Every bench in this module
-    /// reads ~90 ns at width 2, which is more than two entries can possibly account for, so the
-    /// floor has to be measured rather than assumed: an empty map, a one-entry map, and -- as the
-    /// control -- a bare 384-byte copy of a plain array consumed in exactly the same shape.
+    /// **What a clone of a map with (almost) nothing in it costs**: the floor under every bench in
+    /// this module, measured rather than assumed. An empty map, a one-entry map, and, as the
+    /// control, a bare 384-byte copy of a plain array consumed in the same shape.
     ///
-    /// The gap between `empty` and `raw_copy_384` is what the harness and the 392-byte move cost;
-    /// whatever is left over the `by_width` numbers is the clone itself.
+    /// The gap between `empty_or_tiny` at width 0 and `raw_copy_384` is what the harness and the
+    /// 392-byte move cost; whatever the `by_width` numbers show beyond that is the clone itself.
     mod floor {
         use super::*;
 
@@ -214,7 +213,7 @@ mod clone_c {
         }
 
         /// A 384-byte `[u64; 48]`, cloned and consumed identically: no enum, no `Drop`, no
-        /// capacity check -- just the bytes an eight-entry inline `AttrMap` occupies.
+        /// capacity check, only the bytes an eight-entry inline `AttrMap`'s entries occupy.
         #[divan::bench]
         fn raw_copy_384(bencher: Bencher) {
             let array = [0u64; 48];
@@ -222,8 +221,9 @@ mod clone_c {
         }
     }
 
-    /// `Event::clone` on W1's six survey shapes -- the whole-event cost a fan-out really pays, of
-    /// which the attribute map is one part. Nothing here is a mirror: these are the shipped types.
+    /// `Event::clone` on the six survey-derived fixtures (`docs/design/memory.md` §7, "The six
+    /// survey-derived shapes"): the whole-event cost a fan-out pays, of which the attribute map is
+    /// one part. These are the shipped types, not mirrors.
     mod event_clone {
         use super::*;
 
@@ -241,8 +241,8 @@ mod clone_c {
             bencher.bench_local(|| consume(black_box(&event).clone()));
         }
 
-        /// 10 attributes with four boxed nested maps -- W1's costliest shape, five allocations to
-        /// clone where the 30-attribute log takes one.
+        /// 10 attributes with four boxed nested maps: the costliest survey shape to clone, five
+        /// allocations where the 30-attribute log takes one (`docs/design/memory.md` §2).
         #[divan::bench]
         fn pino_http_nested(bencher: Bencher) {
             let event = parsed(fixtures::pino_http_log_event());
@@ -263,7 +263,7 @@ mod clone_c {
             bencher.bench_local(|| consume(black_box(&event).clone()));
         }
 
-        /// 6 attributes (inline) and three metric records (spilled) -- the inverse shape.
+        /// 6 attributes (inline) and three metric records (spilled): the inverse shape.
         #[divan::bench]
         fn collectd_three_record(bencher: Bencher) {
             let event = fixtures::collectd_three_record_event();
@@ -282,15 +282,15 @@ mod clone_c {
     }
 }
 
-/// **Arm E -- per-embedding capacity.**
+/// **Arm E: per-embedding capacity.**
 mod embed_e {
     use super::*;
 
-    /// The nested-map shapes: the pino-http record (four maps, the measured one) and the 1-map and
-    /// 4-map synthetics either side of it.
+    /// The nested-map shapes: the pino-http record (four maps, the measured one) and 1-map and
+    /// 4-map synthetics for the per-map slope.
     const NESTED: [&str; 3] = ["pino", "1map", "4map"];
 
-    /// Interned once, outside every timed region -- see `thin::NestedKeys`.
+    /// Interned once, outside every timed region; see `thin::NestedKeys`.
     fn nested_keys(shape: &str) -> thin::NestedKeys {
         match shape {
             "pino" => thin::pino_keys(),
@@ -340,8 +340,8 @@ mod embed_e {
             bencher.with_inputs(|| map.clone()).bench_local_values(drop);
         }
 
-        /// One top-level lookup that lands on a nested map, then one lookup inside it -- the
-        /// `Box` deref today against a `Vec` deref.
+        /// One top-level lookup that lands on a nested map, then one lookup inside it: the
+        /// shipped `Box` deref against a `Vec` deref.
         #[divan::bench(args = NESTED)]
         fn lookup_today(bencher: Bencher, shape: &str) {
             let map = thin::nested_today(&nested_keys(shape), Mix::Mostly);
@@ -414,13 +414,13 @@ mod embed_e {
     }
 }
 
-/// **Arm K -- a shared key-set plus a values vector.**
+/// **Arm K: a shared key-set plus a values vector.**
 mod keyset_k {
     use super::*;
 
     /// The three shapes arm K is judged on: the commonest log (12 flat attributes), the access log
-    /// (30), and the nested record's **top-level** width (10) -- arm K changes only the top level,
-    /// so a nested map rides along as an ordinary `Value` either way.
+    /// (30), and the nested record's **top-level** width (10). Arm K changes only the top level, so
+    /// a nested map rides along as an ordinary `Value` either way.
     const SHAPES: [&str; 3] = ["log12", "access30", "nested10"];
 
     fn width(shape: &str) -> usize {
@@ -439,7 +439,7 @@ mod keyset_k {
     mod build {
         use super::*;
 
-        /// Today: `k` sorted `insert_sym` calls.
+        /// The shipped build: `k` sorted `insert_sym` calls.
         #[divan::bench(args = SHAPES)]
         fn sorted_insert(bencher: Bencher, shape: &str) {
             let scratch = scratch(shape);
@@ -525,8 +525,8 @@ mod keyset_k {
         }
     }
 
-    /// The shape transition: adding and removing one attribute, which is what a `set`/`remove`
-    /// transform does to every event it sees.
+    /// The shape transition: adding and removing one attribute, what a `set`/`remove` transform
+    /// does to every event it sees.
     mod mutate {
         use super::*;
 
@@ -587,7 +587,7 @@ mod keyset_k {
         }
     }
 
-    /// Iterating in sorted-`Symbol` order -- what every encoder and `attrs::merged` does per event.
+    /// Iterating in sorted-`Symbol` order, what every encoder and `attrs::merged` does per event.
     mod iterate {
         use super::*;
 
@@ -621,15 +621,15 @@ mod keyset_k {
     }
 
     /// The adversarial case: a mixed OTLP gateway with 196 distinct key-sets, top-1 9%, top-5 36%
-    /// (`docs/design/data-shapes.md` §4). Inputs are generated outside the timed region, so what is
-    /// measured is one event's build -- including, for the cached arms, the key-sequence hash and
-    /// whatever the cache does about a miss. `tests/attr_arms.rs` reports the miss *rates* these
-    /// timings go with; a number here without one beside it means nothing.
+    /// (`docs/design/data-shapes.md` §5.4; `shapes::Gateway` says how it is synthesized). Inputs
+    /// are generated outside the timed region, so what is measured is one event's build,
+    /// including, for the cached arms, the key-sequence hash and whatever the cache does about a
+    /// miss. Read each timing beside the miss rate `tests/attr_arms.rs` reports for it.
     mod gateway {
         use super::*;
 
-        /// How many events the synthesized stream covers. Enough that every one of the 196 sets
-        /// appears and the tail's eviction behaviour is exercised.
+        /// How many events the synthesized stream covers: enough that all 196 sets appear and the
+        /// tail exercises eviction.
         const EVENTS: usize = 2000;
 
         fn stream() -> Vec<Vec<(Symbol, Value)>> {
@@ -650,7 +650,7 @@ mod keyset_k {
                 .bench_local_values(|s| consume(shapes::bulk_build(&s)));
         }
 
-        /// 64 entries against 196 shapes -- the bounded cache, with eviction.
+        /// 64 entries against 196 shapes: the bounded cache, with eviction.
         #[divan::bench]
         fn keyset_cache_64(bencher: Bencher) {
             let stream = stream();
@@ -665,7 +665,7 @@ mod keyset_k {
                 .bench_local_values(|s| consume(cache.build(s)));
         }
 
-        /// The same stream with room for every shape -- the ceiling a bounded cache is measured
+        /// The same stream with room for every shape: the ceiling a bounded cache is measured
         /// against.
         #[divan::bench]
         fn keyset_cache_unbounded(bencher: Bencher) {
@@ -683,9 +683,9 @@ mod keyset_k {
     }
 }
 
-/// **Arm K's pre-registered kill criterion**, on its own so it cannot be misread off a table:
-/// build + clone of the 12-attribute log, arm K against arm P's bulk build. K must win by **≥10%**
-/// or it is dropped (`docs/plans/event-sizing.md`'s arm K).
+/// **Arm K's pre-registered kill criterion**, separate so it can't be misread off a table: the
+/// build plus one clone of the 12-attribute log, arm K against arm P's bulk build. K must win by
+/// **≥10%** or it is dropped (`docs/plans/event-sizing.md`'s "Bake-off arms").
 ///
 /// Both arms take the same pre-built scratch, build a map from it, clone that map once, and drop
 /// both inside the timed region. "Build + clone" is one number because that is how the criterion is

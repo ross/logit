@@ -1,24 +1,25 @@
-//! **Arm K -- a shared key-set plus a values vector.** A map becomes `Arc<[Symbol]>` (the sorted
+//! **Arm K: a shared key-set plus a values vector.** A map becomes `Arc<[Symbol]>` (the sorted
 //! key-set, shared by every event of the same shape) and a `Vec<Value>` in the same order. Looking
-//! the key-set up once per event at the merge is affordable because a parser has the whole
-//! key sequence in hand by then, which is what makes this different from a general object model
-//! where every insert is a potential shape transition.
+//! the key-set up once per event at the merge is affordable because a parser has the whole key
+//! sequence in hand by then, unlike a general object model where every insert is a potential shape
+//! transition.
 //!
-//! `docs/plans/event-sizing.md` states the case against before the case for: interned 4-byte
-//! symbols already banked most of what a key-set saves, and the clone -- the operation this is
-//! supposed to help -- barely moves, since `Vec<Value>` still clones every value. Hence the
-//! **pre-registered kill criterion**: K must beat the append-then-sort bulk build by **≥10% on the
-//! 12-attribute log's build + clone combined**, and hold up on the 196-key-set gateway, or it is
-//! dropped. `benches/attr_arms.rs`'s `kill_criterion` module is that one comparison, run on its
-//! own so it cannot be read off a table by accident.
+//! The case against (`docs/plans/event-sizing.md`'s "Bake-off arms"): interned 4-byte symbols
+//! already bank most of what a key-set saves, and the clone, the operation this should help,
+//! barely moves, since `Vec<Value>` still clones every value. Hence the **pre-registered kill
+//! criterion**: K must beat the append-then-sort bulk build by **≥10% on the 12-attribute log's
+//! build + clone combined**, and hold up on the 196-key-set gateway, or it is dropped.
+//! `benches/attr_arms.rs`'s `kill_criterion` module is that one comparison, kept separate so it
+//! can't be misread off a table. ADR `event-sizing-and-allocation-strategy` records the outcome.
 //!
 //! **What is mirrored and what is simplified.**
 //!
 //! - The values are real `logit_core::Value`s, so clone cost is the true one (an atomic increment
 //!   per `Value::Str`).
 //! - [`KeySetCache`] is a `HashMap<u64, CacheEntry>` with **LRU eviction by linear scan** over its
-//!   64 entries. A production cache would keep an intrusive LRU list; the scan only runs on a miss,
-//!   and the gateway bench reports miss *rate* alongside the timing so the two can be separated.
+//!   entries. A production cache would keep an intrusive LRU list; the scan only runs on a miss,
+//!   and `tests/attr_arms.rs` reports the miss *rate* the gateway timings go with, so the two can
+//!   be separated.
 //! - The key-sequence hash is an FxHash-shaped multiply-rotate over the symbols
 //!   ([`SeqHasher`]), not SipHash: a cache on this path must be cheaper than the sort it replaces,
 //!   and `DefaultHasher` would decide the question by itself.
@@ -31,7 +32,7 @@
 //! - Not modelled at all: what a shared key-set would do to `attrs::merged`, `SeriesKey`, `keep`,
 //!   the native encoder's dictionary, and Lua's `AttrsProxy`, all of which hand out `&Value` and
 //!   iterate in sorted-`Symbol` order. [`KeySetMap`] preserves both properties, which is the
-//!   precondition for any of them to keep working -- it does not prove they would.
+//!   precondition for any of them to keep working; it does not prove they would.
 
 use logit_core::interner::Symbol;
 use logit_core::Value;
@@ -60,9 +61,9 @@ impl Hasher for SeqHasher {
     }
 }
 
-/// Hashes a key sequence **in arrival order** -- the cache maps a sequence, not a set, so a
-/// producer that emits its fields in a stable order (which is what makes this arm worth trying at
-/// all) gets a hit without any canonicalization first.
+/// Hashes a key sequence **in arrival order**. The cache maps a sequence, not a set, so a producer
+/// that emits its fields in a stable order (the case this arm targets) gets a hit without any
+/// canonicalization first.
 pub fn hash_sequence(keys: impl IntoIterator<Item = Symbol>) -> u64 {
     let mut hasher = SeqHasher::default();
     for key in keys {
@@ -79,9 +80,9 @@ pub struct KeySetMap {
 }
 
 impl KeySetMap {
-    /// Builds directly from an arrival-order scratch with no cache at all -- sort, dedup, allocate
-    /// a fresh key-set. This is both the cache-miss path and the honest baseline for "what if the
-    /// shape never repeats".
+    /// Builds directly from an arrival-order scratch with no cache: sort, dedup, allocate a fresh
+    /// key-set. This is both the cache-miss path and the baseline for a shape that never
+    /// repeats.
     pub fn build_uncached(scratch: Vec<(Symbol, Value)>) -> Self {
         let (keys, perm, distinct) = key_set_of(&scratch);
         Self::place(Arc::from(keys), &perm, scratch, distinct)
@@ -100,13 +101,13 @@ impl KeySetMap {
         self.values.is_empty()
     }
 
-    /// Binary search over the key-set, then one index into the values -- the same two steps
+    /// Binary search over the key-set, then one index into the values: the same two steps
     /// `AttrMap::get_sym` takes, over two allocations instead of one.
     pub fn get_sym(&self, key: Symbol) -> Option<&Value> {
         self.keys.binary_search(&key).ok().map(|i| &self.values[i])
     }
 
-    /// Sorted-`Symbol` order, like `AttrMap::iter` -- the property every consumer of an `AttrMap`
+    /// Sorted-`Symbol` order, like `AttrMap::iter`: the property every consumer of an `AttrMap`
     /// depends on.
     pub fn iter(&self) -> impl Iterator<Item = (Symbol, &Value)> {
         self.keys.iter().copied().zip(self.values.iter())
@@ -238,7 +239,7 @@ struct CacheEntry {
 
 impl KeySetCache {
     /// `capacity` distinct key sequences. 64 is `logit_core::interner::KeyCache`'s own size and the
-    /// number `docs/design/data-shapes.md` §4 measures the 196-set gateway against.
+    /// number `docs/design/data-shapes.md` §6 compares the 196-set gateway against.
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(capacity),
@@ -268,8 +269,8 @@ impl KeySetCache {
         };
         if hit {
             // Borrowed, not cloned: the permutation is read in place, so a hit allocates nothing
-            // beyond the values vector itself. A `perm.clone()` here would put an allocation on
-            // arm K's hot path that the representation does not actually require.
+            // beyond the values vector. A `perm.clone()` here would add an allocation to arm K's
+            // hot path that the representation doesn't require.
             let entry = &self.entries[&hash];
             let map =
                 KeySetMap::place(Arc::clone(&entry.keys), &entry.perm, scratch, entry.distinct);
@@ -295,8 +296,8 @@ impl KeySetCache {
         KeySetMap::place(keys, &perm, scratch, distinct)
     }
 
-    /// Least-recently-used, by linear scan -- see this module's doc for why that is acceptable
-    /// here and would not be in production.
+    /// Least-recently-used, by linear scan. The module doc says why that is acceptable here and
+    /// would not be in production.
     fn evict_one(&mut self) {
         if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
             self.entries.remove(&victim);
@@ -316,9 +317,8 @@ impl KeySetCache {
 
 /// The memo [`KeySetMap::insert_one_cached`] consults: `(key-set identity, added key) -> key-set`.
 ///
-/// Unbounded, deliberately: a transform's set of added keys is configuration, not input, so the
-/// number of distinct transitions is bounded by the config -- unlike [`KeySetCache`], whose keys
-/// come off the wire.
+/// Unbounded: a transform's set of added keys is configuration, not input, so the config bounds
+/// the number of distinct transitions, unlike [`KeySetCache`], whose keys come off the wire.
 #[derive(Default)]
 pub struct TransitionCache {
     map: HashMap<(usize, Symbol), Arc<[Symbol]>>,
