@@ -1221,9 +1221,12 @@ data loss.
 - `file_out` rotation only: `logit.output.file.rotations` (count, one per successful rotation) and,
   through `Diagnostics::warn_throttled`,
   `logit.component.diagnostics{key="rotate_failure"|"retention_failure"}`
-  (`crates/logit-outputs/src/file.rs::FileTarget::rotate`). `rotate_failure` means renaming the
-  active file to `.1` failed and writing continues to the current file; `retention_failure` means a
-  retained file's own delete or rename in the cascade failed and was skipped. Neither can fire for
+  (`crates/logit-outputs/src/file.rs::FileTarget::rotate`). `rotate_failure` means the rotation
+  didn't happen: renaming the active file to its `.rotating` staging path failed, or, under
+  `max_files: 1`, truncating it in place failed. Either way nothing on disk changed, writing
+  continues to the current file, and the next write retries the rotation. `retention_failure`
+  means a retained file's own delete or rename in the cascade, or the staged file's promotion to
+  `.1`, failed and was skipped. Neither can fire for
   a `stdio_out` target or an unrotated `file_out` (`RotatePolicy::never()`), because
   `should_rotate` never returns `true` under that policy.
 
