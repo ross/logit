@@ -1,20 +1,17 @@
 //! [`CountingAlloc`]: a `GlobalAlloc` wrapper that counts what the thread it runs on allocates.
 //!
-//! This exists so "how many allocations does decoding one nginx access-log line cost?" can be an
-//! ordinary `#[test]` with an exact answer, rather than a number someone reads off a profiler once
-//! and never checks again. See `docs/design/memory.md`.
+//! It lets "how many allocations does decoding one nginx access-log line cost?" be an ordinary
+//! `#[test]` with an exact answer (`docs/design/memory.md` §7, "Instrumentation").
 //!
-//! **Counters are thread-local, not global**, for two reasons. Correctness: a global counter would
-//! fold in whatever the test harness, a tokio worker, or a background reaper happened to do while
-//! [`measure`] was running, making results depend on timing. Cost: a thread-local `Cell` increment
-//! is a couple of instructions with no atomics, so wrapping every allocation in the process stays
-//! cheap enough that the benches measuring *time* aren't distorted by it.
+//! **Counters are thread-local, not global.** A global counter would fold in whatever the test
+//! harness, a tokio worker, or a background reaper did while [`measure`] ran, so results would
+//! depend on timing. A thread-local `Cell` increment is also a couple of instructions with no
+//! atomics, cheap enough not to distort the benches that measure *time*.
 //!
-//! The thread-locals are declared with `const` initializers and hold `Cell<u64>`, which has no
-//! destructor. Both details are load-bearing: a lazily-initialized or destructor-carrying
-//! thread-local allocates on first access, and allocating from inside the allocator is an infinite
-//! recursion. `try_with` covers the remaining case -- an allocation arriving during thread
-//! teardown, after the local is already gone -- by dropping the count rather than panicking.
+//! The thread-locals have `const` initializers and hold destructor-free `Cell`s. Both are required:
+//! a lazily-initialized or destructor-carrying thread-local allocates on first access, and
+//! allocating from inside the allocator recurses forever. `try_with` covers an allocation during
+//! thread teardown, after the local is gone, by dropping the count rather than panicking.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -33,32 +30,29 @@ thread_local! {
 /// [`measure`] wrapped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Fresh allocations (`alloc` + `alloc_zeroed`). This is the headline number: it's what
-    /// allocator pressure actually scales with.
+    /// Fresh allocations (`alloc` + `alloc_zeroed`). The headline number: allocator pressure
+    /// scales with it.
     pub allocs: u64,
-    /// Reallocations, counted separately rather than folded into `allocs` because they mean
-    /// something different -- a `Vec`/`String` that was grown, i.e. a missing `with_capacity`,
-    /// not a new object.
+    /// Reallocations, kept out of `allocs` because they mean a grown `Vec`/`String` (a missing
+    /// `with_capacity`), not a new object.
     pub reallocs: u64,
     /// Total bytes requested across every `alloc` and every `realloc` *growth*. Not a memory
     /// footprint: it counts a buffer that was allocated and freed inside the region too.
     pub bytes: u64,
-    /// The high-water mark of bytes live at once, relative to the region's start. This is the
-    /// footprint number -- what the region needed resident simultaneously.
+    /// The high-water mark of bytes live at once, relative to the region's start: the footprint
+    /// number.
     pub peak_live_bytes: u64,
 }
 
 /// Runs `f` with the thread's allocation counters zeroed, and reports what it allocated.
 ///
-/// The value `f` returns is handed back rather than dropped inside the measured region, so
-/// whatever it owns still counts as allocated -- which is the intent: measuring "decode this
-/// datagram" should include the events the decode produced, not net them out against themselves.
+/// `f`'s return value is handed back, not dropped inside the region, so whatever it owns still
+/// counts: "decode this datagram" includes the events the decode produced.
 ///
-/// **Warm up before measuring.** Plenty of things in this codebase allocate exactly once, on
-/// first use -- the `OnceLock` interner (`logit_core::interner`), a `HashMap`'s first table, a
-/// `thread_local`'s backing store. Measuring a cold call attributes all of that to the first
-/// iteration and reports a number that never reproduces. Every test in this crate calls the thing
-/// it's measuring at least once before the `measure` that counts.
+/// **Warm up before measuring.** Plenty of things allocate once, on first use: the `OnceLock`
+/// interner (`logit_core::interner`), a `HashMap`'s first table, a `thread_local`'s backing store.
+/// A cold measurement charges all of that to the first call and never reproduces. Every test in
+/// this crate calls the thing it measures at least once before the `measure` that counts.
 pub fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
     ALLOCS.with(|c| c.set(0));
     REALLOCS.with(|c| c.set(0));
@@ -109,10 +103,9 @@ fn bump_live(delta: i64) {
 
 /// Wraps another allocator, counting every request that passes through it.
 ///
-/// Generic over the inner allocator so a benchmark can measure against whatever allocator
-/// production actually uses (`docs/adr/jemalloc-global-allocator.md`) rather than always
-/// against `System` -- allocation *counts* are allocator-independent, but the time those counts
-/// cost is not.
+/// Generic over the inner allocator so a benchmark can run on production's allocator
+/// (`docs/adr/jemalloc-global-allocator.md`): allocation *counts* don't depend on the allocator,
+/// but their cost in time does.
 pub struct CountingAlloc<A = System> {
     inner: A,
 }

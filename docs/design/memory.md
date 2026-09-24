@@ -1252,8 +1252,9 @@ The pattern for a new shape, in order of preference:
 
 Synthetic doesn't mean guessed. A literal should carry **provenance**: which software and config
 produced this shape, and when it was last checked against the real thing. `NGINX_SYSLOG_LINE` was
-derived from `examples/nginx/nginx.conf`'s `access_json_syslog` format and confirmed against a live
-nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly).
+derived from the `access_json_syslog` format `examples/nginx/nginx.conf` used before it became
+`access_semconv` (the fixture keeps the older shape so the pins stay comparable) and confirmed
+against a live nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly).
 Exploring real software is the right way to *inform* a fixture; the fixture is what gets committed.
 
 **Warm a directly-constructed `Event`'s message `Bytes`, or the count measures the fixture, not the
@@ -1294,7 +1295,7 @@ survey measures record count and attribute width over the same corpus but doesn'
 on one list), and `pino_http_log_event`'s per-map widths are a choice consistent with the measured
 median of 3, not a recorded shape.
 
-**Four of the six are built through the leg that really produces them**: a `tail_in`-shaped log
+**Three of the six are built through the leg that really produces them**: a `tail_in`-shaped log
 event (one `log.file.path` attribute and a JSON body) handed to the real `json` transform, not
 constructed attribute by attribute. So the code under measurement produces the width these
 fixtures pin, at the total count §5.3 measured on that leg. It also gives
