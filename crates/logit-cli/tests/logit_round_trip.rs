@@ -1,11 +1,8 @@
-//! `logit_output_to_logit_input_round_trips_*` -- the native-transport counterpart to
-//! `otlp_round_trip.rs`'s own strongest single test: stand a [`LogitInput`] up on an ephemeral
-//! port in-process, point a [`LogitOutput`] at it, and assert what comes out the far end's
-//! [`Fanout`] matches what went in. Lives here for the same reason `otlp_round_trip.rs` does --
-//! `logit-cli` already depends on both `logit-inputs` and `logit-outputs`, so this is an ordinary
-//! integration test rather than a dev-dependency cycle between two sibling crates.
-//!
-//! `docs/plans/native-transport.md` workstream F.
+//! `logit_out -> logit_in` over real sockets (ADR `native-transport-handshake-and-ack`): a
+//! [`LogitInput`] bound on an ephemeral port in-process, a [`LogitOutput`] pointed at it, and an
+//! exact whole-batch equality check on what leaves the far end's [`Fanout`]. Also covers lz4, TLS
+//! and mutual TLS, provenance crossing the wire, and how a refused connect and a wrong CA are
+//! classified. Lives in `logit-cli` for the same reason `otlp_round_trip.rs` does.
 
 use bytes::Bytes;
 use logit_core::{AttrMap, Event, EventBatch, Resource};
@@ -19,23 +16,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// An address with *nothing* listening on it: bind an ephemeral port, read it back, drop the
-/// socket. The only remaining use is
-/// [`connect_refused_is_classified_clean_against_a_real_logit_in_torn_down`], which needs an
-/// address no `logit_in` will answer on -- every test that wants a live listener goes through
-/// [`bound_input`] instead.
+/// An address with nothing listening on it: bind an ephemeral port, read it back, drop the
+/// socket. Only [`connect_refused_is_classified_clean_against_a_real_logit_in_torn_down`] uses
+/// it; a test that wants a live listener uses [`bound_input`].
 async fn ephemeral_addr() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().to_string()
 }
 
-/// Stands a `logit_in` up on an ephemeral port: builds it, lets `configure` apply whatever
-/// builders the test needs (TLS, mostly), binds it, and hands back the OS-assigned address
-/// alongside the already-bound input.
-///
-/// `Input::bind` (`docs/plans/operator-surface.md`, workstream B) opens the listening socket here,
-/// before `run` is ever spawned, so a `LogitOutput::send` below cannot race the bind -- which is
-/// what this file used to paper over with a 50 ms sleep after every spawn.
+/// Builds a `logit_in` on an ephemeral port, applies `configure` (TLS, mostly), and binds it,
+/// returning the OS-assigned address and the bound input. Binding before `run` is spawned means a
+/// `LogitOutput::send` can't race the bind.
 async fn bound_input(configure: impl FnOnce(LogitInput) -> LogitInput) -> (String, LogitInput) {
     let mut input = configure(LogitInput::new("127.0.0.1:0"));
     input.bind().await.expect("binding an ephemeral port should succeed");
@@ -90,16 +81,13 @@ async fn round_trip(
 
 fn assert_round_tripped(received: &[EventBatch], batch: &EventBatch) {
     assert_eq!(received.len(), 1, "one send should produce exactly one received batch");
-    // The native codec is exact (`EventBatch` derives `PartialEq` as of W1) -- a plain `assert_eq!`
-    // on the whole batch subsumes every field-by-field check this used to spell out by hand.
+    // The native codec is exact, so one `assert_eq!` on the whole batch covers every field.
     assert_eq!(&received[0], batch, "native round-trip should be exact");
 }
 
-/// Like [`round_trip`], but the listener's `Fanout` carries a component id and `output` is
-/// primed with a specific [`logit_core::Provenance`] before sending -- what
-/// [`origin_and_previous_cross_the_wire_untouched_from_a_remote_peer`] needs to observe the
-/// property `docs/adr/batch-provenance-on-delivered.md`'s `logit_out -> logit_in` special case
-/// exists for.
+/// Like [`round_trip`], but the listener's `Fanout` carries a component id and `output` is primed
+/// with `provenance` before sending, so a test can observe the `logit_out -> logit_in` special
+/// case in `docs/adr/batch-provenance-on-delivered.md`.
 async fn round_trip_with_provenance(
     mut input: LogitInput,
     input_component: &str,
@@ -129,11 +117,9 @@ async fn round_trip_with_provenance(
     received
 }
 
-/// The end-to-end property the `logit_out -> logit_in` special case exists for: a batch carrying
-/// a remote listener's `origin` and the remote node that fed `logit_out` as `previous` comes out
-/// the other side of the wire with both untouched -- `logit_in` (named `central_logit_in` here)
-/// never overwrites either, so the split-collection deployment reads as one graph
-/// (`docs/adr/batch-provenance-on-delivered.md`).
+/// A batch's `origin` (a remote listener) and `previous` (the remote node that fed `logit_out`)
+/// cross the wire untouched: `logit_in` overwrites neither, so a split-collection deployment reads
+/// as one graph (`docs/adr/batch-provenance-on-delivered.md`).
 #[tokio::test]
 async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
     let (addr, input) = bound_input(|input| input).await;
@@ -158,9 +144,8 @@ async fn origin_and_previous_cross_the_wire_untouched_from_a_remote_peer() {
     );
 }
 
-/// The fallback half of the same special case: a `logit_out`/`logit_in` pair with nothing to
-/// relay (a v1 peer, or a v2 peer that genuinely had none) must not leave `origin`/`previous`
-/// empty -- `logit_in` backfills its own id into both.
+/// The fallback: with no provenance to relay (a v1 peer, or a v2 peer that had none), `logit_in`
+/// backfills its own id into both `origin` and `previous`.
 #[tokio::test]
 async fn a_batch_with_no_provenance_gets_logit_ins_own_id_backfilled() {
     let (addr, input) = bound_input(|input| input).await;
@@ -202,12 +187,10 @@ async fn logit_output_to_logit_input_round_trips_a_lz4_compressed_batch() {
     assert_round_tripped(&received, &batch);
 }
 
-/// The forwarding-chain smoke test `docs/plans/native-transport.md` workstream F asks for: a
-/// batch decoded from a real statsd line (not hand-built `Event`s) makes it across a real
-/// `logit_out` -> `logit_in` hop with its timestamp and resource attribute intact. The two-process
-/// shape this proves (an edge `statsd_in -> logit_out` feeding a central `logit_in`) is exactly
-/// `examples/forwarder-edge.yaml`/`examples/forwarder-central.yaml`; this test exercises the same
-/// codec/transport path in-process, without a real second `logit run`.
+/// A batch decoded from a real statsd line, not hand-built `Event`s, crosses a real
+/// `logit_out -> logit_in` hop with its timestamp and resource attribute intact. This is the
+/// codec/transport path of `examples/forwarder-edge.yaml` feeding
+/// `examples/forwarder-central.yaml`, in-process rather than across two `logit run` processes.
 #[tokio::test]
 async fn a_statsd_decoded_batch_forwards_through_logit_out_and_logit_in_with_its_timestamp_intact()
 {
@@ -251,8 +234,7 @@ mod tls {
     use super::*;
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
-        // `testdata/tls` -- two levels up from `CARGO_MANIFEST_DIR`.
+        // The certs are the repo root's `testdata/tls`, two levels above `CARGO_MANIFEST_DIR`.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
@@ -318,9 +300,8 @@ mod tls {
         assert_round_tripped(&received, &batch);
     }
 
-    /// The negative case the pair above exists to set off: a client trusting a CA that never
-    /// signed the server's certificate is refused at the TLS handshake, before `Hello` is ever
-    /// sent -- `Fault::Clean`, since nothing of the batch left this sink.
+    /// A client trusting a CA that never signed the server's certificate is refused at the TLS
+    /// handshake, before `Hello` is sent: `Fault::Clean`, since nothing of the batch left the sink.
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_classified_clean() {
         let (addr, mut input) = bound_input(|input| {

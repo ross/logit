@@ -1,12 +1,9 @@
-//! End-to-end proof of `docs/adr/target-components.md`'s headline topology: a real `logit_in`
-//! feeding a real `route` router, splitting onto two `target`s, with the router's own outbound
-//! edge catching whatever nothing claims. Modelled on `logit_round_trip.rs`'s in-process pattern
-//! (`bound_input`, `round_trip_with_provenance`'s `observe_batch`-then-`send` idiom) for the
-//! wire side, and `durable_buffer_restart.rs`'s `Config` -> `graph::resolve` -> `NodeSpec`s ->
-//! `logit_pipeline::run` pattern for the central side -- a real graph, not a hand-rolled `Fanout`
-//! chain, so this exercises the actual `Router`/`Target` runtime wiring
-//! (`crates/logit-pipeline/src/runtime.rs`'s pre-spawn target-`Fanout` pass and `run_router`), not
-//! a simplified stand-in for it.
+//! End to end, ADR `target-components`'s headline topology: a real `logit_in` feeding a `route`
+//! that splits onto two `target`s, with the router's own outbound edge catching whatever no route
+//! claims. The central side is a real resolved graph run by `logit_pipeline::run`, not a
+//! hand-rolled `Fanout` chain, so this exercises the runtime's `Router`/`Target` wiring (the
+//! pre-spawn target-`Fanout` pass and `run_router` in `crates/logit-pipeline/src/runtime.rs`). The
+//! wire side follows `logit_round_trip.rs`'s `observe_batch`-then-`send` idiom.
 //!
 //! Topology:
 //!
@@ -16,8 +13,6 @@
 //!                                   |-> app_stream  (target) -> app_sink  (recording)
 //!                                   \-> (unrouted, split's own consumer) -> forward_sink (recording)
 //! ```
-//!
-//! `docs/plans/target-components.md` workstream W4.
 
 use logit_config::{
     BufferConfig, Component, ComponentKind, Config, ProvenanceField, ReceiveConfig, RouteBy,
@@ -57,10 +52,9 @@ fn tagged_batch(tag: &str) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
 }
 
-/// Records every batch this sink is asked to deliver, paired with the [`Provenance`]
-/// `Output::observe_batch` handed it immediately beforehand -- `write_loop` calls that hook once
-/// per delivery attempt, always before `send`, so the two always describe the same batch
-/// (`crate::runtime`'s own doc comment on `Output::observe_batch`).
+/// Records every batch it's asked to deliver, paired with the [`Provenance`]
+/// `Output::observe_batch` handed it immediately before. `write_loop` calls that hook before every
+/// `send`, so the two describe the same batch (`logit_pipeline::Output::observe_batch`'s doc).
 struct RecordingOutput {
     tx: mpsc::UnboundedSender<(EventBatch, Provenance)>,
     last_provenance: Provenance,
@@ -91,8 +85,7 @@ fn output_spec(output: RecordingOutput) -> NodeSpec {
     )
 }
 
-/// A no-field, no-source `Component` -- shared shape for every kind built below that doesn't need
-/// `buffer:`/`receive:`.
+/// A `Component` with default `buffer:`/`receive:` and no targets, for every kind built below.
 fn component(sources: Vec<&str>, kind: ComponentKind) -> Component {
     Component {
         buffer: BufferConfig::default(),
@@ -103,17 +96,14 @@ fn component(sources: Vec<&str>, kind: ComponentKind) -> Component {
     }
 }
 
-/// The `bind:` `central_in` is configured with. Port 0 is deliberate: the real address is the one
-/// the OS hands back through `LogitInput::local_addr()` after the test binds the concrete input
-/// below -- nothing here reads the config's own string, since the `NodeSpec` is hand-rolled.
+/// `central_in`'s configured `bind:`. Nothing reads it back, since the `NodeSpec` is hand-built;
+/// the test learns the real port from `LogitInput::local_addr()`.
 const EPHEMERAL_BIND: &str = "127.0.0.1:0";
 
-/// A real, resolved graph for the topology in this module's doc comment. Sink kinds are
-/// `null_out` -- only their *shape* (a sink, one source) matters to `graph::resolve`; their actual
-/// runtime behaviour comes from the [`RecordingOutput`] `NodeSpec`s built separately, exactly as
-/// `durable_buffer_restart.rs`'s `graph_and_topology` pairs an `influxdb_out`-shaped `Config` with
-/// a hand-rolled `NodeSpec` (spec kind and config kind are independent at the runtime layer,
-/// `crates/logit-pipeline/src/runtime.rs`'s own tests make the same trade for `Router`/`Target`).
+/// A resolved graph for this module doc's topology. The sinks are `null_out` because only their
+/// shape (a sink, one source) matters to `graph::resolve`; their behaviour comes from the
+/// [`RecordingOutput`] `NodeSpec`s, as `durable_buffer_restart.rs`'s `graph_and_topology` pairs
+/// an `influxdb_out`-shaped `Config` with a hand-built `NodeSpec`.
 fn central_graph() -> graph::Graph {
     let mut routes = BTreeMap::new();
     routes.insert("edge_host".to_string(), "host_stream".to_string());
@@ -152,19 +142,15 @@ fn central_graph() -> graph::Graph {
     graph::resolve(Config { components, ..Default::default() }).expect("topology should resolve")
 }
 
-/// Drives the whole graph: three batches over one `LogitOutput` connection to `central_in`, each
-/// primed with a different provenance beforehand (`Output::observe_batch`'s own client-side
-/// mirror, `LogitOutput::observe_batch`), matching `logit_round_trip.rs`'s
-/// `round_trip_with_provenance` idiom. Returns whichever of the three recording sinks actually
-/// received something for each send, paired with a timeout so a misrouted batch fails the test
-/// instead of hanging it.
+/// Sends three batches over one `LogitOutput` connection, each primed with a different
+/// provenance, and checks each lands on exactly one recording sink. Every receive has a timeout,
+/// so a misrouted batch fails the test instead of hanging it.
 #[tokio::test]
 async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     let graph = central_graph();
 
-    // `component.targets` is the graph's own resolved slot order for `split`
-    // (`graph::targets_of`'s output, `docs/adr/target-components.md`) -- read back rather than
-    // hardcoded, so this test can't silently pass by guessing the same order `Route::new` needs.
+    // `split`'s resolved slot order (`graph::targets_of`), read back rather than hardcoded so the
+    // test can't pass by guessing the order `Route::new` needs.
     let split_targets = graph.components["split"].targets.clone();
     assert_eq!(
         split_targets.len(),
@@ -181,10 +167,9 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     let (mut app_rx, app_output) = recording_sink();
     let (mut forward_rx, forward_output) = recording_sink();
 
-    // Bound here, before it is boxed into the `NodeSpec`, so `local_addr()` can hand the client
-    // below the OS-assigned port with no readiness sleep. `run_with_telemetry`'s own pre-spawn
-    // `Input::bind` pass still runs over this input and no-ops on it -- `Input::bind` is
-    // idempotent by contract (`crates/logit-pipeline/src/input.rs`).
+    // Bound before it's boxed into the `NodeSpec`, so `local_addr()` gives the client the real
+    // port with no readiness sleep. The runtime's pre-spawn `Input::bind` pass then no-ops:
+    // `Input::bind` is idempotent by contract (`crates/logit-pipeline/src/input.rs`).
     let mut central_in = LogitInput::new(EPHEMERAL_BIND);
     central_in.bind().await.expect("binding an ephemeral port should succeed");
     let addr = central_in.local_addr().expect("bind() leaves a real address behind").to_string();

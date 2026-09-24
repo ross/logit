@@ -1,20 +1,15 @@
-//! `--log-level`/`--log-format` (docs/plans/operator-surface.md, workstream A) only take effect
-//! on `logit run`, and only fail loudly on a bad directive -- both need a real process (a
-//! subscriber is process-global, `tracing_subscriber::registry().init()` panics if called twice
-//! in one process, so these can't run as in-crate unit tests alongside anything else that might
-//! install one). `env!("CARGO_BIN_EXE_logit")` is the standard Cargo mechanism for an
-//! integration test to find its own crate's freshly-built binary.
+//! `--log-level`/`--log-format` against the real binary (ADR `tracing-for-self-logging`). The
+//! subscriber is process-global and `tracing_subscriber::registry().init()` panics if called
+//! twice in one process, so these can't be in-crate unit tests alongside anything else that
+//! installs one. Only `logit run` installs a subscriber, so every test here runs it.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// A config broken enough to fail `logit run` immediately (before ever binding a socket) --
-/// deliberately not "a working pipeline," so these tests exit fast regardless of what
-/// `--log-level`/`--log-format` do to the output. Removed on drop -- no `tempfile` dependency
-/// for one throwaway file; a unique name (pid + this process's own address-space randomness via
-/// `std::process::id`) is enough for these tests, which never run two copies against the same
-/// path concurrently.
+/// A config that fails `logit run` before any socket is bound (`components: {}` fails graph
+/// resolution), so each test exits fast whatever the flags do to the output. Removed on drop; the
+/// pid in the name keeps concurrent test binaries apart.
 struct BrokenConfig(PathBuf);
 
 impl BrokenConfig {
@@ -38,10 +33,9 @@ impl Drop for BrokenConfig {
 fn a_bad_log_level_directive_exits_1_with_a_clear_message() {
     let config = BrokenConfig::new("bad-level");
     let output = Command::new(env!("CARGO_BIN_EXE_logit"))
-        // `EnvFilter`'s directive grammar is `[target][span{field=value}]=level` -- "notalevel"
-        // parses as a level filter and fails cleanly (verified by hand: a directive with stray
-        // punctuation instead gets silently accepted as a target/span pattern, which would make
-        // this test assert on the wrong thing).
+        // `EnvFilter`'s grammar is `[target][span{field=value}]=level`, so `notalevel` parses as
+        // a level and fails cleanly. A directive with stray punctuation instead is accepted as a
+        // target/span pattern and wouldn't fail.
         .args(["--log-level", "foo=notalevel", "run"])
         .arg(&config.0)
         .output()
@@ -64,10 +58,10 @@ fn log_format_json_emits_one_parseable_object_per_line() {
         .output()
         .expect("spawning the logit binary");
 
-    // Self-logging goes to stderr deliberately: stdout is the pipeline's (`stdio_out` defaults
-    // to `target: stdout`), so `logit run c.yaml > events.log` stays a clean event stream.
-    // An empty `components: {}` config fails graph resolution (rule: at least one component) --
-    // exit 1, but only *after* `run_pipelines` has already logged `starting`.
+    // Self-logging goes to stderr: stdout is the pipeline's (`stdio_out` defaults to
+    // `target: stdout`), so `logit run c.yaml > events.log` stays a clean event stream.
+    // `components: {}` fails graph resolution with exit 1, but only after `run_pipelines` has
+    // logged `starting`.
     assert!(
         output.stdout.is_empty(),
         "stdout must carry no self-logging, got: {}",
@@ -96,10 +90,9 @@ fn log_format_json_emits_one_parseable_object_per_line() {
 
 #[test]
 fn a_strict_log_level_still_silences_stderr_self_logging() {
-    // The complement of `TelemetryLayer::capture_filter`'s independence: scoping the `EnvFilter`
-    // to the stderr `fmt` layer (rather than the whole subscriber, which would gate internal-log
-    // capture with it) must not stop it filtering stderr. `starting` is an `info` event, so
-    // `--log-level error` has to swallow it.
+    // The `EnvFilter` is scoped to the stderr `fmt` layer so it doesn't gate internal-log capture
+    // (`TelemetryLayer::capture_filter`), but it must still filter stderr: `--log-level error`
+    // has to swallow the `info`-level `starting`.
     let config = BrokenConfig::new("strict-level");
     let output = Command::new(env!("CARGO_BIN_EXE_logit"))
         .args(["--log-level", "error", "run"])
