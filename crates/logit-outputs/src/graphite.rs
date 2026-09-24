@@ -1,107 +1,63 @@
-//! Carbon plaintext/pickle egress over UDP or TCP -- the mirror of `graphite_in`, and a real
-//! relay: path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the
-//! other end (this module's own tests). See
-//! [ADR `graphite-carbon-relay`](../../../../docs/adr/graphite-carbon-relay.md) and
-//! [`docs/plans/graphite-carbon-relay.md`](../../../../docs/plans/graphite-carbon-relay.md).
+//! `graphite_out`: carbon plaintext/pickle over UDP or TCP, the mirror of `graphite_in`
+//! ([ADR `graphite-carbon-relay`](../../../../docs/adr/graphite-carbon-relay.md)).
 //!
-//! Split the way `statsd.rs`/`collectd.rs` are: the pure [`logit_proto::graphite::GraphiteEncoder`]
-//! does every mapping, sanitization, and packing decision (that module's own doc is the spec for
-//! all of it), and this module is only the thin transport wrapper: [`GraphiteOutput`] owns the
-//! socket, hands the encoder a batch, and turns its already-packed
-//! [`logit_proto::MessageBuf`]`<usize>` into UDP or TCP writes. **The codec emits every
-//! metric/tag/name counter and diagnostic itself** (it holds its own `Telemetry`/`Diagnostics`,
-//! fed by this sink's own builders below, collectd's model -- `crate::collectd`'s own module doc)
-//! -- this module adds only the transport-level counters a socket send can produce that the codec
-//! has no way to know about: total bytes, request timing, datagrams/messages actually written, and
-//! an oversize-datagram drop.
+//! [`logit_proto::graphite::GraphiteEncoder`] makes every mapping, sanitization, timestamp, and
+//! per-record allocation decision, and emits its own metric/tag/name counters and diagnostics
+//! through the `Telemetry`/`Diagnostics` this sink's builders hand it; `logit_proto::graphite`'s
+//! module doc is the spec. This module is the transport: [`GraphiteOutput`] owns the socket and
+//! writes the encoder's [`logit_proto::MessageBuf`]`<usize>`, one entry per plaintext line or per
+//! length-prefixed pickle frame, meta = that entry's datapoint count. It implements
+//! [`logit_proto::FramedEncoder`] for the reason `statsd_out` does (ADR `framed-encoder`).
 //!
-//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`** -- the identical
-//! reason `statsd_out`/`collectd_out`'s encoders do (`crate::statsd`'s module doc, ADR
-//! `framed-encoder`). `GraphiteEncoder::encode_into` fills a [`logit_proto::MessageBuf`]`<usize>`
-//! with message boundaries already decided (one plaintext line, or one complete
-//! already-length-prefixed pickle frame -- encoder state, per the trait, rather than a per-call
-//! argument), so this sink's only remaining job is turning each entry into bytes on the wire.
-//!
-//! Unlike `collectd_out` (UDP only) this sink supports **both transports**, carbon's own plaintext
-//! listener speaks either -- the TCP half is a near-verbatim port of
-//! `crates/logit-outputs/src/statsd.rs:1638-2045`'s `Conn`/lazy-connect/reconnect-once/
-//! partial-write machinery, copied and cited at each borrowed shape below rather than
-//! reinvented, since no shared transport module exists yet (`docs/plans/graphite-carbon-relay.md`
-//! decision 16 -- there is nothing to extract a driver from until a second TCP sink needs the same
-//! shape).
+//! The TCP half ports `StatsdOutput`'s `Conn`/lazy-connect/reconnect-once/partial-write shape,
+//! cited at each borrowed item; there's no shared TCP sink driver yet.
 //!
 //! ## Config
 //!
-//! `endpoint` (`host:port`, resolved once per batch, never at config-load time -- same
-//! `statsd_out`/`collectd_out` precedent), `transport` (`tcp`, the default, or `udp`), `protocol`
-//! (`plaintext`, the default, or `pickle` -- TCP only, rejected on UDP by
-//! `crates/logit-pipeline/src/graph.rs` rule 46), `tags`/`multi_value` (forwarded straight to the
-//! encoder, no sink-level meaning), `max_packet_bytes` (default `1432`, `statsd_out`'s own figure
-//! -- UDP only, ignored on TCP, which has no datagram to overflow), `max_frame_bytes` (default
-//! `1MiB`, Twisted's own `Int32StringReceiver.MAX_LENGTH`), and `connect_timeout` (TCP only,
-//! default `5s`, `statsd_out`/`syslog_out`'s own default).
+//! - `endpoint`: `host:port`, resolved once per batch, never at config load.
+//! - `transport`: `tcp` (default) or `udp`.
+//! - `protocol`: `plaintext` (default) or `pickle`, TCP only (graph rule 46).
+//! - `tags`/`multi_value`: forwarded to the encoder; no sink-level meaning.
+//! - `max_packet_bytes`: default `1432`, UDP only; TCP has no datagram to overflow.
+//! - `max_frame_bytes`: default 1 MiB, Twisted's `Int32StringReceiver.MAX_LENGTH`.
+//! - `connect_timeout`: TCP only, default `5s`.
 //!
 //! ## Packing
 //!
-//! Plaintext UDP: the encoder emits one [`logit_proto::MessageBuf`] entry per line (meta always
-//! `1`), and this sink packs them into as few datagrams as fit under `max_packet_bytes`
-//! (newline-joined, **no trailing newline**) -- `StatsdOutput::send_udp`/`flush_datagram`'s exact
-//! shape (`crates/logit-outputs/src/statsd.rs:1880-1958`), copied here because a single line
-//! already longer than `max_packet_bytes` was dropped by the encoder itself (its own line cap,
-//! `with_max_packet_bytes`), so every line this sink ever sees already fits in its own datagram
-//! at minimum. Plaintext TCP: every line is written `\n`-terminated, **including the last** --
-//! `send_tcp` builds one buffer for the whole batch and issues it as one write (partial-then-
-//! `write_all`), `StatsdOutput::send_tcp`'s own shape. Pickle (TCP only): the encoder already
-//! produced complete, self-delimited, length-prefixed frames, so no join separator is needed at
-//! all; this sink concatenates them into the same per-batch write buffer with no separator between
-//! them -- TCP is an ordered byte stream, so writing N already-framed messages back to back in one
-//! `write`/`write_all` sequence is indistinguishable on the wire from N separate `write_all` calls,
-//! and Twisted's `Int32StringReceiver` on the other end parses each frame off its own declared
-//! length regardless of how the bytes arrived in individual `recv`s. This buys the same
-//! "one write (or one partial-write-then-retry) per batch" property `send_tcp` already gives
-//! plaintext, rather than issuing a separate `write_all` per frame.
+//! - **Plaintext UDP**: lines are packed newline-joined, **no trailing newline**, into as few
+//!   datagrams as fit under `max_packet_bytes`. The encoder already dropped any single line over
+//!   the cap, so every line fits a datagram on its own.
+//! - **Plaintext TCP**: every line `\n`-terminated, **including the last**.
+//! - **Pickle** (TCP only): frames concatenated with no separator; the receiver parses each off
+//!   its own length prefix.
+//!
+//! On TCP, the whole batch is one buffer and one write (partial, then `write_all`).
 //!
 //! ## Faults
 //!
-//! `endpoint` is resolved once per batch (a non-numeric host must not be re-resolved once per
-//! datagram/write -- `statsd::send_udp`'s doc comment). UDP: `EMSGSIZE` (raw OS error 90, or
-//! `ErrorKind::InvalidInput` on a platform where the shim never reaches the syscall) on one
-//! datagram counts that datagram's datapoints under
-//! `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
-//! sending continues with the next datagram; any other send error is [`Fault::Clean`] if no
-//! datagram in this batch has been sent yet, else [`Fault::Ambiguous`]. TCP: a fresh/lazy connect
-//! failure or timeout is [`Fault::Clean`]; a write failing before any byte of the batch has left
-//! this host is retried with exactly **one** reconnect (`StatsdOutput::send_tcp`'s own invariant);
-//! a write failing after at least one byte has already gone out is [`Fault::Ambiguous`] and is
-//! **never** retried -- resending would duplicate whatever the peer already has (this is also why
-//! [`GraphiteOutput::duplicate_safe`] is `true`: see "Duplicate safety" below, a property about the
-//! *destination*, not about whether this sink itself ever double-sends).
+//! - UDP `EMSGSIZE` (raw OS error 90, or `ErrorKind::InvalidInput` where the shim never reaches
+//!   the syscall) drops that datagram's datapoints under
+//!   `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
+//!   sending continues. Any other UDP send error is [`Fault::Clean`] if no datagram of the batch
+//!   was sent yet, else [`Fault::Ambiguous`].
+//! - TCP: a connect failure or timeout is [`Fault::Clean`]. A write failing before any byte left
+//!   is retried with one reconnect. A write failing after a byte left is [`Fault::Ambiguous`] and
+//!   never retried by this sink.
 //!
-//! ## Telemetry (transport-level; the codec's own counters are documented on it, not here)
+//! ## Telemetry
 //!
-//! `logit.output.batch.bytes` (total bytes across every message in the batch, emitted only when
-//! there is something to send), `logit.output.request.duration` (one timer per `send` call that
-//! actually touches the socket), `logit.output.requests{class="ok"|"error"}`,
-//! `logit.output.messages` (entries -- lines or pickle frames -- actually sent),
-//! `logit.output.datapoints` (Σ each sent entry's `usize` meta -- datapoints actually sent, which
-//! for plaintext equals `messages` since every line's meta is `1`, and can differ for pickle, whose
-//! frames carry several datapoints each), `logit.output.datagrams` (UDP only, datagrams actually
-//! sent), and `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
-//! `oversize_datagram` diagnostic for the `EMSGSIZE` case above.
+//! Transport-level only; the codec documents its own. `logit.output.batch.bytes` (only when there
+//! is something to send), `logit.output.request.duration`,
+//! `logit.output.requests{class="ok"|"error"}`, `logit.output.messages` (entries sent),
+//! `logit.output.datapoints` (Σ sent entries' meta; equals `messages` for plaintext),
+//! `logit.output.datagrams` (UDP only), and the `oversize_datagram` drop above.
 //!
 //! ## Duplicate safety
 //!
-//! [`GraphiteOutput::duplicate_safe`] is `true`: whisper (carbon's own storage backend) is
-//! last-write-wins **per `(path, second)`** -- a redelivered datapoint for a second whisper already
-//! holds a value for simply overwrites it with the same number, rather than accumulating like a
-//! collectd COUNTER or a statsd `|c` would (`influxdb.rs:191-199`'s identical argument for
-//! InfluxDB's own idempotent-overwrite semantics). This is the first non-HTTP sink with a real
-//! destination to claim `true` (`null_out` claims it too, but trivially -- it has no destination
-//! to redeliver to). **The boundary**: this is whisper's behavior specifically, not a property of the
-//! carbon wire protocol itself -- a non-whisper Graphite-protocol receiver (a different storage
-//! engine listening on the same wire) could treat a redelivered datapoint as an addition instead,
-//! and this sink would have no way to tell. State this plainly rather than silently assuming every
-//! receiver is whisper.
+//! [`GraphiteOutput::duplicate_safe`] is `true` because whisper is last-write-wins per
+//! `(path, second)`: a redelivered datapoint overwrites the same number rather than accumulating
+//! like a collectd COUNTER or statsd `|c`. That's whisper's behavior, not the carbon wire's; a
+//! non-whisper receiver on the same wire could add instead, and this sink can't tell.
 
 use crate::tls::{poll_pending_close, PendingClose};
 use anyhow::Context;
@@ -113,51 +69,41 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 
-/// Which transport a `graphite_out` component was configured with -- the target of
-/// [`crate`]'s CLI-side `graphite_out_transport` converter
-/// (`crates/logit-cli/src/pipeline.rs`), kept as its own small public enum (rather than matching
-/// `logit_config::GraphiteTransport` directly there) so that conversion has a named, stable
-/// signature. Namespaced `graphite_out_*` on the CLI side specifically because `graphite_in`
-/// converts the same `logit_config::GraphiteTransport` onto its own, different type -- a bare
-/// `graphite_transport` name would collide. Not used internally beyond selecting
-/// [`GraphiteOutput::udp`]/[`GraphiteOutput::tcp`]; [`Conn`] is this module's own internal choice.
+/// Which transport a `graphite_out` was configured with: the target of `build_spec`'s
+/// `graphite_out_transport` converter, which picks [`GraphiteOutput::udp`] or
+/// [`GraphiteOutput::tcp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Udp,
     Tcp,
 }
 
-/// `crates/logit-outputs/src/statsd.rs:1638-2045`'s `Conn` -- copied verbatim in shape. `Tcp`'s
-/// `stream` starts `None`: connecting eagerly at construction would turn "the destination isn't up
-/// yet" into a startup failure instead of the retryable `send`-time one every other sink gives it
-/// (`StatsdOutput::tcp`'s own doc comment).
+/// `statsd`'s `Conn`, in shape. `Tcp`'s `stream` starts `None`: an eager connect would turn "the
+/// destination isn't up yet" into a startup failure instead of a retryable `send`-time one.
 enum Conn {
     Udp(UdpSocket),
     Tcp { stream: Option<TcpStream>, connect_timeout: Duration },
 }
 
-/// `logit_pipeline::Output` for `graphite_out`. Built via [`GraphiteOutput::udp`] or
-/// [`GraphiteOutput::tcp`] -- never a bare constructor, mirroring `StatsdOutput`.
+/// `logit_pipeline::Output` for `graphite_out`, built via [`GraphiteOutput::udp`] or
+/// [`GraphiteOutput::tcp`].
 pub struct GraphiteOutput {
     endpoint: String,
     conn: Conn,
     encoder: GraphiteEncoder,
-    /// Kept on the sink, not just the encoder, so [`GraphiteOutput::with_encoder`] can re-apply it
-    /// to a replacement encoder regardless of builder order -- `CollectdOutput::with_encoder`'s own
-    /// doc comment explains why. UDP datagram cap only; see [`GraphiteOutput::encoder_cap`].
+    /// Kept here too so [`GraphiteOutput::with_encoder`] can re-apply it in any builder order.
+    /// UDP datagram cap only ([`GraphiteOutput::encoder_cap`]).
     max_packet_bytes: usize,
-    /// Reused across `send` calls: the codec's own packing buffer, one entry per line (plaintext)
-    /// or per already-prefixed frame (pickle), whose `usize` meta is that entry's datapoint count.
+    /// Reused across `send`s: the encoder's output, meta = each entry's datapoint count.
     buf: MessageBuf<usize>,
-    /// Reused across `send` calls: the packed UDP datagram, or the whole TCP write buffer.
+    /// Reused across `send`s: the packed UDP datagram, or the whole TCP write buffer.
     packet_buf: Vec<u8>,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl GraphiteOutput {
-    /// Binds an ephemeral local UDP socket eagerly -- see `StatsdOutput::udp`'s doc comment for
-    /// why `endpoint` itself is resolved per `send`, not here.
+    /// Binds an ephemeral local UDP socket eagerly; `endpoint` is resolved per `send`.
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .context("binding graphite_out's local UDP socket")?;
@@ -186,9 +132,7 @@ impl GraphiteOutput {
         .with_max_packet_bytes(logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES)
     }
 
-    /// The line cap the encoder enforces for this transport: the configured datagram size on UDP,
-    /// none on TCP (no datagram to overflow -- `StatsdOutput::encoder_cap`'s identical reasoning
-    /// and shape).
+    /// The encoder's line cap: `max_packet_bytes` on UDP, none on TCP.
     fn encoder_cap(&self) -> usize {
         if matches!(self.conn, Conn::Udp(_)) {
             self.max_packet_bytes
@@ -197,10 +141,9 @@ impl GraphiteOutput {
         }
     }
 
-    /// Installs `encoder`, with this sink's transport-appropriate line cap, diagnostics, and
-    /// telemetry re-applied on top of it -- `CollectdOutput::with_encoder`'s own doc comment gives
-    /// the full argument for why a plain `self.encoder = encoder` would be order-dependent and
-    /// would silently drop both handles.
+    /// Installs `encoder` with this sink's line cap, diagnostics, and telemetry re-applied, so
+    /// builder order doesn't matter (`CollectdOutput::with_encoder` says what goes wrong
+    /// otherwise).
     pub fn with_encoder(mut self, encoder: GraphiteEncoder) -> Self {
         self.encoder = encoder
             .with_max_packet_bytes(self.encoder_cap())
@@ -209,8 +152,7 @@ impl GraphiteOutput {
         self
     }
 
-    /// Bounds one UDP **datagram** (several packed lines); ignored by the encoder on TCP (see
-    /// [`GraphiteOutput::encoder_cap`]).
+    /// Bounds one UDP datagram of packed lines; no effect on TCP.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         let cap = self.encoder_cap();
@@ -234,9 +176,7 @@ impl GraphiteOutput {
 #[async_trait::async_trait]
 impl Output for GraphiteOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // Discarded: every counter/diagnostic this produces, the encoder has already emitted
-        // itself through the `Telemetry`/`Diagnostics` handles `with_telemetry`/`with_diagnostics`
-        // fed it -- this module's doc, "Telemetry".
+        // `Stats` discarded: the encoder already reported them through its own handles.
         self.encoder.encode_into(batch, &mut self.buf);
 
         if self.buf.is_empty() {
@@ -288,9 +228,7 @@ impl Output for GraphiteOutput {
         result.map(|_| ())
     }
 
-    /// Implemented explicitly for the same reason `statsd_out`/`syslog_out` do: `send` performs
-    /// one write per batch and retains nothing between calls, so there's nothing buffered here at
-    /// shutdown -- for TCP, this simply flushes the underlying stream.
+    /// `send` buffers nothing between calls; this only flushes an open TCP stream.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
             stream.flush().await.context("flushing graphite_out TCP stream")?;
@@ -298,27 +236,23 @@ impl Output for GraphiteOutput {
         Ok(())
     }
 
-    /// `true`: whisper is last-write-wins per `(path, second)` -- see this module's doc comment,
-    /// "Duplicate safety", for the full argument and its stated boundary.
+    /// Whisper is last-write-wins per `(path, second)`; the module doc's "Duplicate safety" has
+    /// the boundary.
     fn duplicate_safe(&self) -> bool {
         true
     }
 }
 
-/// Running totals for one [`GraphiteOutput::send_udp`] call -- `StatsdOutput`'s own
-/// `UdpSendCounts`, with a `datapoints` column added: a dropped `oversize_datagram` datagram
-/// attributes its **datapoint** count (Σ `meta`), not just its entry count, to
-/// `logit.output.messages.dropped` -- the two coincide for plaintext (every line's meta is `1`)
-/// but this is written generically so the same counting logic would still be correct if this sink
-/// ever packed pickle frames into a UDP datagram (it never legally does -- graph rule 46 -- but the
-/// counting code itself makes no such assumption).
+/// Running totals for one [`GraphiteOutput::send_udp`] call: `statsd`'s `UdpSendCounts` plus
+/// `datapoints`. An `oversize_datagram` drop counts datapoints (Σ `meta`), not entries; the two
+/// coincide for plaintext, the only protocol UDP allows.
 #[derive(Default)]
 struct UdpSendCounts {
-    /// [`MessageBuf`] entries actually written to the socket -- `logit.output.messages`.
+    /// Entries written to the socket: `logit.output.messages`.
     messages: usize,
-    /// Σ of each written entry's `meta` -- `logit.output.datapoints`.
+    /// Σ written entries' `meta`: `logit.output.datapoints`.
     datapoints: usize,
-    /// Datagrams actually written to the socket -- `logit.output.datagrams`.
+    /// Datagrams written to the socket: `logit.output.datagrams`.
     datagrams: usize,
     /// Entries appended to `packet_buf` since the last flush; reset by every flush.
     entries_in_packet: usize,
@@ -327,10 +261,8 @@ struct UdpSendCounts {
 }
 
 impl GraphiteOutput {
-    /// Packs `buf`'s entries into as few UDP datagrams as fit under `max_packet_bytes`
-    /// (newline-joined, no trailing newline), then sends one `send_to` per datagram --
-    /// `StatsdOutput::send_udp`'s exact shape (`crates/logit-outputs/src/statsd.rs:1880-1918`).
-    /// Returns `(messages sent, datapoints sent, datagrams sent)`.
+    /// Packs `buf` into as few datagrams as fit under `max_packet_bytes`, one `send_to` each, as
+    /// `StatsdOutput::send_udp` does. Returns `(messages, datapoints, datagrams)` sent.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
@@ -340,8 +272,7 @@ impl GraphiteOutput {
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<(usize, usize, usize)> {
-        // Resolved once per batch, not once per datagram -- see `statsd::send_udp`'s doc comment
-        // for why a non-numeric host must not be re-resolved on every call.
+        // Once per batch: a non-numeric host must not be re-resolved per datagram.
         let mut addrs = lookup_host(endpoint)
             .await
             .context("resolving graphite_out endpoint")
@@ -373,8 +304,7 @@ impl GraphiteOutput {
         Ok((counts.messages, counts.datapoints, counts.datagrams))
     }
 
-    /// Sends one packed datagram, clearing `packet_buf` and the per-packet counters after --
-    /// `StatsdOutput::flush_datagram`'s exact shape.
+    /// Sends one packed datagram, then clears `packet_buf` and the per-packet counters.
     async fn flush_datagram(
         socket: &UdpSocket,
         addr: std::net::SocketAddr,
@@ -414,28 +344,18 @@ impl GraphiteOutput {
         Ok(())
     }
 
-    /// One write (partial-then-`write_all`) per **batch**, with at most one internal
-    /// reconnect-and-retry -- `StatsdOutput::send_tcp`'s exact control flow
-    /// (`crates/logit-outputs/src/statsd.rs:1983-2038`), including both correctness properties
-    /// documented there: cancellation safety via `stream.take()`, and never resending once a byte
-    /// has left this host. The only difference from `StatsdOutput::send_tcp` is what goes into the
-    /// write buffer: a plaintext batch newline-terminates every line (including the last);
-    /// a pickle batch concatenates its already-length-prefixed frames with **no** separator --
-    /// see this module's doc comment, "Packing", for why one write of the concatenation is
-    /// equivalent to one `write_all` per frame here. Returns `(messages sent, datapoints sent, 0)`
-    /// -- there's no datagram count on TCP.
+    /// One write (partial, then `write_all`) per batch, with at most one reconnect-and-retry:
+    /// `StatsdOutput::send_tcp`'s control flow, including cancellation safety via `stream.take()`
+    /// and never resending once a byte has left this host. Only the buffer differs (module doc,
+    /// "Packing"). Returns `(messages, datapoints, 0)`; TCP has no datagram count.
     ///
-    /// **A reused connection is probed before the first write.** A pooled connection inherited
-    /// from an earlier `send` may have been closed by the carbon receiver in the meantime -- a
-    /// restart, a `logit`-side `idle_timeout:` on the far end, a relay hop cycling -- and carbon's
-    /// wire has no ack and no error to tell the sender so: the write lands in the local socket
-    /// buffer, this function reports the batch delivered, and those datapoints are gone. So a
-    /// connection that came out of `*stream` (never a freshly-dialled one) gets exactly one
-    /// non-consuming `poll_read` first ([`crate::tls::poll_pending_close`], whose doc comment has
-    /// why one poll and not a cancellable `timeout(read)`); anything but "still open" drops it and
-    /// dials a fresh one with nothing written yet. It deliberately does not consume the one
-    /// post-write-failure retry below, which is about a connection that *was* written to.
-    /// `docs/adr/idle-connection-timeout.md`.
+    /// **A reused connection is probed before the first write.** The receiver may have closed it
+    /// since the last `send` (a restart, a far-end `idle_timeout:`), and carbon has no ack to say
+    /// so: the write would land in the local socket buffer and the datapoints would be lost. So a
+    /// connection taken from `*stream`, never a fresh one, gets one non-consuming poll
+    /// ([`crate::tls::poll_pending_close`]); anything but open is replaced before anything is
+    /// written. That doesn't use up the post-write-failure retry
+    /// (`docs/adr/idle-connection-timeout.md`).
     async fn send_tcp(
         stream: &mut Option<TcpStream>,
         endpoint: &str,
@@ -457,11 +377,8 @@ impl GraphiteOutput {
         let mut retried_after_a_zero_byte_failure = false;
         loop {
             let mut conn = match stream.take() {
-                // A *reused* connection is polled once first -- see this function's doc
-                // comment's probe paragraph. `Eof`/`Bytes` fall through to a fresh connect with
-                // nothing written, so `retried_after_a_zero_byte_failure` is deliberately *not*
-                // consumed: this is not the one retry that follows a failed write, it is a
-                // connection that was never written to at all.
+                // The probe (doc comment). A closed connection was never written to, so
+                // replacing it doesn't consume `retried_after_a_zero_byte_failure`.
                 Some(mut conn) => {
                     let mut probe = [0u8; 1];
                     let pending = poll_pending_close(&mut conn, &mut probe).await;
@@ -496,9 +413,7 @@ impl GraphiteOutput {
                             *stream = Some(conn);
                             Ok((buf.len(), datapoints, 0))
                         }
-                        // Never resent: at least one byte of this batch already left this host,
-                        // so retrying (even against a fresh connection) risks the peer applying
-                        // it twice.
+                        // Never resent: a byte already left, so the peer may apply it twice.
                         Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
                     };
                 }
@@ -512,13 +427,9 @@ impl GraphiteOutput {
     }
 }
 
-/// One fresh TCP connection to `endpoint`, raced against `connect_timeout`. `Fault::Clean`
-/// throughout: nothing of a batch can have left this host while a connection is still being
-/// established. Its own function rather than inline in [`GraphiteOutput::send_tcp`] now that
-/// there are two callers -- the first dial of a lazily-connected sink, and replacing a pooled
-/// connection the probe found closed. Unlike `syslog_out`/`statsd_out`'s `TcpDial::connect` there
-/// is no TLS phase and no `logit.output.reconnects` counter here: this sink has never had either
-/// (this module's doc comment; `docs/adr/graphite-carbon-relay.md`).
+/// One fresh TCP connection to `endpoint`, raced against `connect_timeout`. Always
+/// `Fault::Clean`: nothing of a batch has left while connecting. Unlike `statsd_out`/
+/// `syslog_out`'s `TcpDial::connect`, there's no TLS phase and no `logit.output.reconnects`.
 async fn connect(endpoint: &str, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
     tokio::time::timeout(connect_timeout, TcpStream::connect(endpoint))
         .await
@@ -527,9 +438,8 @@ async fn connect(endpoint: &str, connect_timeout: Duration) -> anyhow::Result<Tc
         .context(Fault::Clean)
 }
 
-/// `90` is `EMSGSIZE` on Linux specifically -- see `statsd::is_message_too_large`'s doc comment
-/// (copied rather than shared: it isn't `pub`); this repo only ever ships/runs inside the Linux
-/// containers it builds.
+/// `90` is `EMSGSIZE` on Linux, the only platform `logit` ships for; a copy of
+/// `statsd::is_message_too_large`.
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
@@ -555,9 +465,8 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// A single-gauge, single-tag event -- decode-shaped, deliberately, so whole-`EventBatch`
-    /// equality against a real decode is a meaningful assertion (`collectd.rs`'s `relay_event`
-    /// doc comment makes the identical argument).
+    /// A single-gauge, single-tag event, decode-shaped so whole-`EventBatch` equality against a
+    /// real decode is meaningful.
     fn tagged_event(name: &str, value: f64, tag: (&str, &str)) -> Event {
         let mut attrs = AttrMap::new();
         attrs.insert(tag.0, Value::from(tag.1));
@@ -594,9 +503,7 @@ mod tests {
         })
     }
 
-    /// The summed value of every point named `metric` in an already-drained `events`, regardless
-    /// of tags -- `collectd.rs`'s `metric_sum` (one shared drain, since `drain` empties the
-    /// registry).
+    /// The summed value of every point named `metric` in an already-drained `events`, any tags.
     fn metric_sum(events: &[Event], metric: &str) -> f64 {
         events
             .iter()
@@ -637,8 +544,7 @@ mod tests {
         (addr, received)
     }
 
-    /// Whole-`EventBatch` equality against the input, not a spot check of a couple of fields --
-    /// `tagged_event`'s decode shape makes this a real fixed-point assertion.
+    /// Whole-`EventBatch` equality against the input: a fixed-point assertion.
     #[tokio::test]
     async fn a_line_round_trips_through_a_real_collector_and_the_real_decoder() {
         let (addr, collector) = udp_collector().await;
@@ -694,8 +600,8 @@ mod tests {
         assert!(!received.ends_with(b"\n"), "a UDP datagram must not end with a trailing newline");
     }
 
-    /// A boundary bug that let one datagram's content bleed into the next could still decode to
-    /// the right events while violating the cap it was supposed to honor -- so this checks both.
+    /// Checks both the decoded events and each datagram's size, since a packing bug can bleed
+    /// across datagrams and still decode correctly.
     #[tokio::test]
     async fn a_low_cap_packs_several_events_into_several_datagrams_none_over_cap() {
         let (addr, collector) = udp_collector().await;
@@ -736,9 +642,7 @@ mod tests {
         assert_eq!(decoded, batch.events, "decode(send(b)) must equal b, not just a count");
     }
 
-    /// Strips the 4-byte length prefix and decodes the payload with the real decoder in pickle
-    /// mode -- proving what this sink writes is exactly what a real Twisted `Int32StringReceiver`
-    /// consumer would also accept.
+    /// Strips the 4-byte length prefix and decodes the payload with the real pickle decoder.
     #[tokio::test]
     async fn a_pickle_send_writes_one_length_prefixed_frame_a_real_reader_accepts() {
         let (addr, received) = tcp_collector().await;
@@ -803,9 +707,7 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
 
-    /// "Exactly one reconnect before any byte is written": the peer resets an inherited
-    /// connection, so the very first write against it fails with zero bytes sent -- safe to
-    /// reconnect and retry once, `StatsdOutput`'s own precedent test.
+    /// A first write that fails with zero bytes sent reconnects and retries once.
     #[tokio::test]
     async fn tcp_reconnects_exactly_once_after_the_peer_resets_an_inherited_connection() {
         let (addr, received) = tcp_collector().await;
@@ -831,11 +733,8 @@ mod tests {
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
     }
 
-    /// [`tcp_collector`], except every connection is closed the moment it has read anything at
-    /// all -- the shape a carbon receiver restarting, or one with an idle timeout of its own,
-    /// presents to a sink holding a pooled connection between batches. A clean FIN, not an RST:
-    /// the collector has read everything before it closes, which is exactly the case carbon's
-    /// wire gives a sender no way to detect from a write.
+    /// `tcp_collector`, but each connection closes (a clean FIN) once it has read anything, as a
+    /// restarting or idle-timing-out carbon receiver would.
     async fn tcp_collector_that_closes_after_one_read(
     ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -864,16 +763,8 @@ mod tests {
         (addr, received, accepts)
     }
 
-    /// The pooled-connection probe (`GraphiteOutput::send_tcp`'s doc comment;
-    /// `docs/adr/idle-connection-timeout.md`): the carbon receiver closed the connection this
-    /// sink was holding between batches, and the second batch's datapoints must still arrive.
-    ///
-    /// This is the loss the probe exists to prevent, and nothing else in this file can catch it:
-    /// a write into a FIN'd socket *succeeds* locally, so without the probe `send` returns `Ok`,
-    /// the batch is committed off the sink queue, and those datapoints are simply gone -- carbon
-    /// sends nothing back to lose them against. Hence the assertion on the collector's second
-    /// accept and on the line itself, not merely on `send`'s return value. No reconnect counter
-    /// to check here: `graphite_out` has never had one (this module's doc comment).
+    /// After the receiver closes the pooled connection, the next batch still arrives. Asserts on
+    /// the collector's second accept and the line, since a write into a FIN'd socket returns `Ok`.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {
@@ -885,8 +776,7 @@ mod tests {
             .await
             .expect("first send should succeed against a fresh connection");
 
-        // Let the collector's close land in this host's receive queue, so the probe has a FIN to
-        // find rather than a race to lose.
+        // Let the FIN land before the probe looks for it.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         output
@@ -909,14 +799,9 @@ mod tests {
         );
     }
 
-    /// A write that fails only *after* at least one byte of the batch already left this host must
-    /// be `Fault::Ambiguous`, never retried. Forced deterministically: the collector accepts the
-    /// connection, waits briefly (long enough for this sink's first, necessarily-partial `write`
-    /// of a several-megabyte batch to land locally), then resets the connection -- the follow-up
-    /// `write_all` for the remainder then fails against a connection that already has bytes in
-    /// flight, exactly the "some bytes may have already landed" case `Fault::Ambiguous` exists for.
-    // `set_linger` blocks the thread on drop -- accepted here, a test-only, one-shot loopback
-    // close, for the deterministic RST this test needs.
+    /// A write failing after a byte already left is `Fault::Ambiguous`, never retried. The
+    /// collector resets the connection after the first partial `write` of a large batch.
+    // `set_linger` blocks the thread on drop; acceptable for a one-shot loopback RST in a test.
     #[allow(deprecated)]
     #[tokio::test]
     async fn a_write_failing_after_bytes_already_left_this_host_is_an_ambiguous_fault() {
@@ -924,8 +809,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
-                // Long enough for the sink's first `write()` call (which only needs local buffer
-                // space, not a peer read) to have already returned a partial byte count.
+                // Long enough for the sink's first `write()` to return a partial count.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let _ = stream.set_linger(Some(Duration::ZERO));
                 drop(stream);
@@ -933,9 +817,8 @@ mod tests {
         });
 
         let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
-        // Several megabytes of short lines -- comfortably larger than any default socket send
-        // buffer or advertised receive window, so the very first `write()` call is guaranteed to
-        // return fewer bytes than the whole frame regardless of what the collector does.
+        // Larger than any default send buffer or receive window, so the first `write()` is
+        // partial whatever the collector does.
         let events: Vec<Event> =
             (0..300_000).map(|i| gauge_event(&format!("m{i}"), i as f64)).collect();
         let batch = batch_with(events);
@@ -947,10 +830,8 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
     }
 
-    /// A UDP datagram genuinely too large for the kernel to send (`EMSGSIZE`) is counted and
-    /// skipped, not surfaced as a `send` error -- real `send_to` against a real socket, not a
-    /// simulated error, since `max_packet_bytes` has no graph-rule upper bound for `graphite_out`
-    /// (unlike `collectd_out`'s rule 38 range clamp).
+    /// A real `EMSGSIZE` from `send_to` is counted and skipped, not a `send` error. Reachable
+    /// because rule 38's upper bound applies to `collectd_out` only, not `graphite_out`.
     #[tokio::test]
     async fn an_emsgsize_datagram_is_counted_not_faulted() {
         let (addr, _collector) = udp_collector().await;
@@ -978,17 +859,9 @@ mod tests {
         assert!(output.duplicate_safe());
     }
 
-    /// `with_encoder`/`with_max_packet_bytes` must be order-independent --
-    /// `CollectdOutput`'s own precedent test. A cap of 4 bytes is smaller than any real line, so
-    /// in either order the event below must be dropped whole as oversize by the *encoder* (not
-    /// merely fail to error, which a send to an unconnected UDP socket never does regardless of
-    /// whether the cap was actually applied) -- asserted via the codec's own
-    /// `logit.output.metrics.skipped{reason="oversize_line"}` counter, fed through a
-    /// `Registry`-backed `Telemetry` installed on each ordering, so this test is load-bearing:
-    /// dropping `with_encoder`'s own `.with_max_packet_bytes(self.encoder_cap())`
-    /// re-application would leave the cap at `GraphiteEncoder::new()`'s uncapped `usize::MAX` in
-    /// the `with_encoder`-called-last ordering, the line would encode instead of being dropped,
-    /// and this assertion would fail.
+    /// `with_encoder`/`with_max_packet_bytes` are order-independent: a 4-byte cap makes the
+    /// encoder count the line as `oversize_line` in either order. A UDP send never errors, so only
+    /// the codec's counter can show the cap was applied.
     #[tokio::test]
     async fn the_encoder_cap_is_order_independent_with_with_encoder() {
         let registry_cap_then_encoder = Registry::new();
@@ -1034,8 +907,7 @@ mod tests {
             .with_encoder(
                 GraphiteEncoder::new().with_multi_value(logit_proto::graphite::MultiValue::Skip),
             );
-        // A `Samples` record is skipped by default under `multi_value: skip`, counted through
-        // both handles only if `with_encoder` kept feeding them into the codec.
+        // `multi_value: skip` counts a `Samples` record through both handles, if they survived.
         let batch = batch_with(vec![Event::metric(
             TS,
             AttrMap::new(),
@@ -1077,8 +949,7 @@ mod tests {
         assert_eq!(metric_sum(&events, "logit.output.requests"), 1.0);
     }
 
-    /// A drop the codec counts (an unsupported multi-value kind) is visible through the same
-    /// shared `Telemetry` handle this sink was built with.
+    /// A codec-counted drop is visible through the `Telemetry` this sink was built with.
     #[tokio::test]
     async fn a_skipped_kind_is_counted_by_the_codec_through_the_shared_telemetry_handle() {
         let registry = Registry::new();

@@ -1,9 +1,7 @@
-//! Per-protocol output sinks. The v0.1 vertical slice target is `influxdb`
-//! (`docs/OVERVIEW.md`); other protocols implement the same trait incrementally.
+//! Per-protocol output sinks, each implementing `logit_pipeline::Output`.
 //!
-//! The `Output` trait itself lives in `logit-pipeline`
-//! (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- see `logit-inputs`'s crate doc
-//! comment for the same reasoning.
+//! The trait lives in `logit-pipeline`, not here, so the runtime never depends on a concrete
+//! protocol (`docs/design/pipeline-graph.md`'s "Crate layout").
 
 mod attrs;
 pub mod collectd;
