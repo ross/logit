@@ -1780,7 +1780,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     independently on the same `trace_id`, per ADR
     `internal-span-emission-and-deterministic-sampling`'s "no propagated bit"); or thin metrics
     (`internal`'s point-side buffer and `otlp_out`'s metrics encoding ignore it, which is why the
-    demo's InfluxDB dashboard looks the same at `0.1` or `1.0`).
+    demo's metrics dashboard looks the same at `0.1` or `1.0`).
 
     **Still open, deliberately:**
     1. **The listener span's window is the `send` call only, not decode-to-send.** `Fanout::send`

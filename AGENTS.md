@@ -423,13 +423,16 @@ the operator-facing account of all of this.
   syslog/InfluxDB side against a real nginx (`examples/nginx/`).
 - **`demo/`** is the answer to "let me see this work" for anyone else: a self-contained
   `docker compose up` against the release image. Logs, metrics, and traces all flow through it
-  end to end, into Loki, InfluxDB, and Tempo respectively
+  end to end, into Loki, VictoriaMetrics, and Tempo respectively
   ([docs/plans/demo-stack.md](docs/plans/demo-stack.md),
   [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). In `demo/logit.yaml`:
   - `loki_out` is `otlp_out` over HTTP straight to Loki
     ([docs/plans/otlp-logs-and-resource-identity.md](docs/plans/otlp-logs-and-resource-identity.md)'s
     workstream B); `tempo_out` is `otlp_out` over gRPC to Tempo, proving the internal-span chain
     against a real Tempo.
+  - `victoria_out` is `prometheus_out` sending remote-write 1.0 (zstd) to VictoriaMetrics, so both
+    `aggregate`s feeding it run `temporality: cumulative`. The Grafana dashboard's metric panels
+    are PromQL against the Prometheus-sanitized names (`web_requests_total`).
   - `nginx_in` is `docker_in`, tailing that tier's container directly instead of receiving a
     `syslog:` stream; `postgres_in` is `tail_in`, tailing Postgres's own rotating jsonlog
     directory (`docs/plans/demo-richer-traces.md`'s workstream C).
