@@ -6,3 +6,11 @@ SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 run cargo clippy --workspace --all-targets -- -D warnings
+
+# logit-pipeline's `fault-injection` feature (crates/logit-pipeline/src/fault.rs) is enabled only as
+# a dev-dependency. Resolver 2 keeps it out of the release binary until a normal dependency enables
+# it, which this catches.
+if run cargo tree -p logit-cli -e normal,features | grep -q 'fault-injection'; then
+    echo "error: logit-cli's release dependency graph enables logit-pipeline's fault-injection feature" >&2
+    exit 1
+fi
