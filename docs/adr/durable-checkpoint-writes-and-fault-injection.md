@@ -48,7 +48,37 @@ DISK-09, DISK-10, DISK-13, TAIL-05). Reading them against their ADRs found this:
   between a `rename` and the next syscall. `crates/logit-cli/tests/durable_buffer_restart.rs`
   covers one `SIGKILL` at one point. `FileTarget::rotate_with` injects a failing opener and
   nothing else. The inventory's rule is that each entry ends in a committed, executable
-  artifact, so the cluster needs a way to fail or freeze any single filesystem operation from an ordinary test.
+  artifact, so the cluster needs a way to fail or freeze any single filesystem operation from an
+  ordinary test.
+
+Planning the `dur` stack also found four spool defects, each reproducible from the code. They're
+labelled here so later records can cite them; the workstream named on each closes it.
+
+- **F1: an in-cap corrupt `compressed_len` reads as a torn tail.** A `compressed_len` below
+  `logit_proto::frame`'s sanity cap (just over 64 MiB) but past the bytes present reads as
+  `CodecError::Truncated`. That's correct at the frame layer, where it's indistinguishable from a
+  short read, but `DiskQueue` mishandles it twice. `walk_segment` stops there, so
+  `DiskQueue::open` truncates every real record after it in the active segment. On a closed
+  segment, `read_record_at` returns nothing at end of file, so `peek` retries forever. The disk
+  ADR's "Recovery" section credits the cap with preventing this; it only covers lengths above it.
+  Closed by `dur/w3`.
+- **F2: a cancelled `push` can land its bytes after the repair.** A `push` future dropped at its
+  `flush` await leaves tokio's already-spawned blocking write running: `poll_write` hands the
+  bytes to the blocking pool through `spawn_mandatory_blocking` and returns `Poll::Ready(Ok(n))`,
+  and nothing cancels that task (tokio 1.53.1, `src/fs/file.rs`, `File::poll_write`). The next
+  `write_record`'s torn-tail repair truncates through a fresh file descriptor that doesn't wait
+  for it, so the orphaned bytes can land after the truncate and the file gets ahead of the
+  in-memory segment length. Closed by `dur/w4`.
+- **F3: a batch parked in a blocked `push` is lost uncounted at shutdown.** Under
+  `overflow: block`, `drain_inbox` can hold a batch it already took from the inbox inside a
+  pending `store.push`. When `run_output` drops `drain_inbox` at shutdown, that batch is in
+  neither the inbox (so the abandoned-inbox sweep never sees it) nor the store, and nothing counts
+  it dropped. The memory store has the same hole. Closed by `dur/w5`.
+- **F4: a failed segment unlink leaks the segment for good.** `roll_read_cursor` removes a
+  segment from memory whether or not its unlink succeeded. At the next `DiskQueue::open`,
+  `list_segments` lists it again and counts it in `total_bytes`, and nothing deletes it, because
+  only a segment the read cursor leaves is ever unlinked. Enough leaks fill `disk.max_bytes`.
+  Closed by `dur/w5`.
 
 ## Decision
 
