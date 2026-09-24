@@ -152,11 +152,12 @@ tracing = "0.1"
 # already promoted above. All MIT or (MIT OR Apache-2.0); `deny.toml`'s allowlist already covers
 # both -- script/audit confirms, not assumes.
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-# Pure-codec fixed-point property tests only, dev-only everywhere it's used: `logit-proto`'s
-# OTLP suite (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s
-# W4) and `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5),
-# both asserting `decode(encode(decode(x))) == decode(x)`. MIT OR Apache-2.0, covered by
-# deny.toml's allowlist (`script/audit` confirms, not assumes).
+# Property tests, dev-only everywhere it's used: `logit-proto`'s OTLP suite
+# (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s W4) and
+# `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5), both
+# asserting `decode(encode(decode(x))) == decode(x)`, and `logit-pipeline`'s disk spool recovery
+# suite (`crates/logit-pipeline/src/disk_queue_verification.rs`), which mutates real segments.
+# MIT OR Apache-2.0, covered by deny.toml's allowlist (`script/audit` confirms, not assumes).
 proptest = "1"
 
 [profile.release]

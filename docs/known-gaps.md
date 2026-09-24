@@ -335,10 +335,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     from the last persisted read cursor, replaying at most the batches committed since the last
     checkpoint. The same frames would serve the receive side, but its design isn't started: a
     listener has no equivalent of a sink's "haven't delivered yet" boundary to resume from.
-  - **The disk-backed sink spool has a real, accepted power-loss window.** Durability is
-    `fdatasync` on segment rotation, on the cursor file, and at shutdown, not per push (the ADR's
-    "Durability" section). A power loss (not a process crash) can lose the active segment's most
-    recent un-`fsync`ed writes. A `disk.sync: every_push` knob that closes the window at a real
+  - **The disk-backed sink spool has a real, accepted power-loss window.** Every cursor write is
+    `fsync`ed (tmp file, then directory); a segment is `fsync`ed only when it rotates away and at
+    shutdown, not per push (the ADR's "Durability" section and its 2026-09-24 amendment). A power
+    loss (not a process crash) can lose the active segment's most recent un-`fsync`ed writes. A `disk.sync: every_push` knob that closes the window at a real
     throughput cost is a plausible follow-up, not built.
   - **`logit_proto::buffer::Buffer<T>`'s role narrowed to `InMemoryBuffer` alone.** Written ahead
     of its caller ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)), the trait's
@@ -1251,6 +1251,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     by a kill between that rename and its promotion is promoted to `.1` on the next rotation, never
     silently lost.
 
+- **`file_out` never fsyncs, by design.** Nothing in `crates/logit-outputs/src/file.rs` fsyncs
+  the active file, the `.rotating` staging file, or the directory after a rename, so a power loss
+  (not a process crash) can lose the most recent writes or leave a rotation half-applied. A
+  log-file sink doesn't pay per-batch fsyncs for a guarantee few deployments need; see the
+  "`file_out` makes no durability promise" amendment to
+  [ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24).
+  No revisit trigger short of a deployment that needs a power-loss-safe log file.
 - **`stdio_out` has no reopen** — a file target is opened once, in append mode, and held for the
   process's lifetime, so an external log rotator that moves the file leaves `logit` writing to the
   unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
