@@ -118,7 +118,10 @@ pub(crate) fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("segment-{seq:016}.lgit"))
 }
 
-/// Every `segment-<seq>.lgit` in `dir`, ascending by sequence number. Other files are ignored.
+/// Every `segment-<seq>.lgit` in `dir` whose `seq` is exactly 16 ASCII digits (the form
+/// [`segment_path`] writes), ascending by sequence number. Other files are ignored, including an
+/// unpadded twin such as `segment-0.lgit`: it would parse to a `seq` that already names a
+/// different file, and be counted twice.
 pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     let mut seqs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -126,6 +129,9 @@ pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(seq_str) = name.strip_prefix("segment-").and_then(|s| s.strip_suffix(".lgit")) {
+            if seq_str.len() != 16 || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
             if let Ok(seq) = seq_str.parse::<u64>() {
                 seqs.push(seq);
             }
@@ -168,8 +174,8 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
 
 /// The result of walking every record in a byte range.
 pub(crate) struct WalkOutcome {
-    /// Segment offset up to which data is confirmed good. Everything after it is a torn tail or
-    /// corruption with no further resync target.
+    /// Where the walk stopped: the end of the bytes, or the start of a torn tail (a record that
+    /// reads as `Truncated` with nothing parseable after it).
     pub(crate) good_len: u64,
     pub(crate) valid_count: u64,
     pub(crate) corrupt_skipped: u64,
@@ -178,11 +184,23 @@ pub(crate) struct WalkOutcome {
 /// Walks every record in `bytes` from `start_offset` (`bytes[0]` is the segment's byte 0),
 /// calling `on_record(offset, ctx, batch, len)` for each clean one.
 ///
-/// Stops at the first short read. A torn tail and a clean end look the same here; the caller
-/// tells them apart by comparing `good_len` with the file's length. Any other parse failure
-/// resyncs forward with `frame::resync`, backing up over the 24-byte context prefix it doesn't
-/// know about. A spurious `MAGIC` match (say, inside a `trace_id`) is tried and skipped if it
-/// doesn't parse.
+/// A record that fails to parse resyncs forward with `frame::resync`, backing up over the
+/// 24-byte context prefix it doesn't know about. The scan starts `CONTEXT_LEN + 1` bytes past
+/// the failed record, because the next real record's `MAGIC` can be no nearer (the failed record
+/// is at least one byte, and the next one's context precedes its `MAGIC`). So every candidate
+/// lies past the failed record's start, and the walk never moves backwards. A spurious `MAGIC`
+/// match (say, inside a `trace_id`) is tried and skipped if it doesn't parse.
+///
+/// A `Truncated` failure is a torn tail only if nothing after it parses: `frame::read_frame`
+/// reports any in-cap `compressed_len` longer than the bytes present as `Truncated`
+/// (`crates/logit-proto/tests/frame_fixed_point.rs`'s
+/// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`), so a corrupt length mid-segment
+/// reads the same as a torn write. A torn tail stops the walk at the failed record
+/// (`good_len` is its start); a clean end and a torn tail look the same here, and the caller
+/// tells them apart by comparing `good_len` with the file's length.
+///
+/// `corrupt_skipped` counts skipped regions, not records: one resync, or one unrecoverable run to
+/// the end of `bytes`, counts 1 however many records it spanned. It's a lower bound.
 pub(crate) fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
@@ -191,47 +209,44 @@ pub(crate) fn walk_segment(
     let mut pos = start_offset as usize;
     let mut valid_count = 0u64;
     let mut corrupt_skipped = 0u64;
-    loop {
-        if pos >= bytes.len() {
-            break;
-        }
-        match parse_record(&bytes[pos..]) {
+    while pos < bytes.len() {
+        let err = match parse_record(&bytes[pos..]) {
             Ok((ctx, batch, consumed)) => {
                 on_record(pos as u64, ctx, batch, consumed as u64);
                 valid_count += 1;
                 pos += consumed;
+                continue;
             }
-            Err(CodecError::Truncated { .. }) => break,
-            Err(_corrupt) => {
-                let mut scan_from = pos + 1;
-                let mut recovered = false;
-                while scan_from < bytes.len() {
-                    match frame::resync(&bytes[scan_from..]) {
-                        Some(rel) => {
-                            let magic_at = scan_from + rel;
-                            if magic_at >= CONTEXT_LEN {
-                                let candidate = magic_at - CONTEXT_LEN;
-                                if parse_record(&bytes[candidate..]).is_ok() {
-                                    corrupt_skipped += 1;
-                                    pos = candidate;
-                                    recovered = true;
-                                    break;
-                                }
-                            }
-                            scan_from = magic_at + 1;
-                        }
-                        None => break,
-                    }
-                }
-                if !recovered {
-                    corrupt_skipped += 1;
-                    pos = bytes.len();
-                    break;
-                }
+            Err(err) => err,
+        };
+        match resync_after(bytes, pos) {
+            Some(next) => {
+                corrupt_skipped += 1;
+                pos = next;
+            }
+            None if matches!(err, CodecError::Truncated { .. }) => break,
+            None => {
+                corrupt_skipped += 1;
+                pos = bytes.len();
             }
         }
     }
     WalkOutcome { good_len: pos as u64, valid_count, corrupt_skipped }
+}
+
+/// The start of the first record after the one at `pos` that parses, if any. Always `> pos`: see
+/// [`walk_segment`] for why the scan starts `CONTEXT_LEN + 1` bytes on.
+fn resync_after(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut scan_from = pos + CONTEXT_LEN + 1;
+    while scan_from < bytes.len() {
+        let magic_at = scan_from + frame::resync(&bytes[scan_from..])?;
+        let candidate = magic_at - CONTEXT_LEN;
+        if parse_record(&bytes[candidate..]).is_ok() {
+            return Some(candidate);
+        }
+        scan_from = magic_at + 1;
+    }
+    None
 }
 
 #[derive(Serialize, Deserialize)]
@@ -317,6 +332,19 @@ struct Segment {
     /// be torn), or the active segment's length validated at [`DiskQueue::open`] and advanced by
     /// each successful [`DiskQueue::push`].
     len: u64,
+}
+
+/// What [`DiskQueue::read_record_at`] found at the read cursor.
+enum ReadOutcome {
+    /// A record, and how far the cursor must advance to pass it (past any corrupt bytes skipped
+    /// to reach it).
+    Record(BatchContext, Arc<EventBatch>, u64),
+    /// Corruption with no record after it before the end of the segment: advance this many bytes
+    /// without delivering.
+    Skip(u64),
+    /// Nothing readable now: an I/O error, a segment already rolled away, or a file shorter than
+    /// its recorded length. The caller re-evaluates.
+    Unavailable,
 }
 
 struct HeadCache {
@@ -886,7 +914,11 @@ impl DiskQueue {
             }
             (state.read_seq, state.read_offset)
         };
-        let Some((_ctx, batch, len)) = self.read_record_at(seq, offset).await else { return false };
+        let (batch, len) = match self.read_record_at(seq, offset).await {
+            ReadOutcome::Record(_ctx, batch, len) => (batch, len),
+            ReadOutcome::Skip(delta) => return self.skip_corrupt(seq, offset, delta),
+            ReadOutcome::Unavailable => return false,
+        };
         {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if state.head_cache.is_some() || state.read_seq != seq || state.read_offset != offset {
@@ -904,58 +936,88 @@ impl DiskQueue {
     }
 
     /// Reads one record at `(seq, offset)`, growing the read by [`CodecError::Truncated`]'s
-    /// `needed` hint past [`READ_CHUNK_INITIAL`]. Returns the record and how far the cursor must
-    /// advance to pass it. Resyncs past live corruption as defense in depth; the primary recovery
-    /// is [`DiskQueue::open`].
-    async fn read_record_at(
-        &self,
-        seq: u64,
-        offset: u64,
-    ) -> Option<(BatchContext, Arc<EventBatch>, u64)> {
-        let mut chunk_len = READ_CHUNK_INITIAL;
-        loop {
+    /// `needed` hint past [`READ_CHUNK_INITIAL`]. Reads no further than the segment's in-memory
+    /// length, which covers only whole, flushed records: an in-progress write past it is never
+    /// read, and a record that claims to run past it is corrupt, not waiting on a write. Resyncs
+    /// past live corruption as defense in depth; the primary recovery is [`DiskQueue::open`].
+    async fn read_record_at(&self, seq: u64, offset: u64) -> ReadOutcome {
+        let seg_len = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.segments.iter().find(|s| s.seq == seq).map(|s| s.len)
+        };
+        let Some(seg_len) = seg_len else { return ReadOutcome::Unavailable };
+        let Some(remaining) = seg_len.checked_sub(offset).filter(|&r| r > 0) else {
+            return ReadOutcome::Unavailable;
+        };
+        let remaining = remaining as usize;
+        let mut chunk_len = READ_CHUNK_INITIAL.min(remaining);
+        let buf = loop {
             let buf = match self.read_at(seq, offset, chunk_len).await {
                 Ok(buf) => buf,
-                Err(_) => return None,
+                Err(_) => return ReadOutcome::Unavailable,
             };
-            if buf.is_empty() {
-                return None;
+            if buf.len() < chunk_len {
+                // The file is shorter than the accounting says: nothing to parse or skip.
+                return ReadOutcome::Unavailable;
             }
             match parse_record(&buf) {
-                Ok((ctx, batch, consumed)) => return Some((ctx, batch, consumed as u64)),
-                Err(CodecError::Truncated { needed }) => {
-                    if buf.len() < chunk_len {
-                        // End of segment.
-                        return None;
-                    }
-                    chunk_len = buf.len() + needed;
+                Ok((ctx, batch, consumed)) => {
+                    return ReadOutcome::Record(ctx, batch, consumed as u64)
                 }
-                Err(_corrupt) => {
-                    // Live corruption: resync within what's readable of this segment.
-                    let seg_len = {
-                        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                        state.segments.iter().find(|s| s.seq == seq).map(|s| s.len)
-                    };
-                    let seg_len = seg_len?;
-                    let remaining = seg_len.saturating_sub(offset) as usize;
-                    let whole = match self.read_at(seq, offset, remaining).await {
-                        Ok(b) => b,
-                        Err(_) => return None,
-                    };
-                    // The returned length is a delta from the read cursor, not the record's
-                    // size: `pos` counts the corrupt bytes skipped before the record, so the
-                    // delta is `pos + len`. `len` alone would land the cursor inside the record.
-                    let mut found = None;
-                    let outcome = walk_segment(&whole, 0, |pos, ctx, batch, len| {
-                        if found.is_none() {
-                            found = Some((ctx, batch, pos + len));
-                        }
-                    });
-                    self.count_dropped("disk_corrupt", outcome.corrupt_skipped.max(1));
-                    return found;
+                Err(CodecError::Truncated { needed }) if buf.len() < remaining => {
+                    chunk_len = (buf.len() + needed).min(remaining);
                 }
+                // Corrupt, or `Truncated` with every byte up to the segment's length in hand.
+                Err(_) => break buf,
             }
+        };
+
+        let whole = if buf.len() == remaining {
+            buf
+        } else {
+            match self.read_at(seq, offset, remaining).await {
+                Ok(b) if b.len() == remaining => b,
+                _ => return ReadOutcome::Unavailable,
+            }
+        };
+        // The returned length is a delta from the read cursor, not the record's size: `pos`
+        // counts the corrupt bytes skipped before the record, so the delta is `pos + len`. `len`
+        // alone would land the cursor inside the record.
+        let mut found = None;
+        let outcome = walk_segment(&whole, 0, |pos, ctx, batch, len| {
+            if found.is_none() {
+                found = Some((ctx, batch, pos + len));
+            }
+        });
+        match found {
+            Some((ctx, batch, delta)) => {
+                self.count_dropped("disk_corrupt", outcome.corrupt_skipped.max(1));
+                ReadOutcome::Record(ctx, batch, delta)
+            }
+            None => ReadOutcome::Skip(remaining as u64),
         }
+    }
+
+    /// Advances the read cursor past `delta` bytes of corruption at `(seq, offset)` without
+    /// delivering, as a commit would, and counts one `batches.dropped{reason="disk_corrupt"}`
+    /// with zero events: how many events a run of undecodable bytes held is unknowable. Returns
+    /// whether it skipped: `false` if the head moved or was reserved since the read.
+    fn skip_corrupt(&self, seq: u64, offset: u64, delta: u64) -> bool {
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if state.head_cache.is_some() || state.read_seq != seq || state.read_offset != offset {
+                return false;
+            }
+            state.read_offset += delta;
+            // At least one record's worth, never more than is queued. `open` re-derives the count
+            // from what parses, so any drift here ends at the next restart.
+            state.queued_records = state.queued_records.saturating_sub(1);
+        }
+        self.count_dropped("disk_corrupt", 0);
+        self.after_cursor_advance();
+        self.after_change();
+        self.not_full.notify_one();
+        true
     }
 
     async fn read_at(&self, seq: u64, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -1063,6 +1125,12 @@ impl DiskQueue {
             state.head_cache = None;
             state.read_offset += record_len;
         }
+        self.after_cursor_advance();
+    }
+
+    /// Rolls across any segment boundary the cursor just crossed, and persists the cursor if
+    /// `checkpoint_interval` has elapsed.
+    fn after_cursor_advance(&self) {
         self.roll_read_cursor();
         let due = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1135,16 +1203,19 @@ impl DiskQueue {
             }
 
             match self.read_record_at(seq, offset).await {
-                Some((ctx, batch, record_len)) => {
+                ReadOutcome::Record(ctx, batch, record_len) => {
                     let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                     if state.read_seq == seq && state.read_offset == offset {
                         state.head_cache = Some(HeadCache { batch, ctx, record_len });
                     }
                 }
-                None => {
-                    // Nothing readable where accounting said there should be (an I/O error, a
-                    // short read, or corruption with no resync target). Back off briefly rather
-                    // than spin, then re-evaluate.
+                ReadOutcome::Skip(delta) => {
+                    self.skip_corrupt(seq, offset, delta);
+                }
+                ReadOutcome::Unavailable => {
+                    // Nothing readable where accounting said there should be (an I/O error, or a
+                    // file shorter than its recorded length). Back off briefly rather than spin,
+                    // then re-evaluate.
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
@@ -2095,6 +2166,181 @@ mod tests {
         drop(q);
         let reopened = open_with(cfg);
         deliver(&reopened, &["a", "b", "c"]).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Recovery and the read path treat an in-cap corrupt length as corruption, never walk
+    // backwards, and never stall on a closed segment (DISK-01, DISK-02, DISK-07's read path).
+    // -----------------------------------------------------------------------------------------
+
+    /// `raw_record(batch(marker))` with its frame's `compressed_len` rewritten to `declared`.
+    fn record_with_compressed_len(marker: &str, declared: u32) -> Vec<u8> {
+        let mut record = raw_record(&batch(marker), ctx());
+        let at = CONTEXT_LEN + 16;
+        record[at..at + 4].copy_from_slice(&declared.to_le_bytes());
+        record
+    }
+
+    /// A length past everything written after it, but far under the frame layer's sanity cap, so
+    /// `frame::read_frame` reports `Truncated` rather than `Malformed`
+    /// (`crates/logit-proto/tests/frame_fixed_point.rs`'s
+    /// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`).
+    const IN_CAP_CORRUPT_LEN: u32 = 1024 * 1024;
+
+    async fn peek_within(q: &DiskQueue) -> Option<(Arc<EventBatch>, BatchContext)> {
+        tokio::time::timeout(Duration::from_secs(5), q.peek())
+            .await
+            .expect("peek must not stop responding")
+    }
+
+    #[tokio::test]
+    async fn a_corrupted_length_field_below_the_sanity_cap_does_not_truncate_the_records_after_it()
+    {
+        let dir = scratch_dir("in-cap-length-active");
+        let path = segment_path(&dir, 0);
+        let mut bytes = raw_record(&batch("good"), ctx());
+        bytes.extend_from_slice(&record_with_compressed_len("corrupt", IN_CAP_CORRUPT_LEN));
+        bytes.extend_from_slice(&raw_record(&batch("after"), ctx()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (q, registry, _diag) = open_observed(config(dir.clone()));
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes.len() as u64,
+            "an in-cap corrupt length is corruption with a record after it, not a torn tail"
+        );
+        let events = registry.drain(0);
+        assert_eq!(metric_sum(&events, DISK_TRUNCATED, None), 0.0);
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_corrupt"))),
+            1.0
+        );
+        assert_eq!(metric_sum(&events, DISK_REPLAYED, None), 2.0);
+        deliver(&q, &["good", "after"]).await;
+        q.close();
+        assert!(peek_within(&q).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_closed_segment_with_an_in_cap_corrupt_length_does_not_stall_peek() {
+        let dir = scratch_dir("in-cap-length-closed");
+        let mut closed = raw_record(&batch("good"), ctx());
+        closed.extend_from_slice(&record_with_compressed_len("corrupt", IN_CAP_CORRUPT_LEN));
+        closed.extend_from_slice(&raw_record(&batch("after"), ctx()));
+        std::fs::write(segment_path(&dir, 0), &closed).unwrap();
+        std::fs::write(segment_path(&dir, 1), raw_record(&batch("next"), ctx())).unwrap();
+
+        let q = open(dir.clone());
+        deliver(&q, &["good", "after", "next"]).await;
+        q.close();
+        assert!(peek_within(&q).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted() {
+        for garbage in [
+            // Reads as `Truncated`: a length past the segment's end.
+            record_with_compressed_len("corrupt", IN_CAP_CORRUPT_LEN),
+            // Reads as `Malformed`: no MAGIC anywhere to resync to.
+            vec![0xA5; 64],
+        ] {
+            let dir = scratch_dir("closed-garbage-tail");
+            let mut closed = raw_record(&batch("good"), ctx());
+            closed.extend_from_slice(&garbage);
+            std::fs::write(segment_path(&dir, 0), &closed).unwrap();
+            std::fs::write(segment_path(&dir, 1), raw_record(&batch("next"), ctx())).unwrap();
+
+            let (q, registry, _diag) = open_observed(config(dir.clone()));
+            // Only the read path's count below: `open` counts the same region once itself.
+            registry.drain(0);
+
+            deliver(&q, &["good", "next"]).await;
+            q.close();
+            assert!(peek_within(&q).await.is_none());
+
+            let events = registry.drain(0);
+            let corrupt = |metric| metric_sum(&events, metric, Some(("reason", "disk_corrupt")));
+            assert_eq!(corrupt(SINK_QUEUE_METRICS.items_dropped), 1.0, "one skipped region");
+            assert_eq!(
+                corrupt(SINK_QUEUE_METRICS.units_dropped),
+                0.0,
+                "undecodable bytes have no knowable event count"
+            );
+            assert!(
+                !segment_path(&dir, 0).exists(),
+                "the skip crossed out of segment 0, which is deleted as a commit would"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards() {
+        // Record A, then fewer than `CONTEXT_LEN` filler bytes, then a frame with no context of
+        // its own. Parsing at A's end fails (its "frame" starts inside the real one). The MAGIC
+        // just past A's end, backed up by `CONTEXT_LEN`, lands inside A, and a record parses
+        // there: the last bytes of A plus the filler as its context, then the real frame.
+        let a = raw_record(&batch("a"), ctx());
+        let payload = native::encode_batch_v2(&batch("phantom"), Provenance::default());
+        let bare_frame =
+            frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload).unwrap();
+        for filler in 1..CONTEXT_LEN {
+            let mut bytes = a.clone();
+            bytes.extend(std::iter::repeat_n(0x5A, filler));
+            bytes.extend_from_slice(&bare_frame);
+
+            let mut emitted: Vec<(u64, u64)> = Vec::new();
+            let outcome = walk_segment(&bytes, 0, |offset, _, _, len| emitted.push((offset, len)));
+
+            assert_eq!(emitted, vec![(0, a.len() as u64)], "filler {filler}: only A is a record");
+            assert_eq!(outcome.corrupt_skipped, 1, "filler {filler}");
+            assert_eq!(outcome.good_len, bytes.len() as u64, "filler {filler}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_segment_file_whose_name_is_not_zero_padded_is_ignored() {
+        let dir = scratch_dir("unpadded-segment-name");
+        std::fs::write(segment_path(&dir, 0), raw_record(&batch("real"), ctx())).unwrap();
+        // Each parses as a `u64`: two alias segment 0, one names a segment that isn't there.
+        for name in ["segment-0.lgit", "segment-+000000000000000.lgit", "segment-7.lgit"] {
+            std::fs::write(dir.join(name), raw_record(&batch("alias"), ctx())).unwrap();
+        }
+
+        assert_eq!(list_segments(&dir).unwrap(), vec![0]);
+        let (q, registry, _diag) = open_observed(config(dir.clone()));
+        let events = registry.drain(0);
+        assert_eq!(metric_sum(&events, DISK_REPLAYED, None), 1.0, "segment 0 counts once");
+        deliver(&q, &["real"]).await;
+        q.close();
+        assert!(peek_within(&q).await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_second_open_of_the_same_spool_directory_fails_at_the_lock() {
+        let dir = scratch_dir("second-open");
+        let first = open(dir.clone());
+        first.push((batch("a"), ctx())).await;
+        let segment_before = std::fs::read(segment_path(&dir, 0)).unwrap();
+
+        let err = DiskQueue::open(config(dir.clone()), Telemetry::default(), Diagnostics::new("t"))
+            .err()
+            .expect("a second open of a locked spool must fail");
+        assert!(err.to_string().contains("already in use"), "{err:#}");
+        assert_eq!(
+            std::fs::read(segment_path(&dir, 0)).unwrap(),
+            segment_before,
+            "the refused open must not have truncated or rewritten anything"
+        );
+
+        drop(first);
+        let reopened = open(dir.clone());
+        deliver(&reopened, &["a"]).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }
