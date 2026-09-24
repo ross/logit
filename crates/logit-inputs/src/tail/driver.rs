@@ -7,7 +7,7 @@
 //! opened at the beginning. A tracked file whose size is below the offset already read was
 //! truncated in place: it's re-read from `0` with its partial-line state discarded.
 
-use super::checkpoint::{CheckpointStore, FileId};
+use super::checkpoint::{CheckpointStore, FileId, Loaded};
 use super::line::{LineSplitter, TailDecoder};
 use super::pattern::PathPattern;
 use super::TailConfig;
@@ -88,11 +88,21 @@ enum Outcome {
     Checkpoint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartOffset {
     Beginning,
     End,
     /// An offset past the file's current length (truncated while stopped) restarts at `0`.
     Resume(u64),
+}
+
+impl From<super::ReadFrom> for StartOffset {
+    fn from(read_from: super::ReadFrom) -> Self {
+        match read_from {
+            super::ReadFrom::Beginning => StartOffset::Beginning,
+            super::ReadFrom::End => StartOffset::End,
+        }
+    }
 }
 
 struct TrackedFile<D> {
@@ -130,6 +140,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// instead of replaying. Those entries are process-local, since the checkpoint writes only
     /// tracked files (`docs/adr/docker-container-identity-and-minimal-watches.md`).
     resume: HashMap<FileId, (PathBuf, u64)>,
+    /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
+    /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
+    first_scan_start: StartOffset,
     diag: Diagnostics,
     telemetry: Telemetry,
     watched_dirs: HashSet<PathBuf>,
@@ -143,6 +156,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         Self {
             patterns,
             factory,
+            first_scan_start: StartOffset::from(config.read_from),
             config,
             files: HashMap::new(),
             by_path: HashMap::new(),
@@ -188,9 +202,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             return Ok(());
         }
         if let Some(checkpoint_path) = self.config.checkpoint_path.clone() {
-            let (store, resume) = CheckpointStore::load(checkpoint_path, &mut self.diag);
+            let (store, loaded) =
+                CheckpointStore::load(checkpoint_path, &mut self.diag, &self.telemetry);
             self.checkpoint = Some(store);
-            self.resume = resume;
+            match loaded {
+                Loaded::Missing => {}
+                Loaded::Resume(resume) => self.resume = resume,
+                Loaded::Unusable => self.first_scan_start = StartOffset::Beginning,
+            }
         }
 
         let mut watcher = match super::watch::Watcher::new(self.config.watch, &mut self.diag) {
@@ -353,8 +372,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// Discovers matched files, opens new ones, and reconciles rotation, truncation, and removal
     /// for tracked ones.
     ///
-    /// Only files found on the `first` scan follow `read_from`; a later discovery starts at the
-    /// beginning, since it has no "before startup" to skip. A checkpoint entry wins over both.
+    /// Only files found on the `first` scan follow `read_from` (`first_scan_start`, which an
+    /// unusable checkpoint overrides to `Beginning`); a later discovery starts at the beginning,
+    /// since it has no "before startup" to skip. A checkpoint entry wins over both.
     /// A path missing from this scan (including a failed `read_dir`) starts draining its file.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
@@ -400,10 +420,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     // offset. `open_tracked` removes it once `accept` succeeds.
                     let start = match self.resume.get(&id) {
                         Some(&(_, offset)) => StartOffset::Resume(offset),
-                        None if first => match self.config.read_from {
-                            super::ReadFrom::Beginning => StartOffset::Beginning,
-                            super::ReadFrom::End => StartOffset::End,
-                        },
+                        None if first => self.first_scan_start,
                         None => StartOffset::Beginning,
                     };
                     self.open_tracked(path, id, start, watcher).await;
@@ -775,7 +792,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             .files
             .values()
             .map(|f| (f.id, f.path.as_path(), f.offset.saturating_sub(f.splitter.pending_bytes())));
-        checkpoint.write(entries, force, &mut self.diag, &self.telemetry);
+        checkpoint.write(entries, force, &mut self.diag, &self.telemetry).await;
     }
 }
 
@@ -1585,6 +1602,184 @@ mod tests {
         assert_eq!(messages(&events), vec!["one", "two", "three"]);
         assert!(checkpoint_path.exists(), "shutdown should force a checkpoint write");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sums counter `name` tagged `tag`. Drains `registry`, so it's a one-shot check.
+    fn counter_sum(registry: &Registry, name: &str, tag: (&str, &str)) -> f64 {
+        registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get(tag.0).and_then(logit_core::Value::as_str) == Some(tag.1))
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value,
+                other => panic!("{name} must be a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// Polls `cond` every 5ms for up to 5s.
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Decision 4 of `docs/adr/durable-checkpoint-writes-and-fault-injection.md`: a checkpoint
+    /// that exists but can't be used says a previous run read these files, so skipping to their
+    /// end under `read_from: end` would drop whatever they gained while `logit` was down. Each
+    /// shape here is what a power loss or a crash mid-write can leave behind.
+    #[tokio::test]
+    async fn an_unusable_checkpoint_starts_every_preexisting_file_at_the_beginning_even_under_read_from_end(
+    ) {
+        // `(label, bytes, written at the tmp path rather than the checkpoint path)`.
+        let cases: [(&str, &[u8], bool); 4] = [
+            ("empty", b"", false),
+            ("truncated", br#"{"version":1,"files":[{"dev":"#, false),
+            ("wrong-version", br#"{"version":99,"files":[]}"#, false),
+            ("stray-tmp", br#"{"version":1,"#, true),
+        ];
+        for (label, bytes, at_tmp) in cases {
+            let dir = scratch_dir(&format!("unusable-checkpoint-{label}"));
+            let a_path = dir.join("a.log");
+            let b_path = dir.join("b.log");
+            std::fs::write(&a_path, b"a1\na2\n").unwrap();
+            std::fs::write(&b_path, b"b1\n").unwrap();
+            let checkpoint_path = dir.join("checkpoint.json");
+            let written = if at_tmp {
+                logit_pipeline::atomic_write::tmp_path(&checkpoint_path)
+            } else {
+                checkpoint_path.clone()
+            };
+            std::fs::write(written, bytes).unwrap();
+
+            let mut config = fast_config(ReadFrom::End);
+            config.checkpoint_path = Some(checkpoint_path.clone());
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+            let diag = Diagnostics::new("test");
+            let (fanout, mut rx) = recording_fanout(8);
+            let tailer = Tailer::new(
+                vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
+                LineFactory,
+                config,
+            )
+            .with_diagnostics(diag.clone())
+            .with_telemetry(telemetry);
+            let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+            let mut got = messages(&expect_events(&mut rx, 3).await);
+            got.sort();
+            assert_eq!(got, vec!["a1", "a2", "b1"], "{label}: every pre-existing line replays");
+            shutdown(shutdown_tx, handle).await;
+
+            assert_eq!(
+                counter_sum(&registry, "logit.input.checkpoint.errors", ("op", "load")),
+                1.0,
+                "{label}"
+            );
+            assert!(diag.occurrences("checkpoint_error") >= 1, "{label}");
+            // Shutdown's forced write replaces the unusable document with a good one.
+            let text = std::fs::read_to_string(&checkpoint_path).unwrap();
+            assert!(text.contains("a.log") && text.contains("b.log"), "{label}: {text}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The other half of decision 4: no checkpoint and no tmp beside it is a first run, so
+    /// `read_from` still decides.
+    #[tokio::test]
+    async fn a_missing_checkpoint_still_honours_read_from_end() {
+        let dir = scratch_dir("missing-checkpoint-read-from-end");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"old line\n").unwrap();
+        let mut config = fast_config(ReadFrom::End);
+        config.checkpoint_path = Some(dir.join("checkpoint.json"));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+        let diag = Diagnostics::new("test");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_diagnostics(diag.clone())
+            .with_telemetry(telemetry);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        // Let the initial scan open the file before appending, or the append could be skipped.
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"new line\n")
+            .unwrap();
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["new line"], "the pre-existing line must be skipped");
+        shutdown(shutdown_tx, handle).await;
+
+        assert_eq!(counter_sum(&registry, "logit.input.checkpoint.errors", ("op", "load")), 0.0);
+        assert_eq!(diag.occurrences("checkpoint_error"), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `kill -9` after the new checkpoint's tmp file is written but before it's renamed over
+    /// the old one. The restart must resume from the old checkpoint, so the lines read since are
+    /// delivered again (duplicates), and nothing is skipped even under `read_from: end`.
+    #[tokio::test]
+    async fn a_crash_between_checkpoint_write_and_rename_resumes_from_the_previous_checkpoint_with_duplicates_only(
+    ) {
+        use logit_pipeline::fault::{self, sites, Op, Point};
+
+        let dir = scratch_dir("checkpoint-crash-before-rename");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_millis(20);
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["one"]);
+        wait_until("the first checkpoint to cover \"one\"", || {
+            std::fs::read_to_string(&checkpoint_path).is_ok_and(|t| t.contains("\"offset\": 4"))
+        })
+        .await;
+
+        let scope = fault::scope(&dir);
+        scope.crash_at(Point::new(sites::TAIL_CHECKPOINT, Op::Rename), 1);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"two\n").unwrap();
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["two"]);
+        wait_until("the next checkpoint write to reach its rename", || scope.crashed()).await;
+        // The process is dead from here on: shutdown's forced write fails under the freeze too.
+        shutdown(shutdown_tx, handle).await;
+        scope.revive();
+        drop(scope);
+
+        let text = std::fs::read_to_string(&checkpoint_path).unwrap();
+        assert!(text.contains("\"offset\": 4"), "the previous checkpoint survives: {text}");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"three\n")
+            .unwrap();
+        config.read_from = ReadFrom::End; // the resume entry wins over it
+        let (fanout2, mut rx2) = recording_fanout(8);
+        let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
+        assert_eq!(
+            messages(&expect_events(&mut rx2, 2).await),
+            vec!["two", "three"],
+            "\"two\" is delivered again, \"one\" is not, and nothing is skipped"
+        );
+        shutdown(shutdown_tx2, handle2).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 

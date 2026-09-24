@@ -1071,6 +1071,7 @@ dependencies = [
  "logit-core",
  "logit-proto",
  "logit-script",
+ "proptest",
  "regex",
  "serde",
  "serde_json",
