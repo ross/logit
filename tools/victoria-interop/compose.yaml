@@ -64,6 +64,10 @@ services:
     <<: *logit
     volumes: ["./logit-rw1.yaml:/config.yaml:ro,z"]
 
+  logit-rw1-zstd:
+    <<: *logit
+    volumes: ["./logit-rw1-zstd.yaml:/config.yaml:ro,z"]
+
   logit-rw2:
     <<: *logit
     volumes: ["./logit-rw2.yaml:/config.yaml:ro,z"]

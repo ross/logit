@@ -337,11 +337,14 @@ From `script/victoria-interop` on 2026-09-24, at `73ca4931`, with `logit` built 
 Image tags: `victoriametrics/victoria-metrics:v1.152.0`, `victoriametrics/vmagent:v1.152.0`,
 `victoriametrics/victoria-logs:v1.52.0`, `victoriametrics/victoria-traces:v0.11.1`. The harness
 prints `PASS`, `GAP`, or `FAIL` per leg; the result column here is the plan's worked, fixed, or
-gap.
+gap. Legs 1z and 10 were rerun on 2026-09-24 at `cacf17bf` (W2 landed), after adding a permanent
+zstd leg (1z) and extending leg 10's check for the codec change; their rows and the verbatim block
+below reflect that rerun, the rest reflect the original run.
 
 | Leg | Result | Detail |
 |---|---|---|
 | 1 | Worked | `vi_rw1_gauge` and `vi_rw1_requests_total` (a `Sum` through `aggregate` `temporality: cumulative`) stored with their `leg` label and nothing added |
+| 1z | Worked | `prometheus_out` `compression: zstd` (W2): `vi_rw1z_gauge` and `vi_rw1z_requests_total` stored via a zstd-compressed remote-write body, same as leg 1 otherwise |
 | 2 | Gap | VictoriaMetrics answers a remote-write 2.0 request `204` with an empty body and stores nothing, with nothing logged, so `prometheus_out` `version: 2` reports every batch delivered while all of it is lost. Replaying the committed `prometheus-v2-000` capture gives the same `204` |
 | 3 | Worked | vmagent scrapes `prometheus_out`'s `bind:` and remote-writes `vi_expose_gauge` and `vi_expose_requests_total` to VictoriaMetrics with `job="logit-expose"` and `instance` added |
 | 4 | Worked | `vi_influx_gauge` arrives as `vi_influx_gauge_value{leg="influx"}` (`<measurement>_<field>`); none of `org`, `bucket`, and `db` becomes a label |
@@ -350,12 +353,14 @@ gap.
 | 7 | Gap, plus a fix | Spans arrive, but VictoriaTraces's gRPC listener closes every connection about 5 s after it opens with a TCP FIN and no HTTP/2 `GOAWAY` (packet capture: the FIN lands 5.0 s after connect, whatever is in flight). A request in flight at that moment fails as ambiguous and `otlp_out` drops the batch. At 1 batch/s the first stack, before the fix below, logged a `send_failed` warning every 6 s; an isolated 20 s rerun after the fix saw 3 closes and 2 dropped batches. The harness run recorded here reported `PASS` because no request raced a close inside its window. The same capture showed every export stalled 40 ms between its HEADERS and DATA frames, Nagle against delayed ACK; fixed in `73ca4931` (`fix(outputs): set TCP_NODELAY on otlp_out's gRPC connections`) |
 | 8 | Worked | 53 records under `app_name:vi-syslog`, `_msg` the message with no length prefix, so VictoriaLogs detects `syslog_out`'s octet counting; `format=rfc5424`, stream `{app_name, hostname, proc_id}` |
 | 9 | Worked | `prometheus_in` scrapes `/federate?match[]=vi_rw1_gauge` every 5 s: `vi_rw1_gauge` comes back a `Gauge` with `prometheus.type="untyped"` and its wire timestamp kept |
-| 10 | Fixed | vmagent's first zstd request gets `415` (`logit.input.writes{class="unsupported"}` = 1), vmagent logs "Downgrading protocol from VictoriaMetrics to Prometheus remote write for all future requests", and every later request is Snappy and `class="ok"` (18 in the window). Before the fix, every series carrying a label of its own was skipped as `invalid_labels`, because vmagent doesn't sort a series' labels: `logit` received `up` and `scrape_*` and none of `vi_expose_*`. Fixed in `9bce48fd` (`fix(proto): sort a remote-write label set instead of skipping it`); the run above receives both `vi_expose_*` series with nothing skipped |
+| 10 | Fixed, plus W2 | Before W2: vmagent's first zstd request got `415` (`logit.input.writes{class="unsupported"}` = 1), vmagent logged "Downgrading protocol from VictoriaMetrics to Prometheus remote write for all future requests", and every later request was Snappy and `class="ok"`. Fixed in `9bce48fd` (`fix(proto): sort a remote-write label set instead of skipping it`) for the label-sorting bug the original leg-10 row described. After W2 (`prometheus_in` accepts zstd), vmagent's first request already succeeds: `class="ok",encoding="zstd"` for every write (22 in the window), `class="unsupported"` stays 0, and vmagent's log never shows the downgrade; both `vi_expose_*` series arrive with nothing skipped |
 
-The run's own table, verbatim:
+The run's own table, verbatim (legs 1z and 10 from the `cacf17bf` rerun, the rest from the
+original `73ca4931` run):
 
 ```
 | 1 | prometheus_out version: 1 -> VictoriaMetrics /api/v1/write | PASS | vi_rw1_gauge, vi_rw1_requests_total stored (62 points), labels ['leg'] |
+| 1z | prometheus_out version: 1, compression: zstd -> VictoriaMetrics /api/v1/write | PASS | vi_rw1z_gauge, vi_rw1z_requests_total stored (63 points) via compression: zstd, labels ['leg'] |
 | 2 | prometheus_out version: 2 -> VictoriaMetrics | GAP | VictoriaMetrics answered every 2.0 request 2xx and stored nothing; prometheus_out logged no rejection (see the probe row for the status) |
 | 3 | prometheus_out bind: <- vmagent scrape -> VictoriaMetrics | PASS | vi_expose_gauge, vi_expose_requests_total scraped by vmagent, labels ['instance', 'job', 'leg'] |
 | 4 | influxdb_out -> VictoriaMetrics /api/v2/write | PASS | vi_influx_gauge_value, labels ['leg']; of org/bucket/db, none became labels |
@@ -364,7 +369,7 @@ The run's own table, verbatim:
 | 7 | otlp_out gRPC -> VictoriaTraces | PASS | 20 traces with vi-otlp-grpc-span in VictoriaTraces |
 | 8 | syslog_out TCP -> VictoriaLogs syslog | PASS | 53 records, _msg='victoria-interop syslog line 52' (no length prefix: octet counting detected), format=rfc5424, _stream={app_name="vi-syslog",hostname="vi-syslog-host",proc_id="-"} |
 | 9 | prometheus_in scrape <- VictoriaMetrics /federate | PASS | 10 scrapes of vi_rw1_gauge, rendered `vi_rw1_gauge gauge=42`, prometheus.type=untyped, wire timestamp kept |
-| 10 | vmagent remote-write -> prometheus_in bind: | PASS | writes class=unsupported 1, class=ok 18; vmagent log shows the downgrade; received ['vi_expose_gauge', 'vi_expose_requests_total'] vi_expose_* series; 0 series skipped |
+| 10 | vmagent remote-write -> prometheus_in bind: | PASS | writes class=ok,encoding=zstd 22 (class=ok total 22), class=unsupported 0; vmagent log does not show the downgrade; received ['vi_expose_gauge', 'vi_expose_requests_total'] vi_expose_* series; 0 series skipped |
 ```
 
 ### Gaps for W3

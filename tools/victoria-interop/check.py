@@ -146,6 +146,16 @@ def leg_1():
     return "PASS", f"{', '.join(got)} stored ({points} points), labels {label_names(series)}"
 
 
+def leg_1z():
+    series = vm_series('{__name__=~"vi_rw1z_.*"}')
+    got = names(series)
+    want = ["vi_rw1z_gauge", "vi_rw1z_requests_total"]
+    if got != want:
+        return "FAIL", f"want {want} in VictoriaMetrics, have {got}"
+    points = sum(len(row["values"]) for row in vm_export('{__name__=~"vi_rw1z_.*"}'))
+    return "PASS", f"{', '.join(got)} stored ({points} points) via compression: zstd, labels {label_names(series)}"
+
+
 def leg_2():
     stored = names(vm_series('{__name__=~"vi_rw2_.*"}'))
     logged = strip_ansi(log("logit-rw2"))
@@ -267,20 +277,24 @@ def leg_9():
 
 
 def leg_10():
+    # After W2, `prometheus_in` accepts zstd on the first request, so vmagent (zstd by default)
+    # never gets the `415` that used to force its Snappy downgrade: every write is class=ok,
+    # encoding=zstd, and class=unsupported stays 0.
     telemetry = rendered_events(OUT / "vmagent-in-telemetry.log")
     unsupported = telemetry_sum(telemetry, "logit.input.writes", **{"class": "unsupported"})
     ok = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok"})
+    ok_zstd = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok", "encoding": "zstd"})
     skipped = telemetry_sum(telemetry, "logit.input.metrics.skipped")
     received = rendered_events(OUT / "vmagent-in-received.log")
     ours = sorted({m.split()[1] for _, m in received if m.split()[1].startswith("vi_expose_")})
     downgraded = "Downgrading protocol from VictoriaMetrics to Prometheus" in log("vmagent")
 
     detail = (
-        f"writes class=unsupported {unsupported}, class=ok {ok}; vmagent log "
-        f"{'shows' if downgraded else 'does not show'} the downgrade; received {ours or 'no'} "
-        f"vi_expose_* series; {skipped} series skipped"
+        f"writes class=ok,encoding=zstd {ok_zstd} (class=ok total {ok}), class=unsupported "
+        f"{unsupported}; vmagent log {'shows' if downgraded else 'does not show'} the downgrade; "
+        f"received {ours or 'no'} vi_expose_* series; {skipped} series skipped"
     )
-    if not (unsupported >= 1 and ok >= 1 and downgraded):
+    if not (ok_zstd >= 1 and unsupported == 0 and not downgraded):
         return "FAIL", detail
     if not ours or skipped:
         return "GAP", detail
@@ -289,6 +303,7 @@ def leg_10():
 
 LEGS = [
     (1, "prometheus_out version: 1 -> VictoriaMetrics /api/v1/write", leg_1),
+    ("1z", "prometheus_out version: 1, compression: zstd -> VictoriaMetrics /api/v1/write", leg_1z),
     (2, "prometheus_out version: 2 -> VictoriaMetrics", leg_2),
     (3, "prometheus_out bind: <- vmagent scrape -> VictoriaMetrics", leg_3),
     (4, "influxdb_out -> VictoriaMetrics /api/v2/write", leg_4),
