@@ -1,12 +1,7 @@
-//! The built-in `csv` transform: splits a log record's message as one CSV row and merges the
-//! named columns into the event's attributes -- the delimiter-separated sibling of `json`. See
-//! `docs/adr/csv-positional-columns.md` for the design decisions this implements: an explicit,
-//! positional `columns:` schema (no header-row mode), RFC 4180 quoting within one line (embedded
-//! newlines out of scope), no type coercion, and a wrong field count passing the event through
-//! unchanged.
-//!
-//! Stateless -- like `json`/`scale`, only `process` is overridden; `flush_interval`/`flush` keep
-//! the `Transform` trait's defaults.
+//! `csv`: splits a log message as one CSV row and merges the named columns into the event's
+//! attributes. See `docs/adr/csv-positional-columns.md`: an explicit, positional `columns:`
+//! schema (no header-row mode), RFC 4180 quoting within one line (no embedded newlines), no type
+//! coercion, and a wrong field count passing the event through unchanged.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -15,30 +10,24 @@ use logit_pipeline::Transform;
 use std::sync::Arc;
 
 /// Splits `event.log.message` on `delimiter` per RFC 4180 and merges the named columns into
-/// `event.attributes`, verbatim as `Value::Str` -- no type coercion, no renaming, no prefix. See
-/// the module doc comment/ADR for the full design.
+/// `event.attributes` verbatim as `Value::Str`: no coercion, renaming, or prefix.
 pub struct CsvParser {
-    /// Interned once at construction, never per event.
     columns: Vec<Symbol>,
     delimiter: u8,
-    /// The configured columns rendered back as the header line they'd appear as in the source
-    /// file, built once at construction. A message byte-equal to this is the source's header
-    /// row, recognized by *value* rather than position -- see the ADR for why position is
-    /// unusable here (`read_from: end`, checkpointed restart, rotation, fan-in).
+    /// The configured columns joined as the source's header line. A message byte-equal to it is
+    /// the header row, recognized by value because position is unusable (`read_from: end`,
+    /// checkpointed restart, rotation, fan-in; see the ADR).
     header_line: Vec<u8>,
-    /// Per-field `(start, end, needs_unescape)` byte offsets into the current message, reused
-    /// across events. Offsets, not `Value`s, deliberately: nothing here holds a `Bytes`
-    /// refcount, so unlike `json`'s scratch this can never pin an event's message buffer alive
-    /// past `process`.
+    /// Per-field `(start, end, needs_unescape)` offsets into the current message, reused across
+    /// events. Offsets rather than `Value`s, so no `Bytes` refcount pins a message past `process`.
     scratch: Vec<(u32, u32, bool)>,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl CsvParser {
-    /// `columns` is the config-declared schema (left to right); `delimiter` is a single ASCII
-    /// byte, already validated at graph-resolution time (`docs/design/pipeline-graph.md`'s rule
-    /// 29) to be neither `"` nor `\n`/`\r`/non-ASCII.
+    /// `columns` is the schema, left to right. Graph rule 32 has checked that `delimiter` is one
+    /// ASCII byte other than `"`, `\n`, or `\r`.
     pub fn new(columns: Vec<String>, delimiter: u8) -> Self {
         let header_line = columns.join(&(delimiter as char).to_string()).into_bytes();
         Self {
@@ -63,18 +52,14 @@ impl CsvParser {
 }
 
 impl Transform for CsvParser {
-    /// An event with no log, or a log whose message isn't a string, passes through untouched --
-    /// there's nothing to parse. Any metrics/span already on the event ride through unaffected
-    /// either way. An empty message is a routine, silently-skipped case (no diagnostic) --
-    /// `logit.transform.rows.skipped{reason="empty"}` records it. A message that isn't valid
-    /// UTF-8 also passes through unparsed with a throttled `invalid_utf8` diagnostic -- checked
-    /// once for the whole message, since every column would otherwise be minted as `Value::Str`,
-    /// whose invariant is valid UTF-8. A message equal to the configured header line passes
-    /// through unparsed with a throttled `header_row` diagnostic. A malformed row (bad quoting)
-    /// or one with the wrong field count also passes through unchanged, attributes untouched,
-    /// with a throttled `parse_failure`/`field_count` diagnostic naming what went wrong.
-    /// Otherwise every column lands as `Value::Str`, last-writer-wins on collision with a
-    /// pre-existing attribute of the same name.
+    /// Merges the row's columns as `Value::Str`, overwriting any existing attribute of the name.
+    ///
+    /// Every failure forwards the event unchanged:
+    /// - no log, or a message that isn't `Str`/`Bytes`: nothing to parse;
+    /// - an empty message: no diagnostic, counted as
+    ///   `logit.transform.rows.skipped{reason="empty"}`;
+    /// - invalid UTF-8, the header line, bad quoting, or the wrong field count: a throttled
+    ///   `invalid_utf8`/`header_row`/`parse_failure`/`field_count` diagnostic.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let Some(log) = &event.log else { return true };
         let raw = match &log.message {
@@ -82,22 +67,16 @@ impl Transform for CsvParser {
             _ => return true,
         };
 
-        // An empty line is routine, not exceptional. Silent skip, no diagnostic.
         if raw.is_empty() {
             self.telemetry.count("logit.transform.rows.skipped", 1.0, &[("reason", "empty")]);
             return true;
         }
 
-        // Every field below is handed to `Value::Str`, whose invariant is valid UTF-8 -- four
-        // `.expect("Value::Str is always valid UTF-8")` call sites downstream
-        // (`logit_core::Value::as_str`, `logit-proto`'s OTLP encoder, `stdio`/`syslog`'s
-        // renderers) panic outright if that's violated. A `Value::Bytes` message carries no such
-        // guarantee (an OTLP body's `bytes_value` decodes straight into one,
-        // `crates/logit-proto/src/otlp/common.rs`), so validate here -- once, for the whole
-        // message, not per field. One check is sufficient: `delimiter` is a single ASCII byte and
-        // `"` is ASCII (rule 29, `crates/logit-pipeline/src/graph.rs`), so every boundary
-        // `split_row` computes falls on an ASCII byte and never inside a multi-byte sequence, and
-        // `unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
+        // Every field becomes a `Value::Str`, which must be valid UTF-8: `Value::as_str`, the
+        // OTLP encoder, and the stdio/syslog renderers `.expect` it. A `Value::Bytes` message
+        // (an OTLP `bytes_value` body) has no such guarantee. One whole-message check suffices:
+        // the delimiter and `"` are ASCII (rule 32), so no field boundary splits a multi-byte
+        // sequence, and `unescape` only deletes an ASCII `"`.
         if std::str::from_utf8(&raw).is_err() {
             self.diag.warn_throttled(
                 "invalid_utf8",
@@ -144,17 +123,13 @@ impl Transform for CsvParser {
     }
 }
 
-/// Why a [`split_row`] call failed. `Display`ed into a `Diagnostics::warn_throttled` message, so
-/// no need for this to be more than the two shapes an RFC-4180-minus-embedded-newlines grammar
-/// can actually produce.
+/// Why a [`split_row`] call failed; `Display`ed into the `parse_failure` diagnostic.
 #[derive(Debug, PartialEq, Eq)]
 enum RowError {
-    /// End of input reached inside a quoted field, with no closing `"` -- either a genuinely
-    /// malformed row, or (per the ADR) the first half of a record whose embedded newline already
-    /// split it into two separate events.
+    /// End of input inside a quoted field: a malformed row, or the first half of a record an
+    /// embedded newline already split into two events.
     UnterminatedQuote,
-    /// A closing `"` was followed by something other than the delimiter or end-of-line (e.g.
-    /// `"a"b,c`) -- a quoted field must be the *entire* field, not just a prefix of it.
+    /// A closing `"` followed by something other than the delimiter or end of line (`"a"b,c`).
     TrailingAfterQuote,
 }
 
@@ -170,12 +145,10 @@ impl std::fmt::Display for RowError {
 }
 
 /// Splits `line` on `delim` per RFC 4180 quoting, appending each field's `(start, end,
-/// needs_unescape)` byte-offset triple to `out` (cleared by the caller first). `needs_unescape`
-/// is set only for a quoted field containing a doubled `""` -- the caller's cue to run
-/// [`unescape`] rather than slice `line` directly.
+/// needs_unescape)` offsets to `out`.
 ///
-/// Precondition: `!line.is_empty()` (the caller special-cases an empty message before ever
-/// calling this).
+/// `needs_unescape` marks a quoted field containing a doubled `""`, which needs [`unescape`]
+/// rather than a slice. Requires a non-empty `line`.
 fn split_row(line: &Bytes, delim: u8, out: &mut Vec<(u32, u32, bool)>) -> Result<(), RowError> {
     let n = line.len();
     let mut i = 0usize;
@@ -213,8 +186,7 @@ fn split_row(line: &Bytes, delim: u8, out: &mut Vec<(u32, u32, bool)>) -> Result
                 return Err(RowError::TrailingAfterQuote);
             }
         } else {
-            // Unquoted field: runs to the next delimiter or end-of-line. A `"` *inside* an
-            // unquoted field is data.
+            // Unquoted field, to the next delimiter or end of line; a `"` inside it is data.
             start = i;
             let mut j = i;
             while j < n && line[j] != delim {
@@ -241,12 +213,11 @@ fn split_row(line: &Bytes, delim: u8, out: &mut Vec<(u32, u32, bool)>) -> Result
     Ok(())
 }
 
-/// Collapses each doubled `""` to one `"`. The only path in this transform that allocates --
-/// exactly once: `bytes::Bytes::from(Vec<u8>)` takes the cheap `into_boxed_slice` path (no extra
-/// allocation beyond the vec's own buffer) only when the vec's length equals its capacity, so the
-/// output length is counted in a first pass and the vec is sized exactly, rather than
-/// `field.len()` (always an overestimate whenever there's a doubled quote to collapse, which
-/// would otherwise force `Bytes::from` down its second, eagerly-allocating path).
+/// Collapses each doubled `""` to one `"`: the only path in this transform that allocates.
+///
+/// It allocates once because the first pass sizes the `Vec` exactly: `Bytes::from(Vec<u8>)`
+/// avoids a second allocation only when length equals capacity, and `field.len()` would
+/// overestimate.
 fn unescape(field: &Bytes) -> Bytes {
     let mut out_len = 0;
     let mut i = 0;
@@ -542,9 +513,7 @@ mod tests {
 
     // -- UTF-8 validation --------------------------------------------------------------------
 
-    /// The bytes here are valid CSV *framing* (two fields around a comma) but invalid UTF-8, so
-    /// `split_row` would happily produce two fields -- proving the gate is the UTF-8 check and
-    /// not some incidental parse failure.
+    /// Valid CSV framing but invalid UTF-8, so the UTF-8 check, not parsing, is what rejects it.
     #[test]
     fn an_invalid_utf8_message_passes_the_event_through_untouched() {
         let registry = Registry::new();
@@ -564,8 +533,7 @@ mod tests {
         assert!(fired, "expected logit.component.diagnostics{{key=\"invalid_utf8\"}}");
     }
 
-    /// The check rejects invalid UTF-8, not `Value::Bytes` as a message kind -- a bytes-valued
-    /// OTLP body that happens to be text still parses exactly like a `Value::Str` one.
+    /// A `Value::Bytes` message holding valid UTF-8 parses like a `Value::Str` one.
     #[test]
     fn a_valid_utf8_bytes_message_parses_like_a_string_message() {
         let mut csv = parser(&["a", "b"]);
@@ -576,8 +544,7 @@ mod tests {
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
     }
 
-    /// Why one whole-message check is enough for every field: the delimiter and `"` are both
-    /// ASCII (rule 29), so no field boundary can land inside a multi-byte sequence.
+    /// No field boundary lands inside a multi-byte sequence (the delimiter is ASCII, rule 32).
     #[test]
     fn a_multi_byte_utf8_field_is_sliced_intact() {
         let mut csv = parser(&["a", "b"]);

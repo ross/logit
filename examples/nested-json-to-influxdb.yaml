@@ -1,14 +1,12 @@
-# A contributor-facing fixture for `flatten` (docs/adr/flatten-transform.md): proves
+# A contributor-facing fixture for `flatten` (docs/adr/flatten-transform.md):
 # tail_in -> json -> flatten -> keep -> kv_metrics -> aggregate -> influxdb_out against a nested
-# JSON log line -- the shape none of this repo's other example configs carries (nginx's access log
-# and statsd's wire lines are both already flat). Not wired into `script/server`/`compose.yaml`;
-# covered by `script/validate` and `every_shipped_config_loads_and_validates`
-# (`crates/logit-cli/src/config.rs`) like every other shipped config.
+# JSON log line, the shape no other example carries. Not wired into `script/server`; covered by
+# `script/validate` like every shipped config. Change `paths` to your log files and `influx_out`
+# to your InfluxDB.
 #
-# A pino-http-style completion record is the motivating shape
-# (docs/design/data-shapes-rows.md's pino-http row): the request/response detail an application's
-# structured-logging library nests under `req`/`res` is exactly the data no existing tag-rendering
-# sink (influxdb_out included) can represent at all -- see the ADR's Context for the full list.
+# The motivating shape is a pino-http-style completion record (docs/design/data-shapes-rows.md):
+# the request/response detail nested under `req`/`res` is what no tag-rendering sink,
+# `influxdb_out` included, can represent.
 #
 # Topology:
 #
@@ -19,8 +17,8 @@
 #                          |
 #                          v
 #                     app_flat (flatten) <- req.method, req.url, res.statusCode become ordinary,
-#                          |                 dot-named attributes -- addressable by `keep` below,
-#                          v                 which could never select a nested Value::Map
+#                          |                 dot-named attributes that `keep` below can select
+#                          v
 #                    app_trimmed (keep)  <- only the two dotted tags aggregate should key on
 #                          |
 #                          v
@@ -32,9 +30,8 @@
 #                          v
 #                      influx_out
 #
-# `flatten` creates attribute width, and width is cardinality (the ADR's loudest consequence) --
-# `app_trimmed` runs *after* `app_flat`, never before, the same placement discipline `keep` already
-# recommends ahead of `aggregate` in every other example.
+# `flatten` creates attribute width, and width is cardinality, so `app_trimmed` runs after
+# `app_flat`, never before.
 components:
   app_in:
     type: tail_in
@@ -44,8 +41,8 @@ components:
     type: json
     sources: [app_in]
 
-  # attributes: all (the default) -- this app's own logging library decides req/res's shape, not
-  # this config, so a named field list would need editing every time that shape changes.
+  # attributes: all (the default): the app's logging library decides req/res's shape, so a named
+  # field list would need editing every time that shape changes.
   app_flat:
     type: flatten
     sources: [app_json]

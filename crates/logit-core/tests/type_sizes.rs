@@ -1,19 +1,14 @@
 //! Byte-size assertions for the event model.
 //!
-//! `Event` is moved by value on every hop between pipeline nodes and deep-cloned once per extra
-//! fan-out consumer (`logit-pipeline`'s `Fanout`), so its size is a throughput property, not a
-//! curiosity -- see `docs/design/memory.md` for the full accounting and for what each of these
-//! numbers is made of.
+//! `Event` moves by value on every hop and is deep-cloned once per extra fan-out consumer, so its
+//! size is a throughput property. `docs/design/memory.md` has the full accounting.
 //!
-//! These are exact-equality assertions on purpose. A `<=` bound would silently absorb the thing
-//! this test exists to catch: a field added to `Event` (or to any type it inlines) quietly adding
-//! hundreds of bytes to every event in flight. When one of these fails, that's the test working --
-//! decide whether the growth is worth it, update the number, and update `docs/design/memory.md`'s
-//! table in the same commit.
+//! These are exact-equality assertions. Never relax one to `<=`: that would silently absorb what
+//! this test exists to catch, a field added to `Event` (or a type it inlines) adding bytes to every
+//! event in flight. When one fails, that's the test working: decide whether the growth is worth
+//! it, then update the constant and `docs/design/memory.md`'s table in the same commit.
 //!
-//! Sizes are architecture-dependent (`Bytes`, `Vec`, and `SmallVec` are all pointer-sized), so
-//! every assertion is gated on a 64-bit target rather than asserting something false on a 32-bit
-//! one.
+//! Gated on 64-bit targets: `Bytes`, `Vec`, and `SmallVec` sizes are pointer-dependent.
 
 #![cfg(target_pointer_width = "64")]
 
@@ -23,39 +18,30 @@ use logit_core::{
 };
 use std::mem::{size_of, size_of_val};
 
-/// The interned-key type. `lasso::Spur` is a `NonZeroU32`, which is what makes `Option<Symbol>`
-/// (on `MetricRecord::unit`) free rather than a padded 8 bytes.
+/// `lasso::Spur` is a `NonZeroU32`, so `Option<Symbol>` costs nothing extra.
 #[test]
 fn symbol_is_a_niche_optimized_u32() {
     assert_eq!(size_of::<Symbol>(), 4);
     assert_eq!(size_of::<Option<Symbol>>(), 4, "Spur's NonZero niche should absorb the None case");
 }
 
-/// `Provenance` (`origin`/`previous`, both `Option<Symbol>`) -- the batch-level graph identity
-/// carried alongside `logit-pipeline`'s `TraceContext` on every `Delivered`
-/// (`docs/adr/batch-provenance-on-delivered.md`). Both fields niche-optimize per
-/// `symbol_is_a_niche_optimized_u32` above, so this is two 4-byte fields with no padding.
+/// Two niche-optimized `Option<Symbol>`s, carried on every `Delivered`.
 #[test]
 fn provenance_is_two_niche_optimized_option_symbols() {
     assert_eq!(size_of::<Provenance>(), 8);
 }
 
-/// `Value`'s size is set by its largest variant, `Bytes` (4 words: ptr, len, data, vtable), plus a
-/// discriminant rounded up to `Bytes`'s 8-byte alignment. `Map` is boxed specifically to keep it
-/// from being the largest variant (`value.rs`), and `Array`'s `Vec` is 3 words.
+/// `Value` is its largest variant, `Bytes` (4 words), plus an aligned discriminant. `Map` is boxed
+/// so it isn't the largest.
 #[test]
 fn value_is_bytes_plus_a_discriminant_word() {
     assert_eq!(size_of::<bytes::Bytes>(), 32);
     assert_eq!(size_of::<Value>(), 40);
 }
 
-/// The dominant term in `Event`. `AttrMap` is a `SmallVec<[(Symbol, Value); 8]>`, and a `SmallVec`
-/// occupies its inline footprint **whether or not it has spilled to the heap** -- the inline array
-/// and the heap `(ptr, cap)` share one union-or-enum slot sized by the larger of the two. So an
-/// event with 13 attributes pays both a heap allocation *and* this full inline footprint.
-///
-/// `(Symbol, Value)` is 48 bytes, not 44: `Value` is 8-byte aligned, so the 4-byte `Symbol` is
-/// followed by 4 bytes of padding.
+/// The dominant term in `Event`. A `SmallVec` occupies its inline footprint **whether or not it
+/// has spilled**, so a 13-attribute event pays a heap allocation and the full inline footprint.
+/// `(Symbol, Value)` is 48 bytes, not 44: `Value`'s alignment pads the `Symbol`.
 #[test]
 fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of::<(Symbol, Value)>(), 48);
@@ -67,7 +53,7 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
          it separately"
     );
 
-    // Not a size assertion, but the claim the comment above rests on: spilling doesn't shrink it.
+    // Spilling doesn't shrink it.
     let mut spilled = AttrMap::new();
     for i in 0..32 {
         spilled.insert(&format!("k{i}"), Value::I64(i));
@@ -75,13 +61,11 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
 }
 
-/// `MetricKind` inlines either a whole `DdSketch` (`Distribution`) or a
-/// `SmallVec<[f64; SAMPLES_INLINE]>` (`Samples`), its two largest variants. `size_of::<DdSketch>()`
-/// is 128 bytes (a `Mapping`, two bin `Vec`s, and the summary; it was 176 as a wrapped
-/// `sketches_ddsketch::DDSketch`, whose layout is what `SAMPLES_INLINE = 19` was measured
-/// against). `Samples` at 168 bytes is now the larger, and needs a real discriminant on top, so
-/// `MetricKind` stays at the 176 it always was: the sketch's shrink freed nothing there, and a
-/// `Samples` of 176 would still grow it to 184 (see `metric.rs`'s doc comment on the constant).
+/// `MetricKind`'s two largest variants, sized to match: `Distribution` inlines a `DdSketch`, now
+/// 128 bytes hand-rolled, down from a wrapped `sketches_ddsketch::DDSketch`'s 176, and
+/// `SAMPLES_INLINE = 19` keeps `Samples` at 168 -- still needing a real discriminant, since it
+/// doesn't niche the way `DdSketch` used to -- so `Samples` plus its tag is what now sizes
+/// `MetricKind` at 176 (`SAMPLES_INLINE`'s doc in `metric.rs`).
 #[test]
 fn metric_kind_is_sized_by_its_two_largest_variants() {
     assert_eq!(
@@ -120,24 +104,17 @@ fn metric_kind_is_sized_by_its_two_largest_variants() {
     );
 }
 
-/// `TraceRef` -- `LogRecord`'s optional application-trace reference (`docs/adr/
-/// log-record-trace-context.md`). `span_id: Option<[u8;8]>` has no niche of its own ([u8;8]'s
-/// value space is fully used), so it costs a discriminant byte: 16 (trace_id) + 9 (span_id) + 1
-/// (flags) = 26.
+/// `span_id: Option<[u8; 8]>` has no niche, so it costs a tag byte: 16 + 9 + 1 (flags) = 26.
 #[test]
 fn trace_ref_is_sized_by_its_two_id_arrays_plus_a_span_discriminant() {
     assert_eq!(size_of::<TraceRef>(), 26);
-    // `Option<TraceRef>` is free, somewhat surprisingly: `span_id`'s inner `Option<[u8;8]>`
-    // discriminant byte only uses 2 of its 256 possible values, and rustc's niche-filling finds
-    // and reuses one of the other 254 for the outer `Option`'s `None` -- confirmed here, not
-    // assumed, since it's a compiler optimization with no language guarantee behind it.
+    // The outer `Option` reuses a spare value of `span_id`'s tag byte: a compiler optimization
+    // with no language guarantee, hence asserted.
     assert_eq!(size_of::<Option<TraceRef>>(), 26, "niche-filled through Option<[u8;8]>'s tag");
 }
 
-/// `SpanExt` is boxed on `SpanRecord` specifically so the overwhelmingly common span (no status
-/// message, no `tracestate`, nothing dropped) doesn't pay for it inline -- confirm both halves of
-/// that trade: the box itself is pointer-sized and niche-free (`None` needs no separate
-/// discriminant), and `SpanExt` on its own is worth boxing at all.
+/// `SpanExt` is boxed so the common span doesn't pay for it inline: it's big enough to box, and
+/// `Option<Box<_>>` is one pointer.
 #[test]
 fn span_ext_is_boxed_to_a_niche_free_pointer() {
     assert_eq!(
@@ -153,10 +130,7 @@ fn span_ext_is_boxed_to_a_niche_free_pointer() {
     );
 }
 
-/// `Scope` -- the batch-level OTLP instrumentation scope (`docs/adr/lossless-transit.md`). Two
-/// `Bytes` (32 each) for `name`/`version`, the `AttrMap` (392), a `u32` `dropped_attributes_count`,
-/// and an `Option<Bytes>` `schema_url` (32, no niche: `Bytes` carries no spare bit pattern to fill
-/// with `None`, so this costs a real discriminant, padded to `Bytes`'s 8-byte alignment).
+/// Two `Bytes` (32 each), the `AttrMap` (392), a `u32`, and an `Option<Bytes>` `schema_url`.
 #[test]
 fn scope_size() {
     assert_eq!(size_of::<Scope>(), 496);
@@ -184,16 +158,13 @@ fn record_types() {
         padded) + schema_url: Option<Bytes> (32, no niche)"
     );
 
-    // Both `Option`s are free: `Severity` and `SpanKind` are small field-less enums, so their
-    // spare discriminants absorb the `None` case. Worth asserting rather than assuming -- adding
-    // a 256-variant enum to either record would silently cost `Event` another 8 bytes.
+    // Both `Option`s are free via a small enum's spare discriminants; a 256-variant enum on either
+    // record would cost `Event` another 8 bytes.
     assert_eq!(size_of::<Option<LogRecord>>(), size_of::<LogRecord>());
     assert_eq!(size_of::<Option<SpanRecord>>(), size_of::<SpanRecord>());
 }
 
-/// The number that matters: what one event costs to move between two pipeline nodes, and to deep-
-/// clone for each extra fan-out consumer. `docs/design/memory.md` breaks this down term by term
-/// and lists what could be reclaimed.
+/// What one event costs to move between nodes; `docs/design/memory.md` breaks it down.
 #[test]
 fn event_size() {
     assert_eq!(
@@ -205,7 +176,7 @@ fn event_size() {
          record_types/metric_kind_is_sized_by_the_inlined_ddsketch above"
     );
 
-    // The breakdown, asserted so it can't drift out of sync with the total above.
+    // The breakdown, so it can't drift from the total.
     let sum = size_of::<i64>()
         + size_of::<AttrMap>()
         + size_of::<Option<LogRecord>>()
@@ -214,9 +185,7 @@ fn event_size() {
     assert_eq!(sum, size_of::<Event>(), "Event should have no padding beyond its fields");
 }
 
-/// `SAMPLES_INLINE` is a measured constant, not an arbitrary one -- pin its value directly so a
-/// future change to it (or to `Samples`'s other field) is a deliberate, reviewed edit here, not a
-/// silent drift.
+/// `SAMPLES_INLINE` is measured; pinning it makes a change a reviewed edit here.
 #[test]
 fn samples_inline_is_the_measured_constant() {
     assert_eq!(SAMPLES_INLINE, 19);

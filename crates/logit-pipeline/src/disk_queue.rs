@@ -1,36 +1,30 @@
-//! A disk-backed, crash-recoverable alternative to [`crate::queue::SinkQueue`]'s in-memory
-//! buffer -- see `docs/plans/durable-sink-buffer.md` and `docs/adr/disk-backed-sink-buffer.md`.
-//! [`DiskQueue`] presents the same `push`/`peek`/`commit`/`close` shape `SinkQueue` does (wired
-//! together behind `crate::queue::SinkStore`), but every batch is appended as a native frame to a
-//! segment file before it is eligible for delivery, and a restart resumes from the last
-//! checkpointed read cursor.
+//! A disk-backed, crash-recoverable alternative to [`crate::queue::SinkQueue`]
+//! (`docs/adr/disk-backed-sink-buffer.md`). [`DiskQueue`] has `SinkQueue`'s
+//! `push`/`peek`/`commit`/`close` shape (both sit behind `crate::queue::SinkStore`), but every
+//! batch is appended to a segment file before it is eligible for delivery, and a restart resumes
+//! from the last checkpointed read cursor.
 //!
-//! **On-disk layout.** `<dir>/` holds `segment-<seq:016>.lgit` files (a plain concatenation of
-//! records, oldest segment lowest sequence number), `cursor.json` (the read cursor: which segment
-//! and byte offset the next delivery should read from, tmp+rename like
-//! `crates/logit-inputs/src/tail/checkpoint.rs`), and a `lock` file held exclusively
-//! (`std::fs::File::try_lock`) for this queue's lifetime -- released automatically on process
-//! exit, including `SIGKILL`, so a restart of the same component reopens its own spool without
-//! any stale-lock cleanup. One **record** per batch: 24 raw bytes (16-byte `trace_id` + 8-byte
-//! `span_id`, [`TraceContext`] inline, no framing of its own -- unversioned and never widened, see
-//! `CONTEXT_LEN`'s own doc comment) followed by one `logit_proto::frame` native frame, whose own
-//! codec byte (`native::CODEC_NATIVE_V1` or `..._V2`) tells [`parse_record`] whether a
-//! [`logit_core::Provenance`] trailer follows the batch inside that frame -- see
-//! `docs/adr/batch-provenance-on-delivered.md`. `frame::resync` still works to recover past a
-//! corrupt record because it scans for `MAGIC`, which always immediately follows a record's 24
-//! context bytes.
+//! **On-disk layout.** `<dir>/` holds:
 //!
-//! **The write cursor is never persisted.** Only the read cursor needs to survive a restart --
-//! the write side always resumes at the end of the highest-numbered segment, re-derived by
-//! validating that segment frame by frame at [`DiskQueue::open`]. Every *other* segment on disk
-//! was already complete and closed before a new one became active (single producer, one write in
-//! flight at a time), so only the active segment can ever have a torn tail.
+//! - `segment-<seq:016>.lgit` files, each a plain concatenation of records, oldest lowest.
+//! - `cursor.json`, the read cursor (segment and byte offset), written tmp+rename.
+//! - `lock`, held with `std::fs::File::try_lock` for the queue's lifetime. The OS releases it on
+//!   any exit, `SIGKILL` included, so a restart needs no stale-lock cleanup.
 //!
-//! **`commit` stays synchronous**, exactly like `SinkQueue::commit` -- it only ever mutates
-//! in-memory cursor state plus, occasionally, one small blocking cursor-file write and one file
-//! deletion (never a segment read or write), the same brief-blocking trade-off
-//! `crates/logit-inputs/src/tail/checkpoint.rs`'s own `write` already makes from call sites that
-//! are themselves async elsewhere in this codebase.
+//! A **record** is 24 raw bytes of [`TraceContext`] (16-byte `trace_id`, 8-byte `span_id`;
+//! unversioned, see `CONTEXT_LEN`) followed by one `logit_proto::frame` native frame. The frame's
+//! codec byte (`CODEC_NATIVE_V1` or `_V2`) tells [`parse_record`] whether a
+//! [`logit_core::Provenance`] trailer follows the batch. `frame::resync` can recover past a
+//! corrupt record because `MAGIC` always immediately follows a record's 24 context bytes.
+//!
+//! **Only the read cursor is persisted.** The write side resumes at the end of the
+//! highest-numbered segment, validated frame by frame at [`DiskQueue::open`]. Every other segment
+//! was complete before a newer one became active (one producer, one write in flight), so only the
+//! active segment can have a torn tail.
+//!
+//! **`commit` is synchronous**, like `SinkQueue::commit`: it mutates in-memory cursor state and
+//! occasionally makes one small blocking cursor write and one file deletion, never a segment read
+//! or write.
 
 use std::collections::VecDeque;
 use std::fs::File as StdFile;
@@ -51,14 +45,10 @@ use logit_proto::frame::{self, Compression, MAX_SANE_UNCOMPRESSED_LEN};
 use logit_proto::native;
 use logit_proto::CodecError;
 
-/// `[trace_id: 16][span_id: 8]`, ahead of the frame -- see the module doc. Unversioned and never
-/// widened: a record carries no version of its own, so a wider fixed prefix would silently
-/// misparse every already-spooled record on upgrade. `Provenance` (added alongside
-/// `TraceContext` on every `BatchContext` this queue now stores) rides inside the frame payload
-/// instead, as `native::CODEC_NATIVE_V2` -- self-describing via the codec byte `parse_record`
-/// already reads, so an old (`CODEC_NATIVE_V1`) record on disk keeps replaying with empty
-/// provenance forever, and a downgraded binary encountering a `CODEC_NATIVE_V2` record resyncs
-/// past it exactly as it would past any other codec it doesn't recognize
+/// `[trace_id: 16][span_id: 8]`, ahead of the frame. Never widen it: a record carries no version,
+/// so a wider prefix would misparse every already-spooled record. Anything new rides inside the
+/// frame under a new codec byte, as `Provenance` does with `CODEC_NATIVE_V2`: a `V1` record still
+/// replays with empty provenance, and a binary that doesn't know `V2` resyncs past it
 /// (`docs/adr/batch-provenance-on-delivered.md`).
 const CONTEXT_LEN: usize = 24;
 
@@ -66,19 +56,17 @@ const LOCK_FILE_NAME: &str = "lock";
 const CURSOR_FILE_NAME: &str = "cursor.json";
 const CURSOR_VERSION: u32 = 1;
 
-/// The first read attempt per fresh (uncached) peek -- comfortably larger than any batch this
-/// project's own fixtures produce (`docs/design/memory.md`), so the common case is one disk read.
-/// Grown by exactly [`CodecError::Truncated`]'s `needed` hint on the rare record that doesn't
-/// fit, rather than reading a whole segment (up to `segment_bytes`) for one record.
+/// The first read size for an uncached peek: larger than any fixture batch
+/// (`docs/design/memory.md`), so the common case is one disk read. A record that doesn't fit grows
+/// the read by [`CodecError::Truncated`]'s `needed` hint rather than reading the whole segment.
 const READ_CHUNK_INITIAL: usize = 8 * 1024;
 
 const DISK_SEGMENTS: &str = "logit.component.buffer.disk.segments";
 const DISK_REPLAYED: &str = "logit.component.buffer.disk.replayed";
 const DISK_TRUNCATED: &str = "logit.component.buffer.disk.truncated";
 
-/// Bounds and behavior for one sink's disk spool. Disk *replaces* memory for that sink rather
-/// than sizing beside it (`docs/adr/disk-backed-sink-buffer.md`) -- there is no `max_batches`
-/// analogue here; `max_bytes` alone bounds the sum of on-disk segment sizes.
+/// Bounds and behavior for one sink's disk spool. Disk replaces the in-memory queue, so there is
+/// no `max_batches`: `max_bytes` alone bounds the sum of segment sizes.
 #[derive(Debug, Clone)]
 pub struct DiskQueueConfig {
     pub dir: PathBuf,
@@ -108,10 +96,7 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("segment-{seq:016}.lgit"))
 }
 
-/// Every `segment-<seq>.lgit` currently in `dir`, ascending by sequence number. A file that
-/// doesn't match the naming pattern is silently skipped -- nothing this queue writes should ever
-/// produce one, and an operator poking around the directory is not this queue's problem to crash
-/// over.
+/// Every `segment-<seq>.lgit` in `dir`, ascending by sequence number. Other files are ignored.
 fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     let mut seqs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -128,15 +113,13 @@ fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(seqs)
 }
 
-/// Parses one record -- `[24-byte trace context][native frame]` -- off the front of `buf`.
-/// `Truncated` means `buf` simply doesn't hold a whole record yet (ran out of bytes, benign);
-/// every other error means the bytes present are provably wrong and the caller should resync
+/// Parses one record (`[24-byte trace context][native frame]`) off the front of `buf`, returning
+/// its context, batch, and byte length. `Truncated` means `buf` doesn't hold a whole record yet;
+/// any other error means the bytes are wrong and the caller should resync
 /// (`docs/design/wire-protocol.md`).
 ///
-/// Dispatches on the frame's own codec byte: `CODEC_NATIVE_V1` (every record written before
-/// provenance existed, and still what a v1-only writer produces) decodes via `decode_batch` with
-/// `Provenance::default()`; `CODEC_NATIVE_V2` decodes via `decode_batch_v2`. Any other codec byte
-/// is rejected the same as before -- this queue only ever writes one of these two.
+/// `CODEC_NATIVE_V1` decodes with `Provenance::default()`, `CODEC_NATIVE_V2` with its trailer;
+/// any other codec byte is an error.
 fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), CodecError> {
     if buf.len() < CONTEXT_LEN {
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
@@ -161,25 +144,23 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
     Ok((ctx, Arc::new(batch), CONTEXT_LEN + consumed_frame))
 }
 
-/// The result of walking every record in a byte range: how far into it good data reaches, how
-/// many records parsed cleanly, and how many were skipped for corruption.
+/// The result of walking every record in a byte range.
 struct WalkOutcome {
-    /// Absolute offset (from byte 0 of the segment) up to which data is confirmed good --
-    /// everything from here to the end of the walked bytes is either a torn tail (nothing more
-    /// to parse) or unrecoverable corruption with no further resync target.
+    /// Segment offset up to which data is confirmed good. Everything after it is a torn tail or
+    /// corruption with no further resync target.
     good_len: u64,
     valid_count: u64,
     corrupt_skipped: u64,
 }
 
-/// Walks every record in `bytes` starting at `start_offset` (an absolute offset into `bytes`,
-/// i.e. `bytes[0]` is the segment's own byte 0), invoking `on_record` for each one parsed
-/// cleanly. Stops at the first short read (a torn tail or a clean end -- indistinguishable from
-/// the bytes alone; the caller decides which by comparing `good_len` against the file's actual
-/// on-disk length). A parse failure that isn't simply "ran out of bytes" resyncs forward past it
-/// (`frame::resync`, corrected for the 24-byte context prefix it doesn't know about) and keeps
-/// going, tolerating a spurious `MAGIC` match by trying the candidate and continuing the scan
-/// past it if that candidate doesn't parse either (`frame::resync`'s own documented caveat).
+/// Walks every record in `bytes` from `start_offset` (`bytes[0]` is the segment's byte 0),
+/// calling `on_record(offset, ctx, batch, len)` for each clean one.
+///
+/// Stops at the first short read. A torn tail and a clean end look the same here; the caller
+/// tells them apart by comparing `good_len` with the file's length. Any other parse failure
+/// resyncs forward with `frame::resync`, backing up over the 24-byte context prefix it doesn't
+/// know about. A spurious `MAGIC` match (say, inside a `trace_id`) is tried and skipped if it
+/// doesn't parse.
 fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
@@ -238,10 +219,8 @@ struct CursorFile {
     offset: u64,
 }
 
-/// Loads the persisted read cursor, tolerating everything the way
-/// `crates/logit-inputs/src/tail/checkpoint.rs::CheckpointStore::load` does: missing is the
-/// ordinary first-run case (no diagnostic), a version mismatch or malformed file is diagnosed and
-/// treated as absent -- never fatal to opening the queue.
+/// Loads the persisted read cursor. Missing is the ordinary first run (no diagnostic); a version
+/// mismatch or malformed file is diagnosed and treated as absent, never fatal.
 fn load_cursor(dir: &Path, diag: &mut Diagnostics) -> Option<(u64, u64)> {
     let path = dir.join(CURSOR_FILE_NAME);
     match std::fs::read(&path) {
@@ -277,7 +256,7 @@ fn load_cursor(dir: &Path, diag: &mut Diagnostics) -> Option<(u64, u64)> {
     }
 }
 
-/// Persists the read cursor via tmp+rename, exactly `checkpoint.rs`'s idiom.
+/// Persists the read cursor via tmp+rename.
 fn persist_cursor(dir: &Path, segment: u64, offset: u64, diag: &mut Diagnostics) {
     let path = dir.join(CURSOR_FILE_NAME);
     let doc = CursorFile { version: CURSOR_VERSION, segment, offset };
@@ -299,10 +278,8 @@ async fn fsync_path(path: &Path) -> io::Result<()> {
     tokio::fs::File::open(path).await?.sync_data().await
 }
 
-/// Whether `err` means the filesystem is out of space -- checked via the raw OS errno (`ENOSPC`
-/// is `28` on Linux, the only platform this project targets, `docs/adr/containerized-development.md`)
-/// rather than `io::ErrorKind::StorageFull` alone, since that variant's exact stabilization and
-/// exhaustiveness across platforms is not something to depend on here.
+/// Whether `err` is `ENOSPC` (errno 28 on Linux, the only platform `logit` targets), checked on
+/// the raw errno rather than relying on `io::ErrorKind::StorageFull`'s mapping.
 fn is_disk_full(err: &io::Error) -> bool {
     err.raw_os_error() == Some(28)
 }
@@ -310,10 +287,9 @@ fn is_disk_full(err: &io::Error) -> bool {
 #[derive(Clone, Copy)]
 struct Segment {
     seq: u64,
-    /// The confirmed-good length: for every segment but the active one, its actual on-disk size
-    /// (trusted -- see the module doc on why only the active segment can be torn); for the active
-    /// one, the length validated at [`DiskQueue::open`], kept current by every successful
-    /// [`DiskQueue::push`] afterward.
+    /// The confirmed-good length: a closed segment's on-disk size (only the active segment can
+    /// be torn), or the active segment's length validated at [`DiskQueue::open`] and advanced by
+    /// each successful [`DiskQueue::push`].
     len: u64,
 }
 
@@ -331,16 +307,14 @@ struct State {
     queued_records: u64,
     head_cache: Option<HeadCache>,
     write_file: Option<tokio::fs::File>,
-    /// Set just before a write starts, cleared just after it completes -- a `push` future dropped
-    /// mid-write (`run_output`'s `select!` can drop `drain_inbox`, and with it whatever `push`
-    /// call it was mid-`.await` on, when `write_loop` finishes first) leaves this `true`, and the
-    /// *next* call to [`DiskQueue::push`] repairs the tail (truncates back to
-    /// `write_len_before_flight`) before writing anything new. A crash is the same situation
-    /// discovered at the next [`DiskQueue::open`] instead.
+    /// Set just before a write, cleared once it completes. A `push` future dropped mid-write
+    /// (`run_output`'s `select!` drops `drain_inbox` when `write_loop` finishes first) or a
+    /// failed write leaves it `true`, and the next [`DiskQueue::push`] truncates the tail back to
+    /// `write_len_before_flight` before writing. A crash is the same case, repaired at the next
+    /// [`DiskQueue::open`].
     write_in_flight: bool,
     write_len_before_flight: u64,
-    /// Set alongside `write_in_flight` staying `true` on a failed write, so `push` can classify
-    /// the drop it counts for that batch. Meaningless when `write_in_flight` is `false`.
+    /// Whether the last failed write was `ENOSPC`, so `push` can tag the drop it counts.
     last_write_error_disk_full: bool,
     read_file: Option<(u64, tokio::fs::File)>,
     last_checkpoint: Instant,
@@ -361,20 +335,17 @@ pub struct DiskQueue {
     not_full: tokio::sync::Notify,
     closed: AtomicBool,
     telemetry: Telemetry,
-    /// Held for this queue's whole lifetime -- an OS-level advisory lock
-    /// (`std::fs::File::try_lock`), released automatically when this file closes, including on
-    /// `SIGKILL`. What catches two sinks (mistakenly) configured with the same `disk.path`: graph
-    /// validation only compares literal path strings (`crates/logit-pipeline/src/graph.rs` rule
-    /// 34), so an aliased path (`./spool` vs `spool`) reaches here instead.
+    /// An OS advisory lock held for the queue's lifetime. Catches two sinks sharing a spool
+    /// through an aliased path (`./spool` vs `spool`); graph validation rule 35 compares only
+    /// literal `disk.path` strings.
     _lock: StdFile,
 }
 
 impl DiskQueue {
-    /// Opens (or creates) the spool at `config.dir`, recovering from whatever a previous process
-    /// left behind. Blocking (`std::fs` throughout) -- a one-time startup cost, the same
-    /// trade-off `crates/logit-outputs/src/file.rs::FileTarget::open` and
-    /// `checkpoint.rs::CheckpointStore::load` already make for the same reason: this runs once,
-    /// before the pipeline starts delivering anything, not on any hot path.
+    /// Opens or creates the spool at `config.dir`, recovering whatever a previous process left:
+    /// truncates a torn active segment, clamps a stale cursor, and counts replayed and corrupt
+    /// records. Fails if another process holds the lock. Blocking (`std::fs`): it runs once,
+    /// before delivery starts.
     pub fn open(
         config: DiskQueueConfig,
         telemetry: Telemetry,
@@ -475,9 +446,7 @@ impl DiskQueue {
             (segments, cur_seq, cur_offset)
         };
 
-        // Replay count: walk every record from the resume point to the end of every segment,
-        // across segment boundaries. The active segment's bytes were already loaded above when
-        // it needed validating; every other segment in range is read fresh here.
+        // Replay count: walk every record from the resume point to the end of the spool.
         {
             let mut first = true;
             for seg in segments.iter() {
@@ -515,9 +484,7 @@ impl DiskQueue {
             telemetry.count(DISK_REPLAYED, replayed as f64, &[]);
         }
 
-        // Persist once more so cursor.json reflects any clamping done above, forced regardless of
-        // `checkpoint_interval` -- this is a one-time startup write, not the hot path that gate
-        // protects.
+        // Persist any clamping above, regardless of `checkpoint_interval`.
         persist_cursor(&config.dir, read_seq, read_offset, &mut diag);
 
         let total_bytes: u64 = segments.iter().map(|s| s.len).sum();
@@ -584,16 +551,18 @@ impl DiskQueue {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Appends `item` to the active segment, rotating first if it already exceeds
-    /// `segment_bytes` (a soft trigger checked *before* writing, not a hard cap -- see the module
-    /// doc: this is what lets a single record larger than the trigger still land whole in a
-    /// fresh segment rather than being unwritable).
+    /// Appends `item` to the active segment, rotating first if the segment has reached
+    /// `segment_bytes`. That is a soft trigger checked before writing, not a cap, so a record
+    /// larger than it still lands whole.
     ///
-    /// **Cancellation safety.** The record is encoded fully in memory first; the only `.await` in
-    /// the write path is one `write_all` under `write_in_flight = true`
-    /// (see [`State::write_in_flight`]). This mirrors
-    /// `crates/logit-outputs/src/syslog.rs::send_tcp`'s take-before-write shape, adapted for a
-    /// single always-appending file rather than a reconnectable stream.
+    /// Applies the overflow policy against `max_bytes` first; a record larger than `max_bytes`,
+    /// or a push to a closed queue, is written over-bound rather than blocked. A batch whose
+    /// encoded payload exceeds `MAX_SANE_UNCOMPRESSED_LEN`, or whose write fails, is dropped and
+    /// counted, never counted as queued.
+    ///
+    /// **Cancellation safety.** The record is encoded in memory first; the write-path `.await`s
+    /// run under `write_in_flight` (see [`State::write_in_flight`]), so a dropped future leaves a
+    /// tail the next push repairs.
     pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
         let (batch, ctx) = item;
 
@@ -602,9 +571,8 @@ impl DiskQueue {
             self.count_dropped("frame_too_large", batch.events.len() as u64);
             return;
         }
-        // `write_frame` only ever fails for `Compression::Zstd`, which nothing on the path from
-        // config to here can produce: `logit_config::Compression` (the only place an operator's
-        // `disk.compression` is read from) has no `Zstd` variant at all.
+        // `write_frame` fails only for `Compression::Zstd`, which `logit_config::Compression`
+        // (where `disk.compression` comes from) cannot express.
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, self.compression, &payload)
             .expect("logit_config::Compression excludes Zstd; write_frame only fails for Zstd");
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
@@ -625,10 +593,9 @@ impl DiskQueue {
         }
 
         loop {
-            // F1: keep `evictable`'s reads of the cursor state below from ever checking a stale,
-            // already-rotated-away segment -- gated on `DropOldest` specifically so the `Block`
-            // hot path (what `disk_queue_push_one_batch` measures) gains only one enum comparison,
-            // no lock.
+            // Roll the cursor off a rotated-away segment before deciding what to evict (see
+            // `roll_read_cursor`). Only under `DropOldest`, so the `Block` hot path
+            // (`disk_queue_push_one_batch`) takes no extra lock.
             if matches!(self.overflow, OverflowPolicy::DropOldest) {
                 self.roll_read_cursor();
             }
@@ -642,12 +609,9 @@ impl DiskQueue {
                     match self.overflow {
                         OverflowPolicy::Block => Action::Block,
                         OverflowPolicy::DropNewest => Action::DropNewest,
-                        // F6: three-way decision, not two -- a reserved head used to fall through
-                        // to accepting the push over-bound, the same as "genuinely nothing to
-                        // evict" did, which left `disk.max_bytes` unenforced for as long as the
-                        // head stayed peeked (nearly the whole retry budget, once per delivery
-                        // attempt, not once per attempt -- i.e. most of a destination outage, the
-                        // exact scenario this bound exists for).
+                        // Three outcomes. Accepting over-bound while the head is reserved would
+                        // leave `disk.max_bytes` unenforced for most of a destination outage, the
+                        // case the bound exists for.
                         OverflowPolicy::DropOldest => {
                             let seg_len = state
                                 .segments
@@ -655,25 +619,18 @@ impl DiskQueue {
                                 .find(|s| s.seq == state.read_seq)
                                 .map(|s| s.len);
                             if state.head_cache.is_some() {
-                                // The head is reserved (peeked, mid-delivery-attempt): a
-                                // file-backed FIFO has no way to evict "behind" it the way the
-                                // in-memory buffer can leave a hole -- there is nowhere else to
-                                // evict from without evicting the very record a caller is
-                                // currently holding. Reject the new push instead, exactly like
-                                // `DropNewest` -- an accepted, documented limitation, not
-                                // something to also try to fix here.
+                                // The head is reserved (peeked, mid-delivery). A file-backed
+                                // FIFO can't evict behind it the way the in-memory buffer can,
+                                // so reject the new push, as `DropNewest` would.
                                 Action::DropNewest
                             } else if seg_len.map(|l| state.read_offset < l).unwrap_or(false) {
                                 // Unreserved and something is queued: evict it.
                                 Action::Evict
                             } else {
-                                // Genuinely nothing queued at all -- must not become a drop: right
-                                // after evicting the very last queued record the spool can still
-                                // read as "full" (`total_bytes` only shrinks on whole-segment
-                                // deletion), and dropping here would mean dropping every future
-                                // push forever. Accept over-bound instead, the same escape hatch
-                                // `crate::queue::BoundedQueue::push` documents for the
-                                // impossible-to-ever-fit case.
+                                // Nothing queued. The spool can still read as full
+                                // (`total_bytes` shrinks only when a whole segment is deleted),
+                                // so dropping here would drop every future push. Accept
+                                // over-bound instead.
                                 Action::Write
                             }
                         }
@@ -688,8 +645,8 @@ impl DiskQueue {
                 }
                 Action::Evict => {
                     if !self.evict_oldest().await {
-                        // Raced: a concurrent peek reserved the head, or it was already
-                        // consumed, between the check above and now. Accept anyway.
+                        // A concurrent peek reserved the head, or it was consumed, since the
+                        // check. Accept anyway.
                         break;
                     }
                 }
@@ -705,12 +662,8 @@ impl DiskQueue {
         drop(blocked_timer);
 
         if !self.write_record(&record).await {
-            // The write itself failed (e.g. `ENOSPC`) -- `write_record` has already left
-            // `write_in_flight` set for the next call to repair, and logged why. The batch was
-            // never durably written, so it must not be counted as queued: drop it here, under
-            // `disk_full` when the cause was actually running out of space (the one case the
-            // block/drop_oldest/drop_newest policies above can't have prevented, since none of
-            // them can free real disk space) and a generic reason otherwise.
+            // Never durably written, so count it dropped, not queued. `disk_full` is the one
+            // cause the overflow policies can't prevent, so it gets its own reason.
             let reason =
                 if self.last_write_error_was_disk_full() { "disk_full" } else { "disk_io_error" };
             self.count_dropped(reason, events);
@@ -733,9 +686,9 @@ impl DiskQueue {
         state.last_write_error_disk_full
     }
 
-    /// The write path proper: repair a torn tail from a previously-cancelled call, rotate if the
-    /// active segment is already over `segment_bytes`, then append `record`. Returns whether the
-    /// record actually landed durably in the active segment.
+    /// Repairs a torn tail left by a cancelled or failed write, rotates if the active segment has
+    /// reached `segment_bytes`, then appends and flushes `record`. Returns whether the record
+    /// reached the kernel.
     async fn write_record(&self, record: &[u8]) -> bool {
         let (needs_repair, repair_len, repair_seq) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -796,8 +749,7 @@ impl DiskQueue {
                             "disk_io_error",
                             format!("opening segment {seq} for append: {err}"),
                         );
-                        // Nothing was written -- no torn state to repair, unlike a failed
-                        // `write_all` below.
+                        // Nothing was written, so there is no torn tail to repair.
                         state.write_in_flight = false;
                         state.last_write_error_disk_full = is_disk_full(&err);
                         return false;
@@ -806,12 +758,10 @@ impl DiskQueue {
             }
         };
 
-        // F2: `write_all` returning `Ok` only means the bytes reached `tokio::fs::File`'s own
-        // internal buffer, not that they're visible via an independent file descriptor --
-        // `.flush()` is what actually hands them to the kernel page cache. Without this, a batch
-        // reported as durably queued could be lost entirely on an ordinary process crash, not just
-        // in the documented power-loss window. A failed flush takes the exact same repair path a
-        // failed write already does below (`write_in_flight` stays `true`).
+        // `write_all` returning `Ok` means only that the bytes reached `tokio::fs::File`'s
+        // buffer; `flush()` hands them to the kernel. Without it, a batch counted as queued is
+        // lost on an ordinary process crash, not only on power loss. A failed flush is repaired
+        // like a failed write.
         let mut result = file.write_all(record).await;
         if result.is_ok() {
             result = file.flush().await;
@@ -827,8 +777,7 @@ impl DiskQueue {
             Err(err) => {
                 state.diag.warn_throttled("disk_io_error", format!("writing segment {seq}: {err}"));
                 state.last_write_error_disk_full = is_disk_full(&err);
-                // Leave `write_in_flight = true` and `write_file = None` -- the next push
-                // repairs by truncating back to the length recorded before this attempt.
+                // Leave `write_in_flight` set for the next push to repair.
                 false
             }
         }
@@ -842,17 +791,16 @@ impl DiskQueue {
             .await
     }
 
-    /// Closes out the current active segment (fsync it and the directory, so its directory entry
-    /// and every byte written to it are durable) and starts a new one.
+    /// Closes out the active segment (flush and `fsync` it, `fsync` the directory after creating
+    /// the next) and starts a new one.
     async fn rotate_segment(&self) {
         let (old_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let old_seq = state.segments.back().expect("always at least one segment").seq;
             (old_seq, state.write_file.take())
         };
-        // F2: flush outside the lock -- `.await`ing while holding `std::sync::Mutex`'s guard is
-        // `clippy::await_holding_lock` under this repo's `-D warnings`, so the file is taken out
-        // under the lock and flushed only after the guard is dropped.
+        // Flush after the guard drops: awaiting under a `std::sync::Mutex` guard trips
+        // `clippy::await_holding_lock`.
         if let Some(mut f) = file {
             let _ = f.flush().await;
         }
@@ -866,11 +814,10 @@ impl DiskQueue {
         }
     }
 
-    /// `DropOldest` under a full queue: advances the read cursor past the whole head record
-    /// without delivering it, exactly like an in-memory `SinkQueue`'s own eviction. Re-checks
-    /// (after the async read, under the lock) that the head is still the same, unreserved record
-    /// it started with before actually advancing -- a concurrent `peek` could have reserved it
-    /// in the meantime. Returns whether it actually evicted anything.
+    /// `DropOldest` under a full queue: advances the read cursor past the head record without
+    /// delivering it. After the async read, re-checks under the lock that the head is the same
+    /// unreserved record, since a concurrent `peek` may have reserved it. Returns whether it
+    /// evicted anything.
     async fn evict_oldest(&self) -> bool {
         let (seq, offset) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -896,12 +843,10 @@ impl DiskQueue {
         true
     }
 
-    /// Reads one record at `(seq, offset)`, growing the read buffer using
-    /// [`CodecError::Truncated`]'s `needed` hint rather than reading the rest of the segment --
-    /// most records fit in [`READ_CHUNK_INITIAL`]. Resyncs past corruption discovered live (a
-    /// live segment should never actually be corrupt in ordinary operation -- see the module
-    /// doc -- so this is defense in depth, not the primary recovery path, which is
-    /// [`DiskQueue::open`]).
+    /// Reads one record at `(seq, offset)`, growing the read by [`CodecError::Truncated`]'s
+    /// `needed` hint past [`READ_CHUNK_INITIAL`]. Returns the record and how far the cursor must
+    /// advance to pass it. Resyncs past live corruption as defense in depth; the primary recovery
+    /// is [`DiskQueue::open`].
     async fn read_record_at(
         &self,
         seq: u64,
@@ -920,7 +865,7 @@ impl DiskQueue {
                 Ok((ctx, batch, consumed)) => return Some((ctx, batch, consumed as u64)),
                 Err(CodecError::Truncated { needed }) => {
                     if buf.len() < chunk_len {
-                        // Real end of segment -- nothing more to read here.
+                        // End of segment.
                         return None;
                     }
                     chunk_len = buf.len() + needed;
@@ -937,15 +882,9 @@ impl DiskQueue {
                         Ok(b) => b,
                         Err(_) => return None,
                     };
-                    // `record_len` (the third element of this method's return, and of
-                    // `walk_segment`'s `on_record` callback) is a *delta from the read cursor*,
-                    // not the found record's own byte size -- callers (`commit`/`evict_oldest`,
-                    // via `advance_read_cursor`) advance the cursor by exactly this many bytes
-                    // from where it currently sits. `pos` is the offset within `whole` (itself
-                    // already anchored at the cursor's `offset`) where the recovered record
-                    // begins, non-zero exactly when corrupted bytes were skipped before it -- so
-                    // the delta is `pos + len`, not `len` alone; using `len` alone would leave the
-                    // cursor short by `pos` bytes, landing inside the delivered record itself.
+                    // The returned length is a delta from the read cursor, not the record's
+                    // size: `pos` counts the corrupt bytes skipped before the record, so the
+                    // delta is `pos + len`. `len` alone would land the cursor inside the record.
                     let mut found = None;
                     let outcome = walk_segment(&whole, 0, |pos, ctx, batch, len| {
                         if found.is_none() {
@@ -984,28 +923,19 @@ impl DiskQueue {
         Ok(buf)
     }
 
-    /// While the segment `read_seq` currently names is fully consumed (`read_offset` at or past
-    /// its length) *and* is no longer the active (`segments.back()`) segment, rolls the cursor
-    /// forward onto the next surviving segment and deletes the one just left behind -- looked up
-    /// by scanning for the next larger `seq`, not `read_seq + 1`, since a gap from a previously
-    /// failed deletion is possible. Loops rather than handling one crossing, so a single call
-    /// correctly resolves an advance that overshoots more than one segment boundary.
+    /// While the segment `read_seq` names is fully consumed and is no longer the active one,
+    /// moves the cursor to the next surviving segment (the next larger `seq`, since a failed
+    /// deletion can leave a gap) and deletes the one left behind. Loops, so one call resolves an
+    /// advance past several boundaries.
     ///
-    /// This is what F1 fixes: previously this rollover only ever happened inside
-    /// `advance_read_cursor`, evaluated once at the moment of that specific commit/evict. A reader
-    /// that caught up to the writer while its segment was still active (`read_offset == len`,
-    /// `is_active == true`) left nothing to ever re-evaluate `read_seq` later, once a subsequent
-    /// `push` rotated that segment away and made it eligible to roll onto -- `peek` then waited on
-    /// `not_empty` forever against a segment that would never grow again. Calling this from `peek`
-    /// (before it decides there's nothing to read) and from `push`'s `drop_oldest` arm (before it
-    /// decides there's nothing to evict), in addition to `advance_read_cursor`, closes that gap:
-    /// whichever caller next has a chance to notice the rotation, does.
+    /// `peek`, `push`'s `DropOldest` arm, and `advance_read_cursor` all call it. A reader that
+    /// caught up to the writer while its segment was active has nothing else to re-evaluate
+    /// `read_seq` once a later `push` rotates that segment away, and `peek` would wait on
+    /// `not_empty` forever against a segment that never grows again.
     ///
-    /// Persists the cursor and resets `last_checkpoint` once for the whole roll (not once per
-    /// segment crossed), then releases the lock before deleting files and notifying `not_full` --
-    /// `to_delete` stays empty (no allocation) in the common case of no crossing at all. Returns
-    /// whether the cursor now points at readable bytes (`read_offset < segments[read_seq].len`),
-    /// so callers with more to do after the roll don't need a second, separate check.
+    /// Persists the cursor once per roll, then deletes files and notifies `not_full` outside the
+    /// lock. Allocates nothing when no boundary is crossed. Returns whether the cursor now points
+    /// at readable bytes.
     fn roll_read_cursor(&self) -> bool {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut to_delete: Vec<u64> = Vec::new();
@@ -1049,9 +979,8 @@ impl DiskQueue {
         let readable =
             state.segments.iter().find(|s| s.seq == seq).map(|s| offset < s.len).unwrap_or(false);
         drop(state);
-        // `self.dir` needs no clone here -- `self` (unlike `state`, the `MutexGuard`) is still
-        // borrowed, and the common no-crossing case must not allocate at all (this is on `peek`'s
-        // hot, cached-hit path -- see `disk_queue_peek_cached_costs_nothing`).
+        // The no-crossing case must not allocate: it is on `peek`'s cached-hit path
+        // (`disk_queue_peek_cached_costs_nothing`).
         if !to_delete.is_empty() {
             for seq in to_delete {
                 let _ = std::fs::remove_file(segment_path(&self.dir, seq));
@@ -1061,10 +990,9 @@ impl DiskQueue {
         readable
     }
 
-    /// Advances the read cursor past one record of `record_len` bytes, in-memory only, then rolls
-    /// forward across any segment boundaries that advance crossed (`roll_read_cursor`, which also
-    /// deletes any segment fully left behind). Sync: the only I/O `roll_read_cursor` can trigger
-    /// is one small blocking JSON write and (occasionally) blocking file removal(s).
+    /// Advances the read cursor past `record_len` bytes, clears the head reservation, rolls
+    /// across any segment boundary crossed, and persists the cursor if `checkpoint_interval` has
+    /// elapsed. Sync: its only I/O is a small cursor write and occasional file removals.
     fn advance_read_cursor(&self, record_len: u64) {
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1079,16 +1007,13 @@ impl DiskQueue {
         }
     }
 
-    /// The head, without removing it -- cached until [`DiskQueue::commit`] so a retry
-    /// (`write_loop` calls this once per delivery attempt) costs nothing after the first. `None`
-    /// once closed and empty.
+    /// The head, without removing it. Cached, and reserved against `DropOldest` eviction, until
+    /// [`DiskQueue::commit`], so a retry (`write_loop` peeks once per delivery attempt) costs
+    /// nothing after the first. `None` once closed and empty.
     pub async fn peek(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         loop {
-            // F1: roll past any segment the reader caught up to *while it was still active* and
-            // which has since rotated away -- without this, a reader that reached exactly
-            // `read_offset == len` of the then-active segment would check only that segment's
-            // (unchanging) length forever, even after a later `push` rotated it out and started a
-            // new one with more to read.
+            // Roll past a segment the reader finished while it was active and that has since
+            // rotated away (see `roll_read_cursor`).
             self.roll_read_cursor();
             let (cached, seq, offset, has_data) = {
                 let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1130,18 +1055,17 @@ impl DiskQueue {
                     }
                 }
                 None => {
-                    // Nothing readable where accounting said there should be -- a genuinely
-                    // exceptional case (see the module doc's cancellation-safety notes); brief
-                    // backoff rather than a tight spin, then re-evaluate from scratch.
+                    // Nothing readable where accounting said there should be (an I/O error, a
+                    // short read, or corruption with no resync target). Back off briefly rather
+                    // than spin, then re-evaluate.
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
         }
     }
 
-    /// Advances the read cursor past the currently-cached head, returning it. A no-op (`None`)
-    /// with nothing cached -- mirrors `SinkQueue::commit`'s contract exactly, including staying
-    /// synchronous (see the module doc).
+    /// Advances the read cursor past the cached head, returning it. `None`, and a no-op, with
+    /// nothing peeked.
     pub fn commit(&self) -> Option<(Arc<EventBatch>, BatchContext)> {
         let (item, record_len) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1160,9 +1084,9 @@ impl DiskQueue {
         self.not_full.notify_waiters();
     }
 
-    /// Persists the cursor (forced, regardless of `checkpoint_interval`), `fsync`s it, the active
-    /// segment, and the directory, and closes files. Drops nothing -- a disk-backed sink's
-    /// shutdown grace only bounds how long delivery keeps running, never what's still queued.
+    /// Persists the cursor regardless of `checkpoint_interval`, `fsync`s it, the active segment,
+    /// and the directory, and closes files. Drops nothing: what is queued delivers after the next
+    /// open.
     pub async fn finish(&self) {
         let (active_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1171,7 +1095,7 @@ impl DiskQueue {
             state.read_file = None;
             (state.segments.back().map(|s| s.seq), file)
         };
-        // F2: flush outside the lock, same reasoning as `rotate_segment`.
+        // Flush outside the lock, as in `rotate_segment`.
         if let Some(mut f) = file {
             let _ = f.flush().await;
         }
@@ -1198,13 +1122,8 @@ pub(crate) mod test_support {
         dir
     }
 
-    /// The exact on-disk byte length `DiskQueue::push` would write for `batch` under
-    /// `Compression::None` with `provenance` (the 24-byte `TraceContext` prefix `push` also
-    /// writes is fixed-size regardless of its contents, so only the trace half is irrelevant
-    /// here) -- the same computation `DiskQueue::push` itself does, exposed here so a test in
-    /// another module (`crate::runtime`'s F3 shutdown-sweep test, which needs to size a spool
-    /// tightly around exactly one record) doesn't have to duplicate it or reach into a private
-    /// `tests` module.
+    /// The on-disk length `DiskQueue::push` writes for `batch` under `Compression::None`, for
+    /// tests in other modules that size a spool around one record.
     pub(crate) fn encoded_record_len(
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
@@ -1244,10 +1163,8 @@ mod tests {
         batch.events[0].attributes.get("marker").and_then(Value::as_str).unwrap().to_string()
     }
 
-    /// Sums every counter point named `name` across drained telemetry events, optionally
-    /// filtered to those carrying `(tag_key, tag_value)` -- `ComponentBuffer::drain` puts a
-    /// metric's tags on the drained `Event`'s attributes and its own name on `MetricRecord::name`
-    /// (an interned `Symbol`, not a string attribute), so both have to be checked this way.
+    /// Sums every point named `name` in drained telemetry, only those carrying `tag` if given.
+    /// Tags are on the drained `Event`'s attributes; the name is an interned `MetricRecord::name`.
     fn metric_sum(events: &[logit_core::Event], name: &str, tag: Option<(&str, &str)>) -> f64 {
         let name_sym = logit_core::interner::intern(name);
         events
@@ -1270,7 +1187,7 @@ mod tests {
         DiskQueueConfig {
             dir,
             max_bytes: 10 * 1024 * 1024,
-            // Small enough that a handful of tiny test batches force real rotation.
+            // Small enough that a few test batches force rotation.
             segment_bytes: 200,
             overflow: OverflowPolicy::Block,
             compression: Compression::None,
@@ -1286,8 +1203,7 @@ mod tests {
         DiskQueue::open(config, Telemetry::default(), Diagnostics::new("test")).unwrap()
     }
 
-    /// Builds the exact on-disk bytes `DiskQueue::push` would write for one record -- reused by
-    /// tests that hand-construct or hand-corrupt segment files directly.
+    /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
     fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
         let payload = native::encode_batch_v2(batch, ctx.provenance);
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
@@ -1298,10 +1214,7 @@ mod tests {
         record
     }
 
-    /// The on-disk shape a record written *before* provenance existed still has: `CODEC_NATIVE_V1`
-    /// instead of `CODEC_NATIVE_V2`, no trailer at all. Used only by
-    /// `a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance` below --
-    /// every other test uses [`raw_record`], matching what `DiskQueue::push` writes today.
+    /// A `CODEC_NATIVE_V1` record, with no provenance trailer.
     fn raw_record_v1(batch: &EventBatch, trace: TraceContext) -> Vec<u8> {
         let payload = native::encode_batch(batch);
         let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload)
@@ -1317,8 +1230,7 @@ mod tests {
         let dir = scratch_dir("fifo");
         let q = open(dir.clone());
 
-        // `segment_bytes: 200` and each of these batches encodes to well under that, so pushing
-        // several forces at least one real rotation.
+        // Each batch is well under `segment_bytes: 200`, so several force a rotation.
         for label in ["a", "b", "c", "d", "e", "f", "g", "h"] {
             q.push((batch(label), ctx())).await;
         }
@@ -1338,9 +1250,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `push`'s provenance survives a spool round trip, not just its trace context -- the whole
-    /// point of `parse_record` dispatching on the frame's own codec byte to `decode_batch_v2`
-    /// rather than discarding what it decodes.
+    /// Provenance survives a spool round trip alongside the trace context.
     #[tokio::test]
     async fn provenance_survives_a_spool_round_trip() {
         let dir = scratch_dir("provenance-round-trip");
@@ -1360,11 +1270,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A record spooled by a build of `logit` before provenance existed (`CODEC_NATIVE_V1`, no
-    /// trailer) must keep replaying correctly after this change -- `CONTEXT_LEN`/`encode_context`/
-    /// `decode_context` are deliberately never widened (this module's own doc comment), and
-    /// `parse_record` dispatches on the codec byte specifically so an old record on disk isn't
-    /// silently corrupted or resynced-past by a newer binary.
+    /// A `CODEC_NATIVE_V1` record on disk replays with empty provenance.
     #[tokio::test]
     async fn a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance() {
         let dir = scratch_dir("v1-record-compat");
@@ -1405,7 +1311,7 @@ mod tests {
             q.push((batch("a"), ctx())).await;
             q.push((batch("b"), ctx())).await;
             q.push((batch("c"), ctx())).await;
-            // Commit only the first -- the rest should still be there after a reopen.
+            // Commit only the first.
             let (peeked, _) = q.peek().await.unwrap();
             assert_eq!(marker_of(&peeked), "a");
             q.commit().unwrap();
@@ -1430,7 +1336,7 @@ mod tests {
         let good = raw_record(&batch("good"), ctx());
         let torn = raw_record(&batch("torn"), ctx());
         let mut bytes = good.clone();
-        // Half of the second record only -- a torn write.
+        // Half of the second record: a torn write.
         bytes.extend_from_slice(&torn[..torn.len() / 2]);
         std::fs::write(&path, &bytes).unwrap();
 
@@ -1461,9 +1367,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let first = raw_record(&batch("first"), ctx());
         let mut corrupted = raw_record(&batch("corrupt"), ctx());
-        // Flip a payload byte without touching the frame header, so the header parses fine but
-        // the checksum fails -- `frame::read_frame`'s own `rejects_corrupt_crc` test does the
-        // same thing.
+        // Flip a payload byte so the header parses but the checksum fails.
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xFF;
         let third = raw_record(&batch("third"), ctx());
@@ -1491,8 +1395,7 @@ mod tests {
         let path = segment_path(&dir, 0);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A trace_id whose bytes happen to contain `MAGIC` -- `frame::resync`'s own doc warns a
-        // reader must expect and tolerate exactly this spurious match.
+        // A trace_id containing `MAGIC`: the spurious match `frame::resync` warns about.
         let mut spurious_ctx = ctx();
         spurious_ctx.trace.trace_id[4..8].copy_from_slice(&frame::MAGIC);
         let record = raw_record(&batch("real"), spurious_ctx);
@@ -1523,13 +1426,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Replaces `drop_oldest_never_evicts_a_record_currently_peeked`, which asserted that a second
-    /// push while the head is reserved is admitted over-bound -- that was F6, the bug this test
-    /// now proves is fixed: with the head reserved (peeked, mid-delivery-attempt) there is nowhere
-    /// else in a file-backed FIFO to evict from, so `disk.max_bytes` used to go unenforced for as
-    /// long as the head stayed reserved (nearly a whole destination outage). The reserved-head
-    /// part of the old contract still holds (never evicted; `commit()` still returns it); only the
-    /// second push's outcome changed, from admitted-over-bound to rejected.
+    /// Under `DropOldest` with the head peeked, a push that doesn't fit is rejected and counted
+    /// `overflow_newest`; the reserved head is never evicted and `max_bytes` still holds.
     #[tokio::test]
     async fn drop_oldest_drops_the_newest_rather_than_growing_past_max_bytes_while_the_head_is_peeked(
     ) {
@@ -1546,9 +1444,7 @@ mod tests {
         let (peeked, _) = q.peek().await.expect("should peek the only batch");
         assert_eq!(marker_of(&peeked), "first");
 
-        // Nothing else exists to evict ahead of the reserved head, so this push is now rejected
-        // (counted overflow_newest) rather than evicting the batch a caller (write_loop, here
-        // just this test) is currently holding, and rather than growing past max_bytes.
+        // Nothing but the reserved head to evict, so this push is rejected.
         q.push((batch("second"), ctx())).await;
 
         let (still_first, _) = q.commit().expect("the peeked batch must still be first's");
@@ -1631,9 +1527,7 @@ mod tests {
         assert_eq!(marker_of(&peeked), "a");
         q.commit().unwrap();
 
-        // Give the (synchronous, but internal) deletion a moment to land -- `commit` itself is
-        // sync and returns only after the delete already happened, so this should already be
-        // true immediately, but a tiny yield keeps this robust to any future scheduling change.
+        // `commit` deletes synchronously; the yield guards against a future scheduling change.
         tokio::task::yield_now().await;
         assert_eq!(
             list_segments(&dir).unwrap(),
@@ -1700,12 +1594,8 @@ mod tests {
         let telemetry = registry.telemetry_for("test", "output", "sink");
         let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
 
-        // Replace the active segment with a directory of the same name -- opening it for append
-        // then fails with `EISDIR`, a type mismatch rather than a permission check, so it fails
-        // the same way whether the test runs as an ordinary user or as root (a `chmod`-readonly
-        // file would silently succeed for root, e.g. CI's containers, which is exactly what a
-        // first version of this test got wrong). Exercises the same "batch never actually
-        // landed" path a real write failure (permissions, `ENOSPC`, the device gone) would.
+        // Replace the active segment with a directory: opening it for append fails with
+        // `EISDIR`, for root too (a read-only file would not fail for root, as in CI containers).
         std::fs::remove_file(segment_path(&dir, 0)).unwrap();
         std::fs::create_dir(segment_path(&dir, 0)).unwrap();
 
@@ -1740,22 +1630,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // F1: the read cursor must roll forward past a segment the reader caught up to *while it was
-    // still active*, once that segment later rotates away.
+    // The read cursor rolls past a segment the reader finished while it was active, once that
+    // segment rotates away.
     // -----------------------------------------------------------------------------------------
 
     #[tokio::test]
     async fn the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away() {
         let dir = scratch_dir("roll-forward");
         let mut cfg = config(dir.clone());
-        // Deterministic sizing: every marker-only batch with a single-character marker encodes to
-        // exactly the same length.
+        // Every single-character-marker batch encodes to the same length.
         let one = raw_record(&batch("x"), ctx()).len() as u64;
         cfg.segment_bytes = 3 * one;
         let q = open_with(cfg);
 
-        // `segment_bytes` is a soft trigger checked *before* a write, not a hard cap -- all three
-        // land in segment 0, whose length becomes exactly the trigger.
+        // `segment_bytes` is checked before a write, so all three land in segment 0.
         q.push((batch("a"), ctx())).await;
         q.push((batch("b"), ctx())).await;
         q.push((batch("c"), ctx())).await;
@@ -1765,8 +1653,7 @@ mod tests {
             "all three should still fit in segment 0"
         );
 
-        // Catch the reader up to read_offset == len of the still-active segment 0 -- the exact
-        // state no prior test reached, and the one F1 fixes.
+        // Catch the reader up to the end of the still-active segment 0.
         for label in ["a", "b", "c"] {
             let (peeked, _) = q.peek().await.expect("should peek the next batch");
             assert_eq!(marker_of(&peeked), label);
@@ -1777,8 +1664,7 @@ mod tests {
         q.push((batch("d"), ctx())).await;
         assert_eq!(list_segments(&dir).unwrap(), vec![0, 1], "the push above should have rotated");
 
-        // Pre-fix: this hangs forever, parked on `not_empty` against a segment whose length will
-        // never change again.
+        // Without the roll, this parks forever against a segment that never grows again.
         let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang once the segment it was waiting on has rotated away")
@@ -1804,7 +1690,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // F2: a pushed record must be flushed to the OS before `push` returns.
+    // A pushed record is flushed to the OS before `push` returns.
     // -----------------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1813,17 +1699,15 @@ mod tests {
         let q = open(dir.clone());
         q.push((batch("a"), ctx())).await;
 
-        // An independent, non-tokio path -- proves the bytes are visible via a file descriptor
-        // other than the one `DiskQueue` itself wrote through, which is exactly what `.flush()`
-        // guarantees and a bare `write_all` does not.
+        // Read through an independent path: visible only after `flush()`, not a bare `write_all`.
         let on_disk = std::fs::metadata(segment_path(&dir, 0)).unwrap().len();
         assert_eq!(on_disk, raw_record(&batch("a"), ctx()).len() as u64);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     // -----------------------------------------------------------------------------------------
-    // F4: the live corruption-resync path must advance the cursor past the skipped bytes, not
-    // just past the found record's own length.
+    // Live corruption resync advances the cursor past the skipped bytes too, not only the found
+    // record's length.
     // -----------------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1847,13 +1731,10 @@ mod tests {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("test", "output", "sink");
         let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
-        // `DiskQueue::open`'s own recovery walk independently audits (and counts) every record
-        // from the persisted cursor to the end of the spool, including this same corrupted one --
-        // a separate, already-covered pass (see `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted`).
-        // Discard that count here so the drain below reflects only the live path this test targets.
+        // Discard `open`'s own recovery count so the drain below reflects only the live path.
         registry.drain(0);
 
-        // Consumes the clean first record normally -- not the branch this test targets.
+        // The clean first record.
         let (peeked, _) = q.peek().await.expect("good should be delivered");
         assert_eq!(marker_of(&peeked), "good");
         q.commit().unwrap();
@@ -1866,9 +1747,7 @@ mod tests {
         assert_eq!(marker_of(&peeked), "next");
         q.commit().unwrap();
 
-        // The critical assertion: `last` is reached at all. Pre-fix, after committing `next` the
-        // cursor would land inside `next`'s own bytes (the closure returned only `len`, not
-        // `pos + len`), and this peek would misbehave instead of cleanly delivering `last`.
+        // Reaching `last` proves the cursor didn't land inside `next`'s bytes.
         let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
             .await
             .expect("peek must not hang")
@@ -1889,8 +1768,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // F5: a corrupted `compressed_len` must not be mistaken for a clean end-of-file, which would
-    // silently discard (via truncation, at `DiskQueue::open`) everything after it.
+    // A corrupted `compressed_len` is not mistaken for a torn tail, which `DiskQueue::open` would
+    // truncate away along with everything after it.
     // -----------------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1900,11 +1779,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let good = raw_record(&batch("good"), ctx());
         let mut corrupted = raw_record(&batch("corrupt"), ctx());
-        // Overwrite `compressed_len` (frame header bytes 16..20, offset by the 24-byte context
-        // prefix this record format prepends) to an oversized value -- pre-F5, `read_frame` would
-        // report this as `Truncated` (indistinguishable from a genuine clean end-of-file), so
-        // `walk_segment` would stop right here instead of resyncing, and `DiskQueue::open` would
-        // truncate the segment at this point, silently discarding `after` for good.
+        // Set `compressed_len` (frame header bytes 16..20, after the 24-byte context) oversized.
+        // Were it read as `Truncated`, `walk_segment` would stop and `open` would drop `after`.
         let compressed_len_at = CONTEXT_LEN + 16;
         corrupted[compressed_len_at..compressed_len_at + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());

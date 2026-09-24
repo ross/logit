@@ -6,50 +6,32 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// A batch of events sharing one [`Resource`] and, optionally, one [`Scope`]. Events always travel
-/// in batches -- per-event channel sends and allocation would dominate the profile at any
+/// in batches: per-event channel sends and allocation would dominate the profile at any
 /// interesting throughput. See `docs/design/data-model.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventBatch {
     pub resource: Arc<Resource>,
-    /// The OTLP instrumentation scope this batch's events were reported through, if any -- see
-    /// [`Scope`]'s own doc comment. `Arc`-shared across the batch the same way `resource` is.
+    /// The OTLP instrumentation scope the events were reported through, if any.
     pub scope: Option<Arc<Scope>>,
     pub events: Vec<Event>,
 }
 
 impl EventBatch {
-    /// Approximate heap bytes held by this batch: the `Vec<Event>` backing allocation itself,
-    /// attribute values, log bodies, span-owned data, metric records, and the batch's resource
-    /// and scope. Deliberately approximate -- an O(events) walk for admission control
-    /// (bounding an in-memory delivery buffer, see `docs/adr/buffered-sink-delivery.md`), NOT an
-    /// allocator-accounting figure. Exempt from this crate's exact-size/exact-allocation-count
-    /// discipline (`tests/type_sizes.rs`, `crates/logit-bench/tests/allocations.rs`) on purpose --
-    /// don't add this to either of those.
+    /// Approximate heap bytes held by this batch, for admission control of an in-memory delivery
+    /// buffer (`docs/adr/buffered-sink-delivery.md`), not allocator accounting.
     ///
-    /// What gets counted: the dominant term first -- `events.capacity() * size_of::<Event>()`,
-    /// the batch's own backing storage, which every event pays *before* any nested heap payload --
-    /// a batch of numeric-only metrics with no string attributes would otherwise estimate close to
-    /// zero despite genuinely holding hundreds of bytes per event. Then, per event: every
-    /// attribute value's byte length (`value_heap_bytes` below), the log body's `Value` the same
-    /// way if `event.log` is `Some`, every span-owned `Value`/`AttrMap`/nested `Vec` if
-    /// `event.span` is `Some` (`span_heap_bytes` below), and a per-metric-record contribution for
-    /// `event.metrics` (`metric_record_heap_bytes` below). `Null`/`Bool`/`I64`/`U64`/`F64`/
-    /// `Timestamp` values are stored inline in `Value` with no heap component of their own (see
-    /// `tests/type_sizes.rs`'s `value_is_bytes_plus_a_discriminant_word`), so they contribute
-    /// nothing -- only `Bytes`/`Str`/`Array`/`Map` do. The batch's `resource` and `scope` are each
-    /// counted once, not once per event -- both are `Arc`-shared across every event in the batch,
-    /// not copied per event.
+    /// An O(events) walk. It's exempt from the exact-size and exact-allocation-count tests
+    /// (`tests/type_sizes.rs`, `crates/logit-bench/tests/allocations.rs`); don't add it to them.
     ///
-    /// What deliberately does *not* get counted: interned [`crate::Symbol`]s -- attribute keys,
-    /// metric names/units/descriptions, a log's `event_name`. On the event they are 4-byte handles, and
-    /// the string bytes they name live in the process-wide interner (`crate::interner`) for the
-    /// life of the process, shared by every event that uses the key and never released when a
-    /// batch is dropped -- so they are not heap this batch holds, and charging them here would
-    /// bill the same bytes once per event per hop. An earlier version resolved every symbol to
-    /// add its `len()`, which meant one interner hash probe (read lock + `HashMap` lookup) per key
-    /// per event on every queue push; the `json-parse` load-test flamegraph put that walk at ~30%
-    /// of all samples, more than either transform in the scenario. Dropping the term made the
-    /// estimate both cheaper and more honest about what a batch actually owns.
+    /// Counts `events.capacity() * size_of::<Event>()`, the dominant term (without it a
+    /// numeric-only batch would estimate near zero); then, per event, the heap payload of
+    /// attribute values, the log body, span-owned data, and metric records; and the `Arc`-shared
+    /// resource and scope once per batch. Scalar `Value`s are inline and count nothing.
+    ///
+    /// Doesn't count interned [`crate::Symbol`]s (keys, metric names, `event_name`): their bytes
+    /// live in the process-wide interner, not in the batch. Resolving them also cost an interner
+    /// probe per key per event on every queue push (`docs/design/memory.md` §5 has the measured
+    /// cost).
     pub fn estimated_heap_bytes(&self) -> u64 {
         let mut total = self.resource.estimated_heap_bytes()
             + self.scope.as_ref().map(|s| s.estimated_heap_bytes()).unwrap_or(0)
@@ -61,13 +43,9 @@ impl EventBatch {
     }
 }
 
-/// Heap bytes owned by one `SpanRecord` beyond its own inline size (`memory.md` §1): its `name`,
-/// every `SpanEvent`/`SpanLink`'s own `Vec` backing storage and owned data, and (when present) its
-/// boxed [`SpanExt`]. Unlike `Event`'s outer `Vec` (which every batch has regardless of shape), a
-/// span's `events`/`links` are typically empty, so their `capacity() * size_of::<T>()` terms are
-/// usually zero in practice -- included anyway since a span that *does* carry several span-events
-/// (a common OTLP shape) would otherwise be undercounted the same way the outer batch was before
-/// this fix.
+/// Heap bytes owned by one `SpanRecord` beyond its inline size: `name`, the `events`/`links`
+/// backing storage and owned data, and a boxed [`SpanExt`]. The backing-storage terms are usually
+/// zero, but a span carrying several span events (a common OTLP shape) needs them.
 fn span_heap_bytes(span: &SpanRecord) -> u64 {
     let name = value_heap_bytes(&span.name);
     let events = (span.events.capacity() * std::mem::size_of::<SpanEvent>()) as u64
@@ -98,23 +76,18 @@ fn span_ext_bytes_heap_bytes(ext: &SpanExt) -> u64 {
         + ext.trace_state.as_ref().map(|s| s.len() as u64).unwrap_or(0)
 }
 
-/// A rough per-record stand-in for `MetricKind::Distribution`'s inlined `DDSketch`. The sketch
-/// doesn't expose its live bin count cheaply, and walking its internal `Store`s would make this
-/// method's cost depend on how populated each sketch is rather than staying a flat O(events) walk
-/// -- exactly the kind of precision this estimate deliberately isn't after. Picked as a plausible
-/// "typically a few hundred bins across both of `DDSketch`'s `Store`s" guess, not a measurement.
+/// A flat guess (a few hundred bins), not a measurement, for a `Distribution`'s sketch heap.
+/// `DDSketch` doesn't expose its bin count cheaply, and walking its stores would make the estimate
+/// cost scale with sketch population.
 const ESTIMATED_DISTRIBUTION_HEAP_BYTES: u64 = 512;
 
-/// Values only: the keys are interned [`crate::Symbol`]s, which count for nothing here
-/// ([`EventBatch::estimated_heap_bytes`]'s doc comment says why) -- and, just as importantly,
-/// cost nothing to skip, where sizing them meant an interner probe per key per event.
+/// Values only: keys are interned [`crate::Symbol`]s and count nothing (see
+/// [`EventBatch::estimated_heap_bytes`]).
 pub(crate) fn attr_map_heap_bytes(attrs: &AttrMap) -> u64 {
     attrs.iter().map(|(_, value)| value_heap_bytes(value)).sum()
 }
 
-/// Heap bytes owned by one `Value`. `Array`/`Map` recurse into their elements -- still an O(the
-/// value's own size) walk, not an O(events) one, since a single event's attributes can't nest
-/// arbitrarily many other events inside them.
+/// Heap bytes owned by one `Value`; `Array`/`Map` recurse into their elements.
 fn value_heap_bytes(value: &Value) -> u64 {
     match value {
         Value::Null
@@ -129,16 +102,9 @@ fn value_heap_bytes(value: &Value) -> u64 {
     }
 }
 
-/// Heap bytes owned by one `MetricRecord`: its exemplars plus a kind-dependent contribution --
-/// its name/unit/description are interned symbols and count for nothing
-/// ([`EventBatch::estimated_heap_bytes`]). `Sum`/`Gauge`/`GaugeDelta` are free (no heap payload
-/// of their own); `Set` counts `HyperLogLog::heap_bytes` -- real state now, not the zero-sized stub it used
-/// to be (see `metric.rs`); `Samples` counts its `SmallVec`'s heap allocation only once it has
-/// actually spilled past its inline capacity (an unspilled `Samples` pays nothing extra here, the
-/// same way `AttrMap`'s own inline capacity doesn't count as heap); `SetMembers` counts each
-/// member's own byte length; `Histogram`/`ExponentialHistogram`/`Summary` count their actual
-/// bucket/quantile `Vec`s, since those are plain `Vec`s and doing so costs nothing extra;
-/// `Distribution` uses [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`] rather than walking the sketch.
+/// Heap bytes owned by one `MetricRecord`: exemplars plus the kind's payload. Symbols count
+/// nothing; `Samples` counts only once spilled past its inline capacity; `Distribution` uses
+/// [`ESTIMATED_DISTRIBUTION_HEAP_BYTES`].
 fn metric_record_heap_bytes(record: &MetricRecord) -> u64 {
     let exemplars = if record.exemplars.is_empty() {
         0
@@ -175,17 +141,14 @@ fn exp_histogram_heap_bytes(e: &ExpHistogram) -> u64 {
     positive + negative
 }
 
-/// The metric list on an [`Event`]. Inline capacity 1: the overwhelmingly common shape is a
-/// single metric (statsd) or none at all (a log line), and `kv_metrics` -- the first real
-/// multi-metric producer -- spills to the heap only past the first.
+/// The metric list on an [`Event`]. Inline capacity 1: the common shape is one metric or none (a
+/// log line); multi-metric producers (`kv_metrics`, `collectd_in`) spill past the first.
 pub type MetricList = SmallVec<[MetricRecord; 1]>;
 
-/// One event moving through the pipeline. An event is *whatever it carries* -- a log, some
-/// metrics, a span, several of those at once, or (legally) none at all -- not a tagged one-of.
-/// The same access log line is both a log and, once a transform like `kv_metrics` has run, a
-/// source of several derived metrics; a sink emits whatever it finds. Two logs on one event is
-/// unrepresentable by construction, since `log` is a single `Option`, not a list. See
-/// `docs/adr/multi-payload-events.md` and `docs/design/data-model.md`.
+/// One event moving through the pipeline: whatever it carries (a log, some metrics, a span,
+/// several at once, or none), not a tagged one-of. An access log line is a log and, after
+/// `kv_metrics`, a source of derived metrics; a sink emits whatever it finds. At most one log and
+/// one span per event. See `docs/adr/multi-payload-events.md` and `docs/design/data-model.md`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     /// Unix nanoseconds.
@@ -197,8 +160,7 @@ pub struct Event {
 }
 
 impl Event {
-    /// An event carrying one metric and nothing else -- the shape every metrics-only input
-    /// (statsd today) produces.
+    /// An event carrying one metric and nothing else.
     pub fn metric(timestamp: i64, attributes: AttrMap, record: MetricRecord) -> Self {
         Event {
             timestamp,
@@ -209,8 +171,7 @@ impl Event {
         }
     }
 
-    /// An event carrying a log body and nothing else -- the shape every log-only input
-    /// (`syslog_in`, once implemented) produces.
+    /// An event carrying a log and nothing else.
     pub fn log(timestamp: i64, attributes: AttrMap, record: LogRecord) -> Self {
         Event { timestamp, attributes, log: Some(record), metrics: MetricList::new(), span: None }
     }
@@ -220,25 +181,20 @@ impl Event {
         Event { timestamp, attributes, log: None, metrics: MetricList::new(), span: Some(record) }
     }
 
-    /// An event carrying no payload at all -- legal and representable, unlike under the old
-    /// one-of model. The base for building a multi-payload event by hand:
-    /// `let mut e = Event::empty(ts, attrs); e.metrics.push(record); e.log = Some(log);`
+    /// An event carrying no payload, legal on its own and the base for building a multi-payload
+    /// event: `let mut e = Event::empty(ts, attrs); e.metrics.push(record); e.log = Some(log);`
     pub fn empty(timestamp: i64, attributes: AttrMap) -> Self {
         Event { timestamp, attributes, log: None, metrics: MetricList::new(), span: None }
     }
 
-    /// This event's own contribution to [`EventBatch::estimated_heap_bytes`] -- everything that
-    /// formula counts *per event* (attributes, log body, span-owned data, metric records), minus
-    /// the batch-level terms (the resource and scope, each counted once via their own
-    /// `estimated_heap_bytes`, and the `Vec<Event>` backing storage itself). Exposed so a caller
-    /// accumulating events incrementally (`logit_pipeline::BatchAccumulator`) can track a running
-    /// total in O(1) per event as they arrive, rather than re-walking every event held so far on
-    /// every call -- summing this over a set of events and adding the batch-level terms once
-    /// reproduces `estimated_heap_bytes` exactly, by construction.
+    /// This event's per-event share of [`EventBatch::estimated_heap_bytes`], excluding the
+    /// batch-level terms (resource, scope, `Vec<Event>` storage). Summing it and adding those
+    /// terms reproduces the batch figure exactly, so `logit_pipeline::BatchAccumulator` can keep a
+    /// running total in O(1) per event.
     pub fn estimated_heap_bytes(&self) -> u64 {
         let mut total = attr_map_heap_bytes(&self.attributes);
         if let Some(log) = &self.log {
-            // `event_name` is an interned symbol: not counted, per the batch-level doc comment.
+            // `event_name` is an interned symbol: not counted.
             total += value_heap_bytes(&log.message);
         }
         if let Some(span) = &self.span {
@@ -310,11 +266,7 @@ mod tests {
         let attrs = attrs_with(&[("host", Value::str("web-1")), ("env", Value::str("prod"))]);
         let bytes = default_batch(vec![Event::empty(0, attrs)]).estimated_heap_bytes();
 
-        // "web-1" + "prod" is 9 bytes of actual string data owned by the event -- the keys are
-        // interned symbols and deliberately count for nothing -- on top of the one event's own
-        // Vec<Event> backing-storage floor (size_of::<Event>()) every event pays regardless of
-        // shape. The estimate should cover at least both, and stay in the same ballpark rather
-        // than blowing up to kilobytes.
+        // 9 bytes of value data (keys are interned and count nothing) over the per-event floor.
         let floor = std::mem::size_of::<Event>() as u64;
         assert!(bytes >= floor + 9, "estimate should cover the per-event floor plus the raw string bytes: {bytes} (floor {floor})");
         assert!(
@@ -325,11 +277,7 @@ mod tests {
 
     #[test]
     fn a_purely_numeric_metric_event_is_not_undercounted_to_near_zero() {
-        // The exact scenario a review finding named: a numeric-only event (no strings anywhere)
-        // used to estimate at only a few bytes (then the metric name symbol's length; now nothing
-        // at all, symbols being uncounted) despite Event itself costing several hundred bytes
-        // before any nested allocation -- the dominant term for a metrics-heavy batch. Must be at
-        // least one Event's worth of backing storage.
+        // No strings anywhere, but the event still costs its own backing storage.
         let record = MetricRecord::new(
             crate::interner::intern("numeric_only_test_counter"),
             MetricKind::counter(1.0),
@@ -389,8 +337,7 @@ mod tests {
         );
         let bytes =
             default_batch(vec![Event::metric(0, AttrMap::new(), record)]).estimated_heap_bytes();
-        // A `Sum` has no heap payload of its own and the name symbol counts for nothing, so this
-        // is exactly the `Vec<Event>` backing-storage floor -- nonzero because of it, and only it.
+        // A `Sum` has no heap payload and the name counts nothing: only the per-event floor.
         assert!(bytes > 0);
         assert_eq!(bytes, std::mem::size_of::<Event>() as u64);
     }
@@ -448,12 +395,7 @@ mod tests {
         );
 
         assert!(resource_only_bytes > 0, "fixture should carry a nonzero resource cost");
-        // An empty event with no attributes/log/metrics adds nothing of its own beyond the
-        // Vec<Event> backing storage every event pays regardless of shape -- so the marginal cost
-        // of a second event is exactly one more Event-sized slot, never the resource's cost
-        // repeated (that's what "counted once, not twice" actually means once the per-event floor
-        // exists: the resource term is the same additive constant in both expressions below,
-        // not something that scales with event count the way the floor deliberately does).
+        // A second empty event adds one `Event`-sized slot, never the resource again.
         let event_size = std::mem::size_of::<Event>() as u64;
         assert_eq!(one_event.estimated_heap_bytes(), resource_only_bytes + event_size);
         assert_eq!(two_events.estimated_heap_bytes(), resource_only_bytes + 2 * event_size);

@@ -6,15 +6,13 @@ mod config;
 mod dot;
 mod pipeline;
 
-/// jemalloc rather than the platform default (glibc malloc on this project's `debian:bookworm-slim`
-/// runtime image) -- see `docs/adr/jemalloc-global-allocator.md` and
-/// `docs/design/memory.md`. `logit` is exactly the workload glibc's arena model handles worst: a
-/// long-lived, multi-threaded process churning small short-lived allocations forever, where RSS
-/// drifts upward for days without the working set growing.
+/// jemalloc rather than glibc malloc (the `debian:bookworm-slim` runtime image's default): a
+/// long-lived, multi-threaded process churning small short-lived allocations is the workload
+/// glibc's arena model handles worst, with RSS drifting upward for days without the working set
+/// growing. See `docs/adr/jemalloc-global-allocator.md`.
 ///
-/// Behind a default-on feature so both allocators stay measurable -- `--no-default-features` builds
-/// against the system allocator, which is what makes "is jemalloc actually helping here?" a
-/// question with an answer rather than an assumption.
+/// Behind a default-on feature so both allocators stay measurable: `--no-default-features` builds
+/// against the system allocator.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -24,16 +22,13 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// `tracing`'s `EnvFilter` syntax (e.g. `debug`, `logit_pipeline=trace,info`) -- what severity
-    /// (and per-module override) `logit`'s own self-logging reports at. Only `run` installs a
-    /// subscriber (docs/plans/operator-surface.md); every other command stays print-only.
+    /// Self-logging filter for `run`, in `tracing`'s `EnvFilter` syntax (e.g. `debug`,
+    /// `logit_pipeline=trace,info`). Other commands don't self-log.
     #[arg(long, env = "LOGIT_LOG", default_value = "info", global = true)]
     log_level: String,
-    /// `text` is one line per event, human-formatted; `json` is one JSON object per line
-    /// (`timestamp`, `level`, `target`, `component`, `key`, `message`, every one of them
-    /// top-level -- `flatten_event`, and `target` left displayed, so a collector reads the
-    /// fields named here rather than unwrapping a nested `fields` object) -- for a log
-    /// collector. Both formats write to stderr; see `init_logging`.
+    /// Self-logging format, written to stderr: `text` is one human-formatted line per event;
+    /// `json` is one JSON object per line for a log collector, with `timestamp`, `level`,
+    /// `target`, `component`, `key`, and `message` all top-level.
     #[arg(long, value_enum, default_value = "text", global = true)]
     log_format: LogFormat,
 }
@@ -46,51 +41,39 @@ enum LogFormat {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print the JSON Schema for the config file format (ADR `config-yaml-jsonschema`) to stdout.
+    /// Print the config file format's JSON Schema to stdout.
     Schema,
-    /// Validate a config file against the schema and print a summary.
+    /// Check a config file's schema, `!env` references, and component graph without running it.
     Validate { path: std::path::PathBuf },
     /// Run logit with the given config file.
     Run { path: std::path::PathBuf },
-    /// Print the config's resolved component graph as graphviz DOT (docs/design/pipeline-graph.md).
+    /// Print a config file's component graph as graphviz DOT, even if the config is invalid.
     Graph { path: std::path::PathBuf },
-    /// Probe a running `logit`'s `/readyz` (docs/plans/operator-surface.md) -- exit 0 and print
-    /// the status word on `200`, exit 1 and print it otherwise. What `Dockerfile`'s `HEALTHCHECK`
-    /// runs; needs `admin.bind` set in the target's own config.
+    /// Probe a running `logit`'s `/readyz`: print its status word, and exit 0 on `200` or 1
+    /// otherwise. The target's config must set `admin.bind`; the container image's `HEALTHCHECK`
+    /// runs this.
     Ready {
+        /// The target's admin URL: `http://` plus its `admin.bind` address.
         #[arg(long, default_value = "http://127.0.0.1:9600")]
         admin: String,
     },
 }
 
-/// Builds and installs the process-wide `tracing` subscriber for `Command::Run` -- the only
-/// subcommand that runs long enough, or does enough on `logit`'s own behalf, to want leveled
-/// self-logging (`Schema`/`Validate`/`Graph` are print-only and stay exactly that way).
+/// Installs the process-wide `tracing` subscriber; only `Command::Run` calls it.
 ///
-/// A bad `--log-level`/`LOGIT_LOG` directive is a config error the same as a bad `bind` address:
-/// reported and exited on the spot, before anything else has started -- deliberately *before*
-/// the config is even loaded (`Command::Run` calls this first), so a bad flag fails fast
-/// regardless of whether the config itself would also fail, and `pipeline::run_pipelines`'s own
-/// `starting` log always fires, even for a config that goes on to fail resolution.
+/// `Command::Run` calls this before loading the config, so a bad `--log-level`/`LOGIT_LOG`
+/// directive fails fast whatever the config holds, and `pipeline::run_pipelines`'s `starting` log
+/// fires even for a config that then fails resolution.
 ///
-/// Everything the subscriber renders goes to stderr, never stdout: `stdio_out` defaults to
-/// `target: stdout` (`StdioTarget::Stdout`), so stdout belongs to the pipeline's own event
-/// stream -- `logit run c.yaml > events.log` has to stay parseable, and lifecycle lines
-/// interleaved into it would corrupt exactly the output an operator is capturing.
+/// Output goes to stderr, never stdout: `stdio_out` defaults to `target: stdout`, and
+/// `logit run c.yaml > events.log` has to stay parseable.
 ///
-/// `telemetry_layer` (`docs/plans/operator-surface.md`, workstream D) is stacked in unconditionally
-/// -- it starts inactive (every event a no-op) and stays that way until
-/// `pipeline::run_pipelines` calls `TelemetryLayer::activate` once the config's own `internal`
-/// component (if any) is known, which happens strictly *after* this call: there is no stable API
-/// to add a layer to an already-`.init()`-ed subscriber, so the layer has to already be here,
-/// even inactive.
+/// `telemetry_layer` is stacked in unconditionally, inactive until `pipeline::run_pipelines` calls
+/// `TelemetryLayer::activate` once the config's `internal` component is known. That happens after
+/// this call, and there's no stable API to add a layer to an `.init()`-ed subscriber.
 ///
-/// `--log-level`/`LOGIT_LOG` filters *only* the stderr `fmt` layer, via a per-layer
-/// `.with_filter(...)` rather than a subscriber-wide `.with(filter)`: a global filter
-/// short-circuits every layer beneath it (and `tracing-core` caches that verdict per callsite
-/// forever), which would make `--log-level error` silently override the config's own
-/// `internal.logs` threshold. `telemetry_layer` carries `logit_core::TelemetryLayer::capture_filter`
-/// of its own instead.
+/// `--log-level` filters only the stderr `fmt` layer; `telemetry_layer` carries
+/// `logit_core::TelemetryLayer::capture_filter` of its own. See the comment in the body for why.
 fn init_logging(
     level: &str,
     format: LogFormat,
@@ -103,14 +86,12 @@ fn init_logging(
 
     let filter = EnvFilter::try_new(level)
         .with_context(|| format!("--log-level/LOGIT_LOG: '{level}' is not a valid directive"))?;
-    // `with_filter` on each layer, never a bare `.with(filter)` on the registry: a plain
-    // `.with(EnvFilter)` is a *global* filter -- `Layered::enabled`/`register_callsite`
-    // short-circuit the whole stack, and a `never` verdict is cached at the callsite by
-    // `tracing-core` for the life of the process -- so `--log-level error` (or `LOGIT_LOG=off`)
-    // would kill every `warn` before `TelemetryLayer::on_event` ever ran, silently downgrading
-    // `internal: { logs: warn }` to `error` upstream of anywhere the drop could even be counted.
-    // Scoped per layer, the two are independent knobs: `--log-level` is stderr verbosity,
-    // `internal.logs` is what the pipeline captures (`TelemetryLayer::capture_filter`).
+    // `with_filter` on each layer, never a bare `.with(filter)` on the registry. A registry-level
+    // `EnvFilter` is global: `Layered::enabled`/`register_callsite` short-circuit the whole stack
+    // and `tracing-core` caches a `never` verdict per callsite for the process's life, so
+    // `--log-level error` would drop every `warn` before `TelemetryLayer::on_event` ran,
+    // downgrading `internal: { logs: warn }` to `error` uncounted. Per layer, `--log-level` is
+    // stderr verbosity and `internal.logs` is what the pipeline captures.
     let registry = tracing_subscriber::registry()
         .with(telemetry_layer.with_filter(logit_core::TelemetryLayer::capture_filter()));
     match format {
@@ -122,10 +103,9 @@ fn init_logging(
             registry.with(layer).init();
         }
         LogFormat::Json => {
-            // `target` stays displayed here (unlike the text arm): every `logit` event sets it
-            // explicitly to `"logit"`, and it's one of the six fields `--log-format`'s doc
-            // comment promises a collector. `flatten_event` lifts `message`/`component`/`key`
-            // out of the nested `fields` object the JSON formatter otherwise wraps them in.
+            // `target` stays displayed (unlike the text arm): it's one of the six top-level fields
+            // `--log-format` promises a collector. `flatten_event` lifts `message`/`component`/
+            // `key` out of the nested `fields` object the JSON formatter otherwise uses.
             let layer = tracing_subscriber::fmt::layer()
                 .json()
                 .flatten_event(true)
@@ -137,11 +117,10 @@ fn init_logging(
     Ok(())
 }
 
-/// `GET {admin}/readyz` via `hyper_util`'s legacy client (the workspace's `hyper` entry already
-/// carries the `client` feature this needs) -- no `reqwest` in this crate, matching
-/// `docs/plans/operator-surface.md`'s "no new HTTP client dependency" decision. Returns the
-/// status word on `200`, or an error (naming the status code or the connection failure) that
-/// `main` prints and turns into exit 1.
+/// `GET {admin}/readyz`: the status word on `200`, else an error `main` prints and exits 1 on.
+///
+/// Uses `hyper_util`'s legacy client, not `reqwest`: the crate takes no new HTTP client
+/// dependency (docs/plans/operator-surface.md).
 fn check_ready(admin: &str) -> anyhow::Result<String> {
     use http_body_util::BodyExt;
     use hyper_util::client::legacy::Client;
@@ -184,13 +163,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Validate { path } => {
-            // An unset `!env` variable fails here too, so `validate` is a real preflight -- run
-            // it on the host before restarting the service and it catches a missing secret
-            // before `run` would.
+            // An unset `!env` variable fails here too, so `validate` catches a missing secret on
+            // the host before a restart would.
             let config = config::load(&path)?;
-            // Same semantic checks `logit run` makes before spawning anything (empty component
-            // graph, unknown/self-referencing sources, cycles, arity violations, unimplemented
-            // kinds) -- shared so `validate` can't silently pass a config `run` would reject.
+            // The graph checks `run` makes before spawning anything. `build_spec`'s checks (a
+            // syslog `sd_id`, a referenced file) run only under `run` (docs/deploying.md's
+            // "`logit validate` as a preflight").
             pipeline::validate_semantics(config)?;
             println!("{} is valid", path.display());
             Ok(())
@@ -198,8 +176,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run { path } => {
             let telemetry_layer = logit_core::TelemetryLayer::new();
             init_logging(&cli.log_level, cli.log_format, telemetry_layer.clone())?;
-            // Schema/Validate/Graph stay synchronous above -- only Run needs an async runtime, so
-            // only Run pays for building one.
+            // Only `Run` pays for an async runtime.
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -207,26 +184,20 @@ fn main() -> anyhow::Result<()> {
             match runtime.block_on(pipeline::run_pipelines(path, telemetry_layer)) {
                 Ok(()) => Ok(()),
                 Err(err) => {
-                    // `err.exit_code()` -- 1 for a startup failure (same class as a bad config),
-                    // 2 for a runtime failure (the process was ready and then stopped) --
-                    // `docs/deploying.md`'s exit-code table. Reproduces `anyhow`'s own `Error:
-                    // {:?}` formatting by hand (the same override `Command::Graph` above already
-                    // uses `std::process::exit` for) since `main`'s own `Result` would otherwise
-                    // map every error to exit 1.
+                    // 1 for a startup failure, 2 for a runtime failure after the process was ready
+                    // (`docs/deploying.md`'s "Probes and exit codes"). Prints `anyhow`'s `Error:
+                    // {:?}` by hand because returning the error from `main` would exit 1.
                     eprintln!("Error: {:?}", err.error());
                     std::process::exit(err.exit_code());
                 }
             }
         }
         Command::Graph { path } => {
-            // Every `!env` reference must resolve here too, same as `run`/`validate` -- no
-            // lenient mode that renders a config's shape with its secrets left unset
-            // (docs/adr/env-yaml-tag.md's Alternatives).
+            // Every `!env` reference must resolve here too; there's no lenient mode
+            // (docs/adr/env-yaml-tag.md's "Alternatives considered").
             let config = config::load(&path)?;
-            // Print the DOT first, always -- then report validation problems on stderr without
-            // suppressing it. A cyclic or otherwise-broken config is exactly what this command is
-            // most useful for: a cycle is far easier to see rendered than parsed out of an error
-            // message naming two component ids (docs/design/pipeline-graph.md).
+            // DOT first, always, then any validation error on stderr: a cycle is easier to see
+            // rendered than read out of an error naming two component ids.
             println!("{}", dot::render(&config));
             if let Err(err) = pipeline::validate_semantics(config) {
                 eprintln!("warning: {err}");

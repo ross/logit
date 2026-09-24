@@ -1,8 +1,6 @@
-//! `prometheus_out(endpoint) -> prometheus_in(bind)` over real sockets -- the remote-write
-//! counterpart to [`prometheus_round_trip.rs`](prometheus_round_trip.rs), which does the same job
-//! for the scrape/exposition pair. `docs/plans/prometheus-remote-write.md`'s W6 workstream.
-//!
-//! The topology under test is four real components and three real sockets:
+//! `prometheus_out(endpoint) -> prometheus_in(bind)` over real sockets: the remote-write
+//! counterpart to [`prometheus_round_trip.rs`](prometheus_round_trip.rs). Four real components
+//! and three real sockets:
 //!
 //! ```text
 //! canned hyper target  --scrape-->  PrometheusInput
@@ -16,54 +14,35 @@
 //!                                                               ExposeOutput  <--GET-- reqwest
 //! ```
 //!
-//! and the assertion is that the exposition falling out of the right-hand side equals what
-//! `prometheus_round_trip.rs`'s *direct* scrape -> expose pipeline already produces for the same
-//! fixture, modulo the normalizations below. The corpus is deliberately the same ten fixtures and
-//! the same `.expected` files (`tests/fixtures/prometheus/`, described in that file's own module
-//! doc): reusing them is what makes this file a statement about the remote-write *transport*
-//! rather than a second, independently-drifting account of the codec.
+//! The exposition on the right must equal what `prometheus_round_trip.rs`'s direct scrape ->
+//! expose pipeline produces for the same fixture. The corpus is that file's ten fixtures and their
+//! `.expected` files (`tests/fixtures/prometheus/`, described in its module doc), so this file
+//! tests the remote-write transport, not a second account of the codec.
 //!
-//! ## What the remote-write leg adds on top of that file's eleven normalizations
+//! ## What the remote-write hop adds
 //!
-//! Everything `prometheus_round_trip.rs`'s module doc lists still applies -- family/series/label
-//! reordering, float formatting, the synthesized `untyped`, the text-0.0.4 drops, `# EOF`, the
-//! added `instance` label, the `_total` suffix, the cross-dialect type substitution, and the three
-//! synthetic scrape families excluded by name. Putting a remote-write hop in the middle adds
-//! exactly two more, both of them decided in
-//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md) rather than
-//! discovered here:
+//! Everything `prometheus_round_trip.rs` allows still applies. [`canonicalize`] applies two more
+//! to both sides of the comparison, both decided in
+//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md):
 //!
-//! 12. **Explicit sample timestamps are dropped.** The sender always emits a timestamp (the wire
-//!     has no way to omit one, `PrometheusEncoder::with_timestamps_always(true)`), and the
-//!     receiver sets `Event::timestamp` from it but deliberately does **not** set the
-//!     `prometheus.timestamp: true` marker attribute
-//!     (`PrometheusDecoder::with_timestamp_marker(false)`). That marker records a *producer's
-//!     choice* to expose a timestamp on a line, and a transport that mandates one is not that
-//!     choice -- so an exposition of a received request carries unstamped lines, exactly as the
-//!     ADR's "Timestamps" section says it must. [`canonicalize`] clears every series' timestamp on
-//!     **both** sides of the comparison rather than skipping the fixtures that carry one, so the
-//!     values themselves are still compared.
-//! 13. **`_created` does not survive remote-write 1.0.** 1.0's `prometheus.WriteRequest` has no
-//!     created-timestamp field at all -- 2.0 carries it as `Sample.start_timestamp` (field 3),
-//!     which is why the same fixtures are byte-identical on `version: 2`. [`canonicalize`] drops
-//!     `Series::created` from both sides for [`Version::V1`] only, so the 2.0 runs still prove the
-//!     round trip preserves it.
+//! - **Explicit sample timestamps are dropped.** The sender always writes one
+//!   (`PrometheusEncoder::with_timestamps_always(true)`), but the receiver never sets the
+//!   `prometheus.timestamp` marker (`PrometheusDecoder::with_timestamp_marker(false)`): a
+//!   transport that mandates a timestamp isn't a producer choosing to expose one (the ADR's
+//!   "Timestamps: received without the marker, sent always" section). Clearing timestamps on both
+//!   sides keeps the fixtures that carry one in the sweep, with their values still compared.
+//! - **`_created` doesn't survive 1.0**, whose `WriteRequest` has no field for it; 2.0 carries it
+//!   as `Sample.start_timestamp`. It's cleared for [`Version::V1`] only, so the 2.0 run proves it
+//!   survives.
 //!
-//! Nothing else diverges, and that is the point of asserting on the whole rendered body rather
-//! than on a handful of `contains` probes: `# HELP`, `# UNIT`, family types (`info`, `stateset`,
-//! `gaugehistogram`, `unknown` included), label sets, exemplars with their trace/span references,
-//! histogram buckets and summary quantiles all cross both wire versions unchanged, and a
-//! regression in any of them fails one of the twenty cases below with a readable diff.
+//! Nothing else diverges: `# HELP`, `# UNIT`, every family type, label sets, exemplars with their
+//! trace/span references, buckets, and quantiles all cross both wire versions. Asserting on the
+//! whole body turns a regression in any of them into a readable diff.
 //!
-//! ## The rest of the file
-//!
-//! Beyond the corpus sweep: a `statsd_in -> aggregate(cumulative) -> prometheus_out(endpoint)`
-//! pipeline (the ADR's "Temporality is `aggregate`'s job" worked example, pushed over the wire
-//! instead of exposed in place); a stale marker; an exemplar; the metadata cache typing a
-//! sample-only 1.0 request off a metadata-only one that preceded it; and the backpressure
-//! ordering the ADR's response table promises -- the batch reaches the `Fanout` *before* the `204`
-//! is built, so a stalled downstream throttles the sender rather than being dropped behind an
-//! early acknowledgement.
+//! The rest of the file covers a `statsd_in -> aggregate(cumulative) -> prometheus_out(endpoint)`
+//! pipeline, a stale marker, an exemplar, the metadata cache typing a samples-only 1.0 request
+//! from an earlier metadata-only one, and the backpressure ordering the ADR's response table
+//! promises.
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -106,27 +85,25 @@ fn read_fixture_str(name: &str, ext: &str) -> String {
     String::from_utf8(read_fixture(name, ext)).expect("fixture must be utf-8")
 }
 
-/// The three families `prometheus_in`'s scrape mode always synthesizes -- excluded from every
-/// comparison here by name, exactly as `prometheus_round_trip.rs` excludes them (its normalization
-/// 11). They ride the remote-write leg like any other series; they are simply not what this file
-/// is asserting about.
+/// The three families `prometheus_in`'s scrape mode always synthesizes. They cross the hop like
+/// any other series; every comparison here excludes them by name, as `prometheus_round_trip.rs`
+/// does.
 const SYNTHETIC_FAMILIES: [&str; 3] = ["up", "scrape_duration_seconds", "scrape_samples_scraped"];
 
-/// Reparses an exposition body, applies the module doc's normalizations 11, 12 and 13, and
-/// re-renders it. Applied identically to the *actual* body and to the `.expected` fixture, so the
-/// comparison is still byte-for-byte over everything a remote-write hop does not touch -- rather
-/// than the fixture being edited to match a run, or whole fixtures being skipped because one line
-/// of them carries a timestamp.
+/// Reparses an exposition body, drops the synthetic families, applies the module doc's two
+/// remote-write normalizations, and re-renders. Applied identically to the actual body and the
+/// `.expected` fixture, so the comparison stays byte for byte over everything the hop doesn't
+/// touch.
 fn canonicalize(body: &str, dialect: Dialect, version: Version) -> String {
     let mut families = text::parse(body.as_bytes(), dialect)
         .unwrap_or_else(|e| panic!("a prometheus exposition body must parse: {e}\nbody:\n{body}"));
     families.retain(|family| !SYNTHETIC_FAMILIES.contains(&family.name.as_str()));
     for family in &mut families {
         for series in &mut family.series {
-            // 12: the receiver never sets the `prometheus.timestamp` marker, so no line an
-            // exposition of a received request writes carries one.
+            // The receiver never sets the `prometheus.timestamp` marker, so an exposition of a
+            // received request writes no line timestamps.
             series.timestamp = None;
-            // 13: 1.0 has no created-timestamp field to carry it in.
+            // 1.0 has no created-timestamp field.
             if version == Version::V1 {
                 series.created = None;
             }
@@ -164,10 +141,8 @@ fn accept_of(ext: &str) -> &'static str {
 // Real components, real sockets
 // -------------------------------------------------------------------------------------------------
 
-/// What a canned connection serves: one fixed body under one fixed `Content-Type`, forever -- the
-/// scraped target the corpus sweep pretends to be. The same helper `prometheus_round_trip.rs`
-/// carries, duplicated rather than shared for the reason that file's own module doc gives for
-/// these round-trip tests living in `logit-cli` at all.
+/// A scrape target serving one fixed body under one fixed `Content-Type` on every request; a copy
+/// of `prometheus_round_trip.rs`'s helper.
 async fn canned_server(body: Bytes, content_type: &'static str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -197,8 +172,7 @@ async fn canned_server(body: Bytes, content_type: &'static str) -> SocketAddr {
     addr
 }
 
-/// A plain `reqwest` client with gzip transparently disabled -- a gzipped body should arrive
-/// exactly as `prometheus_out` wrote it, not silently inflated by the client.
+/// A `reqwest` client with gzip decoding off, so a body arrives as `prometheus_out` wrote it.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder().no_gzip().build().expect("a default client always builds")
 }
@@ -232,8 +206,8 @@ fn remote_write_sender(receiver_addr: SocketAddr, version: Version) -> RemoteWri
     RemoteWriteOutput::new(format!("http://{receiver_addr}{WRITE_PATH}")).with_version(version)
 }
 
-/// Scrapes `target_addr` with a real, bound [`PrometheusInput`] on a very short interval and
-/// returns the one `EventBatch` it forwards through a bare [`Fanout`].
+/// Scrapes `target_addr` with a bound [`PrometheusInput`] on a 20ms interval and returns the
+/// first batch it forwards.
 async fn scrape_once(target_addr: SocketAddr) -> EventBatch {
     let mut input = PrometheusInput::new(
         vec![format!("http://{target_addr}/metrics")],
@@ -245,8 +219,8 @@ async fn scrape_once(target_addr: SocketAddr) -> EventBatch {
         let _ = input.run(sink).await;
     });
 
-    // `PrometheusInput::run` swallows its first (immediate) tick, so the first real scrape lands
-    // after one full `interval` -- a generous timeout well past that single 20ms wait.
+    // `PrometheusInput::run` skips its immediate first tick, so the first scrape lands one full
+    // `interval` in; the 2s timeout is well past that.
     let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("prometheus_in should scrape and forward a batch")
@@ -297,11 +271,10 @@ async fn expose_and_fetch(batches: &[EventBatch], accept: &str) -> String {
 // The corpus sweep: scrape -> remote-write -> expose, both wire versions
 // -------------------------------------------------------------------------------------------------
 
-/// `(fixture name, input dialect, requested output dialect)` -- exactly
-/// `prometheus_round_trip.rs`'s ten cases, in the order that file declares them. Table-driven
-/// rather than twenty `#[tokio::test]`s: the same ten cases run twice, once per wire version, and
-/// `crates/logit-inputs/src/collectd.rs`'s own `ALL_FIXTURES` sweep is the precedent for a corpus
-/// loop naming its case in the assertion message.
+/// `(fixture, input dialect, output dialect)`: `prometheus_round_trip.rs`'s ten cases, in its
+/// order. One table-driven test per wire version rather than twenty `#[tokio::test]`s, with the
+/// case named in the assertion message, as `crates/logit-inputs/src/collectd.rs`'s
+/// `INTEROP_FIXTURES` sweep does.
 const CASES: [(&str, &str, &str); 10] = [
     ("counter_no_total", "text", "text"),
     ("counter_created", "om", "om"),
@@ -332,9 +305,8 @@ async fn assert_fixture_round_trips(name: &str, in_ext: &str, out_ext: &str, ver
     let received = collect_batches(&mut rx, 1).await;
 
     let raw = expose_and_fetch(&received, accept_of(out_ext)).await;
-    // The scraped target's real ephemeral `instance` value becomes the placeholder the fixtures
-    // carry (`prometheus_round_trip.rs`'s normalization 8), applied to the *actual* body before
-    // canonicalizing -- never to the fixture.
+    // The target's ephemeral `instance` value becomes the fixtures' `{port}` placeholder, in the
+    // actual body only.
     let actual = canonicalize(
         &raw.replace(&target_addr.to_string(), "{port}"),
         dialect_of(out_ext),
@@ -362,11 +334,8 @@ async fn every_fixture_round_trips_over_remote_write_2_0() {
     }
 }
 
-/// 2.0 carries the created timestamp per sample (`Sample.start_timestamp`), so a counter's
-/// `_created` line survives the wire -- the half of module-doc normalization 13 that is *not* a
-/// normalization. Asserted directly rather than left implicit in the sweep above, because the
-/// sweep's `canonicalize` keeps `created` on 2.0 only by not dropping it, which is easy to break
-/// silently.
+/// 2.0 carries `_created` as `Sample.start_timestamp`. Asserted directly because the sweep keeps
+/// `created` on 2.0 only by [`canonicalize`] not clearing it, which is easy to break unnoticed.
 #[tokio::test]
 async fn remote_write_2_0_preserves_a_created_timestamp() {
     let target_addr =
@@ -386,10 +355,8 @@ async fn remote_write_2_0_preserves_a_created_timestamp() {
     );
 }
 
-/// An OpenMetrics bucket exemplar -- labels, value, and (in `full_openmetrics`) a real trace/span
-/// reference -- crosses the wire and comes back out on the exposition. The sweep asserts this as
-/// part of whole-body equality; this names it, so a regression reads as "the exemplar was lost"
-/// rather than as a diff in one of ten fixtures.
+/// `full_openmetrics`'s counter exemplar, trace/span reference included, crosses both wire
+/// versions. The sweep covers it too; this test makes the failure read as "the exemplar was lost".
 #[tokio::test]
 async fn an_exemplar_with_a_trace_reference_survives_the_wire() {
     for version in [Version::V1, Version::V2] {
@@ -419,15 +386,14 @@ async fn an_exemplar_with_a_trace_reference_survives_the_wire() {
 // Pipeline cases: real components, no fixtures
 // -------------------------------------------------------------------------------------------------
 
-/// `statsd_in -> aggregate(temporality: cumulative) -> prometheus_out(endpoint)`: the ADR's
-/// "Temporality is `aggregate`'s job" worked example with the exposition replaced by a real
-/// remote-write hop. Two `hits:1|c` datagrams absorb into one cumulative counter, which crosses
-/// the wire and renders as `hits_total 2` on the far side.
+/// `statsd_in -> aggregate(temporality: cumulative) -> prometheus_out(endpoint)`: ADR
+/// `prometheus-scrape-and-exposition`'s "Temporality is `aggregate`'s job" example with a
+/// remote-write hop in place of the exposition. Two `hits:1|c` datagrams arrive as
+/// `hits_total 2`.
 #[tokio::test]
 async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_the_wire() {
-    // Bind-drop-rebind: `StatsdInput` exposes no `local_addr()` accessor (its `UdpListener` is
-    // private), so an ephemeral port is reserved with a throwaway socket first -- the same idiom
-    // `prometheus_round_trip.rs`'s own statsd case uses.
+    // Reserves an ephemeral port by bind-drop-rebind, as `prometheus_round_trip.rs`'s statsd case
+    // does. `StatsdInput::local_addr` after `bind()` would avoid the race.
     let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = probe.local_addr().unwrap();
     drop(probe);
@@ -448,9 +414,8 @@ async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_th
         .with_temporality(AggregateTemporality::Cumulative)
         .with_series_retention(5, 10_000);
 
-    // `UdpListenerConfig::default`'s `batch_flush_interval` may coalesce both datagrams into one
-    // batch, so this collects *events* until both increments have arrived rather than assuming a
-    // 1:1 batch:datagram correspondence.
+    // The default `batch_flush_interval` may coalesce both datagrams into one batch, so this
+    // counts events, not batches.
     let mut absorbed_events = 0;
     while absorbed_events < 2 {
         let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -491,11 +456,10 @@ async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_th
     );
 }
 
-/// A stale marker end to end: a `Gauge` carrying `FLAG_NO_RECORDED_VALUE` leaves the sender as
-/// Prometheus's stale NaN (`PrometheusEncoder::with_stale_markers(true)`, which
-/// `RemoteWriteOutput` sets unconditionally) and arrives at the receiver as the same flag on the
-/// same series -- the ADR's "Stale markers <-> `FLAG_NO_RECORDED_VALUE`" section, over a socket.
-/// Both wire versions, since the marker is a sample *value* and therefore version-independent.
+/// A `Gauge` flagged `FLAG_NO_RECORDED_VALUE` leaves the sender as Prometheus's stale NaN
+/// (`RemoteWriteOutput` always sets `with_stale_markers(true)`) and decodes back to the same flag,
+/// per the ADR's "Stale markers ↔ `FLAG_NO_RECORDED_VALUE`" section. Both wire versions, since
+/// the marker is a sample value.
 #[tokio::test]
 async fn a_stale_marker_crosses_the_wire_as_no_recorded_value() {
     for version in [Version::V1, Version::V2] {
@@ -533,11 +497,10 @@ async fn a_stale_marker_crosses_the_wire_as_no_recorded_value() {
 // The metadata cache, over the wire
 // -------------------------------------------------------------------------------------------------
 
-/// Snappy-block-compresses `body` and `POST`s it to a receiver as remote-write 1.0, returning the
-/// response status. Hand-built rather than routed through [`RemoteWriteOutput`] because the two
-/// requests this exercises -- a metadata-only one and a samples-only one -- are shapes *only* a
-/// real Prometheus 1.0 sender produces: `logit`'s own sender always attaches `metadata[]` to the
-/// samples it describes, which is exactly the case the cache is not needed for.
+/// Snappy-compresses `request` and `POST`s it as remote-write 1.0, returning the status.
+/// Hand-built because a metadata-only request and a samples-only request are shapes only a real
+/// Prometheus 1.0 sender produces: `logit`'s sender always attaches `metadata[]` to the samples it
+/// describes, the case that needs no cache.
 async fn post_v1(receiver_addr: SocketAddr, request: &pb1::WriteRequest) -> reqwest::StatusCode {
     let compressed = snap::raw::Encoder::new()
         .compress_vec(&request.encode_to_vec())
@@ -580,9 +543,8 @@ fn latency_seconds_metadata_request() -> pb1::WriteRequest {
     }
 }
 
-/// The flat samples one scrape of that histogram produces, and nothing else -- one shared builder
-/// so the cache test and its no-cache control are demonstrably the same bytes, rather than two
-/// similar-looking literals.
+/// The flat samples one scrape of that histogram produces, and nothing else. One builder, so the
+/// cache test and its control send the same bytes.
 fn latency_seconds_samples_request() -> pb1::WriteRequest {
     pb1::WriteRequest {
         timeseries: vec![
@@ -602,23 +564,21 @@ fn latency_seconds_samples_request() -> pb1::WriteRequest {
     }
 }
 
-/// The W5 metadata cache doing the one job it exists for: a real Prometheus 1.0 sender ships
-/// `MetricMetadata` in requests of its own (`metadata_config.send_interval`, a minute by default)
-/// rather than attached to the samples it describes, so the sample-only requests that follow carry
-/// no `# TYPE` equivalent anywhere. Stateless, they decode as three unrelated `Unknown` series;
-/// against the cache they reassemble into the one `Histogram` the sender meant.
+/// A real Prometheus 1.0 sender ships `MetricMetadata` in requests of its own
+/// (`metadata_config.send_interval`, a minute by default), so the samples-only requests after it
+/// carry no type. Stateless, they decode as three unrelated untyped series; against the cache they
+/// reassemble into the one `Histogram` the sender meant.
 #[tokio::test]
 async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
     let (receiver_addr, mut rx) =
         start_receiver(16, Some((10_000, Duration::from_secs(600)))).await;
 
-    // Request one: metadata, no series at all -- Prometheus's own `metadata_config` request.
+    // Metadata only, no series.
     assert_eq!(post_v1(receiver_addr, &latency_seconds_metadata_request()).await, 204);
-    // Request two: the flat samples one scrape of that histogram produces, and nothing else.
+    // The histogram's flat samples only.
     assert_eq!(post_v1(receiver_addr, &latency_seconds_samples_request()).await, 204);
 
-    // The metadata-only request declares a family and carries no group, so it produces no events
-    // at all -- only the samples request delivers a batch.
+    // The metadata-only request produces no events, so only the samples request delivers a batch.
     let received = collect_batches(&mut rx, 1).await;
     let records: Vec<&MetricRecord> = received
         .iter()
@@ -638,17 +598,13 @@ async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
     assert_eq!(logit_core::interner::resolve(records[0].name), "latency_seconds");
 }
 
-/// **Exactly** the two requests above against a receiver with no cache at all, so the difference
-/// the cache makes is asserted rather than assumed. `start_receiver`'s `None` is what an operator
-/// spells `metadata_cache: {max_families: 0}`: `PrometheusReceiver::with_metadata_cache` turns a
-/// zero cap into no table rather than an empty one, so the two are the same receiver and this is
-/// the control for [`a_metadata_only_1_0_request_types_the_samples_that_follow_it`], not a
-/// near-miss.
+/// The control for [`a_metadata_only_1_0_request_types_the_samples_that_follow_it`]: the same two
+/// requests against a receiver with no cache. `None` is the same receiver an operator's
+/// `metadata_cache: {max_families: 0}` builds, since `PrometheusReceiver::with_metadata_cache`
+/// treats a zero cap as no table.
 ///
-/// Stateless, the three flat series stay three unrelated untyped records -- and **all three**
-/// arrive. What the cache buys is typing, never samples: the request is not lossier without it,
-/// only flatter (`crates/logit-proto/src/prometheus/assemble.rs`'s "Only a declared base claims a
-/// suffix").
+/// All three flat series still arrive, untyped: the cache buys typing, never samples
+/// (`crates/logit-proto/src/prometheus/assemble.rs`'s "Only a declared base claims a suffix").
 #[tokio::test]
 async fn without_the_cache_the_same_samples_stay_three_untyped_series() {
     let (receiver_addr, mut rx) = start_receiver(16, None).await;
@@ -688,13 +644,11 @@ async fn without_the_cache_the_same_samples_stay_three_untyped_series() {
 // Backpressure
 // -------------------------------------------------------------------------------------------------
 
-/// The ADR's response table promises the batch reaches the `Fanout` **before** the `204` is built,
-/// so a stalled downstream throttles the sender instead of being acknowledged and dropped. With a
-/// one-slot channel that nothing is reading, the second `send` cannot complete; once the queue is
-/// drained it completes, and exactly the two batches that were written arrive -- no duplicate from
-/// a sink-level retry, because the sink does not retry (one `send` is one attempt; retry is
-/// `write_loop`'s job, and this test is what makes "does not duplicate" a fact about the sink
-/// rather than an assumption).
+/// The ADR's response table promises the batch reaches the `Fanout` before the `204` is built, so
+/// a stalled downstream throttles the sender instead of being acknowledged and dropped. With a
+/// one-slot channel nothing reads, the second `send` waits until the queue drains, and then the
+/// two written batches arrive once each: the sink never retries (that's `write_loop`'s job), so a
+/// delayed `204` can't duplicate a write.
 #[tokio::test]
 async fn a_stalled_downstream_delays_the_204_without_duplicating_a_write() {
     let (receiver_addr, mut rx) = start_receiver(1, None).await;
@@ -736,8 +690,7 @@ async fn a_stalled_downstream_delays_the_204_without_duplicating_a_write() {
         .collect();
     assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
 
-    // Nothing more: a delayed acknowledgement is not a failed one, so the sink neither retried nor
-    // re-sent anything.
+    // A delayed acknowledgement isn't a failed one, so nothing was re-sent.
     assert!(
         tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
         "a delayed 204 must not produce a duplicate write"

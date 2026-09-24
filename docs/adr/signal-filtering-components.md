@@ -77,7 +77,7 @@ sends nothing downstream (`crates/logit-pipeline/src/runtime.rs`'s `process_batc
 change was needed for this; these are simply the first native transforms to return `None` for a
 reason other than `aggregate`'s accumulation.
 
-**Config validation (rule 19, `logit-pipeline::graph::resolve`).** An empty `signals:` list is
+**Config validation (rule 21, `logit-pipeline::graph::resolve`).** An empty `signals:` list is
 rejected on all three — the same silent-black-hole failure rule 7 already guards against elsewhere.
 `keep_signals`/`drop_signals` additionally reject naming all three signals. Which shape is the
 black hole and which is the no-op is *opposite* between the two: `keep_signals` (an allowlist)

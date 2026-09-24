@@ -2,9 +2,8 @@
 //! (a [`NodeSpec`]) into running tasks/threads, wired together with per-component [`Fanout`]s.
 //! See `docs/design/pipeline-graph.md`'s "Runtime model" and "Thread model" sections.
 //!
-//! Every component gets one inbox channel, created up front for the whole graph before any node
-//! is spawned, so spawning needs no dependency ordering: a `Fanout` is just cloned `Sender`s into
-//! inboxes that already exist by construction, regardless of which node gets spawned first.
+//! Every component's inbox channel is created before any node is spawned, so spawn order doesn't
+//! matter: a `Fanout` is cloned `Sender`s into inboxes that already exist.
 
 use crate::fanout::{BatchContext, Delivered, TraceContext};
 use crate::graph::{Graph, Role};
@@ -26,82 +25,62 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 /// How long permanent (`Fault::Permanent`) send failures may repeat, with no intervening
-/// successful delivery, before `write_loop` gives up and returns `Err` -- ending `run_output` and
-/// therefore the whole pipeline, exactly as an unclassified failure did before this workstream. A
-/// genuinely misconfigured sink (bad token, bad bucket) still fails loudly enough for a
-/// restart-policy supervisor to notice; one malformed batch cannot kill an otherwise-healthy
-/// pipeline. Fixed, not config-exposed -- workstream F's `logit_config::BufferConfig` deliberately
-/// does not surface this window; revisit if a real deployment ever needs to tune it.
-/// See `docs/adr/buffered-sink-delivery.md`'s "Failure handling" section.
+/// successful delivery, before `write_loop` returns `Err`, ending `run_output` and the whole
+/// pipeline. A misconfigured sink (bad token, bad bucket) still fails loudly enough for a
+/// restart-policy supervisor to notice; one malformed batch can't kill a healthy pipeline. Not
+/// config-exposed: `logit_config::BufferConfig` doesn't surface it. See
+/// `docs/adr/buffered-sink-delivery.md`'s "Failure handling" section.
 const PERMANENT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Bounded channel capacity between two graph nodes. Small and arbitrary -- just enough to smooth
-/// out bursts without unbounded memory growth; revisit with real numbers once there's a reason to.
+/// Bounded channel capacity between two graph nodes. Small and arbitrary: enough to smooth bursts
+/// without unbounded memory growth. Not tuned against measurements.
 const CHANNEL_CAPACITY: usize = 64;
 
-/// One component's built implementation, keyed by id and handed to [`run`]. Which variant a
-/// `ComponentKind` becomes is the registry's job (`logit-cli`), not this crate's -- this crate
-/// only knows how to *run* each variant once built.
+/// One component's built implementation, keyed by id and handed to [`run`]. The registry
+/// (`logit-cli`) decides which variant a `ComponentKind` becomes; this crate only runs it.
 pub enum NodeSpec {
-    /// `InputRuntimeConfig` mirrors `Output`'s own runtime knobs below: production call sites
-    /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the listener's `receive:`
-    /// block (`docs/adr/decoupled-listener-io.md`) through `input_runtime_config`, which every one
-    /// of them goes through -- so a listener whose config omits `receive:` gets
-    /// `ReceiveConfig::default()`'s **5 s**, not this struct's own `Duration::ZERO`.
-    /// `InputRuntimeConfig::default()` is reached only from tests, which use it (and other short
-    /// graces) to keep a shutdown test fast. The distinction matters: at `Duration::ZERO` the
-    /// backstop arm in `run_input` is ready the instant shutdown fires, so `select!`'s random
-    /// rotation cancels the listener by drop roughly half the time -- which is exactly the
-    /// cancel-by-drop-immediately behaviour ADR `service-lifecycle-and-output-retry` started
-    /// from, and exactly what production's 5 s exists to avoid.
+    /// A listener and its runtime knobs. Production call sites derive `shutdown_grace` from the
+    /// listener's `receive:` block through `logit-cli`'s `input_runtime_config`, so a config
+    /// that omits `receive:` gets `ReceiveConfig::default()`'s 5 s, not
+    /// `InputRuntimeConfig::default()`'s `Duration::ZERO`, which only tests reach. The
+    /// difference matters: at `ZERO` the backstop arm in `run_input` is ready the instant
+    /// shutdown fires, so `select!`'s random rotation cancels the listener by drop about half
+    /// the time. See `docs/adr/decoupled-listener-io.md`.
     Input(Box<dyn Input + Send>, InputRuntimeConfig),
-    /// The sink's own queue -- in memory or disk-backed (see `queue.rs`'s `SinkStoreConfig`) --
-    /// plus its retry budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production
-    /// call sites (`logit-cli::pipeline::build_spec`) build these from the component's own
-    /// `logit_config::BufferConfig` (`queue_config`/`write_config` there), defaulting to
-    /// `SinkStoreConfig::Memory(SinkQueueConfig::default())`/`WriteLoopConfig::default()` only
-    /// when a config omits its `buffer:` block; a test can pass whatever config it needs to
-    /// exercise (e.g. a tiny `max_batches` to force overflow behavior deterministically, or a
-    /// short `total_budget`/`shutdown_grace` to keep a retry/shutdown test fast).
+    /// The sink, its queue (in memory or disk-backed; see `SinkStoreConfig`), and its retry
+    /// budget and shutdown grace (`WriteLoopConfig`). Production builds these from the
+    /// component's `buffer:` block, falling back to the defaults when it's omitted.
     Output(Box<dyn Output + Send>, SinkStoreConfig, WriteLoopConfig),
     Transform(Box<dyn Transform + Send>),
-    /// A [`Router`] node (`docs/adr/target-components.md`): directs each event to one destination
-    /// -- this component's own outbound `Fanout` ([`Destination::Forward`]) or one of the
-    /// slot-ordered target `Fanout`s the runtime clones in for it from
-    /// `ResolvedComponent::targets`. `logit-transforms::Route` (W4) and, later, a `lua`/`lua_file`
-    /// component with `targets:` (W5) are what the registry builds into this.
+    /// A [`Router`] node (`docs/adr/target-components.md`): directs each event to its own
+    /// outbound `Fanout` ([`Destination::Forward`]) or to one of the slot-ordered target
+    /// `Fanout`s the runtime clones in from `ResolvedComponent::targets`.
     Router(Box<dyn Router + Send>),
     /// A `target`: nothing is spawned for it, and it holds nothing.
     ///
-    /// It exists as a variant purely so the registry stays *one spec per component*
-    /// (`logit-cli::pipeline::build_spec` returns a `NodeSpec` for every id in the graph, and a
-    /// missing one is a startup error) -- a target is a zero-cost alias, not a node: no task, no
-    /// inbox, no channel. Everything that would have been "its" behaviour is the one `Fanout`
-    /// [`run_with_telemetry`]'s pre-spawn pass builds under the target's own id and clones into
-    /// each of its routers. See `docs/adr/target-components.md`'s "Runtime: a target is a
-    /// zero-cost alias".
+    /// The variant exists so the registry stays one spec per component (a missing spec is a
+    /// startup error). A target is a zero-cost alias, not a node: no task, no inbox, no channel.
+    /// Its behavior is the one `Fanout` [`run_with_telemetry`]'s pre-spawn pass builds under the
+    /// target's id and clones into each of its routers. See `docs/adr/target-components.md`'s
+    /// "Runtime: a target is a zero-cost alias".
     Target,
-    /// Built here, not by the caller: `ScriptWorker` is `!Send` (`docs/design/lua-api.md`'s
-    /// concurrency section), so it can't be constructed anywhere but the dedicated thread it
-    /// will live on. Carries no `targets` of its own: the Lua spawn arm resolves both the VM's
-    /// name -> slot table and its target `Fanout`s from `ResolvedComponent::targets`, exactly as
-    /// the `Router` arm resolves its own -- one source of slot order, not two.
+    /// Built on its own thread, not by the caller: `ScriptWorker` is `!Send`
+    /// (`docs/design/lua-api.md`'s concurrency section). Carries no `targets`: the Lua spawn arm
+    /// resolves both the VM's name -> slot table and its target `Fanout`s from
+    /// `ResolvedComponent::targets`, as the `Router` arm does, so slot order has one source.
     Lua {
         script: String,
         interval: Option<Duration>,
     },
 }
 
-/// Why the pipeline stopped, at exactly the granularity `logit`'s exit-code table needs
-/// (`docs/deploying.md`): a startup failure is the operator's own config/environment (exit 1,
-/// same class as a schema error); a runtime failure happened to a process that had already
-/// reported `Ready` (exit 2 -- "this was working and stopped").
+/// Why the pipeline stopped, at the granularity `logit`'s exit-code table needs
+/// (`docs/deploying.md`): a startup failure is the operator's config or environment (exit 1); a
+/// runtime failure happened after the process reported `Ready` (exit 2).
 ///
-/// Deliberately does **not** implement `std::error::Error`. That would give `?`-into-`anyhow` for
-/// free via anyhow's blanket `From`, but at the cost of nesting: `{:?}` would then print this
-/// wrapper's own `Debug` above the inner error's own context chain, changing every message this
-/// crate's tests already assert on. A caller that wants the original `anyhow::Error` back --
-/// unwrapped, byte for byte -- calls [`RunError::into_inner`].
+/// Doesn't implement `std::error::Error`: anyhow's blanket `From` would then nest this wrapper's
+/// `Debug` above the inner error's context chain, changing every message the tests assert on.
+/// [`RunError::into_inner`] returns the original `anyhow::Error` unwrapped.
 #[derive(Debug)]
 pub enum RunError {
     Startup(anyhow::Error),
@@ -109,8 +88,7 @@ pub enum RunError {
 }
 
 impl RunError {
-    /// `1` or `2` -- `0` (clean exit) and `130` (the second-signal kill) are `main`'s and the
-    /// kill switch's own, not this type's.
+    /// `1` or `2`. `0` (clean exit) and `130` (the second-signal kill) belong to `main`.
     pub fn exit_code(&self) -> i32 {
         match self {
             RunError::Startup(_) => 1,
@@ -144,16 +122,13 @@ pub async fn run(graph: Graph, specs: HashMap<String, NodeSpec>) -> anyhow::Resu
     run_with_shutdown(graph, specs, std::future::pending()).await
 }
 
-/// Same as [`run`], but resolving `shutdown` closes every listener's inbound channel *normally*
-/// instead of the process just dying -- which is enough to trigger the existing close-time flush
-/// cascade (a node flushes once when its own inbox closes, `run_transform`/`run_lua` below), with
-/// no change needed to any `Input` implementation.
+/// Same as [`run`], but resolving `shutdown` stops every listener so its downstream inboxes close
+/// normally, which triggers the close-time flush cascade (a node flushes once when its inbox
+/// closes; see `run_transform`/`run_lua`). No `Input` implementation needs to know about it.
 ///
-/// The mechanism: `Input::run` takes its `Fanout` by value, so racing `input.run(fanout)` against
-/// `shutdown` and letting `shutdown` win *drops* that future -- and with it, the last `Fanout` (and
-/// therefore the last `Sender`) into every one of that listener's downstream inboxes. Those inboxes
-/// then observe every sender gone and close, exactly as they do today when a listener returns
-/// `Ok(())` on its own (`FiniteInput` in this module's tests proves that cascade already works).
+/// The mechanism: `Input::run` takes its `Fanout` by value, so when a listener returns or its
+/// future is dropped, the last `Sender` into each downstream inbox goes with it, and those inboxes
+/// close. The `FiniteInput` tests prove the cascade.
 pub async fn run_with_shutdown(
     graph: Graph,
     specs: HashMap<String, NodeSpec>,
@@ -164,17 +139,13 @@ pub async fn run_with_shutdown(
         .map_err(RunError::into_inner)
 }
 
-/// Same as [`run_with_shutdown`], but with a per-component [`Telemetry`] handle attached to every
-/// node -- `run`/`run_with_shutdown` are thin wrappers over this with an empty map, which is what
-/// makes them (and every existing caller and test) cost nothing new: a component with no entry
-/// gets [`Telemetry::default`], the disabled handle, same as if this function never existed. Built
-/// by `logit-cli::pipeline::prepare` only when a config's `internal` component asks for a live
-/// `Registry` (`docs/design/internal-telemetry.md`).
+/// Same as [`run_with_shutdown`], with a per-component [`Telemetry`] handle and a [`Readiness`]
+/// handle. A component with no `telemetry` entry gets [`Telemetry::default`], the disabled handle;
+/// `run`/`run_with_shutdown` pass an empty map and [`Readiness::disabled()`]. See
+/// `docs/design/internal-telemetry.md`.
 ///
-/// `readiness` is the [`Readiness`] handle every input's [`Input::bind`] and every node's spawn
-/// updates -- pass [`Readiness::disabled()`] (what `run`/`run_with_shutdown` do) when nobody's
-/// watching. Returns [`RunError`] rather than a bare `anyhow::Error` so a caller (`logit-cli`) can
-/// tell a startup failure from a runtime one without parsing a message.
+/// Returns [`RunError`] so a caller can tell a startup failure from a runtime one without parsing
+/// a message.
 pub async fn run_with_telemetry(
     graph: Graph,
     mut specs: HashMap<String, NodeSpec>,
@@ -182,70 +153,47 @@ pub async fn run_with_telemetry(
     readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), RunError> {
-    // Sorted, not raw `HashMap` iteration order: a startup failure (an unbindable port, a bad
-    // Lua script) should name the same component every time, not whichever the hash seed reached
-    // first -- the same reproducibility argument `logit-cli::pipeline::prepare` already makes for
-    // build order. `readiness.begin` hands out the complete, ordered component list before
-    // anything is bound, so a probe arriving mid-startup already sees every id.
+    // Sorted so a startup failure (an unbindable port, a bad Lua script) names the same component
+    // every time. `readiness.begin` publishes the full ordered id list before anything binds, so
+    // a probe arriving mid-startup sees every id.
     //
-    // Ahead of the shutdown driver's `tokio::spawn` below, not after it: that task's first act
-    // once `shutdown` resolves is `readiness.draining()`, and a caller handing this function an
-    // already-resolved `shutdown` (`std::future::ready(())`, a pre-fired oneshot) can have it run
-    // before this line -- there is no `.await` on this path between the spawn and here to make
-    // the ordering anything but a race. Seeding here makes `begin` provably the first write on
-    // this signal rather than racily the first one, matching its own doc comment ("called once,
-    // before the first bind").
+    // `begin` must run before the shutdown driver is spawned: that task's first act is
+    // `readiness.draining()`, and an already-resolved `shutdown` (`std::future::ready(())`) could
+    // run it before this line, since no `.await` separates the spawn from here.
     let mut ids: Vec<String> = graph.components.keys().cloned().collect();
     ids.sort();
     readiness.begin(&ids);
 
-    // A `watch` (not a `oneshot`) because every listener needs its own clone of the receiver, and
-    // `watch::Receiver` is `Clone` where `oneshot::Receiver` is not. Driven from a spawned task
-    // rather than shared directly so this function doesn't need to name `shutdown`'s own type in
-    // more than one place.
+    // A `watch`, not a `oneshot`, because every listener needs its own receiver clone.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // Cloned before the move below so the join loop still has a handle to trigger shutdown on
-    // the first task error -- see the loop's own comment further down. `watch::Sender::send` is
-    // idempotent (it just overwrites the latest value and notifies watchers), so it's harmless if
-    // both this clone and `shutdown_tx_for_driver` (via `shutdown` resolving on its own, e.g. a
-    // real SIGTERM under `run_with_shutdown`) end up calling `send(true)`.
+    // The join loop keeps `shutdown_tx` to trigger shutdown on the first task error. Both may
+    // `send(true)`; `watch::Sender::send` is idempotent.
     let shutdown_tx_for_driver = shutdown_tx.clone();
-    // Set once, by whichever of this task or the join loop's first-error branch below notices
-    // shutdown first -- `OnceLock::set` is a no-op once already set, the same idempotency
-    // `shutdown_tx`'s own `send(true)` already relies on. Read back at the very end to log how
-    // long the drain actually took (`docs/plans/operator-surface.md`'s `drain complete` event).
+    // Set by whichever of the driver or the join loop's first-error branch starts the drain
+    // first (`OnceLock::set` ignores later calls); read at the end for the `drain complete` log.
     let drain_started: Arc<std::sync::OnceLock<tokio::time::Instant>> = Arc::default();
     let drain_started_for_driver = drain_started.clone();
     let readiness_for_driver = readiness.clone();
     let shutdown_driver = tokio::spawn(async move {
         shutdown.await;
         tracing::info!(target: "logit", "shutdown signal received");
-        // Flipped *before* the nodes are told (the `send(true)` below), so an orchestrator polling
-        // `/readyz` stops routing to this pod at the instant the signal arrives, not partway
-        // through the drain -- `docs/plans/operator-surface.md`'s "the constraint everything is
-        // designed around". A no-op if a node has already failed (`Readiness::draining`'s own
-        // doc comment): a real SIGTERM arriving after a failure must not paper over it.
+        // Before the nodes are told, so `/readyz` stops routing traffic here the instant the
+        // signal arrives, not partway through the drain. A no-op if a node already failed: a
+        // SIGTERM after a failure must not paper over it.
         readiness_for_driver.draining();
         let _ = drain_started_for_driver.set(tokio::time::Instant::now());
         let _ = shutdown_tx_for_driver.send(true);
     });
 
-    // Total batches this run ever had to abandon in a sink's own inbox because shutdown grace
-    // expired before `write_loop` drained it (`run_output`'s own comment on the sweep) -- summed
-    // across every sink so the `drain complete` event can say whether the drain was clean.
+    // Batches abandoned in any sink's inbox because shutdown grace expired before `write_loop`
+    // drained them, summed so the `drain complete` log can say whether the drain was clean.
     let shutdown_dropped_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Every listener bound *before* any channel exists, let alone any task is spawned
-    // (`docs/plans/operator-surface.md`, workstream B) -- so a bind failure fails startup with
-    // nothing else running yet, rather than surfacing as the first `JoinSet` error once every
-    // sibling is already listening. Sequential, in the same sorted order: a bind is a syscall,
-    // there are single digits of them, and "which one failed" must not depend on a join order.
-    //
-    // Sinks go through the same pass, for the same reason and in the same single sorted sweep
-    // (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`"): `prometheus_out` opens a
-    // listening socket, which has an input's startup failure mode (address in use, privileged
-    // port), not a sink's "destination isn't up yet" one that `write_loop`'s retry already owns.
-    // `Output::bind` defaults to a no-op, so every outward-connecting sink is untouched by this.
+    // Every listener and sink binds before any channel exists or task spawns, so a bind failure
+    // fails startup with nothing else running. Sequential and sorted, so "which one failed" never
+    // depends on join order. Sinks are here because `prometheus_out` opens a listening socket,
+    // which fails like an input (address in use), not like a sink whose destination isn't up yet;
+    // `Output::bind` defaults to a no-op (`docs/adr/prometheus-scrape-and-exposition.md`).
     for id in &ids {
         let bound = match specs.get_mut(id) {
             Some(NodeSpec::Input(input, _)) => input.bind().await,
@@ -259,13 +207,9 @@ pub async fn run_with_telemetry(
     let mut senders: HashMap<String, mpsc::Sender<Delivered>> = HashMap::with_capacity(ids.len());
     let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
     for id in &ids {
-        // No channel at all for a `target` (`docs/adr/target-components.md`): a target declares
-        // no `sources:` and nothing may *name* one as a source (rule 49), so -- unlike a listener,
-        // whose inbox exists but is immediately dropped because nothing can ever write to it --
-        // there is nothing here to create in the first place. Same reasoning as the listener arm
-        // below gives for its dead inbox, one step stronger: a listener's inbox is unreachable,
-        // a target's is meaningless. A target is a *name* for its routers' outbound edges; the
-        // pass below builds that name's one `Fanout` directly onto its consumers' inboxes.
+        // No channel for a `target`: it declares no `sources:` and nothing may name one as a
+        // source (rule 49). A target is a name for its routers' outbound edges; the pass below
+        // builds its one `Fanout` directly onto its consumers' inboxes.
         if graph.components.get(id).is_some_and(|c| c.role() == Role::Target) {
             continue;
         }
@@ -274,18 +218,13 @@ pub async fn run_with_telemetry(
         inboxes.insert(id.clone(), rx);
     }
 
-    // One `Fanout` per `target`, built *before* the spawn loop rather than inside it: `ids` is
-    // sorted, so a router can (and in `examples/fan-out-central.yaml` does) come before the
-    // targets it directs at, and its spawn arm needs every one of them already built. Each
-    // carries the target's *own* id and telemetry handle, which is what makes the two
-    // operator-visible consequences of the alias fall out with no further code:
-    // `Fanout::stamp` writes the target's id into `previous` on every batch that goes through it
-    // (`docs/adr/batch-provenance-on-delivered.md`'s one stamping rule, unchanged), and the
-    // uniform layer-2 producer set (`batches.sent`/`events.sent`/`send.blocked.duration`/
-    // `events.dropped{reason="closed_consumer"}`) appears under the target's id, giving
-    // per-stream volume with no new metric. `telemetry.get(..).cloned()`, *not* `remove`: the
-    // spawn loop below removes each node's handle as it goes, and a target's handle must still be
-    // here when it does -- a target is not in that loop at all, so nothing would ever put it back.
+    // One `Fanout` per `target`, built before the spawn loop: `ids` is sorted, so a router can
+    // sort ahead of the targets it directs at (`examples/fan-out-central.yaml` does), and its
+    // spawn arm needs them built. Each carries the target's own id and telemetry handle, so
+    // `Fanout::stamp` writes the target's id into `previous`
+    // (`docs/adr/batch-provenance-on-delivered.md`) and the producer metrics (`batches.sent`,
+    // `events.sent`, `send.blocked.duration`, `events.dropped{reason="closed_consumer"}`) appear
+    // under the target's id, giving per-stream volume with no new metric.
     let mut target_fanouts: HashMap<String, Fanout> = HashMap::new();
     for id in &ids {
         let component = graph.components.get(id).expect("id came from this graph");
@@ -302,24 +241,17 @@ pub async fn run_with_telemetry(
     }
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
-    // Maps each spawned task back to the component id it runs -- `AbortHandle::id()` at spawn
-    // time, read back via `join_next_with_id`/`JoinError::id()` in the loop below, so a failing
-    // (or panicking) task can be named in `readiness` without threading the id through every
-    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node's entry is its
-    // `watch_lua_thread` task -- the raw `std::thread` itself can't be a `JoinSet` member, so a
-    // task that awaits the thread's exit report stands in for it (see `run_lua`'s doc comment).
+    // Task id -> component id, so the join loop can name a failing or panicking task in
+    // `readiness`. A Lua node's entry is its `watch_lua_thread` task, since a `std::thread` can't
+    // be a `JoinSet` member.
     let mut node_ids: HashMap<tokio::task::Id, String> = HashMap::with_capacity(ids.len());
-    // Needed only for Lua nodes -- see `run_lua`'s doc comment. `Handle::current()` requires an
-    // async context, true here since `run` is itself running as a task on this runtime.
+    // For Lua nodes only (see `run_lua`); `Handle::current()` needs the async context we're in.
     let runtime_handle = tokio::runtime::Handle::current();
 
     for id in ids {
         let component = graph.components.get(&id).expect("id came from this graph");
-        // Targets are skipped *before* anything is taken out of `telemetry`/`specs`/`inboxes`:
-        // there is no inbox to remove (the channel pass above created none), the `Fanout` pass
-        // above already took what a target needs, and nothing is spawned for one by design. A
-        // `NodeSpec::Target` registered for it is therefore never removed and simply goes unused
-        // -- see that variant's own doc comment for why the registry still produces one.
+        // Skipped before anything is taken out of `telemetry`/`specs`/`inboxes`: a target has no
+        // inbox, and its `NodeSpec::Target` goes unused.
         if component.role() == Role::Target {
             continue;
         }
@@ -335,11 +267,7 @@ pub async fn run_with_telemetry(
 
         match spec {
             NodeSpec::Input(input, input_config) => {
-                // A listener's own inbox is never written to (arity rule: a listener has no
-                // sources, so nothing ever names it as a source and sends into it) -- nothing
-                // reads it either. A listener's own send-side telemetry (batches/events sent,
-                // send-blocked duration) comes from `fanout` above, already attached -- nothing
-                // further to instrument here.
+                // A listener has no sources (arity rule), so nothing ever sends into its inbox.
                 drop(inbox);
                 let handle = tasks.spawn(run_input(
                     id.clone(),
@@ -371,31 +299,25 @@ pub async fn run_with_telemetry(
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Router(router) => {
-                // Slot order *is* `ResolvedComponent::targets`' order, which is
-                // `graph::targets_of`'s order -- the one place that order is derived
-                // (`docs/adr/target-components.md`), so `Destination::To(n)` means
-                // `routes[n]` here and in the Lua name -> slot table alike. Cloning a
-                // `Fanout` clones its `Sender`s, so two routers directing at one target is
-                // fan-in at that target for free, exactly as `sources:` fan-in is.
+                // Slot order is `ResolvedComponent::targets`' order, derived only in
+                // `graph::targets_of`, so `Destination::To(n)` means `routes[n]` here and in the
+                // Lua name -> slot table alike. Cloning a `Fanout` clones its `Sender`s, so two
+                // routers directing at one target fan in there like `sources:` fan-in.
                 let routes = resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let handle = tasks.spawn(run_router(router, inbox, fanout, routes, node_telemetry));
                 node_ids.insert(handle.id(), id.clone());
                 readiness.set_node(&id, NodeState::Running);
             }
             NodeSpec::Target => {
-                // Unreachable via any `target` component: the `Role::Target` guard at the top of
-                // this loop skips every one of them before the spec is even taken out of the map.
-                // Reachable only if a caller registered `NodeSpec::Target` for a component whose
-                // *kind* isn't a target -- spec kind and config kind are independent at this
-                // layer, nothing checks they agree -- in which case doing nothing is the honest
-                // outcome, not a panic. Nothing is spawned for a target by design.
+                // Reachable only if a caller registered `NodeSpec::Target` for a non-target
+                // component (nothing checks spec kind against config kind here); the `Role::Target`
+                // guard above skips real targets. Doing nothing beats panicking.
             }
             NodeSpec::Lua { script, interval } => {
-                // A Lua node is a router too (`docs/adr/target-components.md`): the ids in
-                // `component.targets` become `event:to("..")`'s name -> slot table inside the VM,
-                // and these `Fanout`s are the same slots on the Rust side -- resolved exactly as
-                // the `Router` arm above resolves its own, from the same pre-spawn map, so
-                // `Destination::To(n)` and the script's n-th target id mean the same thing.
+                // A Lua node is a router too: the ids in `component.targets` become
+                // `event:to("..")`'s name -> slot table in the VM, resolved from the same
+                // pre-spawn map as the `Router` arm, so `Destination::To(n)` and the script's n-th
+                // target id agree.
                 let targets = component.targets.clone();
                 let target_routes =
                     resolve_target_fanouts(&id, &component.targets, &target_fanouts);
@@ -424,11 +346,9 @@ pub async fn run_with_telemetry(
                     .map_err(RunError::Startup)?;
                 match ready_rx.await {
                     Ok(Ok(())) => {
-                        // The thread's stand-in `JoinSet` entry (see `node_ids`'s doc comment):
-                        // spawned only once the handshake has succeeded, so a load failure --
-                        // which returns `Startup` just below -- never leaves a watcher behind.
-                        // `done_tx` buffers its one message, so a thread that dies between
-                        // reporting ready and this spawn is still observed.
+                        // Spawned only after the ready handshake, so a load failure never leaves a
+                        // watcher behind. `done_tx` buffers its one message, so a thread that dies
+                        // between reporting ready and this spawn is still observed.
                         let watcher = tasks.spawn(watch_lua_thread(id.clone(), done_rx));
                         node_ids.insert(watcher.id(), id.clone());
                         readiness.set_node(&id, NodeState::Running);
@@ -448,41 +368,23 @@ pub async fn run_with_telemetry(
         }
     }
 
-    // Every consumer's `Fanout` already holds its own clone of the `Sender`s it needs -- this
-    // map's own clones are construction-only scaffolding. Left alive, they'd each be one extra
-    // outstanding `Sender` on every channel for the rest of `run`, so a channel would never
-    // observe every real sender dropped and close -- the shutdown cascade (an inbox closing,
-    // triggering that node's close-time flush and exit) could never fire, and `run` would hang
-    // forever waiting on tasks that are themselves waiting on inboxes that can never close.
+    // Every `Fanout` holds its own `Sender` clones; these are construction scaffolding. Left
+    // alive, each is an extra `Sender` on every channel, so no inbox ever closes, the shutdown
+    // cascade never fires, and `run` hangs.
     drop(senders);
-    // The same rule, one step less obvious and one degree more dangerous. Every router that
-    // directs at a target already holds its own clone of that target's `Fanout`; the clones in
-    // this map are construction-only scaffolding exactly as `senders`' were. Left alive, each one
-    // would be an extra outstanding `Sender` on every one of that target's *consumers'* channels
-    // for the rest of `run` -- so none of those inboxes could ever observe every real sender
-    // dropped and close, the shutdown cascade could never fire past the target, and `run` would
-    // hang forever waiting on sinks whose inboxes can never close. A hang, not a failed
-    // assertion, which is why `a_router_exiting_closes_its_targets_consumers_inboxes` below pins
-    // it under a `tokio::time::timeout`.
+    // Same rule for targets: each router holds its own clone of a target's `Fanout`. Left alive,
+    // these keep every target consumer's inbox open and `run` hangs past the target.
+    // `a_router_exiting_closes_its_targets_consumers_inboxes` pins it under a timeout.
     drop(target_fanouts);
 
-    // Every socket bound, every task/thread spawned and running, nothing has failed yet --
-    // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
-    // A no-op if a node has already failed by this point (`Readiness::ready`'s own doc comment).
+    // A no-op if a node has already failed (`Readiness::ready`).
     readiness.ready();
     tracing::info!(target: "logit", "ready");
 
-    // On the first error (from either arm below), record it and trigger the same shutdown signal
-    // SIGTERM already drives -- every remaining task then gets the graceful-shutdown treatment it
-    // already knows how to handle (a listener's inbox closes normally, cascading through to
-    // `write_loop`'s shutdown-grace drain, `docs/adr/buffered-sink-delivery.md`) instead of
-    // being aborted mid-flight by dropping `tasks` early, which would silently discard a healthy
-    // sibling's buffered, not-yet-delivered work. Keep `join_next`ing until every task has actually
-    // exited (the loop condition, unchanged) rather than breaking -- only the *first* error is kept
-    // (a later, cascading error from a task that's now shutting down because of the first one must
-    // not overwrite it), but a second error is still observed and discarded here rather than
-    // aborting the loop. `join_next_with_id` (not `join_next`) so a failing task can be named in
-    // `readiness` via `node_ids` above.
+    // On the first error, trigger the same shutdown SIGTERM drives, so every other task drains
+    // gracefully (`docs/adr/buffered-sink-delivery.md`) instead of being aborted with a healthy
+    // sibling's buffered work. Keep joining until every task exits; keep only the first error,
+    // since later ones are usually cascades from it.
     let mut result: Result<(), RunError> = Ok(());
     while let Some(joined) = tasks.join_next_with_id().await {
         let (task_id, outcome) = match joined {
@@ -498,9 +400,8 @@ pub async fn run_with_telemetry(
                 (task_id, anyhow::Error::from(join_err))
             }
         };
-        // Every failing node is marked, not only the first -- `/readyz`'s `degraded` status
-        // (workstream C) is "any node has exited with an error," while `result` below still keeps
-        // only the first failure's message, as before this workstream.
+        // Every failing node is marked (`/readyz`'s `degraded` means any node failed); `result`
+        // keeps only the first failure.
         if let Some(id) = node_ids.get(&task_id) {
             readiness.set_node(id, NodeState::Failed);
         }
@@ -511,18 +412,10 @@ pub async fn run_with_telemetry(
             let _ = shutdown_tx.send(true);
         }
     }
-    // Whether `shutdown` ever resolved on its own or not (in `run`'s case, it's `pending()` and
-    // never will), this task has nothing left to do once every node has exited -- the join loop
-    // above has already observed that (its `while` condition only becomes `false` once every task
-    // has actually finished, whether that happened via `shutdown` or via the error path above
-    // flipping `shutdown_tx` itself), so abort rather than leave it parked forever holding its own
-    // clone of `shutdown_tx`.
+    // Every node has exited; `shutdown` may never resolve (`run` passes `pending()`).
     shutdown_driver.abort();
 
-    // `drain_started` is only ever set once shutdown began (by whichever of the driver task or
-    // the join loop's own first-error branch above noticed first) -- unset means every node ran
-    // to completion on its own (every `Input` implementor that returns, e.g. a finite one) with
-    // no shutdown or failure in the mix, so there's no meaningful drain duration to report.
+    // Unset means every node finished on its own, with no shutdown or failure: no drain to report.
     if let Some(started) = drain_started.get() {
         let dropped = shutdown_dropped_batches.load(std::sync::atomic::Ordering::Relaxed);
         if dropped > 0 {
@@ -539,26 +432,15 @@ pub async fn run_with_telemetry(
     result
 }
 
-/// Drives one listener via [`Input::run_until_shutdown`], racing it against a *grace-delayed*
-/// backstop rather than `shutdown` itself (`docs/adr/decoupled-listener-io.md`, revising
-/// ADR `service-lifecycle-and-output-retry`'s "no `Input` trait change" rationale, not its cancel-by-drop mechanism -- see the
-/// trait's own doc comment).
+/// Drives one listener via [`Input::run_until_shutdown`], racing it against a grace-delayed
+/// backstop rather than `shutdown` itself (`docs/adr/decoupled-listener-io.md`).
 ///
-/// **Why grace-delayed, and why that doesn't add latency to a non-overriding input.**
-/// `run_until_shutdown`'s default body already races `run` against `shutdown` and resolves the
-/// instant it fires -- exactly ADR `service-lifecycle-and-output-retry`'s original behaviour, unchanged. If this function's outer
-/// race were *also* against `shutdown` itself, both arms would resolve simultaneously with no way
-/// to prefer letting an overriding implementation finish draining first. Racing against
-/// [`shutdown_grace_expired`] instead means: the default impl (or any override that finishes
-/// before the grace) always wins that race, so nothing pays added latency; an override still
-/// working when the grace expires is the only case where this backstop actually fires, cancelling
-/// it by drop -- the same loss ADR `service-lifecycle-and-output-retry` always accepted, now bounded by `shutdown_grace` rather
-/// than unconditional.
-///
-/// No `Box::pin`/`Option` dance like `run_output` needed (`shutdown.clone()` below gives the two
-/// `select!` arms disjoint receivers, and neither arm holds a value the other one needs back
-/// afterward) -- `run_output`'s dance existed only because its two arms shared a mutable borrow of
-/// `output` that the caller needed reclaimed regardless of which arm won.
+/// The default `run_until_shutdown` resolves the instant `shutdown` fires. Racing it against
+/// `shutdown` too would make both arms ready at once, with no way to let an overriding
+/// implementation finish draining. Racing against [`shutdown_grace_expired`] instead means the
+/// default (or any override that finishes within the grace) always wins, adding no latency; only
+/// an override still working at the deadline is cancelled by drop, a loss now bounded by
+/// `shutdown_grace`.
 async fn run_input(
     id: String,
     mut input: Box<dyn Input + Send>,
@@ -574,20 +456,14 @@ async fn run_input(
     }
 }
 
-/// A sink node's drain-and-deliver pair, decoupled through a [`SinkQueue`]
-/// (`docs/adr/buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off this
-/// component's inbox into the queue as fast as the queue's own bounds allow, while [`write_loop`]
-/// delivers from the queue independently -- so a slow or backing-off `Output::send` no longer
-/// stops this sink's own inbox from moving batches into its (deeper, byte-bounded) queue, the way
-/// the single inline loop this replaced did.
+/// A sink node's drain-and-deliver pair, decoupled through a [`SinkStore`]
+/// (`docs/adr/buffered-sink-delivery.md`): [`drain_inbox`] moves every `Delivered` off the inbox
+/// into the store as fast as its bounds allow, while [`write_loop`] delivers from it
+/// independently, so a slow or backing-off `Output::send` doesn't stall the inbox.
 ///
-/// The two run as one task, joined here rather than each spawned separately, so this function's
-/// `Err` (from `write_loop`; `drain_inbox` never fails) is what `run_with_telemetry`'s `JoinSet`
-/// sees. `write_loop` no longer owns `output` for its whole lifetime -- it only ever borrows it,
-/// via `output.as_mut()` -- specifically so this function can perform the final drain-and-flush
-/// itself, *after* `drain` can no longer push anything new, rather than `write_loop` doing it from
-/// inside a race it cannot see the other half of (a real bug an earlier version of this split had:
-/// see `finish_and_flush`'s doc comment).
+/// Both run in this one task, so `write_loop`'s `Err` (`drain_inbox` never fails) is what the
+/// `JoinSet` sees. `write_loop` only borrows `output` so that this function can run the final
+/// drain-and-flush itself, after `drain` can no longer push anything (see `finish_and_flush`).
 #[allow(clippy::too_many_arguments)]
 async fn run_output(
     id: String,
@@ -600,25 +476,18 @@ async fn run_output(
     shutdown_dropped_batches: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
-    // Lazily, the same way `run_input`/`run_until_shutdown` call `Input::bind` when nobody did:
-    // `run_with_telemetry`'s pre-spawn pass has already bound every sink it built, so this is an
-    // idempotent no-op there (`Output::bind`'s own contract), and it is what makes a caller
-    // outside that pass -- a direct unit test spawning `run_output` -- work with one call.
+    // Idempotent (`Output::bind`'s contract): a no-op after `run_with_telemetry`'s pre-spawn
+    // pass, and what lets a unit test spawn `run_output` directly.
     output.bind().await.with_context(|| format!("component '{id}'"))?;
-    // A `Disk` store's `SinkStore::open` does real I/O (opening or recovering a spool directory)
-    // and can fail -- a bad path, a permissions error, another process already holding the lock
-    // (`crate::disk_queue::DiskQueue`'s own doc comment) -- which is a startup error for this
-    // component, exactly like a bad `Output` constructor would be.
+    // A `Disk` store opens or recovers a spool directory and can fail (bad path, permissions,
+    // another process holding the lock).
     let store = Arc::new(
         SinkStore::open(store_config, telemetry.clone(), diag.clone())
             .with_context(|| format!("component '{id}'"))?,
     );
 
-    // `inbox` is now owned by *this* function, not moved into `drain_inbox` -- `drain_inbox`
-    // only ever borrows it (`&mut inbox`). This is what makes the abandoned-inbox accounting
-    // below possible: dropping a future that merely borrowed `inbox` releases the borrow without
-    // touching the channel itself, so whatever `drain_inbox` never got around to `recv()`-ing
-    // stays right where it was, in `inbox`'s own buffer, for this function to still see and count.
+    // `drain_inbox` borrows `inbox` rather than owning it, so dropping an abandoned `drain`
+    // leaves its unread batches in the channel for the sweep below to count.
     let mut drain = Box::pin(drain_inbox(&mut inbox, Arc::clone(&store), telemetry.clone()));
     let mut write = Box::pin(write_loop(
         id.clone(),
@@ -629,35 +498,19 @@ async fn run_output(
         shutdown,
     ));
 
-    // `tokio::join!` would wait for *both* futures every time, which is wrong here: `write_loop`
-    // can return early (a permanent send failure, or shutdown grace expiring) while `inbox` is
-    // still open, e.g. every real listener, which never closes its sender on its own. `drain_inbox`
-    // has no way to learn that its consumer gave up, so it would keep pulling from `inbox` (and,
-    // under `Block`, eventually park forever pushing into a queue nothing commits from any more)
-    // -- hanging this task, and therefore `run`, indefinitely.
+    // Not `tokio::join!`: `write_loop` can return early (a permanent failure, or shutdown grace
+    // expiring) while `inbox` stays open, as it does under every real listener. `drain_inbox`
+    // can't learn its consumer gave up, and under `Block` would park forever pushing into a queue
+    // nothing drains, hanging this task and `run`.
     //
-    // `select!` fixes this without any new cancellation signal: whichever future finishes first
-    // wins.
-    // - `write` finishes first: either it drained to closed-and-empty (only possible once `drain`
-    //   has already run `queue.close()` -- by construction `drain` is then already `Ready`, so no
-    //   work is lost by not polling it again), it bailed with a fatal error, or shutdown grace
-    //   expired. Either way, if `drain` is still pending, it is dropped below -- `Box::pin`ned
-    //   locally, never polled again after this point. Dropping it does **not** drop `inbox` any
-    //   more (see the field comment above): whatever was still sitting in `inbox`'s own buffer,
-    //   never `recv()`-ed by the abandoned `drain`, is swept up and counted just below, instead of
-    //   silently vanishing along with the receiver the way an owned-`inbox` `drain_inbox` used to.
-    // - `drain` finishes first (its inbox closed normally): `write_loop` hasn't necessarily
-    //   finished draining the queue's tail yet, so wait for it.
-    // `write` (a `Pin<Box<dyn Future>>`) holds `output`'s mutable borrow until it is dropped, and
-    // this function needs that borrow released before it can reclaim `output` for
-    // `finish_and_flush` below. The two arms consume `write` differently -- the first only
-    // *polls* it via `&mut write`, leaving the outer binding to be dropped explicitly once we
-    // know which arm fired; the second calls `write.await` on the owned binding directly, which
-    // fully consumes (and so drops) it as part of driving it to completion. Routed through an
-    // intermediate `Option` (rather than dropping `write` unconditionally after the `select!`)
-    // because the borrow checker tracks the move `write.await` performs per-arm -- referencing
-    // `write` after the `select!` regardless of which arm ran does not typecheck even though only
-    // one arm's move ever actually happens at runtime.
+    // If `write` finishes first, a still-pending `drain` is dropped and never polled again; the
+    // sweep below counts what it left in `inbox`. (When `write` finished by draining to
+    // closed-and-empty, `drain` already closed the queue, so it's already done.) If `drain`
+    // finishes first, its inbox closed normally and `write_loop` still has the queue's tail.
+    //
+    // `write` holds `output`'s mutable borrow until dropped, and `finish_and_flush` needs it back.
+    // The `Option` exists for the borrow checker: it tracks the move `write.await` makes per arm,
+    // so dropping `write` unconditionally after the `select!` doesn't typecheck.
     let already_finished = tokio::select! {
         result = &mut write => Some(result),
         () = &mut drain => None,
@@ -670,40 +523,22 @@ async fn run_output(
         None => write.await,
     };
 
-    // Only now, with `write` finished (and dropped) and `drain` either already finished or about
-    // to be dropped (never polled again once this local variable goes out of scope), can nothing
-    // further be pushed into `store` -- so this snapshot is genuinely final. See
-    // `finish_and_flush`.
+    // From here nothing else pushes into `store`, so `finish_and_flush`'s snapshot is final.
     drop(drain);
 
-    // F3: close `store` right here, before the abandoned-inbox sweep below ever calls
-    // `store.push`. This makes "nothing will ever push into this store again" a true statement at
-    // exactly this point -- mirroring what `drain_inbox` itself would have done on its own
-    // close-on-exit path (see its own doc comment) had it not been abandoned mid-flight instead.
-    // Without this, the sweep's `store.push(...).await` below could await `not_full` forever under
-    // `overflow: block` against a full disk spool -- nothing left running would ever notify it.
-    // `DiskQueue::push` already has a `self.closed()` check that short-circuits its overflow
-    // policy to accept the push unconditionally (over-bound) rather than blocking once closed --
-    // the identical escape hatch `crate::queue::BoundedQueue::close`'s own doc comment already
-    // documents for the in-memory case ("never panic, never hang"). So the sweep still drops
-    // nothing (preserving `SinkStore::finish`'s documented "a disk-backed sink drops nothing at
-    // shutdown" contract) -- it just may briefly exceed `disk.max_bytes`, bounded by the channel's
-    // fixed capacity and reclaimed on the next `open`. The `Memory` store path is unaffected: its
-    // sweep push is already gated on `matches!(store.as_ref(), SinkStore::Disk(_))` below, and
-    // `SinkStore::finish`'s in-memory drain uses `commit()`, which doesn't consult `closed`.
+    // Close `store` before the sweep below pushes into it. Otherwise, under `overflow: block`
+    // against a full disk spool, the sweep's `store.push(..).await` waits on `not_full` forever,
+    // since nothing left running would notify it. Once closed, `DiskQueue::push` accepts
+    // over-bound instead of blocking, so the sweep still drops nothing (`SinkStore::finish`'s
+    // "a disk-backed sink drops nothing at shutdown") and may briefly exceed `disk.max_bytes`, by
+    // at most the channel's capacity, reclaimed on the next `open`. The `Memory` path never
+    // pushes in the sweep, and `SinkStore::finish`'s memory drain uses `commit()`, which
+    // ignores `closed`.
     store.close();
 
-    // A `drain` abandoned mid-flight (the `write`-finishes-first case above) may leave batches
-    // sitting in `inbox`'s own buffer -- accepted by the channel but never `recv()`-ed, since
-    // `drain_inbox`'s loop never got back around to pulling them out before this function stopped
-    // polling it. Those batches never reached `store` at all, so `finish_and_flush` below (which
-    // only ever sees what's *in* `store`) cannot count or persist them. A `Disk` store still has
-    // room for them -- they were never delivered, so appending them is exactly what "drops
-    // nothing at shutdown" (`crate::queue::SinkStore::finish`'s own doc comment) requires; a
-    // `Memory` store still counts and diagnoses them, as before, since nothing about them
-    // survives this process exiting either way. `try_recv` is non-blocking and exits as soon as
-    // `inbox` reports empty (or disconnected, the ordinary case when `drain` already ran `inbox`
-    // dry on its own), so this never waits for a sender that may never come.
+    // An abandoned `drain` may leave batches in `inbox` that never reached `store`, so
+    // `finish_and_flush` can't see them. A `Disk` store persists them (it drops nothing at
+    // shutdown); a `Memory` store counts and diagnoses them as dropped. `try_recv` never waits.
     let mut abandoned_batches: u64 = 0;
     let mut abandoned_events: u64 = 0;
     while let Ok(delivered) = inbox.try_recv() {
@@ -747,34 +582,26 @@ async fn run_output(
     write_result
 }
 
-/// Moves every `Delivered` batch off `inbox` into `store`, as fast as `store.push` (governed by
-/// its own bounds/overflow policy) allows -- entirely independent of how long `write_loop`'s
-/// current delivery attempt is taking. `Delivered::Owned` costs one `Arc::new` here (previously
-/// zero on this path -- a real, measured, and accepted cost, see
-/// `crates/logit-bench/tests/allocations.rs` and `docs/design/memory.md`); `Delivered::Shared` is
-/// already an `Arc`, so this is just a move, no clone. Closes `store` once `inbox` itself closes,
-/// which is what lets `write_loop`'s `store.peek()` loop discover "closed and empty" and return --
-/// no separate close-detection logic needed on that side.
+/// Moves every `Delivered` batch off `inbox` into `store` as fast as `store.push`'s bounds allow,
+/// independent of `write_loop`'s current delivery attempt, then closes `store` once `inbox`
+/// closes. That close is how `write_loop`'s `store.peek()` learns "closed and empty".
 ///
-/// Takes `&mut inbox`, not an owned receiver -- `run_output` retains ownership specifically so
-/// dropping this future (when `write_loop` gives up first, see `run_output`'s `select!`) releases
-/// only the borrow, not the channel itself, leaving whatever this loop hadn't yet `recv()`-ed
-/// still sitting in `inbox`'s buffer for `run_output`'s own abandoned-inbox sweep to find and
-/// count, instead of vanishing along with a dropped owned `Receiver`.
+/// Allocation: `Delivered::Owned` costs one `Arc::new`; `Delivered::Shared` is a move
+/// (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`).
 ///
-/// `pub` (rather than crate-private, like every other node-loop function here) purely so
-/// `logit-bench`'s allocation tests can drive it directly, isolating exactly this hop's cost --
-/// see `crates/logit-bench/tests/allocations.rs`.
+/// Borrows `inbox` so that dropping this future (when `write_loop` gives up first) leaves unread
+/// batches in the channel for `run_output`'s abandoned-inbox sweep to count.
+///
+/// `pub` only so `logit-bench`'s allocation tests can drive this hop directly.
 pub async fn drain_inbox(
     inbox: &mut mpsc::Receiver<Delivered>,
     store: Arc<SinkStore>,
     telemetry: Telemetry,
 ) {
     while let Some(delivered) = inbox.recv().await {
-        // Read before `unwrap_batch_arc` consumes `delivered` -- the store carries this context
-        // alongside the batch (`queue.rs`'s own doc comment) specifically so `write_loop`'s sink
-        // span can be parented on it once `peek` reads it back, and so `Output::observe_batch`
-        // has the provenance that arrived with this batch to hand a sink like `logit_out`.
+        // Read before `unwrap_batch_arc` consumes `delivered`. The store carries it with the
+        // batch so `write_loop`'s sink span has a parent and `Output::observe_batch` gets the
+        // batch's provenance.
         let ctx = delivered.batch_context();
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
@@ -784,14 +611,11 @@ pub async fn drain_inbox(
     store.close();
 }
 
-/// Shared by [`drain_inbox`] and `run_output`'s abandoned-inbox sweep: `Delivered::Owned` costs
-/// one `Arc::new` (previously zero on this path -- see `drain_inbox`'s own doc comment);
-/// `Delivered::Shared` is already an `Arc`, so this is just a move.
+/// Converts a `Delivered` into the store's `Arc<EventBatch>`: one `Arc::new` for
+/// `Delivered::Owned`, a move for `Delivered::Shared`.
 ///
-/// Discards `delivered`'s `BatchContext` -- callers that need it (`drain_inbox`, the abandoned-
-/// inbox sweep above) read it via `Delivered::batch_context` first, since `Output::send` itself
-/// still takes `&EventBatch`, not `&Delivered` (see `unwrap_batch`'s own doc comment and
-/// `docs/design/pipeline-graph.md`'s "Trace context propagation" section).
+/// Discards the `BatchContext`; callers read it with `Delivered::batch_context` first
+/// (`docs/design/pipeline-graph.md`'s "Trace context propagation" section).
 fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
     match delivered {
         Delivered::Owned(batch, _ctx) => Arc::new(batch),
@@ -799,30 +623,22 @@ fn unwrap_batch_arc(delivered: Delivered) -> Arc<EventBatch> {
     }
 }
 
-/// Retry budget for [`write_loop`]'s generic `deliver_with_retry`, driving every sink -- moved
-/// here from `logit-outputs::influxdb::RetryPolicy`, which owned its own retry loop before
-/// `docs/adr/buffered-sink-delivery.md`; now every sink gets retry for free instead of
-/// reimplementing it.
+/// Retry budget for every sink's delivery in [`write_loop`] (`docs/adr/buffered-sink-delivery.md`).
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
-    /// Hard ceiling on total time spent retrying one batch, across every attempt and every
-    /// backoff sleep combined. Checked before each backoff sleep, so the budget is a hard ceiling
-    /// regardless of how many attempts fit inside it. A fresh budget starts the moment a batch is
-    /// first attempted -- not shared across batches.
+    /// Hard ceiling on time spent on one batch, across every attempt and backoff sleep. Each
+    /// batch gets a fresh budget from its first attempt.
     pub total_budget: Duration,
-    /// Backoff after attempt `n` is `base_delay * 2^(n-1)`, capped at `max_delay` and further
-    /// clamped to whatever's left of `total_budget`. No jitter: there's exactly one writer per
-    /// `SinkQueue`, not a fleet thundering-herding a shared endpoint.
+    /// Backoff after attempt `n` is `base_delay * 2^(n-1)`, capped at `max_delay` and clamped to
+    /// what's left of `total_budget`. No jitter: one writer per sink, not a fleet.
     pub base_delay: Duration,
     pub max_delay: Duration,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        // Widened from ADR `service-lifecycle-and-output-retry`'s ~5s default: a stall here no longer reaches the drain loop or
-        // the listener behind it (docs/adr/buffered-sink-delivery.md), since the queue
-        // absorbs it instead -- so a much larger budget, enough to ride out a real destination
-        // restart, is now affordable.
+        // Long enough to ride out a destination restart: the sink queue absorbs the stall, so it
+        // doesn't reach the listener (`docs/adr/buffered-sink-delivery.md`).
         Self {
             total_budget: Duration::from_secs(60),
             base_delay: Duration::from_millis(200),
@@ -831,21 +647,15 @@ impl Default for RetryConfig {
     }
 }
 
-/// Config `write_loop` needs beyond `SinkQueueConfig` (which governs the queue `drain_inbox`
-/// pushes into, not delivery itself). Config-file exposure of these fields is workstream F.
+/// Delivery config for `write_loop`; the queue itself is `SinkStoreConfig`'s.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteLoopConfig {
     pub retry: RetryConfig,
-    /// Once the shutdown signal fires, `write_loop`'s remaining allowed drain time is capped at
-    /// this, measured from the moment shutdown first fired (not reset per batch) -- so a
-    /// permanently-down sink can't hang process exit indefinitely under SIGTERM. See
-    /// `docs/adr/buffered-sink-delivery.md`'s "shutdown grace" section.
+    /// Caps `write_loop`'s drain time after shutdown fires, measured from the first signal (not
+    /// reset per batch), so a down sink can't hang exit (`docs/adr/buffered-sink-delivery.md`).
     pub shutdown_grace: Duration,
-    /// Overrides the delivery posture `write_loop` would otherwise derive from
-    /// `output.duplicate_safe()` (`docs/adr/buffered-sink-delivery.md`'s three-layer posture
-    /// design: sink fact -> runtime default -> this config override). `None` -- the default --
-    /// means "use the derived default"; workstream F's `logit-config::BufferConfig::delivery`
-    /// is what sets this per component.
+    /// Overrides the delivery posture derived from `output.duplicate_safe()`; `None` uses it.
+    /// Set from `logit-config::BufferConfig::delivery`.
     pub delivery_override: Option<DeliveryPosture>,
 }
 
@@ -862,13 +672,10 @@ impl Default for WriteLoopConfig {
 /// What one batch's delivery attempt (through however many retries its budget allows) ended in.
 enum Delivery {
     Delivered,
-    /// Never delivered -- either `fault` wasn't retryable under the resolved posture, or it was
-    /// but the retry budget ran out first. Either way the caller commits the batch off the queue
-    /// and counts it. `explicit_permanent` is a *narrower* fact than `fault == Fault::Permanent`:
-    /// it's true only when the sink itself attached `Fault::Permanent`, never when `classify`
-    /// merely defaulted to it for an unclassified error -- only the caller's fatal-streak logic
-    /// (see `write_loop`) needs this distinction; retry decisions already went through
-    /// `is_retryable` using the (possibly defaulted) `fault` alone.
+    /// Never delivered: `fault` wasn't retryable, or the budget ran out. The caller commits and
+    /// counts it. `explicit_permanent` is narrower than `fault == Fault::Permanent`: true only
+    /// when the sink attached `Fault::Permanent` itself, not when `classify` defaulted to it.
+    /// Only `write_loop`'s fatal streak uses it.
     Dropped {
         fault: Fault,
         explicit_permanent: bool,
@@ -877,19 +684,12 @@ enum Delivery {
 
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
 /// either it succeeds, a failure isn't retryable, or `retry.total_budget` (a fresh budget for this
-/// call) is exhausted. Moved here from `logit-outputs::influxdb::InfluxDbOutput::send`'s own retry
-/// loop (`docs/adr/buffered-sink-delivery.md`) -- every sink gets this for free now, driven by
-/// its own `Fault` classification and `duplicate_safe` fact rather than reimplementing the loop.
+/// call) is exhausted.
 ///
-/// **Every attempt, including the first, is raced against the remaining budget** via
-/// `tokio::time::timeout` -- `retry.total_budget`'s own doc comment already promises a "hard
-/// ceiling on total time spent... across every attempt," but a single un-raced `output.send` could
-/// blow straight through it: a sink's own internal timeout (e.g. `InfluxDbOutput`'s 10s HTTP
-/// client timeout) can be far larger than a configured `retry_budget`, so nothing would actually
-/// enforce the budget until the loop got back around to checking it *after* that one attempt
-/// finally gave up on its own. A timeout here is classified `Fault::Ambiguous` (the destination
-/// may have received the request before this gave up waiting on the response) -- never
-/// `Permanent`, since giving up early says nothing about whether the request was valid.
+/// Every attempt, including the first, runs under `tokio::time::timeout` of the remaining budget:
+/// a sink's own timeout (`InfluxDbOutput`'s 10 s HTTP timeout) can exceed the budget, which would
+/// otherwise go unenforced until that attempt gave up. A timeout is `Fault::Ambiguous` (the
+/// destination may have received the request), never `Permanent`.
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
     batch: &EventBatch,
@@ -931,14 +731,11 @@ async fn deliver_with_retry(
     }
 }
 
-/// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times via
-/// repeated `saturating_mul`, stopping early once it's already at or past `max_delay` -- correct
-/// for *any* `base_delay`/`max_delay` pair, not just `RetryConfig::default`'s. Moved here from
-/// `logit-outputs::influxdb` verbatim (`docs/adr/buffered-sink-delivery.md`) -- it was never
-/// InfluxDB-specific, just historically homed on the one sink that had a retry loop at all. See
-/// that module's history for why the loop is bounded at 128 iterations and why a single
-/// `base_delay * 2u32.pow(shift)` with a fixed shift cap doesn't work for every `base_delay`/
-/// `max_delay` pair.
+/// The backoff before retry attempt `attempt + 1`: `base_delay` doubled `attempt - 1` times with
+/// `saturating_mul`, stopping once at or past `max_delay`. Correct for any `base_delay`/`max_delay`
+/// pair, which a single `base_delay * 2u32.pow(shift)` with a fixed shift cap isn't. The 128
+/// bound matters only for a zero `base_delay`, which never grows; a nonzero one saturates
+/// `Duration` in under 100 doublings.
 fn backoff_for(retry: &RetryConfig, attempt: u32) -> Duration {
     let mut backoff = retry.base_delay;
     for _ in 0..attempt.saturating_sub(1).min(128) {
@@ -950,10 +747,7 @@ fn backoff_for(retry: &RetryConfig, attempt: u32) -> Duration {
     backoff.min(retry.max_delay)
 }
 
-/// `&'static str` for a [`Fault`], for `write_loop`'s sink span (`SpanGuard::tag` needs a
-/// `&'static str`, and `Fault`'s own `Display` impl returns a formatted `String`, not the
-/// underlying literal). Not the same thing as `Fault`'s `Display` output being unusable here --
-/// this just avoids an allocation on the failure path a span records.
+/// A [`Fault`] as the `&'static str` `SpanGuard::tag` needs, avoiding `Display`'s allocation.
 fn fault_tag(fault: Fault) -> &'static str {
     match fault {
         Fault::Clean => "clean",
@@ -962,53 +756,35 @@ fn fault_tag(fault: Fault) -> &'static str {
     }
 }
 
-/// Resolves once `shutdown`'s grace period has fully elapsed -- never before `shutdown` fires at
-/// all, and never more than `grace` after it does. `deadline` is `&mut` so it persists across
-/// repeated calls (once per `write_loop` iteration): the grace window is anchored to the instant
-/// shutdown first fired, not reset by racing this again for a later batch. Setting `*deadline`
-/// happens as a plain synchronous step the moment `shutdown.wait_for` resolves -- so it takes
-/// effect even if this particular call loses a `tokio::select!` race and gets dropped before its
-/// own `sleep_until` resolves; the next call sees `deadline` already `Some` and skips straight to
-/// waiting out whatever's left of it.
+/// Resolves `grace` after `shutdown` first fires, never before it fires.
+///
+/// `deadline` persists across calls (one per `write_loop` iteration), anchoring the window to the
+/// first signal rather than resetting per batch. It's set synchronously when `wait_for` resolves,
+/// so it sticks even if this call then loses a `select!` race and is dropped before its
+/// `sleep_until` completes; the next call waits out the remainder. Cancellation-safe.
 async fn shutdown_grace_expired(
     shutdown: &mut watch::Receiver<bool>,
     deadline: &mut Option<tokio::time::Instant>,
     grace: Duration,
 ) {
     if deadline.is_none() {
-        // An error here means the sender side is already gone -- treat that the same as shutdown
-        // having just fired, rather than hanging forever waiting for a signal that will never
-        // come.
+        // An error means the sender is gone; treat it as shutdown firing rather than hang.
         let _ = shutdown.wait_for(|&due| due).await;
         *deadline = Some(tokio::time::Instant::now() + grace);
     }
     tokio::time::sleep_until(deadline.expect("just set above if it was None")).await;
 }
 
-/// Finalizes whatever `store` still holds, counting and logging anything actually dropped, then
-/// flushes `output` exactly once -- called from `run_output` only, only after nothing can push
-/// into `store` any more (`drain_inbox` has either already finished naturally or been dropped).
+/// Finalizes what `store` still holds, counting and logging anything dropped, then calls
+/// `output.flush()` once. `run_output` calls it on every exit path of `write_loop`, and only after
+/// nothing can push into `store` any more.
 ///
-/// **This must not run from inside `write_loop`.** An earlier version did exactly that, on
-/// shutdown-grace expiry: it drained the queue to empty, then `await`ed `output.flush()` -- but
-/// committing wakes any producer blocked on `not_full`, so a concurrent `drain_inbox` could push
-/// a *new* batch into the queue while `flush()` was still pending, land uncounted (this function
-/// had already seen the queue go empty and moved on), and then get silently dropped when
-/// `write_loop` returned and `run_output`'s `select!` cancelled `drain_inbox` -- no delivery, no
-/// `reason="shutdown"` accounting, nothing. Running this only after `run_output` has already
-/// ensured `drain_inbox` can push no more closes that gap: there is no longer any window between
-/// "queue observed empty" and "flush called" for a producer to slip through.
+/// Must not run inside `write_loop`: committing wakes a producer blocked on `not_full`, so a
+/// concurrent `drain_inbox` could push a batch after the queue was seen empty and while `flush()`
+/// was pending, and that batch would be lost uncounted when `drain_inbox` was cancelled.
 ///
-/// This is also what makes `flush()` fire on the *ordinary* completion path too, not just on
-/// shutdown: `run_output` calls this unconditionally after `write_loop` returns, whether that was
-/// via the queue draining to closed-and-empty on its own, a fatal error, or shutdown grace
-/// expiring -- `Output::flush`'s own contract ("called once after the last batch") doesn't carve
-/// out an exception for the happy path, so this doesn't either.
-///
-/// `store.finish()` (`crate::queue::SinkStore::finish`) sources the counts: for `Memory`, exactly
-/// today's drain-to-empty loop; for `Disk`, always `(0, 0)` -- a disk-backed sink persists and
-/// keeps everything still queued rather than dropping it, so this block below simply never fires
-/// for one.
+/// `SinkStore::finish` supplies the counts; for `Disk` they're always `(0, 0)`, since a
+/// disk-backed sink keeps everything still queued.
 async fn finish_and_flush(
     diag: &Diagnostics,
     store: &SinkStore,
@@ -1027,11 +803,7 @@ async fn finish_and_flush(
             dropped_events as f64,
             &[("reason", "shutdown")],
         );
-        // Unthrottled: this fires at most once per `run_output` (shutdown happens once), so
-        // `warn_throttled`'s occurrence-count limiting -- built for a hot-path flood -- would be
-        // pointless machinery here. Goes through `Diagnostics`, not a bare `eprintln!`, so it's
-        // still attributed and still mirrored into telemetry (`docs/known-gaps.md`'s closed
-        // `eprintln!` entry), same as every other diagnostic in this codebase.
+        // Unthrottled: fires at most once per `run_output`.
         diag.warn(format_args!(
             "{dropped_batches} batch(es) ({dropped_events} event(s)) still queued when this sink \
              stopped, undelivered"
@@ -1044,29 +816,18 @@ async fn finish_and_flush(
 }
 
 /// Delivers from `store`'s head, one batch at a time, until `store.peek()` returns `None` (closed
-/// and empty) or shutdown grace expires. Per batch: attempt delivery via
-/// [`deliver_with_retry`], per the posture resolved from `write_config.delivery_override` (config,
-/// workstream F) falling back to `output.duplicate_safe()`'s derived default
-/// (`docs/adr/buffered-sink-delivery.md`). On success, commit and reset the permanent-failure
-/// streak. On failure (not retryable, or retryable but the budget ran out), commit anyway (the
-/// process no longer exits on an ordinary sink failure), count and warn -- *except*: a run of
-/// nothing but *explicitly classified* `Fault::Permanent` outcomes (see
-/// [`is_explicitly_permanent`]), with no successful delivery anywhere in between, for
-/// [`PERMANENT_FAILURE_WINDOW`], still ends this function with `Err` (and therefore `run_output`,
-/// and therefore the whole pipeline) -- a genuinely misconfigured sink still fails loudly enough
-/// for a restart-policy supervisor to notice. Both a budget-exhausted `Clean`/`Ambiguous` fault
-/// *and* an unclassified error that merely defaulted to `Permanent` are a different failure mode (a
-/// destination that's merely slow/down, or a sink that hasn't opted into `Fault` classification at
-/// all, neither of which is a positively-identified configuration error) and reset the streak
-/// exactly like a success would -- the streak only ever accumulates across a run of nothing *but*
-/// the sink explicitly saying "this is a config error," never merely "nothing else was retryable."
+/// and empty) or shutdown grace expires. The posture is `write_config.delivery_override`, else
+/// `output.duplicate_safe()`'s default (`docs/adr/buffered-sink-delivery.md`).
 ///
-/// Does **not** drain the queue or call `output.flush()` itself on any exit path -- that's
-/// `run_output`'s job, after this function returns (see [`finish_and_flush`]'s doc comment for
-/// why it must happen there and not here). `shutdown`: once it flips, this function's remaining
-/// allowed time is capped at `write_config.shutdown_grace` from that point (see
-/// [`shutdown_grace_expired`]) -- on expiry this returns `Ok(())` immediately, not an error: an
-/// incomplete drain on shutdown is expected behavior, not a pipeline failure.
+/// A failed batch is committed, counted, and warned about; the pipeline keeps running. The one
+/// exception: a run of nothing but explicitly classified `Fault::Permanent` outcomes
+/// ([`is_explicitly_permanent`]) lasting [`PERMANENT_FAILURE_WINDOW`] returns `Err`, ending the
+/// pipeline. A success, a budget-exhausted `Clean`/`Ambiguous` fault, or an unclassified error
+/// that only defaulted to `Permanent` resets the streak: only a positively identified config
+/// error counts.
+///
+/// Never drains the queue or calls `output.flush()`; [`finish_and_flush`] does, and says why.
+/// Returns `Ok(())` when shutdown grace expires: an incomplete drain on shutdown isn't a failure.
 async fn write_loop(
     id: String,
     output: &mut (dyn Output + Send),
@@ -1083,20 +844,14 @@ async fn write_loop(
     let mut last_success: Option<tokio::time::Instant> = None;
     let mut permanent_streak_since: Option<tokio::time::Instant> = None;
     let mut shutdown_deadline: Option<tokio::time::Instant> = None;
-    // Set on the first failed delivery after a success (or after startup) and cleared on the next
-    // successful one -- what turns a *stream* of `send_failed` warnings into the two edge events
-    // an operator actually wants alerted on (`docs/plans/operator-surface.md`): `degraded` once,
-    // then silence until either delivery resumes (`recovered`) or the permanent-failure window
-    // ends the loop outright.
+    // Turns a stream of `send_failed` warnings into two edge events: `degraded` on the first
+    // failure, `recovered` on the next success.
     let mut degraded = false;
 
     loop {
-        // Two-step, rather than touching `output` from inside either `select!`'s handler arms:
-        // one arm below (`deliver_with_retry`) already borrows `output` mutably for the future
-        // itself, and a handler block running `output` too would be a second overlapping mutable
-        // borrow as far as the borrow checker's concerned even though only one future is ever
-        // actually driven to completion. Reducing each `select!` to a plain enum keeps every
-        // `output` access outside the macro, in the `match` below, where there's no ambiguity.
+        // Each `select!` reduces to a plain enum so no handler arm touches `output`: the
+        // `deliver_with_retry` future already borrows it mutably, and the borrow checker rejects
+        // a second overlapping borrow inside the macro.
         enum NextBatch {
             Batch(Arc<EventBatch>, BatchContext),
             Closed,
@@ -1117,12 +872,9 @@ async fn write_loop(
             NextBatch::ShutdownExpired => return Ok(()),
         };
 
-        // The sink span: the only span that can carry `SpanStatus::Error` and a fault tag,
-        // which is the whole point of instrumenting a sink
-        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). `ctx.trace.child()` is
-        // minted, used as this span's identity, and then discarded -- `run_output` emits nothing
-        // further downstream for anything to inherit it (`Output::send` takes `&EventBatch`, not
-        // `&Delivered`), so there is no propagation left to do with it beyond this one span.
+        // The sink span, the only one that carries `SpanStatus::Error` and a fault tag
+        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). Its `child()` context
+        // is its own identity and goes nowhere else: a sink has nothing downstream to propagate to.
         let span_ctx = ctx.trace.child();
         let mut span = telemetry.span(
             "deliver",
@@ -1133,11 +885,8 @@ async fn write_loop(
         );
         span.events(batch.events.len() as u64);
 
-        // Gives the sink this batch's `BatchContext` before each delivery attempt (including
-        // retries, since `batch`/`ctx` here are the same values across the whole
-        // `deliver_with_retry` call below) -- `logit_out` is the one implementer today, threading
-        // provenance across the wire (`docs/adr/batch-provenance-on-delivered.md`). Default
-        // no-op for every other sink.
+        // Once per batch, covering all its retries. `logit_out` uses it to carry provenance
+        // across the wire (`docs/adr/batch-provenance-on-delivered.md`); a no-op elsewhere.
         output.observe_batch(ctx);
 
         enum DeliverStep {
@@ -1207,12 +956,8 @@ async fn write_loop(
                         .with_context(|| format!("component '{id}'"));
                     }
                 } else {
-                    // Anything short of an explicit configuration-error classification -- a
-                    // budget-exhausted Clean/Ambiguous fault (a destination that's merely
-                    // slow/down), or an unclassified error that only defaulted to Permanent --
-                    // breaks the streak exactly like a success would: the exit condition is a
-                    // sustained run of nothing *but* explicitly-identified configuration errors,
-                    // not merely "nothing else was retryable."
+                    // Anything short of an explicit config error breaks the streak (see this
+                    // function's doc).
                     permanent_streak_since = None;
                 }
             }
@@ -1221,19 +966,12 @@ async fn write_loop(
     Ok(())
 }
 
-/// Telemetry accounting plus one `Output::send` call -- factored out (rather than left inline) for
-/// the same reason [`process_batch`] below is: so it can be measured directly in
-/// `crates/logit-bench/tests/allocations.rs`/`benches/pipeline.rs`, with no channel or the rest of
-/// the node runtime involved. Unlike `process_batch` this stays `async`, because `Output::send`
-/// itself is; call it from a `current_thread` runtime with no `tokio::spawn` to keep it measurable
-/// the same way `fanout.rs`'s own tests already are.
+/// Telemetry accounting plus one `Output::send` call, for `logit-bench`'s allocation tests and
+/// benches to measure that hop in isolation. Call it from a `current_thread` runtime with no
+/// `tokio::spawn`.
 ///
-/// No caller in this crate any more -- `run_output`'s real delivery path now goes through
-/// `deliver_with_retry`/`write_loop` (`docs/adr/buffered-sink-delivery.md`), which calls
-/// `output.send` directly so it can classify the resulting `Fault` and drive retry/posture
-/// decisions from it; `send_batch`'s all-or-nothing `anyhow::Result` return doesn't fit that. Kept
-/// as its own `pub` function purely so the bench/allocations harness can still measure this exact
-/// "one send, with telemetry" hop in isolation.
+/// Not on the runtime's delivery path: `write_loop` calls `output.send` through
+/// `deliver_with_retry`, which needs the error's `Fault` for retry decisions.
 pub async fn send_batch(
     id: &str,
     output: &mut (dyn Output + Send),
@@ -1256,10 +994,9 @@ pub async fn send_batch(
     result.with_context(|| format!("component '{id}'"))
 }
 
-/// A `Transform`-trait node's loop: races its inbox against its own flush deadline (if it has
-/// one), exactly the shape `run_lua` below uses for a Lua node with `interval` set -- but as a
-/// plain tokio task, this one can use `tokio::time::timeout` directly with no `Handle::block_on`
-/// indirection, since it's already running inside the async runtime.
+/// A `Transform`-trait node's loop: races its inbox against its flush deadline, if it has one,
+/// with `tokio::time::timeout`. `run_lua` has the same shape through `Handle::block_on`. Flushes
+/// once more when the inbox closes.
 async fn run_transform(
     mut transform: Box<dyn Transform + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
@@ -1292,34 +1029,26 @@ async fn run_transform(
             }
         };
         let Some(batch) = batch else {
-            // Inbox closed: flush once more so an in-flight window isn't silently lost, then exit.
+            // Inbox closed: flush once more so an in-flight window isn't lost, then exit.
             if next_flush.is_some() {
                 run_flush(&mut *transform, &fanout, &telemetry).await;
             }
             return Ok(());
         };
-        // Read before `unwrap_batch` consumes `batch` -- this call's entire emission (whatever
-        // survives `process_batch`, however many events it started from) traces back to this one
-        // incoming batch, so it's the unambiguous parent (`TraceContext`'s own doc comment,
-        // `crates/logit-pipeline/src/fanout.rs`). `run_flush` below has no such single parent and
-        // deliberately doesn't do this. `parent.provenance` is what this batch arrived carrying --
-        // propagated through unchanged to `ctx` below, for `Fanout::stamp` to rewrite `previous`
-        // onto while leaving `origin` alone.
+        // Read before `unwrap_batch` consumes `batch`. Everything this call emits comes from this
+        // one batch, so it's the unambiguous parent (`TraceContext`); `run_flush` has no single
+        // parent and mints a root. `parent.provenance` passes through unchanged, for
+        // `Fanout::stamp` to rewrite `previous` while keeping `origin`.
         let parent = batch.batch_context();
-        // Lets a flush-bearing transform (only `Aggregator` today) record this batch as a
-        // contributor to whatever it's about to absorb from it -- the flush-side linking
-        // `TraceContext`'s doc comment and `docs/known-gaps.md`'s internal-spans entry describe.
-        // A no-op for every other transform. `observe_provenance` is the same idea for
-        // `Provenance` -- `has_provenance`/`drop_provenance` cache it here and read it back in
-        // `process`; a no-op for every other transform.
+        // `observe_batch_context` lets a flush-bearing transform (`Aggregator`) link this batch
+        // as a contributor to its next flush. `observe_provenance` hands `has_provenance`/
+        // `drop_provenance` the batch's provenance to read in `process`. Both are no-ops for
+        // other transforms.
         transform.observe_batch_context(parent.trace);
         transform.observe_provenance(parent.provenance);
-        // Minted here, not inside `Fanout::send_with_context`, because this node records its own
-        // span around `process_batch` *and* the send
-        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`'s per-node-kind
-        // table): the span's `span_id` and the outgoing
-        // `Delivered`'s `span_id` have to be the same id, which only holds if this is the one and
-        // only place a context is minted for this emission.
+        // Minted here, not in `Fanout`, because this node's span covers `process_batch` and the
+        // send, and the span's `span_id` must equal the outgoing `Delivered`'s
+        // (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
         let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
         let mut span = telemetry.span(
             "process",
@@ -1336,16 +1065,12 @@ async fn run_transform(
     }
 }
 
-/// The per-batch body of `run_transform`'s loop above: telemetry accounting plus feeding every
-/// event through `Transform::process`, in place, dropping what it absorbs. `Vec::retain_mut` over
-/// the batch's own `events`, not a second `out` Vec collected into: `Transform::process` takes
-/// `&mut Event` and answers `bool` (its own doc comment says why), so a forwarded event is never
-/// moved and the batch needs no allocation of its own to hold the survivors. Factored out (rather
-/// than left inline) so `crates/logit-bench/tests/allocations.rs` can measure the real code path
-/// directly,
-/// instead of a hand-written replica -- the same "call it directly" approach
-/// `docs/design/memory.md` §7 already uses for every other stage, applied to the node runtime for
-/// the first time. `run_transform` is the only caller in this crate; `pub` is for the bench.
+/// The per-batch body of `run_transform`: telemetry accounting plus `Transform::process` over
+/// every event in place, dropping what it absorbs. `Vec::retain_mut` over the batch's own
+/// `events`, so a forwarded event never moves and the survivors need no new allocation.
+///
+/// `pub` so `crates/logit-bench/tests/allocations.rs` can measure the real path
+/// (`docs/design/memory.md` §7).
 pub fn process_batch(
     transform: &mut (dyn Transform + Send),
     batch: EventBatch,
@@ -1354,15 +1079,10 @@ pub fn process_batch(
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
-    // `map_resource` before any event reaches `process`, per `Transform::map_resource`'s doc
-    // comment -- `None` (the common case) moves the incoming `Arc` straight through with no
-    // clone; `Some` substitutes it for both `process`'s argument and the outgoing batch. `scope`
-    // is read out first since it has no analogous `map_scope` hook to consult -- it always rides
-    // straight through onto the outgoing batch unchanged, but is *also* handed to
-    // `Transform::observe_scope` (a no-op for every implementer but `Aggregator`) so a
-    // flush-bearing transform can stamp its own, separately-timed emission with it too
-    // (`FlushOutput`'s own doc comment) -- the same "read here, cached on self, consulted again at
-    // flush" shape `observe_batch_context` already uses for `TraceContext`.
+    // `map_resource` runs before any event reaches `process`. `None` (the common case) moves the
+    // incoming `Arc` through with no clone; `Some` replaces it for `process` and the output.
+    // `scope` passes through unchanged and is also handed to `observe_scope`, so a flush-bearing
+    // transform (`Aggregator`) can stamp its flush with it (`FlushOutput`).
     let EventBatch { resource, scope, mut events } = batch;
     transform.observe_scope(scope.clone());
     let resource = transform.map_resource(&resource).unwrap_or(resource);
@@ -1370,9 +1090,8 @@ pub fn process_batch(
     let process_timer = telemetry.timer("logit.component.process.duration");
     let before = events.len();
     events.retain_mut(|event| transform.process(&resource, event));
-    // Inside the timer on purpose: whatever a transform defers to `end_batch` is still its own
-    // per-batch work (`Transform::end_batch`'s doc comment), and attribution
-    // (`docs/design/internal-telemetry.md`) should keep charging it to this node.
+    // Inside the timer: work a transform defers to `end_batch` is still this node's per-batch
+    // cost (`docs/design/internal-telemetry.md`).
     transform.end_batch();
     drop(process_timer);
     let absorbed = (before - events.len()) as u64;
@@ -1390,20 +1109,15 @@ pub fn process_batch(
     }
 }
 
-/// A [`Router`] node's loop: `run_transform`'s shape minus the flush-deadline race, because no
-/// router flushes (`crate::router`'s module doc says why that is a contract, not a gap). Per
-/// incoming batch it mints **one** child context and records **one** `"process"` span, then sends
-/// one batch per non-empty destination under that same context -- one incoming batch is one hop
-/// however many ways it forks, exactly the rule `Fanout` already applies to an ordinary fan-out
+/// A [`Router`] node's loop: `run_transform` minus the flush-deadline race, since no router
+/// flushes (`crate::router`). Per incoming batch it mints one child context and records one
+/// `"process"` span, then sends one batch per non-empty destination under that same context: one
+/// batch is one hop however many ways it forks, as with `Fanout`
 /// (`docs/design/pipeline-graph.md`'s "Trace context propagation").
 ///
-/// Provenance passes through untouched: `ctx.provenance` is whatever arrived, and each
-/// destination's own `Fanout::stamp` rewrites `previous` to *its* component -- the target's id for
-/// a target slot, this router's id for the ordinary forward edge -- while `origin` keeps the
-/// listener that created the batch. That is the whole of `docs/adr/target-components.md`'s
-/// "`previous` downstream of a target is the target's id", with no code of its own.
-///
-/// When the inbox closes, return `Ok(())` immediately: there is nothing accumulated to flush.
+/// Provenance passes through; each destination's `Fanout::stamp` rewrites `previous` to its own
+/// id (the target's, or this router's for the forward edge) and keeps `origin`. That's all of
+/// `docs/adr/target-components.md`'s "`previous` downstream of a target is the target's id".
 async fn run_router(
     mut router: Box<dyn Router + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
@@ -1411,22 +1125,17 @@ async fn run_router(
     targets: Vec<Fanout>,
     telemetry: Telemetry,
 ) -> anyhow::Result<()> {
-    // Node-owned and reused for the life of the node -- see `RouterScratch`'s own doc comment for
-    // the allocation accounting that buys.
+    // Reused for the node's life; `RouterScratch` documents the allocations that saves.
     let mut scratch = RouterScratch::new(targets.len());
 
     while let Some(batch) = inbox.recv().await {
-        // Read before `unwrap_batch` consumes `batch`, same as `run_transform` -- every partition
-        // this router emits traces back to this one incoming batch, so it is the unambiguous
-        // parent, and `parent.provenance` is what rides through to each destination's `stamp`.
+        // Every partition comes from this one batch: the unambiguous parent, as in
+        // `run_transform`.
         let parent = batch.batch_context();
         router.observe_batch_context(parent.trace);
         router.observe_provenance(parent.provenance);
-        // Minted here, not inside `Fanout::send_with_own_context`, for the same reason
-        // `run_transform` mints its own: this node records a span around the routing *and* the
-        // sends, and that span's `span_id` has to be the one the outgoing `Delivered`s carry --
-        // which only holds if this is the single place a context is minted for this emission.
-        // Every destination gets the *identical* context: one batch forking N ways is one hop.
+        // Minted here so the span and every outgoing `Delivered` share one `span_id`; every
+        // destination gets the identical context.
         let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
         let mut span = telemetry.span(
             "process",
@@ -1436,9 +1145,8 @@ async fn run_router(
             Some(parent.trace.span_id),
         );
         let batch = unwrap_batch(batch);
-        // `observe_scope` and `map_resource` are applied *inside* `route_batch`, exactly where
-        // `process_batch` applies them, so an allocation suite measuring `route_batch` directly
-        // measures the same path the node runs.
+        // `observe_scope` and `map_resource` run inside `route_batch`, as in `process_batch`, so
+        // the allocation suite measuring `route_batch` measures the node's real path.
         let partitions = route_batch(&mut *router, &mut scratch, batch, &telemetry);
         span.events(partitions.iter().map(|(_, batch)| batch.events.len() as u64).sum());
 
@@ -1453,10 +1161,9 @@ async fn run_router(
                     None => continue,
                 },
             };
-            // `Fanout::deliver` returns early on zero consumers and counts *nothing*, so the
-            // ADR's "unrouted events are dropped and counted, never silently" has to be explicit
-            // here. A router with targets and no ordinary consumers is a legal config (rule 50),
-            // and its forward partition is exactly the events no route claimed.
+            // `Fanout::deliver` returns early on zero consumers and counts nothing, so unrouted
+            // events must be counted here. A router with targets and no ordinary consumers is
+            // legal (rule 50); its forward partition is the events no route claimed.
             if slot == 0 && destination.is_empty() {
                 telemetry.count(
                     "logit.component.events.dropped",
@@ -1471,34 +1178,29 @@ async fn run_router(
     Ok(())
 }
 
-/// The per-batch body of `run_router`'s loop above -- the partition itself: telemetry accounting,
-/// then `Router::route` over every event and one outgoing [`EventBatch`] per destination that
-/// received at least one. `pub` for the same reason [`process_batch`] is: so
-/// `crates/logit-bench/tests/allocations.rs` measures the real code path rather than a replica.
+/// The per-batch body of `run_router`: telemetry accounting, `Router::route` over every event, and
+/// one outgoing [`EventBatch`] per destination that received at least one event. `pub` so
+/// `crates/logit-bench/tests/allocations.rs` measures the real path.
 ///
-/// **Four passes, and why.** `Router::route` *borrows* its event (that trait method's own doc
-/// comment: an `Event` is large enough that returning one through an enum would memcpy the whole
-/// batch), so every verdict has to be recorded before anything moves:
+/// Four passes, because `Router::route` borrows its event (returning an `Event` through an enum
+/// would memcpy the batch), so every verdict is recorded before anything moves:
 ///
-/// 1. **Route.** One `Destination` per event, borrowing, appended to `scratch.marks`.
-/// 2. **Count.** `scratch.counts[d]`, straight off those marks.
-/// 3. **Reserve.** `reserve_exact(count)` on each destination with a non-zero count. Every
-///    `scratch.dests` entry was left empty *with capacity 0* by the previous batch's
-///    `std::mem::take`, so this is the one and only allocation that destination makes.
-/// 4. **Move.** `batch.events.into_iter().zip(&marks)`, each event pushed into its destination's
-///    now exactly-sized buffer -- no growth doubling, no reallocation, no event copied twice.
+/// 1. **Route.** One `Destination` per event, appended to `scratch.marks`.
+/// 2. **Count.** `scratch.counts[d]` from those marks.
+/// 3. **Reserve.** `reserve_exact(count)` on each destination with a nonzero count. The previous
+///    batch's `std::mem::take` left every `scratch.dests` entry at capacity 0, so this is that
+///    destination's only allocation.
+/// 4. **Move.** Each event is pushed into its exactly sized buffer: no regrowth, no second copy.
 ///
-/// **Allocation accounting** -- what `docs/adr/target-components.md` commits to, and what W4's
-/// exact-equality suite pins: **`1 + (destinations that received at least one event)` per batch,
-/// and zero per event.** The `1` is the returned `Vec<(usize, EventBatch)>`, sized `used` up
-/// front; each used destination's is its own `reserve_exact`. `scratch.marks`/`scratch.counts`
-/// amortize to zero (both refilled in place, never reallocated once grown to this node's largest
-/// batch), `resource`/`scope` are refcount bumps, and a destination that received nothing
-/// allocates nothing at all -- which is what makes that number an integer rather than a curve.
+/// Allocations: `1 + (destinations that received at least one event)` per batch, zero per event
+/// (`docs/adr/target-components.md`; pinned by
+/// `route_batch_two_targets_costs_one_vec_per_used_destination`). The `1` is the returned `Vec`,
+/// sized `used` up front. `scratch.marks`/`scratch.counts` amortize to zero once grown to the
+/// node's largest batch, `resource`/`scope` are refcount bumps, and an unused destination
+/// allocates nothing.
 ///
-/// An out-of-range `Destination::To(n)` is a programming error in a `Router` impl (slots come
-/// from `graph::targets_of`, which is what sized this scratch) -- a `debug_assert!` in debug
-/// builds, treated as unrouted with a warning in release; never reachable from a resolved graph.
+/// An out-of-range `Destination::To(n)` is a bug in the `Router` impl: a `debug_assert!` in debug
+/// builds, unrouted with a warning in release. A resolved graph never produces one.
 pub fn route_batch(
     router: &mut (dyn Router + Send),
     scratch: &mut RouterScratch,
@@ -1508,10 +1210,8 @@ pub fn route_batch(
     telemetry.count("logit.component.batches.received", 1.0, &[]);
     telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
-    // Read out and handed over exactly as `process_batch` does it: `scope` has no `map_scope` hook
-    // to consult and rides straight through onto every outgoing partition, but is still offered to
-    // `observe_scope`; `map_resource`'s `None` (both shipped routers) moves the incoming `Arc`
-    // straight through with no clone.
+    // As in `process_batch`: `scope` passes through to every partition and is offered to
+    // `observe_scope`; `map_resource`'s `None` (both shipped routers) moves the `Arc`, no clone.
     let scope = batch.scope.clone();
     router.observe_scope(scope.clone());
     let resource = router.map_resource(&batch.resource).unwrap_or(batch.resource);
@@ -1550,7 +1250,7 @@ pub fn route_batch(
         scratch.counts[slot_of(*mark)] += 1;
     }
 
-    // Pass 3: reserve exactly, and only where something is actually going.
+    // Pass 3: reserve exactly, and only where something is going.
     let mut used = 0usize;
     for (dest, count) in scratch.dests.iter_mut().zip(&scratch.counts) {
         if *count > 0 {
@@ -1559,8 +1259,7 @@ pub fn route_batch(
         }
     }
 
-    // Pass 4: move. Every event in, every event out -- a router never absorbs
-    // (`crate::router`'s module doc on why there is no `Destination::Drop`).
+    // Pass 4: move. A router never absorbs (`crate::router`: no `Destination::Drop`).
     for (event, mark) in batch.events.into_iter().zip(&scratch.marks) {
         scratch.dests[slot_of(*mark)].push(event);
     }
@@ -1571,23 +1270,22 @@ pub fn route_batch(
         if dest.is_empty() {
             continue;
         }
-        // `mem::take` hands the exactly-sized buffer out and leaves a capacity-0 `Vec` behind for
-        // the next batch's `reserve_exact` -- see `RouterScratch`'s own doc comment.
+        // Leaves a capacity-0 `Vec` for the next batch's `reserve_exact` (`RouterScratch`).
         let events = std::mem::take(dest);
         out.push((slot, EventBatch { resource: resource.clone(), scope: scope.clone(), events }));
     }
     out
 }
 
-/// The slot-ordered target `Fanout`s one routing node owns, cloned out of the pre-spawn map
-/// [`run_with_telemetry`] built -- shared by the two node kinds that route, `NodeSpec::Router` and
-/// a `NodeSpec::Lua` whose component declares `targets:`.
+/// The slot-ordered target `Fanout`s one routing node (`NodeSpec::Router`, or `NodeSpec::Lua`
+/// with `targets:`) owns, cloned from [`run_with_telemetry`]'s pre-spawn map.
 ///
-/// Slot order *is* `ResolvedComponent::targets`' order, which is `graph::targets_of`'s order --
-/// the one place that order is derived (`docs/adr/target-components.md`), so `Destination::To(n)`
-/// (a native `Router`) and the n-th id in a Lua component's `targets:` (`event:to("..")`'s name ->
-/// slot table) mean the same target. Cloning a `Fanout` clones its `Sender`s, so two routers
-/// directing at one target is fan-in at that target for free, exactly as `sources:` fan-in is.
+/// Slot order is `ResolvedComponent::targets`' order, derived only in `graph::targets_of`, so
+/// `Destination::To(n)` and the n-th id in a Lua component's `targets:` name the same target.
+///
+/// # Panics
+///
+/// If a target id has no `Fanout`; graph rules 48/49 rule that out.
 fn resolve_target_fanouts(
     id: &str,
     targets: &[String],
@@ -1615,34 +1313,20 @@ fn slot_of(destination: Destination) -> usize {
     }
 }
 
-/// Shared by `run_transform`'s two flush call sites (the deadline tick and the close-time flush).
-/// Timed as one call even when it yields several `(resource, events)` groups -- `flush`'s own
-/// per-resource windowing (`docs/adr/aggregation-window-semantics.md`) is internal to the
-/// transform, not something this timing needs to break out further.
+/// Runs one flush, for both `run_transform`'s deadline tick and its close-time flush. Timed as one
+/// call however many resource groups it yields.
 ///
-/// **Mints one root before `transform.flush(now)`, then sends every resource group under that
-/// same root via `send_with_own_context`.** A flushed batch is built from however many incoming
-/// batches `Transform::process` absorbed since the last tick -- an *n*-to-1 relationship, not the
-/// 1-to-1 the non-flush path (`process_batch`'s caller, above) propagates a real parent for, so
-/// there is still no single correct parent to inherit (`TraceContext`'s own doc comment,
-/// `crates/logit-pipeline/src/fanout.rs`; `docs/known-gaps.md`'s internal-spans entry tracks this
-/// *n*-to-1 gap as deliberate, not something this function is wrong to leave open). What changed
-/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`): earlier, every resource
-/// group minted its *own* fresh root via plain `fanout.send`, so an `aggregate` flush spanning
-/// several resources looked like several unrelated hops; now one root is minted before `flush()`
-/// runs, and every group's batch goes out as a *sibling* under it -- one flush is one unit of
-/// work, and N resource groups are an internal detail of `aggregate`'s per-resource windowing
-/// (`docs/adr/aggregation-window-semantics.md`), not N hops. The contributing-context links
-/// `Transform::flush` returns per event (`Aggregator`'s bounded `ContributingContexts`) are unioned
-/// onto this one flush span, bounded by `MAX_LINKS_PER_SPAN` same as any other span's links.
+/// Mints one fresh root before `transform.flush(now)` and sends every resource group under it as
+/// siblings: one flush is one unit of work, not one hop per group. A root, not a parent, because a
+/// flush is *n*-to-1 over the batches absorbed since the last tick, with no single correct parent
+/// (`TraceContext`; `docs/known-gaps.md`'s internal-spans entry;
+/// `docs/adr/internal-span-emission-and-deterministic-sampling.md`). The contributing-context
+/// links `Transform::flush` returns per event are unioned onto the flush span, bounded by
+/// `MAX_LINKS_PER_SPAN`.
 async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
-    // Empty provenance in, same as the trace context's fresh root: a flush is a genuinely new
-    // artifact (merged sketches/counters that were never any one input event), so there is no
-    // single incoming batch's `origin`/`previous` to inherit any more than there's a single
-    // incoming `TraceContext` to inherit. `Fanout::stamp` (`fanout.rs`) fills in *both*
-    // `origin` and `previous` as this flushing component's own id -- exactly the same rule a
-    // listener's first send gets, and for the same reason: nothing upstream to attribute this
-    // emission to. See `docs/adr/batch-provenance-on-delivered.md`.
+    // Empty provenance, for the same reason as the fresh root: a flush has no single upstream
+    // batch. `Fanout::stamp` fills both `origin` and `previous` with this component's id, as for
+    // a listener's first send (`docs/adr/batch-provenance-on-delivered.md`).
     let ctx: BatchContext = TraceContext::new_root().into();
     let mut span =
         telemetry.span("flush", SpanKind::Internal, ctx.trace.trace_id, ctx.trace.span_id, None);
@@ -1663,62 +1347,41 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
             span.links(links);
             events.push(event);
         }
-        // `scope` now rides straight through from `Transform::flush`'s own `(resource, scope,
-        // events)` grouping (`FlushOutput`'s doc comment) instead of always being `None` -- the
-        // `otlp_in -> aggregate -> otlp_out` scope loss this closes (`docs/plans/
-        // lossless-transit.md`'s W2). `Aggregator` groups by `(resource, scope)` value
-        // (`ResourceGroup`, `crates/logit-transforms/src/aggregate.rs`), so each flushed group
-        // here already carries the one scope every series in it shares.
+        // `Aggregator` groups by `(resource, scope)` value, so each flushed group carries the
+        // one scope all its series share; dropping it would lose scope on
+        // `otlp_in -> aggregate -> otlp_out`.
         fanout.send_with_own_context(EventBatch { resource, scope, events }, ctx).await;
     }
     span.events(total_events);
 }
 
-/// A Lua node's loop, on its own dedicated OS thread (`ScriptWorker` is `!Send`). Structurally
-/// the same as `run_transform` above, but `tokio::time::timeout` needs an async context this
-/// plain thread doesn't have on its own -- `runtime` (a `Handle` to the multi-thread runtime
-/// `run` was called from) supplies one via `Handle::block_on`, legal here since this never runs
-/// on the runtime's own worker threads and never nests inside another `.await`. `fanout.send`
-/// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
+/// A Lua node's loop, on its own OS thread (`ScriptWorker` is `!Send`). Same shape as
+/// `run_transform`, but the thread has no async context: `runtime` supplies one through
+/// `Handle::block_on`, which is legal because this never runs on a runtime worker thread or
+/// inside another `.await`. For the same reason it sends with `fanout.send_blocking`.
 ///
-/// **A Lua `flush()` runs in a root context** (`docs/adr/lua-flush-root-context.md`): it is the
-/// result of no one event or batch, so before every `flush()` call this node resets the script's
-/// four batch-scoped globals to what a stand-alone emission genuinely is -- `trace` to the fresh
-/// root the emission is sent under, `provenance` to this component as both `origin` and
-/// `previous` (what this node's own outbound edge stamps; an event marked for a `target` takes a
-/// further hop, and that target's `Fanout` rewrites `previous` to the target's id exactly as it
-/// does on the `process()` path, leaving `origin` this node), `resource` to empty, and `scope` to
-/// none. A script that writes `resource` and/or `scope` inside `flush()`
-/// (`crates/logit-script/src/resource.rs`, `crates/logit-script/src/scope.rs`) gives the emission
-/// a real identity; one that doesn't emits under the empty root -- see `flush_now`'s
-/// `take_resource`/`take_scope` calls below. Nothing from the most recently processed batch
-/// carries over, by design.
+/// A Lua `flush()` runs in a root context (`docs/adr/lua-flush-root-context.md`). Before every
+/// `flush()`, the script's four batch-scoped globals are reset: `trace` to the fresh root the
+/// emission goes out under, `provenance` to this component as both `origin` and `previous`,
+/// `resource` to empty, and `scope` to none. A script that writes `resource` or `scope` in
+/// `flush()` gives the emission that identity (see `flush_now`). Nothing carries over from the
+/// last processed batch.
 ///
-/// **A Lua node is also a router** (`docs/adr/target-components.md`): `targets` is the component's
-/// `targets:` list in `graph::targets_of` slot order -- handed to the VM as `event:to("..")`'s
-/// name -> slot table -- and `target_fanouts` is the matching slot-ordered set of target `Fanout`s.
-/// Every emitted event carries its own `Option<u16>` mark, so one incoming batch is partitioned
-/// into at most `target_fanouts.len() + 1` outgoing ones (slot 0 being this component's own
-/// outbound edge, the unrouted else-branch) and sent under the **one** `BatchContext` this node
-/// mints for that batch -- one incoming batch is one hop however many ways it forks, exactly the
-/// rule `run_router` and `Fanout` already apply. A component with no `targets:` has a single
-/// destination and behaves exactly as it did before any of this existed.
+/// A Lua node is also a router (`docs/adr/target-components.md`): `targets` is the component's
+/// `targets:` in slot order, handed to the VM as `event:to("..")`'s name -> slot table, and
+/// `target_fanouts` is the matching `Fanout`s. One incoming batch splits into at most
+/// `target_fanouts.len() + 1` outgoing batches (slot 0 is the node's own edge) under one
+/// `BatchContext`, as in `run_router`.
 ///
-/// **How the thread's exit reaches `run_with_telemetry`.** Two handshakes, not one: `ready_tx`
-/// carries the script-load outcome (a failure there is `RunError::Startup`; the run never
-/// reports ready), and `done_tx` carries the post-ready outcome -- `Ok(())` once the inbox closed
-/// and the loop returned on its own, `Err(message)` if the loop panicked. [`watch_lua_thread`]
-/// awaits `done_rx` as this node's `JoinSet` entry, so the join loop treats a Lua node's exit
-/// exactly as any task's: `NodeState::Finished` on `Ok`; `NodeState::Failed`, `Phase::Failed`
-/// (`/readyz`'s `degraded`), the graceful drain and `RunError::Runtime` on `Err`. The loop body
-/// runs under `catch_unwind` (`AssertUnwindSafe`: `ScriptWorker` holds `Lua` and `Rc<RefCell>`s,
-/// none of which are `UnwindSafe`, and nothing is used after the unwind anyway) so a panic becomes
-/// a message rather than a silently dropped sender; the default panic hook still prints its own
-/// line to stderr first, naming this `logit-{id}` thread. A script's *own* errors are not this
-/// path: `process()`/`flush()` raising is logged and counted inside [`run_lua_loop`] and never
-/// ends the node. The report is sent only after the closure has dropped `inbox` and the
-/// `Fanout`s, so by the time the watcher resolves the downstream cascade (consumers' inboxes
-/// closing, their close-time flushes running) is already underway.
+/// Two handshakes report to `run_with_telemetry`: `ready_tx` carries the script-load outcome (a
+/// failure is `RunError::Startup`), and `done_tx` the post-ready outcome, `Err` only on a panic.
+/// [`watch_lua_thread`] awaits `done_rx` as the node's `JoinSet` entry, so the join loop treats a
+/// Lua exit like any task's. The loop runs under `catch_unwind` so a panic becomes a message, not
+/// a dropped sender; `AssertUnwindSafe` because `ScriptWorker` holds `Lua` and `Rc<RefCell>`s and
+/// nothing is used after the unwind. A script's own `process()`/`flush()` errors are logged and
+/// counted in [`run_lua_loop`] and never end the node. `done_tx` sends only after the closure
+/// drops `inbox` and the `Fanout`s, so the downstream cascade is already underway when the
+/// watcher resolves.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1740,25 +1403,19 @@ fn run_lua(
     {
         Ok(worker) => worker,
         Err(err) => {
-            // The receiver may already be gone if `run` bailed for an unrelated reason first;
-            // nothing useful to do with that here.
+            // The receiver is gone only if `run` already bailed; nothing to do.
             let _ = ready_tx.send(Err(format!("loading a transform script: {err}")));
             return;
         }
     };
     let _ = ready_tx.send(Ok(()));
 
-    // No `logit-cli::pipeline::build_spec` attaches one the way every other kind's own
-    // `with_diagnostics` builder does -- `ScriptWorker` can't be constructed outside this thread
-    // (see `NodeSpec::Lua`'s own doc comment), so there's no earlier point to attach one at.
-    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent. Cloned so
-    // the panic report below still has one after the loop's own copy has moved into the closure.
+    // Built here because the registry can't attach one to a `ScriptWorker` it never constructs.
+    // Cloned so the panic report below has one after the loop's copy moves into the closure.
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
     let reporter = diag.clone();
 
-    // Interned here, where `id` still lives: the loop has no `String` to intern (everything it
-    // touches is moved in by value, `run_lua_loop`'s own doc comment) and only ever needs the
-    // `Symbol` -- the same one `Fanout::with_component` interned for this node's own edge.
+    // The same `Symbol` `Fanout::with_component` interned for this node's edge.
     let me = logit_core::interner::intern(&id);
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -1782,10 +1439,8 @@ fn run_lua(
     let _ = done_tx.send(report);
 }
 
-/// A Lua thread's post-ready outcome as a message [`watch_lua_thread`] can name the component
-/// in: a panic payload is a `&str` for a literal `panic!("..")`, a `String` for a formatted one,
-/// and anything at all for `panic_any` -- the fallback text keeps the report honest rather than
-/// silent for that last case.
+/// A Lua thread's post-ready outcome as a message. A panic payload is a `&str` for a literal
+/// `panic!`, a `String` for a formatted one, and anything for `panic_any`, hence the fallback.
 fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
@@ -1802,13 +1457,11 @@ fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
     }
 }
 
-/// A Lua node's `JoinSet` entry: nothing but a wait on the thread's `done` report (`run_lua`'s
-/// doc comment). Deliberately does *not* watch `shutdown`: a shutdown reaches the thread the
-/// same way it reaches every other node, by the cascade closing its inbox, after which the loop
-/// returns and reports on its own -- racing against `shutdown` here would only ever resolve
-/// *before* the thread has actually finished its close-time flush. The `Err(_)` arm (sender
-/// dropped without a message) is defensive: `run_lua` sends unconditionally after
-/// `catch_unwind`, so it's reachable only if the wrapper itself dies past that point.
+/// A Lua node's `JoinSet` entry: waits on the thread's `done` report (see `run_lua`).
+///
+/// Doesn't watch `shutdown`: shutdown reaches the thread through the cascade closing its inbox,
+/// and racing `shutdown` here would resolve before the thread's close-time flush finished. The
+/// `Err(_)` arm is defensive; `run_lua` always sends after `catch_unwind`.
 async fn watch_lua_thread(
     id: String,
     done_rx: oneshot::Receiver<Result<(), String>>,
@@ -1820,9 +1473,8 @@ async fn watch_lua_thread(
     }
 }
 
-/// The loop half of [`run_lua`], on the same thread, everything it touches moved in by value so
-/// `catch_unwind` has nothing borrowed to reason about. Returns once `inbox` closes (after a last
-/// `flush()` if the component has an interval); a panic anywhere in here is `run_lua`'s to report.
+/// The loop half of [`run_lua`]. Takes everything by value so `catch_unwind` has nothing borrowed.
+/// Returns once `inbox` closes, after a last `flush()` if the component has an interval.
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
@@ -1836,41 +1488,25 @@ fn run_lua_loop(
     mut diag: Diagnostics,
 ) {
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
-    // The root a `flush()` runs in (`run_lua`'s own doc comment): one empty resource shared
-    // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
-    // own id as both halves of the provenance -- the identical value `Fanout::stamp` fills an
-    // empty provenance in with on this node's *own* outbound edge, pre-filled here so what the
-    // script reads as `provenance.origin`/`.previous` is what a batch leaving that edge carries,
-    // by construction rather than by two code paths agreeing (`stamp` is idempotent over it:
-    // `get_or_insert` on an already-set `origin`, and `previous` overwritten with the same id).
-    // An event the script marked for a `target` takes one more hop first: that target's `Fanout`
-    // is built `with_component(<target id>)`, so `stamp` rewrites `previous` to the target's id
-    // there, exactly as it does for a marked event on the `process()` path
-    // (`docs/adr/target-components.md`). `origin`, filled in here, survives that hop untouched.
+    // A `flush()`'s root (see `run_lua`): one empty resource shared by every tick (an `Arc`
+    // clone, not an allocation), and this node's id as both halves of the provenance. That's
+    // the value `Fanout::stamp` would fill in on this node's edge, so the script reads what the
+    // batch will carry; `stamp` is idempotent over it. An event marked for a `target` gets
+    // `previous` rewritten to the target's id there, and keeps this `origin`.
     let root_resource = Arc::new(Resource::default());
     let flush_provenance = logit_core::Provenance { origin: Some(me), previous: Some(me) };
 
-    // The same node-owned, reused per-destination buffers a native `Router` uses
-    // (`RouterScratch`'s own doc comment has the allocation accounting) -- shared by the batch
-    // path and `flush_now` alike. Only `dests` is used here: a script hands back its verdict *with*
-    // each event (an `Option<u16>` mark on `ProcessOutcome`), so there is nothing for this node to
-    // route-then-count-then-move the way `route_batch`'s borrowing `Router::route` forces.
+    // The same reused per-destination buffers a native `Router` uses (`RouterScratch`), shared
+    // by the batch path and `flush_now`. Only `dests` is used: a script returns its verdict with
+    // each event, so there's no route-then-count pass as in `route_batch`.
     let mut scratch = RouterScratch::new(target_fanouts.len());
 
-    // Mints its own root and records this node's `flush` span directly (rather than going
-    // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
-    // `fanout.rs`'s own doc comment), same reasoning as `run_flush`'s: a Lua `flush()`'s emission
-    // has no single incoming batch to call its parent -- worse than `Transform::flush`, even,
-    // since there's no accumulator here at all to eventually attribute it to
-    // (`docs/adr/lua-flush-root-context.md`). The script sees that same root: every batch-scoped
-    // global is reset to it before `flush()` runs, so a script reading `trace`/`provenance`/
-    // `resource`/`scope` inside `flush()` reads what its emission will actually go out as, not
-    // whatever the last `process()` batch happened to leave behind.
+    // Mints its own root and records the `flush` span, as `run_flush` does: a Lua `flush()` has
+    // no single parent batch (`docs/adr/lua-flush-root-context.md`). The script's batch-scoped
+    // globals are reset to that root first, so `flush()` reads what its emission goes out as.
     //
-    // Takes `diag` as a parameter rather than capturing it: the loop body below also needs its
-    // own `&mut diag` (for `script_error`), and a closure capturing it by unique reference would
-    // hold that borrow for the closure's entire lifetime, conflicting with every other use. The
-    // same goes for `scratch`, whose per-destination buffers the batch path below also fills.
+    // `diag` and `scratch` are parameters, not captures: the loop body also borrows both mutably,
+    // and a capture would hold the borrow for the closure's lifetime.
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
                      fanout: &Fanout,
@@ -1884,8 +1520,7 @@ fn run_lua_loop(
             ctx.trace.span_id,
             None,
         );
-        // The root the script sees -- same four setters, same order, same failure handling as
-        // the per-batch path below, just fed the root instead of an incoming batch.
+        // The same four setters as the batch path below, fed the root.
         if let Err(err) = worker.set_trace_context(ctx.trace.trace_id, ctx.trace.span_id) {
             diag.warn_throttled(
                 "trace_context_error",
@@ -1897,37 +1532,25 @@ fn run_lua_loop(
         worker.set_scope(&None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
-        // The tick time reaches the script as `flush(now)` -- the same `now_unix_nanos()` value
-        // `run_flush` hands the native `aggregate`'s `Transform::flush`, so a flush-driven
-        // `Event.new{timestamp = now, ..}` is stamped the way an aggregate's window would be
+        // The same `now_unix_nanos()` `run_flush` hands `Transform::flush`, so a flush-driven
+        // `Event.new{timestamp = now, ..}` is stamped like an aggregate window
         // (`docs/adr/lua-event-constructor.md`).
         let result = worker.flush(now_unix_nanos());
         drop(timer);
-        // A `flush()` that wrote `resource` (`crates/logit-script/src/resource.rs`) commits that
-        // write here -- the one way a flush-driven emission carries a real identity instead of
-        // the empty root it otherwise goes out under. `None` means the script never wrote it, so
-        // the root moves through as an `Arc` clone, no allocation -- the same `unwrap_or` shape
-        // the batch path below uses for the incoming batch's own resource.
+        // A script that wrote `resource` in `flush()` gives the emission that identity; `None`
+        // keeps the empty root (an `Arc` clone, no allocation).
         let resource = worker.take_resource().unwrap_or_else(|| root_resource.clone());
-        // Same for `scope` (`crates/logit-script/src/scope.rs`): `take_scope` returns `Some` only
-        // once written, so an untouched `scope` stays the root's `None`.
+        // `Some` only if written, so an untouched `scope` stays the root's `None`.
         let scope = worker.take_scope();
-        // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
-        // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
-        // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
-        // arriving on the inbox between ticks) would otherwise leave `logit.script.vm.memory`
-        // frozen or absent for as long as the input stays idle -- the metric would go silent right
-        // when it matters. Sampled unconditionally, including the empty and error outcomes below:
-        // the VM's memory doesn't care whether `flush()` had anything to emit.
+        // Sampled on flush too, whatever the outcome: a script that grows only in `flush()`
+        // while the input is idle would otherwise leave this gauge silent when it matters.
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         match result {
             Ok(events) if !events.is_empty() => {
                 telemetry.count("logit.component.flush.events", events.len() as f64, &[]);
-                // "A `flush()`-built event honours its mark like any other"
-                // (`docs/adr/target-components.md`) -- the same partition-and-send-per-destination
-                // the batch path below does, under this flush's one root context. A flushed event
-                // is typically an `event:clone()` stashed during `process()`, and `clone` copies
-                // both the mark and the target table, so `e:to("x")` is resolvable from `flush()`.
+                // A flushed event honors its mark like any other (`docs/adr/target-components.md`).
+                // It's typically an `event:clone()` stashed in `process()`, and `clone` copies the
+                // mark and the target table, so `e:to("x")` resolves from `flush()`.
                 for (event, mark) in events {
                     let slot = lua_slot_of(mark, scratch.dests.len());
                     scratch.dests[slot].push(event);
@@ -1967,11 +1590,9 @@ fn run_lua_loop(
             None => inbox.blocking_recv(),
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-                // The `async` block matters, not just style: `tokio::time::timeout` builds its
-                // `Sleep` eagerly, and `Sleep` construction needs a runtime context, which this
-                // plain thread doesn't have outside of `block_on`. Deferring construction to
-                // inside the block (only polled once `block_on` has entered that context) is what
-                // makes this legal rather than an immediate panic.
+                // The `async` block is required: `tokio::time::timeout` builds its `Sleep` eagerly,
+                // which panics outside a runtime context. Inside the block it's built only once
+                // `block_on` has entered one.
                 match runtime.block_on(async { tokio::time::timeout(wait, inbox.recv()).await }) {
                     Ok(batch) => batch,
                     Err(_elapsed) => continue,
@@ -1984,16 +1605,10 @@ fn run_lua_loop(
             }
             return;
         };
-        // Read before `unwrap_batch` consumes `batch` -- same reasoning as `run_transform`'s
-        // non-flush path (`crates/logit-pipeline/src/fanout.rs`'s `TraceContext` doc comment):
-        // this call's entire emission traces back to this one incoming batch. `flush_now` above
-        // has no such single parent and deliberately doesn't do this. `parent.provenance` is
-        // propagated through to `ctx` unchanged, same as `run_transform`'s non-flush path.
+        // As in `run_transform`: this batch is the unambiguous parent of everything emitted
+        // below, provenance passes through, and the context is minted once here so the span's
+        // `span_id` matches the outgoing `Delivered`'s.
         let parent = batch.batch_context();
-        // Same reasoning as `run_transform`'s non-flush path: this node records its own span
-        // around `worker.process()` *and* the blocking send, so the context has to be minted once,
-        // here, rather than letting `Fanout::send_blocking_with_context` mint an unrelated one
-        // later -- the span's `span_id` and the outgoing `Delivered`'s `span_id` must match.
         let ctx = BatchContext { trace: parent.trace.child(), provenance: parent.provenance };
         let mut span = telemetry.span(
             "process",
@@ -2002,41 +1617,28 @@ fn run_lua_loop(
             ctx.trace.span_id,
             Some(parent.trace.span_id),
         );
-        // Lets the script's own `process()` read `trace.trace_id`/`trace.span_id`
-        // (`crates/logit-script/src/trace.rs`) -- essentially infallible in practice (the
-        // registry-held table is independent of whatever a script does to the `trace` global),
-        // logged rather than treated as fatal on the off chance it isn't.
+        // Exposes `trace` to `process()`. Effectively infallible (the registry-held table is
+        // independent of the script's `trace` global), so an error is logged, not fatal.
         if let Err(err) = worker.set_trace_context(parent.trace.trace_id, parent.trace.span_id) {
             diag.warn_throttled(
                 "trace_context_error",
                 format_args!("setting trace context failed: {err}"),
             );
         }
-        // Lets the script's own `process()` read `provenance.origin`/`.previous`
-        // (`crates/logit-script/src/provenance.rs`) -- a plain `Rc<RefCell<..>>` mutation, like
-        // `set_resource` just below, so unlike `set_trace_context` there's no `&Lua` call
-        // involved and so nothing that can fail.
         worker.set_provenance(parent.provenance);
         let batch = unwrap_batch(batch);
-        // Lets the script's own `process()` read (and write) `resource`
-        // (`crates/logit-script/src/resource.rs`) -- called on every batch, including one whose
-        // every event errors, so a write left over from the previous batch is always cleared.
+        // Set on every batch, even one whose events all error, so a previous batch's write to
+        // `resource` or `scope` never leaks into this one.
         worker.set_resource(&batch.resource);
-        // Same reasoning, for `scope` (`crates/logit-script/src/scope.rs`) -- `batch.scope` is
-        // `Option`al (not every batch carries one), which `set_scope` itself handles.
         worker.set_scope(&batch.scope);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
 
         let process_timer = telemetry.timer("logit.component.process.duration");
-        // One allocation, exactly as the single `Vec::with_capacity(batch.events.len())` this
-        // replaced was: every `scratch.dests` entry was left empty *with capacity 0* by the
-        // previous batch's `std::mem::take`, and slot 0 -- this component's own outbound edge --
-        // is where every event of a component with no `targets:` goes, and the great majority of
-        // events even on one that has them. A destination a script actually routes to grows
-        // normally instead: unlike `route_batch`, whose `Router::route` borrows and so can count
-        // every verdict before moving anything, a script hands its verdict back *with* the event,
-        // so there is no count to reserve from until the events have already been handed over.
+        // One allocation: the previous batch's `std::mem::take` left slot 0 at capacity 0, and
+        // slot 0 (this node's own edge) gets every event when there are no `targets:`, and most
+        // events otherwise. A target slot grows normally: a script returns its verdict with the
+        // event, so there's no count to reserve from, unlike `route_batch`.
         scratch.dests[0].reserve_exact(batch.events.len());
         let mut dropped: u64 = 0;
         let mut errors: u64 = 0;
@@ -2053,8 +1655,7 @@ fn run_lua_loop(
                         es.len() as f64,
                         &[("outcome", "emit_many")],
                     );
-                    // Each event in a `return {a, b}` carries its own mark, so one fan-out can
-                    // fork several ways (`docs/adr/target-components.md`).
+                    // Each event in a `return {a, b}` carries its own mark.
                     for (event, mark) in es {
                         scratch.dests[lua_slot_of(mark, slots)].push(event);
                     }
@@ -2067,9 +1668,8 @@ fn run_lua_loop(
             }
         }
         drop(process_timer);
-        // Sampled once per batch, not per event: the strongest single candidate found for
-        // observing a stateful script leaking VM-side state (`docs/design/internal-telemetry.md`)
-        // -- otherwise invisible until the process's own memory visibly grows.
+        // Once per batch: how a script leaking VM-side state becomes visible
+        // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
         if dropped > 0 {
             telemetry.count(
@@ -2080,29 +1680,17 @@ fn run_lua_loop(
         }
         if errors > 0 {
             telemetry.count("logit.component.errors", errors as f64, &[("reason", "process")]);
-            // Consistent with `write_loop`'s own rule (ADR `internal-span-emission-and-deterministic-sampling`): the call site whose error path
-            // fired is the one that marks the span, not a downstream reader inferring it from
-            // `logit.component.errors`. A batch with *any* script error, even a partial one mixed
-            // with successful emits, is not a clean node visit -- `span`'s default status is `Ok`,
-            // so a batch where every event errored (`out` stays empty, `span.events` never called
-            // below) would otherwise drain silently as a *successful* zero-event span instead of a
-            // failed one.
+            // Any script error, even mixed with successful emits, marks the span failed at the
+            // call site whose error path fired, as `write_loop` does. Without it, a batch whose
+            // every event errored would record a successful zero-event span.
             span.error();
         }
-        // Picks up a write to `resource` made anywhere during this batch's `process()` calls
-        // (`crates/logit-script/src/resource.rs`'s copy-on-write commit); `None` means the script
-        // never wrote it, so the incoming `Arc` moves straight through with no clone -- same
-        // `map_resource`-shaped contract `process_batch` (above) gives native transforms.
+        // A `resource` write from any `process()` call in this batch; `None` moves the incoming
+        // `Arc` through with no clone, like `map_resource` in `process_batch`.
         let resource = worker.take_resource().unwrap_or(batch.resource);
-        // Same pattern, for `scope` (`crates/logit-script/src/scope.rs`) -- `take_scope` returns
-        // `None` when the script never wrote it, so this falls back to whatever the incoming
-        // batch itself carried (which may itself be `None`), rather than `unwrap_or` (that would
-        // need an owned default `Scope` to unwrap into, and there isn't a sensible one -- `None`
-        // is the correct fallback, not `Scope::default()`).
+        // Unwritten falls back to the batch's own scope, which may itself be `None`.
         let scope = worker.take_scope().or_else(|| batch.scope.clone());
-        // One send per non-empty destination, all under the one `ctx` minted above -- one
-        // incoming batch is one hop however many ways it forks, the same rule `run_router`
-        // applies.
+        // One send per non-empty destination, all under the one `ctx`, as in `run_router`.
         let sent = send_lua_partitions(
             &mut scratch.dests,
             &fanout,
@@ -2118,15 +1706,13 @@ fn run_lua_loop(
     }
 }
 
-/// An `event:to(..)` mark -> index into `run_lua`'s per-destination buffers, the same slot
-/// numbering [`slot_of`] gives a native router's [`Destination`]: 0 is the component's own
-/// outbound edge (an unrouted event), `n + 1` is target slot `n`.
+/// An `event:to(..)` mark -> index into `run_lua`'s per-destination buffers, numbered as
+/// [`slot_of`] numbers a [`Destination`]: 0 is the node's own edge, `n + 1` is target slot `n`.
 ///
-/// An out-of-range slot cannot happen: the only thing that can set a mark is `event:to(id)`, and
-/// that resolves `id` against the very `targets:` list these buffers were sized from -- an
-/// unknown id is a script error, never a mark (`crates/logit-script/src/proxy.rs`'s
-/// `TargetTable`). `debug_assert!` anyway, and in release treat it as unrouted rather than
-/// panicking or indexing out of bounds, exactly as `route_batch` treats a buggy `Router`.
+/// An out-of-range mark can't happen: `event:to(id)` resolves against the same `targets:` list
+/// that sized the buffers, and an unknown id is a script error (`TargetTable` in
+/// `crates/logit-script/src/proxy.rs`). Debug builds assert; release treats it as unrouted, as
+/// `route_batch` does.
 fn lua_slot_of(mark: Option<u16>, slots: usize) -> usize {
     let Some(target) = mark else {
         return 0;
@@ -2143,18 +1729,12 @@ fn lua_slot_of(mark: Option<u16>, slots: usize) -> usize {
     }
 }
 
-/// Sends one Lua node's per-destination partition: one `EventBatch` per non-empty buffer, every
-/// one of them under the *same* [`BatchContext`] its caller minted, with `std::mem::take` handing
-/// each exactly-sized buffer out and leaving a capacity-0 `Vec` behind for the next batch (see
-/// [`RouterScratch`]). Returns the total number of events handed over, for the caller's span.
+/// Sends a Lua node's partition: one `EventBatch` per non-empty buffer, all under the caller's one
+/// [`BatchContext`], each buffer taken with `std::mem::take` (see [`RouterScratch`]). Returns the
+/// number of events handed over, for the caller's span. Used by both `run_lua` paths.
 ///
-/// Shared by `run_lua`'s batch path and its `flush_now`, which partition identically.
-///
-/// The `unrouted` rule is `run_router`'s, unchanged: `Fanout::deliver` returns early on zero
-/// consumers and counts *nothing*, so a router with targets and no ordinary consumers (a legal
-/// config, rule 50) has to count its own forward partition explicitly --
-/// `logit.component.events.dropped{reason="unrouted"}`, never silently
-/// (`docs/adr/target-components.md`, `docs/design/internal-telemetry.md`).
+/// Counts an unconsumed forward partition as `events.dropped{reason="unrouted"}`, as
+/// `run_router` does, since `Fanout::deliver` counts nothing on zero consumers.
 fn send_lua_partitions(
     dests: &mut [Vec<Event>],
     fanout: &Fanout,
@@ -2197,50 +1777,26 @@ fn send_lua_partitions(
     sent
 }
 
-/// Turns the channel payload back into an owned `EventBatch`, right before handing it to a
-/// `Transform`/`ScriptWorker::process` -- called from `run_transform`/`run_lua` only. `run_output`
-/// (above) never calls this: `Output::send` takes `&EventBatch`, so it borrows straight out of the
-/// `Delivered` instead, which is what actually realizes the fan-out saving for an `Output` branch
-/// (`docs/adr/arc-eventbatch-copy-on-write.md`'s "Round two"). `Transform`/`ScriptWorker`
-/// still need to mutate or consume an *owned* `Event`, so this unwrap can't be skipped for them.
+/// Turns the channel payload back into an owned `EventBatch` for `Transform::process` or
+/// `ScriptWorker::process`, which mutate or consume owned events. `run_output` never calls this:
+/// it keeps the batch as an `Arc` (`unwrap_batch_arc`) and `Output::send` borrows it
+/// (`docs/adr/arc-eventbatch-copy-on-write.md`).
 ///
-/// `Delivered::Owned` (a single-consumer edge) is already the owned batch: no `Arc` was ever
-/// involved, so this is free. `Delivered::Shared` (a real fan-out) unwraps via `Arc::try_unwrap`,
-/// which succeeds with no clone whenever this is the only remaining strong reference -- in
-/// practice, whichever branch happens to drop its own reference last at runtime. That is a
-/// best-effort saving over always cloning, not a guarantee that exactly one branch pays nothing:
-/// nothing about `Fanout::send` privileges one branch's handle over another's, and two branches
-/// racing to unwrap concurrently can both still observe a strong count above 1 and both fall back
-/// to cloning.
+/// `Delivered::Owned` (a single-consumer edge) is free. `Delivered::Shared` (a fan-out) uses
+/// `Arc::try_unwrap`, which avoids a clone only when this is the last strong reference: a
+/// best-effort saving, not a guarantee that one branch pays nothing, since two branches unwrapping
+/// concurrently can both see a count above 1 and both clone. An `Output` sibling doesn't make it
+/// deterministic: `drain_inbox` moves the `Arc` into the sink's store, where a `Memory` store
+/// holds it until `write_loop` commits the batch after delivery (a `Disk` store drops it once the
+/// record is written), so the unwrap here is free only if that sink got there first.
+/// `crates/logit-bench/tests/allocations.rs` pins both outcomes. Either way a branch's
+/// copy is independent before it can be mutated
+/// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch`).
 ///
-/// **An `Output` sibling on the same fan-out doesn't change this into a guarantee either way --
-/// it's still genuinely racy, just against a different clock than it used to be.** Before
-/// `docs/adr/buffered-sink-delivery.md` split `run_output` into `drain_inbox`/`write_loop`,
-/// the `Output` branch held its `Delivered` handle for the full duration of `output.send`, which
-/// typically does real I/O -- slower than a `Transform`'s local processing, making a clone (cost
-/// 6) the likelier practical outcome even though a free unwrap (cost 1) was reachable. That's no
-/// longer the shape: `drain_inbox` drops its `Delivered` the moment it matches it -- immediately on
-/// receipt, before even `queue.push`, entirely decoupled from how long the paired `write_loop`'s
-/// `output.send` takes. So whether *this* function's unwrap succeeds for a `Transform`/Lua sibling
-/// now comes down to whether `drain_inbox`'s near-instant match-and-drop wins the race against this
-/// call actually running, which -- both being cheap, local work with no I/O on either side -- is
-/// close to a coin flip biased toward the `Output` side finishing first, not the slow-I/O-bound
-/// race the old shape had. Both outcomes are still genuinely reachable (see
-/// `fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`,
-/// `crates/logit-bench/tests/allocations.rs` -- those tests measure `Fanout::send` directly, not
-/// through `run_output`, so their numbers are unaffected by this shift; only the *practical
-/// likelihood* of each outcome in the real running pipeline changed). Either outcome keeps
-/// isolation intact: a sibling branch's copy is always independent before it can be mutated
-/// (`a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` below pins this).
+/// `pub` for `crates/logit-bench/tests/allocations.rs`.
 ///
-/// `pub` (rather than crate-private) for `crates/logit-bench/tests/allocations.rs`, which needs
-/// to measure this allocation-relevant path directly rather than reconstruct it.
-///
-/// Discards `batch`'s `TraceContext` -- call [`Delivered::context`] first if the caller needs it
-/// as a parent for whatever it goes on to emit (`run_transform`/`run_lua`'s non-flush paths do).
-/// Kept out of this function's own return type deliberately: every existing caller before
-/// propagation landed just wanted the `EventBatch`, and `context()` costs nothing extra to call
-/// separately (it's a `Copy` read, not a consuming one).
+/// Discards the `BatchContext`; call [`Delivered::batch_context`] first when it's needed as a
+/// parent.
 pub fn unwrap_batch(batch: Delivered) -> EventBatch {
     match batch {
         Delivered::Owned(batch, _ctx) => batch,
@@ -2262,9 +1818,7 @@ fn now_unix_nanos() -> i64 {
 /// ticks. If the platform cannot represent the cadence's next instant, fall back to the smallest
 /// representable useful delay rather than overflowing or leaving the deadline due forever.
 ///
-/// `pub(crate)` rather than private: [`crate::accumulator::BatchAccumulator`] reuses this exact
-/// cadence math for its own interval-driven flush rather than a second copy
-/// (`docs/adr/decoupled-listener-io.md`).
+/// [`crate::accumulator::BatchAccumulator`] reuses it for its own interval flush.
 pub(crate) fn advance_flush_deadline(
     deadline: tokio::time::Instant,
     now: tokio::time::Instant,
@@ -2320,9 +1874,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Output for RecordingOutput {
         async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-            // `Output::send` only ever borrows (`docs/adr/arc-eventbatch-copy-on-write.md`);
-            // this test double clones onto its own plain `std::sync::mpsc` channel purely so the
-            // assertion side of each test can inspect what arrived after this async fn returns.
+            // Cloned so the test can inspect it after `send` returns.
             let _ = self.tx.send(batch.clone());
             Ok(())
         }
@@ -2338,8 +1890,7 @@ mod tests {
             if let Some(batch) = self.batch.take() {
                 sink.send(batch).await;
             }
-            // A real listener loops forever; for this test, just idle so `run`'s JoinSet has
-            // something to keep alive until the assertion side has what it needs.
+            // Idle like a real listener, keeping the graph alive.
             std::future::pending::<()>().await;
             Ok(())
         }
@@ -2453,9 +2004,7 @@ mod tests {
         );
     }
 
-    /// Unlike `OneShotInput` above (which idles forever after sending, to keep the graph alive
-    /// for that test's assertion), this returns as soon as it's sent its one batch -- a real
-    /// listener that has genuinely finished.
+    /// Sends one batch, then returns (unlike `OneShotInput`, which idles).
     struct FiniteInput {
         batch: Option<EventBatch>,
     }
@@ -2470,10 +2019,7 @@ mod tests {
         }
     }
 
-    /// Regression test: `run`'s internal `senders` map used to keep one extra `Sender` clone
-    /// alive, for every channel, for `run`'s entire lifetime -- so a downstream inbox could never
-    /// observe every real sender dropped and close, the shutdown cascade could never fire, and
-    /// `run` hung forever even after its only input had genuinely finished.
+    /// `run` drops its scaffolding `senders`, so inboxes close and `run` returns after the input.
     #[tokio::test]
     async fn run_returns_once_the_only_input_finishes_instead_of_hanging() {
         let mut components = Map::new();
@@ -2546,9 +2092,7 @@ mod tests {
         assert_eq!(received.events.len(), 1);
     }
 
-    /// A native `Transform` that mutates every event it sees by appending an extra metric --
-    /// standing in for any real transform (a Lua enrichment stage, `kv_metrics`, ...) that changes
-    /// an event on its way through one branch of a fan-out.
+    /// Appends an `extra` metric to every event.
     struct MutatingTransform;
 
     impl Transform for MutatingTransform {
@@ -2559,16 +2103,14 @@ mod tests {
         }
     }
 
-    /// A native `Transform` that substitutes the resource on every batch it sees -- standing in
-    /// for `logit-transforms::Set`'s `map_resource` implementation.
+    /// Substitutes the resource on every batch, like `logit-transforms::Set`.
     struct ResourceMappingTransform {
         replacement: Arc<Resource>,
     }
 
     impl Transform for ResourceMappingTransform {
         fn process(&mut self, resource: &Arc<Resource>, _event: &mut Event) -> bool {
-            // Proves `process_batch` passes the *mapped* resource to `process`, not the batch's
-            // original one.
+            // `process_batch` must pass the mapped resource, not the original.
             assert!(Arc::ptr_eq(resource, &self.replacement));
             true
         }
@@ -2578,9 +2120,7 @@ mod tests {
         }
     }
 
-    /// `Transform::map_resource`'s contract (`crates/logit-pipeline/src/transform.rs`): a `Some`
-    /// return substitutes the resource for both `process`'s argument (asserted inside
-    /// `ResourceMappingTransform::process` above) and the outgoing batch.
+    /// A `Some` from `map_resource` replaces the resource for `process` and the outgoing batch.
     #[test]
     fn process_batch_uses_map_resources_substituted_resource_for_the_outgoing_batch() {
         let mut attrs = AttrMap::new();
@@ -2602,8 +2142,7 @@ mod tests {
         );
     }
 
-    /// The `None` default (every existing native transform) must leave `process_batch`'s outgoing
-    /// batch carrying the *exact same* `Arc` the incoming batch had -- no clone, no substitution.
+    /// `map_resource`'s `None` default passes the incoming `Arc` through, no clone.
     #[test]
     fn process_batch_with_no_map_resource_override_passes_the_incoming_arc_through_unchanged() {
         let mut transform = MutatingTransform;
@@ -2619,18 +2158,7 @@ mod tests {
         assert!(Arc::ptr_eq(&out.resource, &resource), "the default map_resource must be a no-op");
     }
 
-    /// Operationalizes branch isolation (docs/adr/multi-payload-events.md). Since
-    /// docs/adr/arc-eventbatch-copy-on-write.md, `Fanout` no longer deep-clones eagerly at
-    /// send time -- a real fan-out hands every branch its own `Delivered::Shared` handle onto one
-    /// `Arc`, and the clone (if any) happens lazily, at `unwrap_batch`, right before a branch's own
-    /// node can touch the batch at all. Whichever branch doesn't win `Arc::try_unwrap` gets a real,
-    /// independent deep clone at that point, so no branch ever mutates a batch another branch still
-    /// holds a handle to -- a mutation one branch of a fan-out makes is still never visible on a
-    /// sibling branch's copy of the same upstream event, even now that `Event` can carry several
-    /// payloads at once. Proven against a real two-branch fan-out (one listener feeding a
-    /// mutating transform on one branch and a sink directly on the other -- exactly the "one
-    /// listener, two independently-processed downstream chains" shape ADR `component-graph-configuration` exists to make an
-    /// ordinary config, not an edge case), not just asserted in a design doc.
+    /// Branch isolation (`docs/adr/multi-payload-events.md`) through a real two-branch fan-out.
     #[tokio::test]
     async fn a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch() {
         let mut components = Map::new();
@@ -2650,9 +2178,7 @@ mod tests {
                 },
             },
         );
-        // `Json` is only a graph-arity placeholder here -- the runtime doesn't check that a
-        // component's `NodeSpec` implementation matches what its `ComponentKind` says, so
-        // `branch_a`'s actual behavior below comes entirely from the `MutatingTransform` NodeSpec.
+        // `Json` is an arity placeholder; the `MutatingTransform` spec is what runs.
         components.insert(
             "branch_a".to_string(),
             Component {
@@ -2755,11 +2281,8 @@ mod tests {
         }
     }
 
-    /// A local fake `Transform`, standing in for `logit-transforms::Aggregator` -- this crate
-    /// can't depend on `logit-transforms` (`docs/design/pipeline-graph.md`'s "Crate layout": the
-    /// dependency runs the other way). Absorbs every event it's given (`process` always returns
-    /// `false`) and only ever emits them from `flush`, exactly the shape needed to prove a
-    /// shutdown-triggered close-time flush actually drains what's buffered.
+    /// Stands in for `Aggregator` (this crate can't depend on `logit-transforms`): absorbs every
+    /// event and emits them only from `flush`.
     struct WindowingTransform {
         interval: Duration,
         buffered: Vec<Event>,
@@ -2767,9 +2290,7 @@ mod tests {
 
     impl Transform for WindowingTransform {
         fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
-            // Buffers the whole event, so it has to move it out of the caller's slot: `Event` has
-            // no `Default`, so `mem::replace` with an empty one rather than `mem::take`. The
-            // husk left behind is what `process_batch`'s `retain_mut` drops.
+            // `Event` has no `Default`, so `mem::replace`; `retain_mut` drops the husk.
             self.buffered.push(std::mem::replace(event, Event::empty(0, AttrMap::new())));
             false
         }
@@ -2791,9 +2312,7 @@ mod tests {
         }
     }
 
-    /// Like `OneShotInput`, but also signals `sent` once its one batch has been handed to
-    /// `sink.send` -- so a test can wait for "the batch is definitely enqueued downstream" before
-    /// triggering shutdown, rather than relying on timing.
+    /// `OneShotInput` that signals `sent` once its batch is enqueued downstream.
     struct SignalingInput {
         batch: Option<EventBatch>,
         sent: Option<oneshot::Sender<()>>,
@@ -2813,13 +2332,7 @@ mod tests {
         }
     }
 
-    /// The SIGTERM-mid-window proof, without any real OS signal: `run_with_shutdown`'s `shutdown`
-    /// future is driven by a plain oneshot the test controls directly. Fired only once the input
-    /// confirms its batch is enqueued (via `SignalingInput`/`sent_rx` above) -- not because the
-    /// ordering would otherwise be wrong (`mpsc::Receiver::recv` still drains whatever's already
-    /// buffered before observing every sender gone), but so this test exercises exactly the
-    /// "in-flight window, then shutdown" sequence its name promises, not "shutdown that happens to
-    /// race a send."
+    /// Shutdown mid-window flushes the buffered window through to the sink before exit.
     #[tokio::test]
     async fn run_with_shutdown_flushes_an_in_flight_window_before_exiting() {
         let mut components = Map::new();
@@ -2931,8 +2444,7 @@ mod tests {
     // -- `Input::run_until_shutdown` and `run_input`'s grace backstop
     //    (`docs/adr/decoupled-listener-io.md`). --
 
-    /// Never returns on its own -- the shape that makes the default `run_until_shutdown`'s
-    /// `select!` the *only* way this input can ever stop.
+    /// Never returns on its own; only shutdown stops it.
     struct ForeverInput;
 
     #[async_trait::async_trait]
@@ -2943,9 +2455,7 @@ mod tests {
         }
     }
 
-    /// Overrides `run_until_shutdown` to wait for the signal, then keep draining for
-    /// `drain_for` before sending `batch` (if any) and returning -- the shape a real cooperative
-    /// listener takes.
+    /// A cooperative listener: on shutdown, drains for `drain_for`, sends `batch`, and returns.
     struct DrainingInput {
         drain_for: Duration,
         batch: Option<EventBatch>,
@@ -2972,8 +2482,7 @@ mod tests {
         }
     }
 
-    /// Errors immediately, before any shutdown -- for the "error still propagates with context"
-    /// case, which relies on nothing but `Input::run`'s existing contract.
+    /// Errors immediately.
     struct ErrInput;
 
     #[async_trait::async_trait]
@@ -2983,11 +2492,8 @@ mod tests {
         }
     }
 
-    /// The regression this workstream exists to prevent: grace-delaying `run_input`'s backstop
-    /// arm must not add latency to an input that doesn't override `run_until_shutdown`. Uses a
-    /// deliberately huge grace (1 hour) -- if the backstop ever won this race instead of the
-    /// default impl, this test would need to wait out that whole hour of virtual time, which the
-    /// 1-second real-time `timeout` below would catch as a failure regardless.
+    /// The grace-delayed backstop adds no latency to an input using the default
+    /// `run_until_shutdown`.
     #[tokio::test(start_paused = true)]
     async fn a_non_overriding_input_returns_at_the_instant_shutdown_fires_not_after_the_grace() {
         let (tx, _rx) = mpsc::channel(1);
@@ -3061,8 +2567,6 @@ mod tests {
 
         let handle = tokio::spawn(run_input(
             "in".to_string(),
-            // Drains far longer than the grace -- must be cancelled by drop at the deadline,
-            // never allowed to actually finish its sleep.
             Box::new(DrainingInput { drain_for: Duration::from_secs(3600), batch: None }),
             fanout,
             shutdown_rx,
@@ -3081,9 +2585,7 @@ mod tests {
         assert_eq!(tokio::time::Instant::now().duration_since(before), grace);
     }
 
-    /// The default impl's shutdown path is still exactly ADR `service-lifecycle-and-output-retry`'s cancel-by-drop: dropping
-    /// `run`'s future drops the `Fanout` inside it, which drops the last `Sender` into every
-    /// downstream inbox, closing them -- unchanged by this workstream's `run_input` restructuring.
+    /// Dropping the default impl's `run` future drops its `Fanout`, closing every downstream inbox.
     #[tokio::test(start_paused = true)]
     async fn the_default_impls_dropped_run_future_still_closes_every_downstream_inbox() {
         let (tx, mut rx) = mpsc::channel::<Delivered>(1);
@@ -3127,11 +2629,7 @@ mod tests {
         assert!(message.contains("boom"), "got: {message}");
     }
 
-    /// The property `unwrap_batch` (and the whole `Arc<EventBatch>` design,
-    /// docs/adr/arc-eventbatch-copy-on-write.md) rests on for a single-consumer edge: `Fanout`
-    /// with exactly one consumer never touches an `Arc` at all, so what arrives at the other end is
-    /// `Delivered::Owned` -- proving the fast path (item 1 of the PR #33 review) actually takes,
-    /// not just that the code happens to also be correct if it didn't.
+    /// A single-consumer `Fanout` delivers `Delivered::Owned`, never an `Arc`.
     #[tokio::test]
     async fn a_single_consumer_fanout_delivers_the_batch_owned_with_no_arc_involved() {
         let (tx, mut rx) = mpsc::channel(1);
@@ -3151,13 +2649,7 @@ mod tests {
         );
     }
 
-    /// The property `Arc::try_unwrap` at each consumption point actually depends on: a real
-    /// fan-out's `Arc` reaches strong count 1 -- and so becomes unwrappable with no clone -- only
-    /// once every sibling handle has been dropped. Demonstrated deterministically (no concurrent
-    /// consumers racing each other) rather than asserted as a property of the design, since the PR
-    /// review that asked for this test found that race is real: two branches unwrapping
-    /// concurrently can both still observe strong count 2 and both fall back to cloning. This test
-    /// pins the mechanics `unwrap_batch`'s fallback correctly handles either way, not the timing.
+    /// A fan-out's `Arc` becomes unwrappable without a clone only once every sibling handle drops.
     #[tokio::test]
     async fn a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped() {
         let (tx_a, mut rx_a) = mpsc::channel(1);
@@ -3194,11 +2686,7 @@ mod tests {
         );
     }
 
-    /// Proves the whole point of layer 2 (`docs/design/internal-telemetry.md`): a listener, a
-    /// `Transform`, and an `Output` each produce the uniform in/out metric set with zero code of
-    /// their own, purely from `run_with_telemetry` attaching a handle per node. The listener's
-    /// send-side numbers come entirely from its `Fanout` (`FiniteInput` itself never touches
-    /// telemetry); the transform's and output's come from `run_transform`/`run_output`.
+    /// Listener, transform, and sink each get the uniform metric set from the runtime alone.
     #[tokio::test]
     async fn run_with_telemetry_records_the_uniform_metric_set_for_every_node_kind() {
         let mut components = Map::new();
@@ -3312,10 +2800,7 @@ mod tests {
         assert_eq!(value("logit.component.events.received", "out"), Some(1.0));
     }
 
-    /// The Lua-specific layer-3 additions (`docs/design/internal-telemetry.md`): VM memory is
-    /// visible, and a fan-out script (`return {a, b}`, `ProcessOutcome::EmitMany`) is
-    /// distinguishable from a plain 1:1 script by outcome, not just by the aggregate event count
-    /// `Fanout` already reports.
+    /// A Lua node reports VM memory and tags `return {a, b}` emits as `outcome="emit_many"`.
     #[tokio::test]
     async fn run_lua_records_vm_memory_and_emit_outcome() {
         let mut components = Map::new();
@@ -3448,9 +2933,7 @@ mod tests {
         assert!(vm_memory.is_some_and(|v| v > 0.0), "a loaded Lua VM should report nonzero memory");
     }
 
-    /// A `process()` that writes `resource` (`crates/logit-script/src/resource.rs`,
-    /// `docs/adr/operator-declared-resource-attributes.md`) must produce an outgoing batch
-    /// carrying that resource, not the one the batch arrived with.
+    /// A `resource` write in `process()` reaches the outgoing batch.
     #[tokio::test]
     async fn run_lua_process_writing_resource_re_stamps_the_outgoing_batch() {
         let mut components = Map::new();
@@ -3548,10 +3031,7 @@ mod tests {
         );
     }
 
-    /// As `run_lua_process_writing_resource_re_stamps_the_outgoing_batch`, for `scope`
-    /// (`crates/logit-script/src/scope.rs`, W7): a Lua stage writing `scope.name` emits a batch
-    /// whose `scope` carries the new name, with `resource` left unchanged since this script never
-    /// touches it.
+    /// A `scope` write in `process()` reaches the outgoing batch; `resource` is left unchanged.
     #[tokio::test]
     async fn run_lua_process_writing_scope_re_stamps_the_outgoing_batch() {
         let mut components = Map::new();
@@ -3655,8 +3135,7 @@ mod tests {
         );
     }
 
-    /// Finds the drained `process` span `run_lua` recorded for `component_id`, panicking with the
-    /// full drained batch if none is present -- shared by the two error-status tests below.
+    /// The drained `process` span for `component_id`; panics listing `events` if absent.
     fn find_process_span<'a>(events: &'a [Event], component_id: &str) -> &'a Event {
         events
             .iter()
@@ -3668,13 +3147,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no process span for '{component_id}' in: {events:?}"))
     }
 
-    /// The error half of `run_lua_records_vm_memory_and_emit_outcome`'s success case: a script
-    /// error must mark the process span `SpanStatus::Error`, not leave it at its default `Ok` --
-    /// ADR `internal-span-emission-and-deterministic-sampling`'s rule that the call site whose own error path fired is the one that marks the
-    /// span, applied to Lua's `process` the same way `write_loop` already applies it to a failed
-    /// delivery. Every event in the batch errors here, so `out` also stays empty and nothing is
-    /// ever sent downstream -- exactly the case that would otherwise drain as a *successful*
-    /// zero-event span.
+    /// A batch whose every event errors marks the Lua process span `SpanStatus::Error`.
     #[tokio::test]
     async fn run_lua_marks_its_process_span_as_error_when_every_event_in_the_batch_errors() {
         let mut components = Map::new();
@@ -3751,8 +3224,7 @@ mod tests {
             ),
         );
 
-        // `with_span_sampling(1.0)`, not `Registry::new()` -- this test needs every span kept,
-        // not the default 10%.
+        // Keep every span, not the default 10%.
         let registry = Registry::with_span_sampling(1.0);
         let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
             .into_iter()
@@ -3777,11 +3249,7 @@ mod tests {
         );
     }
 
-    /// The partial-failure half of the same rule: a batch mixing successful and failing events
-    /// must still mark its process span `Error` -- a script that got *some* events through is not
-    /// the same as a clean node visit either. The script alternates outcomes via a persistent Lua
-    /// global (`n`), which survives across `process` calls within this one batch because `run_lua`
-    /// calls `worker.process` once per event against the same `ScriptWorker`/VM.
+    /// A batch mixing successes and script errors still marks the process span `Error`.
     #[tokio::test]
     async fn run_lua_marks_its_process_span_as_error_on_a_mixed_batch_of_successes_and_failures() {
         let mut components = Map::new();
@@ -3870,8 +3338,6 @@ mod tests {
         .expect("should not hang")
         .expect("should complete without error");
 
-        // The one surviving event (the odd-numbered call) still made it downstream -- this is a
-        // partial failure, not a total one.
         let received =
             result_rx.recv_timeout(Duration::from_secs(1)).expect("output should receive a batch");
         assert_eq!(received.events.len(), 1, "only the non-erroring event should survive");
@@ -3886,13 +3352,7 @@ mod tests {
         );
     }
 
-    /// A stateful script whose only growth happens inside `flush()` (nothing new arriving on the
-    /// inbox between ticks) must not leave `logit.script.vm.memory` frozen or absent -- that's
-    /// exactly the leak shape `ScriptWorker::used_memory`'s own doc comment names. Proven with no
-    /// batch ever sent at all: `FiniteInput { batch: None }` finishes immediately, closing this
-    /// Lua node's inbox and triggering the same close-time flush a real flush-interval tick would
-    /// (`next_flush.is_some()` is all that's required, regardless of whether a deadline actually
-    /// elapsed) -- so if `flush_now` didn't sample memory, this test would see no gauge at all.
+    /// `flush_now` samples VM memory even when no batch ever arrived.
     #[tokio::test]
     async fn a_flush_with_no_batch_ever_received_still_records_vm_memory() {
         let mut components = Map::new();
@@ -3998,9 +3458,7 @@ mod tests {
     // `run_output`'s drain/write split (`docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
-    /// A minimal one-shot gate for tests: `wait()` blocks until `open()` is called, from anywhere,
-    /// any time relative to `wait()` -- race-free via the same "register `notified()` before
-    /// checking state" idiom `SinkQueue` itself relies on (`queue.rs`).
+    /// One-shot gate: `wait()` blocks until `open()`, race-free whichever runs first.
     #[derive(Clone)]
     struct Gate(Arc<GateState>);
 
@@ -4033,16 +3491,11 @@ mod tests {
         }
     }
 
-    /// A sink whose `send` doesn't resolve until a test-controlled [`Gate`] opens. Used to prove
-    /// the point of the drain/write split: the inbox keeps draining into the `SinkQueue` while a
-    /// delivery attempt is stuck, instead of the two being coupled the way the single inline loop
-    /// this replaced was.
+    /// A sink whose `send` doesn't resolve until its [`Gate`] opens.
     struct SlowOutput {
         gate: Gate,
-        // A tokio channel, not `std::sync::mpsc` -- this test's `run_with_telemetry` task keeps
-        // running concurrently with the assertion side under a single-threaded test runtime, so
-        // blocking that thread on a std-mpsc receive would starve the very task the test is
-        // waiting on. `.recv().await` yields instead of blocking.
+        // Tokio, not `std::sync::mpsc`: a blocking receive would starve the pipeline task on the
+        // single-threaded test runtime.
         delivered: tokio::sync::mpsc::UnboundedSender<EventBatch>,
     }
 
@@ -4055,8 +3508,7 @@ mod tests {
         }
     }
 
-    /// A sink whose `send` always fails -- for pinning that a permanent failure still ends
-    /// `run_output` (and therefore `run`) with an error, unchanged from before this split.
+    /// A sink whose `send` always fails, with an unclassified error.
     struct FailingOutput;
 
     #[async_trait::async_trait]
@@ -4066,11 +3518,7 @@ mod tests {
         }
     }
 
-    /// Sends every batch in `batches`, in order, then idles forever -- a burst producer standing
-    /// in for a real listener that already has several batches ready before a slow sink can keep
-    /// up. Unlike [`FiniteInput`], deliberately never returns, so the test controls exactly when
-    /// the graph is torn down (via aborting the spawned `run` task) rather than racing a listener
-    /// that finishes on its own.
+    /// Sends every batch in order, then idles forever, so the test controls teardown.
     struct BurstInput {
         batches: Vec<EventBatch>,
     }
@@ -4086,8 +3534,7 @@ mod tests {
         }
     }
 
-    /// Like [`BurstInput`], but returns once every batch is sent -- a real listener that has
-    /// genuinely finished, exactly like [`FiniteInput`] but with more than one batch.
+    /// [`BurstInput`] that returns once every batch is sent.
     struct FiniteBurstInput {
         batches: Vec<EventBatch>,
     }
@@ -4114,15 +3561,7 @@ mod tests {
         })
     }
 
-    /// The property this whole workstream exists to deliver
-    /// (`docs/adr/buffered-sink-delivery.md`, `docs/plans/buffered-sink-delivery.md`
-    /// section C): a slow/backing-off `Output::send` no longer stops its own component's inbox
-    /// from draining. Proven directly: while the sink's very first delivery attempt is parked on a
-    /// gate, several more batches sent right behind it still make it off the inbox and into the
-    /// `SinkQueue` -- observable via `logit.component.buffer.batches`, since nothing else exposes
-    /// the queue's depth to a test driving a full graph rather than `SinkQueue` directly. Uses
-    /// paused time so the polling loop below never depends on real wall-clock timing to be
-    /// deterministic.
+    /// A stuck `send` doesn't stop the inbox draining into the queue (`buffer.batches` shows it).
     #[tokio::test(start_paused = true)]
     async fn a_slow_sinks_send_in_flight_does_not_stop_its_inbox_from_draining_into_the_queue() {
         let mut components = Map::new();
@@ -4195,10 +3634,7 @@ mod tests {
             std::future::pending(),
         ));
 
-        // Poll (under paused time, so this never depends on real wall-clock passing) until the
-        // queue's own depth gauge shows more than the one batch currently stuck inside
-        // `output.send` -- proof the drain side kept moving batches into the queue instead of
-        // waiting on the gated send.
+        // Wait until the queue holds more than the one batch stuck in `send`.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let queued = gauge_value(&registry.drain(0), "out", "logit.component.buffer.batches");
@@ -4230,16 +3666,7 @@ mod tests {
         run_task.abort();
     }
 
-    /// **Behavior change from before this workstream, deliberate**
-    /// (`docs/adr/buffered-sink-delivery.md`'s "Failure handling" section): an isolated,
-    /// unclassified send failure (defaults to `Fault::Permanent`, see `output::classify`) used to
-    /// end `run` outright the moment it happened. It no longer does -- `write_loop` drops the
-    /// batch, counts it, and moves on; only a *sustained* run of nothing but `Permanent` failures
-    /// for the whole `PERMANENT_FAILURE_WINDOW` (pinned directly against `write_loop`,
-    /// `sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses` above) still
-    /// ends the process. This test is the full-graph-level twin of that: with `FiniteInput`
-    /// closing its sender right after its one batch (so the sink's queue drains to closed-and-
-    /// empty right after the single drop), `run` now completes with `Ok(())`, not an error.
+    /// An isolated unclassified send failure drops the batch; `run` still completes `Ok`.
     #[tokio::test]
     async fn a_single_isolated_send_failure_no_longer_ends_run_the_batch_is_dropped_instead() {
         let mut components = Map::new();
@@ -4303,13 +3730,7 @@ mod tests {
             );
     }
 
-    /// The mirror of `a_single_isolated_send_failure_no_longer_ends_run_the_batch_is_dropped_instead`
-    /// with a still-live input (`BurstInput` never closes its sender, unlike `FiniteInput`): a
-    /// permanently failing sink no longer takes the whole pipeline down just because it keeps
-    /// failing -- `run` simply keeps running (dropping every batch), exactly as intended for "one
-    /// malformed batch cannot kill an otherwise-healthy pipeline." Asserted by showing `run`
-    /// does *not* complete within a bounded window, rather than asserting an `Err` it no longer
-    /// promptly returns.
+    /// A sink failing with unclassified errors doesn't end `run` while its input stays live.
     #[tokio::test]
     async fn a_permanently_failing_sink_with_a_live_input_does_not_end_run() {
         let mut components = Map::new();
@@ -4375,12 +3796,7 @@ mod tests {
         abort_handle.abort();
     }
 
-    /// A batch pushed just before the inbox closes must still reach the sink: `drain_inbox`
-    /// closes the queue only once its own inbox is exhausted, and `write_loop`'s `queue.peek()`
-    /// loop only stops once the queue is both closed *and* empty -- so the joined `run_output`
-    /// future can't resolve while any of the tail is still undelivered. Exercised with several
-    /// batches, not just one, so a bug that only drains the last-committed item wouldn't slip
-    /// through.
+    /// Every batch queued before the inbox closes is delivered before `run_output` resolves.
     #[tokio::test]
     async fn inbox_close_drains_the_queues_tail_before_run_output_resolves() {
         let mut components = Map::new();
@@ -4451,15 +3867,10 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `write_loop`'s retry/posture/failure-handling/shutdown-grace logic
-    // (`docs/adr/buffered-sink-delivery.md`, workstream D)
+    // (`docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
-    /// A sink whose `send` fails with a `fault`-tagged error for its first `fail_times` calls,
-    /// then succeeds forever after (`fail_times == u32::MAX` never succeeds) -- the fake every
-    /// test below drives `write_loop` against directly. Each attempt is signaled on `attempted`
-    /// (a test can `.recv().await` it to observe exactly when an attempt happened, race-free) and
-    /// its instant recorded on `attempt_times`, so a test can assert the backoff schedule between
-    /// attempts. `flushed` records whether `Output::flush` was ever called.
+    /// Fails with `fault` for its first `fail_times` sends, then succeeds; records each attempt.
     struct FaultyOutput {
         fault: Fault,
         fail_times: u32,
@@ -4539,10 +3950,7 @@ mod tests {
         }
     }
 
-    /// Drives `write_loop` directly against a fresh, already-closed `SinkQueue` holding exactly
-    /// `batches`, with a default (fast) retry config and a shutdown signal that never fires.
-    /// Returns `write_loop`'s own result -- most tests below only care about `attempts`/
-    /// `attempt_times`/`flushed`, read from the handles passed in separately.
+    /// Runs `write_loop` over a closed queue holding `batches`, with no shutdown.
     async fn run_write_loop_to_completion(
         mut output: FaultyOutput,
         batches: Vec<Arc<EventBatch>>,
@@ -4637,9 +4045,7 @@ mod tests {
         assert_permanent_fault_is_never_retried(true).await;
     }
 
-    /// Pins the exact doubling sequence under a real (paused) clock: 100ms, 200ms, 400ms, 800ms
-    /// between 5 attempts (4 failures then a success), matching `base_delay * 2^(attempt-1)`
-    /// capped at `max_delay` (here, high enough never to clamp).
+    /// Backoff between attempts doubles: 100, 200, 400, 800 ms.
     #[tokio::test(start_paused = true)]
     async fn backoff_between_retry_attempts_follows_the_configured_doubling_schedule() {
         let (output, handles) = faulty_output(Fault::Clean, 4, false);
@@ -4666,11 +4072,7 @@ mod tests {
         );
     }
 
-    /// A retryable (`Ambiguous`, under `AtLeastOnce`) fault that never succeeds is dropped once
-    /// its own `total_budget` runs out -- `write_loop` continues to the next batch rather than
-    /// returning `Err`, and the permanent-failure streak is completely untouched by this (a
-    /// budget-exhausted `Clean`/`Ambiguous` drop is a "destination slow/down" failure mode, not a
-    /// "misconfigured" one).
+    /// A retryable fault that exhausts its budget drops the batch and `write_loop` continues.
     #[tokio::test(start_paused = true)]
     async fn budget_exhaustion_on_a_retryable_fault_drops_the_batch_and_write_loop_continues() {
         let (output, handles) = faulty_output(Fault::Ambiguous, u32::MAX, true);
@@ -4695,10 +4097,8 @@ mod tests {
         );
     }
 
-    /// The ~60s permanent-failure-window exit: sustained `Fault::Permanent` outcomes with no
-    /// intervening success cause `write_loop` to return `Err` once the window elapses. A gap with
-    /// nothing happening in between (simulated here by the queue sitting empty while `write_loop`
-    /// waits) does not itself reset anything -- only a *successful* delivery would.
+    /// Explicit `Permanent` failures spanning `PERMANENT_FAILURE_WINDOW`, idle gap included, end
+    /// `write_loop` with `Err`.
     #[tokio::test(start_paused = true)]
     async fn sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses() {
         let (output, mut handles) = faulty_output(Fault::Permanent, u32::MAX, false);
@@ -4712,10 +4112,7 @@ mod tests {
         store.push((one_event_batch(1.0), TraceContext::default().into())).await;
 
         let store_for_task = Arc::clone(&store);
-        // `write_loop` borrows `output` (it no longer owns it -- `run_output` does, normally);
-        // `tokio::spawn` needs a `'static` future, so `output` moves into this async block and
-        // the `&mut` borrow it passes to `write_loop` lives entirely inside that block's own
-        // stack frame, not tied to this test function's.
+        // `write_loop` borrows `output`; moving it into the block makes the future `'static`.
         let handle = tokio::spawn(async move {
             let mut output = output;
             write_loop(
@@ -4731,9 +4128,7 @@ mod tests {
 
         handles.attempted.recv().await.expect("the first permanent failure should have happened");
 
-        // Nothing else happens for the rest of the window -- the queue sits empty and write_loop
-        // just waits, exactly like `an intervening gap with no success does not reset anything`
-        // above documents.
+        // An idle gap doesn't reset the streak.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW).await;
 
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
@@ -4750,10 +4145,7 @@ mod tests {
         );
     }
 
-    /// A sink whose `send` outcome is driven by a fixed script -- `Ok(())` or an `Err` tagged with
-    /// the given `Fault`, one entry consumed per call, repeating the script's last entry forever
-    /// once exhausted. More flexible than [`FaultyOutput`]'s simpler "fail N times then always
-    /// succeed" shape, for a test that needs a genuine fail/succeed/fail pattern.
+    /// One scripted outcome per `send` (`None` succeeds), repeating the last entry once exhausted.
     struct ScriptedOutput {
         script: Vec<Option<Fault>>,
         index: usize,
@@ -4775,11 +4167,7 @@ mod tests {
         }
     }
 
-    /// A single success anywhere inside the window resets the streak: `Permanent`, then a
-    /// success, then well past where the *original* window would have tripped, one more isolated
-    /// `Permanent` failure -- if the reset hadn't happened, "now - streak_since" would already be
-    /// far past the window the instant that third failure lands, tripping `Err` immediately. It
-    /// must not: the reset means this third failure starts a brand new, still-fresh streak.
+    /// A success resets the permanent-failure streak.
     #[tokio::test(start_paused = true)]
     async fn a_success_inside_the_window_resets_the_permanent_failure_streak() {
         let telemetry = Telemetry::default();
@@ -4813,8 +4201,7 @@ mod tests {
         });
         attempted_rx.recv().await.expect("attempt 1 (failing) should have happened");
 
-        // Well past where the window would trip -- but the *next* batch succeeds, which must
-        // reset the streak before the window is ever checked again.
+        // Past the window, but the next batch succeeds before it's checked again.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         // attempt 2: success -- resets the streak
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
@@ -4836,10 +4223,7 @@ mod tests {
         );
     }
 
-    /// A sink whose `send` always fails with no `Fault` attached at all -- e.g. `StreamOutput`'s
-    /// bare I/O errors. `classify` still defaults this to `Permanent` for retry purposes (never
-    /// retry an error the sink didn't recognize), but it must never be mistaken for a positively
-    /// identified configuration error that should end the process.
+    /// Always fails with no `Fault` attached, like a bare I/O error.
     struct AlwaysUnclassifiedFailure {
         attempted: mpsc::UnboundedSender<()>,
     }
@@ -4852,11 +4236,7 @@ mod tests {
         }
     }
 
-    /// The review finding this guards: an unclassified error defaults to non-retryable (correct),
-    /// but that must not also make it count toward the sustained-permanent-failure exit window --
-    /// a sink that never opted into `Fault` classification at all failing forever is a very
-    /// different situation from `InfluxDbOutput` explicitly identifying a bad token forever, and
-    /// only the latter should ever end the process.
+    /// An unclassified error, though non-retryable, never counts toward the failure window.
     #[tokio::test(start_paused = true)]
     async fn an_unclassified_error_never_trips_the_permanent_failure_window() {
         let telemetry = Telemetry::default();
@@ -4884,7 +4264,6 @@ mod tests {
         });
         attempted_rx.recv().await.expect("the first attempt should have happened");
 
-        // Well past the window, with nothing but this unclassified failure the whole time.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("a later attempt should have happened");
@@ -4901,10 +4280,7 @@ mod tests {
         );
     }
 
-    /// A sink whose `Fault` depends on the batch's own content (its single counter's value) --
-    /// deterministic across however many retries a single batch takes, unlike `ScriptedOutput`
-    /// (whose script advances per *call*, not per logical batch, so it can't represent "retry
-    /// this one batch several times with the same fault" at all).
+    /// Always fails: `Ambiguous` for the batch valued 2.0, else `Permanent`, stable across retries.
     struct FaultByBatchValue {
         attempted: mpsc::UnboundedSender<()>,
     }
@@ -4926,13 +4302,7 @@ mod tests {
         }
     }
 
-    /// The other half of the same review finding: a budget-exhausted `Ambiguous` drop is a
-    /// different failure mode than an explicit configuration error (a destination that's merely
-    /// slow/down, not misconfigured) and must reset the permanent-failure streak exactly like a
-    /// success would -- not merely leave it untouched. `Permanent`, then `Ambiguous` (retried,
-    /// budget exhausted, dropped) for well past the window, then one more isolated `Permanent` --
-    /// if the reset hadn't happened, that third failure would find `permanent_streak_since`
-    /// already far in the past and trip `Err` immediately; it must not.
+    /// A budget-exhausted `Ambiguous` drop resets the permanent-failure streak like a success.
     #[tokio::test(start_paused = true)]
     async fn a_budget_exhausted_ambiguous_drop_resets_the_permanent_failure_streak_like_success_does(
     ) {
@@ -4944,8 +4314,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (attempted_tx, mut attempted_rx) = mpsc::unbounded_channel();
         let output = FaultByBatchValue { attempted: attempted_tx };
-        // A short retry budget so batch 2's Ambiguous failures exhaust quickly rather than
-        // actually taking PERMANENT_FAILURE_WINDOW of real retrying.
+        // Short, so batch 2's budget exhausts quickly.
         let write_config = WriteLoopConfig {
             retry: RetryConfig {
                 total_budget: Duration::from_millis(50),
@@ -4972,12 +4341,8 @@ mod tests {
         });
         attempted_rx.recv().await.expect("attempt 1 (Permanent) should have happened");
 
-        // Well past where the *original* streak would have tripped -- batch 2 (Ambiguous)
-        // retries within its short (50ms) budget, exhausts it, and gets dropped; that drop must
-        // reset the streak despite happening long after streak_since was first set. A 200ms sleep
-        // (comfortably longer than the 50ms budget, and free under start_paused) guarantees the
-        // retry loop has already given up and committed batch 2 before batch 3 is pushed --
-        // simpler and less brittle than trying to count exactly how many retries it took.
+        // Past the window; batch 2 then exhausts its 50 ms budget and is dropped. The 200 ms
+        // sleep guarantees that drop is committed before batch 3 is pushed.
         tokio::time::sleep(PERMANENT_FAILURE_WINDOW * 2).await;
         store.push((one_event_batch(2.0), TraceContext::default().into())).await;
         attempted_rx.recv().await.expect("batch 2's first attempt should have happened");
@@ -4999,10 +4364,7 @@ mod tests {
         );
     }
 
-    /// Shutdown grace: a sink that's permanently stuck retrying (a `Clean` fault, retried
-    /// indefinitely under a huge `total_budget`) still causes `write_loop` to return within
-    /// `shutdown_grace` once the shutdown signal fires -- counting the drop with
-    /// `reason="shutdown"` and calling `Output::flush`.
+    /// A sink stuck retrying still returns `Ok` within `shutdown_grace`, leaving its batch queued.
     #[tokio::test(start_paused = true)]
     async fn shutdown_grace_expiry_ends_write_loop_promptly_leaving_the_remainder_for_run_output() {
         let (mut output, _handles) = faulty_output(Fault::Clean, u32::MAX, false);
@@ -5013,8 +4375,7 @@ mod tests {
             telemetry.clone(),
         )));
         store.push((one_event_batch(1.0), TraceContext::default().into())).await;
-        // Deliberately left open (not closed) -- shutdown grace must cut delivery off even while
-        // the store could still receive more, not just once it's known to be exhausted.
+        // Left open: grace must cut delivery off even while more could arrive.
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let write_config = WriteLoopConfig {
@@ -5039,7 +4400,7 @@ mod tests {
             .await
         });
 
-        // Let a couple of retry attempts actually happen before shutdown fires.
+        // Let a couple of retry attempts happen first.
         tokio::time::sleep(Duration::from_millis(90)).await;
         shutdown_tx.send(true).expect("receiver should still be alive");
 
@@ -5049,28 +4410,14 @@ mod tests {
             .expect("the task should not panic");
         assert!(result.is_ok(), "shutdown-grace expiry should end write_loop with Ok, not Err");
 
-        // write_loop no longer drains or flushes on shutdown-grace expiry itself -- that's
-        // run_output's job (see finish_and_flush's doc comment for why it must happen there, not
-        // here), exercised end to end by
-        // `run_output_flushes_exactly_once_and_never_loses_a_batch_racing_shutdown_grace` below.
-        // Confirm the batch is still exactly where write_loop left it: untouched, not silently
-        // dropped by write_loop itself.
+        // Draining and flushing are `finish_and_flush`'s job, so the batch is still queued.
         assert!(
             store.commit().is_some(),
             "write_loop must leave the undelivered batch for run_output to account for, not drop it silently itself"
         );
     }
 
-    /// The exact race a review finding named: `finish_and_flush` must run only after `drain_inbox`
-    /// can no longer push anything new, or a batch that lands in the gap between "queue observed
-    /// empty" and "flush called" is silently lost -- no delivery, no `reason=shutdown` accounting.
-    /// Drives `run_output` directly against a hand-fed `Delivered` channel (bypassing any real
-    /// `Input`/listener) specifically so the producer side survives past the moment shutdown
-    /// fires -- a real listener's task is cancelled by `run_input`'s own shutdown race almost
-    /// immediately (see `run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one`'s
-    /// doc comment for the same lesson learned elsewhere), which would close `drain_inbox`'s inbox
-    /// well before `write_loop`'s shutdown-grace timer ever expires, and this race needs
-    /// `drain_inbox` to still be pushable exactly when grace expires.
+    /// A batch pushed as shutdown grace expires is counted, not lost, and `flush` runs once.
     #[tokio::test(start_paused = true)]
     async fn run_output_flushes_exactly_once_and_never_loses_a_batch_racing_shutdown_grace() {
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
@@ -5098,8 +4445,7 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
-        // One batch, permanently failing to send -- write_loop will be mid-retry when shutdown
-        // fires.
+        // Fails forever, so write_loop is mid-retry when shutdown fires.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5114,10 +4460,8 @@ mod tests {
         handles.attempted.recv().await.expect("the first attempt should have happened");
 
         shutdown_tx.send(true).expect("receiver should still be alive");
-        // Right at the shutdown-grace boundary: this batch's push races finish_and_flush's final
-        // drain. Before the fix, a push landing here could slip past the snapshot and be dropped
-        // when run_output returned, uncounted. `inbox_tx` is still held by this test (not by any
-        // cancelled listener task), so this send is exactly the race the fix closes.
+        // At the grace boundary, this push races the final drain. The test holds `inbox_tx`
+        // itself because a real listener would already be cancelled here.
         tokio::time::sleep(Duration::from_millis(100)).await;
         inbox_tx
             .send(Delivered::Owned(
@@ -5144,25 +4488,11 @@ mod tests {
         );
     }
 
-    /// A review finding, adjacent to the flush/shutdown race the test above closes: when
-    /// `write_loop` gives up first (shutdown-grace expiry here; a permanent-failure-window trip
-    /// is the other way this happens) while `drain_inbox` is still mid-flight, `run_output`'s
-    /// `select!` drops the abandoned `drain` future -- and `drain_inbox` used to *own* its
-    /// `inbox: mpsc::Receiver`, so dropping it also destroyed the channel, silently discarding
-    /// whatever was still sitting in its buffer (accepted by `send`, never yet `recv()`-ed) with
-    /// no `batches.dropped` count and no diagnostic, unlike every other drop path this workstream
-    /// instruments. `drain_inbox` now borrows `inbox` (`&mut`) instead of owning it, so
-    /// `run_output` can retain it, sweep whatever `drain_inbox` never got around to, and count it.
+    /// A batch left unread in the inbox when `write_loop` gives up is counted as dropped.
     ///
-    /// Setup: `max_batches: 1` under `Block` means batch 1 fills the queue and is immediately
-    /// `peek()`-reserved by `write_loop`'s endless-failure retry loop. Batch 2, sent right behind
-    /// it, is pulled off the channel by `drain_inbox` but then blocks forever inside
-    /// `queue.push()` -- a separate, narrower gap this fix does not close, since that batch is
-    /// already out of the channel and held in the abandoned future's own suspended stack by the
-    /// time `drain` is dropped (see this test's final assertion, which documents that residual
-    /// loss rather than papering over it). Batch 3, sent only once `drain_inbox` is confirmed
-    /// stuck on batch 2's push, can only ever sit in `inbox`'s own buffer, genuinely
-    /// un-`recv()`-ed -- exactly the case this fix closes.
+    /// Batch 1 fills the one-slot queue and is reserved by the failing retry loop; batch 2 is
+    /// received by `drain_inbox` and stuck in `push`, lost with the abandoned future (a known,
+    /// uncounted residual gap); batch 3 stays in the channel for the sweep to count.
     #[tokio::test(start_paused = true)]
     async fn a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost(
     ) {
@@ -5198,8 +4528,7 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
-        // Batch 1: drained into the queue (filling its one slot), then peeked -- and so
-        // reserved -- by write_loop's endless-failure retry loop.
+        // Batch 1: fills the queue's one slot and is reserved by the retry loop.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5213,9 +4542,7 @@ mod tests {
             .expect("receiver should still be alive");
         handles.attempted.recv().await.expect("the first attempt should have happened");
 
-        // Batch 2: drain_inbox receives it, then blocks forever inside `queue.push` -- the queue
-        // is full and its one slot is reserved, so there is nothing a concurrent commit could
-        // ever free.
+        // Batch 2: received by drain_inbox, which then blocks forever in `queue.push`.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5227,14 +4554,10 @@ mod tests {
             ))
             .await
             .expect("receiver should still be alive");
-        // Let drain_inbox actually reach and block on that push before sending batch 3 -- if
-        // batch 3 raced ahead of batch 2, it could be the one that gets stuck instead, proving
-        // nothing about the case this fix targets.
+        // Let drain_inbox block on batch 2 first, so batch 3 is the one left in the channel.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Batch 3: drain_inbox is already stuck on batch 2's push, so this one can only ever sit
-        // in `inbox`'s own channel buffer, genuinely un-`recv()`-ed -- exactly the case this fix
-        // closes.
+        // Batch 3: stays unread in the channel.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5286,13 +4609,7 @@ mod tests {
         }
     }
 
-    /// F3: the shutdown sweep in `run_output` (the `while let Ok(delivered) = inbox.try_recv() {
-    /// ... store.push(...).await ... }` block right after `drop(drain)`) used to run against a
-    /// store that was never closed. Under `overflow: block` with a full disk spool, `store.push`
-    /// awaits `not_full`, which nothing could ever notify again -- a permanent hang. Modelled
-    /// directly on `a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost`
-    /// above (the in-memory version of this same shutdown-sweep scenario), but with a one-record
-    /// disk spool standing in for the in-memory queue's `max_batches: 1`.
+    /// `run_output`'s shutdown sweep doesn't hang pushing into a full, `Block` disk spool.
     #[tokio::test]
     async fn a_disk_backed_sinks_shutdown_sweep_does_not_hang_pushing_into_a_full_spool() {
         let dir = crate::disk_queue::test_support::scratch_dir("shutdown-sweep-full-spool");
@@ -5309,9 +4626,7 @@ mod tests {
             delivery_override: None,
         };
 
-        // Every counter-metric batch this test pushes encodes to the same length (`write_f64_kind`
-        // is fixed-width), regardless of its value -- so this one measurement sizes the spool to
-        // admit exactly one record.
+        // Every counter batch encodes to the same length, so this sizes the spool to one record.
         let sample_batch = EventBatch {
             resource: Arc::new(Resource::default()),
             scope: None,
@@ -5346,8 +4661,7 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
 
-        // Batch 1: drains into the spool (filling its one-record capacity), then peeked -- and so
-        // reserved -- by write_loop's endless-failure retry loop.
+        // Batch 1: fills the spool and is reserved by the retry loop.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5361,10 +4675,7 @@ mod tests {
             .expect("receiver should still be alive");
         handles.attempted.recv().await.expect("the first attempt should have happened");
 
-        // Batch 2: drain_inbox receives it, then blocks forever inside `queue.push` -- the spool
-        // is full (room for exactly one record) and that one slot is reserved, so under `Block`
-        // there is nothing a concurrent commit could ever free. Same residual gap
-        // the in-memory version of this test already names in its own comment.
+        // Batch 2: received by drain_inbox, which then blocks forever in `queue.push`.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5376,12 +4687,9 @@ mod tests {
             ))
             .await
             .expect("receiver should still be alive");
-        // Let drain_inbox actually reach and block on that push before sending batch 3.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Batch 3: drain_inbox is already stuck on batch 2's push, so this one can only ever sit
-        // in `inbox`'s own channel buffer, genuinely un-`recv()`-ed -- exactly the case this fix
-        // targets.
+        // Batch 3: stays unread in the channel for the sweep.
         inbox_tx
             .send(Delivered::Owned(
                 EventBatch {
@@ -5397,8 +4705,6 @@ mod tests {
         shutdown_tx.send(true).expect("receiver should still be alive");
         drop(inbox_tx);
 
-        // Pre-fix: this times out -- the abandoned-inbox sweep hangs forever trying to push batch
-        // 3 into a still-open, still-full spool.
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .expect("run_output should not hang")
@@ -5423,11 +4729,7 @@ mod tests {
              must survive, not be counted dropped"
         );
 
-        // Reopen a fresh DiskQueue on the same directory: batches 1 and 3 should both still be
-        // present, in FIFO order -- proving the fix stops the sweep from hanging without silently
-        // dropping anything. (Batch 2 was never drained out of the inbox channel at all -- the
-        // same narrower residual gap named above, not something this fix closes, so it is not
-        // expected to be here.)
+        // Batches 1 and 3 survive, in order. Batch 2 was lost in the abandoned `push`.
         let reopened = crate::disk_queue::DiskQueue::open(
             crate::disk_queue::DiskQueueConfig {
                 dir: dir.clone(),
@@ -5455,19 +4757,10 @@ mod tests {
 
     // -----------------------------------------------------------------------------------------
     // `run_with_telemetry`'s join loop: drain every task on the first error instead of aborting
-    // (`docs/plans/buffered-sink-delivery.md` workstream E,
-    // `docs/adr/buffered-sink-delivery.md`)
+    // (`docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
 
-    /// An `Input` fully driven by the test: every batch handed to the paired `UnboundedSender`
-    /// is forwarded to `sink` as soon as it arrives, in order -- unlike `BurstInput`/
-    /// `FiniteBurstInput` above (whose batch list is fixed at construction time), this lets a
-    /// test stagger exactly when each batch reaches a component. The join-loop tests below need
-    /// that control to trigger `write_loop`'s permanent-failure-window trip at a precise instant
-    /// rather than all at once. Ends (closing its `Fanout`, and therefore its consumer's inbox,
-    /// exactly like `FiniteInput`) once the test drops its sender -- or, same as every other
-    /// `Input` here, once `run_input`'s own race against the shutdown signal picks the shutdown
-    /// branch first.
+    /// Forwards each batch the test sends on `rx`; returns once the test drops the sender.
     struct ChannelInput {
         rx: mpsc::UnboundedReceiver<EventBatch>,
     }
@@ -5482,17 +4775,7 @@ mod tests {
         }
     }
 
-    /// The property this workstream exists to deliver: `run_with_telemetry`'s join loop no
-    /// longer aborts every other task the instant one task fails. Two independent sinks, each
-    /// fed by its own live input: `bad` is a sink that trips `write_loop`'s sustained-permanent-
-    /// failure-window path (`PERMANENT_FAILURE_WINDOW`, workstream D) and ends with `Err`; `good`
-    /// is a healthy sink whose delivery is held shut (via a `Gate`) with several batches already
-    /// sitting in its `SinkQueue`, still undelivered, at the exact moment `bad` fails. Under the
-    /// old `break`-and-drop-the-`JoinSet` behavior, dropping the `JoinSet` at that instant would
-    /// abort `good`'s task mid-drain, discarding those buffered batches outright. This test
-    /// proves that no longer happens: only once `bad`'s failure has fired the shared shutdown
-    /// signal does the test open `good`'s gate, and `good`'s already-queued batches are still
-    /// delivered through the ordinary path before `run_with_telemetry` returns.
+    /// When one sink fails, a healthy sibling still delivers its queued batches before exit.
     #[tokio::test(start_paused = true)]
     async fn a_healthy_sinks_buffered_batches_are_still_delivered_after_a_sibling_sink_trips_the_permanent_failure_window(
     ) {
@@ -5584,12 +4867,8 @@ mod tests {
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
                 }),
-                // Generous shutdown grace AND retry budget: this test deliberately holds "good"'s
-                // gate shut past bad's own PERMANENT_FAILURE_WINDOW trip (60s+), and every attempt
-                // is now raced against its own retry budget (`deliver_with_retry`'s "impossible to
-                // ever fit" fix) -- a default 60s budget would time this send out as `Ambiguous`
-                // before the gate ever opens, which is not what this test is proving. Neither
-                // bound should matter to what's actually under test here.
+                // The gate stays shut past bad's 60 s window; a default budget or grace would
+                // time this send out first.
                 WriteLoopConfig {
                     retry: RetryConfig {
                         total_budget: Duration::from_secs(3600),
@@ -5613,9 +4892,7 @@ mod tests {
             std::future::pending(),
         ));
 
-        // Queue three batches on "good" while its delivery is gated shut -- they land in its
-        // SinkQueue, undelivered, exactly the state a healthy sibling can be in when another
-        // node fails.
+        // Queue three batches on "good" while its delivery is gated shut.
         for i in 0..3 {
             good_tx
                 .send(EventBatch {
@@ -5638,10 +4915,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        // Trip "bad"'s sustained-permanent-failure-window path, ending its write_loop (and
-        // therefore its task) with Err -- mirrors
-        // `sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses` above,
-        // just driven through the full graph rather than against `write_loop` directly.
+        // Trip "bad"'s permanent-failure window, ending its task with Err.
         bad_tx
             .send(EventBatch {
                 resource: Arc::new(Resource::default()),
@@ -5664,15 +4938,10 @@ mod tests {
             .await
             .expect("bad's second (window-tripping) attempt should have happened");
 
-        // A short (paused-clock) sleep, far shorter than "good"'s 3600s shutdown grace above, so
-        // there's no risk of it accidentally expiring: this just gives every already-runnable
-        // task (bad's task completing, run_with_telemetry's join loop observing that and firing
-        // shutdown, bad_in/good_in reacting to shutdown) room to actually run before the test
-        // moves on -- none of that needs any further time to elapse, just scheduling.
+        // Lets the join loop observe bad's failure and fire shutdown.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Only now open "good"'s gate -- proving its delivery wasn't already finished (and so
-        // trivially safe from the old abort-on-first-error bug) before shutdown fired.
+        // Opened only after shutdown fired, so good's delivery can't have finished earlier.
         gate.open();
 
         for i in 0..3 {
@@ -5697,14 +4966,8 @@ mod tests {
         assert!(err.to_string().contains("bad"), "the returned error should be bad's, got: {err}");
     }
 
-    /// An `Output` whose `send` always fails `Fault::Permanent`, but delays before returning its
-    /// *second* call's error by `delay` -- used to control exactly when a sink's
-    /// sustained-permanent-failure-window trips (its first call sets `write_loop`'s streak clock,
-    /// its second call's failure is what gets checked against it) without needing any `Input` to
-    /// stay alive past its own immediate completion. The delay lives inside `Output::send` itself,
-    /// which `write_loop`'s outer `shutdown_grace` select doesn't preempt -- so as long as a
-    /// node's `shutdown_grace` is generous, this keeps working normally even after a sibling
-    /// node's failure has already fired the shared shutdown signal.
+    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`. A `delay`
+    /// past the retry budget times that attempt out as `Fault::Ambiguous` instead.
     struct DelayedSecondFailureOutput {
         delay: Duration,
         calls: Arc<std::sync::atomic::AtomicU32>,
@@ -5721,16 +4984,9 @@ mod tests {
         }
     }
 
-    /// `run_with_telemetry`'s join loop keeps the *first* recorded error, not whichever task
-    /// happens to finish last. Two independent sinks, `bad1`/`bad2`, each fed two batches
-    /// up front by an input that finishes immediately on its own (so neither depends on
-    /// surviving past the other's shutdown-triggering failure); each sink's own second `send`
-    /// call is what trips its sustained-permanent-failure-window (`PERMANENT_FAILURE_WINDOW`,
-    /// workstream D), and `DelayedSecondFailureOutput`'s internal delay is what controls *when*
-    /// that happens -- `bad1`'s trips at exactly the window, `bad2`'s one second later -- so
-    /// `bad1`'s task is guaranteed to complete (and be recorded by the join loop) strictly before
-    /// `bad2`'s, deterministically, with no reliance on scheduling order between two
-    /// simultaneously-ready tasks.
+    /// The join loop returns `bad1`'s failure, which trips the window at 60 s. `bad2`'s 61 s
+    /// delay exceeds the default 60 s retry budget, so its second batch drops as `Ambiguous`,
+    /// resetting its streak: `bad2` never fails, and the `!contains("bad2")` check holds trivially.
     #[tokio::test(start_paused = true)]
     async fn run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one() {
         let mut components = Map::new();
@@ -5792,9 +5048,7 @@ mod tests {
         let (bad1_tx, bad1_rx) = mpsc::unbounded_channel();
         let (bad2_tx, bad2_rx) = mpsc::unbounded_channel();
 
-        // Generous shutdown grace on both -- this test wants each sink's own internal delay
-        // (inside `DelayedSecondFailureOutput::send`) to run to completion normally, not get cut
-        // short just because the *other* sink's failure already fired shutdown in the meantime.
+        // So one sink's failure-triggered shutdown doesn't cut the other's delay short.
         let generous_grace = WriteLoopConfig {
             retry: RetryConfig::default(),
             shutdown_grace: Duration::from_secs(3600),
@@ -5833,9 +5087,7 @@ mod tests {
             ),
         );
 
-        // Both batches for both sinks, sent and the senders dropped immediately -- each
-        // `ChannelInput` sees its channel close right away and finishes on its own (`Ok(())`)
-        // with no dependency on shutdown timing at all.
+        // Senders dropped up front, so both inputs finish on their own.
         for tx in [&bad1_tx, &bad2_tx] {
             for i in 0..2 {
                 tx.send(EventBatch {
@@ -5851,10 +5103,7 @@ mod tests {
 
         let run_task = tokio::spawn(run(g, specs));
 
-        // Paused clock: both sinks' internal delays (60s and 61s) elapse in virtual time while
-        // this just waits for the task to actually finish -- no real wall-clock cost, but the
-        // timeout itself must still exceed both delays or it trips first against the same
-        // virtual clock.
+        // On the same virtual clock, so the timeout must exceed both delays.
         let result = tokio::time::timeout(PERMANENT_FAILURE_WINDOW * 2, run_task)
             .await
             .expect(
@@ -5873,10 +5122,9 @@ mod tests {
         );
     }
 
-    // -- workstream B: `Input::bind`, readiness, exit codes (docs/plans/operator-surface.md) --
+    // -- `Input::bind`, readiness, exit codes (docs/plans/operator-surface.md) --
 
-    /// Fails every `bind()` call -- proves the pre-pass in `run_with_telemetry` runs *before* any
-    /// task is spawned, and never falls through to `run()`.
+    /// Fails every `bind()`; `run()` must never be reached.
     struct FailingBindInput;
 
     #[async_trait::async_trait]
@@ -5953,10 +5201,7 @@ mod tests {
         );
     }
 
-    /// The sink mirror of [`FailingBindInput`]: proves the pre-spawn pass covers `NodeSpec::Output`
-    /// too, so a `prometheus_out` whose `bind:` address is taken fails startup rather than
-    /// answering nothing once the first scrape arrives
-    /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`").
+    /// The sink mirror of [`FailingBindInput`].
     struct FailingBindOutput {
         tx: std::sync::mpsc::Sender<EventBatch>,
     }
@@ -6016,8 +5261,7 @@ mod tests {
         );
     }
 
-    /// Sorted id order (`docs/plans/operator-surface.md`'s "reproducible startup failures"): two
-    /// independently-unbindable inputs must always report the same one first.
+    /// With two unbindable inputs, the first by sorted id is always the one reported.
     #[tokio::test]
     async fn the_first_failing_bind_by_sorted_id_is_the_one_reported() {
         let mut components = Map::new();
@@ -6044,11 +5288,8 @@ mod tests {
         assert!(err.to_string().contains("a_in"), "the sorted-first id should be named: {err}");
     }
 
-    /// `PipelineState`'s phase reaches `Ready` once every socket is bound and every task is
-    /// spawned, then `Draining` the instant the caller's `shutdown` future resolves -- driven
-    /// with `wait_for`, never an exact `changed()` sequence, since `watch` coalesces (a per-node
-    /// update between two reads can hide an intermediate phase from a slow reader, which is
-    /// correct for a probe and would make an exact-sequence assertion flaky).
+    /// Phase reaches `Ready` after startup, then `Draining` when `shutdown` resolves. Uses
+    /// `wait_for`, not a `changed()` sequence, since `watch` coalesces updates.
     #[tokio::test(start_paused = true)]
     async fn phase_reaches_ready_then_draining_on_a_normal_run() {
         let mut components = Map::new();
@@ -6102,9 +5343,7 @@ mod tests {
             .expect("a clean shutdown should end run_with_telemetry with Ok");
     }
 
-    /// A listener failing once the pipeline is already `Ready` flips `phase` to `Failed`, marks
-    /// that component's own `NodeState::Failed`, and ends the run with `RunError::Runtime` --
-    /// distinct from a startup (bind) failure's `RunError::Startup`.
+    /// A listener failing after `Ready` sets `Phase::Failed` and returns `RunError::Runtime`.
     #[tokio::test]
     async fn a_listener_failing_after_ready_flips_failed_and_returns_runtime() {
         let mut components = Map::new();
@@ -6141,20 +5380,7 @@ mod tests {
         assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
     }
 
-    /// A Lua node's thread panicking once the pipeline is already `Ready` is observed exactly
-    /// like a task failing (`watch_lua_thread`): `Phase::Failed`, that node `Failed`, the rest
-    /// drained (`Finished`, not aborted), and `RunError::Runtime` naming the component. Before
-    /// the watcher existed this run would have hung forever with `/readyz` still `ok` -- hence
-    /// the timeout around it.
-    ///
-    /// **The panic vector.** A script's own errors are non-fatal by design, so the only way to
-    /// kill the thread is a Rust panic. `NodeSpec::Lua { interval: Some(Duration::ZERO) }` gets
-    /// one deterministically on the first loop iteration: `advance_flush_deadline` rejects a
-    /// zero interval (`debug_assert!` in debug, `% 0` in release -- both after the ready
-    /// handshake and before the first `inbox.recv()`). Graph rule 9 (`graph.rs`) rejects a zero
-    /// interval from *config*, which is why the graph component here has `interval: None` and
-    /// only the spec carries the zero -- the two are independent at this layer. If a runtime
-    /// guard on the interval ever lands, this test needs a new vector, not a relaxed assertion.
+    /// A Lua thread panicking after `Ready` fails the run like a task: `Runtime`, others drained.
     #[tokio::test]
     async fn a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime() {
         let mut components = Map::new();
@@ -6184,6 +5410,10 @@ mod tests {
             "enrich".to_string(),
             NodeSpec::Lua {
                 script: "function process(event) return event end".to_string(),
+                // The panic vector: script errors are non-fatal, but `advance_flush_deadline`
+                // panics on a zero interval on the first loop iteration. Graph rule 9 rejects a
+                // zero interval from config, so only the spec carries it. If a runtime guard
+                // lands, find a new vector rather than relaxing the assertions.
                 interval: Some(Duration::ZERO),
             },
         );
@@ -6227,9 +5457,7 @@ mod tests {
         );
     }
 
-    /// The other half of `watch_lua_thread`: a Lua node whose inbox closes normally (its only
-    /// listener finished) reports `Finished`, the same as any task -- previously it stayed
-    /// `Running` for the rest of the run, since nothing ever observed the thread returning.
+    /// A Lua node whose inbox closes normally reaches `NodeState::Finished`.
     #[tokio::test]
     async fn a_lua_node_finishing_on_its_own_reaches_finished() {
         let mut components = Map::new();
@@ -6302,9 +5530,7 @@ mod tests {
         assert_eq!(snapshot.components.get("out"), Some(&NodeState::Finished));
     }
 
-    /// `thread_outcome` turns each payload shape `std::panic` can hand back into a message that
-    /// still says *panicked* -- a `&str` from `panic!("literal")`, a `String` from a formatted
-    /// `panic!`, and the honest fallback for `panic_any` with anything else.
+    /// Every panic payload shape (`&str`, `String`, other) becomes a "thread panicked" message.
     #[test]
     fn thread_outcome_reports_a_panic_payload_as_a_message() {
         assert_eq!(thread_outcome(Ok(())), Ok(()));
@@ -6328,10 +5554,7 @@ mod tests {
         );
     }
 
-    /// `watch_lua_thread` maps the three ways `done_rx` can resolve: a clean report is `Ok`, a
-    /// panic report is an error naming the component and carrying the message, and a sender
-    /// dropped without reporting is still an error (the defensive arm) rather than a hang or a
-    /// silent `Ok`.
+    /// A clean report is `Ok`; a panic report or a dropped sender is an error naming the node.
     #[tokio::test]
     async fn watch_lua_thread_maps_each_outcome() {
         let (tx, rx) = oneshot::channel();
@@ -6356,9 +5579,7 @@ mod tests {
         );
     }
 
-    /// The exit-2 path: a sustained permanent sink failure (`PERMANENT_FAILURE_WINDOW`) ends
-    /// `run_with_telemetry` with `RunError::Runtime`, not `Startup` -- no shortened window or
-    /// test-only knob needed, `write_loop` runs entirely on the paused virtual clock.
+    /// A sustained permanent sink failure ends `run` with an error naming the sink.
     #[tokio::test(start_paused = true)]
     async fn a_sustained_permanent_sink_failure_returns_runtime_not_startup() {
         let mut components = Map::new();
@@ -6410,10 +5631,7 @@ mod tests {
             .expect("bad's second (window-tripping) attempt should have happened");
         drop(bad_tx);
 
-        // `run` (not `run_with_telemetry`) is under test here -- it flattens `RunError` back to
-        // a plain `anyhow::Error` via `RunError::into_inner`, so the exit_code()/RunError-typed
-        // assertion below is done separately (`run_error_exit_codes`); this test only pins that
-        // `run`'s error text still names the failing component after that flattening.
+        // `run` flattens `RunError`; `run_error_exit_codes` covers the typed variant.
         let result = tokio::time::timeout(PERMANENT_FAILURE_WINDOW * 2, run_task)
             .await
             .expect("run should not hang")
@@ -6422,18 +5640,14 @@ mod tests {
         assert!(err.to_string().contains("bad"), "the error should name bad, got: {err}");
     }
 
-    /// `RunError::exit_code()` -- `docs/deploying.md`'s exit-code table: 1 for a startup failure
-    /// (the same class as a bad config), 2 for a runtime failure.
+    /// Exit codes match `docs/deploying.md`: 1 for startup, 2 for runtime.
     #[test]
     fn run_error_exit_codes() {
         assert_eq!(RunError::Startup(anyhow::anyhow!("x")).exit_code(), 1);
         assert_eq!(RunError::Runtime(anyhow::anyhow!("x")).exit_code(), 2);
     }
 
-    /// `Readiness::disabled()` is a receiver-less channel by construction -- every update method
-    /// must use `send_modify`, never `watch::Sender::send` (which returns `Err` once the last
-    /// receiver drops), or a real run under `run`/`run_with_shutdown` (both pass `disabled()`)
-    /// would panic or silently swallow an error the moment any node so much as bound or spawned.
+    /// A full run under receiver-less `Readiness::disabled()` doesn't panic.
     #[tokio::test]
     async fn readiness_disabled_never_panics_across_a_full_run() {
         let mut components = Map::new();
@@ -6458,8 +5672,6 @@ mod tests {
             ),
         );
 
-        // `run` passes `Readiness::disabled()` internally -- reaching `Ready` (and, via the
-        // shutdown below, `Draining`) without panicking is the assertion.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let run_task = tokio::spawn(run_with_shutdown(g, specs, async {
             let _ = shutdown_rx.await;
@@ -6469,14 +5681,7 @@ mod tests {
         run_task.await.expect("task should not panic").expect("clean shutdown should be Ok");
     }
 
-    /// `run_transform`'s non-flush path (`MutatingTransform`, which always returns `Some`) reads
-    /// the incoming batch's `TraceContext` and sends its own emission as a
-    /// [`TraceContext::child`] of it -- the propagation this PR's "Inherited context" follow-up
-    /// implements for the two straightforward node kinds. Tests `run_transform` directly (a
-    /// private fn in this module, not through the full graph) because nothing surfaces a
-    /// propagated context past this crate yet: `Output::send` still takes `&EventBatch`, not
-    /// `&Delivered`, so an end-to-end test through `run` has nowhere to observe it -- see
-    /// `docs/design/pipeline-graph.md`'s "Trace context propagation" section.
+    /// `run_transform` sends its emission as a [`TraceContext::child`] of the incoming batch.
     #[tokio::test]
     async fn run_transform_propagates_the_incoming_context_as_a_child() {
         let (in_tx, in_rx) = mpsc::channel(1);
@@ -6508,13 +5713,7 @@ mod tests {
         );
     }
 
-    /// The other half of the same story: `run_transform`'s flush path (`WindowingTransform`,
-    /// which only ever emits from `flush`, never `process`) has no single incoming batch to
-    /// attribute a close-time flush to -- deliberately mints a fresh root rather than picking one
-    /// of however many batches it absorbed, per `TraceContext`'s own doc comment
-    /// (`crates/logit-pipeline/src/fanout.rs`) and `docs/known-gaps.md`'s internal-spans entry.
-    /// Two absorbed batches on two different traces prove the point directly: neither survives
-    /// into the flushed context.
+    /// A flush mints a fresh root, not the context of either absorbed batch.
     #[tokio::test]
     async fn run_transform_flush_mints_a_fresh_root_not_either_absorbed_batchs_context() {
         let (in_tx, in_rx) = mpsc::channel(2);
@@ -6557,10 +5756,7 @@ mod tests {
         event.attributes.get("logit.node.op").and_then(|v| v.as_str())
     }
 
-    /// `run_transform`'s non-flush path mints its own child context (not through
-    /// `Fanout::send_with_context`) specifically so it can record a span under the same id it
-    /// sends with -- this pins the span half of that contract: parented on the incoming batch's
-    /// context, `SpanKind::Internal`, op `"process"`.
+    /// One `Internal` `"process"` span per batch, parented on the incoming batch's context.
     #[tokio::test]
     async fn run_transform_records_one_span_per_incoming_batch_parented_on_that_batchs_context() {
         let registry = Registry::with_span_sampling(1.0);
@@ -6594,9 +5790,7 @@ mod tests {
         assert_eq!(record.kind, SpanKind::Internal);
     }
 
-    /// The context this PR's design settles: a span records the *node's visit*, not "whether it
-    /// produced anything" -- `WindowingTransform::process` always returns `None` (absorbed into
-    /// its own accumulator), and a process span should still be recorded for that visit.
+    /// A span records the node's visit even when every event is absorbed.
     #[tokio::test]
     async fn a_transform_that_absorbs_every_event_still_records_a_span() {
         let registry = Registry::with_span_sampling(1.0);
@@ -6630,9 +5824,7 @@ mod tests {
         );
     }
 
-    /// The fan-out collision this PR's design explicitly rules out: one `send_with_own_context`
-    /// call, however many consumers it fans out to, records exactly one span for that emission --
-    /// the span belongs to the emission, not to any one edge.
+    /// One emission fanned out to two consumers records one span, not one per branch.
     #[tokio::test]
     async fn a_fan_out_records_exactly_one_span_not_one_per_branch() {
         let registry = Registry::with_span_sampling(1.0);
@@ -6668,10 +5860,7 @@ mod tests {
         );
     }
 
-    /// A local fake `Transform` whose `flush()` always emits two resource groups in one call --
-    /// standing in for `Aggregator`'s per-resource windowing
-    /// (`docs/adr/aggregation-window-semantics.md`) -- used to prove `run_flush` sends every
-    /// group under one shared root context and unions every group's links onto one flush span.
+    /// Flushes two resource groups per call, like `Aggregator`'s per-resource windowing.
     struct MultiGroupFlushTransform {
         links_for_first_group: Vec<SpanLink>,
     }
@@ -6741,10 +5930,7 @@ mod tests {
         assert_eq!(a, b, "both resource groups from one flush should share the identical context");
     }
 
-    /// A local fake `Transform`, standing in for `Aggregator`'s own `(resource, scope)` grouping
-    /// (`crates/logit-transforms/src/aggregate.rs`) -- proves `run_flush` carries a flushed
-    /// group's scope onto the outgoing `EventBatch` (`FlushOutput`'s own doc comment) instead of
-    /// hardcoding `None` the way it used to.
+    /// Flushes one group carrying `scope`, like `Aggregator`'s `(resource, scope)` grouping.
     struct ScopedFlushTransform {
         scope: Arc<Scope>,
     }
@@ -6792,8 +5978,7 @@ mod tests {
         );
     }
 
-    /// The whole point of instrumenting a sink: `write_loop`'s span is the only one that can
-    /// carry `SpanStatus::Error` and name the `Fault` that caused it.
+    /// A failed delivery records a `Client` sink span with `Error` status and a `fault` tag.
     #[tokio::test]
     async fn write_loop_records_a_sink_span_with_error_status_and_a_fault_tag_on_a_failed_delivery()
     {
@@ -6828,8 +6013,7 @@ mod tests {
         assert_eq!(span_event.attributes.get("fault").and_then(|v| v.as_str()), Some("permanent"));
     }
 
-    /// The propagation half of the same span: parented on the context the batch actually arrived
-    /// under (read from the `SinkQueue` entry `drain_inbox` pushed it with), not an unrelated one.
+    /// The sink span is parented on the context the batch was queued with.
     #[tokio::test]
     async fn write_loop_records_a_sink_span_parented_on_the_incoming_batchs_context() {
         let registry = Registry::with_span_sampling(1.0);
@@ -6865,14 +6049,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
-    // Routers and targets (`docs/adr/target-components.md`, `docs/plans/target-components.md` W3)
+    // Routers and targets (`docs/adr/target-components.md`)
     // -------------------------------------------------------------------------------------------
 
-    /// A test `Router`: reads one attribute off every event and maps its value onto a target slot,
-    /// with anything absent or unmatched left [`Destination::Forward`] -- the same shape
-    /// `logit-transforms::Route`'s `by: {attribute: ..}` form will have in W4, minus the interning
-    /// and the coercing comparator. Local for the same reason `MutatingTransform` is: this crate
-    /// can't depend on `logit-transforms` (`docs/design/pipeline-graph.md`'s "Crate layout").
+    /// Maps one attribute's value to a target slot, else [`Destination::Forward`]; a local
+    /// stand-in for `logit-transforms::Route`.
     struct SplitByAttr {
         key: String,
         values: Vec<(String, u16)>,
@@ -6899,9 +6080,7 @@ mod tests {
         }
     }
 
-    /// A pass-through `Transform` that reports every batch's [`Provenance`] to the test -- the
-    /// only way to observe what a `Delivered` carried from inside a running graph, since
-    /// `Output::send` borrows an `&EventBatch` and never sees the context.
+    /// Passes events through and reports each batch's [`Provenance`], which a sink never sees.
     struct RecordProvenance {
         tx: std::sync::mpsc::Sender<Provenance>,
     }
@@ -6932,25 +6111,12 @@ mod tests {
         symbol.map(|s| logit_core::interner::resolve(s).to_string())
     }
 
-    /// Builds a resolved [`Graph`] directly, from `(id, sources, targets, kind)` tuples, instead of
-    /// going through `graph::resolve` the way every other runtime test does.
+    /// Builds a resolved [`Graph`] from `(id, sources, targets, kind)` tuples without
+    /// `graph::resolve`, producing the `ResolvedComponent`s it would.
     ///
-    /// It has to: `graph::resolve`'s rule 8 rejects any config naming an unimplemented kind, and
-    /// `is_implemented` deliberately leaves `ComponentKind::Target`/`Route` out until W4
-    /// (`docs/plans/target-components.md`), so a config with a `target` in it cannot resolve yet --
-    /// while the runtime seam this workstream builds is exactly what has to work first. Nothing is
-    /// faked: these are the same `ResolvedComponent`s `resolve` would produce (`consumers` is the
-    /// inverted `sources` relation, `targets` is `graph::targets_of`'s slot order), and
-    /// `run_with_telemetry` reads nothing else.
-    ///
-    /// Two consequences worth naming, since the tests below rely on both. **A router is declared as
-    /// a `lua`-kind component carrying `targets:`** -- a shape the graph layer already accepts as a
-    /// transform -- and handed a `NodeSpec::Router` implementation: spec kind and config kind are
-    /// independent at the runtime layer, nothing checks they agree, exactly as
-    /// `a_mutation_on_one_fan_out_branch_is_invisible_to_the_sibling_branch` hands a
-    /// `ComponentKind::Json` component a `MutatingTransform`. **A target must be a real
-    /// `ComponentKind::Target {}`**, because `Role::Target` is precisely what the runtime's two
-    /// target passes key off.
+    /// A router here is a `lua`-kind component with `targets:`, handed a `NodeSpec::Router` (spec
+    /// kind and config kind are independent at this layer). A target must be a real
+    /// `ComponentKind::Target {}`: `Role::Target` is what the runtime's target passes key off.
     fn routed_graph(nodes: Vec<(&str, Vec<&str>, Vec<&str>, ComponentKind)>) -> Graph {
         let consumers: HashMap<String, Vec<String>> = nodes
             .iter()
@@ -6995,10 +6161,7 @@ mod tests {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
     }
 
-    /// Every event this test's listener sends is either `stream=a`, `stream=b`, or untagged, and
-    /// each has exactly one right place to end up: target `a`'s consumer, target `b`'s consumer, or
-    /// the router's own consumer. Nothing is duplicated (the whole point of a partition over a
-    /// fan-out) and nothing is lost.
+    /// A router partitions one batch across two targets and its own edge, with no duplicates.
     #[tokio::test]
     async fn a_router_partitions_a_batch_across_two_targets() {
         let g = routed_graph(vec![
@@ -7051,9 +6214,7 @@ mod tests {
             "split".to_string(),
             NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0), ("b", 1)]))),
         );
-        // The registry produces one spec per component, a target included -- these are never
-        // removed from the map (`NodeSpec::Target`'s own doc comment), and the run works either
-        // way; registering them here is what the production call site will do.
+        // As the registry does; the run works with or without them.
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("b".to_string(), NodeSpec::Target);
         specs.insert("sink_a".to_string(), recording_sink(tx_a));
@@ -7086,9 +6247,7 @@ mod tests {
         assert!(rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
     }
 
-    /// The else-branch, spelled as the router's own outbound edge rather than as a chain of
-    /// complementary filters (`docs/adr/target-components.md`): when no route claims anything, the
-    /// whole batch still arrives -- at the router's ordinary consumer, in one piece.
+    /// When no route claims anything, the whole batch reaches the router's ordinary consumer.
     #[tokio::test]
     async fn unrouted_events_reach_the_routers_ordinary_consumers() {
         let g = routed_graph(vec![
@@ -7151,10 +6310,7 @@ mod tests {
         );
     }
 
-    /// A router with targets and no ordinary consumers is a legal config (rule 50), and its
-    /// unrouted events are dropped -- but never *silently*: `Fanout::deliver` returns early on
-    /// zero consumers and counts nothing, so `run_router` has to count them itself. Also pins that
-    /// the run still terminates: a partition with nowhere to go must not park the node.
+    /// With no ordinary consumers, unrouted events are counted as dropped and the run terminates.
     #[tokio::test]
     async fn unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers() {
         let g = routed_graph(vec![
@@ -7242,11 +6398,7 @@ mod tests {
         );
     }
 
-    /// The operator-visible half of the alias (`docs/adr/target-components.md`): each target's
-    /// `Fanout` is built `with_component(<target id>)`, so `Fanout::stamp`'s one unchanged rule
-    /// (`docs/adr/batch-provenance-on-delivered.md`) makes the *target* the `previous` a downstream
-    /// component reads -- not the router that decided, and not at the cost of `origin`, which still
-    /// names the listener that created the batch.
+    /// Downstream of a target, `previous` is the target's id and `origin` is still the listener.
     #[tokio::test]
     async fn previous_downstream_of_a_target_is_the_targets_id_and_origin_is_untouched() {
         let g = routed_graph(vec![
@@ -7314,11 +6466,7 @@ mod tests {
         );
     }
 
-    /// One incoming batch is one hop, however many ways it forks -- exactly the rule
-    /// `a_fan_out_records_exactly_one_span_not_one_per_branch` pins for an ordinary `Fanout`,
-    /// applied to a router's N destinations. Drives `run_router` directly (same shape as the
-    /// `run_transform` span tests above) so the span count isn't entangled with a whole graph's
-    /// worth of other nodes.
+    /// A router batch forked to three destinations records one span.
     #[tokio::test]
     async fn one_incoming_batch_forks_into_one_span_however_many_destinations() {
         let registry = Registry::with_span_sampling(1.0);
@@ -7369,13 +6517,7 @@ mod tests {
         );
     }
 
-    /// The shutdown-cascade pin, and the reason `drop(target_fanouts)` sits beside `drop(senders)`
-    /// in `run_with_telemetry` with a comment of the same weight: a live clone of a target's
-    /// `Fanout` held by that function would be an extra outstanding `Sender` on every one of that
-    /// target's consumers' channels, so none of them could ever close and `run` would hang
-    /// forever. A hang is not a failed assertion, so this test is wrapped in a real timeout -- and
-    /// `run` returning `Ok(())` is itself the proof every sink's inbox closed, since a `run_output`
-    /// task only resolves once its inbox is closed *and* its queue is drained.
+    /// The shutdown cascade reaches past targets (`drop(target_fanouts)`); a hang is the failure.
     #[tokio::test]
     async fn a_router_exiting_closes_its_targets_consumers_inboxes() {
         let g = routed_graph(vec![
@@ -7451,9 +6593,7 @@ mod tests {
         assert_eq!(snapshot.components.get("sink_b"), Some(&NodeState::Finished));
     }
 
-    /// Fan-in at a target is free, by exactly the mechanism `sources:` fan-in already is: each
-    /// router holds its own clone of the same target `Fanout`, so both deliver into the same
-    /// consumer's inbox with nothing to coordinate.
+    /// Two routers directing at one target both deliver to its consumer.
     #[tokio::test]
     async fn two_routers_directing_at_one_target_both_deliver() {
         let g = routed_graph(vec![
@@ -7497,9 +6637,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        // Each router claims one of the two events for the shared target and forwards the other
-        // -- and neither has an ordinary consumer, so each one's forward partition is counted
-        // unrouted and dropped, leaving exactly one batch per router for `shared`.
+        // Each router claims one event for `shared`; the other is dropped as unrouted.
         specs.insert(
             "split_a".to_string(),
             NodeSpec::Router(Box::new(SplitByAttr::new("stream", &[("a", 0)]))),
@@ -7536,11 +6674,7 @@ mod tests {
         );
     }
 
-    /// The unit-level half of the partition, against a *warmed* scratch (W4's allocation suite is
-    /// what pins the exact counts): the right events end up in the right slots, slot order is
-    /// `Forward` then target slots, a destination nothing routed to produces no partition at all,
-    /// and every buffer is handed back empty -- with capacity 0, which is what makes the next
-    /// batch's `reserve_exact` allocate exactly once.
+    /// `route_batch` yields slot-ordered, non-empty partitions and leaves every buffer capacity 0.
     #[test]
     fn route_batch_partitions_into_slot_order_and_leaves_its_scratch_empty_for_reuse() {
         let mut router = SplitByAttr::new("stream", &[("a", 0), ("b", 1)]);
@@ -7548,7 +6682,7 @@ mod tests {
         assert_eq!(scratch.destinations(), 3, "Forward plus one slot per target");
         let telemetry = Telemetry::default();
 
-        // Warm-up batch: gives every buffer a real allocation to have been taken away from it.
+        // Warm-up: gives every buffer an allocation to be taken away.
         let warmed = route_batch(
             &mut router,
             &mut scratch,
@@ -7592,11 +6726,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------------------------
-    // Lua routers (`docs/adr/target-components.md`, `docs/plans/target-components.md` W5)
+    // Lua routers (`docs/adr/target-components.md`)
     // -------------------------------------------------------------------------------------------
 
-    /// As `FiniteInput`, for the tests that need to prove a node is still alive *after* something
-    /// went wrong on an earlier batch: sends each batch in turn, then finishes.
+    /// Sends each batch in turn, then returns.
     struct FiniteBatches {
         batches: Vec<EventBatch>,
     }
@@ -7611,8 +6744,7 @@ mod tests {
         }
     }
 
-    /// The script every Lua-router test below runs: the ADR's own example, an `event:to(..)` per
-    /// branch and a plain `return event` for anything else.
+    /// The ADR's example: `event:to(..)` per stream, `return event` otherwise.
     const SPLIT_SCRIPT: &str = r#"
         function process(event)
             if event.attributes.stream == "a" then
@@ -7624,11 +6756,7 @@ mod tests {
         end
     "#;
 
-    /// `a_router_partitions_a_batch_across_two_targets`'s Lua twin: the same one-batch, three-way
-    /// split, driven by `event:to(..)` marks on the handle rather than by a native `Router`. Each
-    /// event has exactly one right place to end up -- target `a`'s consumer, target `b`'s
-    /// consumer, or (the unmarked ones) the Lua component's *own* consumer -- and nothing is
-    /// duplicated or lost.
+    /// A Lua router's `event:to(..)` marks split one batch across two targets and its own edge.
     #[tokio::test]
     async fn a_lua_router_splits_a_batch_two_ways() {
         let g = routed_graph(vec![
@@ -7713,10 +6841,7 @@ mod tests {
         assert!(rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(), "no duplicate batch");
     }
 
-    /// The else-branch, for a Lua router: an event no `event:to(..)` ever touched goes to whoever
-    /// lists the *component* in `sources:` -- the same rule `unrouted_events_reach_the_routers_
-    /// ordinary_consumers` pins for a native one, asserted on its own rather than only as part of
-    /// the three-way split above.
+    /// An unmarked event reaches the Lua router's ordinary consumer.
     #[tokio::test]
     async fn an_unmarked_event_reaches_the_lua_routers_ordinary_consumers() {
         let g = routed_graph(vec![
@@ -7780,11 +6905,7 @@ mod tests {
         );
     }
 
-    /// "An id not in `targets:` is a script error, counted like every other script error, never a
-    /// silent forward" (`docs/adr/target-components.md`) -- so the event is lost exactly the way
-    /// any other `process()` error loses one, the error is counted under the component the same
-    /// `logit.component.errors{reason="process"}` way, and the node carries on: the batch after it
-    /// still flows, and `run` still returns cleanly.
+    /// `event:to` an unknown id is a counted script error; the node keeps running.
     #[tokio::test]
     async fn an_unknown_target_in_lua_counts_a_script_error_and_does_not_kill_the_node() {
         let script = r#"
@@ -7900,11 +7021,7 @@ mod tests {
         );
     }
 
-    /// A `flush()`-built event honours its mark like any other (`docs/adr/target-components.md`):
-    /// the script stashes an `event:clone()` -- which copies the target table, the only reason
-    /// `e:to("a")` resolves from inside `flush()` at all -- and routes it at flush time. The
-    /// close-time flush (the inbox closing is enough, no deadline has to elapse) is what fires it,
-    /// exactly as in `a_flush_with_no_batch_ever_received_still_records_vm_memory`.
+    /// A `flush()`-emitted `event:clone()` honors its `event:to(..)` mark.
     #[tokio::test]
     async fn lua_flush_output_honours_marks() {
         let script = r#"
@@ -7988,10 +7105,7 @@ mod tests {
     // A Lua `flush()` runs in a root context (`docs/adr/lua-flush-root-context.md`)
     // -----------------------------------------------------------------------------------------
 
-    /// A pass-through `Transform` that reports every batch's [`TraceContext`] and [`Provenance`]
-    /// to the test -- `RecordProvenance`'s shape, widened to the trace half, since the flush
-    /// tests below need to compare what a script *read* inside `flush()` against what its
-    /// emission actually went out under, and `Output::send` never sees the context.
+    /// `RecordProvenance` that also reports each batch's [`TraceContext`].
     struct RecordDelivered {
         ctx_tx: std::sync::mpsc::Sender<TraceContext>,
         prov_tx: std::sync::mpsc::Sender<Provenance>,
@@ -8019,11 +7133,8 @@ mod tests {
         event.attributes.get(key).and_then(|v| v.as_str())
     }
 
-    /// Runs `in -> windowed (this `script`, with an interval) -> watcher -> out` with `input` as
-    /// the one and only batch, until the input finishes and the close-time flush has fired.
-    /// Returns, in delivery order, every `(context, provenance)` the watcher observed and every
-    /// batch the sink received -- index-aligned, since one watcher sits on the one path between
-    /// the Lua node and the sink.
+    /// Runs `in -> windowed(script) -> watcher -> out` over `input`; returns index-aligned
+    /// observed `(context, provenance)` pairs and sink batches.
     async fn run_lua_flush_probe(
         script: &str,
         input: EventBatch,
@@ -8093,9 +7204,8 @@ mod tests {
         (contexts.into_iter().zip(provenances).collect(), batches)
     }
 
-    /// Stashes a clone in `process()` (which also passes the original through, so the process
-    /// path's batch reaches the sink too) and re-emits it from `flush()`, tagging each with what
-    /// the script could see of `trace`/`provenance` at that moment.
+    /// Passes each event through and re-emits a clone from `flush()`, tagging both with what the
+    /// script saw of `trace`/`provenance`.
     const FLUSH_PROBE_SCRIPT: &str = r#"
         local pending = nil
         local function stamp(e, phase)
@@ -8137,8 +7247,7 @@ mod tests {
         }
     }
 
-    /// The flushed batch goes out under an empty resource and no scope -- not the last processed
-    /// batch's, which the process path's own batch (first to arrive) still carries untouched.
+    /// A flushed batch has an empty resource and no scope, not the last processed batch's.
     #[tokio::test]
     async fn lua_flush_resource_and_scope_start_empty_not_last_seen() {
         let (_, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
@@ -8162,8 +7271,7 @@ mod tests {
         assert!(flushed.scope.is_none(), "a flush runs in a root context: no scope");
     }
 
-    /// A `resource`/`scope` write inside `flush()` is the one way a flush-driven emission carries
-    /// either -- committed onto the flushed batch exactly as a `process()`-time write would be.
+    /// A `resource`/`scope` write inside `flush()` reaches the flushed batch.
     #[tokio::test]
     async fn lua_flush_resource_and_scope_written_inside_flush_are_honoured() {
         let script = r#"
@@ -8195,9 +7303,7 @@ mod tests {
         assert_eq!(&scope.name[..], b"from-flush-lib");
     }
 
-    /// Inside `flush()`, `provenance.origin`/`.previous` are both this component -- what the
-    /// flushed batch is stamped with on the way out -- while `process()` still sees the incoming
-    /// batch's own provenance.
+    /// `flush()` sees this component as `origin` and `previous`; `process()` sees the batch's.
     #[tokio::test]
     async fn lua_flush_sees_its_own_component_as_origin_and_previous() {
         let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
@@ -8219,8 +7325,7 @@ mod tests {
         assert_eq!(symbol_name(stamped.previous).as_deref(), Some("windowed"));
     }
 
-    /// Inside `flush()`, `trace` is the fresh root the flushed batch is actually sent under --
-    /// the very ids the watcher observes on it -- and not the last processed batch's context.
+    /// `flush()` sees the fresh root its batch is sent under, not the last batch's context.
     #[tokio::test]
     async fn lua_flush_sees_the_fresh_root_trace_context_it_is_sent_under() {
         let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
@@ -8231,13 +7336,12 @@ mod tests {
             panic!("expected the process-path batch then the flushed batch, got {batches:?}");
         };
 
-        // The process path: the script reads the *incoming* batch's context, and the outgoing
-        // batch is its child -- same trace, different span.
+        // Process path: the script reads the incoming context; the outgoing batch is its child.
         let seen = &processed.events[0];
         assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&process_ctx.trace_id).as_str()));
         assert_ne!(attr_str(seen, "seen_span_id"), Some(hex_id(&process_ctx.span_id).as_str()));
 
-        // The flush: what the script read *is* the root the batch went out under, both halves.
+        // Flush: the script read the root the batch went out under.
         let seen = &flushed.events[0];
         assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&flush_ctx.trace_id).as_str()));
         assert_eq!(attr_str(seen, "seen_span_id"), Some(hex_id(&flush_ctx.span_id).as_str()));
@@ -8247,13 +7351,7 @@ mod tests {
         );
     }
 
-    /// A flushed event marked for a `target` keeps this node as `origin` and takes the target as
-    /// `previous`: the flush pre-fills both halves of the provenance
-    /// (`docs/adr/lua-flush-root-context.md`), and the target's own `Fanout` then applies the one
-    /// unchanged stamping rule (`docs/adr/batch-provenance-on-delivered.md`) it applies on the
-    /// `process()` path -- `previous` becomes the target, `origin` is untouched
-    /// (`docs/adr/target-components.md`). Before the root context an empty `origin` reached the
-    /// target unset, so the *target* named itself as the origin of a flushed batch.
+    /// A flushed event sent through a target keeps this node as `origin`, the target as `previous`.
     #[tokio::test]
     async fn lua_flush_through_a_target_keeps_this_node_as_origin_and_the_target_as_previous() {
         let script = r#"

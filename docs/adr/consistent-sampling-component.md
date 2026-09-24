@@ -101,7 +101,7 @@ dependency (a named, stable algorithm rather than one whose output is allowed to
 releases).
 
 **Rate edges follow the graph's "a config that can only ever be a no-op is an error" precedent**
-(rules 7, 12, 54, 59): `rate: 1` is rejected, and `rate: 0` is rejected *unless* `always_keep` is
+(rules 10, 12, 54, 59): `rate: 1` is rejected, and `rate: 0` is rejected *unless* `always_keep` is
 set — `rate: 0` with an override is the "only flagged events" debugging mode, and worth having.
 Non-finite and out-of-`[0, 1]` rates are rejected the way `span_sample_rate`'s are (rule 16).
 `missing:` without `key:` is rejected as meaningless.

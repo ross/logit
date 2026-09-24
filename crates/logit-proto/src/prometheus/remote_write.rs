@@ -3,13 +3,12 @@
 //! [`decode`] turns one request body into [`MetricFamily`]s; [`encode`] turns them back into
 //! protobuf. The sibling of [`super::text`]: same seam, same model mapping, different syntax.
 //! Nothing here knows about [`logit_core::Event`], and nothing here re-decides a mapping
-//! [`super`]'s module doc already states -- remote-write is a *transport* for exactly the semantics
-//! the exposition format describes.
+//! [`super`]'s module doc already states: remote-write is a *transport* for the semantics the
+//! exposition format describes.
 //!
 //! Neither Snappy nor HTTP is this module's business. The caller decompresses (block format,
 //! `snap::raw`, **not** the framed one), enforces its own body cap, and hands over plain protobuf;
-//! [`Version`] holds the header knowledge both ends need so the receiver and the sender don't spell
-//! it out independently.
+//! [`Version`] holds the header knowledge both the receiver and the sender need.
 //!
 //! References:
 //! <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
@@ -42,12 +41,11 @@
 //! takes a slice of groups and merges series with identical label sets **across** groups into one
 //! `TimeSeries` whose samples are in timestamp order.
 //!
-//! The partition is the right one rather than a convenient one, for two independent reasons. A
-//! classic histogram's `_bucket`/`_sum`/`_count` series all come from one scrape and therefore share
-//! one timestamp exactly, so grouping by timestamp puts precisely the samples that belong to one
-//! `Histogram { buckets, sum, count }` in front of one assembler and never mixes two scrapes'
-//! buckets into one record. And both versions require a sender to write a series' samples in
-//! timestamp order, which ascending groups give for free, per series, across the whole request.
+//! Two reasons make this the right partition. A classic histogram's `_bucket`/`_sum`/`_count`
+//! series all come from one scrape and so share one timestamp, so grouping by timestamp puts the
+//! samples of one `Histogram { buckets, sum, count }` in front of one assembler and never mixes two
+//! scrapes' buckets into one record. And both versions require a sender to write a series' samples
+//! in timestamp order, which ascending groups give per series, across the whole request.
 //!
 //! ## Decode: protobuf → families
 //!
@@ -73,7 +71,7 @@
 //! `seed` table to fall back on per family name, the request's own metadata always winning, and
 //! every [`Decoded`] reports the declarations its request carried ([`Decoded::declarations`]) for a
 //! caller to learn from. What is remembered, for how long, and how much of it is the caller's
-//! decision entirely -- `prometheus_in`'s `metadata_cache:` is the one that exists.
+//! decision -- `prometheus_in`'s `metadata_cache:` makes it.
 //!
 //! ### Malformed input: what is a `400`, and what is a counted skip
 //!
@@ -83,10 +81,10 @@
 //! - the body is not the protobuf message the `Content-Type` promised. Protobuf cannot say so
 //!   directly -- it skips fields it does not recognise -- so this is caught by the *shape* of what
 //!   came back: a non-empty body that decodes to a request with nothing in it was some other
-//!   message. The two versions are mutually unrecognisable in exactly this way, since 2.0 reserves
+//!   message. The two versions are mutually unrecognisable in this way, since 2.0 reserves
 //!   fields 1-3 and 1.0 uses 1 and 3, so a 1.0 body posted with a 2.0 `Content-Type` yields an
 //!   empty `Request` rather than an error. Without the check the receiver would answer `204` and
-//!   report nothing written, which reads to a sender as "accepted". A genuinely empty body -- zero
+//!   report nothing written, which reads to a sender as "accepted". A truly empty body -- zero
 //!   bytes, which is what an empty 1.0 `WriteRequest` encodes to -- is a valid empty request and
 //!   decodes to no groups;
 //! - 2.0: `symbols[0]` is not the empty string, a `labels_refs` list has an odd length, or any
@@ -155,8 +153,8 @@
 //! - `Untyped` is spelled `Unknown` on both versions: the metadata enums have one value for "no
 //!   type", so a text 0.0.4 relay's `untyped` comes back as `unknown`. Both decode to the same
 //!   `Gauge` + `prometheus.type` marker and both write as `untyped` in text 0.0.4;
-//! - a counter's value sample gains `_total` when the model name lacks it, exactly as in both
-//!   exposition dialects;
+//! - a counter's value sample gains `_total` when the model name lacks it, as in both exposition
+//!   dialects;
 //! - 1.0 drops `Series::created` (above);
 //! - an exemplar belongs to a `TimeSeries`, not to a sample, in *both* versions -- so a request
 //!   carrying several timestamps for one series cannot say which sample an exemplar came from.
@@ -185,7 +183,7 @@ use std::sync::Arc;
 
 /// `X-Prometheus-Remote-Write-Version`, which both versions require on every request.
 pub const HEADER_VERSION: &str = "x-prometheus-remote-write-version";
-/// 2.0's report of how many samples the receiver actually stored -- set on 2xx *and* 4xx.
+/// 2.0's report of how many samples the receiver stored -- set on 2xx *and* 4xx.
 pub const HEADER_SAMPLES_WRITTEN: &str = "x-prometheus-remote-write-samples-written";
 /// 2.0's report of how many native histograms the receiver stored, which for this codec is always
 /// `0` ([`Decoded::histograms_skipped`] counts what it did *not* store).
@@ -205,7 +203,7 @@ const PROTO_V2: &str = "io.prometheus.write.v2.Request";
 /// accept 1.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
-    /// `prometheus.WriteRequest` -- what every Prometheus ships today.
+    /// `prometheus.WriteRequest` -- Prometheus's default remote-write message.
     V1,
     /// `io.prometheus.write.v2.Request` -- symbol table, inline metadata, created timestamps.
     V2,
@@ -213,8 +211,8 @@ pub enum Version {
 
 impl Version {
     /// The `Content-Type` a sender sets. 1.0 gets the fully-qualified spelling Prometheus itself
-    /// sends rather than the bare media type, because it is strictly more informative and every
-    /// conforming 1.0 receiver accepts it.
+    /// sends rather than the bare media type: it is more informative and every conforming 1.0
+    /// receiver accepts it.
     pub fn content_type(self) -> &'static str {
         match self {
             Version::V1 => "application/x-protobuf;proto=prometheus.WriteRequest",
@@ -233,7 +231,7 @@ impl Version {
 
     /// The version a request's `Content-Type` selects, or `None` -- the receiver's `415`.
     ///
-    /// Tolerant in exactly the ways a real sender is careless: the media type and the parameter
+    /// Tolerant where real senders are careless: the media type and the parameter
     /// names compare case-insensitively (HTTP says they may), whitespace around `;` and `=` is
     /// ignored, unrecognized parameters (`charset=…`) are ignored, and a bare
     /// `application/x-protobuf` with no `proto=` at all is 1.0 -- which is what the 1.0 spec itself
@@ -246,9 +244,8 @@ impl Version {
         }
         let mut version = Version::V1;
         for part in parts {
-            // A parameter with no `=` at all -- a trailing `;`, which `split` yields as an empty
-            // part, or a bare word -- is one more parameter this codec has no use for, not a
-            // reason to reject the request. The `proto=` parameter is the only one that decides
+            // A parameter with no `=` -- a trailing `;`, which `split` yields as an empty part, or
+            // a bare word -- is ignored, not a reason to reject the request. Only `proto=` decides
             // anything here.
             let Some((key, parameter)) = part.split_once('=') else { continue };
             if !key.trim().eq_ignore_ascii_case("proto") {
@@ -277,20 +274,18 @@ pub struct Decoded {
     /// is canonically ordered the way `Assembler::finish` orders one (families by name, series by
     /// label set).
     pub groups: Vec<Vec<MetricFamily>>,
-    /// Samples actually stored -- a sample the assembler stepped over (a duplicate, a bad `le`) is
-    /// not counted, because the header is a report of what the receiver kept.
+    /// Samples stored -- a sample the assembler stepped over (a duplicate, a bad `le`) is not
+    /// counted, because the header is a report of what the receiver kept.
     pub samples: u64,
-    /// Exemplars actually stored. `X-Prometheus-Remote-Write-Exemplars-Written` is a report of
-    /// what the receiver *stored*, so an exemplar this codec could not place is not counted here.
-    /// Every one of those is counted `logit.input.metrics.degraded{reason="exemplar_dropped"}`
+    /// Exemplars stored, for `X-Prometheus-Remote-Write-Exemplars-Written`. Every exemplar this
+    /// codec could not place is counted `logit.input.metrics.degraded{reason="exemplar_dropped"}`
     /// instead -- whether its series carried no sample this codec kept, or the series was skipped
-    /// outright as `invalid_labels` -- so a sender reconciling what it sent against what was
-    /// written can always find the difference in one counter.
+    /// as `invalid_labels` -- so the difference from what was sent is in one counter.
     pub exemplars: u64,
     /// Native-histogram entries skipped, each also counted
     /// `logit.input.metrics.skipped{reason="native_histogram"}`.
     pub histograms_skipped: u64,
-    /// Exactly what **this request** declared -- 1.0's `metadata[]`, 2.0's inline `Metadata` with a
+    /// What **this request** declared -- 1.0's `metadata[]`, 2.0's inline `Metadata` with a
     /// type that is not `UNSPECIFIED` -- deduped to one entry per family and keyed by the family's
     /// own name. Not the table the decode ran against: a [`decode_with`] seed is the caller's, and
     /// giving it back would let a cache refresh entries off its own memory forever.
@@ -306,7 +301,7 @@ pub struct Decoded {
 /// reports having kept.
 ///
 /// This is [`flatten`]'s own spelling, read off the [`Point`] rather than recomputed from a model
-/// record, which is what makes it exact: a `Point` still carries the `Option`s the wire had, so a
+/// record, which makes it exact: a `Point` still carries the `Option`s the wire had, so a
 /// summary sent without `_sum`/`_count` counts its quantiles and nothing more, and a gaugehistogram
 /// without a `_gsum` has no `_gcount` either (OpenMetrics' own rule, which both ends already
 /// follow). `kind` is needed for the two cases the point alone cannot answer: a [`Point::Stale`] is
@@ -315,7 +310,7 @@ pub struct Decoded {
 ///
 /// `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs` pins it against [`encode`]
 /// itself: summed over a generated group set, this equals the number of `Sample`s the encoder
-/// actually writes. The one deliberate difference is the `_created` term -- 1.0 spells a created
+/// writes. The one difference is the `_created` term -- 1.0 spells a created
 /// timestamp as a `_created` sample of its own, which [`decode`] counts and this counts, while
 /// [`encode`] drops it (1.0 has no field for it; see the permitted-normalization list). 2.0 carries
 /// it as `Sample.start_timestamp`, a field *on* a sample rather than a sample, so it adds nothing
@@ -324,7 +319,7 @@ pub struct Decoded {
 /// **What "kept" means for a malformed sender.** The count describes the series this receiver now
 /// holds, not the bytes that arrived: where a sender omitted a `+Inf` bucket or a `_count` the
 /// assembler synthesized one, and this counts the synthesized sample, because that is a sample the
-/// receiver really did store and really will re-emit. Both specs require a conforming sender to
+/// receiver stored and will re-emit. Both specs require a conforming sender to
 /// send them, so the two readings only ever differ for input that was already wrong.
 pub fn wire_samples(kind: FamilyType, series: &Series, version: Version) -> u64 {
     let value_samples = match &series.point {
@@ -378,8 +373,8 @@ pub fn decode(
 }
 
 /// [`decode`], plus a `seed` of declarations to fall back on for a family this request says nothing
-/// about -- and reporting, in [`Decoded::declarations`], exactly what it *did* say, so the caller
-/// can keep its seed current.
+/// about -- and reporting, in [`Decoded::declarations`], what it *did* say, so the caller can keep
+/// its seed current.
 ///
 /// **The request wins, per family name.** A request that declares `foo` a counter decodes its own
 /// `foo` samples as a counter even where the seed remembers a histogram, and a request that
@@ -419,7 +414,7 @@ type Description = (Option<Arc<str>>, Option<Arc<str>>);
 type UntypedDescription = Option<Description>;
 
 /// One series, once its labels have been resolved and validated and its samples have been routed:
-/// the sample name, the series labels, and the groups a sample of it actually landed in (ascending,
+/// the sample name, the series labels, and the groups a sample of it landed in (ascending,
 /// deduplicated). That last part is what the exemplar pass needs and the only reason this outlives
 /// the sample loop.
 struct Routed<'a> {
@@ -436,11 +431,10 @@ impl Routed<'_> {
     /// sample at that instant, else the latest group where it has one at all.
     ///
     /// An exemplar hangs off a `TimeSeries` rather than off a sample in both versions, so a request
-    /// carrying several timestamps for one series cannot say which sample an exemplar came from and
-    /// this is a choice the wire forces -- see the permitted-normalization list. What it must not
-    /// do is pick a group in which the series has no sample: an exemplar is an example of a
-    /// reading, and inventing a reading-less series to hang it on turns into an `incomplete_series`
-    /// skip that swallows the exemplar on the way past.
+    /// carrying several timestamps for one series cannot say which sample an exemplar came from:
+    /// a choice the wire forces (see the permitted-normalization list). It must never pick a group
+    /// in which the series has no sample: a reading-less series invented to hang it on becomes an
+    /// `incomplete_series` skip that swallows the exemplar.
     fn group_for(&self, timestamp_nanos: i64) -> Option<i64> {
         if self.groups.binary_search(&timestamp_nanos).is_ok() {
             return Some(timestamp_nanos);
@@ -457,7 +451,7 @@ impl Routed<'_> {
 struct Groups<'a> {
     declarations: &'a Declarations,
     /// What the caller remembered, consulted per family name where `declarations` has nothing --
-    /// see [`decode_with`]. Shared by reference exactly as the request's own table is.
+    /// see [`decode_with`]. Shared by reference, as the request's own table is.
     seed: &'a Declarations,
     groups: BTreeMap<i64, Assembler<'a>>,
 }
@@ -488,9 +482,9 @@ impl<'a> Groups<'a> {
     }
 }
 
-/// Folds one metadata entry into the request's declaration table, first-wins per field. The dedupe
-/// matters for more than tidiness: 2.0 repeats a family's `Metadata` on every one of its wire
-/// series, so without this a five-series histogram would declare itself five times.
+/// Folds one metadata entry into the request's declaration table, first-wins per field. 2.0 repeats
+/// a family's `Metadata` on every one of its wire series, so without the dedupe a five-series
+/// histogram would declare itself five times.
 ///
 /// Only a *conflict* is counted -- a second entry naming a different type, help or unit for one
 /// family. A sender repeating what it already said is not a dropped input, and
@@ -581,7 +575,7 @@ fn non_empty(s: &str) -> Option<Arc<str>> {
 }
 
 /// 1.0's `MetricMetadata.type`. `UNKNOWN` (and any value this build doesn't recognize) is
-/// [`FamilyType::Unknown`], which is exactly what an undeclared family already gets.
+/// [`FamilyType::Unknown`], which is what an undeclared family already gets.
 fn family_type_v1(value: i32) -> FamilyType {
     match pb1::metric_metadata::MetricType::try_from(value) {
         Ok(pb1::metric_metadata::MetricType::Counter) => FamilyType::Counter,
@@ -623,22 +617,20 @@ fn decode_v1(
         ));
     }
 
-    // Pass one: the declaration table. An `UNKNOWN` entry declares **nothing**, exactly as 2.0's
-    // `UNSPECIFIED` declares nothing (see `decode_v2`), even though 1.0 does name the family it is
-    // talking about. `UNKNOWN` is the metadata enum's zero value and means "no type given", which
-    // is already what an undeclared family gets -- so entering it in the table can only do harm in
-    // two ways, and no good at all. In the request, a declared `Unknown` family named `foo` claims
-    // `foo_bucket` by the suffix scan and then refuses it (`unknown_suffix`), where an undeclared
-    // one would have let it open a family of its own. And out of the request, it is a declaration
-    // a caller can *learn* -- so one sender saying `foo` UNKNOWN would overwrite another sender's
-    // HISTOGRAM in a metadata cache and take the whole family's assembly with it. A type that says
-    // nothing must never displace one that says something.
+    // Pass one: the declaration table. An `UNKNOWN` entry declares **nothing**, as 2.0's
+    // `UNSPECIFIED` declares nothing (see `decode_v2`), even though 1.0 names the family.
+    // `UNKNOWN` is the enum's zero value, "no type given", which an undeclared family already
+    // gets; entering it would only do harm. In the request, a declared `Unknown` family `foo`
+    // claims `foo_bucket` by the suffix scan and then refuses it (`unknown_suffix`), where an
+    // undeclared one would have let it open a family of its own. Out of the request, it is a
+    // declaration a caller can *learn*, so one sender saying `foo` UNKNOWN would overwrite another
+    // sender's HISTOGRAM in a metadata cache. A type that says nothing must never displace one
+    // that says something.
     //
-    // Its `help`/`unit` still land, by 2.0's own route: held aside here and applied after the
-    // samples have routed (`Assembler::describe`), to the family a sample of that exact name
-    // opened. An `Unknown` family's only sample is its own name, so that is the whole of what such
-    // an entry can be describing -- and an entry naming a family this request has no samples for
-    // describes nothing, which is the right answer rather than a lost one.
+    // Its `help`/`unit` still land, by 2.0's route: held aside here and applied after the samples
+    // have routed (`Assembler::describe`), to the family a sample of that exact name opened. An
+    // `Unknown` family's only sample is its own name, so an entry naming a family this request has
+    // no samples for describes nothing.
     let mut declarations = Declarations::default();
     let mut described: HashMap<&str, Description> = HashMap::new();
     for metadata in &request.metadata {
@@ -708,15 +700,9 @@ fn decode_v1(
     // `Routed::group_for` for why this cannot be done as the samples go past.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
         let Some(routed) = routed else {
-            // The series itself was skipped as `invalid_labels`, so its exemplars have no series to
-            // sit on. Counted individually rather than left to the one skip that dropped the
-            // series: the two counters measure different things, and an operator reconciling
-            // "exemplars sent" against `X-Prometheus-Remote-Write-Exemplars-Written` needs every
-            // unwritten one to appear somewhere.
-            //
-            // Their labels are deliberately not resolved on the way past. The series they describe
-            // is already gone, so nothing will read them, and a symbol reference inside one is not
-            // worth failing the whole request over when the request is otherwise fine.
+            // The series was skipped as `invalid_labels`. Each of its exemplars is counted too:
+            // an operator reconciling "exemplars sent" against
+            // `X-Prometheus-Remote-Write-Exemplars-Written` needs every unwritten one to appear.
             for _ in &series.exemplars {
                 decoder.degraded("exemplar_dropped");
             }
@@ -852,11 +838,10 @@ fn decode_v2(
     // 2.0's `Metadata` rides every series and names no family, so the family has to be the sample
     // name with its type's own suffix taken off -- which only works when there *is* a type.
     // `UNSPECIFIED` therefore declares nothing: `family_base` would strip no suffix, so a series
-    // called `foo_bucket` would declare a family literally called `foo_bucket`, and `route` prefers
-    // an exact name over the suffix scan -- so it would beat a sibling series' `HISTOGRAM`
-    // declaration of `foo` and leave that histogram bucket-less. Any help or unit such a series
-    // carries is applied after its samples route, to whatever family they landed in
-    // (`Assembler::describe`), which is the only question that has an answer.
+    // called `foo_bucket` would declare a family called `foo_bucket`, and `route` prefers an exact
+    // name over the suffix scan -- so it would beat a sibling series' `HISTOGRAM` declaration of
+    // `foo` and leave that histogram bucket-less. Any help or unit such a series carries is applied
+    // after its samples route, to whatever family they landed in (`Assembler::describe`).
     let mut declarations = Declarations::default();
     let mut described: Vec<UntypedDescription> = Vec::with_capacity(request.timeseries.len());
     for (series, resolved) in request.timeseries.iter().zip(&resolved) {
@@ -937,15 +922,9 @@ fn decode_v2(
     // Pass four: exemplars.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
         let Some(routed) = routed else {
-            // The series itself was skipped as `invalid_labels`, so its exemplars have no series to
-            // sit on. Counted individually rather than left to the one skip that dropped the
-            // series: the two counters measure different things, and an operator reconciling
-            // "exemplars sent" against `X-Prometheus-Remote-Write-Exemplars-Written` needs every
-            // unwritten one to appear somewhere.
-            //
-            // Their labels are deliberately not resolved on the way past. The series they describe
-            // is already gone, so nothing will read them, and a symbol reference inside one is not
-            // worth failing the whole request over when the request is otherwise fine.
+            // The series was skipped as `invalid_labels`; each exemplar is counted, as in
+            // `decode_v1`. Their labels are not resolved: nothing will read them, and a bad
+            // symbol reference inside one is not worth failing an otherwise-fine request over.
             for _ in &series.exemplars {
                 decoder.degraded("exemplar_dropped");
             }
@@ -990,7 +969,7 @@ pub fn encode(
     encode_counted(groups, version, encoder).0
 }
 
-/// [`encode`], plus how many samples the body it returns actually carries -- what a sender counts
+/// [`encode`], plus how many samples the body it returns carries -- what a sender counts
 /// as `logit.output.samples`, the mirror of [`Decoded::samples`] on the receiving end.
 ///
 /// A separate entry point rather than a wider return type on [`encode`], because the count is only
@@ -1064,10 +1043,8 @@ pub fn encode_counted(
             encoder.degraded_reason("sub_ms_collapsed");
         }
     }
-    // Counted in its own pass, deliberately *after* everything that can still add to or remove
-    // from `built` -- what a caller reports as `logit.output.samples` has to be what the body
-    // ends up carrying, not what the merge loop above happened to have accumulated at some point
-    // on the way there.
+    // Counted in its own pass, *after* everything that can still add to or remove from `built`:
+    // `logit.output.samples` has to be what the body carries.
     let samples = built.values().map(|out| out.samples.len() as u64).sum();
     let body = match version {
         Version::V1 => encode_v1(built),
@@ -1185,9 +1162,9 @@ fn flatten(
             // `unknown_suffix`/`malformed_line` and the series would vanish on a 1.0-to-2.0
             // transcode or a receiver-to-sender relay. `_count`/`_sum` (`_gcount`/`_gsum` for a
             // gaugehistogram) are names those types do have, and a stale NaN in any role flags the
-            // whole series stale, so either one alone would do; both are sent because a Prometheus
-            // marking a metric stale marks every series of it, and a receiver that reads only one
-            // of them still gets the message.
+            // whole series stale, so either one alone would do; both are sent because Prometheus
+            // marks every series of a stale metric, and a receiver that reads only one of them
+            // still gets the message.
             drop_exemplars(encoder);
             let stale = f64::from_bits(STALE_NAN_BITS);
             let suffixes: &[&str] = match family.kind {
@@ -1279,7 +1256,7 @@ fn label_set(
     let mut out: Vec<(String, String)> = Vec::with_capacity(labels.len() + 2);
     for (key, value) in labels {
         // Names this codec generates itself cannot also arrive as model labels: a repeated label
-        // name is an invalid label set, not merely a confusing one. `events_to_families` already
+        // name is an invalid label set. `events_to_families` already
         // drops an attribute that would collide with `le`/`quantile`, so this is the guard for a
         // hand-built family rather than a path a pipeline reaches.
         if key == "__name__" || extra.is_some_and(|(generated, _)| key == generated) {

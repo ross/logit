@@ -1,52 +1,35 @@
-//! Pure-codec collectd fixed-point tests: `docs/adr/lossless-transit.md`'s "round-trip fixed point
-//! is the test that proves this" requirement, exercised directly against [`CollectdEncoder`]/
-//! [`CollectdDecoder`] with no pipeline, listener, sink or socket in between. The mirror of
-//! `tests/otlp_fixed_point.rs` and `tests/prometheus_fixed_point.rs`.
+//! Pure-codec collectd fixed-point tests, against [`CollectdEncoder`]/[`CollectdDecoder`] with no
+//! pipeline or socket: `collectd_in -> collectd_out` is a fixed point modulo the "Permitted
+//! normalizations" list in `logit_proto::collectd`'s module doc.
 //!
 //! Two properties, per fixture:
 //!
-//! 1. **`decode(encode(b)) == b`** -- whole-event equality via `PartialEq`
-//!    (`docs/adr/metrics-model-v2.md`'s "`PartialEq` on every record type"). Every fixture is built
-//!    in the shape a *real decode* already produces -- identity on `collectd.*` attributes, a
-//!    positive timestamp, integral values where COUNTER/DERIVE/ABSOLUTE demand them, record names
-//!    exactly `<plugin>.<type>[.<i>]` -- so the round trip is a real fixed-point check rather than a
-//!    tautology over whatever the encoder happens to emit.
-//! 2. **`encode(decode(encode(b))) == encode(b)` on bytes** -- the same fixed point restated at the
-//!    wire level, which catches a codec that produces two different byte strings for what it itself
-//!    considers the same batch (a non-deterministic elision decision, a stray part it sometimes
-//!    writes and sometimes doesn't).
+//! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
+//!    decode produces (identity on `collectd.*` attributes, a positive timestamp, integral values
+//!    for COUNTER/DERIVE/ABSOLUTE, names `<plugin>.<type>[.<i>]`), so the check isn't a tautology.
+//! 2. **`encode(decode(encode(b))) == encode(b)` on bytes**, which catches a codec that writes two
+//!    byte strings for one batch (a non-deterministic elision decision, a sometimes-written part).
 //!
-//! Both are asserted at three datagram caps -- 1024 (collectd's own minimum `MaxPacketSize`), 1452
-//! (its default) and 65535 (one datagram, no packing at all) -- because re-chosen datagram
-//! boundaries are on the permitted-normalization list and must not change what decodes back out.
+//! Both are asserted at three datagram caps: 1024 (collectd's minimum `MaxPacketSize`), 1452 (its
+//! default), and 65535 (no packing), because re-chosen boundaries (normalization 3) must not change
+//! what decodes.
 //!
-//! The `proptest` at the bottom does the same over a generated packet *grammar*, starting from wire
-//! bytes rather than a hand-built batch, so the fixtures above stay readable while the coverage is
-//! not limited to what anyone thought to write down. What it generates, precisely:
+//! The `proptest` at the bottom starts from a generated packet *grammar*:
 //!
-//! - 1–8 value lists in one datagram, each naming any subset of the five identity parts (the
-//!   opening list always gets a host/plugin/type, since a datagram whose first list has none is one
-//!   collectd itself rejects) — so **elision is generated, not assumed**: a list that names no
-//!   plugin is inheriting the sticky one, exactly as a real sender's elision does;
-//! - 1–7 data sources per list, any mix of all four types, over `any::<u64>`/`any::<i64>`/
-//!   `any::<f64>` — so `NaN`, `±inf`, `u64::MAX` and the whole `f64` space are in range;
-//! - identity strings from `[A-Za-z0-9._-]{1,20}` — deliberately **excluding** `/` and NUL, which
-//!   the encoder substitutes (normalization 8) and which therefore are not a fixed point; that
-//!   substitution has its own unit test in `encode.rs` instead;
-//! - times as either whole seconds through the legacy `Time` part *or* an arbitrary `cdtime_t` in
-//!   `[2^60, 2^61)` with every sub-second bit live, and intervals likewise legacy-seconds or an
-//!   arbitrary `cdtime_t` below 2^53 ticks. The high-resolution branch is what reaches
-//!   **normalization 2** — a `TimeHR` that may move ≤1 tick on the first hop and is stable after —
-//!   which a whole-second `TimeHR` cannot, since it is bit-identical to its own legacy spelling;
-//! - an optional notification (`0x0101`/`0x0100`) after any generated list, so it can precede a
-//!   later list or trail the whole packet, dispatched against whatever sticky identity that list
-//!   left behind, with a valid severity and a non-empty message (an invalid severity or an empty
-//!   message is a counted drop, not a fixed point, and has its own unit tests in `encode.rs`
-//!   instead).
+//! - 1–8 value lists per datagram, each naming any subset of the five identity parts (the first
+//!   always gets host/plugin/type, which collectd requires), so **elision is generated**;
+//! - 1–7 data sources per list, all four types, over `any::<u64>`/`any::<i64>`/`any::<f64>`, so
+//!   `NaN`, `±inf`, and `u64::MAX` are in range;
+//! - identity strings from `[A-Za-z0-9._-]{1,20}`, **excluding** `/` and NUL (normalization 8,
+//!   tested in `encode.rs`);
+//! - times as legacy whole seconds *or* a `cdtime_t` in `[2^60, 2^61)` with live sub-second bits,
+//!   and intervals as legacy seconds or a `cdtime_t` below 2^53 ticks. Only the high-resolution
+//!   branch reaches **normalization 2** (a `TimeHR` may move ≤1 tick on the first hop);
+//! - an optional notification after any list, with a valid severity and a non-empty message
+//!   (the drop cases are tested in `encode.rs`).
 //!
-//! Because of that last point the property is asserted **from the first hop on**, not from the
-//! input bytes: see the test's own doc comment for the exact chain, and for why the model half of
-//! it (`d1 == d2`) nonetheless holds unconditionally.
+//! Because of normalization 2, the property holds **from the first hop on**, not from the input
+//! bytes; the test's doc comment has the chain.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -64,14 +47,13 @@ use std::sync::Arc;
 
 const TS: i64 = 1_700_000_000_000_000_000;
 const RECEIVED_AT: i64 = 1_699_000_000_000_000_000;
-/// The three caps every property is checked at -- see this file's module doc.
+/// The three caps every property is checked at.
 const CAPS: [usize; 3] = [1024, DEFAULT_MAX_PACKET_BYTES, 65535];
 
 // -- part writing, for the wire-level fixtures and the proptest grammar -------------------------
 //
-// Deliberately hand-rolled rather than reusing `logit_proto::collectd::part`'s writers: a fixture
-// built by the same code the encoder uses could not prove the encoder writes what a real collectd
-// sender does, and could not express the legacy-part shapes this file needs.
+// Hand-rolled, not `logit_proto::collectd::part`'s writers: the encoder's own code can't prove
+// it writes what a collectd sender does, or express legacy parts.
 
 const TYPE_HOST: u16 = 0x0000;
 const TYPE_TIME: u16 = 0x0001;
@@ -145,7 +127,7 @@ fn encode_at(batch: &EventBatch, cap: usize) -> Vec<Vec<u8>> {
     packets.iter().map(|bytes| bytes.to_vec()).collect()
 }
 
-/// Decodes every datagram in order through one decoder, exactly as `collectd_in` would.
+/// Decodes every datagram in order through one decoder, as `collectd_in` does.
 fn decode_all(packets: &[Vec<u8>], resource: &Arc<Resource>) -> Vec<Event> {
     let mut decoder = CollectdDecoder::new(resource.clone());
     let mut events = Vec::new();
@@ -157,8 +139,7 @@ fn decode_all(packets: &[Vec<u8>], resource: &Arc<Resource>) -> Vec<Event> {
     events
 }
 
-/// One batch over `events`, sharing `resource` -- the `EventBatch` wrapper the encoder wants, built
-/// often enough in the property below to be worth naming.
+/// One batch over `events`, sharing `resource`.
 fn rebatch(resource: &Arc<Resource>, events: Vec<Event>) -> EventBatch {
     EventBatch { resource: resource.clone(), scope: None, events }
 }
@@ -184,10 +165,8 @@ fn assert_fixed_point(batch: EventBatch) {
     }
 }
 
-/// The same two properties starting from real wire bytes: `packet` is decoded first, so the fixture
-/// is decode-shaped by construction rather than by hand. This is the only way to exercise a wire
-/// shape the encoder never emits -- a legacy `Time`/`Interval` part, a non-UTF-8 identity string, an
-/// elision pattern a sender chose differently than this encoder would.
+/// The same two properties starting from wire bytes, which reaches shapes the encoder never
+/// emits: a legacy `Time`/`Interval` part, a non-UTF-8 identity, a sender's own elision pattern.
 fn assert_wire_fixed_point(packet: Bytes, expected_events: usize) {
     let resource = Arc::new(Resource::default());
     let mut decoder = CollectdDecoder::new(resource.clone());
@@ -212,8 +191,7 @@ fn identity(type_instance: Option<&str>) -> AttrMap {
     attrs
 }
 
-/// One event carrying one record named exactly what a decode of a single-data-source
-/// `load`/`load` list produces.
+/// One event carrying one record named as a decoded single-data-source `load`/`load` list is.
 fn single(kind: MetricKind) -> EventBatch {
     let mut event = Event::empty(TS, identity(Some("short")));
     event.metrics.push(MetricRecord::new(intern("load.load"), kind));
@@ -244,8 +222,8 @@ fn an_absolute_list_is_a_fixed_point() {
     assert_fixed_point(single(sum(5.0, Temporality::Delta, true)));
 }
 
-/// The whole range collectd's integer types span, including the two values that sit exactly on the
-/// `f64` bounds (`u64::MAX` and `i64::MAX` both round *up* to a power of two as doubles).
+/// The whole range of collectd's integer types, including `u64::MAX` and `i64::MAX`, which both
+/// round *up* to a power of two as doubles.
 #[test]
 fn integer_values_at_the_edges_of_their_ranges_are_fixed_points() {
     for value in [0.0, 1.0, 9_007_199_254_740_992.0, u64::MAX as f64] {
@@ -257,8 +235,7 @@ fn integer_values_at_the_edges_of_their_ranges_are_fixed_points() {
     }
 }
 
-/// NaN is collectd's "no reading this interval," which the model carries as a flagged point -- so
-/// the *flag*, not the NaN, is what has to survive (a `Gauge(NaN)` could never compare equal).
+/// A NaN gauge's *flag* survives the round trip.
 #[test]
 fn a_nan_gauge_round_trips_as_a_flagged_zero_gauge() {
     let mut event = Event::empty(TS, identity(Some("short")));
@@ -279,8 +256,7 @@ fn an_infinite_gauge_is_a_fixed_point() {
     assert_fixed_point(single(MetricKind::Gauge(f64::NEG_INFINITY)));
 }
 
-/// A multi-data-source list is **one** event carrying N records in wire order -- the shape that
-/// makes it re-encodable as the same single list rather than N single-value ones.
+/// A multi-data-source list is **one** event of N records, re-encoded as one list.
 #[test]
 fn a_multi_value_list_is_a_fixed_point() {
     let mut event = Event::empty(TS, identity(None));
@@ -297,8 +273,7 @@ fn a_multi_value_list_is_a_fixed_point() {
     });
 }
 
-/// A mix of data-source types in one list, which a real `types.db` type (`ps_state`, `disk_octets`)
-/// routinely has.
+/// A mix of data-source types in one list.
 #[test]
 fn a_mixed_data_source_list_is_a_fixed_point() {
     let mut event = Event::empty(TS, identity(None));
@@ -320,8 +295,7 @@ fn a_mixed_data_source_list_is_a_fixed_point() {
     });
 }
 
-/// An event with no `collectd.interval` at all: it leaves as `IntervalHR 0` and must come back
-/// absent, not as `F64(0.0)`.
+/// No `collectd.interval` leaves as `IntervalHR 0` and comes back absent, not `F64(0.0)`.
 #[test]
 fn a_list_with_no_interval_is_a_fixed_point() {
     let mut attrs = identity(Some("short"));
@@ -335,9 +309,8 @@ fn a_list_with_no_interval_is_a_fixed_point() {
     });
 }
 
-/// Several events sharing an identity: the encoder elides the repeated parts, and the decoder's own
-/// sticky state has to put them back. At cap 1024 this also crosses a datagram boundary, which is
-/// where the encoder's re-encode earns its keep.
+/// Events sharing an identity: elided parts come back from sticky state, including across the
+/// datagram boundary cap 1024 forces.
 #[test]
 fn many_lists_sharing_an_identity_are_a_fixed_point_across_datagram_boundaries() {
     let events: Vec<Event> = (0..60)
@@ -354,8 +327,7 @@ fn many_lists_sharing_an_identity_are_a_fixed_point_across_datagram_boundaries()
 
 // -- wire-level fixtures -------------------------------------------------------------------------
 
-/// Legacy second-resolution `Time`/`Interval` parts: normalization (1) re-emits both as their
-/// high-resolution counterparts, so the *model* is a fixed point even though the bytes are not.
+/// Normalization 1: legacy `Time`/`Interval` re-emit as HR parts; the *model* is a fixed point.
 #[test]
 fn a_legacy_time_and_interval_packet_is_a_fixed_point_after_the_hr_rewrite() {
     assert_wire_fixed_point(
@@ -371,10 +343,8 @@ fn a_legacy_time_and_interval_packet_is_a_fixed_point_after_the_hr_rewrite() {
     );
 }
 
-/// Normalization 2, made concrete and deterministic rather than left to the generator: a `TimeHR`
-/// and an `IntervalHR` with real sub-second bits. The *bytes* are entitled to come back one tick
-/// (2⁻³⁰ s) away from where they started — `cdtime -> ns -> cdtime` is not quite the identity —
-/// while the model's timestamp does not move at all, because `ns -> cdtime -> ns` is.
+/// Normalization 2, deterministically: a `TimeHR` and an `IntervalHR` with sub-second bits may
+/// come back one tick away in bytes, while the model's timestamp doesn't move.
 #[test]
 fn a_sub_second_time_and_interval_packet_is_a_fixed_point_from_the_first_hop() {
     assert_wire_fixed_point(
@@ -390,9 +360,8 @@ fn a_sub_second_time_and_interval_packet_is_a_fixed_point_from_the_first_hop() {
     );
 }
 
-/// A sender's own elision pattern: one Host/Plugin/Type for three lists, each changing only its
-/// TypeInstance. The encoder re-derives elision per output datagram and must land on the same
-/// events.
+/// A sender's elision pattern (one Host/Plugin/Type for three lists) decodes to the same events
+/// after the encoder re-derives elision.
 #[test]
 fn an_elided_identity_packet_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -414,8 +383,7 @@ fn an_elided_identity_packet_is_a_fixed_point() {
     );
 }
 
-/// A non-UTF-8 host: it rides as a `Value::Bytes` and is written back byte-verbatim. Lossily
-/// replacing it would make this exact test fail, which is the point of keeping the distinction.
+/// A non-UTF-8 host rides as a `Value::Bytes` and is written back byte-verbatim.
 #[test]
 fn a_non_utf8_host_packet_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -430,7 +398,7 @@ fn a_non_utf8_host_packet_is_a_fixed_point() {
     );
 }
 
-/// A NaN gauge straight off the wire, rather than a hand-built flagged record.
+/// A NaN gauge off the wire.
 #[test]
 fn a_nan_gauge_packet_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -467,13 +435,8 @@ fn a_packet_with_one_list_per_data_source_type_is_a_fixed_point() {
     );
 }
 
-/// **Record names cannot affect the fixed point.** The same `load` packet is decoded twice -- once
-/// with a `types.db` (naming the records `load.load.shortterm`/`midterm`/`longterm`) and once
-/// without (`load.load.0`/`1`/`2`) -- and both encode to byte-identical datagrams, because
-/// `collectd_out` builds a value list from the `collectd.*` attributes, the `MetricList`'s order
-/// and each record's kind, and never reads a name. This is what makes `types_db:` a display
-/// setting rather than a relay-fidelity one (`docs/adr/collectd-binary-relay.md`), and it is why
-/// misconfiguring it can never corrupt a relay.
+/// **Record names cannot affect the fixed point**: a `load` packet decoded with and without a
+/// `types.db` encodes to byte-identical datagrams.
 #[test]
 fn types_db_names_do_not_affect_the_fixed_point() {
     let packet = PacketBuilder::new()
@@ -520,11 +483,8 @@ fn types_db_names_do_not_affect_the_fixed_point() {
         );
     }
 
-    // The `types.db`-named batch is a fixed point too -- against a decoder holding the same file,
-    // which is what a real `collectd_in` with `types_db:` configured is. (It is deliberately *not*
-    // checked through `assert_fixed_point`, whose decoder has no `types.db`: that round trip comes
-    // back index-named, which is the display-only property this test is about rather than a
-    // fidelity break -- the bytes above are identical either way.)
+    // The `types.db`-named batch is a fixed point against a decoder holding the same file. Not
+    // via `assert_fixed_point`, whose decoder has no `types.db` and would come back index-named.
     let named_batch = batch(named_events.clone());
     for cap in CAPS {
         let mut decoder = CollectdDecoder::new(resource.clone())
@@ -538,16 +498,14 @@ fn types_db_names_do_not_affect_the_fixed_point() {
         assert_eq!(decoded, named_events, "cap {cap}: decode(encode(b)) must equal b");
     }
 
-    // The index-named batch is one against an ordinary decoder, as every other fixture here is.
+    // The index-named batch, against an ordinary decoder.
     assert_fixed_point(batch(plain_events));
 }
 
 // -- notification fixtures -----------------------------------------------------------------------
 
-/// A single value list's worth of identity plus one notification dispatched right after it, at
-/// wire level. One [`assert_wire_fixed_point`] call decodes both, so the property covers a
-/// notification sharing sticky identity with a preceding list -- the ordinary shape a `threshold`
-/// plugin produces alongside `load`/`memory` reads on the same host.
+/// A notification sharing sticky identity with the value list before it, as a `threshold` plugin
+/// produces alongside `load` reads.
 fn notification_after_a_list(severity: u64, message: &[u8]) -> Bytes {
     PacketBuilder::new()
         .string(TYPE_HOST, b"web-1")
@@ -567,7 +525,7 @@ fn every_severity_notification_is_a_fixed_point() {
     }
 }
 
-/// A notification with no plugin or type at all -- legal, unlike a value list.
+/// A notification with no plugin or type, which is legal, unlike a value list.
 #[test]
 fn a_notification_with_no_plugin_or_type_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -580,7 +538,7 @@ fn a_notification_with_no_plugin_or_type_is_a_fixed_point() {
     );
 }
 
-/// A notification carrying its own plugin/type/instance -- present, unlike the fixture above.
+/// A notification carrying its own plugin/type/instance.
 #[test]
 fn a_notification_with_plugin_and_type_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -597,8 +555,7 @@ fn a_notification_with_plugin_and_type_is_a_fixed_point() {
     );
 }
 
-/// A message at exactly the 255-byte usable limit (`NOTIF_MAX_MSG_LEN - 1`) round-trips untouched
-/// -- the decoder accepts it as-is (this codec's own cap is an encode-side concern only).
+/// A message at exactly the 255-byte limit (`NOTIF_MAX_MSG_LEN - 1`) round-trips untouched.
 #[test]
 fn a_message_at_exactly_255_bytes_is_a_fixed_point() {
     let message = vec![b'm'; 255];
@@ -612,7 +569,7 @@ fn a_message_at_exactly_255_bytes_is_a_fixed_point() {
     );
 }
 
-/// A non-UTF-8 message rides byte-verbatim, exactly like a non-UTF-8 identity field.
+/// A non-UTF-8 message rides byte-verbatim, like a non-UTF-8 identity field.
 #[test]
 fn a_non_utf8_message_is_a_fixed_point() {
     assert_wire_fixed_point(
@@ -627,10 +584,8 @@ fn a_non_utf8_message_is_a_fixed_point() {
 
 // -- the generated grammar -------------------------------------------------------------------
 
-/// One generated value list: its identity (each field optional except the three collectd's own
-/// receiver requires) and its data sources. `None` for an identity field means "don't write the
-/// part," i.e. inherit whatever the datagram's sticky state already holds -- which is exactly how a
-/// real sender elides.
+/// One generated value list: its identity and data sources. `None` for an identity field means
+/// "don't write the part", inheriting the sticky one, which is how a sender elides.
 #[derive(Debug, Clone)]
 struct GenList {
     host: Option<String>,
@@ -643,21 +598,17 @@ struct GenList {
     values: Vec<(u8, [u8; 8])>,
 }
 
-/// A generated time or interval, in one of the two spellings the wire has for each: whole seconds
-/// (the legacy `Time`/`Interval` parts) or raw `cdtime_t` ticks (`TimeHR`/`IntervalHR`). Kept as an
-/// enum rather than a `(bool, value)` pair so the two branches can generate genuinely different
-/// *values* -- a whole-second `TimeHR` exercises none of the sub-second arithmetic, which is what
-/// made the earlier `(bool, whole seconds)` shape inert.
+/// A generated time or interval, as legacy whole seconds or raw `cdtime_t` ticks (HR). An enum so
+/// each branch generates its own *values*: a whole-second `TimeHR` exercises no sub-second
+/// arithmetic.
 #[derive(Debug, Clone, Copy)]
 enum GenNumber {
     Legacy(u64),
     Hr(u64),
 }
 
-/// `[A-Za-z0-9._-]{1,20}` -- collectd's own identity alphabet minus the two bytes this codec
-/// sanitizes (`/` and NUL), and short enough that the 127-byte truncation never fires. Both
-/// exclusions are covered by their own unit tests in `encode.rs`; including them here would test
-/// the sanitizer, not the fixed point.
+/// `[A-Za-z0-9._-]{1,20}`: no byte the codec sanitizes, and too short to truncate. Both are tested
+/// in `encode.rs`.
 fn identity_string() -> impl Strategy<Value = String> {
     "[A-Za-z0-9._-]{1,20}"
 }
@@ -671,10 +622,8 @@ fn ds_value() -> impl Strategy<Value = (u8, [u8; 8])> {
     ]
 }
 
-/// A list's time: whole seconds through the legacy part, or an **arbitrary** `cdtime_t` in
-/// `[2^60, 2^61)` — roughly 2004..2038, with every one of the 30 sub-second bits live. That range is
-/// what makes the property reach normalization 2 at all: a `cdtime` with real low bits is exactly
-/// the case where `cdtime -> ns -> cdtime` may land one tick away from where it started.
+/// A list's time: legacy whole seconds, or an **arbitrary** `cdtime_t` in `[2^60, 2^61)` (roughly
+/// 2004..2038) with all 30 sub-second bits live, which is what reaches normalization 2.
 fn gen_time() -> impl Strategy<Value = GenNumber> {
     prop_oneof![
         (1u64..2_000_000_000).prop_map(GenNumber::Legacy),
@@ -682,10 +631,8 @@ fn gen_time() -> impl Strategy<Value = GenNumber> {
     ]
 }
 
-/// A list's interval: whole seconds through the legacy part, or an arbitrary `cdtime_t` below 2^53
-/// ticks (~97 days). The bound is `f64`'s exact-integer range, which is the honest limit of the
-/// `Value::F64` seconds carrier `collectd.interval` uses — above it the tick count itself stops
-/// being representable, which is a documented `f64` gap rather than a codec property to assert.
+/// A list's interval: legacy whole seconds, or an arbitrary `cdtime_t` below 2^53 ticks (~97
+/// days), the exact-integer range of the `Value::F64` that carries `collectd.interval`.
 fn gen_interval() -> impl Strategy<Value = GenNumber> {
     prop_oneof![
         (0u64..3600).prop_map(GenNumber::Legacy),
@@ -720,20 +667,15 @@ fn gen_list() -> impl Strategy<Value = GenList> {
         )
 }
 
-/// An optional notification dispatched right after one generated list, in one generated packet: a
-/// valid severity (an invalid one would be a counted drop, not a fixed point, and has its own unit
-/// tests in `encode.rs`) and a non-empty message (an empty one drops the notification entirely,
-/// same reasoning) from the same restricted alphabet [`identity_string`] uses.
+/// An optional notification after one generated list: a valid severity and a non-empty message
+/// from [`identity_string`]'s alphabet (the drop cases are tested in `encode.rs`).
 fn gen_notification() -> impl Strategy<Value = (u64, String)> {
     (prop_oneof![Just(1u64), Just(2u64), Just(4u64)], identity_string())
 }
 
-/// `lists` alongside one optional notification *per list*, dispatched immediately after that
-/// list's own Values part -- so a notification can precede a later list (for every index but the
-/// last) or trail the whole packet (at the last index), covering both placements this codec's own
-/// `pack_notification` treats identically (always its own datagram, sharing no elision state with
-/// anything). Generated together, rather than as two independently-sized vectors, so
-/// `notifications.len() == lists.len()` always holds without a truncate/pad step.
+/// `lists` with one optional notification *per list*, dispatched after that list's Values part, so
+/// a notification can precede a later list or trail the packet. Generated together so
+/// `notifications.len() == lists.len()`.
 fn gen_lists_and_notifications() -> impl Strategy<Value = (Vec<GenList>, Vec<Option<(u64, String)>>)>
 {
     proptest::collection::vec(gen_list(), 1..8).prop_flat_map(|lists| {
@@ -743,13 +685,9 @@ fn gen_lists_and_notifications() -> impl Strategy<Value = (Vec<GenList>, Vec<Opt
     })
 }
 
-/// Renders generated lists into one datagram, writing only the parts each list actually names --
-/// so elision within the packet is part of what is generated, not something this helper decides.
-/// The first list always gets a full host/plugin/type, since a datagram whose opening list has no
-/// identity is one collectd itself rejects (and this codec skips, counted). `notifications[i]`,
-/// when present, is dispatched immediately after list `i`, against whatever sticky identity that
-/// list left behind -- by construction (list 0 always sets a full identity first) every generated
-/// notification always has a host to dispatch against, so none is ever dropped for that reason.
+/// Renders generated lists into one datagram, writing only the parts each list names. The first
+/// list always gets a full host/plugin/type (collectd rejects one without), so every notification
+/// (`notifications[i]`, after list `i`) has a host.
 fn render(lists: &[GenList], notifications: &[Option<(u64, String)>]) -> Bytes {
     let mut builder = PacketBuilder::new();
     for (index, list) in lists.iter().enumerate() {
@@ -761,8 +699,7 @@ fn render(lists: &[GenList], notifications: &[Option<(u64, String)>]) -> Bytes {
         builder = match list.time {
             Some(GenNumber::Legacy(seconds)) => builder.number(TYPE_TIME, seconds),
             Some(GenNumber::Hr(cdtime)) => builder.number(TYPE_TIME_HR, cdtime),
-            // Only the opening list needs a default: after it the time is sticky like everything
-            // else, and a list that names none is a list deliberately inheriting one.
+            // Only the first list needs a default; after it, the time is sticky.
             None if first => builder.number(TYPE_TIME_HR, 1_700_000_000u64 << 30),
             None => builder,
         };
@@ -797,22 +734,19 @@ fn render(lists: &[GenList], notifications: &[Option<(u64, String)>]) -> Bytes {
 }
 
 proptest! {
-    // 256 cases x 3 caps x 2 encode passes: comfortably inside the "keep the suite fast" budget
-    // `tests/robustness.rs`'s module doc sets for this crate.
+    // 256 cases x 3 caps x 2 encode passes, inside `tests/robustness.rs`'s "keep this suite
+    // fast" budget.
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// The whole point, over generated packets, stated the way normalization 2 requires -- from the
-    /// *first hop* on, not from the input bytes:
+    /// The fixed point over generated packets, from the *first hop* on (normalization 2):
     ///
     /// - `d1 = decode(p)`, `e1 = encode(d1)`, `d2 = decode(e1)`, `e2 = encode(d2)`;
-    /// - `d2 == decode(e2)` -- the model is a fixed point;
-    /// - `e2 == encode(decode(e2))` -- and so are the bytes, from `e1` onward.
+    /// - `d2 == decode(e2)`: the model is a fixed point;
+    /// - `e2 == encode(decode(e2))`: so are the bytes, from `e1` onward.
     ///
-    /// `d1 == d2` is asserted too, and holds *unconditionally* rather than only for tick-aligned
-    /// input: the ≤1-tick drift normalization 2 permits is a `cdtime -> ns -> cdtime` drift, which
-    /// lives entirely in the bytes (`p`'s `TimeHR` may differ from `e1`'s), while `ns -> cdtime ->
-    /// ns` is exact -- so the *model's* timestamp never moves at all. Asserting it here is what
-    /// would catch that stopping being true.
+    /// `d1 == d2` holds *unconditionally*: the ≤1-tick drift is `cdtime -> ns -> cdtime`, which
+    /// lives in the bytes, while `ns -> cdtime -> ns` is exact, so the model's timestamp never
+    /// moves.
     #[test]
     fn a_generated_packet_is_a_fixed_point_at_every_cap(
         (lists, notifications) in gen_lists_and_notifications()

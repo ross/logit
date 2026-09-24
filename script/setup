@@ -1,8 +1,7 @@
 #!/bin/bash
 # Usage: script/setup
-# One-time setup for a fresh checkout: builds the dev image and starts the local InfluxDB +
-# Grafana stack the v0.1 slice targets (docs/OVERVIEW.md). Run script/update instead after
-# pulling changes to an already-set-up checkout.
+# One-time setup for a fresh checkout: builds the dev image and starts the local InfluxDB and
+# Grafana stack. After pulling changes, run script/update instead.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

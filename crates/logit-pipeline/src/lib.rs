@@ -2,16 +2,14 @@
 //! the node runtime. See `docs/design/pipeline-graph.md` and
 //! `docs/adr/component-graph-configuration.md` for the design this crate implements.
 //!
-//! Crate layout note (`docs/design/pipeline-graph.md`'s "Crate layout" section): this crate
-//! defines `Input`/`Output`/`Transform`/`Router` -- `logit-inputs`/`logit-outputs`/`logit-transforms` hold
-//! only implementations and depend on this crate for the trait, not the other way around. That
-//! inversion is what avoids a circular dependency: this crate needs to be buildable without
-//! knowing about any concrete input/output/transform kind.
+//! This crate defines `Input`/`Output`/`Transform`/`Router`; `logit-inputs`/`logit-outputs`/
+//! `logit-transforms` hold only implementations and depend on this crate, never the reverse
+//! (`docs/design/pipeline-graph.md`'s "Crate layout" section). Keep this crate buildable without
+//! any concrete input/output/transform kind.
 
-// This crate carries `sockstat.rs`'s `getsockopt` calls, one of the codebase's three raw-`libc`
-// production `unsafe` call sites -- see `docs/adr/out-of-ci-unsafe-verification.md`. Denied at
-// the crate level, not promoted to `[workspace.lints]`: see `logit-inputs/src/lib.rs`'s matching
-// comment for why a workspace-wide deny doesn't land cleanly (`logit-bench`/`logit-perf` fallout).
+// `sockstat`'s `getsockopt` calls are one of the codebase's three raw-`libc` `unsafe` call sites
+// (docs/adr/out-of-ci-unsafe-verification.md). Denied per crate, not in `[workspace.lints]`: see
+// `logit-inputs/src/lib.rs`'s matching comment for why.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -25,9 +23,8 @@ pub mod queue;
 pub mod readiness;
 pub mod router;
 pub mod runtime;
-/// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd -- see the module's own
-/// doc comment. Namespaced rather than re-exported flat: `sockstat::meminfo` reads better at a
-/// call site than a bare `meminfo`, and the same goes for `SockMeminfo`'s companions.
+/// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd. Not re-exported flat:
+/// call sites read as `sockstat::meminfo`.
 pub mod sockstat;
 pub mod transform;
 

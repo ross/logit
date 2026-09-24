@@ -1,24 +1,19 @@
 //! collectd's `types.db`: the data-set definitions that give a value list's data sources their
 //! *names*.
 //!
-//! The wire carries no data-source names at all -- a Values part is a count, a type byte per data
-//! source and a value per data source, and nothing more. collectd's own receiver resolves the list's
-//! `type` against its `types.db` to learn both how many data sources the type has and what each one
-//! is called (`load` is `shortterm`, `midterm`, `longterm`); `write_graphite` then renders a
-//! single-data-source list as `<plugin>.<type>` and a multi-data-source one as
-//! `<plugin>.<type>.<ds_name>`. This module is the parser for that file, and
-//! [`super::CollectdDecoder::with_types_db`] is where the names it holds reach a record name.
+//! The wire carries no data-source names: a Values part is a count, a type byte per data source,
+//! and a value per data source. collectd's receiver resolves the list's `type` against `types.db`
+//! for the data sources' count and names (`load` is `shortterm`, `midterm`, `longterm`). This
+//! module parses that file; [`super::CollectdDecoder::with_types_db`] turns its names into record
+//! names.
 //!
-//! **collectd's own `types.db` is GPL and is never copied into this repository.** An operator points
-//! `collectd_in`'s `types_db:` at their own installed copy (conventionally
-//! `/usr/share/collectd/types.db`); every test here uses the short, hand-written fixture at the
-//! bottom of this file, in the same format.
+//! **collectd's own `types.db` is GPL and is never copied into this repository.** An operator
+//! points `collectd_in`'s `types_db:` at their installed copy (conventionally
+//! `/usr/share/collectd/types.db`); tests use the hand-written [`TEST_TYPES_DB`].
 //!
-//! **Names are display only.** `collectd_in -> collectd_out` fidelity rides on the `collectd.*`
-//! attributes, the [`logit_core::MetricList`] order and the per-record kinds -- never on the record
-//! name -- so a pipeline with no `types_db:` configured, one with a stale file, and one with the
-//! matching file all relay the same bytes. What changes is what the name looks like at a
-//! *cross-protocol* sink (InfluxDB, Prometheus, statsd), which is the whole reason to configure it.
+//! **Names are display only.** The relay rides on the `collectd.*` attributes, the
+//! [`logit_core::MetricList`] order, and the per-record kinds, never the record name (see
+//! [`super`]'s module doc). The names change only what a cross-protocol sink calls the series.
 //!
 //! ## File format
 //!
@@ -30,30 +25,26 @@
 //!
 //! One type per line: the type name, then one or more data-source definitions, each exactly
 //! `<name>:<KIND>:<min>:<max>`. **Fields are separated by whitespace, and a trailing `,` on a field
-//! is decoration** -- collectd's own `types_list.c` splits the whole line with `strsplit` and its
-//! `parse_ds` strips one trailing comma off each field, so `rx:DERIVE:0:U, tx:DERIVE:0:U`,
-//! `rx:DERIVE:0:U tx:DERIVE:0:U` and a line ending in a stray `,` are all the same file to
-//! collectd, and all the same file here. `<KIND>` is `COUNTER`, `GAUGE`, `DERIVE` or `ABSOLUTE`
-//! and `<min>`/`<max>` are numbers or `U` for unbounded, all four matched case-insensitively
-//! (`parse_ds` uses `strcasecmp` throughout). The bounds are parsed for validation and then
-//! discarded, since nothing in this codec range-checks a value (collectd itself only uses them
-//! inside its RRD writer).
+//! is decoration**: collectd's `types_list.c` splits the line with `strsplit` and `parse_ds` strips
+//! one trailing comma per field, so `rx:DERIVE:0:U, tx:DERIVE:0:U`, `rx:DERIVE:0:U tx:DERIVE:0:U`,
+//! and a line ending in a stray `,` are the same file. `<KIND>` is `COUNTER`, `GAUGE`, `DERIVE`, or
+//! `ABSOLUTE` and `<min>`/`<max>` are numbers or `U` for unbounded, all matched case-insensitively
+//! (`parse_ds` uses `strcasecmp`). The bounds are validated, then discarded: nothing here
+//! range-checks a value (collectd uses them only in its RRD writer).
 //!
 //! Blank lines and lines whose first non-whitespace character is `#` are skipped. An inline `#` is
-//! **not** a comment, exactly as in collectd's own parser (`types_list.c`), so a `#` inside a
-//! definition is a parse error rather than a silently truncated line.
+//! **not** a comment, as in collectd's parser, so it is a parse error, not a truncated line.
 //!
-//! A later definition of a type replaces an earlier one -- within one file, and across
-//! [`TypesDb::load`]'s file list in order, which is how an operator overrides a stock definition
-//! with a local one by listing their own file second.
+//! A later definition of a type replaces an earlier one, within one file and across
+//! [`TypesDb::load`]'s files in order, so an operator overrides a stock definition by listing their
+//! own file second.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// A data source's type, the `DS_TYPE_*` vocabulary shared by `types.db` and the wire's own
-/// per-value type byte ([`super::part::DS_COUNTER`] and friends). Kept as its own enum rather than
-/// reusing [`super::part::DsValue`] because a `types.db` entry names a *kind* with no value attached
-/// to it.
+/// A data source's type, the `DS_TYPE_*` vocabulary shared by `types.db` and the wire's per-value
+/// type byte ([`super::part::DS_COUNTER`] and friends). Not [`super::part::DsValue`], because a
+/// `types.db` entry names a kind with no value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DsKind {
     Counter,
@@ -63,9 +54,8 @@ pub enum DsKind {
 }
 
 impl DsKind {
-    /// The wire data-source type byte this kind corresponds to -- what
-    /// [`super::CollectdDecoder`] compares a declared type against before trusting a `types.db`
-    /// entry's names.
+    /// The wire data-source type byte for this kind, which [`super::CollectdDecoder`] compares
+    /// before trusting a `types.db` entry's names.
     pub fn ds_type_byte(self) -> u8 {
         match self {
             DsKind::Counter => super::part::DS_COUNTER,
@@ -75,8 +65,7 @@ impl DsKind {
         }
     }
 
-    /// The inverse: the kind a wire type byte names, or `None` for a byte this protocol does not
-    /// define.
+    /// The kind a wire type byte names, or `None` for a byte this protocol doesn't define.
     pub fn from_ds_type_byte(byte: u8) -> Option<DsKind> {
         Some(match byte {
             super::part::DS_COUNTER => DsKind::Counter,
@@ -87,8 +76,7 @@ impl DsKind {
         })
     }
 
-    /// Parses the `<KIND>` field of a data-source definition, case-insensitively (collectd's own
-    /// `parse_ds` uses `strcasecmp`).
+    /// Parses a definition's `<KIND>` field, case-insensitively, as collectd's `parse_ds` does.
     fn parse(text: &str) -> Option<DsKind> {
         Some(if text.eq_ignore_ascii_case("counter") {
             DsKind::Counter
@@ -104,8 +92,8 @@ impl DsKind {
     }
 }
 
-/// One data source of one type: its name and its kind. The `min`/`max` bounds a `types.db` line
-/// also carries are validated at parse time and then dropped -- see this module's doc.
+/// One data source of one type: its name and kind. A line's `min`/`max` bounds are validated at
+/// parse time, then dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataSource {
     pub name: String,
@@ -119,9 +107,7 @@ pub struct TypesDb {
 }
 
 impl TypesDb {
-    /// Parses one `types.db`'s worth of text. See this module's doc for the format; every error
-    /// names the line it was found on, because that is the only thing that makes a 200-line file
-    /// with one bad entry debuggable.
+    /// Parses one `types.db`'s text (format in this module's doc). Every error names its line.
     pub fn parse(text: &str) -> Result<TypesDb, TypesDbError> {
         let mut types: HashMap<String, Vec<DataSource>> = HashMap::new();
         for (index, raw) in text.lines().enumerate() {
@@ -133,10 +119,8 @@ impl TypesDb {
             let Some((type_name, rest)) = split_once_whitespace(trimmed) else {
                 return Err(TypesDbError::NoDataSources { line, type_name: trimmed.to_string() });
             };
-            // Whitespace-separated fields, each allowed one decorative trailing comma -- collectd's
-            // own `strsplit` + `parse_ds` pair, not a comma-separated list (see this module's
-            // "File format"). A field that is *only* a comma leaves nothing behind and is skipped,
-            // the way an empty `strsplit` field would be.
+            // Whitespace-separated fields, each with an optional trailing comma ("File format").
+            // A field that is *only* a comma is skipped, as an empty `strsplit` field would be.
             let mut sources = Vec::new();
             for field in rest.split_whitespace() {
                 let spec = field.strip_suffix(',').unwrap_or(field);
@@ -148,8 +132,7 @@ impl TypesDb {
             if sources.is_empty() {
                 return Err(TypesDbError::NoDataSources { line, type_name: type_name.to_string() });
             }
-            // A repeated type replaces the earlier one rather than appending to it -- collectd's
-            // own behaviour, and what makes "list your override file second" work.
+            // A repeated type replaces the earlier one, as in collectd.
             types.insert(type_name.to_string(), sources);
         }
         Ok(TypesDb { types })
@@ -163,11 +146,9 @@ impl TypesDb {
 
     /// Reads, parses and merges every path in order -- later files override earlier ones.
     ///
-    /// A path that cannot be read, or whose contents do not parse, is an **error** rather than a
-    /// warning: an operator who named a `types.db` wants its names, and silently starting with no
-    /// names at all would look exactly like a correctly-running pipeline whose records happen to be
-    /// index-named. `logit-cli`'s `build_spec` surfaces this as a startup config error, so the
-    /// process never reaches ready.
+    /// A path that can't be read or parsed is an **error**, not a warning: an operator who named a
+    /// `types.db` wants its names, and index naming would look like a working pipeline. The CLI
+    /// makes it a startup config error.
     pub fn load(paths: &[PathBuf]) -> anyhow::Result<TypesDb> {
         use anyhow::Context;
 
@@ -182,13 +163,13 @@ impl TypesDb {
         Ok(merged)
     }
 
-    /// The data sources of `type_name`, or `None` when this file never defined it (routine: no
-    /// `types.db` lists every type every plugin in the world emits).
+    /// The data sources of `type_name`, or `None` when undefined (routine: no `types.db` lists
+    /// every plugin's types).
     pub fn get(&self, type_name: &str) -> Option<&[DataSource]> {
         self.types.get(type_name).map(Vec::as_slice)
     }
 
-    /// How many types are defined -- for tests and for a startup log line.
+    /// How many types are defined.
     pub fn len(&self) -> usize {
         self.types.len()
     }
@@ -198,8 +179,8 @@ impl TypesDb {
     }
 }
 
-/// Splits a line into its type name and the rest, on the first run of whitespace (a real `types.db`
-/// is column-aligned with a mix of tabs and spaces, so this cannot be a single-character split).
+/// Splits a line into its type name and the rest on the first run of whitespace (a real
+/// `types.db` aligns columns with mixed tabs and spaces).
 fn split_once_whitespace(line: &str) -> Option<(&str, &str)> {
     let end = line.find(char::is_whitespace)?;
     let rest = line[end..].trim_start();
@@ -226,9 +207,8 @@ fn parse_data_source(line: usize, spec: &str) -> Result<DataSource, TypesDbError
     let Some(kind) = DsKind::parse(fields[1]) else {
         return Err(TypesDbError::UnknownKind { line, kind: fields[1].to_string() });
     };
-    // Parsed for validation only: a bound that is neither a number nor `U` means the line is not
-    // the format it claims to be, and accepting it would mean accepting an arbitrary line as a
-    // type definition.
+    // Validation only: a bound that is neither a number nor `U` means the line isn't a type
+    // definition.
     for (bound, value) in [("min", fields[2]), ("max", fields[3])] {
         if !value.eq_ignore_ascii_case("U") && value.parse::<f64>().is_err() {
             return Err(TypesDbError::BadBound {
@@ -242,8 +222,7 @@ fn parse_data_source(line: usize, spec: &str) -> Result<DataSource, TypesDbError
     Ok(DataSource { name: name.to_string(), kind })
 }
 
-/// Why a `types.db` did not parse. Every variant names the line number, which is what
-/// [`TypesDb::load`] adds the file path to.
+/// Why a `types.db` did not parse. Every variant names the line; [`TypesDb::load`] adds the path.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TypesDbError {
     #[error("line {line}: type '{type_name}' has no data-source definitions")]
@@ -264,7 +243,7 @@ pub enum TypesDbError {
 }
 
 impl TypesDbError {
-    /// The line the problem was found on -- 1-based, as an editor counts.
+    /// The 1-based line the problem was found on.
     pub fn line(&self) -> usize {
         match self {
             TypesDbError::NoDataSources { line, .. }
@@ -276,15 +255,12 @@ impl TypesDbError {
     }
 }
 
-/// A short, **hand-written** stand-in for collectd's own `types.db`, covering the type shapes this
-/// codec's tests care about: multi-data-source gauges (`load`), a two-data-source DERIVE pair
-/// (`if_octets`), single-data-source types of each kind (`cpu`, `memory`, `uptime`, and the four
-/// stock fallback types the encoder emits), and the column alignment a real file has (tabs and
-/// spaces both).
+/// A short, **hand-written** stand-in for collectd's `types.db`, covering multi-data-source gauges
+/// (`load`), a two-data-source DERIVE pair (`if_octets`), single-data-source types of each kind
+/// (including the encoder's four fallback types), and a real file's mixed-whitespace alignment.
 ///
-/// collectd's own file is GPL-licensed and is deliberately **not** vendored here (AGENTS.md's
-/// fixture rule); the definitions below were written from the collectd wiki's documented data
-/// sources rather than copied.
+/// collectd's file is GPL-licensed and **not** vendored here; these definitions were written from
+/// the collectd wiki's documented data sources, not copied.
 pub const TEST_TYPES_DB: &str = "\
 # a hand-written fixture, not collectd's own types.db
 
@@ -347,8 +323,7 @@ mod tests {
         assert!(fixture().get("no_such_type").is_none());
     }
 
-    /// Comments, blank lines, tabs and spaces, `U` bounds, and a kind in lower case -- the whole
-    /// format's tolerance in one fixture.
+    /// Comments, blank lines, tabs and spaces, `U` bounds, and a lower-case kind all parse.
     #[test]
     fn comments_blank_lines_and_mixed_whitespace_are_tolerated() {
         let db = TypesDb::parse(
@@ -365,15 +340,9 @@ mod tests {
         assert_eq!(db.get("tabbed").unwrap()[0].name, "value");
     }
 
-    /// The comma in `rx:DERIVE:0:U, tx:DERIVE:0:U` is **decoration on a whitespace-separated
-    /// field**, not the separator: collectd's `types_list.c` splits the line with `strsplit` and
-    /// `parse_ds` strips one trailing `,`. So the stock file's `, ` style, a comma-free line, and a
-    /// line ending in a stray comma all have to parse to the same two data sources -- a hand-written
-    /// override file written in any of these styles must not refuse to start the process.
-    ///
-    /// Two definitions run together with **no** whitespace (`rx:DERIVE:0:U,tx:DERIVE:0:U`) are one
-    /// field with too many colon fields, and stay an error: that is what collectd's own parser does
-    /// with them too (see `every_malformed_line_shape_is_an_error_naming_its_line`).
+    /// The stock `, ` style, a comma-free line, and a stray trailing comma all parse to the same
+    /// two data sources. (Definitions joined with **no** whitespace stay an error, as in collectd;
+    /// see `every_malformed_line_shape_is_an_error_naming_its_line`.)
     #[test]
     fn data_sources_are_whitespace_separated_with_an_optional_trailing_comma() {
         for text in [
@@ -395,8 +364,7 @@ mod tests {
         }
     }
 
-    /// collectd's `parse_ds` compares the bounds with `strcasecmp` too, not just the kind -- so a
-    /// lower-case `u` is unbounded, and must not be a startup failure.
+    /// A lower-case `u` bound is unbounded, as with collectd's `strcasecmp`.
     #[test]
     fn an_unbounded_bound_is_matched_case_insensitively() {
         for text in ["t value:GAUGE:U:U\n", "t value:GAUGE:u:u\n", "t value:GAUGE:u:U\n"] {
@@ -427,14 +395,13 @@ mod tests {
             ("an unknown kind", "load shortterm:FLOAT:0:5000\n"),
             ("a nameless data source", "load :GAUGE:0:5000\n"),
             ("a non-numeric bound", "load shortterm:GAUGE:zero:5000\n"),
-            // Only *one* trailing comma is decoration, so this is a single field with six colon
-            // fields, not two data sources -- collectd's own `parse_ds` rejects it too.
+            // Only *one* trailing comma is decoration, so this is one six-colon field, which
+            // collectd's `parse_ds` rejects too.
             ("two definitions run together by a doubled comma", "load a:GAUGE:U:U,,b:GAUGE:U:U\n"),
             ("an inline '#', which collectd does not treat as a comment", "load a:GAUGE:U:U # x\n"),
         ];
         for (label, text) in cases {
-            // Prefixed with a comment and a blank line so the reported line number is 3, not 1 --
-            // a parser that hard-coded `1` would pass a weaker version of this test.
+            // Prefixed so the reported line is 3, not 1.
             let parsed = TypesDb::parse(&format!("# header\n\n{text}"));
             let err = parsed.expect_err(label);
             assert_eq!(err.line(), 3, "{label} must report the line it was found on");

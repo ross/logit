@@ -1,38 +1,31 @@
 //! [`BatchAccumulator`]: amortizes many small decoded batches into fewer, larger ones before a
-//! [`crate::Fanout::send`] -- the "datagram->batch assembly" half of
-//! `docs/adr/decoupled-listener-io.md`. Transport-agnostic and socket-free by design: a UDP
-//! listener's decode loop (`logit-inputs`) is the only caller today, but nothing here mentions a
-//! socket, a datagram, or any concrete [`logit_proto::Decoder`].
+//! [`crate::Fanout::send`], the "datagram->batch assembly" half of
+//! `docs/adr/decoupled-listener-io.md`. Transport-agnostic: the UDP, TCP, and tail drivers in
+//! `logit-inputs` all use it, and nothing here knows a socket or a concrete
+//! [`logit_proto::Decoder`].
 
 use logit_core::{Event, EventBatch, Resource, Scope};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Why an accumulated batch was emitted -- a `&'static str` reason tag on
-/// `logit.component.receive.flushed` (`docs/design/internal-telemetry.md`).
+/// Why an accumulated batch was emitted: the `reason` tag on `logit.component.receive.flushed`
+/// (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushReason {
     MaxEvents,
     MaxBytes,
     Interval,
     ResourceChange,
-    /// The held [`logit_core::Scope`] changed -- same trigger as [`FlushReason::ResourceChange`],
-    /// just for the batch's other identity term (`BatchAccumulator` keys on `(resource, scope)`).
-    /// Kept distinct rather than folded into `ResourceChange` since the enum is cheap to extend and
-    /// a distinct `logit.component.receive.flushed` reason tag is more useful for operators
-    /// diagnosing unexpectedly small OTLP batches than an undifferentiated one.
+    /// The held [`logit_core::Scope`] changed: [`FlushReason::ResourceChange`] for the key's other
+    /// term. A distinct tag lets an operator tell why OTLP batches come out small.
     ScopeChange,
     Shutdown,
-    /// **A single tracked file or connection** is ending, and its own accumulator is flushing on
-    /// the way out: a tailed file rotated away, removed, or drained past EOF
-    /// (`logit_inputs::tail`), or one TCP connection on the shared stream driver
-    /// (`logit_inputs::tcp`, which every stream listener runs on) reaching EOF, being reset by its
-    /// client, hitting a fatal framing error, or being closed as idle (its configured
-    /// `idle_timeout:` elapsing with the peer silent, `docs/adr/idle-connection-timeout.md`).
-    /// Distinct from [`FlushReason::Shutdown`]: this fires while
-    /// the listener keeps running, for one source among several it may be tracking, not for the
-    /// whole component's own shutdown. Keeping the two apart is what stops a healthy listener from
-    /// reporting `receive.flushed{reason="shutdown"}` every time a client hangs up.
+    /// One tracked file or connection is ending and its accumulator flushes on the way out: a
+    /// tailed file rotated away, removed, or drained past EOF (`logit_inputs::tail`), or one TCP
+    /// connection (`logit_inputs::tcp`) reaching EOF, reset by its client, failing framing, or
+    /// closed idle (`docs/adr/idle-connection-timeout.md`). Distinct from
+    /// [`FlushReason::Shutdown`], so a healthy listener doesn't report `reason="shutdown"` every
+    /// time a client hangs up.
     Closed,
 }
 
@@ -50,30 +43,25 @@ impl FlushReason {
     }
 }
 
-/// Accumulates decoded events until one of three bounds is reached, then hands back everything
-/// held as one merged batch. Owns no clock and no timer of its own -- the caller races its own
-/// deadline (see [`BatchAccumulator::next_deadline`]) and calls [`BatchAccumulator::take`] when it
-/// fires; this type only tracks the held events and their resource.
+/// Accumulates decoded events until a bound is reached, then hands back everything held as one
+/// merged batch. Owns no timer: the caller races its own deadline (see
+/// [`BatchAccumulator::next_deadline`]) and calls [`BatchAccumulator::take`] when it fires.
 ///
-/// `resource_weight`/`events_weight` cache [`EventBatch::estimated_heap_bytes`]'s two per-batch,
-/// non-capacity terms incrementally -- see [`BatchAccumulator::absorb`]'s doc comment for why this
-/// is exact, not approximate, and costs O(incoming events) per call rather than O(everything held
-/// so far).
+/// The `*_weight` fields cache [`EventBatch::estimated_heap_bytes`]'s non-capacity terms
+/// incrementally; see [`BatchAccumulator::absorb`] for why the total is exact.
 pub struct BatchAccumulator {
     resource: Option<Arc<Resource>>,
-    /// The held [`Scope`], if any -- part of this accumulator's key alongside `resource` (see
-    /// [`BatchAccumulator::absorb`]'s doc comment). Carried onto the emitted [`EventBatch`].
+    /// The held [`Scope`], part of the accumulation key alongside `resource` (see
+    /// [`BatchAccumulator::absorb`]). Carried onto the emitted [`EventBatch`].
     scope: Option<Arc<Scope>>,
     events: Vec<Event>,
-    /// [`Resource::estimated_heap_bytes`] of the held resource -- recomputed only when the
-    /// resource changes (rare, and O(that resource's own attributes) regardless), not per absorb.
+    /// [`Resource::estimated_heap_bytes`] of the held resource, recomputed only when it changes.
     resource_weight: u64,
-    /// [`Scope::estimated_heap_bytes`] of the held scope -- recomputed only when the scope
-    /// changes, mirroring `resource_weight`. Zero when no scope is held.
+    /// [`Scope::estimated_heap_bytes`] of the held scope, recomputed only when it changes. Zero
+    /// when no scope is held.
     scope_weight: u64,
-    /// The running sum of [`Event::estimated_heap_bytes`] over every event currently held --
-    /// updated by adding just the incoming slice's contribution each `absorb`, never by re-walking
-    /// events already accounted for.
+    /// Running sum of [`Event::estimated_heap_bytes`] over every held event; each `absorb` adds
+    /// only the incoming slice's contribution.
     events_weight: u64,
     max_events: usize,
     max_bytes: u64,
@@ -97,54 +85,32 @@ impl BatchAccumulator {
         self.events.is_empty()
     }
 
-    /// Absorbs `events` under `resource`, appending via [`Vec::append`] rather than taking `events`
-    /// by value. This is what makes the whole exercise pay off: `events` comes straight from a
-    /// [`logit_proto::Decoder::decode_into`] call against a buffer the caller reuses across
-    /// datagrams, and `Vec::append` drains `events` into this accumulator's own buffer while
-    /// leaving `events` empty **with its allocated capacity intact** -- unlike `std::mem::take`,
-    /// which would replace it with a fresh, capacity-0 `Vec` and silently undo the whole point of
-    /// reusing a scratch buffer across calls (`docs/design/memory.md` §2; see also
-    /// `docs/adr/decoupled-listener-io.md`'s allocation accounting).
+    /// Absorbs `events` under `resource` and `scope`, returning the held batch and why if this
+    /// call flushed it.
     ///
-    /// Returns `Some` once a bound is *reached or exceeded* -- never splits a decoded batch, which
-    /// is what makes `batch_max_events: 1` mean "one send per datagram": every non-empty decode
-    /// immediately reaches the bound, so a single datagram decoding to 40 events still emits one
-    /// batch of 40, not 40 batches -- the bound governs when to stop accumulating, never how to
-    /// subdivide one decode's output.
+    /// Drains `events` with [`Vec::append`], leaving it empty with its capacity intact, so a
+    /// caller reusing one scratch buffer across [`logit_proto::Decoder::decode_into`] calls keeps
+    /// its allocation. `std::mem::take` would leave a capacity-0 `Vec` (`docs/design/memory.md`
+    /// §2).
     ///
-    /// **The resource/scope rule.** An accumulated batch carries one `Arc<Resource>` and at most
-    /// one `Arc<Scope>` -- the accumulator's key is the pair `(resource, scope)`. If `resource` is
-    /// not `Arc::ptr_eq` to whatever this accumulator already holds, or `scope` is not equivalent
-    /// to whatever is already held (`Arc::ptr_eq` when both are `Some`; `None`/`Some` always
-    /// counts as a change; two `None`s are equal), whatever was held is flushed first
-    /// (`FlushReason::ResourceChange` or `FlushReason::ScopeChange` respectively -- resource wins
-    /// if both changed at once) and `events` starts a fresh accumulation -- merging across
-    /// distinct resources or scopes would silently relabel events onto the wrong one, a
-    /// correctness bug no test would catch since the output stays well-formed. Every decoder
-    /// shipped today (`StatsdDecoder`, `SyslogDecoder`) constructs one `Arc::new(Resource::
-    /// default())` per decoder instance and stamps every decoded batch with it, and none produce a
-    /// `Scope`, so in practice neither comparison trips -- they exist to make that assumption
-    /// load-bearing rather than latent, the same *n*-to-1 hazard
-    /// `docs/adr/aggregation-window-semantics.md` already documents for a Lua component's
-    /// `flush()`.
+    /// Returns `Some` once a bound is reached or exceeded, and never splits a decoded batch:
+    /// under `batch_max_events: 1` a datagram decoding to 40 events emits one batch of 40.
     ///
-    /// **Why weight tracking here is exact, not approximate, despite being incremental.**
-    /// `EventBatch::estimated_heap_bytes` is `resource.estimated_heap_bytes() +
-    /// scope.estimated_heap_bytes() + events.capacity() * size_of::<Event>() +
-    /// events.iter().map(Event::estimated_heap_bytes).sum()` -- four terms, each cheap to
-    /// reproduce without re-walking events already accounted for: the resource term only changes
-    /// when the resource does (`resource_weight`, updated on the rare `ResourceChange` path
-    /// below), the scope term only when the scope does (`scope_weight`, same pattern); the
-    /// per-event term is a plain running sum, so adding just the incoming slice's contribution
-    /// (`events_weight`) reproduces the same total a full walk would; and the capacity term is
-    /// read live off `self.events.capacity()` in [`BatchAccumulator::current_weight`] --
-    /// `Vec::capacity` is O(1), so nothing needs to track it. The four added together equal
-    /// `estimated_heap_bytes` exactly, by construction, not approximately -- this isn't trading
-    /// accuracy for speed, the original per-call recomputation was simply doing O(everything
-    /// held) of work to answer a question four O(1)/O(incoming) updates already answer.
+    /// **The resource/scope rule.** The accumulation key is `(resource, scope)`, compared by
+    /// `Arc::ptr_eq` (`None`/`Some` is a change; two `None`s are equal). On a change, whatever was
+    /// held is flushed first (`ResourceChange` wins over `ScopeChange` if both changed) and
+    /// `events` starts a fresh accumulation. Merging across keys would relabel events onto the
+    /// wrong resource or scope with well-formed output no test would catch. A decoder therefore
+    /// stamps one shared `Arc<Resource>` per stream, or every batch would flush on arrival.
     ///
-    /// An empty `events` (a datagram that decoded to nothing) is absorbed as a no-op: it never
-    /// changes the held resource/scope and never triggers a flush on its own.
+    /// **Weight tracking is exact.** `EventBatch::estimated_heap_bytes` is the sum of four terms:
+    /// resource, scope, `events.capacity() * size_of::<Event>()`, and each event's own. The
+    /// resource and scope terms change only with the key, the per-event term is a running sum,
+    /// and [`BatchAccumulator::current_weight`] reads capacity live, so the total equals a full
+    /// recompute at O(incoming events) per call.
+    ///
+    /// An empty `events` (a datagram that decoded to nothing) is a no-op: it never changes the
+    /// held key and never triggers a flush.
     #[must_use]
     pub fn absorb(
         &mut self,
@@ -161,22 +127,17 @@ impl BatchAccumulator {
             Some(held) => !Arc::ptr_eq(held, &resource),
             None => false,
         };
-        // Only a real change once something is actually held -- the very first absorb ever (no
-        // resource held yet) must never count as a "change" just because `self.scope` starts as
-        // `None`, the same reasoning `resource_changed` already gets for free from matching on
-        // `self.resource` above.
+        // With nothing held, the first absorb is never a change, even though `self.scope`
+        // starts as `None`.
         let scope_changed = holding_something && !scope_eq(&self.scope, &scope);
 
         let incoming_weight: u64 = events.iter().map(Event::estimated_heap_bytes).sum();
 
         if resource_changed || scope_changed {
-            // Flush whatever was held under the old resource/scope, then start a fresh
-            // accumulation with the incoming events -- they are NOT dropped, only deferred to a
-            // later `take()`/`absorb()`. Not also bound-checked against `max_events`/`max_bytes`
-            // here: this call already reports one flush; a lone incoming batch that happens to
-            // also exceed a bound on its own gets flushed on the very next `absorb` or by the
-            // caller's interval timer, whichever comes first -- accepted staleness of at most one
-            // absorb, not a correctness gap (nothing is ever dropped).
+            // Flush the old key's batch and start a fresh accumulation with the incoming events.
+            // They are not bound-checked here, since this call already reports one flush: an
+            // incoming batch that alone exceeds a bound flushes on the next `absorb` or the
+            // caller's interval, whichever comes first. Nothing is dropped.
             let flushed = self
                 .take()
                 .expect("resource_changed/scope_changed are only true when something is held");
@@ -212,8 +173,8 @@ impl BatchAccumulator {
         None
     }
 
-    /// Everything held, if anything -- the interval and shutdown paths, which don't go through
-    /// `absorb`'s bound checks. `None` when nothing has been absorbed since the last `take`.
+    /// Takes everything held, for the interval and shutdown paths. `None` when nothing has been
+    /// absorbed since the last `take`.
     pub fn take(&mut self) -> Option<EventBatch> {
         let resource = self.resource.take()?;
         let scope = self.scope.take();
@@ -224,10 +185,8 @@ impl BatchAccumulator {
         Some(EventBatch { resource, scope, events })
     }
 
-    /// See `absorb`'s doc comment: `resource_weight`, `scope_weight`, and `events_weight` are the
-    /// three non-capacity terms of `EventBatch::estimated_heap_bytes`, maintained incrementally;
-    /// only the capacity term is read live here, since `Vec::capacity` is O(1) and changes with
-    /// every `append` in a way not worth shadowing in a separate field.
+    /// `EventBatch::estimated_heap_bytes` of what is held (see `absorb`): the three cached terms
+    /// plus the capacity term, read live because it changes on every `append`.
     fn current_weight(&self) -> u64 {
         self.resource_weight
             + self.scope_weight
@@ -235,10 +194,8 @@ impl BatchAccumulator {
             + self.events_weight
     }
 
-    /// The next point on `deadline`'s interval cadence, reusing `run_transform`'s own
-    /// constant-time cadence math (`crate::runtime::advance_flush_deadline`) rather than a second
-    /// copy of it. `logit-inputs`' decode loop races this against its queue read, exactly the
-    /// shape `run_transform` already uses for a stateful transform's flush timer.
+    /// The next point on `deadline`'s interval cadence, using `run_transform`'s flush-timer math
+    /// (`crate::runtime::advance_flush_deadline`). A decode loop races it against its queue read.
     pub fn next_deadline(
         deadline: tokio::time::Instant,
         now: tokio::time::Instant,
@@ -248,8 +205,8 @@ impl BatchAccumulator {
     }
 }
 
-/// `None`/`Some` always counts as different; two `Some`s compare by `Arc::ptr_eq` (not by value --
-/// the same reasoning as the resource comparison above); two `None`s are equal.
+/// Two `None`s are equal, `None`/`Some` differ, and two `Some`s compare by `Arc::ptr_eq`, like
+/// the resource.
 fn scope_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -287,8 +244,7 @@ mod tests {
         let mut acc = BatchAccumulator::new(1, u64::MAX);
         let r = resource();
 
-        // One datagram decoding to 40 events must emit exactly one batch of 40, not 40 batches --
-        // the bound governs *when* to stop accumulating, never how to subdivide one absorb call.
+        // The bound decides when to stop accumulating, never how to split one absorb call.
         let (flushed, reason) =
             acc.absorb(Arc::clone(&r), None, &mut events(40)).expect("should flush immediately");
         assert_eq!(flushed.events.len(), 40);
@@ -332,21 +288,14 @@ mod tests {
         let mut acc = BatchAccumulator::new(usize::MAX, u64::MAX);
         let r = resource();
 
-        // Absorb varying-weight slices across many calls under one shared resource -- the shape
-        // a real decode loop produces -- to prove `current_weight`'s incrementally-tracked total
-        // never drifts from a full, from-scratch recompute of the merged batch. This is exactly
-        // the case a naive per-call recomputation of the resource's own contribution would get
-        // wrong (double-, triple-, ...-counting it once per absorb instead of once per batch).
+        // Many absorbs under one resource: a per-absorb resource term would count it repeatedly.
         for i in 0..25 {
             assert!(acc.absorb(Arc::clone(&r), None, &mut heavy_events(i * 7)).is_none());
         }
 
         let incremental = acc.current_weight();
 
-        // Recompute authoritatively: swap the accumulator's own resource/events into a real
-        // `EventBatch` -- the same `Vec`, not a clone (which would reset capacity to length and
-        // invalidate the comparison's capacity-driven term) -- and ask the one formula both are
-        // supposed to agree with, then swap them back so `acc` is left unchanged.
+        // Move the same `Vec` into an `EventBatch`, not a clone: a clone's capacity would differ.
         let resource = acc.resource.clone().expect("absorbed at least one non-empty batch");
         let events = std::mem::take(&mut acc.events);
         let probe = EventBatch { resource, scope: None, events };
@@ -405,10 +354,7 @@ mod tests {
         assert!(Arc::ptr_eq(&merged.resource, &r), "must be the exact same Arc, not an equal one");
     }
 
-    /// The property the whole `&mut Vec<Event>` signature exists for: `absorb` must leave the
-    /// caller's buffer empty but with its capacity intact (via `Vec::append`, not
-    /// `std::mem::take`), so a caller reusing one scratch buffer across many `decode_into` calls
-    /// actually gets to reuse it.
+    /// `absorb` leaves the caller's scratch buffer empty with its capacity intact.
     #[test]
     fn absorb_drains_the_callers_buffer_via_append_leaving_its_capacity_intact() {
         let mut acc = BatchAccumulator::new(1_000, u64::MAX);

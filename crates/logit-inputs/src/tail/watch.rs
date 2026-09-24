@@ -1,37 +1,29 @@
-//! The wake source a [`crate::tail::driver::Tailer`] races against its own poll tick.
-//! [`Watcher::Poll`] never resolves on its own ([`Watcher::next_wake`] is `std::future::pending`)
-//! -- the driver's own `poll_interval` tick is its only wake source, and racing a future that
-//! never completes against it costs nothing. On Linux, [`Watcher::Inotify`] wraps a real
-//! `inotify` file descriptor (`inotify::InotifyWatcher`, below) for near-immediate wakeups;
-//! `poll_interval` still runs underneath it as reconciliation (a missed rename, an
-//! `IN_Q_OVERFLOW`, anything `inotify` didn't report). See
-//! `docs/adr/file-tailing-and-docker-json-logs.md` and
-//! `docs/adr/docker-container-identity-and-minimal-watches.md`.
+//! The wake source a [`crate::tail::driver::Tailer`] races against its poll tick.
 //!
-//! Two kinds of watch, deliberately kept apart rather than sharing one mask: a directory watch
-//! ([`Watcher::watch_dir`]) only ever needs to know something *appeared or departed* underneath
-//! it (`DIR_MASK`) -- `docker_in` watches exactly one of these, `root` itself, since a container's
-//! own state directory is a direct child of it. A file watch ([`Watcher::watch_file`]) only ever
-//! needs to know its own content changed (`FILE_MASK`, just `IN_MODIFY`) -- one per file a
-//! [`crate::tail::driver::Tailer`] actually has open. Nothing is watched beyond those two kinds:
-//! a container this listener isn't tailing gets no watch at all, and a write to a tailed file
-//! never triggers the directory-level rescan a `Wake::Discover` does.
+//! [`Watcher::Poll`] never resolves, leaving `poll_interval` as the only wake. On Linux,
+//! [`Watcher::Inotify`] wraps an `inotify` fd for near-immediate wakes, with `poll_interval` still
+//! running as reconciliation for anything `inotify` missed (an `IN_Q_OVERFLOW`, a network or FUSE
+//! mount). See `docs/adr/file-tailing-and-docker-json-logs.md`'s "Wake source: poll always,
+//! `inotify` as a lower-latency addition", which records the kernel facts this module relies on,
+//! and `docs/adr/docker-container-identity-and-minimal-watches.md`.
+//!
+//! Two kinds of watch with separate masks. A directory watch ([`Watcher::watch_dir`], `DIR_MASK`)
+//! reports entries appearing or departing; each pattern has one (`docker_in`'s is `root`). A file
+//! watch ([`Watcher::watch_file`], `FILE_MASK`) reports only content changes, one per open file.
+//! An untailed file has no watch, and a write to a tailed file never causes a rescan.
 
 use super::WatchMode;
 use logit_core::Diagnostics;
 use std::path::{Path, PathBuf};
 
-/// Something changed. `Discover` names a directory watch's own wake -- a path appeared, departed,
-/// or (nameless) the directory itself changed -- and is what triggers a full `scan`. `Data` names
-/// a file watch's own wake -- that exact tracked file was written to -- and triggers nothing more
-/// than draining that one file; see `crate::tail::driver::Tailer::run_until_shutdown`'s `select!`
-/// match. `Overflow` means the kernel's `inotify` event queue overflowed and some events were
-/// lost -- unreachable under [`Watcher::Poll`], which has no queue to overflow; the driver
-/// responds to it with a full `scan` rather than trying to reconstruct which specific paths were
-/// missed. `Dead` is the wake source itself giving up: the fd is unusable and this watcher will
-/// never wake again, so the driver diagnoses it once (`watch_error`) and carries on with its own
-/// `poll_interval` tick alone -- emitted at most once per watcher, after which
-/// [`Watcher::next_wake`] parks forever rather than spinning on a fd that cannot recover.
+/// What a watcher woke for; `crate::tail::driver::Tailer::run_until_shutdown` handles each.
+///
+/// - `Discover`: a directory watch saw a path appear or depart, or (nameless) the directory itself
+///   was deleted or moved. The driver rescans.
+/// - `Data`: a tracked file's content changed. The driver checks only that file for truncation.
+/// - `Overflow`: the kernel's event queue overflowed and events were lost. The driver rescans.
+/// - `Dead`: the fd is unusable. Emitted at most once per watcher, after which
+///   [`Watcher::next_wake`] parks forever; the driver diagnoses `watch_error` and polls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Wake {
     Discover(PathBuf),
@@ -40,9 +32,7 @@ pub(crate) enum Wake {
     Dead(String),
 }
 
-/// Identifies one file watch for a later [`Watcher::unwatch`] call. Opaque outside this module --
-/// `crate::tail::driver::TrackedFile` just holds one and hands it back, never inspects it. `Copy`
-/// so a `Tailer` can hold it in a plain field alongside the file it names.
+/// Identifies one file watch for a later [`Watcher::unwatch`]. Opaque outside this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WatchId(i32);
 
@@ -54,18 +44,15 @@ pub(crate) enum Watcher {
 }
 
 impl Watcher {
-    /// `Poll` always succeeds. `Inotify` fails startup outright on setup failure (including on a
-    /// non-Linux build) -- an operator who explicitly asked for the low-latency path should know
-    /// immediately if it isn't available, not silently get polling instead. `Auto` tries
-    /// `inotify` first and falls back to `Poll` (diagnosed `watch_error`) on any setup failure,
-    /// since it's the "best available" mode by definition.
+    /// `Poll` always succeeds. `Inotify` fails on any setup failure, including a non-Linux build,
+    /// so an explicit request for the low-latency path never degrades unnoticed. `Auto` falls
+    /// back to `Poll`, diagnosed `watch_error`.
     pub fn new(mode: WatchMode, diag: &mut Diagnostics) -> anyhow::Result<Self> {
         Self::new_inner(mode, diag, make_inotify)
     }
 
-    /// Test-only seam: same as [`Watcher::new`], but with the `inotify` constructor injected --
-    /// lets a test force `Auto`'s fallback path without needing to actually exhaust a real
-    /// `fs.inotify.max_user_instances` limit.
+    /// [`Watcher::new`] with the `inotify` constructor injected, so a test can force a setup
+    /// failure.
     #[cfg(test)]
     fn new_with(
         mode: WatchMode,
@@ -104,17 +91,11 @@ impl Watcher {
         }
     }
 
-    /// Called by `Tailer::reconcile_watches` for a directory that was armed on an earlier scan and
-    /// is no longer reached by any pattern's `dir()`.
+    /// Releases a directory watch no pattern reaches any more (`Tailer::reconcile_watches`).
     ///
-    /// **Unreachable today, deliberately kept.** `Tailer::patterns` is assigned once in
-    /// `Tailer::new` and never mutated, so the set `reconcile_watches` computes is the same on
-    /// every scan and its removal loop always iterates an empty difference. It stays because
-    /// `reconcile_watches` is only *correct* with it -- a pattern set that ever becomes mutable
-    /// (a reloadable config, a `docker_in` that widens its watch set again) would otherwise leak
-    /// a kernel watch per dropped directory -- and because it is what `watch_dir`'s own stale-`wd`
-    /// replacement is the mirror of. Covered by `unwatch_dir_releases_both_indexes_and_allows_a_
-    /// rearm` below rather than by any production call path.
+    /// **Unreachable today, but kept.** The patterns never change, so the difference is always
+    /// empty. If they ever become mutable, `reconcile_watches` needs this to avoid leaking a
+    /// kernel watch per dropped directory. Covered by a unit test only.
     pub fn unwatch_dir(&mut self, dir: &Path) {
         match self {
             Watcher::Poll => {}
@@ -123,15 +104,12 @@ impl Watcher {
         }
     }
 
-    /// Watches one file's own content changes. `Ok(None)` under [`Watcher::Poll`] (nothing to
-    /// watch with); an `Err` is non-fatal to the caller -- the file is still tailed, just without
-    /// a low-latency data wake, falling fully back to `poll_interval` for it exactly as
-    /// `watch: poll` always does -- but it is *not* swallowed here: `Tailer::open_tracked`
-    /// diagnoses it (`watch_error`, via [`watch_error_message`]), because the difference between
-    /// "this file wakes promptly" and "this file waits for the poll tick" is otherwise invisible
-    /// to an operator, and the most likely cause at scale (`ENOSPC` --
-    /// `fs.inotify.max_user_watches`) is a host setting only a diagnostic would ever point at.
-    /// Called once, when `Tailer::open_tracked` opens the file.
+    /// Watches one file's content changes; `Ok(None)` under [`Watcher::Poll`].
+    ///
+    /// An `Err` must reach the caller rather than become `None`: `Tailer::open_tracked` diagnoses
+    /// it `watch_error`, since the file falling back to `poll_interval` is otherwise
+    /// invisible, and the likely cause at scale is `ENOSPC` against
+    /// `fs.inotify.max_user_watches`.
     pub fn watch_file(&mut self, path: &Path) -> std::io::Result<Option<WatchId>> {
         match self {
             Watcher::Poll => Ok(None),
@@ -140,8 +118,7 @@ impl Watcher {
         }
     }
 
-    /// Releases a file watch [`Watcher::watch_file`] returned -- called once, when the file it
-    /// names stops being tracked (closed, rotated away, de-selected), regardless of reason.
+    /// Releases a file watch when its file stops being tracked, for any reason.
     pub fn unwatch(&mut self, id: WatchId) {
         match self {
             Watcher::Poll => {}
@@ -158,8 +135,7 @@ impl Watcher {
         }
     }
 
-    /// Test-only: asserting `Auto`'s fallback behavior, and that a successful `inotify` setup
-    /// actually took the `Inotify` branch rather than silently landing on `Poll` regardless.
+    /// Whether this is the `Inotify` backend, for tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_inotify(&self) -> bool {
         match self {
@@ -169,10 +145,8 @@ impl Watcher {
         }
     }
 
-    /// Test-only: the raw `inotify` fd, so a leak test can cross-check this watcher's own
-    /// bookkeeping against the kernel's (`/proc/self/fdinfo/<fd>` carries one `inotify wd:` line
-    /// per *live* watch -- the external count `logit.input.watch.watches` deliberately isn't,
-    /// see `Tailer::scan`). `None` under [`Watcher::Poll`], which has no fd.
+    /// The raw `inotify` fd, so a test can count live kernel watches in `/proc/self/fdinfo/<fd>`
+    /// (one `inotify wd:` line each). `None` under [`Watcher::Poll`].
     #[cfg(all(test, target_os = "linux"))]
     pub fn inotify_fd(&self) -> Option<std::os::fd::RawFd> {
         match self {
@@ -181,8 +155,7 @@ impl Watcher {
         }
     }
 
-    /// Test-only companion to [`Watcher::inotify_fd`]: how many watch descriptors this watcher
-    /// believes it holds.
+    /// How many watch descriptors this watcher believes it holds, for tests.
     #[cfg(all(test, target_os = "linux"))]
     pub fn tracked_watch_count(&self) -> usize {
         match self {
@@ -192,19 +165,14 @@ impl Watcher {
     }
 }
 
-/// One operator-facing line for a failed `inotify_add_watch`, shared by the directory
-/// (`Tailer::reconcile_watches`, diagnosed as `watch_dir_error` since it recurs every scan) and
-/// file (`Tailer::open_tracked`, the one-shot `watch_error`) call sites so both read the same way.
+/// The diagnostic text for a failed `inotify_add_watch`, shared by the directory
+/// (`watch_dir_error`) and file (`watch_error`) call sites.
 ///
-/// `ENOSPC` gets a pointer at the host setting behind it, because the errno alone ("No space left
-/// on device") reads as a full disk and is not: `inotify_new_watch()` returns it from
-/// `if (!inc_inotify_watches(group->inotify_data.ucounts))` when the per-user watch limit is
-/// reached (`inotify_add_watch(2)` ERRORS: "The user limit on the total number of inotify watches
-/// was reached"). The limit is no longer the flat 8192 of folklore -- since Linux 5.11 (commit
-/// `92890123749b`, "inotify: Increase default inotify.max_user_watches limit to 1048576")
-/// `inotify_user_setup()` sizes it from lowmem, `watches_max = clamp(watches_max, 8192UL,
-/// 1048576UL)` over roughly 1% of `si.totalram - si.totalhigh` -- so the number to look at is the
-/// running host's own `/proc/sys/fs/inotify/max_user_watches`, not a remembered constant.
+/// `ENOSPC` ("No space left on device") gets a pointer at the host setting, because it reads as a
+/// full disk: `inotify_add_watch(2)` returns it when the per-user watch limit is reached
+/// (`inotify_new_watch`'s `inc_inotify_watches` check). Since Linux 5.11 (commit `92890123749b`)
+/// `inotify_user_setup()` derives that limit from memory, clamped to `8192..=1048576`, so the
+/// number to check is the host's `/proc/sys/fs/inotify/max_user_watches`.
 pub(crate) fn watch_error_message(path: &Path, err: &std::io::Error) -> String {
     let base = format!("{}: {err}", path.display());
     #[cfg(target_os = "linux")]
@@ -218,10 +186,8 @@ pub(crate) fn watch_error_message(path: &Path, err: &std::io::Error) -> String {
     base
 }
 
-// The platform-specific `inotify` constructor type `Watcher::new`/`new_with` are generic over --
-// `InotifyWatcher` itself on Linux, and an uninhabited stand-in everywhere else (never
-// constructed, since `make_inotify` on a non-Linux build always returns `Err` before producing
-// one -- see `make_inotify` below).
+// What `make_inotify` builds: `InotifyWatcher` on Linux, and an uninhabited type elsewhere, where
+// `make_inotify` always fails.
 #[cfg(target_os = "linux")]
 type PlatformInotify = inotify::InotifyWatcher;
 #[cfg(not(target_os = "linux"))]
@@ -244,7 +210,7 @@ fn wrap_inotify(w: PlatformInotify) -> anyhow::Result<Watcher> {
 
 #[cfg(not(target_os = "linux"))]
 fn wrap_inotify(w: PlatformInotify) -> anyhow::Result<Watcher> {
-    match w {} // `PlatformInotify` is uninhabited here -- nothing ever reaches this call
+    match w {} // uninhabited here: unreachable
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -282,11 +248,8 @@ mod tests {
         assert!(!watcher.is_inotify(), "auto should have fallen back to Poll");
     }
 
-    /// A failed file watch reaches the caller as an `Err`, not as a `None` indistinguishable from
-    /// `watch: poll`'s "there was never anything to watch with" -- that difference is the whole
-    /// reason `Tailer::open_tracked` can diagnose it. `ENOENT` is the deterministic trigger here;
-    /// the one that actually bites in production is `ENOSPC` against `fs.inotify.
-    /// max_user_watches`, which no test can provoke without changing a host-wide sysctl.
+    /// A failed file watch is an `Err`, not `Poll`'s `None`. `ENOENT` stands in for production's
+    /// `ENOSPC`, which a test can't provoke without a host-wide sysctl.
     #[tokio::test]
     async fn watch_file_surfaces_its_error_rather_than_swallowing_it() {
         let mut diag = Diagnostics::new("test");
@@ -297,7 +260,7 @@ mod tests {
             .expect_err("a missing file must not watch successfully");
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "got: {err}");
 
-        // And the operator-facing line names the path plus the errno.
+        // The diagnostic names the path and the errno.
         let message = watch_error_message(Path::new("/nonexistent/logit-test/app.log"), &err);
         assert!(message.contains("/nonexistent/logit-test/app.log"), "got: {message}");
         assert!(message.contains("No such file"), "got: {message}");
@@ -307,8 +270,7 @@ mod tests {
         assert!(poll.watch_file(Path::new("/nonexistent/logit-test/app.log")).unwrap().is_none());
     }
 
-    /// `ENOSPC`'s own message, built directly -- the errno alone reads as a full disk, which is
-    /// the wrong thing for an operator to go looking at.
+    /// `ENOSPC` points at the watch limit, not a full disk.
     #[test]
     fn an_enospc_watch_error_points_at_the_watch_limit() {
         let err = std::io::Error::from_raw_os_error(libc::ENOSPC);
@@ -327,12 +289,10 @@ mod tests {
     }
 }
 
-/// A hand-rolled `inotify` backend: `libc` calls confined to this module, no `notify` crate
-/// (license-blocked by `deny.toml` -- see the ADR's Alternatives). A directory watch and a file
-/// watch are both plain `inotify_add_watch` calls against one shared fd, distinguished only by
-/// mask and by what `parse_events` does with their wake (`WatchTarget`, private to this
-/// submodule) -- there is nothing `inotify`-specific about the split itself, it's the same "watch
-/// exactly what you'd act on" design `watch.rs`'s own module doc describes.
+/// A hand-rolled `inotify` backend with every `libc` call confined here, instead of the `notify`
+/// crate (`docs/adr/file-tailing-and-docker-json-logs.md`'s "Alternatives considered"). Its
+/// `unsafe` sites are verified out of CI (`docs/adr/out-of-ci-unsafe-verification.md`). Directory
+/// and file watches share one fd and differ only by mask and `WatchTarget`.
 #[cfg(target_os = "linux")]
 mod inotify {
     use super::{Wake, WatchId};
@@ -344,24 +304,16 @@ mod inotify {
     use std::path::{Path, PathBuf};
     use tokio::io::unix::AsyncFd;
 
-    /// One `read()` off the inotify fd -- generously larger than any single burst of events this
-    /// driver's own watches (`root`, plus one file per currently-tailed container) would ever
-    /// produce at once; a burst larger than this is exactly what `IN_Q_OVERFLOW` (and this
-    /// driver's full-rescan response to it) exists to handle.
+    /// One `read()` off the inotify fd: far more than one burst from these watches produces. A
+    /// larger backlog is what `IN_Q_OVERFLOW` and the full rescan handle.
     ///
-    /// Its *lower* bound is load-bearing for liveness, not just for throughput, which is what the
-    /// assertion below pins. `inotify_read` refuses an event that doesn't fit the caller's buffer
-    /// rather than truncating it (`get_one_event`: `if (event_size > count) return
-    /// ERR_PTR(-EINVAL);`), and surfaces that as `EINVAL` whenever nothing has been copied yet --
-    /// a *persistent* error, since the same oversized event is still at the head of the queue on
-    /// the next read. A buffer below `sizeof(struct inotify_event) + NAME_MAX + 1` therefore turns
-    /// one long filename into a read that can never succeed; `next_wake` treats that as fatal to
-    /// the wake source (`Wake::Dead`) rather than looping on it, but the buffer is what keeps the
-    /// condition unreachable in the first place.
+    /// The *lower* bound is a liveness requirement, asserted below. The kernel never truncates an
+    /// event: one that doesn't fit fails the read with `EINVAL` when nothing was copied yet, and
+    /// stays at the head of the queue, so every later read fails too. Below
+    /// `sizeof(struct inotify_event) + NAME_MAX + 1`, one long filename would kill the wake source.
     const EVENT_BUF_BYTES: usize = 64 * 1024;
 
-    /// `NAME_MAX + 1`, the largest name the kernel can pad an event out to -- `libc` exposes no
-    /// `NAME_MAX` constant, and the value is 255 on every Linux filesystem this could tail.
+    /// `NAME_MAX + 1`. `libc` has no `NAME_MAX`; it's 255 on every Linux filesystem.
     const MAX_EVENT_NAME_BYTES: usize = 256;
 
     const _: () = assert!(
@@ -369,12 +321,11 @@ mod inotify {
         "a read buffer below one maximum-size event makes `read(2)` fail with EINVAL forever"
     );
 
-    // The kernel's `struct inotify_event` is four 4-byte fields (`wd`, `mask`, `cookie`, `len`)
-    // followed by a flexible `name[]` member that is *not* part of the Rust type -- `parse_events`
-    // walks the name itself, out of the same buffer, at `header_len` past each event's start.
-    // `ptr::read_unaligned` below is sound for any bit pattern of those four fields, but only if
-    // the Rust type really is those four fields in that order with no padding, so pin it: a
-    // `libc` bump that reshaped the struct would otherwise silently reinterpret every event.
+    // `struct inotify_event` is four 4-byte fields (`wd`, `mask`, `cookie`, `len`) then a
+    // flexible `name[]` the Rust type omits; `parse_events` reads the name from the buffer at
+    // `header_len` past each event. `read_unaligned` is sound for any bit pattern only if the Rust
+    // type is those four fields, in order, unpadded, so a `libc` change that reshaped it fails
+    // the build here.
     const _: () = assert!(std::mem::size_of::<libc::inotify_event>() == 16);
     const _: () = assert!(std::mem::align_of::<libc::inotify_event>() == 4);
     const _: () = assert!(std::mem::offset_of!(libc::inotify_event, wd) == 0);
@@ -382,25 +333,16 @@ mod inotify {
     const _: () = assert!(std::mem::offset_of!(libc::inotify_event, cookie) == 8);
     const _: () = assert!(std::mem::offset_of!(libc::inotify_event, len) == 12);
 
-    /// A directory watch's mask: appearance and departure only, no content events. `root` is the
-    /// only directory `docker_in` ever watches with this -- Docker's per-container state
-    /// directories are direct children of it, so `IN_CREATE`/`IN_DELETE` alone catch a container
-    /// arriving or leaving without needing to also watch what's written inside it.
-    /// `IN_DELETE_SELF` covers the watched directory itself disappearing; `IN_MOVE_SELF` covers
-    /// the other way it can stop being the directory at this path -- a rename of the directory
-    /// itself, after which the watch stays perfectly valid on an inode nobody is looking for any
-    /// more, with no `IN_IGNORED` to mark it (`fsnotify_move` just calls `fsnotify_inode(source,
-    /// FS_MOVE_SELF)`; nothing destroys the mark. The shape `notify`#555 records. A rename across
-    /// filesystems is not this case at all -- that is a copy plus an unlink, so it arrives as
-    /// `IN_DELETE_SELF` + `IN_IGNORED`). Both arrive nameless -- `fsnotify_inode` passes `NULL`
-    /// for both `dir` and `name`, and `inotify_handle_inode_event` explicitly masks `IN_ISDIR`
-    /// back out of them ("inotify never reported IN_ISDIR with those events") -- so
-    /// `parse_events`' existing nameless-`Dir` arm reports them as the directory changing and the
+    /// A directory watch's mask: entries appearing and departing, no content events.
+    ///
+    /// `IN_DELETE_SELF` catches the directory being deleted. `IN_MOVE_SELF` catches it being
+    /// renamed, which leaves the watch valid on the moved inode with no `IN_IGNORED` to say so (a
+    /// rename across filesystems arrives as `IN_DELETE_SELF` + `IN_IGNORED` instead). Both arrive
+    /// nameless and without `IN_ISDIR`, so `parse_events` reports the directory itself and the
     /// driver's `scan` re-arms by path.
     ///
-    /// `IN_ONLYDIR` is a guard rather than an event: a pattern whose `dir()` is a regular file
-    /// (`paths: [/var/log/app.log/*.log]`) would otherwise register a permanently silent watch
-    /// that looks healthy. With it, that config mistake is an `ENOTDIR` at the syscall, which
+    /// `IN_ONLYDIR` is a guard, not an event: a pattern whose `dir()` is a regular file would
+    /// otherwise get a silent watch that looks healthy. With it, that's an `ENOTDIR` that
     /// `Tailer::reconcile_watches` diagnoses.
     const DIR_MASK: u32 = libc::IN_CREATE
         | libc::IN_MOVED_TO
@@ -410,12 +352,9 @@ mod inotify {
         | libc::IN_MOVE_SELF
         | libc::IN_ONLYDIR;
 
-    /// A file watch's mask: content changes only. One registered per file a
-    /// `crate::tail::driver::Tailer` actually has open -- a write to any *other* file (an
-    /// unselected container's log, a rotated-away `.1`) produces no event on this watch, and
-    /// therefore no `scan`. A file's own deletion doesn't need a bit here: the kernel always
-    /// emits `IN_IGNORED` when a watched inode goes away, regardless of the requested mask -- see
-    /// `parse_events`.
+    /// A file watch's mask: content changes only. A truncation, including an `O_TRUNC` open, also
+    /// raises `IN_MODIFY` (`notify_change` → `fsnotify_change` on `ATTR_SIZE`). Deletion needs no
+    /// bit: the kernel emits `IN_IGNORED` when a watched inode goes away, whatever the mask.
     const FILE_MASK: u32 = libc::IN_MODIFY;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,37 +366,28 @@ mod inotify {
     #[derive(Debug)]
     pub(crate) struct InotifyWatcher {
         fd: AsyncFd<OwnedFd>,
-        /// Watch descriptor -> the path it watches and which kind it is, so a raw event (which
-        /// only carries a wd) can be turned back into the right [`Wake`] variant. Purged on
-        /// `IN_IGNORED` as well as on an explicit `unwatch`/`unwatch_dir` -- see `parse_events`.
+        /// `wd` to the watched path and kind, to turn a raw event into a [`Wake`]. Purged on
+        /// `IN_IGNORED` as well as by `unwatch`/`unwatch_dir`.
         watches: HashMap<i32, (PathBuf, WatchTarget)>,
-        /// Directory watches only -- the reverse index, so re-arming a path that already has a
-        /// watch can tell "the same inode, same `wd`" from "a *new* inode at that path, new `wd`
-        /// and a stale one to release" (`watch_dir`). File watches are never indexed here: a
-        /// rotation legitimately reuses one path under a new inode, and each generation gets its
-        /// own watch.
+        /// Directory path to `wd`, so `watch_dir` can tell a re-arm of the same inode from a new
+        /// inode at the path whose stale `wd` must be released. Files aren't indexed: a rotation
+        /// puts a new inode, with its own watch, at the same path.
         ///
-        /// Kept honest in both directions or it is worse than useless -- an entry that outlives
-        /// its `wd` used to make `watch_dir` short-circuit on a watch the kernel had already
-        /// invalidated. Every removal path purges both maps together: `unwatch_dir`,
-        /// `parse_events`' `IN_IGNORED` and `IN_MOVE_SELF` arms, and `watch_dir`'s own
-        /// stale-`wd` replacement.
+        /// Every removal purges both maps together (`unwatch_dir`, `parse_events`' `IN_IGNORED`
+        /// and `IN_MOVE_SELF` arms, `watch_dir`'s stale-`wd` release). An entry outliving its `wd`
+        /// is worse than none.
         by_path: HashMap<PathBuf, i32>,
         buf: Vec<u8>,
-        /// One `read()` can (and often does) carry more than one event -- drained one at a time
-        /// by [`InotifyWatcher::next_wake`] before this reads again.
+        /// Parsed wakes from one `read()`, handed out one per [`InotifyWatcher::next_wake`].
         pending: VecDeque<Wake>,
-        /// Set once, by the first unrecoverable failure of the fd itself (see
-        /// [`InotifyWatcher::read_once`]). After it, `next_wake` parks forever instead of reading
-        /// again: tokio only clears a fd's cached readiness on a `WouldBlock`
-        /// (`AsyncFdReadyGuard::try_io`, tokio 1.53.1), so looping on a fd that fails any other
-        /// way would spin *without ever yielding*: `AsyncFd::readable()` resolves through
-        /// `Registration::readiness`, which -- unlike `Registration::poll_ready` and
-        /// `Registration::async_io` -- carries no `coop::poll_proceed` budget check to break such
-        /// a loop up, and `try_io` itself is synchronous. That takes the driver's poll, flush and
-        /// checkpoint ticks down with it, which is the one way a defect in this module could cost
-        /// data rather than latency. Parking instead leaves the listener exactly where
-        /// `watch: poll` always is.
+        /// Set by the fd's first unrecoverable failure ([`InotifyWatcher::read_once`]); after
+        /// it, `next_wake` parks forever.
+        ///
+        /// Retrying would spin without yielding: tokio clears cached readiness only on
+        /// `WouldBlock` (`AsyncFdReadyGuard::try_io`, tokio 1.53.1), and `AsyncFd::readable()`
+        /// goes through `Registration::readiness`, which has no `coop` budget check. That would
+        /// stall the driver's poll, flush, and checkpoint ticks, the one way this module could
+        /// cost data rather than latency. Parking leaves the listener as `watch: poll` would be.
         dead: bool,
     }
 
@@ -466,12 +396,8 @@ mod inotify {
             Self::with_fd(open_inotify()?)
         }
 
-        /// Test-only seam: same as [`InotifyWatcher::new`], but with the fd-opening step
-        /// injected, so `Watcher::new_with`'s own test seam can force this to fail without
-        /// touching a real OS limit.
-        /// `pub(super)`, not `pub(crate)`: this is a test-only seam for `Watcher::new_with`'s own
-        /// tests (in the parent module) as well as this module's own -- nothing outside `watch`
-        /// should ever construct one with a fake fd.
+        /// [`InotifyWatcher::new`] with the fd injected, so a test can supply a failing open or
+        /// a fd that isn't an inotify instance.
         #[cfg(test)]
         pub(super) fn with_init(
             open: impl FnOnce() -> io::Result<OwnedFd>,
@@ -491,20 +417,19 @@ mod inotify {
             })
         }
 
-        /// Test-only: see [`super::Watcher::inotify_fd`].
+        /// See [`super::Watcher::inotify_fd`].
         #[cfg(test)]
         pub(super) fn raw_fd(&self) -> std::os::fd::RawFd {
             self.fd.get_ref().as_raw_fd()
         }
 
-        /// Test-only: see [`super::Watcher::tracked_watch_count`].
+        /// See [`super::Watcher::tracked_watch_count`].
         #[cfg(test)]
         pub(super) fn tracked_watch_count(&self) -> usize {
             self.watches.len()
         }
 
-        /// `inotify_add_watch` against `path` with `mask`, wrapped once so [`InotifyWatcher::
-        /// watch_dir`] and [`InotifyWatcher::watch_file`] share the one `unsafe` call site.
+        /// `inotify_add_watch(2)`: the one `unsafe` call site both watch kinds share.
         fn add_watch(&self, path: &Path, mask: u32) -> io::Result<i32> {
             let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte")
@@ -520,10 +445,8 @@ mod inotify {
             Ok(wd)
         }
 
-        /// `inotify_rm_watch` against `wd`, ignoring the result -- shared by every caller that
-        /// already removed its own bookkeeping and doesn't need to know whether the kernel had
-        /// already invalidated the watch first (a redundant removal, e.g. after `IN_DELETE_SELF`
-        /// or `IN_IGNORED`, returns `EINVAL`, not worth surfacing as an error).
+        /// `inotify_rm_watch(2)`, ignoring the result: removing a watch the kernel already
+        /// invalidated (after `IN_IGNORED`) returns a harmless `EINVAL`.
         fn rm_watch(&self, wd: i32) {
             // SAFETY: `self.fd`'s inner fd is valid; `wd` was returned by a prior successful
             // `inotify_add_watch` on this same fd, or is already stale (harmless per above).
@@ -532,31 +455,18 @@ mod inotify {
             }
         }
 
-        /// Arms a directory watch, idempotently. Called for **every** directory the patterns
-        /// reach on **every** `scan`, not just for newly-appearing ones -- that repetition is
-        /// what makes the watch set self-healing, and it is only affordable because the kernel
-        /// makes the repeat call a no-op on the common path: the mark is looked up by *inode*
-        /// (`inotify_update_existing_watch`'s `fsnotify_find_inode_mark(inode, group)`), so
-        /// re-adding on a live directory returns that same mark's `wd` and, with `IN_MASK_ADD`
-        /// absent, rewrites its mask under `spin_lock(&fsn_mark->lock)`. Re-arming with the
-        /// identical mask therefore leaves `old_mask == new_mask`, which skips even the
-        /// `fsnotify_recalc_mask` branch: no event window, no `IN_IGNORED`, no second kernel
-        /// watch. One `inotify_add_watch(2)` per pattern directory per scan is the whole cost,
-        /// and every caller has exactly one such directory (`tail_in`'s `paths:` parent,
-        /// `docker_in`'s `root` -- `PathPattern::dir`, one per pattern, and neither kind
-        /// configures more than one).
+        /// Arms a directory watch, idempotently; called for every pattern directory on every
+        /// `scan`.
         ///
-        /// There is deliberately **no** "already in `by_path`, skip the syscall" short-circuit.
-        /// That is what used to make a directory deleted and recreated -- or renamed away and
-        /// replaced -- unrecoverable: the reverse index still held the dead `wd`, so the re-arm
-        /// returned `Ok(())` without ever asking the kernel, and discovery in that directory
-        /// silently stayed at `poll_interval` for the life of the process.
+        /// A repeat on a live directory is a kernel no-op: the mark is found by inode, so it
+        /// returns the same `wd`, and an identical mask changes nothing (no event, no
+        /// `IN_IGNORED`, no second watch).
         ///
-        /// A `wd` that differs from the one this path had means a *new inode* now answers to it.
-        /// The previous one is released here: if it died on its own (the directory was deleted)
-        /// the `inotify_rm_watch` is a harmless `EINVAL`, and if it did not (the directory was
-        /// renamed away, which leaves the watch valid on the moved inode) this is what stops it
-        /// reporting activity under a name it no longer has.
+        /// **Never skip the syscall because `by_path` has the path.** After a delete-and-recreate
+        /// or a rename-and-replace, `by_path` holds a dead or moved `wd`, and only asking the
+        /// kernel finds the new inode. A different `wd` means a new inode: the old one is
+        /// released, a harmless `EINVAL` if it died, and otherwise what stops a renamed-away
+        /// directory reporting under its old name.
         pub fn watch_dir(&mut self, dir: &Path) -> io::Result<()> {
             let wd = self.add_watch(dir, DIR_MASK)?;
             if let Some(stale) = self.by_path.insert(dir.to_path_buf(), wd) {
@@ -570,11 +480,8 @@ mod inotify {
         }
 
         pub fn watch_file(&mut self, path: &Path) -> io::Result<WatchId> {
-            // No `by_path` dedup here, deliberately: a caller (`Tailer::open_tracked`) registers
-            // a file watch exactly once, when it opens the file, and calls `unwatch` exactly
-            // once, when it stops tracking it -- deduping by path would paper over a caller bug
-            // rather than serve a real need, and would be actively wrong across a rotation, where
-            // the same path is legitimately watched under a new inode.
+            // No dedup by path: the caller watches each opened file once and unwatches it once,
+            // and a rotation puts a new inode, needing its own watch, at the same path.
             let wd = self.add_watch(path, FILE_MASK)?;
             self.watches.insert(wd, (path.to_path_buf(), WatchTarget::File));
             Ok(WatchId(wd))
@@ -591,19 +498,16 @@ mod inotify {
             self.rm_watch(wd);
         }
 
-        /// Cancel-safe: the only suspension point is `readable().await` (plus the terminal
-        /// `pending()`), and everything between a successful `read` and the parsed events landing
-        /// in `self.pending` is synchronous, so a dropped future can never lose an event this
-        /// already took off the fd.
+        /// Cancel-safe: the only await points are `readable()` and the terminal `pending()`, and
+        /// a successful read reaches `self.pending` synchronously, so dropping the future never
+        /// loses an event already read.
         pub async fn next_wake(&mut self) -> Wake {
             loop {
                 if let Some(wake) = self.pending.pop_front() {
                     return wake;
                 }
                 if self.dead {
-                    // Already reported, once, as the `Wake::Dead` that set this. Park rather than
-                    // read again: see the field's own doc comment for why looping here would
-                    // wedge the driver's task instead of merely busying it.
+                    // Already reported as `Wake::Dead`. Park; see `dead` for why not retry.
                     return std::future::pending().await;
                 }
                 match self.read_once().await {
@@ -616,19 +520,15 @@ mod inotify {
             }
         }
 
-        /// Waits for readiness, takes one `read(2)` off the fd, and parses whatever it yielded
-        /// into `self.pending`. `Ok(())` covers both a successful read and a stale-readiness
-        /// `WouldBlock` -- the caller loops. `Err(reason)` means the fd itself is no longer
-        /// usable and never will be: reading again could not make progress, so the caller retires
-        /// the wake source instead of retrying it.
+        /// Waits for readiness, takes one `read(2)`, and parses it into `self.pending`.
         ///
-        /// All three `Err` cases are believed unreachable against a real `inotify` fd --
-        /// `readable()` errs only when the tokio runtime is shutting down; `EINVAL` needs a
-        /// buffer smaller than one event (see `EVENT_BUF_BYTES`), `EINTR` is excluded by
-        /// `IN_NONBLOCK`, `EFAULT` by the buffer being a live `Vec`; and a `0` return is
-        /// pre-2.6.21 behaviour that modern kernels replaced with `EINVAL`. They are handled as
-        /// fatal anyway because the alternative shape (swallow and loop) is not a spin but a
-        /// hang: tokio clears a fd's cached readiness only on `WouldBlock`.
+        /// `Ok(())` is a read or a stale-readiness `WouldBlock` (`EAGAIN`); the caller loops.
+        /// `Err` means the fd can never make progress, and the caller retires the wake source.
+        /// Every `Err` should be unreachable on a real inotify fd: `readable()` fails only during
+        /// runtime shutdown, `EINVAL` needs a buffer below one event (`EVENT_BUF_BYTES`), a
+        /// non-blocking read can't be interrupted (`EINTR`), `EFAULT` can't happen with a live
+        /// `Vec`, and a `0` return predates Linux 2.6.21. They're fatal anyway, because looping
+        /// on them would hang (see `dead`).
         async fn read_once(&mut self) -> Result<(), String> {
             let n = {
                 let mut guard = match self.fd.readable().await {
@@ -658,9 +558,8 @@ mod inotify {
                     }
                     Ok(Ok(n)) => n,
                     Ok(Err(err)) => return Err(format!("reading the inotify fd: {err}")),
-                    // Readiness was stale; loop back to `readable().await`. This is the *only*
-                    // arm tokio treats as "not ready after all" -- `try_io` clears the cached
-                    // readiness bit here and nowhere else.
+                    // Stale readiness: the only case where `try_io` clears the cached bit, so
+                    // the next `readable()` really waits.
                     Err(_would_block) => return Ok(()),
                 }
             };
@@ -672,9 +571,8 @@ mod inotify {
                 &mut release,
                 &mut self.pending,
             );
-            // Watches `parse_events` decided this instance should stop holding but could not
-            // release itself (it is a pure function over the buffer, with no fd) -- today, a
-            // directory renamed out from under its own watch.
+            // `parse_events` has no fd, so it hands back the watches to release (a directory
+            // renamed away).
             for wd in release {
                 self.rm_watch(wd);
             }
@@ -694,33 +592,24 @@ mod inotify {
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
-    /// Decodes every complete `inotify_event` in `buf` (as delivered by one `read()` off the fd)
-    /// into a [`Wake`], appended to `out` in order. Pure and independent of a live fd -- `read`'s
-    /// job (above) is entirely "make a live fd look like a byte buffer"; this is everything past
-    /// that, and is what the unit tests below exercise directly.
+    /// Decodes every complete `inotify_event` from one `read()` into [`Wake`]s, in order. Pure,
+    /// with no fd, so tests (and miri) exercise it directly.
     ///
-    /// Takes the watch bookkeeping by `&mut`, which every caller reads as immutable everywhere
-    /// else: this is the one place that *removes* an entry the kernel has already invalidated,
-    /// rather than waiting for the driver's own close path to call `unwatch`. Two events do that:
+    /// Also the one place that removes watches the kernel invalidated, rather than waiting for
+    /// the driver to `unwatch`:
     ///
-    /// - `IN_IGNORED` -- the watch is gone (the inode was deleted, unmounted, or explicitly
-    ///   removed). It is structurally the last event for that `wd`: `inotify_freeing_mark` →
-    ///   `inotify_ignored_and_remove_idr` sets `i_mark->wd = -1`, after which
-    ///   `inotify_handle_inode_event` emits nothing more for it. Purging here is what keeps both
-    ///   maps from growing one dead entry per rotation, and -- for a directory -- what lets the
-    ///   next `scan` re-arm the path at all.
-    /// - `IN_MOVE_SELF` on a directory -- the watch is *not* gone, but the inode behind it no
-    ///   longer answers to the path this instance knows it by, and the kernel sends no
-    ///   `IN_IGNORED` for a rename. The `wd` is dropped from both maps and pushed onto `release`
-    ///   for the caller to `inotify_rm_watch` (this function has no fd), so the `Wake::Discover`
-    ///   it also emits finds a clean slate to re-arm into.
+    /// - `IN_IGNORED`: the watch is gone (inode deleted, unmounted, or removed), and it's the last
+    ///   event for that `wd` (`inotify_ignored_and_remove_idr` sets the mark's `wd` to -1).
+    ///   Purging keeps the maps from growing an entry per rotation and lets the next `scan`
+    ///   re-arm a directory.
+    /// - `IN_MOVE_SELF` on a directory: the watch is valid but on an inode no longer at this path,
+    ///   and no `IN_IGNORED` follows. Dropped from both maps and pushed onto `release` for the
+    ///   caller to `inotify_rm_watch`.
     ///
-    /// Note what this purge is *not* about: `wd` values are not small recycled integers. The
-    /// kernel allocates them with `idr_alloc_cyclic(idr, i_mark, 1, 0, GFP_NOWAIT)` (cyclic since
-    /// v3.10, commit `a66c04b4534f`; before that a `*last_wd + 1` cursor that never wrapped at
-    /// all), so reuse needs a process to cycle the whole `1..INT_MAX` range -- the caveat
-    /// `inotify(7)`'s BUGS section describes, and not a thing a tailer reaches. The purge earns
-    /// its place by keeping the maps bounded and `by_path` honest, not by racing a recycled `wd`.
+    /// The purge isn't about `wd` reuse: the kernel allocates them cyclically over `1..INT_MAX`.
+    ///
+    /// After a malformed event the rest of the buffer is discarded, not resynchronized
+    /// (`docs/known-gaps.md`); a real inotify fd never produces one.
     fn parse_events(
         buf: &[u8],
         watches: &mut HashMap<i32, (PathBuf, WatchTarget)>,
@@ -740,40 +629,30 @@ mod inotify {
                 std::ptr::read_unaligned(buf[i..].as_ptr().cast::<libc::inotify_event>())
             };
             let name_len = event.len as usize;
-            // `checked_add`, not `i + header_len + name_len`: `event.len` is a `u32` widened to
-            // `usize`, so on a 32-bit target the sum can wrap past `buf.len()` and turn the guard
-            // below into a permission to slice out of bounds. The kernel itself can never produce
-            // such a `len` (`round_event_name_len` caps it at `roundup(NAME_MAX + 1, 16)` = 272),
-            // but the SAFETY comment above claims "never read past `buf`" unconditionally, and
-            // this is what makes that true for any bytes at all.
+            // `checked_add`: on a 32-bit target `i + header_len + name_len` can wrap and pass the
+            // bounds check below. The kernel caps `len` at 272, but this keeps the slice in
+            // bounds for any bytes at all.
             let Some(name_end) = i.checked_add(header_len).and_then(|h| h.checked_add(name_len))
             else {
                 break;
             };
             if name_end > buf.len() {
-                break; // a truncated trailing event -- shouldn't happen, but never read past buf
+                break; // truncated trailing event: never read past `buf`
             }
 
             if event.mask & libc::IN_Q_OVERFLOW != 0 {
                 out.push_back(Wake::Overflow);
             } else if event.mask & libc::IN_IGNORED != 0 {
-                // The kernel has already invalidated this watch descriptor -- rotation cleanup
-                // deleting an old file, an operator deleting a log directly, or an explicit
-                // `inotify_rm_watch` this process itself issued (which also produces this event,
-                // redundantly with the bookkeeping `unwatch`/`unwatch_dir` already did -- removing
-                // an already-absent key here is a no-op). No `Wake` for it: whatever needed to
-                // notice the underlying file or directory is gone already does, via `root`'s own
-                // `IN_DELETE` or the driver's ordinary stale-tracking.
+                // The kernel invalidated this `wd`: a deleted file or directory, or our own
+                // `inotify_rm_watch` (whose bookkeeping is already gone, making this a no-op). No
+                // `Wake`: the parent's `IN_DELETE` or the driver's rescan notices the loss.
                 //
-                // Tested separately rather than folded into the `else if` chain below, because it
-                // never arrives ORed with an event bit: the kernel emits it as
-                // `inotify_handle_inode_event(fsn_mark, FS_IN_IGNORED, NULL, NULL, NULL, 0)` -- a
-                // bare constant, no inode, no name -- and `event_compare` refuses to merge
-                // anything into an already-queued ignore.
+                // Tested before any other bit. The kernel never ORs it with one (it queues a bare
+                // `FS_IN_IGNORED`, and `event_compare` merges nothing into it), but if it did, a
+                // wake would name a path this instance just stopped watching.
                 if let Some((_, WatchTarget::Dir)) = watches.remove(&event.wd) {
-                    // Every path that resolved to this now-dead `wd`, not just one: two spellings
-                    // of the same directory (a symlink, a `.` component) alias one inode and
-                    // therefore share its `wd`.
+                    // Every path with this `wd`: two spellings of a directory (a symlink, a `.`
+                    // component) share one.
                     by_path.retain(|_, held| *held != event.wd);
                 }
             } else if let Some((path, target)) = watches.get(&event.wd).cloned() {
@@ -781,28 +660,19 @@ mod inotify {
                     WatchTarget::File => out.push_back(Wake::Data(path)),
                     WatchTarget::Dir if name_len > 0 => {
                         let name_bytes = &buf[i + header_len..name_end];
-                        // `inotify_event`'s `name` is NUL-padded out to a multiple of
-                        // `sizeof(struct inotify_event)` (`round_event_name_len`'s
-                        // `roundup(name_len + 1, sizeof(struct inotify_event))`), not exactly
-                        // `strlen`-sized -- trim at the first NUL rather than trusting `event.len`
-                        // as the name's real length.
+                        // `len` includes NUL padding to a multiple of 16, so trim at the first
+                        // NUL.
                         let end =
                             name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
                         let name = OsStr::from_bytes(&name_bytes[..end]);
                         out.push_back(Wake::Discover(path.join(name)));
                     }
                     WatchTarget::Dir => {
-                        // No name -- `IN_DELETE_SELF` or `IN_MOVE_SELF` on the watched directory
-                        // itself (the kernel strips `IN_ISDIR` from both, so neither ever carries
-                        // one). Reported as the directory changing, which is accurate: something
-                        // about it did.
+                        // Nameless: `IN_DELETE_SELF` or `IN_MOVE_SELF` on the directory itself.
                         out.push_back(Wake::Discover(path));
                         if event.mask & libc::IN_MOVE_SELF != 0 {
-                            // Unlike a deletion, a rename leaves the watch perfectly valid -- on
-                            // an inode that is no longer this path. Drop it here and let the
-                            // `scan` the `Wake` above triggers re-arm whatever is at the path
-                            // now; holding on would keep reporting the moved-away directory's
-                            // activity under a name it no longer has.
+                            // A rename leaves the watch valid on an inode no longer at this
+                            // path. Drop it; the `scan` this wake triggers re-arms the path.
                             watches.remove(&event.wd);
                             by_path.retain(|_, held| *held != event.wd);
                             release.push(event.wd);
@@ -810,8 +680,7 @@ mod inotify {
                     }
                 }
             }
-            // else: an event on a watch descriptor this instance no longer knows about (already
-            // unwatched) -- ignored, not an error.
+            // Otherwise the `wd` was already unwatched: ignored.
 
             i = name_end;
         }
@@ -821,7 +690,7 @@ mod inotify {
     mod tests {
         use super::*;
 
-        /// The kernel's own name padding, reproduced exactly (`round_event_name_len`, v6.12
+        /// The kernel's name padding (`round_event_name_len`, v6.12
         /// `fs/notify/inotify/inotify_user.c`):
         ///
         /// ```c
@@ -835,11 +704,9 @@ mod inotify {
         /// }
         /// ```
         ///
-        /// So a nameless event has `len == 0` -- not 4, not 16 -- and a named one is padded to a
-        /// multiple of **16**, never 4. Getting this wrong in a fixture is not cosmetic: it is
-        /// what decides whether a multi-event buffer's second event starts where the code thinks
-        /// it does, and it is why `parse_events_reports_the_wd_of_every_event_in_a_multi_event_
-        /// buffer` can tell a correct advance from one that forgets `name_len`.
+        /// A nameless event has `len == 0`, and a named one is padded to a multiple of **16**.
+        /// A fixture that pads differently puts a multi-event buffer's later events where the
+        /// kernel never would, and can hide a decoder that forgets to skip the name.
         fn kernel_name_len(name: &str) -> usize {
             let header_len = std::mem::size_of::<libc::inotify_event>();
             if name.is_empty() {
@@ -849,8 +716,7 @@ mod inotify {
             }
         }
 
-        /// Builds one raw `inotify_event` (header + NUL-padded name) exactly as the kernel would
-        /// write it, for feeding to `parse_events` without a real fd.
+        /// One raw `inotify_event` (header plus NUL-padded name) as the kernel writes it.
         fn raw_event(wd: i32, mask: u32, name: &str) -> Vec<u8> {
             let header_len = std::mem::size_of::<libc::inotify_event>();
             let name_bytes = name.as_bytes();
@@ -866,8 +732,7 @@ mod inotify {
             buf
         }
 
-        /// One raw event with a hand-chosen `len`, for the malformed cases the kernel could never
-        /// produce but `parse_events` must still walk without panicking.
+        /// One raw event with an arbitrary `len`, for malformed cases the kernel never produces.
         fn raw_event_with_len(wd: i32, mask: u32, len: u32, trailing: usize) -> Vec<u8> {
             let header_len = std::mem::size_of::<libc::inotify_event>();
             let event = libc::inotify_event { wd, mask, cookie: 0, len };
@@ -880,8 +745,7 @@ mod inotify {
             buf
         }
 
-        /// `parse_events` with the two bookkeeping maps and the release list a caller would pass,
-        /// returning everything a test might want to assert on.
+        /// `parse_events`, returning the wakes and the release list.
         fn parse(
             buf: &[u8],
             watches: &mut HashMap<i32, (PathBuf, WatchTarget)>,
@@ -893,7 +757,7 @@ mod inotify {
             (out, release)
         }
 
-        /// The common shape: one watch, no reverse index worth caring about.
+        /// `parse` with an empty reverse index, returning only the wakes.
         fn parse_wakes(
             buf: &[u8],
             watches: &mut HashMap<i32, (PathBuf, WatchTarget)>,
@@ -903,14 +767,12 @@ mod inotify {
 
         #[test]
         fn parse_events_fixture_pads_names_the_way_the_kernel_does() {
-            // A nameless event is a bare 16-byte header with `len == 0` -- the kernel does not
-            // pad "no name" out to anything.
+            // A nameless event is a bare 16-byte header with `len == 0`.
             let nameless = raw_event(7, libc::IN_MODIFY, "");
             assert_eq!(nameless.len(), 16);
             assert_eq!(u32::from_ne_bytes(nameless[12..16].try_into().unwrap()), 0);
 
-            // A name is padded to a multiple of `sizeof(struct inotify_event)` == 16, always
-            // including at least one NUL: 6 bytes of "abc123" plus its terminator round up to 16.
+            // A name is padded to a multiple of 16 with at least one NUL: "abc123" plus NUL is 16.
             let named = raw_event(7, libc::IN_CREATE, "abc123");
             assert_eq!(named.len(), 32);
             assert_eq!(u32::from_ne_bytes(named[12..16].try_into().unwrap()), 16);
@@ -936,8 +798,7 @@ mod inotify {
         fn parse_events_reports_a_file_watch_modify_as_data_ignoring_any_name() {
             let path = PathBuf::from("/var/lib/docker/containers/abc/abc-json.log");
             let mut watches = HashMap::from([(7, (path.clone(), WatchTarget::File))]);
-            // A file watch's own events never carry a name in practice, but even if one somehow
-            // did, `Data` always names the watched file itself, never a joined child path.
+            // `Data` names the watched file itself, never a joined child path.
             let buf = raw_event(7, libc::IN_MODIFY, "");
 
             let out = parse_wakes(&buf, &mut watches);
@@ -957,9 +818,7 @@ mod inotify {
             assert_eq!(out, VecDeque::from([Wake::Overflow]));
         }
 
-        /// `wd == -1` without the overflow bit: the kernel's overflow event is the only thing
-        /// that carries that descriptor, so anything else bearing it resolves to no watch and is
-        /// dropped rather than treated as an overflow.
+        /// `wd == -1` without the overflow bit resolves to no watch and is dropped.
         #[test]
         fn parse_events_ignores_a_minus_one_watch_descriptor_without_the_overflow_bit() {
             let mut watches =
@@ -1013,10 +872,7 @@ mod inotify {
             );
         }
 
-        /// The half the reverse index used to miss. A directory watch's `IN_IGNORED` has to clear
-        /// `by_path` too, or the next `scan`'s re-arm looks at a stale entry for a watch the
-        /// kernel has already invalidated -- which is exactly how a deleted-and-recreated log
-        /// directory used to lose its watch permanently.
+        /// A directory's `IN_IGNORED` clears `by_path` too, aliases included.
         #[test]
         fn parse_events_purges_both_indexes_for_an_ignored_directory_watch() {
             let dir = PathBuf::from("/var/log/app");
@@ -1036,9 +892,7 @@ mod inotify {
             assert!(release.is_empty(), "the kernel already released this one");
         }
 
-        /// A file watch's `IN_IGNORED` must not touch `by_path` -- file watches are never indexed
-        /// there, and a directory that happens to be keyed elsewhere in the map has nothing to do
-        /// with this descriptor.
+        /// A file watch's `IN_IGNORED` leaves `by_path` alone; files are never indexed there.
         #[test]
         fn parse_events_leaves_the_reverse_index_alone_for_an_ignored_file_watch() {
             let dir = PathBuf::from("/var/log/app");
@@ -1056,11 +910,8 @@ mod inotify {
             assert_eq!(by_path.len(), 1, "the directory's reverse entry is untouched");
         }
 
-        /// `IN_MOVE_SELF` is the one event that invalidates this instance's *knowledge* of a
-        /// watch without invalidating the watch: the kernel sends no `IN_IGNORED` for a rename,
-        /// and the descriptor stays live on the moved-away inode. Both indexes drop it and the
-        /// caller is handed the `wd` to `inotify_rm_watch`, while the `Wake::Discover` drives the
-        /// `scan` that re-arms whatever is at the path now.
+        /// A moved directory is reported, dropped from both indexes, and handed back for
+        /// `inotify_rm_watch`, since its watch is still live.
         #[test]
         fn parse_events_on_a_moved_directory_purges_it_and_asks_for_its_release() {
             let dir = PathBuf::from("/var/log/app");
@@ -1080,9 +931,7 @@ mod inotify {
             );
         }
 
-        /// A *file* watch never carries `IN_MOVE_SELF` (it isn't in `FILE_MASK`), but if one
-        /// somehow arrived it must stay an ordinary data wake rather than silently dropping the
-        /// file's watch.
+        /// `IN_MOVE_SELF` on a file watch (not in `FILE_MASK`) stays a data wake, not a release.
         #[test]
         fn parse_events_does_not_release_a_file_watch_on_a_move_self_bit() {
             let path = PathBuf::from("/var/log/app/app.log");
@@ -1096,12 +945,7 @@ mod inotify {
             assert!(release.is_empty());
         }
 
-        /// `IN_IGNORED` is tested before any other bit, so a mask carrying both is a purge and
-        /// nothing else. The kernel never ORs them (`inotify_ignored_and_remove_idr` passes the
-        /// bare `FS_IN_IGNORED` constant with no inode and no name, and `event_compare` refuses
-        /// to merge anything into a queued ignore), but the precedence is worth pinning: the
-        /// alternative reading -- emit the wake *and* purge -- would name a path this instance
-        /// has just stopped watching.
+        /// `IN_IGNORED` ORed with another bit is only a purge, never also a wake.
         #[test]
         fn parse_events_treats_ignored_ored_with_another_bit_as_a_purge() {
             let dir = PathBuf::from("/var/log/app");
@@ -1126,11 +970,9 @@ mod inotify {
 
             let out = parse_wakes(&buf, &mut watches);
 
-            // Not de-duplicated by `parse_events` itself -- `Tailer::drain`'s own round-robin
-            // already drains a file fully on any one wake, so a second, third, ... `Data(path)`
-            // queued right behind the first costs nothing but wake up to an already-drained file.
-            // (The *kernel* does coalesce identical consecutive unread events, which is what
-            // keeps a real burst small; this fixture is one it would never actually produce.)
+            // Not deduplicated: `drain` reads the file fully on the first wake, so the rest find
+            // nothing. The kernel coalesces identical consecutive unread events, so it never
+            // produces this fixture.
             assert_eq!(
                 out,
                 VecDeque::from([
@@ -1141,11 +983,8 @@ mod inotify {
             );
         }
 
-        /// The advance past each event has to include its name, and only a buffer whose *first*
-        /// event carries one can tell `i += header + name_len` from `i += header_len`: with a
-        /// nameless first event the two are identical, and with a single named event the mutated
-        /// loop simply exits early on the right answer. Three events -- named, nameless, named --
-        /// so every offset in the walk is load-bearing.
+        /// The advance past each event includes its name. Named, nameless, named, so only a
+        /// correct advance decodes all three.
         #[test]
         fn parse_events_decodes_every_event_of_a_mixed_named_and_nameless_buffer() {
             let dir = PathBuf::from("/var/log/app");
@@ -1170,10 +1009,8 @@ mod inotify {
             );
         }
 
-        /// The name-fit guard, exercised as a guard: a complete event followed by a named one
-        /// whose padding was cut short yields exactly the first wake and no panic. The same
-        /// buffer at its full length yields both -- otherwise this would pass for the wrong
-        /// reason (a decoder that dropped the second event unconditionally).
+        /// A trailing event whose name is cut short is dropped without panicking; the intact
+        /// buffer decodes both, so the test can't pass by always dropping the second.
         #[test]
         fn parse_events_stops_at_a_truncated_trailing_event() {
             let dir = PathBuf::from("/var/log/app");
@@ -1193,10 +1030,7 @@ mod inotify {
             );
         }
 
-        /// The header-fit guard's `<=` boundary, from both sides: a buffer that ends exactly on
-        /// an event boundary decodes everything in it, and one byte of a further header decodes
-        /// no more. (The fixture only reaches this boundary because it pads the way the kernel
-        /// does -- a 4-byte pad would never land a nameless event's end on `buf.len()`.)
+        /// The header-fit check's `<=` boundary, from both sides.
         #[test]
         fn parse_events_decodes_an_event_that_exactly_fills_the_buffer() {
             let dir = PathBuf::from("/var/log/app");
@@ -1220,10 +1054,7 @@ mod inotify {
             assert!(out.is_empty(), "one byte short of a header decodes nothing at all");
         }
 
-        /// `event.len` is a `u32` widened to `usize`; on a 32-bit target `i + 16 + len` can wrap
-        /// past `buf.len()` and turn the fit check into a green light for an out-of-bounds slice.
-        /// `checked_add` is what makes the SAFETY comment's "never read past `buf`" hold for any
-        /// bytes at all, and this pins it on every target: the event is discarded, nothing panics.
+        /// A `len` whose offset sum would overflow is discarded, on every target.
         #[test]
         fn parse_events_discards_an_event_whose_len_would_overflow() {
             let dir = PathBuf::from("/var/log/app");
@@ -1235,9 +1066,8 @@ mod inotify {
             }
         }
 
-        /// A `len` the kernel could never emit (not a multiple of 16) walks the rest of the
-        /// buffer misaligned, which is garbage in and garbage out -- but it must stay
-        /// memory-safe, terminate, and never resolve a descriptor this instance doesn't hold.
+        /// A `len` that isn't a multiple of 16 decodes garbage but never panics or names an
+        /// unwatched path.
         #[test]
         fn parse_events_never_panics_on_a_len_that_is_not_a_multiple_of_sixteen() {
             let dir = PathBuf::from("/var/log/app");
@@ -1257,18 +1087,12 @@ mod inotify {
             }
         }
 
-        /// A seeded mutation sweep in the shape of `crates/logit-proto/tests/robustness.rs`:
-        /// every single-byte truncation of a valid multi-event buffer, plus a few thousand
-        /// single-bit flips. `parse_events` walks kernel-supplied bytes, so this is not an
-        /// untrusted-input parser in the network sense -- but it is the one piece of this module
-        /// that does manual offset arithmetic over an unaligned struct read, and the `with_init`
-        /// seam can feed it bytes from a fd that isn't an inotify instance at all. The contract:
-        /// never panic, always terminate, and never emit a wake naming a watch that isn't in the
-        /// map.
+        /// Every truncation and a few thousand bit flips of a valid buffer never panic, always
+        /// terminate, and never name a watch outside the map.
         #[test]
         fn parse_events_survives_seeded_truncation_and_bit_flips() {
-            // Hand-rolled, seeded, reproducible -- no RNG crate exists in this workspace, and
-            // this is the same `Lcg` `logit-proto`'s robustness suite uses.
+            // No RNG crate in the workspace; the same `Lcg` as
+            // `crates/logit-proto/tests/robustness.rs`.
             struct Lcg(u64);
             impl Lcg {
                 fn next_u64(&mut self) -> u64 {
@@ -1312,8 +1136,7 @@ mod inotify {
                 check(&valid[..len], &format!("truncated to {len}"));
             }
 
-            // Miri walks every one of these at interpreter speed; a hundredth of the iterations
-            // still covers every byte of the fixture several times over.
+            // Miri is slow; 40 flips still cover every byte of the fixture several times.
             let flips = if cfg!(miri) { 40 } else { 4_000 };
             let mut rng = Lcg(0x005E_ED10_71F7);
             for i in 0..flips {
@@ -1365,9 +1188,8 @@ mod inotify {
                 InotifyWatcher::new().expect("inotify should be available in the dev container");
             watcher.watch_file(&path).expect("watch_file should succeed");
 
-            // Not `IN_CREATE` -- the file already exists, so only content changes should wake
-            // this watch. `OpenOptions::append` avoids `O_TRUNC`, which fires no `IN_MODIFY` of
-            // its own to conflate with the appended write below.
+            // Append rather than `std::fs::write`, whose `O_TRUNC` raises an `IN_MODIFY` of its
+            // own.
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .append(true)
@@ -1384,10 +1206,7 @@ mod inotify {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// Re-arming a live directory is cheap *and* stable: the kernel looks a mark up by inode,
-        /// so the second `inotify_add_watch` returns the same descriptor and replaces an
-        /// identical mask, with no second watch and no bookkeeping churn. This is what makes
-        /// `Tailer::reconcile_watches` calling `watch_dir` on every scan affordable.
+        /// Re-arming a live directory returns the same `wd` and adds no second entry.
         #[tokio::test]
         async fn rearming_a_live_directory_returns_the_same_watch_descriptor() {
             let dir = crate::tail::test_support::scratch_dir("inotify-rearm-live");
@@ -1402,9 +1221,7 @@ mod inotify {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// The recreate case, at the watcher's own level: a directory replaced by a new inode at
-        /// the same path gets a *new* descriptor, and the stale one is dropped from both indexes
-        /// rather than left to make the next re-arm a no-op.
+        /// A directory recreated at the same path gets a new `wd`, and the stale one is dropped.
         #[tokio::test]
         async fn rearming_a_replaced_directory_swaps_the_watch_descriptor() {
             let dir = crate::tail::test_support::scratch_dir("inotify-rearm-replaced");
@@ -1429,11 +1246,8 @@ mod inotify {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// A failed `inotify_add_watch` is surfaced, not swallowed -- the errno is what
-        /// `Tailer`'s `watch_error` diagnostic carries. Two deterministic triggers: a path that
-        /// doesn't exist (`ENOENT`, the "log directory isn't there yet" case), and a path that is
-        /// a regular file (`ENOTDIR`, courtesy of `IN_ONLYDIR` -- without that bit this would
-        /// succeed and register a permanently silent watch).
+        /// `watch_dir` surfaces `ENOENT` for a missing path and `ENOTDIR` (from `IN_ONLYDIR`)
+        /// for a regular file, recording nothing.
         #[tokio::test]
         async fn watch_dir_surfaces_enoent_and_enotdir() {
             let dir = crate::tail::test_support::scratch_dir("inotify-dir-errors");
@@ -1454,9 +1268,7 @@ mod inotify {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// `unwatch_dir` has no production caller today (`Tailer::patterns` never changes, so
-        /// `reconcile_watches`' removal loop always iterates an empty difference) -- this is what
-        /// keeps it honest anyway: both indexes go, and the path can be armed again afterwards.
+        /// `unwatch_dir` (no production caller) clears both indexes and allows a re-arm.
         #[tokio::test]
         async fn unwatch_dir_releases_both_indexes_and_allows_a_rearm() {
             let dir = crate::tail::test_support::scratch_dir("inotify-unwatch-dir");
@@ -1484,17 +1296,8 @@ mod inotify {
             assert!(err.to_string().contains("permission"), "got: {err}");
         }
 
-        /// The one liveness property that isn't about inotify semantics at all: a fd that reads
-        /// as broken must retire the wake source, once, rather than loop on it. tokio clears a
-        /// fd's cached readiness only on `WouldBlock` (`AsyncFdReadyGuard::try_io`), and
-        /// `AsyncFd::readable()`'s path has no cooperative-budget check, so a "swallow it and try
-        /// again" arm here would spin *without yielding* -- taking the driver's poll, flush and
-        /// checkpoint ticks down with it, which is the one way an inotify defect in this module
-        /// could cost data rather than latency.
-        ///
-        /// Driven through `with_init` over the read end of a pipe whose write end is already
-        /// closed: `read(2)` on it returns `0` deterministically, which is the same dead-end this
-        /// arm handles for a real inotify fd (a `0` return, or any error other than would-block).
+        /// A broken fd yields one `Wake::Dead`, then parks (see `InotifyWatcher::dead`). Uses a
+        /// pipe whose write end is closed, so `read(2)` returns `0` deterministically.
         #[tokio::test]
         async fn a_watcher_whose_fd_reads_as_broken_dies_once_and_then_parks() {
             let mut fds = [0 as libc::c_int; 2];
@@ -1506,7 +1309,7 @@ mod inotify {
             // this process, and not yet handed to anything else.
             let (read_end, write_end) =
                 unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-            drop(write_end); // every subsequent read on `read_end` is an immediate EOF
+            drop(write_end); // every read on `read_end` is now an immediate EOF
 
             let mut watcher =
                 InotifyWatcher::with_init(move || Ok(read_end)).expect("with_init should succeed");
@@ -1517,8 +1320,7 @@ mod inotify {
             let Wake::Dead(reason) = wake else { panic!("expected Wake::Dead, got {wake:?}") };
             assert!(reason.contains("end-of-file"), "got: {reason}");
 
-            // Reported once. From here the arm simply never resolves again -- the driver's own
-            // poll tick is the listener's wake source, exactly as under `watch: poll`.
+            // Reported once; from here it never resolves again.
             let again =
                 tokio::time::timeout(std::time::Duration::from_millis(250), watcher.next_wake())
                     .await;

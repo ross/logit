@@ -1,59 +1,51 @@
-//! `http_access`: normalizes a web server's access line -- logged under raw OTel semconv attribute
-//! names, the standard name with the untouched value -- into its conformant form, plus a small
-//! set of derived attributes it fills in wherever the producer left them out. See `docs/adr/http-access-normalization.md` for why the
-//! work lives here rather than in a hundred lines of per-server `map` blocks, and
-//! `docs/plans/http-access-normalization.md` for the step list this module implements.
+//! `http_access`: normalizes a web server's access line, logged under raw OTel semconv attribute
+//! names with the untouched value, into its conformant form, and fills in a small set of derived
+//! attributes the producer left out. See `docs/adr/http-access-normalization.md` for the design
+//! and `docs/plans/http-access-normalization.md` for the step list `process` runs.
 //!
-//! Placed by the operator between `json` (or whatever parsed the line) and `trace_context`:
-//! this component only *emits* `span.name`/`span.status`/`span.duration_s`; `trace_context`
-//! lifts them, and nothing here ever mints a trace id.
+//! Placed between `json` (or whatever parsed the line) and `trace_context`: this component only
+//! emits `span.name`/`span.status`/`span.duration_s` for `trace_context` to lift, and never mints
+//! a trace id. It adds no metrics to an event; a stock `kv_metrics` + `keep` does that.
 //!
-//! Best-effort per field, never all-or-nothing and never a dropped event -- the deliberate
-//! opposite of `trace_context`'s contract, because that component writes *identity* (a half-lifted
-//! trace id is a corrupt trace) while this one writes *descriptions*, where a half-normalized line
-//! is strictly more useful than an untouched one. A value that doesn't parse is left exactly as
-//! it arrived and counted `invalid{field}`; a status, duration, or request line that doesn't
-//! parse also gets one throttled diagnostic, since those are genuine producer malformation. An
-//! absent field produces nothing: no default `url.scheme`, no `user_agent.class` for a producer
-//! that doesn't log the header, no fabricated route -- ADR
-//! `operator-declared-resource-attributes`' rule applied one component over.
+//! Best-effort per field, never all-or-nothing, and it never drops an event. That is the opposite
+//! of `trace_context`'s contract: that component writes identity (a half-lifted trace id is a
+//! corrupt trace), this one writes descriptions, where a half-normalized line beats an untouched
+//! one. A value that doesn't parse is left as it arrived and counted `invalid{field}`; a bad
+//! status, duration, or request line also gets one throttled diagnostic, since those are producer
+//! malformation. An absent field produces nothing: no default `url.scheme`, no `user_agent.class`
+//! for a producer that doesn't log the header, no fabricated route (ADR
+//! `operator-declared-resource-attributes`' rule).
 //!
-//! **It fills what is missing; a derived attribute the producer already sent is honoured.**
-//! Every derived attribute -- `http.route`, `span.name`, `span.status`, `error.type`,
-//! `user_agent.class`, `user_agent.synthetic.type`, and the `span.duration_s` mirror -- is
-//! written only when absent (by [`present`]'s rule), so whatever an operator chose to compute
-//! server-side (a real router's `http.route`, an application's own `span.status`) wins, and
-//! `http_access` is a safe drop-in on top of it. There is no `overwrite:` option. The one
-//! deliberate exception is `forwarded: {trust: true}`, an explicit opt-in to *replace*
-//! `client.address` with the first `X-Forwarded-For` hop (a server always logs a peer address,
-//! so fill-only would make the option a no-op). Normalizing a value the producer did send --
-//! coercion, unit conversion, method/version normalization, capping, cleaning, redaction -- is
-//! hardening, not overriding, and still applies.
+//! **Derived attributes are fill-only.** `http.route`, `span.name`, `span.status`, `error.type`,
+//! `user_agent.class`, `user_agent.synthetic.type`, and the `span.duration_s` mirror are written
+//! only when absent (by [`present`]'s rule), so a value computed server-side (a real router's
+//! `http.route`, an application's `span.status`) wins. There is no `overwrite:` option. The one
+//! exception is `forwarded: {trust: true}`, an opt-in to *replace* `client.address` with the first
+//! `X-Forwarded-For` hop (a server always logs a peer address, so fill-only would make the option
+//! a no-op). Normalizing a value the producer did send (coercion, unit conversion, method/version
+//! normalization, capping, cleaning, redaction) still applies.
 //!
-//! Fill-only also settles a second pass: the user agent is classified on its uncapped,
-//! uncleaned value, which only the first pass ever sees, and the class that pass wrote is
-//! present on the second, so the first verdict stands rather than one re-read from the
-//! capped/cleaned value.
+//! Fill-only also makes a second pass stable: the user agent is classified on its uncapped,
+//! uncleaned value, which only the first pass sees, and the class it wrote is present on the
+//! second.
 //!
-//! **The values this component itself writes are bounded**: every `http.route`,
-//! `user_agent.class`, `span.name`, `span.status`, and `error.type` it writes comes from config, a
-//! built-in table, or a closed numeric range -- never from a capture of the input -- save a
-//! `span.name` built around a producer-sent `http.route`, which is exactly as bounded as that
-//! route. A producer's derived values are the producer's; `keep_values` bounds them if needed.
-//! That is the review question for any change here, the same one `shape`'s ADR asks: does any
-//! value this component writes derive from the input?
+//! **Every value this component writes derives from config or a built-in table, never a capture
+//! of the input**: every `http.route`, `user_agent.class`, `span.name`, `span.status`, and
+//! `error.type` comes from config, a built-in table, or a closed numeric range. The one exception
+//! is a `span.name` built around a producer-sent `http.route`, which is as bounded as that route.
+//! A producer's own derived values are the producer's; `keep_values` bounds them if needed. Any
+//! change here must keep that property.
 //!
-//! Allocation posture (`docs/design/memory.md`, pinned from a measurement in W4, not here): every
-//! constant output is `Bytes::from_static`, every substring a `Bytes::slice` of the value it came
-//! from, and every config-derived output a `Value` built once in [`HttpAccess::new`] and cloned by
-//! refcount. What allocates is what has to: a control-byte clean, a redaction, the first use of
-//! each lazily-built `span.name`/`error.type` cell, and -- the one producer-route cost -- the
-//! `span.name` of an event whose producer sent its own `http.route` but no `span.name`,
-//! formatted as `{method} {route}` per event, since an arbitrary producer route has no pre-built
-//! cell.
+//! Allocation posture (pinned in `docs/design/memory.md`): every constant output is
+//! `Bytes::from_static`, every substring a `Bytes::slice` of its source, and every config-derived
+//! output a `Value` built once in [`HttpAccess::new`] and cloned by refcount. The user-agent and
+//! route tables are scanned with `is_match`, which allocates nothing. What allocates: a
+//! control-byte clean or a redaction (one exact-size copy, via the reused `scratch` buffer), the
+//! first use of each lazily-built `span.name`/`error.type` cell, and the `span.name` of an event
+//! whose producer sent its own `http.route` but no `span.name`, formatted per event since an
+//! arbitrary route has no pre-built cell.
 //!
-//! Stateless apart from those caches -- only `process` is overridden; `flush_interval`/`flush`
-//! keep the `Transform` trait's defaults, and there is no `map_resource`: the batch `Resource` is
+//! Stateless apart from those caches: only `process` is overridden, and the batch `Resource` is
 //! never touched.
 
 use ::regex::Regex;
@@ -65,9 +57,9 @@ use std::sync::Arc;
 
 // -- Names ------------------------------------------------------------------------------------
 //
-// Every attribute name this component reads or writes. Each is interned exactly once, in
+// Every attribute name this component reads or writes. Each is interned once, in
 // `HttpAccess::new`, paired with its `&'static str` spelling so a telemetry tag never has to
-// `resolve` a `Symbol` (a shard-locked interner probe) on the per-event path.
+// `resolve` a `Symbol` (a shard-locked interner probe) per event.
 
 /// `logit`'s own composite: `GET /p?q HTTP/1.1`, nginx's `$request`.
 const REQUEST_LINE: &str = "http.request.line";
@@ -107,11 +99,10 @@ const INTEGER_FIELDS: [&str; 9] = [
     "network.connection.requests",
 ];
 
-/// Each duration quantity in its four spellings, each with its divisor to seconds: `_s` first --
-/// the one this component writes (`F64` seconds), and the one that wins when more than one is
-/// present -- then `_ms`, `_us`, and the unsuffixed form, which is integer nanoseconds exactly as
-/// `docs/design/data-model.md`'s unsuffixed `span.duration` is (Traefik's `Duration`/
-/// `OriginDuration` are raw int64 nanoseconds). The unit is only ever in the name.
+/// Each duration quantity in its four spellings with its divisor to seconds: `_s` first (the one
+/// written, as `F64` seconds, and the winner when several are present), then `_ms`, `_us`, and the
+/// unsuffixed form, which is integer nanoseconds like `docs/design/data-model.md`'s unsuffixed
+/// `span.duration` (Traefik's `Duration`/`OriginDuration`). The unit is only ever in the name.
 const DURATIONS: [[(&str, f64); 4]; 4] = [
     [
         ("http.request.duration_s", 1.0),
@@ -146,7 +137,7 @@ const NANOS_FORM: usize = 3;
 /// `span.duration_s` is mirrored from the request duration unless the line already states a
 /// duration, or states both a start and an end -- the two shapes `trace_context` can resolve on
 /// its own. A lone end (nginx's `$msec`) and a lone start (HAProxy's `request_date(us)`) are
-/// exactly what the mirror exists for: `trace_context` would otherwise borrow the event's receipt
+/// what the mirror exists for: `trace_context` would otherwise borrow the event's receipt
 /// time for the missing bound, ending a HAProxy span a syslog hop late.
 const SPAN_TIMING: [&str; 14] = [
     "span.duration",
@@ -180,11 +171,9 @@ const PASSTHROUGH: [&str; 8] = [
     "http.request.header.referer",
 ];
 
-/// `docs/design/data-model.md`'s trace/timing names that `trace_context` reads and this
-/// component never touches -- aliased anyway, because `http_access` runs *before*
-/// `trace_context`, which then stays dotted-only (the ADR's dashed-alias decision).
-/// (`span.name`/`span.status`/`span.duration_s` and every `span.{start,end,duration}*` form are
-/// listed above, since this component reads or writes them.)
+/// Trace names `trace_context` reads and this component never touches, aliased anyway because
+/// `http_access` runs first and `trace_context` stays dotted-only (the ADR's dashed-alias
+/// decision). The `span.*` names this component reads or writes are in `SPAN_TIMING` and above.
 const TRACE_NAMES: [&str; 5] =
     ["trace.id", "trace.flags", "span.id", "span.parent_id", "span.kind"];
 
@@ -197,32 +186,28 @@ const OTHER_METHOD: &str = "_OTHER";
 /// `_OTHER {route}`, when the method is unknown.
 const SPAN_METHOD_OTHER: &str = "HTTP";
 
-/// `(class, pattern)`, in priority order -- a UA claiming both `Mozilla/` and `bot` is a crawler,
+/// `(class, pattern)`, in priority order: a UA claiming both `Mozilla/` and `bot` is a crawler,
 /// which is why `browser` comes last and why this is an ordered scan, not a `RegexSet` (the ADR's
-/// Alternatives). Corpus-verified against 62 real, sourced UA strings (W3,
-/// `docs/plans/http-access-normalization.md`); the corpus and the hand-traced regex analysis
-/// behind every change below live in that workstream's research notes. `\bbot\b` rather than
-/// `bot\b` because the latter matches phone models like `CUBOT`. Bare `bot/` stays alongside it,
-/// deliberately *not* `\bbot/`: a `/` is always a word boundary, so `\bbot/` matches nothing
-/// `\bbot\b` doesn't, and the bare form is what catches a `...Bot/<version>` token with no
-/// boundary before it (`DotBot/1.2`, `Discordbot/2.0`, `YandexMobileBot/3.0`). `CUBOT` still
-/// falls through, having no `/` after it. The one false positive bare `bot/` has, UptimeRobot's
-/// `UptimeRobot/2.0` (`Ro-bot/2.0`), is a synthetic monitor, so `uptimerobot` lives in `tool`,
-/// which is checked first. `yandex`, not `yandexbot`: Yandex runs a family of robots
-/// (`YandexImages`, `YandexMetrika`, `YandexFavicons`, `YandexVideo`, ...) on the page the
-/// corpus cites, and only some of them carry a `bot` token. `^java/` is anchored: Java's `HttpURLConnection` sends exactly `Java/<version>` as
-/// the whole UA string, so an anchored match is strictly safer than a bare `java/`, which could
-/// also fire on a JVM version fragment embedded in an unrelated UA. `blackbox-exporter` is
-/// hyphenated -- the Blackbox Exporter's real wire format since v0.28.0; the underscored spelling
-/// this table used to carry never matched any real version of the exporter. `chrome-lighthouse`
-/// lives in `tool`, not `crawler`: Chrome Lighthouse is a synthetic page-audit tool, the same
-/// bucket as k6/wrk/JMeter, not a content-indexing crawler. `fuzz faster u fool` is ffuf's actual
-/// default `User-Agent` (`Fuzz Faster U Fool v<version>`) -- that string contains no "ffuf"
-/// substring anywhere, so the bare `ffuf` token alone is invisible to ffuf's own default traffic.
-/// **Known limitation, not a regex bug**: nikto (2.6.1+), nuclei, and Nessus all spoof a real
-/// browser `User-Agent` by default (nikto and nuclei pick one at random; Nessus mirrors the scan
-/// host's own browser), so their un-configured traffic classifies `browser`, not `scanner`, no
-/// matter how this table is tuned -- see the corpus notes for the confirmed vendor sources.
+/// Alternatives). Verified against the 62 sourced UA strings in this module's corpus test
+/// (`docs/plans/http-access-normalization.md`). Pattern choices a maintainer would otherwise undo:
+///
+/// - `\bbot\b`, not `bot\b`, which matches phone models like `CUBOT`.
+/// - Bare `bot/` alongside it, not `\bbot/` (a `/` is always a boundary, so `\bbot/` adds
+///   nothing): it catches a `...Bot/<version>` token with no boundary before it (`DotBot/1.2`,
+///   `Discordbot/2.0`). `CUBOT` still falls through, having no `/` after it. Its one false
+///   positive, `UptimeRobot/2.0`, is a synthetic monitor, so `uptimerobot` sits in `tool`, which
+///   is checked first.
+/// - `yandex`, not `yandexbot`: only some of Yandex's robots (`YandexImages`, `YandexMetrika`,
+///   ...) carry a `bot` token.
+/// - `^java/` is anchored: `HttpURLConnection` sends `Java/<version>` as the whole UA, and a bare
+///   `java/` could fire on a JVM version fragment inside an unrelated UA.
+/// - `blackbox-exporter` is hyphenated, the exporter's wire spelling since v0.28.0.
+/// - `chrome-lighthouse` is a synthetic page-audit tool, so `tool`, not `crawler`.
+/// - `fuzz faster u fool` is ffuf's default UA, which contains no `ffuf` substring.
+///
+/// Known limitation, not a regex bug: nikto (2.6.1+), nuclei, and Nessus spoof a real browser UA
+/// by default, so their unconfigured traffic classifies `browser`, not `scanner`, however this
+/// table is tuned.
 const BUILTIN_UA_RULES: [(&str, &str); 4] = [
     (
         "scanner",
@@ -245,22 +230,14 @@ const UA_OTHER: &str = "other";
 /// header, which writes no class at all.
 const UA_NONE: &str = "none";
 
-/// `(set, pattern, route value)`. The three route values are fixed by the plan; the member lists
-/// are corpus-verified against 18 real paths (W3, `docs/plans/http-access-normalization.md`).
-/// `probes` and `well_known` are matched case-sensitively, unlike `assets`: a file extension's
-/// casing is conventionally meaningless (`LOGO.PNG` is unambiguously a PNG), but a probe/
-/// well-known path is a protocol- or convention-mandated literal (`robots.txt` is always
-/// lowercase by spec, `/healthz` always lowercase by k8s convention) -- treating `/ROBOTS.TXT` as
-/// the same resource risks silently absorbing a genuinely different (and typically 404) route.
-/// `probes` adds `-/(healthy|ready)` for Prometheus's and Alertmanager's own Management API
-/// (`/-/healthy`, `/-/ready` -- neither fits the table's existing "single segment" shape, hence
-/// the separate leading alternative). `well_known` adds `manifest.webmanifest` alongside
-/// `manifest.json` -- the same PWA-metadata family, just the newer W3C-recommended extension.
-/// `assets` gains `.heic`/`.heif` (Apple's default photo format since iOS 11), `.docx`/`.xlsx`/
-/// `.pptx` (binary Office documents, the same "static/binary download" rationale as the existing
-/// `.pdf`/`.zip`), and `.apk`/`.ipa` (direct-download mobile app packages); it still carries no
-/// `json`/`xml`/`txt`/`csv` -- those are routinely API responses, and routing an API endpoint to
-/// `/{asset}` would hide it.
+/// `(set, pattern, route value)`. The route values are fixed by the plan; the member lists are
+/// verified against the real paths in this module's corpus test. `probes` and `well_known` match
+/// case-sensitively, unlike `assets`: an extension's casing is meaningless (`LOGO.PNG` is a PNG),
+/// but a probe or well-known path is a mandated lowercase literal (`robots.txt` by spec,
+/// `/healthz` by k8s convention), so `/ROBOTS.TXT` is a different, typically 404, route.
+/// `-/(healthy|ready)` is Prometheus's and Alertmanager's Management API, the one two-segment
+/// probe. `assets` carries no `json`/`xml`/`txt`/`csv`: those are routinely API responses, and
+/// routing an API endpoint to `/{asset}` would hide it.
 const BUILTIN_ROUTE_SETS: [(RouteSet, &str, &str); 3] = [
     (
         RouteSet::Probes,
@@ -303,9 +280,7 @@ const ROUTED: &str = "logit.transform.http_access.routed";
 
 // -- Config -----------------------------------------------------------------------------------
 
-/// Mirrors `logit_config::HttpRouteSet` -- `logit-transforms` deliberately doesn't depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the
-/// pattern `Normalize`/`MatchMode` already follow.
+/// Mirrors `logit_config::HttpRouteSet`; `logit-cli` converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSet {
     Assets,
@@ -313,8 +288,8 @@ pub enum RouteSet {
     Probes,
 }
 
-/// One `routes:` entry, already shape-checked by graph rule 60 -- so an enum here, where the
-/// config side is one flat struct only so that rule can name the offending key.
+/// One `routes:` entry, already shape-checked by graph rule 60. The config side is one flat
+/// struct only so that rule can name the offending key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteRule {
     Builtin(RouteSet),
@@ -328,10 +303,10 @@ pub struct UaRule {
     pub class: String,
 }
 
-/// Everything [`HttpAccess::new`] takes. `max_length` is the **fully resolved** cap list --
+/// Everything [`HttpAccess::new`] takes. `max_length` is the fully resolved cap list:
 /// `logit_config::CAPPED_FIELDS`' defaults with the config's `max_length:` overrides applied, as
-/// `logit-cli` builds it -- so this crate never needs to know the defaults, and a field absent
-/// from it is simply never capped.
+/// `logit-cli` builds it. This crate never sees the defaults, and a field absent from the list is
+/// never capped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpAccessConfig {
     pub routes: Vec<RouteRule>,
@@ -421,8 +396,8 @@ impl Keys {
     }
 }
 
-/// Every canonical name this component knows, in no particular order, duplicates allowed --
-/// the source of the dashed-alias table.
+/// Every canonical name this component knows, unordered, duplicates allowed: the source of the
+/// dashed-alias table.
 fn canonical_names() -> impl Iterator<Item = &'static str> {
     [
         REQUEST_LINE,
@@ -455,11 +430,11 @@ fn canonical_names() -> impl Iterator<Item = &'static str> {
 }
 
 /// Builds the fixed `(dashed, dotted)` alias table: every canonical name with at least one `.`,
-/// spelled with each `.` as `-`. A **fixed table** of pre-interned pairs, never a blanket
-/// `-`-to-`.` rewrite, which would corrupt a legitimately dashed key -- and `-`, not `_`, because
-/// canonical names already contain `_`, so only the dashed spelling is decodable from the dotted
-/// table by rule alone (the ADR's dashed-alias decision). `extra` adds the configured cap fields,
-/// which rule 60 already restricts to names this table carries anyway.
+/// spelled with each `.` as `-` (HAProxy's `%{+json}o` item names can't contain a dot). A fixed
+/// table of pre-interned pairs, never a blanket `-`-to-`.` rewrite, which would corrupt a
+/// legitimately dashed key; and `-`, not `_`, because canonical names already contain `_` (the
+/// ADR's dashed-alias decision). `extra` adds the configured cap fields, which rule 60 already
+/// restricts to names this table carries.
 fn alias_table(extra: impl Iterator<Item = &'static str>) -> Vec<(Symbol, Key)> {
     let mut seen: Vec<&'static str> = Vec::new();
     canonical_names()
@@ -476,10 +451,10 @@ fn alias_table(extra: impl Iterator<Item = &'static str>) -> Vec<(Symbol, Key)> 
 
 /// Clones `value` once and drops the clone, so the one kept is already in `bytes`' shared,
 /// refcounted representation. A `Bytes` built from an owned `String` starts out "promotable" and
-/// only allocates its shared header on the *first* clone (`bytes-1.x`'s `shallow_clone_vec`,
-/// which swaps the original's own data pointer in place -- `crates/logit-bench/src/fixtures.rs`'s
-/// `cached_message` has the long form). Paying that here, at construction or on a lazy cell's
-/// first fill, is what makes every later per-event clone a refcount bump.
+/// allocates its shared header on the *first* clone (`bytes-1.x`'s `shallow_clone_vec`, which
+/// swaps the original's data pointer in place; `crates/logit-bench/src/fixtures.rs`'s
+/// `cached_message` has the long form). Paying that at construction or on a lazy cell's first
+/// fill makes every later per-event clone a refcount bump.
 fn shared(value: Value) -> Value {
     drop(value.clone());
     value
@@ -489,14 +464,13 @@ fn static_str(s: &'static str) -> Value {
     Value::Str(Bytes::from_static(s.as_bytes()))
 }
 
-/// Whether a matched class also marks the request synthetic -- semconv's
-/// `user_agent.synthetic.type: bot`, for the two classes that are bots by definition.
+/// Whether a class also marks the request `user_agent.synthetic.type: bot` (semconv).
 fn is_bot_class(class: &str) -> bool {
     class == "crawler" || class == "scanner"
 }
 
 /// The ordered user-agent table: config rules first, then the built-ins. Scanned with `is_match`,
-/// which allocates nothing -- `RegexSet::matches` allocates a `Vec<bool>` per call and cannot
+/// which allocates nothing; `RegexSet::matches` allocates a `Vec<bool>` per call and cannot
 /// express priority (the ADR's Alternatives).
 struct Classifier {
     rules: Vec<UaEntry>,
@@ -545,9 +519,8 @@ impl Classifier {
     }
 }
 
-/// Where a matched route came from -- the `routed{outcome}` tag's `rule`/`builtin`. The rest of
-/// its vocabulary is spelled in [`classify_route`]: `other` (`route_other`), `none` (no route),
-/// and `kept` (a producer-sent `http.route`, honoured).
+/// Where a matched route came from: the `routed{outcome}` tag's `rule`/`builtin`. The tag's
+/// other values, `other`/`none`/`kept`, are spelled in [`classify_route`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Rule,
@@ -602,8 +575,7 @@ impl Router {
 
 /// `span.name` values, one cell per `(method row, route column)`, built on first use. Rows are
 /// `KNOWN_METHODS` then `HTTP`; columns are each route rule, then `route_other`, then "no route"
-/// (the method alone). Bounded by construction: `11 * (rules + 2)` cells, every one a product of
-/// config and a closed table.
+/// (the method alone). Bounded: `11 * (rules + 2)` cells, each from config and a closed table.
 struct SpanNames {
     width: usize,
     cells: Vec<Option<Value>>,
@@ -665,7 +637,7 @@ pub struct HttpAccess {
     redact: Vec<String>,
     trust_forwarded: bool,
     /// Reused across events for a control-byte clean or a redaction rewrite, so neither pays for
-    /// a growing buffer -- only for the one exact-size copy that becomes the new `Bytes`.
+    /// a growing buffer, only for the one exact-size copy that becomes the new `Bytes`.
     scratch: Vec<u8>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -673,8 +645,8 @@ pub struct HttpAccess {
 
 impl HttpAccess {
     /// Compiles every pattern and pre-builds every output value. The `Err` is unreachable after
-    /// graph rule 60, which compiled the same config patterns at validate time; the built-in
-    /// patterns are constants covered by this module's tests.
+    /// graph rule 60, which compiles the same config patterns at validate time; the built-in
+    /// patterns are covered by this module's tests.
     pub fn new(config: HttpAccessConfig) -> Result<Self, ::regex::Error> {
         let caps: Vec<(Key, usize)> =
             config.max_length.iter().map(|(field, cap)| (Key::owned(field), *cap)).collect();
@@ -710,7 +682,7 @@ impl HttpAccess {
         self
     }
 
-    /// Attaches the throttled-diagnostic sink for the three genuine producer malformations:
+    /// Attaches the throttled-diagnostic sink for the three producer malformations:
     /// `bad_request_line`, `bad_status`, `bad_duration`. An absent field, an unknown method, an
     /// unclassifiable UA, or an unrouted path is normal traffic and gets counters only.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -728,7 +700,7 @@ fn is_blank(bytes: &[u8]) -> bool {
 }
 
 /// An attribute counts as present only if it carries a value: `Null`, `""`, and `"-"` are how
-/// nginx and haproxy spell "nothing here" -- `trace_context`'s `present` rule exactly, so the two
+/// nginx and haproxy spell "nothing here". Must match `trace_context`'s `present` rule, so the two
 /// components agree on what a blank field is.
 fn present(attrs: &AttrMap, key: Symbol) -> Option<&Value> {
     match attrs.get_sym(key)? {
@@ -738,8 +710,8 @@ fn present(attrs: &AttrMap, key: Symbol) -> Option<&Value> {
     }
 }
 
-/// Writes `value` under `key` only if `key` is absent (by [`present`]'s rule) -- a composite
-/// never overrides an atomic field the producer logged directly.
+/// Writes `value` under `key` only if `key` is absent (by [`present`]'s rule), so a composite
+/// never overrides an atomic field the producer logged.
 fn write_absent(attrs: &mut AttrMap, key: Symbol, value: Bytes) {
     if present(attrs, key).is_none() {
         attrs.insert_sym(key, Value::Str(value));
@@ -749,8 +721,7 @@ fn write_absent(attrs: &mut AttrMap, key: Symbol, value: Bytes) {
 // -- Step 0: de-alias -------------------------------------------------------------------------
 
 /// Renames every dashed spelling present to its dotted one. The dotted spelling wins when both
-/// are present, and the dashed key is removed either way, so nothing downstream ever sees two
-/// spellings of one field.
+/// are present, and the dashed key is removed either way.
 fn dealias(attrs: &mut AttrMap, aliases: &[(Symbol, Key)], telemetry: &Telemetry) {
     for (dashed, dotted) in aliases {
         let Some(value) = attrs.remove_sym(*dashed) else { continue };
@@ -791,10 +762,9 @@ fn write_target(attrs: &mut AttrMap, keys: &Keys, target: &Bytes) {
     }
 }
 
-/// Step 1: `http.request.line` and `url.original` into their atomic fields, each writing only the
-/// fields that are absent, then removed -- the atomic parts are strictly more useful, and keeping
-/// both would give every consumer two sources for one fact. A request line that isn't three
-/// tokens is left in place, counted, and diagnosed: it's a producer bug, not traffic.
+/// Step 1: `http.request.line` and `url.original` into whichever atomic fields are absent, then
+/// removed, so no consumer sees two sources for one fact. A request line that isn't three tokens
+/// is left in place, counted, and diagnosed: it's a producer bug, not traffic.
 fn decompose(attrs: &mut AttrMap, keys: &Keys, telemetry: &Telemetry, diag: &mut Diagnostics) {
     if let Some(line) = present(attrs, keys.request_line.sym) {
         let parts = match line {
@@ -835,16 +805,14 @@ fn decompose(attrs: &mut AttrMap, keys: &Keys, telemetry: &Telemetry, diag: &mut
 
 /// What a coercion decided about one present value.
 enum Coerced {
-    /// Already in the target representation -- nothing to write, nothing to count.
+    /// Already in the target representation: nothing to write or count.
     Keep,
     Write(Value),
     Invalid,
 }
 
-/// To `I64`, from `I64`/`U64`/an integral `F64`/a quoted decimal string (`"000"` is `0`, which is
-/// what keeps nginx's client-abort status from breaking anything downstream). A `U64` past
-/// `i64::MAX` is a real number, just not one this can write as `I64`, so it's left alone rather
-/// than called invalid.
+/// To `I64`, from `I64`/`U64`/an integral `F64`/a quoted decimal string (nginx's client-abort
+/// status `"000"` becomes `0`). A `U64` past `i64::MAX` is left alone, not called invalid.
 fn to_i64(value: &Value) -> Coerced {
     match value {
         Value::I64(_) => Coerced::Keep,
@@ -860,7 +828,7 @@ fn to_i64(value: &Value) -> Coerced {
     }
 }
 
-/// To `F64`, from any finite numeric or numeric string -- the compression ratio.
+/// To `F64`, from any finite numeric or numeric string (the compression ratio).
 fn to_f64(value: &Value) -> Coerced {
     match value {
         Value::F64(f) if f.is_finite() => Coerced::Keep,
@@ -868,9 +836,9 @@ fn to_f64(value: &Value) -> Coerced {
     }
 }
 
-/// nginx's per-attempt spelling for `$upstream_status`/`$upstream_response_time` and friends --
-/// `502, 200`, or `502 : 200` across an internal redirect. Verbatim is the only faithful thing to
-/// do with it, and it is normal traffic, never counted invalid.
+/// nginx's per-attempt spelling for `$upstream_status`/`$upstream_response_time` and friends:
+/// `502, 200`, or `502 : 200` across an internal redirect. Left verbatim; normal traffic, never
+/// counted invalid.
 fn is_attempt_list(value: &Value) -> bool {
     matches!(value, Value::Str(bytes) if bytes.iter().any(|&b| b == b',' || b == b':'))
 }
@@ -918,8 +886,8 @@ fn coerce_numerics(
 // -- Step 3: durations --------------------------------------------------------------------------
 
 /// An unsuffixed duration is integer nanoseconds: `I64`/`U64` or a quoted integer. A float is
-/// rejected outright rather than rounded -- `trace_context`'s rule for unsuffixed `span.duration`,
-/// since a fractional nanosecond count is a producer bug, not a value to guess at.
+/// rejected, not rounded (`trace_context`'s rule for unsuffixed `span.duration`): a fractional
+/// nanosecond count is a producer bug.
 fn integer_nanos(value: &Value) -> Option<f64> {
     match value {
         Value::I64(n) => Some(*n as f64),
@@ -929,8 +897,8 @@ fn integer_nanos(value: &Value) -> Option<f64> {
     }
 }
 
-/// Step 3: each duration quantity to `<quantity>_s` (`F64` seconds), the source removed --
-/// keeping two spellings of one quantity is the contradiction `trace_context` already refuses.
+/// Step 3: each duration quantity to `<quantity>_s` (`F64` seconds), the source removed, since
+/// two spellings of one quantity is a contradiction `trace_context` refuses.
 /// `_s` wins when present, then `_ms`, `_us`, and the unsuffixed nanoseconds; the losers are
 /// removed once the winner parses. An unparseable winner is left in place with everything else,
 /// counted, and diagnosed.
@@ -955,8 +923,8 @@ fn convert_durations(
         }
         let parsed =
             if winner == NANOS_FORM { integer_nanos(value) } else { crate::numeric(value) };
-        // `None` inside: the winner is `_s` and already an `F64` -- nothing to write, but the
-        // losers still go.
+        // `None`: the winner is `_s` and already an `F64`, so nothing to write, but the losers
+        // still go.
         let seconds = match (value, parsed) {
             (Value::F64(f), _) if winner == 0 && f.is_finite() => None,
             (_, Some(f)) => Some(f / divisor),
@@ -982,9 +950,9 @@ fn convert_durations(
 
 // -- Step 4: method -----------------------------------------------------------------------------
 
-/// Step 4: a method outside semconv's known set becomes `_OTHER`, the raw value preserved as
-/// `http.request.method_original` -- the one pre-normalization value kept, because semconv itself
-/// asks for it. Returns the method's `span.name` row, or `None` with no method at all.
+/// Step 4: a method outside semconv's known set becomes `_OTHER`, the raw value kept as
+/// `http.request.method_original` (the one pre-normalization value kept, because semconv asks for
+/// it). Returns the method's `span.name` row, or `None` with no method.
 fn normalize_method(
     attrs: &mut AttrMap,
     keys: &Keys,
@@ -1011,7 +979,7 @@ fn normalize_method(
 // -- Step 5: protocol version -------------------------------------------------------------------
 
 /// Step 5: `HTTP/1.1` to `1.1` (a zero-copy slice), and semconv's `2`/`3` for `2.0`/`3.0`.
-/// Anything else is left exactly as it arrived.
+/// Anything else is left as it arrived.
 fn normalize_version(attrs: &mut AttrMap, keys: &Keys, telemetry: &Telemetry) {
     let Some(Value::Str(bytes)) = present(attrs, keys.protocol_version.sym) else { return };
     let stripped = bytes.starts_with(b"HTTP/").then(|| bytes.slice(5..));
@@ -1030,10 +998,10 @@ fn normalize_version(attrs: &mut AttrMap, keys: &Keys, telemetry: &Telemetry) {
 // -- Step 6: query ------------------------------------------------------------------------------
 
 /// Rewrites `query` into `scratch` with every sensitive key's value replaced by `REDACTED`,
-/// returning how many values were replaced -- `0` means `scratch` is untouched and nothing needs
-/// writing back. Keys match ASCII-case-insensitively; an empty value, or one already `REDACTED`,
-/// is left alone, which is what makes a second pass a no-op. Only ASCII delimiters are ever cut
-/// at and only ASCII is written, so a `Value::Str` stays valid UTF-8.
+/// returning how many values were replaced (`0`: `scratch` untouched, nothing to write back).
+/// Keys match ASCII-case-insensitively; an empty or already-`REDACTED` value is left alone, which
+/// makes a second pass a no-op. Only ASCII delimiters are cut at and only ASCII is written, so a
+/// `Value::Str` stays valid UTF-8.
 fn redact_query(query: &[u8], sensitive: &[String], scratch: &mut Vec<u8>) -> usize {
     let is_sensitive = |pair: &[u8]| -> Option<usize> {
         let eq = pair.iter().position(|&b| b == b'=')?;
@@ -1064,9 +1032,9 @@ fn redact_query(query: &[u8], sensitive: &[String], scratch: &mut Vec<u8>) -> us
     redacted
 }
 
-/// Step 6: a leading `?` stripped (a zero-copy slice -- nginx's `$is_args$args` logs one), then
-/// semconv's sensitive values redacted. Before step 7's cap on purpose: a secret must not survive
-/// by being cut mid-value, where the key would no longer be followed by a complete value to find.
+/// Step 6: a leading `?` stripped (a zero-copy slice; nginx's `$is_args$args` logs one), then
+/// semconv's sensitive values redacted. Must run before step 7's cap: a secret cut mid-value by
+/// the cap would survive in part.
 fn normalize_query(
     attrs: &mut AttrMap,
     keys: &Keys,
@@ -1094,10 +1062,9 @@ fn normalize_query(
 
 /// Step 7: every capped field to at most its limit in characters (a `Bytes::slice` at a char
 /// boundary, so `Value::Str` stays valid UTF-8), then every control byte (`< 0x20`, `0x7F`) in
-/// what's left becomes `_`. Bytewise and length-preserving, `keep_values::lower`'s reasoning: a
-/// control byte is never part of a multi-byte UTF-8 sequence, so replacing it can't break
-/// validity, and the clean allocates only when a byte actually changed. A `Value::Bytes` (a
-/// non-UTF-8 value) is capped in bytes instead, since it has no characters to count.
+/// what's left becomes `_`. Bytewise and length-preserving, as in `keep_values::lower`: a control
+/// byte is never part of a multi-byte UTF-8 sequence, and the clean allocates only when a byte
+/// changed. A `Value::Bytes` (non-UTF-8) is capped in bytes, having no characters to count.
 fn cap_and_clean(
     attrs: &mut AttrMap,
     caps: &[(Key, usize)],
@@ -1149,19 +1116,15 @@ fn cap_and_clean(
 // -- Step 8: classify ---------------------------------------------------------------------------
 
 /// Step 8, user-agent half: `user_agent.class` from the *uncapped* value, which is why `process`
-/// runs this before step 7 -- the identifying token of a spoofed UA is often at its tail. Absent
-/// writes nothing (an absent header is silence); present but blank is `none`; a `Value::Bytes`
-/// UA (not UTF-8, so no regex can read it) is `other`.
+/// runs this before step 7: a spoofed UA's identifying token is often at its tail. Absent writes
+/// nothing; present but blank is `none`; a `Value::Bytes` UA (no regex can read it) is `other`.
 ///
-/// Fill-only, like every derived attribute: an existing `user_agent.class` (by [`present`]'s
-/// rule) is honoured and never recomputed. A class sent by the producer, or written upstream by a
-/// `set` or Lua stage, wins over the built-in and configured tables, and neither the class nor
-/// `user_agent.synthetic.type` is derived for that event -- `user_agent.synthetic.type` is only
-/// ever written alongside a class this component wrote, and only when absent itself. The same
-/// rule is what keeps a second pass stable: the first pass is the only one that ever sees the
-/// uncapped, uncleaned value -- step 7 then caps and cleans it in place -- so re-classifying would
-/// read the rewritten value and could flip the class (a tail token cut off by the cap, a control
-/// byte cleaned to `_`) while leaving the first pass's `user_agent.synthetic.type` behind.
+/// Fill-only: an existing `user_agent.class` (by [`present`]'s rule), from the producer or an
+/// upstream `set`/Lua stage, wins over both tables, and nothing is derived for that event.
+/// `user_agent.synthetic.type` is written only alongside a class this component wrote, and only
+/// when absent itself. This also keeps a second pass stable: re-classifying the value step 7
+/// capped and cleaned could flip the class (a tail token cut off, a control byte cleaned to `_`)
+/// while leaving the first pass's `user_agent.synthetic.type` behind.
 fn classify_user_agent(
     attrs: &mut AttrMap,
     keys: &Keys,
@@ -1190,19 +1153,18 @@ fn classify_user_agent(
 enum Routed {
     /// No route: no path, or a path that matched nothing with no `route_other`.
     None,
-    /// This component wrote `http.route`; the `span.name` table column -- the rule's index, or
-    /// `rules.len()` for `route_other`.
+    /// This component wrote `http.route`; the `span.name` table column (the rule's index, or
+    /// `rules.len()` for `route_other`).
     Column(usize),
     /// The producer sent its own `http.route`, which was honoured.
     Kept,
 }
 
-/// Step 8, route half: `http.route` from the *capped* `url.path` -- first matching rule, else
-/// `route_other`, else nothing -- written only when the producer didn't send one. A producer's
-/// `http.route` (by [`present`]'s rule) is honoured: no rule is even tried, nothing is written,
-/// and the event counts `routed{outcome="kept"}`. Otherwise counted `routed{outcome}` once per
-/// event with a path. The tag is the outcome, never the route value, which is operator-declared
-/// (or producer-sent) and unbounded in number.
+/// Step 8, route half: `http.route` from the *capped* `url.path` (first matching rule, else
+/// `route_other`, else nothing), written only when the producer didn't send one. A producer's
+/// `http.route` (by [`present`]'s rule) is honoured: no rule is tried, and the event counts
+/// `routed{outcome="kept"}`. Otherwise `routed{outcome}` counts once per event with a path. The
+/// tag is the outcome, never the route value, which is unbounded in number.
 fn classify_route(
     attrs: &mut AttrMap,
     keys: &Keys,
@@ -1249,13 +1211,12 @@ fn first_hop(xff: &Bytes) -> Bytes {
 impl HttpAccess {
     /// Step 9, each attribute written only when the producer didn't send it (by [`present`]'s
     /// rule): `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
-    /// `unset` -- never `ok`, which semconv reserves for an explicit override; a producer's own
-    /// `ok` is honoured, even on a 5xx), `span.name` (`{method} {route}`, or the method alone),
-    /// and the `span.duration_s` mirror. Then -- only under `forwarded: {trust: true}`, since the
-    /// header is client-supplied, and the one *replacement* this component makes --
-    /// `client.address` from the first XFF hop. Every value comes from a pre-built cell, a
-    /// constant, or a slice, except a `span.name` around a producer-sent `http.route`, which is
-    /// formatted per event.
+    /// `unset`; never `ok`, which semconv reserves for an explicit override, though a producer's
+    /// own `ok` is honoured even on a 5xx), `span.name` (`{method} {route}`, or the method
+    /// alone), and the `span.duration_s` mirror. Then, only under `forwarded: {trust: true}`
+    /// since the header is client-supplied, `client.address` is *replaced* by the first XFF hop.
+    /// Every value is a pre-built cell, a constant, or a slice, except a `span.name` around a
+    /// producer-sent `http.route`, which is formatted per event.
     fn derive(&mut self, attrs: &mut AttrMap, method: Option<usize>, route: Routed) {
         let keys = &self.keys;
         let telemetry = &self.telemetry;
@@ -1276,8 +1237,8 @@ impl HttpAccess {
             let name = match route {
                 Routed::Column(column) => self.span_names.get(&self.router, method, Some(column)),
                 Routed::None => self.span_names.get(&self.router, method, None),
-                // A producer's route is an arbitrary string with no pre-built cell, so it is
-                // formatted here; a non-UTF-8 one can't be spelled into a name: the method alone.
+                // A producer's route has no pre-built cell, so it is formatted here; a non-UTF-8
+                // one can't be spelled into a name, so the method alone.
                 Routed::Kept => match present(attrs, keys.route.sym).and_then(Value::as_str) {
                     Some(route) => {
                         let method =
@@ -1316,11 +1277,10 @@ impl HttpAccess {
 }
 
 impl Transform for HttpAccess {
-    /// Runs the plan's steps in order, each best-effort and independent of whether any other
-    /// succeeded. An event with no log passes through untouched: an access line is always a log
-    /// record, and a metric or span event carrying `server.port`-shaped attributes is not this
-    /// component's to rewrite. Never touches `event.log`/`metrics`/`span`/`timestamp` or the
-    /// batch `Resource`; always returns `true`.
+    /// Runs the plan's steps in order, each best-effort and independent of the others. An event
+    /// with no log passes through untouched: a metric or span event carrying
+    /// `server.port`-shaped attributes is not an access line. Touches only `event.attributes`;
+    /// always returns `true`.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.log.is_none() || event.attributes.is_empty() {
             return true;
@@ -1333,8 +1293,8 @@ impl Transform for HttpAccess {
         let method = normalize_method(attrs, &self.keys, &self.other_method, &self.telemetry);
         normalize_version(attrs, &self.keys, &self.telemetry);
         normalize_query(attrs, &self.keys, &self.redact, &mut self.scratch, &self.telemetry);
-        // Step 8's user-agent half runs here, ahead of step 7, because it classifies the
-        // uncapped value; the route half below classifies the capped path, as the plan says.
+        // Step 8's user-agent half runs ahead of step 7 because it classifies the uncapped
+        // value; the route half below classifies the capped path.
         classify_user_agent(attrs, &self.keys, &self.ua, &self.telemetry);
         cap_and_clean(attrs, &self.caps, &mut self.scratch, &self.telemetry);
         let route = classify_route(attrs, &self.keys, &self.router, &self.telemetry);
@@ -1351,8 +1311,8 @@ mod tests {
         BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, SpanKind, SpanRecord, SpanStatus,
     };
 
-    /// A handful of `logit_config::CAPPED_FIELDS`' defaults -- this crate can't see that list
-    /// (`logit-cli` resolves it), so the tests carry the subset they exercise.
+    /// The subset of `logit_config::CAPPED_FIELDS`' defaults these tests exercise; this crate
+    /// can't see that list.
     fn test_caps() -> Vec<(String, usize)> {
         [
             ("url.path", 256),
@@ -1424,8 +1384,8 @@ mod tests {
         (t, registry, diag)
     }
 
-    /// Sums one counter across a single drain, optionally filtered to one tag. Callers drain
-    /// once -- `Registry::drain` empties the buffer.
+    /// Sums one counter across a single drain, optionally filtered to one tag. Drain once:
+    /// `Registry::drain` empties the buffer.
     fn counter(events: &[Event], name: &str, tag: Option<(&str, &str)>) -> f64 {
         events
             .iter()
@@ -1828,13 +1788,10 @@ mod tests {
         assert_eq!(capped.len(), 256, "and still capped afterwards");
     }
 
-    // -- W3 corpus: 62 real, sourced UA strings, each verified against a vendor doc, the
-    // project's own source code, or well-corroborated captured-traffic write-ups (never
-    // invented) -- `docs/plans/http-access-normalization.md`'s W3 row. Expected classes are
-    // under the *final* `BUILTIN_UA_RULES` above, not the placeholder table W2 shipped; two
-    // entries (`ffuf`'s real default, `blackbox_exporter`'s real spelling) are corrections the
-    // corpus found in that placeholder, and two more (a nikto default, `l9explore`) are
-    // documented, accepted gaps -- the corpus's own conclusion, not a table this PR can fix.
+    // -- UA corpus: 62 real UA strings, each sourced from a vendor doc, the project's own
+    // source, or corroborated captured-traffic write-ups, never invented
+    // (`docs/plans/http-access-normalization.md`). Two entries (a nikto default, `l9explore`)
+    // are accepted gaps that no table can fix.
     const UA_CORPUS: &[(&str, &str)] = &[
         // -- Tools / HTTP clients --
         // curl's default UA is `curl/` + libcurl version --
@@ -1866,7 +1823,7 @@ mod tests {
         ("GoogleHC/1.0", "tool"),
         // `version.PrometheusUserAgent()` -- https://github.com/prometheus/prometheus/blob/main/scrape/scrape.go
         ("Prometheus/3.14.0", "tool"),
-        // CORRECTED: real format is hyphenated since v0.28.0, not `blackbox_exporter` --
+        // Hyphenated since v0.28.0, not `blackbox_exporter` --
         // https://github.com/prometheus/blackbox_exporter/releases (v0.28.0 changelog)
         ("Blackbox-Exporter/0.28.0", "tool"),
         // UptimeRobot's monitor, which contains `bot/` mid-word (`Ro-bot/2.0`) and so would be a
@@ -1881,8 +1838,8 @@ mod tests {
             "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/119.0.6045.214 Safari/537.36",
             "crawler",
         ),
-        // Same source (Googlebot Smartphone variant) -- deliberate edge case: browser-shaped
-        // *and* crawler-tokened, crawler wins because it's checked first
+        // Same source (Googlebot Smartphone): browser-shaped *and* crawler-tokened; crawler wins
+        // because it's checked first
         (
             "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.214 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
             "crawler",
@@ -1996,7 +1953,7 @@ mod tests {
             "Mozilla/5.0 (Linux; Android 7.0; CUBOT MAGIC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Mobile Safari/537.36",
             "browser",
         ),
-        // -- Constructed edge cases (the prompt's own required negatives, not vendor strings) --
+        // -- Constructed edge cases, not vendor strings --
         ("", "none"),
         ("-", "none"),
         ("SomeCustomAgent/1.0", "other"),
@@ -2022,8 +1979,8 @@ mod tests {
         ),
         // gobuster's `helpers.go` template -- https://github.com/OJ/gobuster/blob/master/libgobuster/helpers.go
         ("gobuster/3.8.2", "scanner"),
-        // CORRECTED: ffuf's real default (`pkg/runner/simple.go`) contains no "ffuf" substring
-        // at all -- https://github.com/ffuf/ffuf/blob/master/pkg/runner/simple.go
+        // ffuf's default (`pkg/runner/simple.go`) contains no "ffuf" substring --
+        // https://github.com/ffuf/ffuf/blob/master/pkg/runner/simple.go
         ("Fuzz Faster U Fool v2.1.0", "scanner"),
         // feroxbuster's `config/utils.rs` template --
         // https://github.com/epi052/feroxbuster/blob/main/src/config/utils.rs
@@ -2047,11 +2004,9 @@ mod tests {
         // ACCEPTED GAP: LeakIX's *older* self-identification, no URL and no "leakix" substring
         // at all -- matches nothing in any table, misclassifies as `other`; same source as above
         ("l9explore/1.2.2", "other"),
-        // ACCEPTED GAP: nikto 2.6.1+ no longer self-identifies by default -- it picks a real
-        // browser UA from its own bundled list --
-        // https://github.com/sullo/nikto/blob/main/program/plugins/nikto_core.plugin -- this
-        // exact string is byte-for-byte indistinguishable from real Chrome traffic, so it
-        // classifies `browser`, not `scanner`, no matter how the table is tuned
+        // ACCEPTED GAP: nikto 2.6.1+ picks a real browser UA from its bundled list by default --
+        // https://github.com/sullo/nikto/blob/main/program/plugins/nikto_core.plugin -- so this
+        // string is indistinguishable from Chrome and classifies `browser`
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.6280.45 Safari/537.36",
             "browser",
@@ -2083,13 +2038,12 @@ mod tests {
         }
     }
 
-    // -- W3 corpus: real paths against the final `BUILTIN_ROUTE_SETS`, run with no
-    // `route_other` so an unmatched path shows as `None`.
+    // -- Path corpus: real paths against `BUILTIN_ROUTE_SETS`, with no `route_other` so an
+    // unmatched path shows as `None`.
     const PATH_CORPUS: &[(&str, Option<&str>)] = &[
         ("/healthz", Some("/{probe}")),
         ("/healthz/", Some("/{probe}")),
-        // the corpus's `/health?x=1` -- the query is never part of `url.path`, so the matcher
-        // only ever sees `/health`
+        // the corpus's `/health?x=1`: the query is never part of `url.path`
         ("/health", Some("/{probe}")),
         // Prometheus's/Alertmanager's own Management API
         ("/-/healthy", Some("/{probe}")),
@@ -2104,10 +2058,10 @@ mod tests {
         ("/photo.heic", Some("/{asset}")),
         ("/report.docx", Some("/{asset}")),
         ("/app.apk", Some("/{asset}")),
-        // `.json` is deliberately excluded -- routinely an API response
+        // `.json` is excluded: routinely an API response
         ("/api/v1/orders.json", None),
         ("/download/report.pdf", Some("/{asset}")),
-        // an application route, not a probe -- the probes table is a full-string match only
+        // an application route: the probes table is a full-string match
         ("/status/42", None),
     ];
 
@@ -2241,9 +2195,7 @@ mod tests {
         assert_eq!(get(&event, "error.type"), Some(&s("503")), "the cached cell again");
     }
 
-    /// A lone end (nginx) and a lone start (HAProxy) both get the mirror -- without it
-    /// `trace_context` borrows receipt time for the missing bound. A stated duration, or a
-    /// start *and* an end, is a span `trace_context` can already resolve, so nothing is added.
+    /// A lone start or end gets the mirror; a stated duration, or a start and an end, doesn't.
     #[test]
     fn the_request_duration_is_mirrored_unless_the_line_already_states_a_resolvable_span() {
         for lone in ["span.end_s", "span.start_us", "span.start_rfc3339"] {
@@ -2320,8 +2272,7 @@ mod tests {
 
     #[test]
     fn every_dashed_alias_round_trips_to_its_dotted_output_and_dotted_wins_when_both_present() {
-        // One instance throughout: the component is stateless per event (its lazy cells only
-        // memoize constants), and compiling the built-in tables per case is slow in debug.
+        // One instance throughout: compiling the built-in tables per case is slow in debug.
         let mut t = bare();
         for name in aliased_names() {
             let dashed_key = name.replace('.', "-");
@@ -2416,9 +2367,7 @@ mod tests {
         assert_eq!(twice, once);
     }
 
-    /// The UA is classified before step 7 caps and cleans it, so a second pass sees a rewritten
-    /// value. These two shapes classify differently before and after the rewrite; the existing
-    /// class is trusted, so the second pass changes neither it nor `user_agent.synthetic.type`.
+    /// A second pass keeps the class of a UA that classifies differently once step 7 rewrote it.
     #[test]
     fn a_second_pass_keeps_the_first_user_agent_verdict() {
         let long = format!("Mozilla/5.0 {} sqlmap/1.7", "x".repeat(300));
@@ -2449,8 +2398,7 @@ mod tests {
         }
     }
 
-    /// A class already on the event -- from an upstream `set`/Lua stage or the producer itself --
-    /// is an operator override: kept as-is, with no `user_agent.synthetic.type` derived.
+    /// An existing class is kept as-is, with no `user_agent.synthetic.type` derived.
     #[test]
     fn an_existing_user_agent_class_overrides_the_table() {
         let event = run(
@@ -2464,9 +2412,7 @@ mod tests {
         assert_eq!(get(&event, "user_agent.synthetic.type"), None);
     }
 
-    /// Every derived attribute is fill-only: whatever the producer (or an upstream stage) already
-    /// computed is honoured -- a real router's `http.route` even where a configured rule would
-    /// match, a producer's `ok` even on a 500 -- and `derived{field}` never fires for it.
+    /// Producer-sent derived attributes win, even over a matching rule or a 5xx, uncounted.
     #[test]
     fn producer_sent_derived_fields_are_honoured() {
         let config = HttpAccessConfig {

@@ -12,9 +12,9 @@ path = "src/main.rs"
 
 [features]
 default = ["jemalloc"]
-# See `main.rs`'s `#[global_allocator]` and docs/adr/jemalloc-global-allocator.md. Opt-out
-# rather than opt-in so the shipped binary gets it by default, but a build can still fall back to
-# the system allocator to measure the difference (or on a target jemalloc doesn't support).
+# See `main.rs`'s `#[global_allocator]` and docs/adr/jemalloc-global-allocator.md. On by default
+# so the shipped binary gets it; `--no-default-features` falls back to the system allocator, to
+# measure the difference or for a target jemalloc doesn't support.
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
@@ -24,9 +24,8 @@ logit-pipeline.workspace = true
 logit-inputs.workspace = true
 logit-outputs.workspace = true
 logit-transforms.workspace = true
-# `to_native_compression` (pipeline.rs) crosses `logit_config::Compression` into
-# `logit_proto::frame::Compression` -- already a transitive dependency via `logit-outputs`, named
-# directly here because `build_spec` names its type.
+# `build_spec` names `logit_proto::frame::Compression` (`to_native_compression`). Already a
+# transitive dependency via `logit-outputs`.
 logit-proto.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -38,9 +37,8 @@ tikv-jemallocator = { version = "0.6", optional = true }
 # filter and formatter (docs/plans/operator-surface.md).
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# `admin.rs`'s `/readyz`/`/healthz` server, and `logit ready`'s client -- already direct deps of
-# `logit-inputs`/`logit-outputs` at these exact versions; promoting them here adds no new crate
-# version to the graph (docs/plans/operator-surface.md, workstream C).
+# `admin.rs`'s `/readyz`/`/healthz` server, and `logit ready`'s client. Already direct deps of
+# `logit-inputs`/`logit-outputs` at these versions, so no new crate version enters the graph.
 bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -48,38 +46,26 @@ http.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
-# `admin_ready.rs`'s drain test needs a real SIGTERM (`Child::kill` sends SIGKILL, which has no
-# graceful path and therefore no drain to probe). Already a workspace dependency via
-# `logit-inputs`, so this adds no new crate to the graph.
+# `admin_ready.rs`'s drain test needs a real SIGTERM: `Child::kill` sends SIGKILL, which has no
+# graceful drain to probe. Already a dependency via `logit-inputs`.
 libc.workspace = true
-# `crates/logit-cli/tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output`
-# test doubles directly, the same way `crates/logit-outputs`/`logit-inputs` implement the real
-# ones.
+# `tests/durable_buffer_restart.rs` implements `logit_pipeline::Input`/`Output` test doubles.
 async-trait.workspace = true
-# tests/logit_round_trip.rs's forwarding-chain test decodes a real statsd line with
-# `StatsdDecoder` directly, which takes its input as `bytes::Bytes` -- already a transitive
-# dependency via every crate above, named directly here because the test constructs one itself.
+# `tests/logit_round_trip.rs` constructs the `bytes::Bytes` it hands `StatsdDecoder` directly.
+# Already a transitive dependency.
 bytes.workspace = true
-# tests/statsd_round_trip.rs's `mod tls` now drives the real `statsd_out -> statsd_in` path over
-# TLS on both ends (`docs/adr/statsd-output.md`'s TLS amendment). A raw `tokio_rustls` client
-# survives alongside it for the one assertion a sink cannot make: that a *refused* handshake
-# leaves the listener still serving everyone else. All three are already transitive dependencies
-# at these exact versions via `logit-inputs`/`logit-outputs`, so naming them here adds no new
-# crate version to the graph -- the same call `bytes`/`reqwest` below already make.
+# `tests/statsd_round_trip.rs`'s `mod tls`: a raw `tokio_rustls` client makes the one assertion a
+# sink can't, that a refused handshake leaves the listener serving everyone else. All three are
+# already transitive at these versions via `logit-inputs`/`logit-outputs`.
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
-# tests/prometheus_round_trip.rs's scrape client, and its canned-target server (the same
-# `hyper`/`hyper-util`/`http-body-util` stack `crates/logit-inputs/src/prometheus.rs`'s own tests
-# use, all already ordinary dependencies above). `reqwest` is already a transitive dependency at
-# this exact version via `logit-inputs`/`logit-outputs`, so this adds no new crate version to the
-# graph.
+# `tests/prometheus_round_trip.rs`'s scrape client (its canned target uses the `hyper` stack
+# above). Already transitive at this version via `logit-inputs`/`logit-outputs`.
 reqwest.workspace = true
-# tests/prometheus_remote_write_round_trip.rs hand-builds the two request shapes only a real
-# Prometheus 1.0 sender produces -- a metadata-only `WriteRequest` and a samples-only one, which
-# `logit`'s own sender never writes because it always attaches `metadata[]` to the samples it
-# describes -- straight onto `logit_proto::prometheus::generated`'s prost types, and Snappy-block-
-# compresses them the way both specs require. Both are already transitive dependencies at these
-# exact versions via `logit-proto`, so naming them here adds no new crate version to the graph.
+# `tests/prometheus_remote_write_round_trip.rs` hand-builds the metadata-only and samples-only
+# `WriteRequest`s a real Prometheus 1.0 sender produces (`logit`'s own sender always attaches
+# `metadata[]` to its samples) on `logit_proto::prometheus::generated`'s prost types, then
+# Snappy-block-compresses them. Both already transitive at these versions via `logit-proto`.
 prost.workspace = true
 snap.workspace = true

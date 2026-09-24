@@ -1,84 +1,56 @@
 //! `Event`/`LogRecord` ↔ OTLP `LogRecord`.
 //!
-//! **`Severity` ↔ `SeverityNumber`.** Encode treats `otel.severity_number`/`otel.severity_text`
-//! (see below) as one unit, not two independent overrides: when the event carries **neither**
-//! raw attribute, each band's base value (`Trace`→1, `Debug`→5, `Info`→9, `Warn`→13, `Error`→17,
-//! `Fatal`→21; `log.severity == None` leaves `severity_number` unset at
-//! `SEVERITY_NUMBER_UNSPECIFIED`/`0`) is used, with `severity_text` set to the variant's name.
-//! When the event carries **either** raw attribute, the present side's raw value wins and the
-//! *other*, missing side falls back to OTLP's own unset sentinel
-//! (`SEVERITY_NUMBER_UNSPECIFIED`/empty string) -- never to the band-derived value, which would
-//! invent a value (or a mismatched pairing, e.g. `10`/`"Info"` instead of the wire's `10`/`""`)
-//! the original producer never sent for that field. Decode prefers `severity_number`'s band (any
-//! of the 4 numbers in a band -- e.g. `TRACE2..TRACE4` -- map to that band's `Severity`), falls
-//! back to a case-insensitive `severity_text` match when the number is unspecified or out of
-//! range, else `None`.
+//! **`Severity` ↔ `SeverityNumber`.** Decode takes `severity_number`'s band (any of a band's four
+//! numbers, e.g. `TRACE2..TRACE4`, maps to that band's `Severity`), then a case-insensitive
+//! `severity_text` match when the number is unspecified or out of range, else `None`.
 //!
-//! **Raw severity survives alongside the normalized `Severity`**, the same shape `syslog_in`/
-//! `syslog_out` already use for `syslog.severity` (`docs/adr/syslog-output.md`'s "Header-field
-//! precedence", generalized by `docs/adr/lossless-transit.md` rule (b)): OTLP's 24 raw severity
-//! numbers collapse onto this model's 6-variant `Severity` on decode, which is lossy by
-//! construction (`INFO2` and `INFO4` both decode to `Severity::Info`). Decode stamps
-//! `otel.severity_number` (`Value::I64`, the raw `1..=24`, only when non-zero) and
-//! `otel.severity_text` (`Value::Str`, raw, only when non-empty) on the event's own attributes
-//! alongside the normalized `Severity`; encode reads those back per the pair-as-a-unit rule above
-//! -- consumed (removed from the emitted attribute set) only when *usable* (`take_severity_attrs`
-//! peeks the value's type/range before removing it: `I64`/`U64` in `1..=24` for the number, any
-//! `as_str`-able value for the text), the same way `traces.rs` handles its own retired
-//! status-message attribute convention, so neither raw severity attribute leaks into every other
-//! sink's tag set. An attribute present but unusable (wrong type, or a number outside `1..=24`) is
-//! left in place as an ordinary attribute and treated as *absent* for the fallback rule above --
-//! it is never used as the raw value.
-//! A log with no OTLP-sourced severity attributes (built by `kv_metrics`, a Lua script, `json`, ...)
-//! still encodes the band base + variant name exactly as before.
+//! Decode's 24-to-6 collapse is lossy (`INFO2` and `INFO4` both become `Info`), so the raw values
+//! survive as attributes, the shape `syslog.severity` uses (ADR `syslog-output`'s "Header-field
+//! precedence", ADR `lossless-transit` rule (b)): `otel.severity_number` (`Value::I64`, when
+//! non-zero) and `otel.severity_text` (`Value::Str`, when non-empty).
+//!
+//! Encode treats that pair as one unit:
+//! - **Neither attribute:** each band's base number (`Trace`→1, `Debug`→5, `Info`→9, `Warn`→13,
+//!   `Error`→17, `Fatal`→21) and the variant's name as text. `severity == None` leaves the number
+//!   `0` (`SEVERITY_NUMBER_UNSPECIFIED`).
+//! - **Either attribute:** the present side's raw value, and OTLP's unset sentinel (`0` or `""`)
+//!   for the missing side, never the band-derived value, which would invent a field the producer
+//!   never sent (`10`/`"Info"` where the wire had `10`/`""`).
+//!
+//! `take_severity_attrs` removes an attribute only when it's usable: a number (`I64` or `U64`) in
+//! `1..=24`, or any `as_str`-able text. An unusable one stays as an ordinary attribute and counts
+//! as absent. So neither raw attribute leaks into the emitted attribute set.
 //!
 //! **`BodyFormat` has no OTLP field.** It round-trips through a `logit.body_format` attribute
-//! (`"raw" | "json" | "structured"`), inserted on encode and consumed (removed) on decode -- the
-//! same "reserved key rides as an attribute" idiom this module now uses for severity too.
+//! (`"raw" | "json" | "structured"`), inserted on encode and removed on decode.
 //!
-//! **`time_unix_nano == 0` falls back to `observed_time_unix_nano`,** per OTLP's own contract for
-//! a consumer that (like this one) keeps a single timestamp: `time_unix_nano == 0` means "unknown
-//! or missing" (`logs.proto`'s own doc comment), not literally the Unix epoch -- a real collector
-//! commonly sends exactly that when the original event time wasn't available, and treating it as
-//! epoch would silently corrupt ordering and could push the record outside a downstream retention
-//! window. If `observed_time_unix_nano` is also `0`, `Event::timestamp` is `0`; there is no third
-//! fallback to reach for.
+//! **`time_unix_nano == 0` decodes to `observed_time_unix_nano`.** Zero means "unknown or
+//! missing" (`logs.proto`), not the epoch, and a collector sends it when the event time wasn't
+//! available; treating it as 1970 corrupts ordering and retention. If both are `0`,
+//! `Event::timestamp` is `0`.
 //!
-//! **`observed_time_unix_nano` ↔ `LogRecord::observed_timestamp`, preserved both ways.** Decode
-//! copies the wire field verbatim (`0` stays `0`, this model's own "unset" convention -- the same
-//! sentinel OTLP itself uses for the field). Encode prefers `log.observed_timestamp` when it is
-//! non-zero -- what makes `otlp_in -> otlp_out` a fixed point on this field -- and falls back to
-//! the current wall clock (`crate::now_nanos()`) only when it's `0`/unset: OTLP's own definition of
-//! the field (`logs.proto`: "Time when the event was observed by the collection system"), and at
-//! encode time `logit` *is* that collection system when nothing upstream already set one. This is
-//! what makes the `time_unix_nano` fallback above do real work end to end even for a record not
-//! sourced from OTLP: a `syslog_in` event with no parseable timestamp carries `Event::timestamp ==
-//! 0` and `LogRecord::observed_timestamp == 0`, and exports as `time_unix_nano: 0,
-//! observed_time_unix_nano: <now>`, so a downstream consumer -- `logit`'s own `otlp_in` included --
-//! recovers a sane timestamp instead of the Unix epoch. Encode is non-deterministic only on the
-//! path where `observed_timestamp` is `0` -- no test may assert whole-record equality against a
-//! fixed expected value in that case; when `observed_timestamp` is set, the test asserts the wire
-//! value equals it exactly.
+//! **`observed_time_unix_nano` ↔ `LogRecord::observed_timestamp`.** Decode copies it verbatim
+//! (`0` is unset in both models). Encode writes `observed_timestamp` when non-zero, the
+//! `otlp_in -> otlp_out` fixed point, and otherwise the current time: `logs.proto` defines it as
+//! when the collection system observed the event, and with nothing upstream, `logit` is that
+//! system. So a `syslog_in` event with no parseable timestamp exports as `time_unix_nano: 0,
+//! observed_time_unix_nano: <now>`, and a consumer recovers a sane timestamp. That path is the
+//! only non-deterministic encode; a test there can't assert whole-record equality.
 //!
-//! **`trace_id`/`span_id`/`flags` map to `LogRecord::trace` (`Option<TraceRef>`),** not dropped
-//! any more (`docs/adr/log-record-trace-context.md`). **Decode is lenient, unlike a `Span`'s ids**
-//! (`traces.rs`'s `mod ids`, which rejects a wrong-length id outright): `logs.proto`'s own
-//! contract is "receivers SHOULD assume the log record is not associated with a trace" if
-//! `trace_id` is absent or invalid, so `TraceRef::from_bytes` degrades a malformed id to `None`
-//! rather than failing the whole record -- correlation metadata a log can do without, unlike a
-//! `Span`'s own identity. **Encode falls back to the event's `span`** when the log has no trace
-//! context of its own: an `Event` carrying both a `log` and a `span` (still `logit`'s primary
-//! correlation mechanism -- one `Event`, both payloads) exports the span's `trace_id`/`span_id`
-//! onto the `LogRecord` too, `flags: 0`. This is *not* a round-trip fixed point: `encode_signals`
-//! splits such an `Event` into a separate `LogRecord` and `Span`, and decode makes one `Event` per
-//! record, so the log comes back as its own event, now carrying `trace: Some(..)` where it had
-//! `None` going in -- an enrichment, not a lossless mirror.
+//! **`trace_id`/`span_id`/`flags` ↔ `LogRecord::trace`** (ADR `log-record-trace-context`). `flags`
+//! keeps its low 8 bits, the W3C trace flags. **Decode is lenient, unlike a `Span`'s ids**
+//! (`traces.rs`'s `mod ids` rejects a wrong-length id): `logs.proto` says to treat an absent or
+//! invalid `trace_id` as no trace, so `TraceRef::from_bytes` degrades a malformed id to `None`
+//! rather than failing the record. **Encode falls back to the event's `span`** when the log has
+//! no trace context: an `Event` carrying both a `log` and a `span` puts the span's ids on the
+//! `LogRecord` with `flags: 0`. That isn't a fixed point: `encode_signals` splits the event into a
+//! `LogRecord` and a `Span`, decode makes one `Event` per record, and the log comes back with
+//! `trace: Some(..)` where it had `None`.
 //!
-//! **`event_name` ↔ `LogRecord::event_name`,** interned on decode when non-empty, resolved back to
-//! a plain string on encode (empty when `None`).
+//! **`event_name` ↔ `LogRecord::event_name`,** interned on decode when non-empty; `None` encodes
+//! as empty.
 //!
-//! **`dropped_attributes_count` maps directly, both ways** -- no more special handling than any
-//! other scalar field.
+//! **`dropped_attributes_count` maps directly, both ways.**
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::logs::v1 as pb;
@@ -97,8 +69,8 @@ fn severity_number(sev: Severity) -> i32 {
     n as i32
 }
 
-/// The severity_text `logit` writes on encode: the variant's own name, matching every other
-/// `{:?}`-derived tag value convention in this codebase.
+/// The `severity_text` encode writes: the variant's name, matching the `{:?}` convention for tag
+/// values elsewhere.
 fn severity_text(sev: Severity) -> &'static str {
     match sev {
         Severity::Trace => "Trace",
@@ -110,7 +82,7 @@ fn severity_text(sev: Severity) -> &'static str {
     }
 }
 
-/// See the module doc's `Severity ↔ SeverityNumber` section.
+/// See the module doc's "`Severity` ↔ `SeverityNumber`".
 fn decode_severity(number: i32, text: &str) -> Option<Severity> {
     match number {
         1..=4 => return Some(Severity::Trace),
@@ -140,8 +112,8 @@ fn body_format_str(format: BodyFormat) -> &'static str {
     }
 }
 
-/// Reads and removes `logit.body_format` from `attrs`, defaulting to `Raw` when absent or
-/// unrecognized (e.g. a peer OTLP producer that never set it).
+/// Reads and removes `logit.body_format` from `attrs`, defaulting to `Raw` when absent (any
+/// non-`logit` producer) or unrecognized.
 fn decode_body_format(attrs: &mut AttrMap) -> BodyFormat {
     let format = match attrs.get("logit.body_format").and_then(|v| v.as_str()) {
         Some("json") => BodyFormat::Json,
@@ -152,9 +124,7 @@ fn decode_body_format(attrs: &mut AttrMap) -> BodyFormat {
     format
 }
 
-/// `log.trace`, or -- when the log has none of its own -- `event.span`'s ids with `flags: 0`.
-/// See the module doc's trace-context paragraph for why this fallback exists and why it isn't a
-/// round-trip fixed point.
+/// `log.trace`, else `event.span`'s ids with `flags: 0` (not a fixed point; see the module doc).
 fn encode_trace(event: &Event, log: &LogRecord) -> (Vec<u8>, Vec<u8>, u32) {
     if let Some(trace) = log.trace {
         let span_id = trace.span_id.map(|id| id.to_vec()).unwrap_or_default();
@@ -166,13 +136,10 @@ fn encode_trace(event: &Event, log: &LogRecord) -> (Vec<u8>, Vec<u8>, u32) {
     (Vec::new(), Vec::new(), 0)
 }
 
-/// Reads and removes `otel.severity_number`/`otel.severity_text` from `attrs` (`Value::I64`/
-/// `Value::U64` in `1..=24` for the number, any `as_str`-able value for the text, per the module
-/// doc's severity precedence) -- consumed the same way `decode_body_format` consumes
-/// `logit.body_format`, so neither leaks into the emitted attribute set as a plain attribute too.
-/// **Peeks before removing**: an attribute of the wrong type, or a number outside `1..=24`, is
-/// left in `attrs` untouched -- it was never a usable raw override, so it's an ordinary attribute
-/// as far as this codec is concerned, not a value to consume and discard.
+/// Removes and returns `otel.severity_number`/`otel.severity_text` from `attrs`.
+///
+/// **Peeks before removing**: only a `Value::I64`/`Value::U64` number in `1..=24` or an
+/// `as_str`-able text is taken. Anything else stays in `attrs` as an ordinary attribute.
 fn take_severity_attrs(attrs: &mut AttrMap) -> (Option<i32>, Option<String>) {
     let number = match attrs.get("otel.severity_number") {
         Some(Value::I64(i)) if (1..=24).contains(i) => Some(*i as i32),
@@ -200,10 +167,8 @@ pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord
         key_strindex: 0,
     });
 
-    // The raw-severity pair is treated as a unit -- see the module doc's severity section. When
-    // neither raw attribute is present, fall back to the band-derived value; when either is
-    // present, the missing side falls back to OTLP's own unset sentinel, never the band-derived
-    // value (which would invent a value the producer never sent for that field).
+    // The raw pair is one unit (module doc): neither present means band-derived values; either
+    // present means OTLP's unset sentinel for the missing side.
     let (number, text) = match (severity_number_attr, severity_text_attr) {
         (None, None) => match log.severity {
             Some(sev) => (severity_number(sev), severity_text(sev).to_string()),
@@ -237,13 +202,12 @@ pub(crate) fn encode_log_record(event: &Event, log: &LogRecord) -> pb::LogRecord
     }
 }
 
-/// `base_attrs` is the resource-level base (`common`'s own doc), cloned once per record by the
-/// caller -- this only layers the record's own attributes on top.
+/// Decodes one record, layering its attributes onto `attrs`; every caller passes an empty map.
 pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Event {
     common::key_values_into_attrs(record.attributes, &mut attrs);
     let body_format = decode_body_format(&mut attrs);
     let severity = decode_severity(record.severity_number, &record.severity_text);
-    // Raw severity survives alongside the normalized Severity -- see the module doc.
+    // Raw severity survives alongside the normalized Severity (module doc).
     if record.severity_number != 0 {
         attrs.insert("otel.severity_number", Value::I64(record.severity_number as i64));
     }
@@ -251,15 +215,14 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
         attrs.insert("otel.severity_text", record.severity_text.as_str());
     }
     let message = record.body.map(common::any_value_to_value).unwrap_or(Value::Null);
-    // See the module doc: 0 means "unknown", not literally the epoch -- prefer the observed time
-    // over silently treating a missing original timestamp as 1970-01-01.
+    // 0 means "unknown", not the epoch (module doc).
     let timestamp = if record.time_unix_nano != 0 {
         record.time_unix_nano as i64
     } else {
         record.observed_time_unix_nano as i64
     };
-    // `LOG_RECORD_FLAGS_TRACE_FLAGS_MASK`: the low 8 bits of the `fixed32` are the W3C trace
-    // flags; the rest is reserved. Lenient by construction -- see the module doc.
+    // `LOG_RECORD_FLAGS_TRACE_FLAGS_MASK`: the low 8 bits are the W3C trace flags, the rest is
+    // reserved. A malformed id degrades to `None` (module doc).
     let trace =
         TraceRef::from_bytes(&record.trace_id, &record.span_id, (record.flags & 0xFF) as u8);
     let event_name =
@@ -325,11 +288,7 @@ mod tests {
     #[test]
     fn body_format_survives_a_full_round_trip() {
         for format in [BodyFormat::Raw, BodyFormat::Json, BodyFormat::Structured] {
-            // `timestamp: 0` here means `decoded.timestamp` comes back as a real wall-clock value
-            // (the encoder's own `observed_time_unix_nano` stamp, decode's fallback for a `0`
-            // `time_unix_nano`), not the `0` it would have been before `encode_log_record` started
-            // stamping observed time -- this test doesn't assert on `timestamp` so that's not a
-            // regression, just worth knowing if a future reader goes looking for why it changed.
+            // `timestamp: 0` decodes as the encoder's wall-clock observed time; not asserted.
             let event = Event::log(
                 0,
                 AttrMap::new(),
@@ -376,9 +335,7 @@ mod tests {
         );
     }
 
-    /// The fidelity half of the same field: when `observed_timestamp` is already set, encode
-    /// preserves it exactly rather than overwriting it with the current wall clock -- what makes
-    /// `otlp_in -> otlp_out` a fixed point on this field.
+    /// A set `observed_timestamp` encodes unchanged, not overwritten with the wall clock.
     #[test]
     fn encode_prefers_a_nonzero_observed_timestamp_over_the_current_wall_clock() {
         let event = Event::log(
@@ -400,12 +357,8 @@ mod tests {
 
     #[test]
     fn an_event_with_an_unknown_timestamp_round_trips_to_the_observed_time() {
-        // The case `encode_log_record`'s module doc calls out: `Event::timestamp == 0` (OTLP's
-        // own "unknown" sentinel) must not export as the literal Unix epoch -- the encoder's own
-        // `observed_time_unix_nano` stamp, recovered by decode's existing fallback, is what makes
-        // that true end to end through logit's own encoder now, not just against a hand-built
-        // `pb::LogRecord` the way `a_zero_time_unix_nano_falls_back_to_observed_time_unix_nano`
-        // above already proves for decode alone.
+        // `Event::timestamp == 0` must not come back as the epoch through logit's own encoder,
+        // not only through a hand-built `pb::LogRecord`.
         let before = crate::now_nanos();
         let event = Event::log(
             0,
@@ -704,9 +657,7 @@ mod tests {
         assert_eq!(decoded.log.unwrap().dropped_attributes_count, 5);
     }
 
-    /// INFO2 (severity_number 10) round-trips as 10, not collapsed to Info's own band base (9) --
-    /// the raw number and text both survive on the event's attributes and win back over the wire
-    /// on re-encode. This is the fidelity half of `Severity`'s lossy 24-to-6 collapse.
+    /// INFO2 (severity_number 10) round-trips as 10, not Info's band base (9).
     #[test]
     fn a_raw_severity_number_and_text_survive_a_decode_reencode_round_trip() {
         let wire = pb::LogRecord {
@@ -750,9 +701,7 @@ mod tests {
         );
     }
 
-    /// A log never sourced from OTLP (no `otel.severity_*` attributes at all -- e.g. one built by
-    /// `kv_metrics`, a Lua script, or `json`) still encodes the band base + variant name exactly as
-    /// it always did.
+    /// A log with no `otel.severity_*` attributes encodes the band base and the variant name.
     #[test]
     fn a_non_otlp_sourced_log_still_encodes_the_band_base() {
         let record = plain_log(LogRecord {
@@ -768,11 +717,7 @@ mod tests {
         assert_eq!(record.severity_text, "Info");
     }
 
-    /// One-sided severity, number only: `{10, ""}` must decode then re-encode back to `{10, ""}`
-    /// -- the missing `severity_text` must fall back to OTLP's unset sentinel (empty string), not
-    /// the band-derived variant name (`"Info"`), which would invent a value the producer never
-    /// sent. This is the fix-1 regression the review flagged: `decode(encode(decode(x))) != x`
-    /// before this fix, for either one-sided input.
+    /// Number only: `{10, ""}` re-encodes as `{10, ""}`, not `{10, "Info"}`.
     #[test]
     fn a_severity_number_with_no_text_round_trips_without_inventing_text() {
         let wire = pb::LogRecord {
@@ -797,10 +742,7 @@ mod tests {
         );
     }
 
-    /// The mirror case, text only: `{0, "warn"}` must decode then re-encode back to `{0, "warn"}`
-    /// -- the missing `severity_number` must fall back to `0` (`SEVERITY_NUMBER_UNSPECIFIED`),
-    /// not the band-derived number (`13`, Warn's own base), which would invent a number the
-    /// producer never sent.
+    /// Text only: `{0, "warn"}` re-encodes as `{0, "warn"}`, not `{13, "warn"}`.
     #[test]
     fn a_severity_text_with_no_number_round_trips_without_inventing_a_number() {
         let wire = pb::LogRecord {
@@ -826,8 +768,7 @@ mod tests {
         assert_eq!(re_encoded.severity_text, "warn");
     }
 
-    /// `take_severity_attrs` peeks before removing (fix 2): a `Value::U64` number in `1..=24` is a
-    /// usable raw override, same as `Value::I64`.
+    /// A `Value::U64` number in `1..=24` is a usable raw override, like `Value::I64`.
     #[test]
     fn take_severity_attrs_honours_a_u64_number() {
         let mut attrs = AttrMap::new();
@@ -837,9 +778,7 @@ mod tests {
         assert_eq!(attrs.get("otel.severity_number"), None, "a usable value must be removed");
     }
 
-    /// An out-of-range or wrong-type `otel.severity_number` is left in place as an ordinary
-    /// attribute, not removed and not used as a raw override -- the "peek before removing" half
-    /// of fix 2.
+    /// An out-of-range or wrong-type `otel.severity_number` stays as an ordinary attribute.
     #[test]
     fn take_severity_attrs_leaves_an_unusable_number_in_place() {
         for value in [Value::I64(-1), Value::I64(99), Value::str("10")] {
@@ -855,8 +794,7 @@ mod tests {
         }
     }
 
-    /// A wrong-type `otel.severity_text` (e.g. raw `Bytes`, not `Str`) is left in place, same
-    /// rule as the number.
+    /// A wrong-type `otel.severity_text` (`Bytes`, not `Str`) stays as an ordinary attribute.
     #[test]
     fn take_severity_attrs_leaves_unusable_text_in_place() {
         let mut attrs = AttrMap::new();

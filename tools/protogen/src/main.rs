@@ -1,23 +1,17 @@
-//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus,datadog}/generated/`. Not a
-//! workspace member and not a build-time dependency (see
-//! `docs/adr/committed-pregenerated-otlp-protobuf.md`) -- run via `script/protogen`, inside a
-//! throwaway image with `protoc` installed, then review the diff and commit the result by hand.
-//! Messages only, no service stubs: hand-rolled transports (OTLP's gRPC/HTTP, Prometheus
-//! remote-write's HTTP, the Datadog Agent intake's HTTP) send/receive these bytes directly.
+//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus,datadog}/generated/`, run by
+//! `script/protogen` (see `docs/adr/committed-pregenerated-otlp-protobuf.md`). Messages only, no
+//! service stubs: the hand-rolled transports send and receive these bytes directly.
 //!
-//! Three independent proto families, each generated from its own vendored `.proto` sources
-//! (`crates/logit-proto/proto/README.md` has the pinned tag/commit for all three) into its own
-//! `generated/` directory. Regenerating one family never touches another's committed output --
-//! `script/protogen` regenerates all three every run, and `git diff --stat` after a run should
-//! show changes only under the family whose `.proto` sources actually moved.
+//! Each proto family is generated from its own vendored sources (pinned in
+//! `crates/logit-proto/proto/README.md`) into its own `generated/` directory. All three regenerate
+//! on every run, so a diff should show changes only under the family whose sources moved.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-// `#![rustfmt::skip]` (inner form) is nightly-only (rust-lang/rust#54726) -- each family's
-// hand-written `generated/mod.rs` carries the stable outer `#[rustfmt::skip]` on every file's
-// `pub mod ...;` declaration instead.
+// No `#![rustfmt::skip]`: the inner form is nightly-only (rust-lang/rust#54726), so each
+// family's hand-written `generated/mod.rs` puts the outer `#[rustfmt::skip]` on its `pub mod`s.
 const HEADER: &str = "#![allow(clippy::all)]\n#![allow(rustdoc::all)]\n\n";
 
 /// One proto family: include roots (repo-relative) for resolving `import`s, `(source .proto,
@@ -73,14 +67,11 @@ const FAMILIES: &[Family] = &[
         rename: strip_otlp_prefix,
     },
     Family {
-        // `remote.proto`'s `import "types.proto"` and the nested v2 file both resolve against the
-        // prompb root; `import "gogoproto/gogo.proto"` (all three files) resolves against the
-        // proto/ root. Neither prompb file imports the other's package, so no cross-package
-        // `super::`-relative field types appear in the output (checked against the vendored
-        // sources -- see crates/logit-proto/proto/README.md). `gogoproto/gogo.proto`'s own
-        // `import "google/protobuf/descriptor.proto"` needs `/usr/include` on the include path --
-        // Debian's `protobuf-compiler` package alone doesn't ship the well-known-types `.proto`
-        // sources, `libprotobuf-dev` does (tools/protogen/Dockerfile installs both).
+        // `remote.proto`'s `import "types.proto"` and the nested v2 file resolve against the
+        // prompb root; `import "gogoproto/gogo.proto"` resolves against proto/. Neither prompb
+        // package imports the other, so the output has no cross-package `super::` field types.
+        // gogo.proto's `import "google/protobuf/descriptor.proto"` needs `/usr/include`, which
+        // `libprotobuf-dev` populates (see tools/protogen/Dockerfile).
         includes: &[
             "crates/logit-proto/proto/prometheus/prompb",
             "crates/logit-proto/proto",

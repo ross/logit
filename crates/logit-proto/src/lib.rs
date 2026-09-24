@@ -1,10 +1,10 @@
-//! The codec traits, plus the native logit-to-logit wire format: [`Decoder`]/[`Encoder`] for
-//! one-blob-per-batch codecs (the native format, InfluxDB line protocol), [`SignalEncoder`]/
-//! [`SignalDecoder`] for OTLP's per-signal payloads, and [`FramedEncoder`] (over
-//! [`MessageBuf`]) for sinks that need one framed message per record with per-message drop
-//! accounting (syslog, statsd) -- see ADR `framed-encoder` for why there are three encoder
-//! shapes rather than one. See `docs/design/wire-protocol.md` for the native format's framing
-//! and payload design.
+//! The codec traits and every wire codec, including the native logit-to-logit format.
+//!
+//! A new protocol implements [`Decoder`] on the listener side and one of three encoder shapes on
+//! the sink side ([ADR `framed-encoder`](../../../docs/adr/framed-encoder.md) says why three):
+//! [`Encoder`] (one blob per batch), [`FramedEncoder`] (one framed message per record into a
+//! [`MessageBuf`], with per-message drop accounting), or [`SignalEncoder`] (one payload per OTLP
+//! signal). `docs/design/wire-protocol.md` has the native format's framing and payload.
 
 pub mod buffer;
 pub mod collectd;
@@ -28,53 +28,37 @@ pub enum CodecError {
     Malformed(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    /// Something this codec cannot represent at all, as opposed to [`CodecError::Malformed`]'s
-    /// "this input violates the format." OTLP's own service RPCs (PR3) are the first caller: an
-    /// `application/json` content type, or an unknown gRPC method name, is well-formed on the
-    /// wire, just not something this codec speaks.
+    /// Well-formed input this codec doesn't speak, as opposed to [`CodecError::Malformed`]'s
+    /// "this input violates the format": a frame version or codec byte this reader doesn't know,
+    /// or reserved `zstd` compression.
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// The input is a *valid prefix* of something this codec could decode -- the buffer simply
-    /// ends before a complete frame does, and it doesn't have `needed` more bytes yet. Distinct
-    /// from [`CodecError::Malformed`], which means the bytes present are provably wrong and more
-    /// of them won't help.
+    /// The input is a valid prefix of a frame and needs `needed` more bytes; unlike
+    /// [`CodecError::Malformed`], more bytes could make it decode.
     ///
-    /// A stream or file reader needs that difference to decide what to do next: `Truncated` means
-    /// "come back once more bytes exist" (a live socket, a `logit_in` connection) or "this is where
-    /// a torn write ends, truncate here" (a durable buffer's segment file, a reader resuming
-    /// mid-file), where `Malformed` means the reader should give up on this frame and resync past
-    /// it instead (`crate::frame::resync`). `needed` is the additional byte count that would make
-    /// the read succeed, when known. `frame::read_frame`/`FrameHeader::read` are the first callers,
-    /// on a short header or a short body.
+    /// A stream or file reader acts on the difference: `Truncated` means "read more" (a live
+    /// socket) or "a torn write ends here" (a spool segment), where `Malformed` means give up on
+    /// this frame and [`frame::resync`] past it. Returned by [`frame::read_frame`] and
+    /// [`frame::FrameHeader::read`] on a short header or body.
     #[error("truncated input: need {needed} more byte(s)")]
     Truncated { needed: usize },
 }
 
-/// Turns wire bytes into events sharing one [`Resource`]. The native format, statsd, syslog, and
-/// OTLP implement this against the same internal model (`docs/design/data-model.md`);
-/// `prometheus_in` is the one listener that doesn't -- it holds a whole HTTP body from a scrape
-/// it initiated, not a datagram it received, and uses the plain functions `prometheus` exposes
-/// instead (ADR `prometheus-scrape-and-exposition`).
+/// Turns wire bytes into events sharing one [`Resource`] (`docs/design/data-model.md`).
+///
+/// `prometheus_in` doesn't implement it: a scrape body it fetched isn't a datagram it received,
+/// so it calls `prometheus`'s plain functions (ADR `prometheus-scrape-and-exposition`). OTLP
+/// decodes through [`SignalDecoder`].
 pub trait Decoder {
-    /// Decodes one datagram, appending its events to `out` rather than returning a fresh `Vec` --
-    /// a caller accumulating across many datagrams (`logit_pipeline::BatchAccumulator`,
-    /// `docs/adr/decoupled-listener-io.md`) can then reuse one buffer via `Vec::drain`
-    /// instead of allocating and immediately discarding one per datagram
-    /// (`docs/design/memory.md` §2).
+    /// Decodes one datagram, appending its events to `out` so an accumulating caller
+    /// (`logit_pipeline::BatchAccumulator`) reuses one buffer (`docs/design/memory.md` §2).
     ///
-    /// `received_at` is when the datagram was taken off the socket, not when this runs -- once a
-    /// listener's own I/O is decoupled from its decode loop (ADR `decoupled-listener-io`), the two can diverge by the
-    /// receive queue's own latency under backlog, and every emitted event's `timestamp` must be
-    /// the former: this is what keeps a syslog/statsd event's `timestamp` meaning *receipt* time
-    /// regardless of how far behind decode is running.
+    /// `received_at` is when the datagram left the socket, not when this runs; the two diverge by
+    /// the receive queue's latency under backlog (ADR `decoupled-listener-io`). A receipt-time
+    /// `timestamp` (every syslog and statsd event's) comes from it, never from the decode clock.
     ///
-    /// Returns the batch's [`Resource`] **and** its [`Scope`], if any -- not just the former. A
-    /// scope, when a wire format carries one at all, is part of what one datagram/frame decodes
-    /// to, the same identity term `resource` already is
-    /// (`docs/adr/lossless-transit.md`); dropping it here would silently lose it even though the
-    /// native codec encodes it end to end. `logit_pipeline::BatchAccumulator::absorb` keys its own
-    /// accumulation on the pair `(resource, scope)`, so a caller decoding into it needs both, not
-    /// just the resource half.
+    /// Returns the batch's [`Scope`] beside its [`Resource`]: a scope is part of the batch's
+    /// identity (ADR `lossless-transit`), and `BatchAccumulator::absorb` keys on the pair.
     fn decode_into(
         &mut self,
         bytes: bytes::Bytes,
@@ -82,11 +66,8 @@ pub trait Decoder {
         out: &mut Vec<Event>,
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError>;
 
-    /// Convenience wrapper over [`Decoder::decode_into`], stamping every event with the current
-    /// time -- for a caller (a test, a benchmark) with no real "receipt" instant of its own to
-    /// thread through. Production code always calls `decode_into` directly with the read half's
-    /// own captured `received_at`; nothing in this crate or its callers uses this method on the
-    /// hot path.
+    /// [`Decoder::decode_into`] with `received_at` set to now, for tests and benchmarks. A
+    /// listener calls `decode_into` with the instant its read half captured.
     fn decode(&mut self, bytes: bytes::Bytes) -> Result<EventBatch, CodecError> {
         let received_at = now_nanos();
         let mut events = Vec::new();
@@ -99,50 +80,43 @@ pub(crate) fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
 
-/// Turns an [`EventBatch`] into one opaque blob of wire bytes per batch. The mirror of
-/// [`Decoder`], for the codecs whose output *is* one blob: the native format, InfluxDB line
-/// protocol (one HTTP body), and `stdio_out`/`file_out`'s human-readable dump. Sinks that need
-/// per-message framing implement [`FramedEncoder`] instead; OTLP, whose one batch fans out into
-/// one payload per signal, implements [`SignalEncoder`]; `prometheus_out` is a stateful registry
-/// rendered on scrape and implements none of the three (ADR `prometheus-scrape-and-exposition`).
+/// Turns an [`EventBatch`] into one opaque blob of wire bytes.
+///
+/// For a codec whose output is one blob per batch: the native format, InfluxDB line protocol (one
+/// HTTP body), and `stdio_out`/`file_out`'s dump. An error means the whole batch didn't encode.
+/// `prometheus_out` is a registry rendered on scrape and implements none of the three encoder
+/// shapes (ADR `prometheus-scrape-and-exposition`).
 pub trait Encoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<bytes::Bytes, CodecError>;
 }
 
-/// The shape for a sink that needs N framed messages per batch -- one datagram or one framed
-/// record per message (syslog), or lines a transport packs into datagrams (statsd) -- with
-/// per-message drop accounting. The third encoder shape beside [`Encoder`] (one blob per batch)
-/// and [`SignalEncoder`] (one blob per signal); use it when one opaque `Bytes` per batch can't
-/// carry the message boundaries the transport needs without reinventing them on the other side.
-/// See ADR `framed-encoder`.
+/// Turns an [`EventBatch`] into N framed messages with per-message drop accounting.
 ///
-/// **Never fails.** Every per-message problem (an oversize line, an unencodable value, a record
-/// the wire format can't represent) is a counted outcome in `Stats`, not an error, because there
-/// is nothing a caller can do about one bad message beyond counting it -- contrast
-/// [`Encoder::encode`]'s `Result`, where a failure means the whole batch didn't encode. `Stats`
-/// is **per sink** (a syslog drop reason is not a statsd drop reason); each sink's `send` maps
-/// its own struct onto `logit.output.*` telemetry counters by hand.
+/// For a transport that needs message boundaries one opaque `Bytes` can't carry: one datagram or
+/// framed record per message (syslog), or lines or packets a transport packs into datagrams
+/// (statsd, collectd, graphite). See ADR `framed-encoder`.
 ///
-/// `Meta` is what the encoder needs to say about each message beyond its bytes: `()` for syslog
-/// and statsd, whose messages are self-describing; a per-datagram value-list count for a
-/// collectd-style packer, the next implementor. Implemented by `logit_outputs::syslog::
-/// SyslogEncoder` and `logit_outputs::statsd::StatsdEncoder`; the one generic consumer is the
-/// allocation-row helper in `crates/logit-bench/tests/allocations.rs`.
+/// **Never fails.** A per-message problem (an oversize line, an unencodable value, a record the
+/// wire can't represent) is a counted outcome in `Stats`, since a caller can do nothing about one
+/// bad message but count it. `Stats` is per sink; each sink's `send` maps it onto
+/// `logit.output.*` counters by hand.
+///
+/// `Meta` is what a message carries beyond its bytes: `()` for syslog and statsd, whose messages
+/// are self-describing; a per-packet count for collectd (messages) and graphite (datapoints).
 pub trait FramedEncoder {
     type Meta;
     type Stats: Default + std::fmt::Debug + PartialEq;
 
     /// Encodes every event in `batch` into `out` (cleared first), one entry per framed message.
-    /// Anything the encoder needs beyond the batch -- a dialect, a size cap -- is encoder state
-    /// set at construction, never a per-call argument, so the same call works for every
-    /// implementor.
+    /// Anything else the encoder needs (a dialect, a size cap) is state set at construction,
+    /// never a per-call argument.
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats;
 }
 
-/// Which OTLP service a payload belongs to. `logit`'s `Event` doesn't split by signal -- one event
-/// may carry a log, metrics, and a span at once (ADR `multi-payload-events`) -- but OTLP's wire protocol does: logs,
-/// metrics, and traces are three separate RPCs/URLs with three separate message types. A `Signal`
-/// names which one a given payload of bytes belongs to.
+/// Which OTLP service a payload belongs to.
+///
+/// One `Event` can carry a log, metrics, and a span at once (ADR `multi-payload-events`), but OTLP
+/// sends logs, metrics, and traces as three RPCs with three message types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Logs,
@@ -151,8 +125,7 @@ pub enum Signal {
 }
 
 impl Signal {
-    /// The OTLP/HTTP path this signal is POSTed to, e.g. `/v1/traces`. Doubles as the `signal` tag
-    /// value on any telemetry a caller attaches to a per-signal operation.
+    /// The default OTLP/HTTP path this signal is POSTed to, e.g. `/v1/traces`.
     pub fn path(self) -> &'static str {
         match self {
             Signal::Logs => "/v1/logs",
@@ -170,6 +143,7 @@ impl Signal {
         }
     }
 
+    /// The `signal` tag value on per-signal telemetry.
     pub fn as_str(self) -> &'static str {
         match self {
             Signal::Logs => "logs",
@@ -179,31 +153,27 @@ impl Signal {
     }
 }
 
-/// An encoder whose wire format splits one [`EventBatch`] across several payloads, one per
-/// [`Signal`] -- [`Encoder`] doesn't fit here since OTLP has no single message type an
-/// [`EventBatch`] maps onto, and [`FramedEncoder`] doesn't either, since each payload needs a
-/// `Signal` label and a per-signal destination rather than a message boundary.
+/// Splits one [`EventBatch`] into one payload per [`Signal`].
+///
+/// OTLP has no single message type a batch maps onto, and each payload needs a per-signal
+/// destination rather than a message boundary.
 pub trait SignalEncoder {
-    /// Encodes `batch` into zero or more `(Signal, bytes)` payloads. Only non-empty signals
-    /// appear -- an event batch with no metrics produces no `Signal::Metrics` payload -- and an
-    /// entirely empty batch yields none at all, never an empty OTLP request.
+    /// Encodes `batch` into zero or more `(Signal, bytes)` payloads, one per non-empty signal. An
+    /// empty batch yields none, never an empty OTLP request.
     fn encode_signals(
         &mut self,
         batch: &EventBatch,
     ) -> Result<Vec<(Signal, bytes::Bytes)>, CodecError>;
 }
 
-/// The mirror of [`SignalEncoder`]. Returns several batches, not one: a single OTLP request can
-/// carry data from N distinct `Resource*` entries, and an [`EventBatch`] holds exactly one
-/// `Arc<Resource>` -- collapsing every entry under the first would silently mislabel the rest.
+/// The mirror of [`SignalEncoder`].
 ///
-/// **OTLP/JSON decoding (`otlp::OtlpDecoder::decode_signal_json`) is deliberately not on this
-/// trait.** `OtlpDecoder` is this trait's only implementor, and nothing in the crate is generic
-/// over `SignalDecoder` -- every call site already holds a concrete `OtlpDecoder`. A trait method
-/// would need either a default body (silently giving any future implementor "JSON unsupported"
-/// with no compile error to catch it) or forcing every implementor to answer a question that's
-/// only meaningful for OTLP in the first place. An inherent method costs nothing today and adds
-/// friction only if a second `SignalDecoder` ever needs the same asymmetry solved for real.
+/// Returns one batch per `Resource*` entry: one OTLP request can carry N resources, and an
+/// [`EventBatch`] holds one.
+///
+/// OTLP/JSON decoding ([`otlp::OtlpDecoder::decode_signal_json`]) is an inherent method, not part
+/// of this trait: `OtlpDecoder` is the only implementor and nothing is generic over the trait, so
+/// a trait method would only force a default "JSON unsupported" body on a future implementor.
 pub trait SignalDecoder {
     fn decode_signal(
         &mut self,

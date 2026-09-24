@@ -1,26 +1,18 @@
-//! Exposes the incoming batch's OTLP instrumentation scope to Lua as a global `scope`
-//! userdata -- readable and writable, copy-on-write. Mirrors `crate::resource`; see that module's
-//! doc comment for the shared reasoning (install-before-`.exec()`, `Rc<RefCell<..>>` state instead
-//! of a `RegistryKey`-held table, identity writes as no-ops) and `docs/design/lua-api.md`'s
-//! "Reading and writing `resource`" section, whose shape this follows for `scope` too.
+//! Exposes the incoming batch's OTLP instrumentation scope to Lua as a global `scope` userdata,
+//! readable and writable, copy-on-write. It mirrors `crate::resource` (installed before
+//! `.exec()`, `Rc<RefCell<..>>` state, identity writes as no-ops); `docs/design/lua-api.md`'s
+//! "Reading and writing `resource`" section covers both.
 //!
-//! **Unlike `resource`, a batch may have no scope at all** (`EventBatch.scope: Option<Arc<Scope>>`
-//! -- `crate::event`). Reading any field before a write reports the all-clear value (`""` for
+//! **Unlike `resource`, a batch may have no scope** (`logit_core::EventBatch::scope` is an
+//! `Option`). Every field then reads as [`logit_core::Scope::default`]'s value (`""` for
 //! `name`/`version`, `nil` for `schema_url`, `0` for `dropped_attributes_count`, an empty table
-//! for `attributes`) -- the same values [`logit_core::Scope::default`] itself carries. A write on
-//! such a batch starts `modified` from `Scope::default()` rather than erroring.
+//! for `attributes`), and a write starts `modified` from `Scope::default()` rather than erroring.
 //!
-//! **`scope.attributes` is its own sub-userdata**, mirroring `event.attributes`'s `AttrsProxy`
-//! (`crate::proxy`) -- same open-map `__index`/`__newindex`/`to_table` shape, sharing this same
-//! `Rc<RefCell<ScopeState>>`. Unlike `EventProxy::attrs`, this doesn't need the
-//! lazy-create-and-cache-via-`RegistryKey` dance that module documents at length: that laziness
-//! exists there because a fresh `EventProxy` is created once *per event* (worth avoiding the
-//! `create_userdata` cost when a script never touches `.attributes`) and the cached handle must
-//! later be torn down cleanly (`EventProxy::into_inner`) before the event itself is handed back.
-//! `scope` is installed exactly once, for a worker's entire lifetime, and is never "handed back"
-//! or destructed the way an event is -- so `scope.attributes`'s userdata is simply created once,
-//! here in [`install`], and its `RegistryKey` held directly as a [`ScopeProxy`] field for the
-//! worker's whole lifetime. The simplest correct approach that's still right, not a shortcut.
+//! **`scope.attributes` is its own sub-userdata**, [`ScopeAttrsProxy`], with `AttrsProxy`'s
+//! open-map shape over the same `Rc<RefCell<ScopeState>>`. It skips `EventProxy::attrs`'s lazy
+//! create-and-cache: that exists because an `EventProxy` is created per event and must be torn
+//! down before the event is handed back. `scope` lives for the worker's lifetime, so [`install`]
+//! creates the sub-userdata once and [`ScopeProxy`] holds its `RegistryKey`.
 
 use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
 use bytes::Bytes;
@@ -30,24 +22,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Per-batch scope state, shared between [`crate::ScriptWorker`], the installed [`ScopeProxy`]
-/// userdata, and its `attributes` sub-userdata ([`ScopeAttrsProxy`]) through one
-/// `Rc<RefCell<..>>` -- a script mutating through either handle is immediately visible to `take`
-/// below, with no trip back through Lua required.
+/// Per-batch scope state, shared by [`crate::ScriptWorker`], [`ScopeProxy`], and
+/// [`ScopeAttrsProxy`], so a script's write is visible to [`take`] without a trip through Lua.
 pub(crate) struct ScopeState {
-    /// `None` before the first [`set`], and again for any batch that itself carries no scope --
-    /// see the module doc comment.
+    /// `None` before the first [`set`] and for a batch that carries no scope.
     base: Option<Arc<Scope>>,
-    /// `Some` once a script has written at least one field since the last [`set`] -- a full copy
-    /// of `base` (or, if `base` is `None`, of `Scope::default()`), mutated in place from there so
-    /// one clone on the first write covers every field. `None` (the common case: a script that
-    /// never writes `scope`) is what keeps this allocation-free.
+    /// A full copy of `base` (or `Scope::default()`), made on the first write since the last
+    /// [`set`] and mutated in place after. `None` keeps a script that never writes allocation-free.
     modified: Option<Scope>,
 }
 
-/// Creates the `scope` global (starting with no batch's scope seen yet -- `base: None`, reading
-/// as all-clear, like `crate::resource::install`'s empty placeholder) and returns the shared
-/// state [`set`]/[`take`] mutate directly.
+/// Creates the `scope` global, reading as defaults until the first [`set`], and returns its
+/// shared state.
 pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ScopeState>>> {
     let state = Rc::new(RefCell::new(ScopeState { base: None, modified: None }));
     let attrs_ud = lua.create_userdata(ScopeAttrsProxy(state.clone()))?;
@@ -57,21 +43,21 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ScopeState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` (and once before
-/// every `flush()` call, with `None` -- `docs/adr/lua-flush-root-context.md`) -- resets `scope`
-/// to read the batch's own scope (or the all-clear defaults, if there is none) and clears any
-/// write left over from a previous call.
+/// Resets `scope` to read `scope` (defaults if `None`) and discards any earlier write.
+///
+/// Called once per incoming batch before its events reach `process`, and before every `flush()`
+/// with `None`, the flush root context (`docs/adr/lua-flush-root-context.md`).
 pub(crate) fn set(state: &Rc<RefCell<ScopeState>>, scope: &Option<Arc<Scope>>) {
     let mut state = state.borrow_mut();
     state.base = scope.clone();
     state.modified = None;
 }
 
-/// `Some` if a script wrote `scope` since the last [`set`], committing that write as the new
-/// `base` so a read before the next [`set`] sees it too, and a second [`take`] returns `None`.
-/// `run_lua` calls [`set`] before every batch and before every `flush()`
-/// (`docs/adr/lua-flush-root-context.md`), so no write carries into the next call. `None` -- the
-/// common case -- costs nothing.
+/// The script's write since the last [`set`], if any.
+///
+/// Commits the write as the new `base`, so a read before the next [`set`] still sees it and a
+/// second call returns `None`. `run_lua` calls [`set`] before every batch and every `flush()`, so
+/// no write carries into the next call.
 pub(crate) fn take(state: &Rc<RefCell<ScopeState>>) -> Option<Arc<Scope>> {
     let mut state = state.borrow_mut();
     let modified = state.modified.take()?;
@@ -80,10 +66,11 @@ pub(crate) fn take(state: &Rc<RefCell<ScopeState>>) -> Option<Arc<Scope>> {
     Some(new)
 }
 
-/// `state.base`'s scope, or `Scope::default()` if the batch carried none -- the starting point
-/// for `modified` on a write. Shared by every write path below so a write to one field never
-/// discards an earlier write to another within the same batch, and so "the batch has no scope
-/// yet" and "start a fresh one" share one definition.
+/// Clones `state.base` (or `Scope::default()`) into `state.modified` on the first write since
+/// the last [`set`].
+///
+/// Every write path goes through this, so a write to one field never discards an earlier write
+/// to another in the same batch.
 fn ensure_modified(state: &mut ScopeState) {
     if state.modified.is_none() {
         state.modified = Some(match &state.base {
@@ -121,9 +108,8 @@ fn scope_dropped_attributes_count(state: &ScopeState) -> u32 {
     }
 }
 
-/// `scope.name`/`scope.version = <string>` -- rejects anything else outright (there is no `nil`
-/// meaning for either: an absent scope reads back `""`, not `nil`, so a script never needs to
-/// write `nil` here the way it can for `schema_url`).
+/// Accepts only a string for `scope.name`/`scope.version`. Unlike `schema_url`, neither has a
+/// `nil` meaning: an absent scope reads back `""`.
 fn require_string<'a>(value: &'a LuaValue, field: &str) -> mlua::Result<&'a [u8]> {
     match value {
         LuaValue::String(s) => Ok(s.as_bytes()),
@@ -134,13 +120,10 @@ fn require_string<'a>(value: &'a LuaValue, field: &str) -> mlua::Result<&'a [u8]
     }
 }
 
-/// The `scope` global's userdata. Shares `ScopeState` with [`install`]'s caller and with
-/// [`ScopeAttrsProxy`].
+/// The `scope` global's userdata.
 struct ScopeProxy {
     state: Rc<RefCell<ScopeState>>,
-    /// `scope.attributes`'s sub-userdata, created once in [`install`] and cached for this
-    /// worker's whole lifetime -- see the module doc comment for why, unlike `EventProxy::attrs`,
-    /// this needs no lazy-create/`RefCell<Option<..>>`/teardown dance.
+    /// `scope.attributes`'s sub-userdata, created once in [`install`]; see the module doc.
     attrs: RegistryKey,
 }
 
@@ -194,10 +177,8 @@ impl UserData for ScopeProxy {
                         Ok(())
                     }
                     "schema_url" => {
-                        // Same string-equality no-op check as `resource::write_schema_url`, and
-                        // for the same reason: this is a plain `Option<Bytes>` field, not an
-                        // attribute `Value`, so `lua_value_matches` (which compares against a
-                        // `Value`'s variant) doesn't apply here.
+                        // Byte-equality no-op check, as `resource::write_schema_url`: an
+                        // `Option<Bytes>` has no `Value` variant for `lua_value_matches` to keep.
                         let new_value: Option<&[u8]> = match &value {
                             LuaValue::Nil => None,
                             LuaValue::String(s) => Some(s.as_bytes()),
@@ -231,8 +212,7 @@ impl UserData for ScopeProxy {
             },
         );
 
-        // No __pairs (unavailable under LuaJIT, same as `AttrsProxy`/`ResourceProxy`):
-        // `scope:to_table()` is the enumeration escape hatch.
+        // LuaJIT has no `__pairs`, so `scope:to_table()` is how a script enumerates.
         methods.add_method("to_table", |lua, this, ()| {
             let state = this.state.borrow();
             let table = lua.create_table()?;
@@ -255,9 +235,8 @@ impl UserData for ScopeProxy {
     }
 }
 
-/// The `scope.attributes` sub-object. Shares the same `Rc<RefCell<ScopeState>>` as its parent
-/// [`ScopeProxy`] -- reads/writes through this proxy are reads/writes to that same scope. Mirrors
-/// `crate::proxy::AttrsProxy` and `crate::resource::ResourceProxy`'s attribute handling exactly.
+/// The `scope.attributes` sub-userdata, over its parent [`ScopeProxy`]'s state, with
+/// `crate::proxy::AttrsProxy`'s attribute semantics.
 struct ScopeAttrsProxy(Rc<RefCell<ScopeState>>);
 
 impl UserData for ScopeAttrsProxy {
@@ -279,10 +258,8 @@ impl UserData for ScopeAttrsProxy {
             MetaMethod::NewIndex,
             |_, this, (key, value): (mlua::String, LuaValue)| {
                 let key = key.to_str()?;
-                // Same no-op check, and the same borrow-then-release-before-`lua_to_value`
-                // ordering, as `crate::proxy::AttrsProxy::__newindex` -- see that method's
-                // comment for why the borrow below must not still be held once `lua_to_value`
-                // (which can re-enter Lua for a table value) runs.
+                // Same no-op check and borrow ordering as `crate::proxy::AttrsProxy::__newindex`:
+                // the borrow must be released before `lua_to_value`, which can re-enter Lua.
                 let is_noop = {
                     let state = this.0.borrow();
                     let existing = match &state.modified {
@@ -320,9 +297,8 @@ impl UserData for ScopeAttrsProxy {
     }
 }
 
-/// `lua_to_value`, relabeled for a `scope` attribute write -- see
-/// `crate::resource::lua_to_resource_value` for why this is a string replace rather than a
-/// threaded parameter.
+/// `lua_to_value` with its error text relabeled for a `scope` attribute write, as
+/// `crate::resource::lua_to_resource_value` does.
 fn lua_to_scope_value(value: LuaValue) -> mlua::Result<logit_core::Value> {
     lua_to_value(value).map_err(|err| match err {
         mlua::Error::RuntimeError(msg) => {
