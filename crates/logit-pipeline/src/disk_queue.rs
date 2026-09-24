@@ -194,8 +194,8 @@ pub(crate) struct WalkOutcome {
 /// A `Truncated` failure is a torn tail only if nothing after it parses: `frame::read_frame`
 /// reports any in-cap `compressed_len` longer than the bytes present as `Truncated`
 /// (`crates/logit-proto/tests/frame_fixed_point.rs`'s
-/// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`), so a corrupt length mid-segment
-/// reads the same as a torn write. A torn tail stops the walk at the failed record
+/// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`, on `dur/w2`, #323), so a corrupt
+/// length mid-segment reads the same as a torn write. A torn tail stops the walk at the failed record
 /// (`good_len` is its start); a clean end and a torn tail look the same here, and the caller
 /// tells them apart by comparing `good_len` with the file's length.
 ///
@@ -2187,7 +2187,7 @@ mod tests {
     /// A length past everything written after it, but far under the frame layer's sanity cap, so
     /// `frame::read_frame` reports `Truncated` rather than `Malformed`
     /// (`crates/logit-proto/tests/frame_fixed_point.rs`'s
-    /// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`).
+    /// `a_compressed_len_corrupted_below_the_cap_reads_as_truncated`, on `dur/w2`, #323).
     const IN_CAP_CORRUPT_LEN: u32 = 1024 * 1024;
 
     async fn peek_within(q: &DiskQueue) -> Option<(Arc<EventBatch>, BatchContext)> {

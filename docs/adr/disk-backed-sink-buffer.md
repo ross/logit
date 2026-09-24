@@ -291,9 +291,10 @@ or freeze it; see ADR
 
 "Recovery" above says `MAX_SANE_COMPRESSED_LEN` keeps a corrupted length field from reading as
 `Truncated`. It does so only for a length over the 64 MiB cap. `frame::read_frame` reports any
-in-cap `compressed_len` longer than the bytes present as `Truncated`, exactly like a torn write
-(`crates/logit-proto/tests/frame_fixed_point.rs`'s
-`a_compressed_len_corrupted_below_the_cap_reads_as_truncated` pins this). So a record whose length
+in-cap `compressed_len` longer than the bytes present as `Truncated`, exactly like a torn write.
+`frame::read_frame_with_header`'s `Truncated` arm shows this directly, and
+`crates/logit-proto/tests/frame_fixed_point.rs`'s
+`a_compressed_len_corrupted_below_the_cap_reads_as_truncated` (`dur/w2`, #323) pins it. So a record whose length
 field was corrupted to, say, 1 MiB mid-segment stopped `DiskQueue::open`'s walk, and `open`
 truncated every real record after it out of the active segment: permanent loss. On a closed
 segment the same record made `peek` retry forever, on every restart.
