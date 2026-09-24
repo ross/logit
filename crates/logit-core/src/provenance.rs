@@ -3,21 +3,17 @@
 //! `Event::attributes` or `Resource` (`docs/design/pipeline-graph.md`'s "Provenance propagation"
 //! section, `docs/adr/batch-provenance-on-delivered.md`).
 //!
-//! Lives here rather than in `logit-pipeline` (where the closest precedent, `TraceContext`,
-//! lives) for two reasons: `logit-proto` has to name this type to encode/decode it, and cannot
-//! depend on `logit-pipeline` (the dependency runs the other way); and `logit-script` depends on
-//! `logit-core` only, so a type it can pass around directly here avoids the raw-byte-array
-//! workaround `crate::trace`/`logit_script::trace` needs for `TraceContext`. `TraceContext` stays
-//! in `logit-pipeline` because it carries real behavior (minting roots, deriving children);
-//! `Provenance` is inert data, the same character as `Symbol`/the interner it's built from -- all
-//! stamping *policy* (when to set which field) lives in `logit-pipeline::Fanout`, not here.
+//! Lives here, unlike `TraceContext`, because `logit-proto` must encode it and can't depend on
+//! `logit-pipeline`, and `logit-script` depends only on `logit-core`. It's inert data; the
+//! stamping policy lives in `logit-pipeline::Fanout`.
 
 use crate::interner::{resolve, Symbol};
 
-/// `origin`: the component that created the batch, set once and never mutated again.
-/// `previous`: the component the current node received the batch from, rewritten at every hop.
-/// Both `None` only when nothing in the graph has stamped a value yet (a `Fanout` with no
-/// component attached -- tests/benches that construct one directly).
+/// A batch's graph identity. Both fields are `None` only before anything stamps them (a `Fanout`
+/// built directly by a test or bench, with no component).
+///
+/// `origin` is the component that created the batch, set once. `previous` is the component the
+/// current node received it from, rewritten at every hop.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Provenance {
     pub origin: Option<Symbol>,
@@ -25,13 +21,12 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// `origin`, resolved back to its string. Panics if `origin` is `Some` but wasn't produced by
-    /// `crate::interner::intern` -- the same invariant `interner::resolve` itself documents.
+    /// `origin` as a string. Panics as [`crate::interner::resolve`] does.
     pub fn origin_str(&self) -> Option<&'static str> {
         self.origin.map(resolve)
     }
 
-    /// `previous`, resolved back to its string. See [`Provenance::origin_str`].
+    /// `previous` as a string. Panics as [`crate::interner::resolve`] does.
     pub fn previous_str(&self) -> Option<&'static str> {
         self.previous.map(resolve)
     }

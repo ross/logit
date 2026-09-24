@@ -5,7 +5,7 @@
 //! reason `docs/design/memory.md`'s "Fixtures" section gives: a `bytes::Bytes` promotes to its
 //! shared, atomically-refcounted representation on its *first* clone, so a value built fresh
 //! inside a timed loop would measure that one-time promotion instead of the refcount bump a real
-//! clone pays. [`shared_str`] memoizes and pre-promotes, so every `Value::Str` handed to a bench is
+//! clone pays. [`shared_str`] memoizes and pre-promotes, so every `Value::Str` a bench gets is
 //! already shared.
 //!
 //! **Widths** are `docs/design/data-shapes.md`'s own: 2 (a statsd/collectd metric event), 8 (the
@@ -14,10 +14,10 @@
 //! `jsonlog` access-log line).
 //!
 //! **Value mixes** come from the same survey: §2 puts string values at 50-88% of a parsed log
-//! record's attributes, the rest integers, floats and booleans. [`Mix::Mostly`] is 75% strings --
-//! the middle of that band -- and the two extremes bracket it. The mix matters to arm **C**
-//! specifically: a `Value::Str` clone is an atomic increment, a `Value::I64` clone is a register
-//! move, and any "bitwise copy the whole slice" fast path is only available to the latter.
+//! record's attributes, the rest integers, floats and booleans. [`Mix::Mostly`] is 75% strings,
+//! the middle of that band, and the two extremes bracket it. The mix matters most to arm **C**: a
+//! `Value::Str` clone is an atomic increment, a `Value::I64` clone is a register move, and a
+//! "bitwise copy the whole slice" fast path is only available to the latter.
 
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
@@ -31,9 +31,9 @@ pub const WIDTHS: [usize; 6] = [2, 8, 9, 12, 17, 30];
 /// How the values of a synthetic map are distributed across `Value` variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mix {
-    /// Every value a scalar (`I64`/`F64`/`Bool`/`Timestamp`) -- no heap, no refcount, and the only
-    /// mix where a bitwise copy of the whole entry slice is a legal clone. W2's
-    /// `attr_clone` group measured this one and only this one.
+    /// Every value a scalar (`I64`/`F64`/`Bool`/`Timestamp`): no heap, no refcount, and the only
+    /// mix where a bitwise copy of the whole entry slice is a legal clone. `size_vs_alloc.rs`'s
+    /// `attr_clone` group measures only this mix.
     Scalar,
     /// 75% `Value::Str`, the middle of the survey's 50-88% band; the rest scalars.
     Mostly,
@@ -68,8 +68,8 @@ impl Mix {
 /// Every mix, for a `divan` `args` list.
 pub const MIXES: [Mix; 3] = [Mix::Scalar, Mix::Mostly, Mix::AllStr];
 
-/// A `Value::Str` over an already-shared, already-promoted `Bytes`, memoized per string -- see this
-/// module's doc for why the memoization is load-bearing rather than a convenience.
+/// A `Value::Str` over an already-shared, already-promoted `Bytes`, memoized per string. The module
+/// doc says why the memoization matters.
 pub fn shared_str(s: &str) -> Value {
     static CACHE: OnceLock<Mutex<HashMap<String, Bytes>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -95,12 +95,14 @@ pub fn keys(prefix: &str, width: usize) -> Vec<Symbol> {
     keys
 }
 
-/// The same keys in a fixed, deliberately *unsorted* arrival order -- what a parser hands a map
-/// builder. Insertion order is not incidental: `AttrMap::insert_sym` is a binary search plus a
-/// positional `SmallVec::insert`, so ascending order is its best case (nothing ever moves) and a
-/// shuffled one is the realistic case. The stride is coprime with the width, so it visits every
-/// index exactly once without a random-number generator -- the same construction
-/// `benches/size_vs_alloc.rs` uses, kept identical so the two files' build numbers compare.
+/// The same keys in a fixed, *unsorted* arrival order.
+///
+/// `AttrMap::insert_sym` is a binary search plus a positional `SmallVec::insert`, so ascending
+/// order is its best case (nothing moves) and this shuffle a worse one. Most real sources deliver
+/// ascending order, because keys arrive in the interner's first-seen order (ADR
+/// `event-sizing-and-allocation-strategy`, "Consequences"). The stride is coprime with the width,
+/// so it visits every index once without a random-number generator: the same construction as
+/// `benches/size_vs_alloc.rs`'s `build_shape::keys`, so the two files' build numbers compare.
 pub fn shuffled(keys: &[Symbol]) -> Vec<Symbol> {
     let width = keys.len();
     if width == 0 {
@@ -111,11 +113,10 @@ pub fn shuffled(keys: &[Symbol]) -> Vec<Symbol> {
 }
 
 /// One value for slot `i` of a `width`-wide map under `mix`. String lengths follow
-/// `docs/design/data-shapes.md` §2's measured band (median 10-16 bytes, p90 26-37) rather than
-/// being chosen freely.
+/// `docs/design/data-shapes.md` §2's measured band (median 10-16 bytes, p90 26-37).
 pub fn value(mix: Mix, i: usize) -> Value {
     if mix.is_str(i) {
-        // 14 bytes at the median, 33 in the tail -- inside §2's measured bands.
+        // 14 bytes at the median, 33 in the tail: inside §2's measured bands.
         if i.is_multiple_of(5) {
             shared_str("Mozilla/5.0 (Macintosh; Intel M")
         } else {
@@ -138,7 +139,8 @@ pub fn scratch(prefix: &str, width: usize, mix: Mix) -> Vec<(Symbol, Value)> {
     keys.iter().enumerate().map(|(i, k)| (*k, value(mix, i))).collect()
 }
 
-/// Today's build, for the arms to be measured against: `insert_sym` per entry, in arrival order.
+/// The shipped build, for the arms to be measured against: `insert_sym` per entry, in arrival
+/// order.
 pub fn attr_map(scratch: &[(Symbol, Value)]) -> AttrMap {
     let mut map = AttrMap::new();
     for (k, v) in scratch {
@@ -152,11 +154,11 @@ pub fn attr_map(scratch: &[(Symbol, Value)]) -> AttrMap {
 /// **Not `sort_unstable`, and not `sort` alone.** `AttrMap::insert` is last-write-wins on a
 /// repeated key (`insert_sym`'s `Ok(i) => self.0[i].1 = value`), so a bulk build is only equivalent
 /// if it (a) sorts *stably*, preserving arrival order within a key, and (b) collapses each run to
-/// its **last** entry. `benches/size_vs_alloc.rs`'s `append_then_sort` mirror does neither -- it is
-/// measuring a build that would silently keep an arbitrary duplicate. The difference is not free
-/// (a stable sort allocates a scratch buffer past 20 elements, and the dedup is another pass), so
-/// any arm-P number taken from the simpler mirror is optimistic on inputs with repeated keys.
-/// `tests/attr_arms.rs`'s equivalence tests pin the semantics this function implements.
+/// its **last** entry. `benches/size_vs_alloc.rs`'s `append_then_sort` does neither, so it times a
+/// build that would keep an arbitrary duplicate. The difference isn't free (a stable sort allocates
+/// a scratch buffer past 20 elements, and the dedup is another pass), so an arm-P number from that
+/// bench is optimistic on inputs with repeated keys. `tests/attr_arms.rs`'s equivalence tests pin
+/// the semantics this function implements.
 pub fn bulk_build(scratch: &[(Symbol, Value)]) -> Vec<(Symbol, Value)> {
     let mut entries: Vec<(Symbol, Value)> = Vec::with_capacity(scratch.len());
     entries.extend_from_slice(scratch);
@@ -165,7 +167,7 @@ pub fn bulk_build(scratch: &[(Symbol, Value)]) -> Vec<(Symbol, Value)> {
     entries
 }
 
-/// Collapses each run of equal keys to its last entry, in place -- the last-write-wins half of
+/// Collapses each run of equal keys to its last entry, in place: the last-write-wins half of
 /// [`bulk_build`]'s equivalence with repeated `AttrMap::insert` calls.
 pub fn dedup_last(entries: &mut Vec<(Symbol, Value)>) {
     let mut write = 0usize;
@@ -186,21 +188,20 @@ pub fn dedup_last(entries: &mut Vec<(Symbol, Value)>) {
 // -- the mixed-gateway key-set distribution ------------------------------------------------------
 
 /// How many distinct key-sets the survey's mixed OTLP gateway carried
-/// (`docs/design/data-shapes.md` §4).
+/// (`docs/design/data-shapes.md` §5.4).
 pub const GATEWAY_SETS: usize = 196;
 
-/// A synthesized stream of key-sets matching the two numbers the survey reports for that gateway:
-/// **top-1 = 9%** of events and **top-5 = 36%**.
+/// A synthesized stream of key-sets matching the two numbers the survey reports for that gateway,
+/// rounded: **top-1 = 9%** of events and **top-5 = 36%** (§5.4 measured 9.5% and 36.1%).
 ///
-/// **How it was synthesized, and why it is not a plain Zipf.** Those two numbers are not
-/// simultaneously reachable by any single Zipf exponent over 196 sets: matching top-5 = 36%
-/// requires `s ≈ 0.245`, which puts the head at 1.4%, and matching top-1 = 9% requires `s ≈ 1.0`,
-/// which puts the top five at 45%. So this is a **two-component** distribution, stated rather than
-/// disguised: a head of five sets carrying 9/8/7/6/6% (= 36% exactly, top-1 = 9% exactly), and a
-/// Zipf tail (`s = 1`) over the remaining 191 sets scaled to the leftover 64%. Both reported
-/// numbers are then exact by construction, and the tail's *shape* -- the part the survey does not
-/// report -- is the assumption. A flatter tail would make a bounded cache look worse and a steeper
-/// one better, so any cache-hit-rate number from this fixture carries that assumption with it.
+/// **Two components, not a plain Zipf.** No single Zipf exponent over 196 sets reaches both
+/// numbers: matching top-5 = 36% requires `s ≈ 0.245`, which puts the head at 1.4%, and matching
+/// top-1 = 9% requires `s ≈ 1.0`, which puts the top five at 45%. So the head is five sets carrying
+/// 9/8/7/6/6% (36% in total, top-1 9%), and the tail is a Zipf (`s = 1`) over the remaining 191
+/// sets, scaled to the leftover 64%. Both reported numbers hold by construction; the tail's
+/// *shape*, which the survey doesn't report, is the assumption. A flatter tail would make a bounded
+/// cache look worse and a steeper one better, so any cache-hit-rate number from this fixture
+/// carries that assumption.
 ///
 /// Widths are drawn deterministically from 8-17, the OTLP span band §4 measures (p50 8, p90 17).
 pub struct Gateway {
@@ -235,7 +236,7 @@ impl Gateway {
         }
         for rank in 1..=(GATEWAY_SETS - head.len()) {
             let share = 0.640 / ((rank + head.len()) as f64 * tail_harmonic);
-            // Every tail set appears at least once, so the cache really sees 196 distinct sets.
+            // Every tail set appears at least once, so the cache sees all 196 distinct sets.
             counts.push(((events as f64 * share).round() as usize).max(1));
         }
 

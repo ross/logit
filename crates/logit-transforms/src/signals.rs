@@ -1,31 +1,23 @@
-//! `has_signal`/`keep_signals`/`drop_signals`: signal-type-aware transforms. Exist so a sink that
-//! only wants one signal (a traces-only backend like Tempo, a logs-only backend like Loki) can be
-//! fed correctly without teaching every `_out` component its own filtering config -- see ADR
-//! `signal-filtering-components` for why this is a component, not a sink field.
+//! `has_signal`/`keep_signals`/`drop_signals`: feed a single-signal sink (Tempo for traces, Loki
+//! for logs) without a filtering field on every `_out`. See
+//! `docs/adr/signal-filtering-components.md`.
 //!
-//! Two *kinds* of operation, not one, because of `docs/adr/multi-payload-events.md`: a single
-//! `Event` can carry a log, metrics, and a span at once, so "filter by signal" is ambiguous
-//! between "should this event be here at all" and "which of this event's payloads belong here."
-//! `HasSignal` answers the first without ever mutating an event; `KeepSignals`/`DropSignals`
-//! answer the second by clearing disallowed payload slots, mirroring `crate::keep`'s
-//! allowlist/denylist split for attributes.
+//! One `Event` can carry a log, metrics, and a span at once (`docs/adr/multi-payload-events.md`),
+//! so "filter by signal" is two questions. `HasSignal` answers "should this event be here" and
+//! never mutates it; `KeepSignals`/`DropSignals` answer "which payloads belong here" by clearing
+//! payload slots, as `keep`/`remove` do for attributes.
 //!
-//! All three drop an event that ends up carrying nothing -- for `HasSignal` because it never
-//! matched a listed signal to begin with, for `KeepSignals`/`DropSignals` because stripping left
-//! no payload behind. `Transform::process`'s `false` already means "don't forward"
-//! (`crates/logit-pipeline/src/transform.rs`), and an all-dropped batch simply sends nothing
-//! downstream (`crates/logit-pipeline/src/runtime.rs`'s `process_batch`) -- no runtime change was
-//! needed to support this.
+//! All three drop an event that ends up carrying nothing: for `HasSignal` because no listed signal
+//! matched, for the other two because stripping left no payload.
 
 use logit_core::{Event, Resource, Telemetry};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// Which payload slots a signal-aware transform acts on. Named for OTLP's signals
-/// (`logit_proto::Signal`), not `Event`'s field names -- `traces` corresponds to `event.span`.
-/// `logit-transforms` depends on neither `logit-config` nor `logit-proto`
-/// (`crates/logit-transforms/Cargo.toml`), so this is its own type, built from config in
-/// `logit-cli::pipeline::build_spec` the same way `to_metric_specs` builds `MetricSpec`.
+/// Which payload slots a signal-aware transform acts on.
+///
+/// Named for OTLP's signals, not `Event`'s fields: `traces` is `event.span`. `logit-cli`'s
+/// `build_spec` builds it from config.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SignalSet {
     pub logs: bool,
@@ -39,10 +31,11 @@ impl SignalSet {
     }
 }
 
-/// `HasSignal`'s matching rule. `AnyOf` forwards an event carrying at least one listed signal;
-/// `Only` additionally requires the event carry nothing outside the listed set. Both require at
-/// least one listed signal be present, so an empty event is always dropped under either mode, and
-/// `Only` can never be satisfied vacuously by an event with no payload at all.
+/// `HasSignal`'s matching rule.
+///
+/// `AnyOf` forwards an event carrying at least one listed signal; `Only` also requires nothing
+/// outside the listed set. Both require a listed signal to be present, so an event with no payload
+/// is dropped under either mode rather than satisfying `Only` vacuously.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MatchMode {
     #[default]
@@ -50,10 +43,10 @@ pub enum MatchMode {
     Only,
 }
 
-/// Drops an event that doesn't carry a wanted signal. Never mutates a forwarded event -- an event
-/// matched under `MatchMode::AnyOf` keeps every payload it arrived with, including ones not
-/// listed in `signals`. Use `KeepSignals` instead when disallowed payloads must actually be
-/// removed, not just tolerated.
+/// Drops an event that doesn't carry a wanted signal.
+///
+/// Never mutates a forwarded event: under `MatchMode::AnyOf` it keeps unlisted payloads too. Use
+/// `KeepSignals` to remove them.
 pub struct HasSignal {
     signals: SignalSet,
     mode: MatchMode,
@@ -65,8 +58,7 @@ impl HasSignal {
         Self { signals, mode, telemetry: Telemetry::default() }
     }
 
-    /// See [`crate::keep::Keep::with_telemetry`] -- same reasoning, no `Diagnostics` here either:
-    /// nothing about matching a fixed signal set can fail.
+    /// Attaches a telemetry handle; matching a fixed signal set can't fail, so no `Diagnostics`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -99,8 +91,8 @@ impl Transform for HasSignal {
     }
 }
 
-/// Retains only the listed signals' payloads on every event, clearing the rest -- an allowlist,
-/// the same relationship to `DropSignals` that `crate::keep::Keep` has to `crate::keep::Remove`.
+/// Retains only the listed signals' payloads on every event, clearing the rest (an allowlist).
+///
 /// Drops an event whose payload is entirely stripped away.
 pub struct KeepSignals {
     signals: SignalSet,
@@ -124,8 +116,9 @@ impl Transform for KeepSignals {
     }
 }
 
-/// Clears the listed signals' payloads on every event, keeping the rest -- a denylist. Drops an
-/// event whose payload is entirely stripped away.
+/// Clears the listed signals' payloads on every event, keeping the rest (a denylist).
+///
+/// Drops an event whose payload is entirely stripped away.
 pub struct DropSignals {
     signals: SignalSet,
     telemetry: Telemetry,
@@ -144,8 +137,6 @@ impl DropSignals {
 
 impl Transform for DropSignals {
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
-        // `DropSignals` clears exactly what `KeepSignals` would discard -- the complement of its
-        // own `signals` set is what survives.
         let complement = SignalSet {
             logs: !self.signals.logs,
             metrics: !self.signals.metrics,
@@ -155,9 +146,10 @@ impl Transform for DropSignals {
     }
 }
 
-/// Shared by [`KeepSignals`] and [`DropSignals`]: clears every payload slot not named in `keep`,
-/// records `logit.transform.payloads.stripped{signal}` for each slot actually cleared, and drops
-/// the event (returns `false`) if nothing survives.
+/// Clears every payload slot not named in `keep`; `false` (drop) if nothing survives.
+///
+/// Records `logit.transform.payloads.stripped{signal}` per slot cleared, and
+/// `logit.transform.events.filtered` on a drop.
 fn strip(event: &mut Event, keep: SignalSet, telemetry: &Telemetry) -> bool {
     if event.log.is_some() && !keep.logs {
         event.log = None;

@@ -1,43 +1,27 @@
 #!/usr/bin/env python3
 """Fold a `shape.log` capture into `summary.json` + `summary.md`, for `script/shape-survey`.
 
-Parses `stdio_out`/`file_out`'s human render (`crates/logit-outputs/src/stdio.rs`) -- the only
-text output in `logit` that emits **raw metric values** rather than re-sketched quantiles, which
-is why a survey writes its capture through `file_out` and reads it back here rather than through
-`influxdb_out` or `prometheus_out`.
+Parses `stdio_out`/`file_out`'s human render (`crates/logit-outputs/src/stdio.rs`), the only text
+output in `logit` that emits raw metric values rather than re-sketched quantiles.
 
 What it does with each `logit.shape.*` record, per series (a series being the metric name plus the
 `signal`/`source`/`tap` tags `shape` stamps):
 
-  samples=[...]  concatenated across every flush window in the capture -- these are raw
-                 observations, one per event (or per batch), and a survey wants the whole
-                 population, not a per-window summary of it
+  samples=[...]  concatenated across every flush window: raw observations, one per event (or
+                 per batch), so the summary covers the whole population
   sum=           summed (a counter, delta temporality from `aggregate`)
   gauge=         last value wins (cumulative-since-start gauges: distinct keys, key-set shares)
 
-**A sketched `logit.shape.*` series is a hard failure.** `aggregate` falls back from raw retention
-to a `DdSketch` past `max_samples_per_series`, which renders as `distribution count=N p50=...`;
-every distribution in this output would then be a silently truncated, silently approximated
-answer to the question the survey is asking. Rather than summarize that, this exits non-zero and
-names the series, so the config's `max_samples_per_series` gets raised instead.
+A sketched `logit.shape.*` series is a hard failure. Past `max_samples_per_series`, `aggregate`
+falls back to a `DdSketch` (`distribution count=N p50=...`), which would make every distribution
+silently approximate. This exits non-zero and names the series, so the config's cap gets raised.
 
-Percentiles are **nearest-rank** (the smallest value at or above the p-th position of the sorted
-sample), stated as such in the output. A p99 is refused below 100 values and a p90 below 10 --
-printed `n/a`, never a number computed from too few observations to mean one -- and every table
-carries its own value count beside it.
+Percentiles are nearest-rank. A p99 prints `n/a` below 100 values and a p90 below 10, and every
+table carries its own value count.
 
-Stdlib only, so it runs in a bare `python:3.12-slim` with no `pip install` step, the same
-constraint `tools/record-fixtures/raw_capture.py` has.
-
-Every summary opens with its run's **representativeness banner**, read from `provenance.txt`'s
-`representativeness:` line (which `lib.sh` requires every producer to supply). That is deliberate
-placement rather than a footnote: these numbers get quoted and pasted, and a measurement of a
-stack this project built to demonstrate itself says something very different from a measurement of
-a third-party producer. The banner travels with the table, so the two cannot be confused later.
-
-`--source-labels` optionally adds a per-source column saying where each source's *format* came
-from -- a tier logging in its own software's default shape is evidence about that software, and a
-tier logging in a format this repo authored is partly a measurement of our own choices.
+Every summary opens with the representativeness banner from `provenance.txt` (README
+"Representativeness is structural"). `--source-labels` adds a per-source table of where each
+source's format came from. Stdlib only.
 
 Usage:
     summarize.py --shape-log /out/shape.log --out-dir /out --provenance /out/provenance.txt
@@ -55,8 +39,8 @@ from collections import Counter, OrderedDict
 #: is identified by its metric name plus these, in this order.
 TAG_KEYS = ("signal", "source", "tap")
 
-#: The attribute-count thresholds the survey exists to answer (`AttrMap`'s inline capacity is 8
-#: today; docs/design/memory.md §8). Reported as "fraction of events wider than this".
+#: Attribute-count thresholds around `AttrMap`'s inline capacity of 8 (docs/design/memory.md,
+#: "Recommendations"). Reported as "fraction of events wider than this".
 WIDTH_THRESHOLDS = (4, 8, 12, 16)
 
 #: Below this many values a p99 is not printed at all, and below `MIN_FOR_P90` a p90 is not.
@@ -93,11 +77,10 @@ def parse_quoted(text: str, i: int) -> tuple[str, int]:
 def skip_container(text: str, i: int) -> int:
     """Returns the index just past the `[...]`/`{...}` that starts at `text[i]`.
 
-    `render_value` renders a `Value::Array` as `[a, b]` and a `Value::Map` as `{k=v, k=v}`, both
-    recursively -- so a container can hold containers, and either can hold a quoted string that
-    itself contains a bracket, a brace, a comma or a space. The only way to find a container's end
-    is to walk it, counting nesting and stepping over quoted strings whole (which is what
-    `parse_quoted` is for: a `\\"` inside one must not be mistaken for its terminator).
+    `render_value` renders a `Value::Array` as `[a, b]` and a `Value::Map` as `{k=v, k=v}`,
+    recursively, and either can hold a quoted string containing a bracket, brace, comma, or space.
+    So this walks the container, counting nesting and stepping over quoted strings whole (a `\\"`
+    inside one isn't its terminator).
     """
     closers = {"[": "]", "{": "}"}
     stack = [closers[text[i]]]
@@ -134,11 +117,9 @@ def parse_value(text: str, i: int) -> tuple[str, int]:
     | `null`/`true`/`-1`/`.5` | `Null`/`Bool`/ints/floats   | the next space              |
     | `2026-09-20T…Z`         | `Timestamp`                 | the next space              |
 
-    A string is returned decoded; a container is returned as its raw rendered text, which is all
-    this summary ever needs of one (nothing under `TAG_KEYS` is a container). The three
-    space-bearing forms -- a quoted string, a container, and `Bytes`'s `<N bytes>` -- are exactly
-    why an `attrs` line cannot be split on whitespace, and why this is a scanner rather than a
-    `str.split`.
+    A string is returned decoded; a container as its raw rendered text, since nothing under
+    `TAG_KEYS` is a container. The three space-bearing forms (a quoted string, a container, and
+    `<N bytes>`) are why an `attrs` line can't be split on whitespace.
     """
     c = text[i]
     if c == '"':
@@ -160,14 +141,12 @@ def parse_value(text: str, i: int) -> tuple[str, int]:
 def parse_attrs(text: str) -> dict[str, str]:
     """Parses one `attrs` line's space-separated `key=value` pairs.
 
-    `render_attrs`/`render_merged_attrs` write `key=value` pairs separated by a single space, the
-    key through `render_key` (bare when identifier-shaped, quoted and escaped otherwise) and the
-    value through `render_value`. Both sides can therefore contain spaces, `=`, commas, brackets
-    and quotes, so both are read by a scanner that knows the grammar -- see `parse_value`.
+    `render_attrs`/`render_merged_attrs` write space-separated pairs, the key through `render_key`
+    (bare when identifier-shaped, quoted otherwise) and the value through `render_value`, so both
+    sides can contain spaces, `=`, commas, brackets, and quotes (see `parse_value`).
 
-    Values are returned as text: decoded for a string, raw rendered text for an array or a map.
-    Only `TAG_KEYS` are ever read back out, and `shape`'s own tags are all plain strings; the rest
-    are parsed to find where the next pair starts, not for their content.
+    Only `TAG_KEYS` are read back out; the other pairs are parsed only to find where the next one
+    starts.
     """
     attrs: dict[str, str] = {}
     i = 0
@@ -229,9 +208,7 @@ def parse(text: str) -> "OrderedDict[tuple, Series]":
         body = line[len("metric ") :].strip()
         name, _, rendered = body.partition(" ")
         if not name.startswith("logit.shape."):
-            # Anything else sharing the sink (a pipeline's own `internal` leg, say) is not this
-            # survey's subject. Skipped rather than an error: a producer is free to point other
-            # traffic at the same file_out.
+            # Skipped, not an error: a producer may point other traffic at the same file_out.
             continue
         entry = series.setdefault((name, *(tags.get(k, "") for k in TAG_KEYS)), Series(name, tags))
 
@@ -281,9 +258,7 @@ def describe(values: list[float]) -> dict:
         "p99": nearest_rank(ordered, 0.99) if n >= MIN_FOR_P99 else None,
     }
     if all(float(v).is_integer() for v in ordered):
-        # An exact value->count table, which for a count-shaped series (attributes per event,
-        # events per batch) is strictly more informative than any percentile -- the survey's
-        # whole question is "what fraction sits at or above N", and this answers it for every N.
+        # An exact value->count table answers "what fraction sits at or above N" for every N.
         stats["histogram"] = {str(int(v)): c for v, c in sorted(Counter(ordered).items())}
     return stats
 
@@ -308,8 +283,7 @@ def render_markdown(summary: dict) -> str:
     out: list[str] = []
     out.append("# Event-shape survey")
     out.append("")
-    # The banner, before any number -- see this module's docstring. A run with no
-    # representativeness line at all says so loudly rather than opening with a bare table.
+    # The banner comes before any number; a missing one says so rather than opening with a table.
     banner = summary.get("representativeness")
     out.append(f"> **Representativeness:** {banner}" if banner else
                "> **Representativeness: not stated** -- this run's provenance.txt carried no"
@@ -415,10 +389,7 @@ def render_markdown(summary: dict) -> str:
             )
         out.append("")
 
-    # The producer's own section, last: everything above is the general engine's, and a reading
-    # that needs to know what the source *is* ("series per scrape, per exporter") belongs to the
-    # producer that knows it. It is appended verbatim rather than re-rendered here, which is what
-    # keeps this file free of anything producer-specific.
+    # The producer's own section, last and verbatim, which keeps this file producer-agnostic.
     section = summary.get("producer_section")
     if section:
         out.append(section.rstrip("\n"))
@@ -430,8 +401,7 @@ def render_markdown(summary: dict) -> str:
 def read_provenance(path: pathlib.Path | None) -> dict:
     """The banner fields out of a run's provenance.txt: `producer`, `representativeness`, `captured`.
 
-    A trivial `name: value` read of the file `lib.sh` writes, not a general parser -- everything
-    else in that file is for a human reading the run directory, not for this summary.
+    A `name: value` read; the rest of the file is for a human reading the run directory.
     """
     fields: dict = {}
     if path is None or not path.is_file():
@@ -474,10 +444,8 @@ def summarize(series: "OrderedDict[tuple, Series]") -> dict:
 
 # ---- self-test -----------------------------------------------------------------------------------
 
-#: A verbatim excerpt of a real `shape.log` (the interop producer's own first run), kept here so a
-#: change to `stdio_out`'s human render fails this test rather than silently producing an empty
-#: summary from a capture that took real traffic to collect. `script/shape-survey` runs
-#: `--self-test` before every survey for exactly that reason.
+#: A verbatim excerpt of a real `shape.log` from the interop producer, so a change to `stdio_out`'s
+#: human render fails this test. `script/shape-survey` runs `--self-test` before every survey.
 SELF_TEST_RENDER = """2026-09-20T15:56:20.153724900Z
   attrs   signal="metric" source="statsd_in" tap="tap_input"
   metric  logit.shape.events sum=3 temporality=delta monotonic=true
@@ -498,18 +466,14 @@ SELF_TEST_RENDER = """2026-09-20T15:56:20.153724900Z
 """
 
 
-#: A second excerpt, structurally verbatim from a real `resource: keep` capture (the `oteldemo`
-#: producer's second, opt-in run, whose tap forwards the observed `Resource` so every resource
-#: attribute the OTel SDKs' `resource_detection` stamped lands on each record's `attrs` line).
-#: **The structure is the capture's; the values are not** -- hostnames, container ids, paths,
-#: pids, command lines and kernel strings are replaced with neutral placeholders, because
-#: `shape`'s whole contract is that a survey output can leave an environment the traffic could
-#: not, and that holds for a test fixture quoting one.
+#: A second excerpt, structurally verbatim from a real `oteldemo` `resource: keep` capture, where
+#: every resource attribute lands on each record's `attrs` line. The structure is the capture's;
+#: the values are neutral placeholders, because a fixture quoting a capture must not carry the
+#: identity `shape`'s output never does.
 #:
-#: Everything here is a real shape `parse_attrs` has to survive: an array of strings holding
-#: commas, spaces and an `=` (`process.command_args`, on the resource of every OTel SDK that
-#: detects a process -- which is what made a `resource: keep` capture unparseable), a bare integer
-#: beside it, empty quoted strings, and a quoted string carrying spaces, `=` and `:`.
+#: It holds what `parse_attrs` has to survive: an array of strings holding commas, spaces, and an
+#: `=` (`process.command_args`, on the resource of every OTel SDK that detects a process), a bare
+#: integer beside it, empty quoted strings, and a quoted string carrying spaces, `=`, and `:`.
 SELF_TEST_RESOURCE_KEEP = """2026-09-20T20:43:57.818255215Z
   attrs   signal="log" source="otlp_gateway" tap="tap_input" process.pid=1 process.executable.path="/opt/app/bin/node" process.command_args=["/opt/app/bin/node", "--require=./Instrumentation.js", "/app/server.js"] process.command_line="/opt/jdk/bin/java -javaagent:/app/agent.jar -Xmx200m example.Service" host.name="host-placeholder" container.id="0000000000000000000000000000000000000000000000000000000000000000" service.name="frontend" os.description="Linux host-placeholder 0.0.0-0 #1 SMP PLACEHOLDER x86_64" host.cpu.cache.l2.size=1024 zone_name="" cluster_name=""
   metric  logit.shape.attributes samples=[11,9] rate=1
@@ -520,12 +484,11 @@ SELF_TEST_RESOURCE_KEEP = """2026-09-20T20:43:57.818255215Z
   metric  logit.shape.attributes samples=[7] rate=1
 """
 
-#: The remaining `Value` variants `render_value` can put on an `attrs` line, which no capture in
-#: hand happens to contain but any one of them could: a nested array, a `Value::Map` (what a
-#: `syslog_in` structured-data element becomes) including a nested one, a `Value::Bytes` (rendered
-#: `<N bytes>` -- bare, *with a space in it*), a quoted key needing quotes, and a string value
-#: carrying the delimiters `[`, `]`, `{`, `}`, `,`, `=`, a space and an escaped quote. Synthetic,
-#: and labelled as such: it is a grammar test, not a measurement.
+#: The remaining `Value` variants `render_value` can put on an `attrs` line: a nested array, a
+#: `Value::Map` (a `syslog_in` structured-data element) including a nested one, a `Value::Bytes`
+#: (`<N bytes>`, bare, with a space in it), a key needing quotes, and a string value carrying
+#: `[`, `]`, `{`, `}`, `,`, `=`, a space, and an escaped quote. Synthetic: a grammar test, not a
+#: measurement.
 SELF_TEST_EXOTIC_VALUES = """2026-09-20T20:43:57.818255215Z
   attrs   signal="metric" nested=[1, [2, 3], {a=1, b=[4, 5]}] sd={origin={ip="10.0.0.1", port=514}, note="a=b, c=d"} blob=<12 bytes> "odd key"="[{x=1}], \\"quoted\\"" source="syslog_in" tap="tap_input" trailing=true
   metric  logit.shape.attributes samples=[6] rate=1
@@ -564,8 +527,7 @@ def self_test() -> None:
     assert len(summary["attribute_widths"]) == 1, summary["attribute_widths"]
     assert "Attribute width per event" in render_markdown(summary)
 
-    # The banner, and the loud absence of one. A summary that opened with a bare table would let a
-    # number from a stack we built to demo ourselves be read as evidence about the world.
+    # The banner, and the stated absence of one.
     assert "Representativeness: not stated" in render_markdown(summary)
     banner = dict(summary, representativeness="own demo stack -- harness exercise", producer="demo")
     rendered = render_markdown(banner)
@@ -598,13 +560,11 @@ def self_test() -> None:
 def self_test_attrs_grammar() -> None:
     """The `attrs`-line grammar, over every `Value` variant `render_value` can emit.
 
-    This half exists because the parser used to split an `attrs` line as if a value never
-    contained a space unless it was quoted. An **array** value breaks that: it is rendered bare,
-    `[a, b]`, with spaces and commas inside, and its elements can be quoted strings carrying an
-    `=`. The old parser walked into the middle of one looking for the next key's `=`, found the
-    one inside `--require=./Instrumentation.js`, and asserted -- which made every `resource: keep`
-    capture unsummarizable, since `process.command_args` rides on the resource of every OTel SDK
-    that detects a process. `Value::Map` and `Value::Bytes` (`<12 bytes>`) have the same property.
+    An unquoted value can contain a space: an array renders bare, `[a, b]`, and its elements can
+    be quoted strings carrying an `=` (`--require=./Instrumentation.js` in
+    `process.command_args`, on every OTel SDK resource that detects a process). `Value::Map` and
+    `Value::Bytes` (`<12 bytes>`) have the same property. A parser that splits on the next `=`
+    breaks every `resource: keep` capture.
     """
     keep = parse(SELF_TEST_RESOURCE_KEEP)
 
@@ -625,7 +585,7 @@ def self_test_attrs_grammar() -> None:
     assert (attrs["signal"], attrs["source"], attrs["tap"]) == ("log", "otlp_gateway", "tap_input")
 
     # Two blocks, same series key (the resource is not part of it, by design), so the samples
-    # concatenate exactly as they do for a `resource: drop` capture.
+    # concatenate as they do for a `resource: drop` capture.
     kept = keep[("logit.shape.attributes", "log", "otlp_gateway", "tap_input")]
     assert kept.samples == [11.0, 9.0, 7.0], kept.samples
     assert keep[("logit.shape.events", "log", "otlp_gateway", "tap_input")].total == 2.0

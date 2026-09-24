@@ -119,7 +119,7 @@ condition unrecoverable even if the call had been repeated: `watch_dir` short-ci
 rename produced no event at all.
 
 Every pattern directory is now armed on **every** `scan`; `watched_dirs` records what is armed
-rather than what was wanted; a failure is diagnosed (`watch_error`, with the errno) and retried on
+rather than what was wanted; a failure is diagnosed (`watch_dir_error`, with the errno) and retried on
 the next scan. The kernel facts this rests on, each verified against v6.12
 `fs/notify/inotify/inotify_user.c` and `inotify(7)` rather than assumed:
 

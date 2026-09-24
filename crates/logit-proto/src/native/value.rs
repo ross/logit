@@ -1,14 +1,9 @@
 //! `Value`/`AttrMap` wire encoding: every value is `tag(1) + len(varint) + payload(len bytes)`.
 //!
-//! The `len` prefix is what makes an unrecognized tag skippable -- a future `Value` variant this
-//! reader doesn't know about can still be stepped over by byte count, so the rest of the
-//! surrounding structure (sibling attributes, other event fields) decodes normally. There is no
-//! `Value::Unknown` escape hatch to return in that case (`Value` is a closed enum with no
-//! extensibility variant, `docs/design/data-model.md`'s own open question), so an unrecognized tag
-//! decodes to [`Value::Null`] -- the same "absent" sentinel `docs/design/data-model.md`'s
-//! well-known-attributes table already documents for `""`/`"-"`, not a new convention invented
-//! here. This degrades a value this reader can't represent rather than corrupting the byte stream
-//! trying to skip it blindly.
+//! The `len` prefix makes an unrecognized tag skippable by byte count, so sibling attributes and
+//! later fields still decode. `Value` has no `Unknown` variant (`docs/design/data-model.md`), so an
+//! unrecognized tag decodes to [`Value::Null`], the "absent" sentinel data-model.md already uses
+//! for `""`/`"-"`.
 
 use bytes::{Buf, Bytes, BytesMut};
 use logit_core::{AttrMap, Value};
@@ -28,14 +23,10 @@ const TAG_TIMESTAMP: u8 = 7;
 const TAG_ARRAY: u8 = 8;
 const TAG_MAP: u8 = 9;
 
-/// The deepest `Value::Array`/`Value::Map` nesting this reader will follow. Generous -- real
-/// telemetry attribute values are flat or one level deep, and this is in the same range as
-/// `serde_json`'s own 128-level recursion limit, which bounds the deepest `Value` the `json`
-/// transform can construct in the first place -- but bounded, because the decode side is
-/// recursive: without a cap, a crafted payload of nothing but nested array headers overflows the
-/// stack and aborts the process rather than returning an error. Encode-side (`write_value`) is
-/// deliberately NOT capped: it only ever encodes a `Value` that already exists in memory, so a
-/// depth that would overflow the encoder would already have overflowed whatever built the value.
+/// The deepest `Value::Array`/`Value::Map` nesting the recursive decoder follows. Without a cap, a
+/// crafted payload of nested array headers overflows the stack and aborts the process. It sits
+/// near `serde_json`'s 128-level limit, which bounds what the `json` transform can build.
+/// `write_value` isn't capped: a `Value` too deep to encode couldn't have been built.
 const MAX_VALUE_DEPTH: usize = 128;
 
 pub fn write_value(out: &mut BytesMut, dict: &mut DictBuilder, value: &Value) {
@@ -161,10 +152,8 @@ fn read_value_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Value, 
             Ok(Value::Array(items))
         }
         TAG_MAP => Ok(Value::Map(Box::new(read_attr_map_at(&mut payload, dict, depth + 1)?))),
-        // Forward compatibility: a tag this reader doesn't recognize (a future Value variant)
-        // was still framed as tag+len+payload, so the `len`-byte skip above already consumed it
-        // in full -- there is nothing left to do but degrade to the documented "absent" sentinel.
-        // See this module's own doc comment for why Null, not an error.
+        // An unrecognized tag: the `len`-byte skip above already consumed it, so degrade to
+        // Null (see the module doc).
         _unknown => Ok(Value::Null),
     }
 }
@@ -261,18 +250,14 @@ mod tests {
         assert_eq!(out, map);
     }
 
-    /// The version-skew gate: a `Value` tag this reader doesn't recognize must decode to `Null`
-    /// and leave every byte after it correctly positioned -- proven here by putting a real value
-    /// right after the unknown one and confirming it still reads back exactly.
+    /// An unrecognized `Value` tag decodes to `Null`, and the value after it still reads back.
     #[test]
     fn an_unrecognized_value_tag_degrades_to_null_without_corrupting_what_follows() {
         let mut buf = BytesMut::new();
-        // A value tag (200) no version of this codec will ever assign, with a 3-byte payload a
-        // future variant might plausibly have used.
+        // Tag 200 is unassigned.
         buf.extend_from_slice(&[200]);
         write_uvarint(&mut buf, 3);
         buf.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
-        // A real, known value immediately after it.
         write_value(&mut buf, &mut DictBuilder::default(), &Value::I64(99));
 
         let mut bytes = buf.freeze();

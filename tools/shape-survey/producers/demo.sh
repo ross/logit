@@ -1,54 +1,25 @@
-# The `demo` producer: run `demo/`'s own stack, tapped, for a quarter of an hour.
+# The `demo` producer: `demo/`'s own stack, tapped, for 15 minutes by default.
 #
-# Sourced by script/shape-survey, which discovers this file by glob. Everything specific to this
-# producer lives here -- there is no `configs/demo*.yaml`, because the config is *generated* from
-# demo/logit.yaml at run time (see `survey_demo_config`) and lives in the run directory as an
-# artifact. A committed second copy would have to be kept in step with demo/logit.yaml by hand,
-# and would be wrong the first time either changed.
+# There is no configs/demo*.yaml: `survey_demo_config` generates the tapped config from
+# demo/logit.yaml at run time, so no committed copy has to be kept in step. demo/ itself is never
+# modified; tools/shape-survey/demo-overlay.yaml mounts the generated config and changes nothing
+# else.
 #
-# **`demo/` itself is never modified.** The taps go into a generated copy of its config, mounted
-# over `/config.yaml` by tools/shape-survey/demo-overlay.yaml, which changes nothing else about
-# the stack.
+# Representativeness: the weakest evidence in the harness, and some tiers' formats were authored
+# in this repo. See README "Representativeness is structural". `survey_demo_tiers` labels each
+# tier's format origin, and the summary prints that table above the numbers.
 #
-# ---------------------------------------------------------------------------------------------
-# WHAT THESE NUMBERS ARE WORTH, AND WHY THE CAVEAT IS STRUCTURAL
-#
-# This is the harness's best end-to-end exercise: six tiers, three signals, real software, real
-# rotation, real Docker json-file logs, a real transform chain per tier. It is **not** evidence
-# about production shape, and it must not be quoted as though it were:
-#
-#   * The stack exists to demonstrate `logit`. Its tiers were chosen to show components off, not
-#     because that is how anybody's estate is built, and several of them are configured for
-#     visibility rather than the way an operator would run them (Postgres at
-#     `log_min_duration_statement=0`, rotation every few minutes, one request generator).
-#   * Some of the formats being measured **were written by this project**. nginx's JSON
-#     `log_format`, the Django app's logging config and the Celery worker's are ours; measuring
-#     the width of an event whose field list we chose is circular, and says what we picked, not
-#     what the world sends. `survey_demo_source_labels` below labels every tier with where its
-#     format came from, and summarize.py prints that table above the numbers.
-#
-# So this producer states its representativeness in provenance.txt, summarize.py turns that into
-# the banner at the top of summary.md, and the per-tier format-origin table sits above the first
-# distribution. None of that is a footnote a reader can skip past on the way to a percentile --
-# which is the point. In docs/plans/data-shape-survey.md's grading these rows are Measured/Demo:
-# highest fidelity, lowest representativeness.
-# ---------------------------------------------------------------------------------------------
+# Environment: SHAPE_SURVEY_DURATION (default 900s); INFLUXDB_TOKEN (read by both the validation
+# step and demo/compose.yaml, each defaulting to `logit-demo-token`).
 
-#: How long the stack runs before SIGTERM, in seconds. 15 minutes by default (the plan's box);
-#: `SHAPE_SURVEY_DURATION=180 script/shape-survey demo` for a quick verification run. demo/'s
-#: `traffic` service is steady from its first ~16s cycle, so a short run is a smaller sample of
-#: the same thing rather than a different thing.
+#: Seconds the stack runs before SIGTERM. demo/'s `traffic` service is steady from its first ~16s
+#: cycle, so a short `SHAPE_SURVEY_DURATION` run is a smaller sample of the same thing.
 SHAPE_SURVEY_DEMO_DURATION_DEFAULT=900
 
 # The tiers, as `<input component>|<post-parse component>|<tier>|<where its format came from>`.
-# The first two are what the two taps attach to; the last two are what
-# `survey_demo_source_labels` writes for the summary.
-#
-# "software's own default" versus "authored in this repo" is the distinction that decides whether
-# a row is evidence about anything outside this repository. Postgres's jsonlog, Redis's log line,
-# HAProxy's `option httplog` and Docker's json-file envelope are those projects' own formats,
-# configured on but not designed here. nginx's `log_format` and the Django/Celery logging configs
-# are ours.
+# The taps attach to the first two; `survey_demo_source_labels` writes the last two. "Software
+# default" versus "authored in this repo" decides whether a row is evidence about anything outside
+# this repository.
 survey_demo_tiers() {
     cat <<'EOF'
 haproxy_in|haproxy_trace|haproxy|haproxy's own `option httplog` line (software default, configured on here)
@@ -74,10 +45,8 @@ survey_demo_source_labels() {
     echo "}"
 }
 
-# Generates the tapped config from demo/logit.yaml. Appended, not rewritten: `components:` is the
-# last top-level key in that file, so more two-space-indented entries at the end of it join the
-# same mapping -- which keeps this a purely additive transformation with nothing to re-derive if
-# demo/logit.yaml changes shape.
+# Generates the tapped config from demo/logit.yaml by appending. This relies on `components:`
+# being that file's last top-level key, so two-space-indented entries at the end join its mapping.
 survey_demo_config() {
     local out="$1" inputs=() landed=() input landed_name tier format
     while IFS='|' read -r input landed_name tier format; do
@@ -90,16 +59,11 @@ survey_demo_config() {
     cat >>"${out}" <<EOF
 
   # ---- appended by tools/shape-survey/producers/demo.sh; NOT part of demo/logit.yaml ----------
-  # Two taps per the survey's design (docs/plans/data-shape-survey.md): one straight off each
-  # tier's listener, one after that tier's own parse chain, so the widening a chain does is a
-  # measured difference rather than an assumption. \`shape\` tags every measurement with the
-  # batch's provenance \`source\`, so all six tiers share one component per tap and stay
-  # distinguishable downstream.
+  # Two taps: one off each tier's listener, one after its parse chain. \`shape\` tags each
+  # measurement with the batch's \`source\`, so six tiers share one component per tap.
   #
-  # \`tap_input\` reads nginx's listener directly, which means it also sees the container's
-  # stderr (error_log) lines that \`nginx_stdout\` filters out before \`nginx_trace\`. That is the
-  # honest reading of "straight off the input" -- and it is why the two nginx rows in the summary
-  # are not a like-for-like pair the way the other five tiers' are.
+  # \`tap_input\` also sees nginx's stderr (error_log) lines, which \`nginx_stdout\` filters out
+  # before \`nginx_trace\`, so the two nginx rows aren't a like-for-like pair.
   tap_input:
     type: shape
     sources: [$(IFS=,; echo "${inputs[*]}")]
@@ -112,10 +76,8 @@ survey_demo_config() {
     interval: 10s
     resource: drop
 
-  # \`distributions: samples\` keeps \`shape\`'s raw observations raw through the window;
-  # \`max_samples_per_series\` is far above what 15 minutes of this stack can produce, and
-  # summarize.py fails loudly on any sketched \`logit.shape.*\` series rather than reporting an
-  # approximation as a measurement.
+  # \`distributions: samples\` with a cap far above what this stack produces keeps observations
+  # raw; summarize.py fails on any sketched \`logit.shape.*\` series.
   shape_rollup:
     type: aggregate
     sources: [tap_input, tap_landed]
@@ -124,9 +86,8 @@ survey_demo_config() {
     max_samples_per_series: 5000000
     max_retained_series: 1000000
 
-  # Into the run directory, mounted by tools/shape-survey/demo-overlay.yaml. A huge
-  # \`rotate.max_bytes\`: \`file_out\` requires a rotation trigger, and a survey that rotated would
-  # silently lose the start of its own capture.
+  # A huge \`rotate.max_bytes\`: \`file_out\` requires a rotation trigger, and a survey that rotated
+  # would lose the start of its capture.
   shape_out:
     type: file_out
     sources: [shape_rollup]
@@ -136,22 +97,17 @@ survey_demo_config() {
 EOF
 }
 
-# The stack, under this run's own compose project. `survey_compose` does the namespacing, the
-# "somebody else's demo stack is already up" guard (demo/compose.yaml gives `nginx`/`redis` fixed
-# container names, since `docker_in` follows them by name, so only one can exist on a host) and the
-# teardown registration -- see lib.sh.
+# The stack, through `survey_compose`, whose already-running guard matters here: demo/compose.yaml
+# fixes the `nginx` and `redis` container names for `docker_in`, so only one can exist on a host.
 survey_demo_compose() {
     survey_compose stack \
         -f "${ROOT}/demo/compose.yaml" -f "${ROOT}/tools/shape-survey/demo-overlay.yaml" \
         --env-file "${SURVEY_RUN_DIR}/compose.env" -- "$@"
 }
 
-# The readiness condition `survey_capture_until` polls below. `logit`'s own healthcheck is
-# `logit ready` against demo/logit.yaml's `admin:` block, so compose's health state is the signal
-# here -- no blind sleep, same as start_logit. Compose names the container after the project, so it
-# is asked for the id rather than guessed at: `docker inspect` on a name that does not exist prints
-# an empty *stdout* line before failing, which quietly turned a later "healthy" into "\nhealthy"
-# and never matched.
+# Readiness: compose's health state for `logit`, whose healthcheck is `logit ready`. Ask compose
+# for the container id rather than guess the name: `docker inspect` on a missing name prints an
+# empty stdout line before failing, turning "healthy" into "\nhealthy", which never matches.
 survey_demo_healthy() {
     local cid
     cid="$(survey_demo_compose ps -q logit 2>/dev/null || true)"
@@ -185,9 +141,8 @@ survey_demo() {
 
     config="${run_dir}/logit.yaml"
     survey_demo_config "${config}"
-    # `INFLUXDB_TOKEN` because demo/logit.yaml's `influx_out` resolves its token through `!env`
-    # (ADR `env-yaml-tag`), and `validate` resolves those exactly as `run` does. The same default
-    # demo/compose.yaml itself uses, so validating here and running there see the same config.
+    # `validate` resolves `!env` like `run` does, and `influx_out`'s token is one. The default
+    # matches demo/compose.yaml's, so both see the same config.
     echo "shape-survey: validating the generated ${config}"
     ${DOCKER} run --rm -e "INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-logit-demo-token}" \
         -v "${config}:/config.yaml:ro,z" "${SURVEY_IMAGE}" validate /config.yaml ||
@@ -198,10 +153,8 @@ survey_demo() {
         echo "SHAPE_SURVEY_RUN_DIR=${run_dir}"
     } >"${run_dir}/compose.env"
 
-    # The first `survey_compose` call registers the teardown hook before `up` returns, so a
-    # failure anywhere below still brings the stack down (`down -v`: the checkpoints and the
-    # Postgres log volume are this run's, and leaving them would make the next run resume a tail
-    # mid-file instead of reading from the beginning).
+    # The first `survey_compose` call registers the teardown hook, so a failure below still brings
+    # the stack down.
     echo "shape-survey: bringing up the demo stack (this builds demo images on a first run)"
     survey_demo_compose up -d --build
 

@@ -1,18 +1,17 @@
-# Router + target cost (docs/adr/target-components.md): passthrough.yaml's exact event stream --
-# the same six attributes, the same count -- through a `route` that splits it by `host` across
-# three `target`s, each into its own null_out, with the tenth host value left unrouted so the
-# router's own consumer edge is exercised too. Every batch of 100 lands ~25 events in each of the
-# four destinations, so all four are "used" every batch: route_batch's documented cost of
-# `1 + used destinations` = 5 allocations per batch, zero per event
-# (crates/logit-pipeline/src/runtime.rs), plus one attribute lookup and one table match per event.
+# Router + target cost (docs/adr/target-components.md): passthrough.yaml's event stream through a
+# `route` that splits it by `host` across three `target`s, each into its own null_out, with the
+# tenth host value left unrouted so the router's own consumer edge is exercised too. Every batch of
+# 100 lands ~25 events in each of the four destinations, so `route_batch`'s cost of
+# `1 + used destinations` allocations per batch (crates/logit-pipeline/src/runtime.rs) is 5 here,
+# zero per event, plus one attribute lookup and one table match per event. Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios".
 #
 #   script/perf run --scenario route
 #
-# Read against `passthrough` (same events, one sink, no router): the gap is the router hop itself
-# plus three more sink-side hops (drain_inbox -> SinkQueue -> write_loop), each on a quarter-size
-# batch. Read against `fanout` (same events, three sinks): `fanout` delivers every event three
-# times, this delivers every event once -- so `route` moving less data than `fanout` per generated
-# event is expected, and the interesting number is how close it lands to `passthrough`. `count` is
+# Read against passthrough (same events, one sink, no router): the gap is the router hop plus three
+# more sink-side hops (drain_inbox -> SinkQueue -> write_loop), each on a quarter-size batch. Read
+# against fanout (same events, three sinks): fanout delivers every event three times, this delivers
+# every event once, so the interesting number is how close it lands to passthrough. `count` is
 # generated events, as in every other scenario.
 components:
   gen:
@@ -41,8 +40,7 @@ components:
       web-6: tier_c
       web-7: tier_c
       web-8: tier_c
-      # web-9 is unrouted on purpose: it falls through to `unrouted_out` via the router's own
-      # `sources:` edge.
+      # web-9 is unrouted: it falls through to `unrouted_out` via the router's own `sources:` edge.
 
   tier_a: {type: target}
   tier_b: {type: target}

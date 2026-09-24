@@ -1,18 +1,18 @@
-//! The `Event` <-> Lua boundary: [`EventProxy`] (the whole event) and its typed sub-proxies --
-//! `AttrsProxy` (`event.attributes`, an open map), `LogProxy` (`event.log`, a fixed field set,
-//! mostly read-write), `MetricsProxy`/`MetricProxy` (`event.metrics`, an indexable array of
-//! per-kind records, read-write only on the handful of fields a script can legitimately mutate
-//! in place -- a metric's `value` on `sum`/`gauge`, plus `sum`'s own `temporality`/`monotonic`),
-//! and `SpanProxy` (`event.span`, entirely read-only -- in-place mutation of an existing span is
-//! not offered; a script that wants a span builds a whole one with `Event.new`, `crate::construct`,
-//! or reads one `logit_config::ComponentKind::TraceContext`'s `span:` block or a wire codec
-//! already minted). All of these share the same `Rc<RefCell<Event>>` as
-//! their parent [`EventProxy`] -- mutating through any of them is visible through every other,
-//! matching Lua's own reference semantics (`local e2 = event` aliases the same event, exactly as
-//! it would for a table).
+//! The `Event` <-> Lua boundary. Events reach a script as userdata proxies, not converted tables,
+//! so a stage pays only for the fields its script touches; `Event.new(t)` (`crate::construct`)
+//! and `event:to_table()` are the opt-in full-table paths (`docs/design/memory.md` §2). See
+//! `docs/design/lua-api.md` for the script-visible contract.
 //!
-//! See `docs/design/lua-api.md` for why this exists instead of full table conversion, and for the
-//! script-visible contract these types implement.
+//! - [`EventProxy`]: the whole event.
+//! - `AttrsProxy`: `event.attributes`, an open map.
+//! - `LogProxy`: `event.log`, a fixed field set, mostly read-write.
+//! - `MetricsProxy`/`MetricProxy`: `event.metrics`, a 1-based array of records. Writable fields
+//!   are `name`, `unit`, `description`, `start_timestamp`, `value` on a `sum`/`gauge`, and a
+//!   `sum`'s `temporality`/`monotonic`.
+//! - `SpanProxy`: `event.span`, read-only. A script makes a span with `Event.new`.
+//!
+//! Every sub-proxy shares its parent's `Rc<RefCell<Event>>`, so a write through one is visible
+//! through all, matching Lua's reference semantics (`local e2 = event` aliases the event).
 
 use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
 use logit_core::interner::{intern, resolve};
@@ -27,17 +27,14 @@ use mlua::{
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
-/// The `target` ids one `lua`/`lua_file` component may direct events into, as a name -> slot
-/// lookup -- built **once per worker** ([`crate::ScriptWorker::with_targets`]) and shared by every
-/// [`EventProxy`] that worker mints, rather than rebuilt per event.
+/// The `target` ids one `lua`/`lua_file` component may direct events into, as a name-to-slot
+/// lookup, built once per worker ([`crate::ScriptWorker::with_targets`]) and shared by every
+/// [`EventProxy`] it creates.
 ///
-/// A `Vec<Box<str>>` scanned linearly, not a `HashMap`: a `targets:` list is a handful of ids
-/// written out by an operator in one YAML block, so a scan over `Box<str>` beats hashing on every
-/// `event:to(..)` call -- and, more to the point here, neither shape allocates on lookup, which is
-/// what the allocation suite in `crates/logit-bench/tests/allocations.rs` actually pins. The slot
-/// is the index, which *is* `logit_pipeline::graph::targets_of`'s order -- the one place that
-/// order is derived (`docs/adr/target-components.md`) -- so `Some(n)` here and
-/// `logit_pipeline::Destination::To(n)` mean the same target.
+/// A linear scan, not a `HashMap`: a `targets:` list is a handful of ids, and neither allocates
+/// on lookup (`crates/logit-bench/tests/allocations.rs`). The slot is the index in
+/// `logit_pipeline::graph::targets_of`'s order (`docs/adr/target-components.md`), so `Some(n)`
+/// here and `logit_pipeline::Destination::To(n)` name the same target.
 #[derive(Default)]
 pub(crate) struct TargetTable {
     names: Vec<Box<str>>,
@@ -48,26 +45,24 @@ impl TargetTable {
         Self { names: names.iter().map(|name| name.as_str().into()).collect() }
     }
 
-    /// The shared empty table, for a component with no `targets:` -- a refcount bump, never an
+    /// The shared empty table, for a component with no `targets:`; a refcount bump, not an
     /// allocation. See [`NO_TARGETS`].
     pub(crate) fn empty() -> Rc<Self> {
         no_targets()
     }
 
-    /// The slot `name` occupies, or `None` if this component declares no such target -- which
-    /// `event:to(..)` turns into a script error naming the configured list, never a silent
-    /// forward (`docs/adr/target-components.md`).
+    /// The slot `name` occupies, or `None`, which `event:to(..)` turns into a script error, never
+    /// a silent forward (`docs/adr/target-components.md`).
     pub(crate) fn slot(&self, name: &str) -> Option<u16> {
         self.names.iter().position(|candidate| &**candidate == name).map(|slot| slot as u16)
     }
 
-    /// The configured ids, in slot order -- for `event:to(..)`'s error message only.
+    /// The configured ids, in slot order, for `event:to(..)`'s error message.
     pub(crate) fn names(&self) -> &[Box<str>] {
         &self.names
     }
 
-    /// `event:to("x")`'s error text for an id this component doesn't declare. Built only on the
-    /// error path, so the allocations here cost nothing in the ordinary case.
+    /// `event:to("x")`'s error text for an id this component doesn't declare.
     fn unknown_target_message(&self, name: &str) -> String {
         match self.names().is_empty() {
             true => format!(
@@ -82,107 +77,66 @@ impl TargetTable {
 }
 
 thread_local! {
-    /// The one empty [`TargetTable`] every [`EventProxy::new`] proxy shares -- a `lua` component
-    /// with no `targets:` is the overwhelmingly common case, and minting a fresh `Rc` per event
-    /// for it would add a real allocation to every `process()` call
-    /// (`crates/logit-bench/tests/allocations.rs`'s exact-equality counts). A `thread_local`
-    /// rather than a `static`: `Rc` is `!Send`, and so, by design, is every `ScriptWorker` that
-    /// could reach this (`docs/design/lua-api.md`'s concurrency section).
+    /// The empty [`TargetTable`] every untargeted proxy shares. A component with no `targets:` is
+    /// the common case, and a fresh `Rc` per event would add an allocation to every `process()`
+    /// call (`crates/logit-bench/tests/allocations.rs`). A `thread_local` because `Rc` is
+    /// `!Send`, as is every `ScriptWorker` that reaches it.
     static NO_TARGETS: Rc<TargetTable> = Rc::new(TargetTable::default());
 }
 
-/// A shared handle to the empty [`TargetTable`] -- a refcount bump, never an allocation.
+/// A shared handle to the empty [`TargetTable`].
 fn no_targets() -> Rc<TargetTable> {
     NO_TARGETS.with(Rc::clone)
 }
 
-/// Wraps one [`Event`] for the duration of a `process()`/`flush()` call -- and possibly longer, if
-/// a script stashes it in a global or upvalue.
+/// Wraps one [`Event`] for a `process()`/`flush()` call, or longer if a script stashes it.
 ///
-/// **Contract: an event handle -- and its `event.attributes` handle -- is consumed once the event
-/// is returned from `process()` or included in a `flush()` table.** Don't keep using a Lua
-/// variable referencing either after handing the event back that way -- both stop working (see
-/// [`take_event`]'s doc comment for exactly why: a Lua userdata is a reference type, so a stashed
-/// alias and the returned value can be the *same* underlying box, and extracting one invalidates
-/// the other; `event.attributes` is cached per event -- see the `attrs` field below -- so the same
-/// is true of a `local a = event.attributes` stashed alongside it). Touching either past that
-/// point fails clearly, via [`clarify_destructed_handle_use`], rather than with mlua's generic
-/// destructed-userdata wording. If a script genuinely needs to both emit an event now and keep
-/// something for later (e.g. a stateful `flush()` re-emitting it), stash `event:clone()` -- an
-/// independent copy -- rather than `event` (or `event.attributes`) itself.
+/// **An event handle, and every sub-handle from it, is consumed once the event is returned from
+/// `process()` or included in a `flush()` table.** A stashed alias is the same Lua box as the
+/// returned value, so extracting one invalidates both ([`take_event`]); the cached sub-proxies
+/// are torn down with it ([`EventProxy::into_inner`]). Later use fails with this crate's wording
+/// ([`clarify_destructed_handle_use`]). A script that needs to emit now and keep the event for
+/// `flush()` stashes `event:clone()`.
 pub struct EventProxy {
     event: Rc<RefCell<Event>>,
-    /// The `event.attributes` sub-proxy, created lazily on the first access and cached rather
-    /// than rebuilt on every later one (`docs/design/memory.md` §8's "cache the `AttrsProxy`
-    /// userdata" recommendation) -- a script that reads and writes attributes on the same event
-    /// used to pay a fresh `create_userdata` call (a real allocation) per access.
+    /// The `event.attributes` sub-proxy, created on first access and cached, so repeated access
+    /// costs no `create_userdata` allocation (`docs/design/memory.md` §8).
     ///
-    /// Stored as a `RegistryKey`, not the `AnyUserData` handle itself: `AnyUserData<'lua>`
-    /// carries a `'lua` lifetime tied to a specific borrow of the `Lua` instance, and `EventProxy`
-    /// -- like every `UserData` type -- must be `'static` to be storable as userdata at all, so
-    /// there is no field type that could hold the handle directly. A `RegistryKey` is `mlua`'s
-    /// `'static` answer to exactly this: redeemable via `Lua::registry_value` whenever a `&Lua`
-    /// is back in scope (the same reason `ScriptWorker` caches `process`/`flush` this way -- see
-    /// lib.rs).
-    ///
-    /// mlua's own docs warn that a `RegistryKey` stored inside a `UserData` type is an easy way
-    /// to leak: the registry is a GC root, so the referenced `AttrsProxy` would stay alive forever
-    /// once cached, independent of whether this `EventProxy` itself is still reachable, unless
-    /// something removes it explicitly. [`into_inner`](EventProxy::into_inner) is that explicit
-    /// removal, for the path that matters: a script that returns (or emits) its event is the
-    /// overwhelmingly common case, and that's exactly when this cache must be torn down anyway,
-    /// both to avoid the leak and -- more importantly here -- to keep `into_inner`'s
-    /// `Rc::try_unwrap` fast path working (see that method's doc comment). A script that drops an
-    /// event after touching its attributes without ever returning it (no `into_inner` call at
-    /// all) leaves the registry entry for `Lua`'s own reclaiming -- `RegistryKey::drop` queues its
-    /// slot for reuse, and this worker creates new registry entries constantly, so the slot doesn't
-    /// sit unreclaimed for long. A deliberate, bounded trade against the complexity of covering
-    /// that path too: forcing cleanup there risks invalidating a script that legitimately stashed
-    /// the event (or its attributes) for `flush()` to use later, the same pattern this module's
-    /// docs already call out as supported for `event` itself.
+    /// A `RegistryKey` because `AnyUserData<'lua>` borrows the `Lua` and a `UserData` type must be
+    /// `'static`. The registry is a GC root, so a cached entry would outlive this proxy unless
+    /// removed: [`into_inner`](EventProxy::into_inner) removes it when the event is returned,
+    /// which also keeps its `Rc::try_unwrap` fast path working. An event dropped without being
+    /// returned leaves the entry to `RegistryKey::drop`, which queues the slot for reuse; forcing
+    /// cleanup there could invalidate an event a script stashed for `flush()`.
     attrs: RefCell<Option<RegistryKey>>,
-    /// `event.log`'s sub-proxy, cached the same way and for the same reason as `attrs` above.
-    /// Only ever populated when `event.log.is_some()` -- nothing in this crate's Lua surface can
-    /// clear a log once an event has one (only fields *within* it, via [`LogProxy`]), so "cached
-    /// once" and "log is present" stay equivalent for this event's whole lifetime.
+    /// `event.log`'s sub-proxy, cached as `attrs` is. Only populated when `event.log.is_some()`;
+    /// no script can remove a log, so a cached proxy always has one.
     log: RefCell<Option<RegistryKey>>,
-    /// `event.metrics`'s sub-proxy ([`MetricsProxy`]), cached the same way as `attrs` -- and, like
-    /// `attrs`, created lazily on first access regardless of whether the metric list is empty
-    /// (unlike `log`/`span`, there's no `is_some()` gate: an empty `MetricsProxy` is still a valid
-    /// handle, `#event.metrics == 0`).
+    /// `event.metrics`'s sub-proxy ([`MetricsProxy`]), cached as `attrs` is, even for an empty
+    /// list (`#event.metrics == 0`).
     metrics: RefCell<Option<RegistryKey>>,
-    /// `event.span`'s sub-proxy ([`SpanProxy`]), cached and gated on `event.span.is_some()` the
-    /// same way `log` is above.
+    /// `event.span`'s sub-proxy ([`SpanProxy`]), cached and gated as `log` is.
     span: RefCell<Option<RegistryKey>>,
-    /// Where `event:to(id)` said this event goes -- a slot in [`TargetTable`] order, `None` for an
-    /// unrouted event (the default, and every event of a component with no `targets:`).
+    /// Where `event:to(id)` said this event goes, a slot in [`TargetTable`] order; `None` if
+    /// unrouted.
     ///
-    /// **The mark rides on the *handle*, not on the `Event`.** `crates/logit-core/tests/
-    /// type_sizes.rs` pins `size_of::<Event>()` exactly, and a routing decision is a property of
-    /// this one `process()`/`flush()` call's answer, not of the event as a value -- the same
-    /// reasoning that keeps provenance off `Event` (`docs/adr/target-components.md`'s "Lua"
-    /// consequence). It leaves with the event, once, through [`take_event`].
-    ///
-    /// A `Cell`, not a plain field: `event:to(..)` is reached through `&self` like every other
-    /// method on this type.
+    /// **The mark rides on the handle, not on the `Event`.** `size_of::<Event>()` is pinned
+    /// (`crates/logit-core/tests/type_sizes.rs`), and a routing decision belongs to this call's
+    /// answer, not to the event (`docs/adr/target-components.md`'s "Lua" consequence). It leaves
+    /// with the event through [`take_event`]. A `Cell` because `event:to(..)` only gets `&self`.
     target: Cell<Option<u16>>,
-    /// This component's `targets:` list, shared with every other proxy this worker mints -- see
-    /// [`TargetTable`]. Empty (and shared process-wide per thread, see [`no_targets`]) for a
-    /// component that declares none.
+    /// This component's `targets:`, shared with every proxy the worker creates; [`no_targets`]
+    /// for a component that declares none.
     targets: Rc<TargetTable>,
 }
 
 impl EventProxy {
-    /// A proxy for a component that declares no `targets:` -- every caller outside
-    /// `ScriptWorker::process` (`event:clone()` excepted, which shares its source's table).
-    /// `event:to(..)` on one of these is a script error naming the empty list, never a silent
-    /// forward.
+    /// A proxy with no `targets:`, on which `event:to(..)` is always a script error.
     pub fn new(event: Event) -> Self {
         Self::with_targets(event, no_targets())
     }
 
-    /// A proxy that can be routed: `event:to(id)` resolves `id` against `targets`.
-    /// `ScriptWorker::process`'s own constructor.
+    /// A proxy whose `event:to(id)` resolves `id` against `targets`.
     pub(crate) fn with_targets(event: Event, targets: Rc<TargetTable>) -> Self {
         Self {
             event: Rc::new(RefCell::new(event)),
@@ -195,18 +149,15 @@ impl EventProxy {
         }
     }
 
-    /// `event:clone()`'s independent copy: a fresh `Event`, but the *same* routing table (an `Rc`
-    /// bump) and a *copy* of the mark -- "a script fanning out a routed event gets two events
-    /// headed the same way, and `b:to(nil)` is how they diverge"
-    /// (`docs/adr/target-components.md`).
+    /// `event:clone()`: a fresh `Event` with the same routing table and a copy of the mark, so a
+    /// fanned-out copy starts headed the same way (`docs/adr/target-components.md`).
     fn cloned_from(source: &Self) -> Self {
         let clone = Self::with_targets(source.event.borrow().clone(), source.targets.clone());
         clone.target.set(source.target.get());
         clone
     }
 
-    /// Returns this event's `AttrsProxy` userdata, creating and caching it on the first call and
-    /// simply handing back the same handle on every later one -- see the field doc comment above.
+    /// This event's `AttrsProxy` userdata, created and cached on first call.
     fn attrs_userdata<'lua>(&self, lua: &'lua Lua) -> mlua::Result<AnyUserData<'lua>> {
         if let Some(key) = self.attrs.borrow().as_ref() {
             return lua.registry_value(key);
@@ -216,8 +167,7 @@ impl EventProxy {
         Ok(ud)
     }
 
-    /// As [`Self::attrs_userdata`], for `event.log` -- caller must only invoke this when
-    /// `event.log.is_some()` (the `"log"` `__index` arm checks first).
+    /// As [`Self::attrs_userdata`], for `event.log`. Only call when `event.log.is_some()`.
     fn log_userdata<'lua>(&self, lua: &'lua Lua) -> mlua::Result<AnyUserData<'lua>> {
         if let Some(key) = self.log.borrow().as_ref() {
             return lua.registry_value(key);
@@ -227,9 +177,7 @@ impl EventProxy {
         Ok(ud)
     }
 
-    /// As [`Self::attrs_userdata`], for `event.metrics` -- unlike `log_userdata`, has no
-    /// `is_some()` precondition: an empty metric list still gets a (cheap, empty-backed)
-    /// `MetricsProxy`.
+    /// As [`Self::attrs_userdata`], for `event.metrics`, including an empty list.
     fn metrics_userdata<'lua>(&self, lua: &'lua Lua) -> mlua::Result<AnyUserData<'lua>> {
         if let Some(key) = self.metrics.borrow().as_ref() {
             return lua.registry_value(key);
@@ -239,8 +187,7 @@ impl EventProxy {
         Ok(ud)
     }
 
-    /// As [`Self::log_userdata`], for `event.span` -- caller must only invoke this when
-    /// `event.span.is_some()` (the `"span"` `__index` arm checks first).
+    /// As [`Self::attrs_userdata`], for `event.span`. Only call when `event.span.is_some()`.
     fn span_userdata<'lua>(&self, lua: &'lua Lua) -> mlua::Result<AnyUserData<'lua>> {
         if let Some(key) = self.span.borrow().as_ref() {
             return lua.registry_value(key);
@@ -250,24 +197,15 @@ impl EventProxy {
         Ok(ud)
     }
 
-    /// Unwraps back to an owned `Event`. Cheap (no clone) in the ordinary case -- see
-    /// `ScriptWorker::process`'s use of [`AnyUserData::take`], which is what makes this the
-    /// *only* remaining reference by the time a script returns its event unchanged. Falls back to
-    /// cloning the inner event if something else still holds a reference; correctness over
-    /// performance in what should be a rare case, and this must never panic either way.
+    /// Unwraps back to the owned `Event` and its routing mark.
     ///
-    /// Needs `&Lua` (unlike the version of this method before `attrs` existed) to release the
-    /// cached `AttrsProxy` first: that release must happen, and must happen *before* the
-    /// `Rc::try_unwrap` below, or every script that ever reads `event.attributes` -- which is
-    /// nearly all of them -- would permanently defeat this fast path, paying a full `Event` clone
-    /// on every call instead of the rare fallback this was always meant to be. Releasing it means
-    /// synchronously emptying the cached userdata's box via `take`, the same tool [`take_event`]
-    /// uses on the `EventProxy` itself -- Lua's GC would get there eventually, but "eventually"
-    /// isn't deterministic enough to depend on here.
+    /// No clone in the ordinary case, because [`take_event`]'s [`AnyUserData::take`] leaves this
+    /// the only reference. It falls back to cloning if something else still holds one, and never
+    /// panics.
     ///
-    /// Returns the routing mark alongside the event (`None` for an unrouted one): the mark rides
-    /// on this handle, not on the `Event` (see the `target` field), so this -- the one point the
-    /// event leaves the Lua side -- is where it has to come with it.
+    /// The cached sub-proxies are emptied with `take` and removed from the registry first, before
+    /// `Rc::try_unwrap`: each holds an `Rc` to the event, and waiting for the GC would make nearly
+    /// every script pay the clone.
     pub fn into_inner(self, lua: &Lua) -> (Event, Option<u16>) {
         if let Some(key) = self.attrs.into_inner() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
@@ -300,11 +238,8 @@ impl EventProxy {
         (event, self.target.get())
     }
 
-    /// Test-only window onto the strong-count `into_inner`'s `Rc::try_unwrap` above lives and
-    /// dies by: a `MetricProxy` minted for a script's `event.metrics[i]` read must never nudge
-    /// this above 1 (it holds a `Weak`, not an `Rc` -- see `MetricProxy`'s own doc comment for
-    /// why that's load-bearing), regardless of whether LuaJIT has gotten around to collecting the
-    /// userdata that read produced by the time this is checked.
+    /// The event's strong count, which `into_inner`'s `Rc::try_unwrap` needs to be 1; an
+    /// uncollected `MetricProxy` must not raise it.
     #[cfg(test)]
     fn strong_count(&self) -> usize {
         Rc::strong_count(&self.event)
@@ -315,39 +250,27 @@ impl UserData for EventProxy {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::Index, |lua, this, key: mlua::String| {
             match key.to_str()? {
-                // A string, not a Lua number: Lua's only numeric type is an IEEE-754 double,
-                // safely exact only up to 2^53 (~9e15). A unix-nanos timestamp is routinely
-                // ~1.7e18 -- empirically confirmed to silently round-trip wrong as a Lua number
-                // (verified with a real script: reads back as "1.7e+18", and even an unmodified
-                // read-then-write loses precision). A decimal-digit string is exact and
-                // unambiguous; a script that wants to do real arithmetic on it can `tonumber()`
-                // at whatever precision it actually needs.
+                // A decimal-digit string, not a Lua number: a double is exact only to 2^53, and a
+                // unix-nanos timestamp (~1.7e18) read as a number loses precision even through an
+                // unmodified read-then-write. A script can `tonumber()` it if it needs arithmetic.
                 "timestamp" => Ok(LuaValue::String(
                     lua.create_string(this.event.borrow().timestamp.to_string())?,
                 )),
                 "attributes" => Ok(LuaValue::UserData(this.attrs_userdata(lua)?)),
-                // Typed access to the log record -- trace_id/span_id/trace_flags read+write,
-                // message/severity/body_format read-only for now (`docs/design/lua-api.md`).
-                // `nil` when the event has no log, exactly like `has_log` says it should.
+                // `nil` when the event has no log, agreeing with `has_log`.
                 "log" => match this.event.borrow().log.is_some() {
                     true => Ok(LuaValue::UserData(this.log_userdata(lua)?)),
                     false => Ok(LuaValue::Nil),
                 },
-                // Always present, even for an empty metric list -- see `metrics_userdata`'s doc
-                // comment.
+                // Present even for an empty metric list.
                 "metrics" => Ok(LuaValue::UserData(this.metrics_userdata(lua)?)),
                 "span" => match this.event.borrow().span.is_some() {
                     true => Ok(LuaValue::UserData(this.span_userdata(lua)?)),
                     false => Ok(LuaValue::Nil),
                 },
-                // Presence flags, not a classification string: an event can carry a log, several
-                // metrics, and a span all at once now, so "what type is this event" has no single
-                // right answer (docs/adr/multi-payload-events.md) -- a script or native
-                // component checks the specific thing it cares about instead. There is
-                // deliberately no `event.type` any more: a single summary label would be lossy at
-                // best and a silent footgun at worst (a script branching on `event.type ==
-                // "metric"` would skip the metrics on a log-carrying event, exactly the shape
-                // `kv_metrics` produces).
+                // Presence flags, not an `event.type` label: an event can carry a log, metrics,
+                // and a span at once (`docs/adr/multi-payload-events.md`), and a script branching
+                // on one label would skip the metrics on a log event `kv_metrics` produced.
                 "has_log" => Ok(LuaValue::Boolean(this.event.borrow().log.is_some())),
                 "has_metrics" => Ok(LuaValue::Boolean(!this.event.borrow().metrics.is_empty())),
                 "has_span" => Ok(LuaValue::Boolean(this.event.borrow().span.is_some())),
@@ -361,9 +284,8 @@ impl UserData for EventProxy {
                 let key = key.to_str()?;
                 match key {
                     "timestamp" => {
-                        // Must be a string, for the same precision reason __index returns one --
-                        // accepting a Lua number here would silently accept an already-corrupted
-                        // value rather than catching the mistake.
+                        // A string only, as `__index` returns: a Lua number may already have lost
+                        // precision.
                         let LuaValue::String(s) = value else {
                             return Err(mlua::Error::RuntimeError(format!(
                                 "event.timestamp must be a string of decimal digits (a Lua number \
@@ -390,38 +312,28 @@ impl UserData for EventProxy {
             },
         );
 
-        // An independent deep copy, for fan-out: `return {a, b}` needs a second event distinct
-        // from the first -- derived from this one, where `Event.new(t)` (`crate::construct`)
-        // builds one from scratch. Carries the routing mark over and shares the target table --
-        // see `cloned_from`.
+        // An independent deep copy, for fan-out (`return {a, b}`); see `cloned_from` for the
+        // mark.
         methods.add_method("clone", |_, this, ()| Ok(EventProxy::cloned_from(this)));
 
-        // `event:to(id)` -- *mark* this event for one of this component's `targets:`, and return
-        // the same handle so `return event:to("host_stream")` chains
+        // `event:to(id)` marks this event for one of the component's `targets:` and returns the
+        // same handle, so `return event:to("host_stream")` chains
         // (`docs/adr/target-components.md`, `docs/design/lua-api.md`'s "Routing to a target").
-        // It marks; it does not emit: the event still has to be returned from `process()`/
-        // `flush()`, exactly as an unrouted one does.
+        // It doesn't emit: the event must still be returned.
         //
-        // `add_function`, not `add_method`, purely so the *same* userdata can be handed back --
-        // `add_method` only ever sees a `&EventProxy`, from which the `AnyUserData` that wraps it
-        // is unreachable. Method-call syntax (`event:to(..)`) passes the handle as the first
-        // argument either way, so the script-visible shape is identical. A destructed handle
-        // (`take_event` already ran on it) never reaches this closure at all: Lua swaps a
-        // destructed userdata's metatable out, so the `__index` lookup of `to` itself raises, and
-        // `clarify_destructed_handle_use` gives the same "already returned/emitted" wording every
-        // other method on this type gives.
+        // `add_function`, not `add_method`, so the same userdata can be returned; `add_method`
+        // only sees `&EventProxy`. A colon call passes the handle first either way, so scripts
+        // see no difference. A destructed handle never reaches this closure: looking up
+        // `to` on it raises, and `clarify_destructed_handle_use` rewords that.
         methods.add_function("to", |_, (this, id): (AnyUserData, LuaValue)| {
             {
                 let proxy = this.borrow::<EventProxy>()?;
                 match id {
-                    // `event:to(nil)` clears the mark -- an event a script routed and then thought
-                    // better of goes back to this component's ordinary consumers.
+                    // Clears the mark: the event goes to the component's ordinary consumers.
                     LuaValue::Nil => proxy.target.set(None),
                     LuaValue::String(name) => match proxy.targets.slot(name.to_str()?) {
                         Some(slot) => proxy.target.set(Some(slot)),
-                        // "An id not in `targets:` is a script error, counted like every other
-                        // script error, never a silent forward" -- the ADR's rule, and the reason
-                        // this names the configured list rather than just the bad id.
+                        // A script error, never a silent forward, naming the configured list.
                         None => {
                             return Err(mlua::Error::RuntimeError(
                                 proxy.targets.unknown_target_message(name.to_str()?),
@@ -440,10 +352,9 @@ impl UserData for EventProxy {
             Ok(this)
         });
 
-        // The escape hatch: a real Lua table, disconnected from the live event, for anything the
-        // proxy doesn't expose directly -- including iterating all attributes, since `__pairs`
-        // isn't available under LuaJIT (see docs/design/lua-api.md). Deliberately not exhaustive
-        // over payload fields; see the v0.1-lua-engine PR description for why.
+        // A plain Lua table, detached from the live event: how a script iterates attributes,
+        // since LuaJIT has no `__pairs`. Covers every payload field, and `Event.new` is its
+        // inverse (`crate::construct`).
         methods.add_method("to_table", |lua, this, ()| {
             let event = this.event.borrow();
             let table = lua.create_table()?;
@@ -476,8 +387,7 @@ impl UserData for EventProxy {
     }
 }
 
-/// The `event.attributes` sub-object. Shares the same `Rc<RefCell<Event>>` as its parent
-/// [`EventProxy`] -- reads/writes through this proxy are reads/writes to that same event.
+/// The `event.attributes` sub-proxy, an open map over its parent's event.
 struct AttrsProxy(Rc<RefCell<Event>>);
 
 impl UserData for AttrsProxy {
@@ -493,15 +403,11 @@ impl UserData for AttrsProxy {
             MetaMethod::NewIndex,
             |_, this, (key, value): (mlua::String, LuaValue)| {
                 let key = key.to_str()?;
-                // A no-op assignment must stay a no-op: if `value` is byte-for-byte what
-                // value_to_lua would have handed the script for this attribute's current
-                // content, leave the stored Value untouched -- so its variant (e.g. Bytes vs.
-                // Str, U64 vs. I64) survives an unmodified `event.attributes.x =
-                // event.attributes.x` even though a plain Lua string/number can't itself carry
-                // that information. See value.rs's `lua_value_matches` for the full reasoning.
-                // Must run before `lua_to_value` re-borrows mutably below, and must not call
-                // back into Lua while `this.0` is borrowed here -- see that function's doc
-                // comment for why.
+                // If `value` is what `value_to_lua` gave for the current content, keep the stored
+                // `Value`, so its variant (`Bytes` vs. `Str`, `U64` vs. `I64`) survives
+                // `event.attributes.x = event.attributes.x` (`lua_value_matches`). The borrow is
+                // released before `lua_to_value`, whose `pairs()` walk over a table can call back
+                // into Lua and re-enter this proxy.
                 let is_noop = this
                     .0
                     .borrow()
@@ -517,20 +423,17 @@ impl UserData for AttrsProxy {
             },
         );
 
-        // No __pairs: not available under LuaJIT/Lua 5.1 (mlua's MetaMethod::Pairs requires Lua
-        // 5.2+). A script that needs to enumerate every attribute uses
-        // `event:to_table().attributes` and native `pairs()` on that real table instead.
+        // No `__pairs`: mlua's `MetaMethod::Pairs` needs Lua 5.2+, not LuaJIT. A script
+        // enumerates `event:to_table().attributes` instead.
     }
 }
 
-/// The `event.log` sub-object. Shares the same `Rc<RefCell<Event>>` as its parent [`EventProxy`],
-/// like [`AttrsProxy`] -- but unlike that one, exposes a fixed, typed field set rather than an
-/// open map, closer in shape to `EventProxy` itself: `trace_id`/`span_id`/`trace_flags` are
-/// read+write (`docs/adr/log-record-trace-context.md`); `message`/`severity`/`body_format` are
-/// read-only for now (`docs/design/lua-api.md` -- a later design pass, not an oversight). Callers
-/// must only construct this when `event.log.is_some()`; every method below panics via `.expect`
-/// on a borrow it assumes is upheld by that precondition, which `EventProxy::log_userdata`'s only
-/// call site enforces.
+/// The `event.log` sub-proxy: a fixed, typed field set over its parent's event.
+///
+/// `trace_id`/`span_id`/`trace_flags` (`docs/adr/log-record-trace-context.md`), `event_name`, and
+/// `observed_timestamp` are writable; `message`/`severity`/`body_format` are read-only pending a
+/// design (`docs/design/lua-api.md`), and `dropped_attributes_count` is read-only. Construct only
+/// when `event.log.is_some()`: every accessor `.expect`s it.
 struct LogProxy(Rc<RefCell<Event>>);
 
 impl LogProxy {
@@ -557,9 +460,7 @@ impl UserData for LogProxy {
                     Some(id) => Ok(LuaValue::String(lua.create_string(to_hex(&id))?)),
                     None => Ok(LuaValue::Nil),
                 },
-                // `nil`, not `0`, when there's no trace at all -- so a script checking
-                // `event.log.trace_flags == nil` agrees with `event.log.trace_id == nil` instead
-                // of a flags read silently implying a trace that isn't there.
+                // `nil`, not `0`, without a trace, so it agrees with `trace_id == nil`.
                 "trace_flags" => match log.trace {
                     Some(t) => Ok(LuaValue::Integer(t.flags as i64)),
                     None => Ok(LuaValue::Nil),
@@ -570,16 +471,13 @@ impl UserData for LogProxy {
                     None => Ok(LuaValue::Nil),
                 },
                 "body_format" => Ok(LuaValue::String(lua.create_string(log.body_format.as_str())?)),
-                // OTLP's `LogRecord.event_name` -- an interned `Symbol`, like every other
-                // string-shaped attribute-ish field crossing the Lua boundary.
+                // OTLP's `LogRecord.event_name`, an interned `Symbol`.
                 "event_name" => match log.event_name {
                     Some(sym) => Ok(LuaValue::String(lua.create_string(resolve(sym))?)),
                     None => Ok(LuaValue::Nil),
                 },
-                // A decimal-digit string, not a Lua number, for the same reason
-                // `event.timestamp` is -- see that field's comment above. `0` (unset) still reads
-                // as the string `"0"`, not `nil`: unlike `event.log` itself, there's no
-                // "unset means absent" convention for this field.
+                // A decimal-digit string, as `event.timestamp` is. Unset reads as `"0"`, not
+                // `nil`.
                 "observed_timestamp" => {
                     Ok(LuaValue::String(lua.create_string(log.observed_timestamp.to_string())?))
                 }
@@ -608,9 +506,8 @@ impl UserData for LogProxy {
                                         .to_string(),
                                 )
                             })?;
-                            // A changed trace_id replaces the whole TraceRef, not just the
-                            // id field -- an old span_id/flags belongs to the old trace and
-                            // must not be carried over onto the new one.
+                            // A new trace_id replaces the whole TraceRef: the old span_id and
+                            // flags belong to the old trace.
                             log.trace = Some(TraceRef { trace_id, span_id: None, flags: 0 });
                             Ok(())
                         }
@@ -719,8 +616,7 @@ impl UserData for LogProxy {
     }
 }
 
-/// Shared by `LogProxy::to_table` and `EventProxy::to_table` (the latter's `log` key) -- one
-/// definition of what a log record looks like as a plain table.
+/// A log record as a plain table, for `LogProxy::to_table` and `EventProxy::to_table`'s `log`.
 fn log_to_table<'lua>(lua: &'lua Lua, log: &LogRecord) -> mlua::Result<Table<'lua>> {
     let table = lua.create_table()?;
     table.set(
@@ -767,26 +663,16 @@ fn log_to_table<'lua>(lua: &'lua Lua, log: &LogRecord) -> mlua::Result<Table<'lu
 
 // -- `event.metrics` -----------------------------------------------------------------------
 
-/// The `event.metrics` sub-object: an indexable, array-like view over the event's
-/// [`logit_core::MetricList`], shared with its parent [`EventProxy`] the same way [`AttrsProxy`]
-/// is. Always present once accessed, even for an empty list (`#event.metrics == 0` is a normal,
-/// valid read) -- see [`EventProxy::metrics_userdata`]'s doc comment.
+/// The `event.metrics` sub-proxy: a 1-based array view over the event's
+/// [`logit_core::MetricList`].
 ///
-/// `#event.metrics` (`MetaMethod::Len`) and `event.metrics[i]` (`MetaMethod::Index`, 1-based) are
-/// its whole surface: no `__newindex` (there is no script-visible way to add, remove, or reorder
-/// metrics), and no cached per-index handle -- each `event.metrics[i]` access mints a fresh, tiny
-/// [`MetricProxy`] rather than reusing one, unlike `attrs`/`log`/`span` above, which are each
-/// worth caching because there's exactly one per event. A metric list is typically short (`kv_
-/// metrics`' multi-metric shape is the extreme case), so a script indexing into it pays the
-/// userdata mint per access -- **3 allocations, measured** (`crates/logit-bench/tests/
-/// allocations.rs`'s `lua_process_one_event_reading_metric_value`, the same cost a cached proxy's
-/// first access pays) -- rather than a registry slot per index held for the event's whole
-/// lifetime. A per-index cache would only win for a script that re-indexes the *same* metric
-/// repeatedly; `local m = event.metrics[1]` once is the idiom `docs/design/lua-api.md` shows, and
-/// `docs/design/memory.md` §8 records this as the known trade.
-///
-/// Not caching a `MetricProxy` is only safe because it holds a [`Weak`], not an [`Rc`], onto the
-/// event -- see [`MetricProxy`]'s own doc comment for why that's load-bearing, not incidental.
+/// `#event.metrics` and `event.metrics[i]` are its whole surface: no `__newindex`, so a script
+/// can't add, remove, or reorder metrics. Each `event.metrics[i]` creates a fresh [`MetricProxy`]
+/// (3 allocations, measured: part of `crates/logit-bench/tests/allocations.rs`'s pinned 11 in
+/// `lua_process_one_event_reading_metric_value`) rather than holding a registry slot per index
+/// for the event's lifetime. A cache would only win for a script that re-indexes the same
+/// metric; `local m = event.metrics[1]` is the documented idiom (`docs/design/memory.md` §8).
+/// Not caching is safe only because a `MetricProxy` holds a [`Weak`]; see its doc.
 struct MetricsProxy(Rc<RefCell<Event>>);
 
 impl UserData for MetricsProxy {
@@ -798,10 +684,7 @@ impl UserData for MetricsProxy {
         methods.add_meta_method(MetaMethod::Index, |lua, this, key: LuaValue| {
             let index = match key {
                 LuaValue::Integer(i) => i,
-                // LuaJIT's dual-number mode keeps small-integer arithmetic as an Integer, but a
-                // computed index (`event.metrics[i + 0.0]`, say) could in principle still arrive
-                // as an integral Number -- accepted the same way, anything with a fractional part
-                // is not a valid index either way.
+                // A computed index (`i + 0.0`) can arrive as an integral Number.
                 LuaValue::Number(n) if n.fract() == 0.0 => n as i64,
                 other => {
                     return Err(mlua::Error::RuntimeError(format!(
@@ -810,9 +693,8 @@ impl UserData for MetricsProxy {
                     )))
                 }
             };
-            // Out of range (including `<= 0`, Lua has no negative indexing here) is `nil`, same
-            // as an ordinary Lua array read past its end -- only a genuinely non-integer key is a
-            // hard error (checked above).
+            // Out of range, `<= 0` included, is `nil`, as for a Lua array; only a non-integer key
+            // is an error.
             if index < 1 {
                 return Ok(LuaValue::Nil);
             }
@@ -828,53 +710,27 @@ impl UserData for MetricsProxy {
     }
 }
 
-/// One `event.metrics[i]` entry -- unlike every other proxy in this module, not cached: see
-/// [`MetricsProxy`]'s doc comment for why. `index` is 0-based (a plain `Vec`/`SmallVec` index);
-/// every user-facing message adds 1 back, to match the 1-based Lua index a script actually wrote.
+/// One `event.metrics[i]` entry, not cached (see [`MetricsProxy`]). `index` is 0-based; every
+/// message adds 1 back to match the script's Lua index.
 ///
-/// **Holds a [`Weak`], not an [`Rc`], onto the event -- load-bearing, not a style choice.** Every
-/// other proxy in this module (`AttrsProxy`, `LogProxy`, `SpanProxy`) is cached as a
-/// [`RegistryKey`] on its parent [`EventProxy`] and explicitly `take`n in
-/// [`EventProxy::into_inner`] before that method's own `Rc::try_unwrap` -- so by the time
-/// `into_inner` runs, none of them still hold a strong reference. `MetricProxy` is deliberately
-/// *not* cached that way (see [`MetricsProxy`]'s doc comment), so nothing tears one down on the
-/// same schedule; a script reading so much as `event.metrics[1].value` mints one, and LuaJIT's GC
-/// gives no guarantee it's been collected -- or even that its underlying `MetricProxy` has been
-/// dropped -- by the time `process()` returns and `take_event` calls `into_inner`. An `Rc` field
-/// here would silently defeat `into_inner`'s no-clone fast path on *every* script that ever reads
-/// a metric field (`Rc::try_unwrap` fails whenever any other strong reference is still alive,
-/// which a not-yet-collected `MetricProxy` always would be) -- paying a full `Event` clone on
-/// what should be the overwhelmingly common case, exactly the cost that field exists to avoid.
-/// Worse, a *stashed* `local m = event.metrics[1]` used from `flush()` after its event was
-/// returned would keep that returned event's clone alive and silently mutable through `m` --
-/// wrong data accepted quietly, rather than the "consumed handle" error every other stashed
-/// sub-proxy in this module already gives (see [`take_event`]'s and
-/// [`clarify_destructed_handle_use`]'s doc comments). A [`Weak`] fixes both: it costs nothing
-/// towards `Rc::try_unwrap`'s strong-count check regardless of GC timing, so the no-clone path
-/// keeps working; and `Weak::upgrade` on a `MetricProxy` outliving its event fails deterministically
-/// the moment that event is torn down, giving `with_metric`/`with_metric_mut` below a clear signal
-/// to raise the same "already returned" error the rest of this module's stashed-handle story
-/// already tells scripts, instead of resurrecting stale data.
+/// **Holds a [`Weak`], not an [`Rc`].** The cached sub-proxies are torn down in
+/// [`EventProxy::into_inner`] before its `Rc::try_unwrap`; this one isn't, and the GC may not
+/// have collected it by then. An `Rc` would make every script that reads a metric field pay a
+/// full `Event` clone, and would let a stashed `local m = event.metrics[1]` silently mutate a
+/// returned event's clone from `flush()`. A `Weak` doesn't count toward `try_unwrap`, and its
+/// failed upgrade after the event is gone gives the same "already returned" error the other
+/// handles give.
 ///
-/// **Robust to a stale index**, independent of the above: nothing in today's Lua surface can
-/// shrink `event.metrics` *while its event is still alive*, so `index >= event.metrics.len()`
-/// can't actually happen through a script alone -- but this proxy checks for it on every access
-/// anyway (`with_metric`/`with_metric_mut` below), both as cheap insurance against a future
-/// surface that *can* (an eventual `event.metrics:remove(i)`, say) and because nothing about
-/// `MetricProxy`'s own type forbids constructing one with a bad index by hand (as this module's
-/// own tests do, directly, to exercise exactly this path).
+/// **Checks the index on every access**, though no script can shrink `event.metrics` today: a
+/// future surface might, and tests construct one with a bad index directly.
 struct MetricProxy {
     event: Weak<RefCell<Event>>,
     index: usize,
 }
 
 impl MetricProxy {
-    /// Upgrades the held [`Weak`] and, if that succeeds, looks up this proxy's metric by index --
-    /// the two ways a `MetricProxy` access can fail, kept distinct: an upgrade failure means the
-    /// *event* this handle pointed at is gone (already returned/emitted elsewhere -- see this
-    /// struct's own doc comment), while a successful upgrade with a missing index means the event
-    /// is still alive but this particular metric no longer is (today, unreachable through Lua
-    /// alone, but checked anyway -- same doc comment).
+    /// Runs `f` on this proxy's metric. A failed upgrade means the event was returned; a missing
+    /// index means the event lives but the metric doesn't. Each has its own error.
     fn with_metric<R>(&self, f: impl FnOnce(&MetricRecord) -> mlua::Result<R>) -> mlua::Result<R> {
         let event = self.event.upgrade().ok_or_else(|| metric_handle_consumed_error(self.index))?;
         let event = event.borrow();
@@ -897,13 +753,9 @@ impl MetricProxy {
     }
 }
 
-/// The event behind this handle is gone -- it was returned from `process()` or included in a
-/// `flush()` table (and every other strong reference, per `MetricProxy`'s own doc comment, was
-/// already gone by then too), the same "consumed handle" failure
-/// [`clarify_destructed_handle_use`] gives a script for a stashed `event`/`event.attributes`/
-/// `event.log`, just discovered here via a failed `Weak::upgrade` instead of mlua's destructed-
-/// userdata marker (`MetricProxy` isn't registry-cached, so it was never a candidate for that
-/// mechanism in the first place -- see this module's doc comment on the difference).
+/// The event behind this handle was returned: the "consumed handle" error
+/// [`clarify_destructed_handle_use`] gives other stashed handles, found here by a failed
+/// `Weak::upgrade` rather than mlua's destructed-userdata marker.
 fn metric_handle_consumed_error(index: usize) -> mlua::Error {
     mlua::Error::RuntimeError(format!(
         "event.metrics[{}] belongs to an event that has already been returned from process() or \
@@ -916,13 +768,9 @@ fn stale_metric_error(index: usize) -> mlua::Error {
     mlua::Error::RuntimeError(format!("event.metrics[{}] no longer exists", index + 1))
 }
 
-/// A write to a field a metric's *current kind* doesn't allow -- either a field that's read-only
-/// for every kind (`flags`, `kind`, `exemplars`, ...), or a kind-specific one (`value`, `sum`,
-/// `temporality`, ...) being written on a kind that doesn't support writing it (or doesn't carry
-/// it at all). Names the kind either way, per `docs/design/lua-api.md`'s contract for this proxy
-/// -- "read-only" alone wouldn't tell a script *why* (unlike an unconditionally read-only field
-/// elsewhere in this module), since the same field name is legitimately writable on a different
-/// kind.
+/// A write to a field the metric's current kind doesn't allow. The message names the kind,
+/// because the same field (`value`, `temporality`) is writable on another kind
+/// (`docs/design/lua-api.md`).
 fn metric_ro_error(index: usize, field: &str, kind: &MetricKind) -> mlua::Error {
     mlua::Error::RuntimeError(format!(
         "event.metrics[{}].{field} is read-only on a {} metric",
@@ -931,10 +779,7 @@ fn metric_ro_error(index: usize, field: &str, kind: &MetricKind) -> mlua::Error 
     ))
 }
 
-/// As [`lua_to_value`]'s string branch reasoning, but simpler: a nil-able `f64` reaches Lua as a
-/// real number when present, `nil` when not -- there is no variant-identity concern here the way
-/// `value.rs` has for attributes, since a metric field's shape is fixed by its kind, not
-/// reconstructed from an arbitrary Lua value.
+/// An optional `f64` as a Lua number or `nil`.
 fn opt_number<'lua>(v: Option<f64>) -> LuaValue<'lua> {
     match v {
         Some(n) => LuaValue::Number(n),
@@ -942,8 +787,8 @@ fn opt_number<'lua>(v: Option<f64>) -> LuaValue<'lua> {
     }
 }
 
-/// A non-finite (or non-numeric) `value` write is a clear error rather than silently storing NaN/
-/// infinity into a metric a downstream sink or `aggregate` would then have to defend against.
+/// A finite number for a `value` write. NaN and the infinities are errors rather than values a
+/// sink or `aggregate` must defend against.
 fn require_finite_number(value: LuaValue, field: &str) -> mlua::Result<f64> {
     let v = match value {
         LuaValue::Integer(i) => i as f64,
@@ -998,9 +843,8 @@ fn exemplar_to_table<'lua>(lua: &'lua Lua, exemplar: &Exemplar) -> mlua::Result<
             None => LuaValue::Nil,
         },
     )?;
-    // `nil` without a trace, the same rule `event.log.trace_flags` follows -- and present at
-    // all so `Event.new(e:to_table())` (`crate::construct`'s `exemplar_from_table`) rebuilds
-    // the exemplar's `TraceRef` exactly rather than with its flags zeroed.
+    // `nil` without a trace, as `event.log.trace_flags` is; present so `Event.new` rebuilds the
+    // flags rather than zeroing them.
     table.set(
         "trace_flags",
         match exemplar.trace {
@@ -1012,8 +856,7 @@ fn exemplar_to_table<'lua>(lua: &'lua Lua, exemplar: &Exemplar) -> mlua::Result<
     Ok(table)
 }
 
-/// `(offset, counts)` -- `ExpHistogram::positive`/`.negative`'s shape -- as `{offset=, counts=
-/// [...]}`.
+/// `ExpHistogram::positive`/`negative`'s `(offset, counts)` as `{offset=, counts=[...]}`.
 fn exp_buckets_table<'lua>(lua: &'lua Lua, bucket: &(i32, Vec<u64>)) -> mlua::Result<Table<'lua>> {
     let (offset, counts) = bucket;
     let table = lua.create_table()?;
@@ -1028,17 +871,10 @@ fn exp_buckets_table<'lua>(lua: &'lua Lua, bucket: &(i32, Vec<u64>)) -> mlua::Re
 
 impl UserData for MetricProxy {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
-        // Registered via `add_method`, not handled inside the `MetaMethod::Index` closure below,
-        // and deliberately the *only* thing on this proxy that is: mlua consults a type's
-        // `add_method`-registered methods table before ever falling back to a custom `Index`
-        // meta method, so `m.quantile` (plain field read) and `m:quantile(q)` (sugar for
-        // `m.quantile(m, q)`) both resolve here regardless of what key names the `Index` closure
-        // handles -- no risk of the two definitions drifting or shadowing each other the way a
-        // second `"quantile"` arm down there would. `add_method` also hands the callback `&Self`
-        // directly and strips the implicit receiver argument a colon call passes, so unlike the
-        // hand-rolled closure this replaced, there's no `_self` parameter to thread through by
-        // hand. Only meaningful for `distribution` (`DdSketch::quantile`); every other kind's
-        // call returns `nil`, matching the field table's own wording for this method.
+        // The one method on this proxy. mlua checks `add_method` methods before the `Index`
+        // metamethod, so `m:quantile(q)` resolves here and the `Index` closure needs no
+        // `"quantile"` arm. Only a `distribution` answers (`DdSketch::quantile`); any other kind
+        // returns `nil`.
         methods.add_method("quantile", |_, this, q: f64| {
             this.with_metric(|m| {
                 Ok(match &m.kind {
@@ -1150,13 +986,8 @@ impl UserData for MetricProxy {
                     MetricKind::ExponentialHistogram(e) => Ok(opt_number(e.max)),
                     _ => Ok(LuaValue::Nil),
                 },
-                // A plain read-only integer field on every kind that carries one --
-                // `exponential_histogram`, `summary`, and `distribution` (`DdSketch::count()`,
-                // the sketch's own observation count) -- and `nil` everywhere else, the ordinary
-                // "nil when the kind doesn't carry it" rule every other kind-specific field here
-                // follows. No method role: unlike `quantile` (meaningful only via a `q` argument
-                // a plain field can't carry), a count is just data, so there's no reason to make
-                // scripts write `m:count()` instead of `m.count`.
+                // A field, not a method like `quantile`, since it takes no argument. A
+                // `distribution`'s is `DdSketch::count()`.
                 "count" => match &m.kind {
                     MetricKind::Distribution(sketch) => {
                         Ok(LuaValue::Integer(sketch.count() as i64))
@@ -1204,9 +1035,7 @@ impl UserData for MetricProxy {
                     }
                     _ => Ok(LuaValue::Nil),
                 },
-                // No `"quantile"` arm here -- it's registered via `add_method` above, which mlua
-                // resolves before ever reaching this `Index` fallback (see that registration's
-                // comment).
+                // `quantile` is a method, resolved before this fallback.
                 _ => Ok(LuaValue::Nil),
             })
         });
@@ -1345,9 +1174,8 @@ impl UserData for MetricProxy {
     }
 }
 
-/// Shared by `EventProxy::to_table`'s `metrics` array -- one definition of what a metric record
-/// looks like as a plain table, exhaustive over every kind-specific field (present only for the
-/// kind that actually carries it, same "only when present" rule the field table above documents).
+/// A metric record as a plain table, for `EventProxy::to_table`'s `metrics`: every
+/// kind-specific field, each present only on the kind that carries it.
 fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<Table<'lua>> {
     let table = lua.create_table()?;
     table.set("name", resolve(record.name))?;
@@ -1446,21 +1274,13 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
 
 // -- `event.span` ---------------------------------------------------------------------------
 
-/// The `event.span` sub-object -- entirely read-only, unlike every other proxy in this module:
-/// in-place mutation of an existing span is the one thing not offered. *Construction* is
-/// `Event.new`'s job (`crate::construct`'s `span_from_table`, the inverse of [`span_to_table`]
-/// below; `docs/design/lua-api.md`'s "Constructing events"), and "rebuild it with one field
-/// changed" is `Event.new(event:to_table())` with the table edited. This proxy is the read side
-/// once a span already exists -- minted by `Event.new`, by `ComponentKind::TraceContext`'s
-/// `span:` block, or by a codec that decoded one off the wire. Shares the same
-/// `Rc<RefCell<Event>>` as its parent [`EventProxy`], cached and gated on `event.span.is_some()`
-/// the same way [`LogProxy`] is -- see [`EventProxy::span_userdata`].
+/// The `event.span` sub-proxy, read-only. A script changes a span by rebuilding the event with
+/// `Event.new(event:to_table())`, edited (`docs/design/lua-api.md`'s "Constructing events");
+/// `crate::construct`'s `span_from_table` is [`span_to_table`]'s inverse. Construct only when
+/// `event.span.is_some()`, as for [`LogProxy`].
 ///
-/// Note what's *not* here: a `SpanRecord` has no `attributes` field of its own (checked against
-/// `crates/logit-core/src/span.rs` directly) -- a span-carrying event's attributes are
-/// `event.attributes`, the same single attribute set every event has, not a second span-specific
-/// map. So there is no `event.span.attributes` -- a script already has that data through
-/// `event.attributes`.
+/// There is no `event.span.attributes`: a `SpanRecord` has no attributes of its own, and a span
+/// event's are `event.attributes`.
 struct SpanProxy(Rc<RefCell<Event>>);
 
 impl SpanProxy {
@@ -1523,9 +1343,7 @@ impl UserData for SpanProxy {
             })
         });
 
-        // Unconditional, unlike every other proxy's `__newindex` -- there's no per-field split to
-        // make: nothing on a span is writable *in place* from Lua. A script that wants a
-        // different span builds one with `Event.new` (`crate::construct`).
+        // Every field is read-only, so there's no per-field split.
         methods.add_meta_method(
             MetaMethod::NewIndex,
             |_, _this, (_key, _value): (mlua::String, LuaValue)| {
@@ -1561,8 +1379,8 @@ fn span_link_to_table<'lua>(lua: &'lua Lua, link: &SpanLink) -> mlua::Result<Tab
     Ok(table)
 }
 
-/// Shared by `EventProxy::to_table`'s `span` key -- one definition of what a span record looks
-/// like as a plain table, mirroring [`SpanProxy`]'s own `__index` field-for-field.
+/// A span record as a plain table, for `EventProxy::to_table`'s `span`; mirrors [`SpanProxy`]'s
+/// fields.
 fn span_to_table<'lua>(lua: &'lua Lua, span: &SpanRecord) -> mlua::Result<Table<'lua>> {
     let table = lua.create_table()?;
     table.set("trace_id", to_hex(&span.trace_id))?;
@@ -1618,33 +1436,17 @@ fn span_to_table<'lua>(lua: &'lua Lua, span: &SpanRecord) -> mlua::Result<Table<
     Ok(table)
 }
 
-/// Extracts the owned `Event` from a Lua value that should be an [`EventProxy`] userdata --
-/// shared by `ScriptWorker::process`'s single-event and table-of-events return-value cases, and
-/// by `flush()`'s table case.
+/// Extracts the owned `Event` and its routing mark from a returned [`EventProxy`] userdata, for
+/// `process()`'s and `flush()`'s return values.
 ///
-/// Uses `AnyUserData::take`, not `borrow().clone()`: `take` empties the value out of the Lua
-/// userdata box itself (leaving a "destructed" marker `mlua` returns a clear error for on any
-/// further use), which is what makes `EventProxy::into_inner`'s `Rc::try_unwrap` fast path
-/// actually fire in the ordinary case -- with `borrow().clone()`, the original argument's Lua-side
-/// box would still hold its own reference for as long as Lua's GC keeps it alive, so
-/// `try_unwrap` would essentially never succeed and every call would pay a full `Event` clone.
+/// `AnyUserData::take`, not `borrow().clone()`: `take` empties the Lua box, so
+/// [`EventProxy::into_inner`]'s `Rc::try_unwrap` succeeds; with a clone, the box's reference
+/// would live until GC and every call would pay a full `Event` clone.
 ///
-/// The real cost of `take`: a Lua userdata is a *reference* type, so `pending = event` doesn't
-/// clone anything at the Rust level (`Rc::strong_count` stays 1 the whole time -- there is no way
-/// to detect this aliasing from Rust at all) -- it makes `pending` a second Lua variable pointing
-/// at the exact same underlying box. `take` empties that box, so it invalidates every alias, not
-/// just the one being extracted here. A script that stashes an event in `process()` (for `flush()`
-/// to pick up later) and *also* returns that same event from `process()` in the same call will
-/// find the stashed alias destructed by the time `flush()` tries to use it -- see the "handles are
-/// consumed once returned" note on [`EventProxy`], and use `event:clone()` for the stash if both
-/// are genuinely needed.
-///
-/// Takes `&Lua` to hand to [`EventProxy::into_inner`], which needs it to release the cached
-/// `AttrsProxy` registry entry before its own `Rc::try_unwrap` fast path.
-///
-/// Returns the event's routing mark (`event:to(..)`, `None` if unmarked) alongside it: the mark
-/// lives on the handle this consumes, so this is the one place it can leave with the event. See
-/// [`EventProxy`]'s `target` field.
+/// The cost: `pending = event` makes a second Lua reference to the same box, invisible from Rust
+/// (`Rc::strong_count` stays 1), and `take` invalidates every alias. A script that stashes an
+/// event for `flush()` and also returns it finds the stash destructed; it should stash
+/// `event:clone()`.
 pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<(Event, Option<u16>)> {
     match ud.take::<EventProxy>() {
         Ok(proxy) => Ok(proxy.into_inner(lua)),
@@ -1659,41 +1461,16 @@ pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<(Event, Opt
     }
 }
 
-/// Rewrites an error caused by a *script* touching an already-destructed `EventProxy`/`AttrsProxy`
-/// handle into this crate's own clear wording -- the same "handle consumed once returned" message
-/// [`take_event`] already gives for the one case it can see directly (a destructed `EventProxy`
-/// it's the one taking). Passed through unchanged if it isn't that.
+/// Rewrites a script's use of a destructed handle into this crate's "consumed once returned"
+/// wording; any other error passes through.
 ///
-/// This exists because caching `event.attributes` (see [`EventProxy::attrs_userdata`] and
-/// [`EventProxy::into_inner`]) opens the same failure class on an `AttrsProxy` handle that already
-/// existed for `EventProxy` itself: a script that does `local a = event.attributes`, returns its
-/// event (destructing the cached `AttrsProxy` as part of that), and then touches `a` again from
-/// `flush()` now hits a destructed userdata -- exactly the stash-then-reuse mistake
-/// `take_event`'s message already explains for the event handle itself, just discovered from a
-/// different place.
-///
-/// `take_event` catches its case by matching `Err(mlua::Error::UserDataDestructed)` returned
-/// directly from its own `AnyUserData::take` call -- a Rust-side operation. This case is
-/// different: the destructed access happens *inside a running script* (`flush()`'s own body reads
-/// or writes through `a`), so it's mlua's metamethod dispatch, not our code, that discovers the
-/// problem -- Lua swaps a destructed userdata's metatable out for one whose every metamethod
-/// raises `mlua::Error::CallbackDestructed` unconditionally, without ever reaching `AttrsProxy`'s
-/// own `__index`/`__newindex` closures above. That error then crosses back into Rust wrapped in
-/// one or more layers of `mlua::Error::CallbackError` (mlua's mechanism for propagating a Lua-side
-/// error, plus a traceback, back through a `Function::call`) by the time `ScriptWorker::process`/
-/// `flush` see it -- so the only place this can be caught and clarified is here, wrapping the
-/// whole `process.call(...)`/`flush.call(())`, not inside any one metamethod.
-///
-/// `SpanProxy` fails exactly this same way for exactly this same reason: it's cached and `take`n
-/// in `into_inner` just like `AttrsProxy`/`LogProxy` are, so a stashed `local s = event.span`
-/// used after its event is returned hits the identical destructed-userdata path. `MetricProxy` is
-/// the one handle in this module that reaches an "already returned" error *without* going through
-/// this function at all -- it isn't registry-cached (see its own doc comment), so there's no
-/// destructed-userdata marker for it to trip; `metric_handle_consumed_error` raises a plain
-/// `RuntimeError` directly from a failed `Weak::upgrade` instead. The message below still names it
-/// alongside `event.attributes`/`event.log`/`event.span`, though, since a script doesn't need to
-/// know or care which internal mechanism caught the mistake -- only that stashing any handle this
-/// module hands out has the same rule.
+/// A stashed `event`, or a cached sub-proxy (`event.attributes`, `event.log`, `event.span`) torn
+/// down by [`EventProxy::into_inner`], is destructed once its event is returned. Using it inside
+/// a running script hits mlua's replacement metatable, which raises
+/// `mlua::Error::CallbackDestructed` without reaching this module's closures, and that arrives
+/// wrapped in `CallbackError` layers. So this wraps the whole `process`/`flush` call rather than
+/// any metamethod. `MetricProxy` reports the same mistake itself (`metric_handle_consumed_error`),
+/// but the message names it too, since the rule is the same for every handle.
 pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
     fn is_destructed_handle_use(err: &mlua::Error) -> bool {
         match err {
@@ -2066,10 +1843,8 @@ mod tests {
     fn metric_index_on_emptied_list_errors_cleanly() {
         let lua = Lua::new();
         let event = Rc::new(RefCell::new(metric_event(sum_kind())));
+        // The event stays alive, so this exercises the index check, not the failed upgrade.
         event.borrow_mut().metrics.clear(); // simulate a handle outliving its metric
-                                            // The event itself is still alive (`event` stays in scope for the whole test), so
-                                            // `Weak::upgrade` succeeds and this exercises the *other* staleness check --
-                                            // `with_metric`'s index lookup -- not `metric_handle_consumed_error`.
         let proxy = MetricProxy { event: Rc::downgrade(&event), index: 0 };
         let ud = lua.create_userdata(proxy).unwrap();
         lua.globals().set("m", ud).unwrap();
@@ -2213,12 +1988,7 @@ mod tests {
         w.process(metric_event(distribution_kind())).unwrap();
     }
 
-    /// `:quantile` is a bound function on every kind (per its own field-table entry, "only
-    /// meaningful for distribution, returns nil for other kinds"), so calling it on a `sum`
-    /// doesn't error, it just answers `nil`. `count` has no method role at all -- it's a plain
-    /// (and, off `distribution`/`exponential_histogram`/`summary`, absent) *field*, matching the
-    /// field table's "count (ro integer; distribution, exponential_histogram, summary)" entry
-    /// exactly, not a method the way `quantile` is.
+    /// `:quantile` answers `nil` on a non-distribution kind, and `count` is a field, not a method.
     #[test]
     fn quantile_method_returns_nil_for_a_non_distribution_kind() {
         let w = worker(
@@ -2595,11 +2365,8 @@ mod tests {
         assert_eq!(out.attributes.get("span_links_len"), Some(&Value::I64(1)));
     }
 
-    /// Reading `event.metrics[1].value` and `event.span.name` mints (and drops) a `MetricProxy`
-    /// and reads through the cached `SpanProxy`, but touches nothing -- the event returned from
-    /// `process()` must come back byte-for-byte identical, and `into_inner`'s cache teardown
-    /// (`attrs`/`log`/`metrics`/`span` registry entries all released before `Rc::try_unwrap`) must
-    /// not panic or corrupt anything along the way.
+    /// Reading through `event.metrics[1]` and `event.span` leaves the returned event identical,
+    /// through `into_inner`'s cache teardown.
     #[test]
     fn reading_metric_and_span_fields_leaves_the_event_unchanged() {
         let w = worker(
@@ -2619,21 +2386,10 @@ mod tests {
         assert_eq!(out, expected);
     }
 
-    // -- MetricProxy holds a Weak, not an Rc (PR #134 review finding 1) --------------------------
+    // -- MetricProxy holds a Weak, not an Rc ------------------------------------------------------
 
-    /// Direct regression coverage for the bug the `Weak` fix closes: with `MetricProxy` holding a
-    /// strong `Rc`, a script reading so much as `event.metrics[1].value` -- even without stashing
-    /// anything anywhere -- would leave that temporary `MetricProxy` userdata's `Rc` clone alive
-    /// on Lua's stack for as long as LuaJIT's GC hadn't gotten around to collecting it, which
-    /// `EventProxy::into_inner`'s `Rc::try_unwrap` has no way to wait for.
-    ///
-    /// Mints its `MetricProxy` directly against `EventProxy`'s own `event` field, bypassing
-    /// `event.metrics` (`MetricsProxy`) entirely -- going through the real `event.metrics[i]`
-    /// surface would also populate `EventProxy`'s *own* `metrics` registry cache (correctly
-    /// released inside `into_inner`, before its `Rc::try_unwrap`, same as `attrs`/`log`/`span`;
-    /// unrelated to this fix), which would confound a strong-count check taken *before*
-    /// `into_inner` runs. Isolating `MetricProxy` this way targets exactly the regression: does
-    /// *this* proxy type hold a strong `Rc`, independent of anything else `EventProxy` caches.
+    /// A live `MetricProxy` doesn't raise the event's strong count. Built directly, bypassing
+    /// `MetricsProxy`, whose own cached `Rc` would confound the count before `into_inner`.
     #[test]
     fn reading_a_metric_field_keeps_into_inner_on_the_no_clone_path() {
         let lua = Lua::new();
@@ -2653,10 +2409,8 @@ mod tests {
         let _ = event_proxy.into_inner(&lua); // must not panic
     }
 
-    /// The other half of the same fix: a script that stashes `event.metrics[i]` in a global and
-    /// uses it later (the same `flush()`-reuses-state idiom `docs/design/lua-api.md` documents for
-    /// `event`/`event.attributes` themselves) must get the same "already returned" error those
-    /// handles give, not silently read or write a resurrected copy of the metric.
+    /// A stashed `event.metrics[i]` used after its event is returned gets the "already returned"
+    /// error, not a resurrected copy.
     #[test]
     fn a_stashed_metric_handle_errors_after_the_event_is_returned() {
         let w = worker(

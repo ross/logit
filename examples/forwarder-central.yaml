@@ -1,36 +1,26 @@
-# The other half of the native-transport forwarding pair -- see examples/forwarder-edge.yaml for
-# the full picture, how to run both together, and the `logit_out`/`logit_in` field reference this
-# file doesn't repeat.
+# The central half of the native-transport forwarding pair. examples/forwarder-edge.yaml is the
+# far side and says how to run both together.
 #
 # Topology (this file):
 #
 #   [the wire] --> central_in (logit_in) --> windowed (aggregate) --> central_out (stdio_out)
 #
-# `windowed` is where the 60s aggregation window actually happens -- the edge process forwards
-# everything unaggregated (docs/adr/aggregation-window-semantics.md's merge semantics apply once,
-# here, not once per edge and again centrally). `stdio_out` stands in for a real sink
-# (`influxdb_out`, another `otlp_out`/`logit_out` hop, ...) purely so this example is runnable with
-# no external service.
+# The 60s window happens here, once; the edge forwards everything unaggregated, so
+# docs/adr/aggregation-window-semantics.md's merge applies once, not per hop. `stdio_out` stands
+# in for a real sink so the example runs with no external service.
 components:
   central_in:
     type: logit_in
     bind: 0.0.0.0:5140
-    # tls:                        # presence turns TLS on; no ALPN, unlike otlp_in
+    # tls:                        # presence turns TLS on
     #   cert_file: server.pem
     #   key_file: server.key
-    #   client_ca_file: null       # set for mutual TLS -- every connecting client must then
-    #                                present a certificate chaining to this CA
-    # max_frame_bytes: 64MiB       # caps one frame's size (post- and pre-decompression alike),
-    #                                echoed to every connecting client in HelloAck.max_frame_bytes
-    # handshake_timeout: 5s        # bounds each pre-Hello phase *separately* -- the TLS accept,
-    #                                then the Hello read -- so a TLS peer that connects and sends
-    #                                no Hello costs up to twice this before its connection-cap
-    #                                slot is released. Not an idle timeout: see idle_timeout below.
-    # idle_timeout: 5m              # off by default. Bounds how long a handshaken connection may
-    #                                stay quiet before this listener closes it (Reject{GOING_AWAY}
-    #                                first, so logit_out reconnects rather than losing a batch) and
-    #                                releases its permit. Recommended wherever consistent traffic
-    #                                is expected, sized above the sender's longest normal gap
+    #   client_ca_file: null       # set for mutual TLS
+    # max_frame_bytes: 64MiB       # caps one frame, pre- and post-decompression alike
+    # handshake_timeout: 5s        # per pre-Hello phase (TLS accept, then the Hello read), so a
+    #                                TLS peer that sends no Hello costs up to twice this
+    # idle_timeout: 5m              # off by default; closes a handshaken connection quiet for
+    #                                this long. Size it above the sender's longest normal gap
     #                                (docs/adr/idle-connection-timeout.md).
 
   windowed:

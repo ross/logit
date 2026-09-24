@@ -1,15 +1,11 @@
 #!/bin/bash
 # Usage: script/protogen
-# Regenerates all three proto families -- crates/logit-proto/src/otlp/generated/,
-# crates/logit-proto/src/prometheus/generated/, and crates/logit-proto/src/datadog/generated/ --
-# from their vendored .proto files (crates/logit-proto/proto/, provenance in proto/README.md) via
-# prost-build + protoc, run inside a throwaway image (tools/protogen/Dockerfile) that carries
-# protoc.
+# Regenerates crates/logit-proto/src/{otlp,prometheus,datadog}/generated/ from the vendored
+# .proto files in crates/logit-proto/proto/ (provenance in its README.md), using prost-build and
+# protoc in a throwaway image (tools/protogen/Dockerfile). Review the diff and commit it yourself.
 #
-# Deliberately NOT part of script/cibuild: putting protoc in the CI image is exactly what
-# ADR `containerized-development` rules out, and ADR `committed-pregenerated-otlp-protobuf` settles regeneration as a deliberate, reviewed act instead of a
-# CI drift check. Review the diff under crates/logit-proto/src/{otlp,prometheus}/generated/ and
-# commit it yourself after running this.
+# Not part of script/cibuild: regeneration is a reviewed act, not a CI drift check, and protoc
+# stays out of the CI image (ADR `committed-pregenerated-otlp-protobuf`).
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

@@ -157,7 +157,7 @@ carry the table above, and `has_signal`'s must say plainly that it never mutates
 4. `logit-cli::pipeline::build_spec` (`crates/logit-cli/src/pipeline.rs:253-262`, beside the
    `Keep`/`Remove` arms) — plus a `to_signal_set` converter alongside `to_metric_specs`.
 
-### Validation — rule 19
+### Validation — rule 21
 
 Its own loop in `graph::resolve`, following the `kv_metrics` precedent (`graph.rs:316-340`):
 
@@ -177,7 +177,7 @@ the multi-payload model forces two operations rather than one; the drop-emptied-
 
 ### Docs and demo
 
-- `docs/design/pipeline-graph.md` — transform-kind lists, the `ComponentKind` sketch, and rule 19
+- `docs/design/pipeline-graph.md` — transform-kind lists, the `ComponentKind` sketch, and rule 21
   in the validation list.
 - `demo/logit.yaml` — replace `trace_windowed` (aggregate) with `type: has_signal` /
   `signals: [traces]`, and rewrite the topology comment and the long explanation above it: the
@@ -203,7 +203,7 @@ the multi-payload model forces two operations rather than one; the drop-emptied-
   the log body survives — the workstream B (Loki-direct) shape from the parent plan.
 - Config deserialization tests beside `keep_component_deserializes`
   (`crates/logit-config/src/lib.rs:1113-1123`), including `mode` defaulting to `any_of`.
-- `graph.rs` role/kind_name tests (`:944-990`) and a rule-19 rejection test.
+- `graph.rs` role/kind_name tests (`:944-990`) and a rule-21 rejection test.
 - `build_spec` tests mirroring `build_spec_builds_a_keep_transform`
   (`crates/logit-cli/src/pipeline.rs:909-935`).
 
@@ -219,7 +219,7 @@ export request on **both** transports; values are plain strings so `!env` works 
 `X-Scope-OrgID` for multi-tenant Loki/Mimir/Grafana Cloud; and protocol-owned headers are rejected
 at load rather than silently overridden.
 
-**Rule 20** in `graph::resolve` rejects, case-insensitively: `content-type`, `content-length`,
+**Rule 22** in `graph::resolve` rejects, case-insensitively: `content-type`, `content-length`,
 `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, `grpc-encoding`,
 `grpc-accept-encoding`, `grpc-timeout`, `grpc-status`, `grpc-message`, an empty name, and anything
 starting with `:` (HTTP/2 pseudo-headers, which hyper would otherwise reject with an opaque error
@@ -242,9 +242,9 @@ does the lexical `HeaderName`/`HeaderValue` validation `graph` can't, and apply 
 raw request text into an `Arc<Mutex<Vec<String>>>` and assert the header arrives; same for
 `canned_grpc_server` (`:841`) via `req.headers()`. Plus
 `with_timeout_after_with_headers_keeps_the_headers` (the regression test for the hazard, asserting
-both builder orders send identically), `an_invalid_header_value_fails_construction`, and rule-20
+both builder orders send identically), `an_invalid_header_value_fails_construction`, and rule-22
 accept/reject tests in `graph.rs`. No ADR — config surface only; the reserved list's reasoning
-lives in the field doc comment and rule 20's inline comment.
+lives in the field doc comment and rule 22's inline comment.
 
 ---
 
@@ -263,7 +263,7 @@ override or `signal.path()`, and `send_http:132` using it. `Signal::path()`
 `otlp_in`'s router is unaffected — the input's mount points are not the output's.
 
 **gRPC: rejected, not ignored.** gRPC method names are fixed by the `.proto` service definitions and
-`Signal::grpc_method()` is shared with `otlp_in`'s router. **Rule 21** rejects a non-empty `paths`
+`Signal::grpc_method()` is shared with `otlp_in`'s router. **Rule 23** rejects a non-empty `paths`
 on an `otlp_out` with `protocol: grpc`, in the same spirit as rule 14 (`buffer:` on a non-sink) and
 rule 17 (`receive:` on a non-datagram listener).
 

@@ -1,11 +1,10 @@
-//! Readiness/liveness state (docs/plans/operator-surface.md, workstream B): a live snapshot of
-//! where the pipeline is in its lifecycle and what every component is doing, written by
-//! [`crate::runtime::run_with_telemetry`] and read by `logit-cli`'s admin server (workstream C).
+//! Readiness/liveness state: a live snapshot of where the pipeline is in its lifecycle and what
+//! every component is doing, written by [`crate::runtime::run_with_telemetry`] and read by
+//! `logit-cli`'s admin server (`docs/adr/admin-readiness-endpoint.md`).
 //!
-//! The constraint this whole module is designed around: readiness must be true only when the
-//! pipeline can actually accept and forward, and false as soon as it can't -- never a static
-//! "the process is up." See `docs/plans/operator-surface.md`'s "The constraint everything is
-//! designed around".
+//! Readiness is true only while the pipeline can accept and forward, and false as soon as it
+//! can't; never a static "the process is up." See `docs/plans/operator-surface.md`'s "The
+//! constraint everything is designed around".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,11 +13,9 @@ use tokio::sync::watch;
 
 /// Where the process as a whole is in its lifecycle.
 ///
-/// Transitions are monotonic in one direction only: `Starting -> Ready -> Draining`, with
-/// `Failed` reachable from any of them and terminal once reached. That monotonicity is enforced
-/// inside [`Readiness`]'s own update methods, not by the callers -- the join loop (on a task
-/// error) and the shutdown driver (on a real signal) genuinely race to update this, and neither
-/// needs to know which one the other already did.
+/// Transitions only move forward: `Starting -> Ready -> Draining`, with `Failed` reachable from
+/// any of them and terminal. [`Readiness`]'s update methods enforce this, not their callers: the
+/// join loop (on a task error) and the shutdown driver (on a signal) race to update it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Binding listeners and spawning tasks. Nothing has failed yet, but not everything exists.
@@ -27,14 +24,13 @@ pub enum Phase {
     Ready,
     /// A shutdown signal arrived; nodes are draining. Never entered from `Failed`.
     Draining,
-    /// At least one node exited with an error. Terminal -- once here, always here.
+    /// At least one node exited with an error. Terminal.
     Failed,
 }
 
 impl Phase {
-    /// This module's own vocabulary, not the wire words `/readyz` returns -- workstream C's
-    /// `admin.rs` maps `Phase` to `ok`/`starting`/`draining`/`degraded` itself, deliberately using
-    /// different strings: that mapping is an HTTP-response concern, not a runtime one.
+    /// This module's vocabulary, not the words `/readyz` returns: `logit-cli`'s `admin.rs` maps
+    /// `Phase` to `ok`/`starting`/`draining`/`degraded` itself, as an HTTP-response concern.
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Starting => "starting",
@@ -45,33 +41,28 @@ impl Phase {
     }
 }
 
-/// One component's coarse lifecycle, as seen from the outside -- not the same granularity as
-/// `Diagnostics`/`Telemetry`'s per-component instrumentation, just enough for a readiness probe.
+/// One component's coarse lifecycle, as seen from the outside: enough for a readiness probe, far
+/// coarser than `Diagnostics`/`Telemetry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
     /// In the graph; not yet bound or spawned.
     Pending,
-    /// [`crate::Input::bind`] or [`crate::Output::bind`] returned `Ok` -- listeners and sinks
-    /// alike, since both go through `run_with_telemetry`'s one pre-spawn bind pass
-    /// (`docs/adr/prometheus-scrape-and-exposition.md`, "`Output::bind`"). A transform or Lua node
-    /// is never `Bound`, it goes straight from `Pending` to `Running`. A sink whose `bind` is the
-    /// default no-op (every sink that only connects outward) still reaches `Bound`: the state
-    /// records that the pre-spawn pass cleared that node, not that it opened a socket.
+    /// [`crate::Input::bind`] or [`crate::Output::bind`] returned `Ok` in `run_with_telemetry`'s
+    /// pre-spawn bind pass. A sink with the default no-op `bind` still reaches `Bound`: the state
+    /// records that the pass cleared the node, not that it opened a socket. A transform or Lua
+    /// node goes straight from `Pending` to `Running`.
     Bound,
     /// Its task (or, for a Lua node, its thread) exists and hasn't returned.
     Running,
-    /// It returned `Ok(())` on its own -- a finite listener, or any node whose inbox closed
+    /// It returned `Ok(())` on its own: a finite listener, or any node whose inbox closed
     /// during a graceful drain.
     Finished,
     /// It returned `Err`, or its task (or, for a Lua node, its thread) panicked.
     Failed,
-    /// A `target` ([`crate::graph::Role::Target`], `docs/adr/target-components.md`): there is no
-    /// task and no inbox to report on, because a target is a *name* for its routers' outbound
-    /// edges, not a node that runs. Its liveness is its routers' -- a target whose routers are all
-    /// `Running` is carrying traffic, and one whose routers have all exited is not, with nothing
-    /// of its own in between. Set once, in the pre-spawn pass that builds each target's `Fanout`
-    /// (`crate::runtime::run_with_telemetry`), and never moved again: the `Running`/`Finished`/
-    /// `Failed` transitions all come from a `JoinSet` entry a target doesn't have.
+    /// A `target` ([`crate::graph::Role::Target`], `docs/adr/target-components.md`): a name for
+    /// its routers' outbound edges, with no task or inbox, so its liveness is its routers'. Set
+    /// once, in the pre-spawn pass that builds each target's `Fanout`, and never moved: the
+    /// other transitions come from a `JoinSet` entry a target doesn't have.
     Alias,
 }
 
@@ -88,14 +79,13 @@ impl NodeState {
     }
 }
 
-/// The whole readiness snapshot, as one `watch` value -- cheap to clone (a `HashMap` per update,
-/// bounded by the graph's own component count) and cheap to read (`watch::Receiver::borrow`).
+/// The whole readiness snapshot, as one `watch` value. A clone copies a `HashMap` bounded by the
+/// graph's component count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineState {
     pub phase: Phase,
-    /// Every id in the graph, populated (all [`NodeState::Pending`]) by [`Readiness::begin`]
-    /// before the first bind -- so a probe arriving during startup already sees the complete
-    /// component list, not one that grows as nodes are bound and spawned.
+    /// Every id in the graph, seeded as [`NodeState::Pending`] by [`Readiness::begin`] before the
+    /// first bind, so a probe during startup sees the complete component list.
     pub components: HashMap<String, NodeState>,
     /// When `phase` last *changed*. A per-node update alone does not move it.
     pub since: SystemTime,
@@ -107,29 +97,24 @@ impl Default for PipelineState {
     }
 }
 
-/// The runtime's write end of the readiness signal. Cloned freely -- every clone shares the same
-/// underlying `watch::Sender`.
+/// The runtime's write end of the readiness signal. Every clone shares one `watch::Sender`.
 ///
 /// Every update goes through `watch::Sender::send_modify`, never `send`: `send` returns `Err`
-/// once the last receiver is dropped, and [`Readiness::disabled`] is a channel with no receivers
-/// *by construction* -- every update on a disabled signal would otherwise have to be `let _ =
-/// ...`'d at the call site, or every call site would have to know to check first. `send_modify`
-/// is infallible, mutates the shared value in place, and holds the watch's internal write lock
-/// for the whole closure -- which is what makes the monotonicity rules above atomic against a
-/// second, concurrent writer.
+/// once the last receiver is dropped, and [`Readiness::disabled`] has no receivers by
+/// construction. `send_modify` is infallible and holds the watch's write lock for the whole
+/// closure, which makes each forward-only transition check atomic against a concurrent writer.
 #[derive(Clone)]
 pub struct Readiness(Arc<watch::Sender<PipelineState>>);
 
 impl Readiness {
-    /// A live signal, plus the receiver `logit-cli::admin::serve` (workstream C) watches.
+    /// A live signal, plus the receiver `logit-cli::admin::serve` watches.
     pub fn channel() -> (Self, watch::Receiver<PipelineState>) {
         let (tx, rx) = watch::channel(PipelineState::default());
         (Self(Arc::new(tx)), rx)
     }
 
-    /// A signal nobody is watching -- what `run`/`run_with_shutdown` and every test that doesn't
-    /// care about readiness passes. Still a real channel (see the type's own doc comment on why
-    /// that matters); the receiver this constructor drops is simply never handed to anyone.
+    /// A signal nobody watches, for `run`/`run_with_shutdown` and tests that don't care about
+    /// readiness. Still a real channel whose receiver is dropped here (see [`Readiness`]).
     pub fn disabled() -> Self {
         let (tx, _rx) = watch::channel(PipelineState::default());
         Self(Arc::new(tx))
@@ -140,23 +125,17 @@ impl Readiness {
         self.0.subscribe()
     }
 
-    /// A cloned snapshot -- for tests. The server (workstream C) holds a `Receiver` directly
-    /// rather than polling this repeatedly.
+    /// A cloned snapshot, for tests. The admin server holds a `Receiver` instead.
     pub fn snapshot(&self) -> PipelineState {
         self.0.borrow().clone()
     }
 
-    /// Every id in `ids` set to [`NodeState::Pending`]. Called once, before the first bind --
-    /// `run_with_telemetry` calls it before it spawns anything that could write here.
+    /// Sets every id in `ids` to [`NodeState::Pending`]. Called once, before the first bind.
     ///
-    /// It does **not** set `phase`: `phase` is already [`Phase::Starting`] by construction
-    /// ([`PipelineState::default`], which both constructors above start from), so the only thing
-    /// assigning it could ever do is move an *already advanced* phase backwards -- erasing a
-    /// drain (and its `since`) that a concurrent writer had just recorded, and letting
-    /// [`Readiness::ready`] then promote the run to `Ready` as if nothing had happened. Like
-    /// every other method here, the rule lives in this method rather than in its caller's
-    /// ordering (see this module's own doc comment); `since` moves only while the phase is still
-    /// the `Starting` this seeding belongs to.
+    /// It does not set `phase`, which starts as [`Phase::Starting`] by construction: assigning it
+    /// could only move an advanced phase backwards, erasing a concurrent writer's drain (and its
+    /// `since`) and letting [`Readiness::ready`] promote the run to `Ready`. `since` moves only
+    /// while the phase is still `Starting`.
     pub fn begin(&self, ids: &[String]) {
         self.0.send_modify(|state| {
             state.components = ids.iter().map(|id| (id.clone(), NodeState::Pending)).collect();
@@ -166,8 +145,8 @@ impl Readiness {
         });
     }
 
-    /// Sets one component's state, leaving `phase` untouched -- callers move `phase` itself via
-    /// [`Readiness::ready`]/[`Readiness::draining`]/[`Readiness::failed`].
+    /// Sets one component's state, leaving `phase` untouched. An id not seeded by `begin` is
+    /// ignored.
     pub fn set_node(&self, id: &str, node_state: NodeState) {
         self.0.send_modify(|state| {
             if let Some(existing) = state.components.get_mut(id) {
@@ -176,8 +155,8 @@ impl Readiness {
         });
     }
 
-    /// `Starting -> Ready`. A no-op from `Draining` or `Failed` -- once draining has begun (or
-    /// failed), nothing moves the process back to accepting traffic.
+    /// `Starting -> Ready`. A no-op from `Draining` or `Failed`: nothing moves the process back
+    /// to accepting traffic.
     pub fn ready(&self) {
         self.0.send_modify(|state| {
             if state.phase == Phase::Starting {
@@ -187,8 +166,8 @@ impl Readiness {
         });
     }
 
-    /// `Starting | Ready -> Draining`. A no-op from `Failed` -- a real shutdown signal arriving
-    /// after a node has already failed must not paper over the failure with "draining".
+    /// `Starting | Ready -> Draining`. A no-op from `Failed`: a shutdown signal after a node has
+    /// failed must not mask the failure as "draining".
     pub fn draining(&self) {
         self.0.send_modify(|state| {
             if state.phase != Phase::Failed && state.phase != Phase::Draining {
@@ -198,8 +177,8 @@ impl Readiness {
         });
     }
 
-    /// Any phase -> `Failed`. Terminal, and idempotent: a second failing node after the first
-    /// leaves `phase` at `Failed` and `since` at the *first* failure's timestamp.
+    /// Any phase -> `Failed`. Terminal and idempotent: `since` keeps the first failure's
+    /// timestamp.
     pub fn failed(&self) {
         self.0.send_modify(|state| {
             if state.phase != Phase::Failed {
@@ -248,12 +227,7 @@ mod tests {
         assert_eq!(readiness.snapshot().phase, Phase::Failed, "draining() must not undo failed");
     }
 
-    /// `begin` is the one update method that isn't a transition -- it seeds the component list --
-    /// so it must leave `phase` alone rather than resetting it to `Starting`. `run_with_telemetry`
-    /// calls it before it spawns anything that could write here, but the rule lives here, in the
-    /// method, not in that caller's statement order (this module's own doc comment): a caller that
-    /// got the order wrong would otherwise erase a drain, `since` and all, and `ready()` would
-    /// then promote the run to `Ready` as though shutdown had never begun.
+    /// `begin` seeds components without moving an advanced phase (or its `since`) backwards.
     #[test]
     fn begin_seeds_components_without_moving_the_phase_backwards() {
         let (readiness, _rx) = Readiness::channel();
@@ -301,11 +275,7 @@ mod tests {
         assert_eq!(readiness.snapshot().components.len(), 1);
     }
 
-    /// The whole reason `Readiness` uses `send_modify` and never `watch::Sender::send`: `send`
-    /// returns `Err` once every receiver is dropped, which is exactly `disabled()`'s shape by
-    /// construction. If any update method regressed to `send`, this test would panic (an
-    /// unhandled `Err`) or -- if it were `let _ = ... .send(...)` -- would still be silently
-    /// swallowing exactly the bug this test exists to catch.
+    /// Every update method works on `disabled()`, which has no receiver (see [`Readiness`]).
     #[test]
     fn every_update_method_is_infallible_with_no_receiver() {
         let readiness = Readiness::disabled();

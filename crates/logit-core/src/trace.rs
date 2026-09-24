@@ -1,41 +1,34 @@
 //! Application trace context: a log record's reference to the trace/span it was emitted under.
 //!
-//! Distinct from `logit`'s own *pipeline* trace context (`logit_pipeline::fanout::TraceContext`,
-//! exposed to Lua as the `trace` global, `crates/logit-script/src/trace.rs`) -- that names which
-//! `logit` node-visit processed a batch; a [`TraceRef`] on a [`crate::LogRecord`] names the
-//! *application's* trace, carried on the wire by OTLP's `LogRecord.trace_id`/`span_id`/`flags`
-//! fields. See `docs/adr/log-record-trace-context.md`.
+//! Distinct from `logit`'s own pipeline trace context (`logit_pipeline::fanout::TraceContext`,
+//! the Lua `trace` global), which names the node visit that processed a batch. A [`TraceRef`]
+//! names the application's trace, carried by OTLP's `LogRecord.trace_id`/`span_id`/`flags`. See
+//! `docs/adr/log-record-trace-context.md`.
 //!
-//! Hex helpers live here too (`push_hex`/`to_hex`/`parse_trace_id`/`parse_span_id`) -- trace-id
-//! semantics, not generic hex encoding: `parse_*` enforces the same "all-zero is invalid" rule
-//! [`TraceRef::from_bytes`] does, so there is exactly one place that decides what a valid id is,
-//! not two independently-maintained ones.
+//! The hex and id helpers live here so one module decides what a valid id is: `parse_*` applies
+//! the same all-zero-is-invalid rule as [`TraceRef::from_bytes`].
 
 use std::fmt::Write;
 
-/// A reference to an application trace/span, carried on a [`crate::LogRecord`]. Bundled rather
-/// than two flat `Option`s on `LogRecord` itself: OTLP's own contract is "if `SpanId` is present,
-/// `TraceId` SHOULD be also present" -- a `TraceRef` makes "span without trace" unrepresentable
-/// instead of merely undocumented.
+/// A reference to an application trace/span, carried on a [`crate::LogRecord`]. One struct rather
+/// than two `Option`s makes a span without a trace unrepresentable (OTLP: "if `SpanId` is
+/// present, `TraceId` SHOULD be also present").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceRef {
     pub trace_id: [u8; 16],
-    /// `None` when a log is correlated to a trace but not a specific span within it -- OTLP
-    /// allows `TraceId` alone.
+    /// `None` for a log correlated to a trace but no span in it.
     pub span_id: Option<[u8; 8]>,
-    /// W3C trace flags (low 8 bits of OTLP's `LogRecord.flags`); bit 0 is the `SAMPLED` flag.
-    /// `0` means unset, not "not sampled" -- OTLP doesn't distinguish the two over the wire.
+    /// W3C trace flags (the low 8 bits of OTLP's `LogRecord.flags`); bit 0 is `SAMPLED`. `0`
+    /// means unset, not "not sampled": the wire doesn't distinguish them.
     pub flags: u8,
 }
 
 impl TraceRef {
-    /// The OTLP validity rule for a log record (`logs.proto`: "receivers SHOULD assume the log
-    /// record is not associated with a trace" if `trace_id` is absent or invalid): `trace`
-    /// valid only if exactly 16 non-zero bytes, `span` kept only if `trace` is valid *and* `span`
-    /// is exactly 8 non-zero bytes. An invalid `trace` drops `flags` too -- there is no "flags
-    /// with no trace" case to keep. Infallible by design: unlike a `Span`'s `trace_id` (required,
-    /// rejected outright when malformed -- `crates/logit-proto/src/otlp/traces.rs`'s `mod ids`),
-    /// a log's is optional correlation metadata a decoder degrades gracefully without, per spec.
+    /// Applies OTLP's log validity rule: `None` unless `trace` is 16 non-zero bytes; `span` kept
+    /// only if it's 8 non-zero bytes. An invalid `trace` drops `flags` too.
+    ///
+    /// Degrades rather than errors: a log's trace is optional correlation metadata, unlike a
+    /// span's required `trace_id`, which the OTLP decoder rejects outright.
     pub fn from_bytes(trace: &[u8], span: &[u8], flags: u8) -> Option<TraceRef> {
         let trace_id: [u8; 16] = trace.try_into().ok()?;
         if trace_id == [0; 16] {
@@ -46,47 +39,40 @@ impl TraceRef {
     }
 }
 
-/// Appends lowercase hex to `out` -- the shared rendering `crates/logit-script/src/trace.rs` (the
-/// `trace` Lua global) and `crates/logit-outputs/src/stdio.rs` (span/log rendering) both need.
+/// Appends lowercase hex to `out`.
 pub fn push_hex(out: &mut String, bytes: &[u8]) {
     for b in bytes {
         let _ = write!(out, "{b:02x}");
     }
 }
 
-/// A fresh `String` of lowercase hex -- the shape the Lua `trace` global and `event.log.trace_id`
-/// both want (a value to hand back, not a buffer to append to).
+/// `bytes` as a new lowercase hex `String`.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     push_hex(&mut out, bytes);
     out
 }
 
-/// Parses a 32-character case-insensitive hex string into a trace id, rejecting anything the
-/// wrong length, non-hex, or all-zero (OTLP: an all-zero id is invalid, same rule
-/// [`TraceRef::from_bytes`] applies to bytes off the wire).
+/// Parses 32 case-insensitive hex characters into a trace id; `None` if the wrong length,
+/// non-hex, or all-zero (invalid per OTLP).
 pub fn parse_trace_id(s: &str) -> Option<[u8; 16]> {
     parse_hex::<16>(s).filter(|id| *id != [0; 16])
 }
 
-/// Parses a 16-character case-insensitive hex string into a span id, same rules as
-/// [`parse_trace_id`] at half the length.
+/// [`parse_trace_id`] for a 16-character span id.
 pub fn parse_span_id(s: &str) -> Option<[u8; 8]> {
     parse_hex::<8>(s).filter(|id| *id != [0; 8])
 }
 
 /// Parses a W3C Trace Context `traceparent` header value
 /// (<https://www.w3.org/TR/trace-context/>): `00-<32 hex trace-id>-<16 hex parent-id>-<2 hex
-/// flags>`, exactly 55 ASCII characters, case-insensitive hex. Returns `(trace_id, parent_id,
-/// flags)` -- named `parent_id` deliberately: the span id in a `traceparent` is the *caller's*
-/// span, never the receiving service's own (`docs/adr/trace-context-span-lifting.md`). Only
-/// version `00` is accepted: the spec says a receiver "MUST" treat an unknown version leniently
-/// when the rest parses, but `ff` is forbidden outright and no other version exists, so being
-/// strict here rejects nothing real and keeps the parser trivially auditable. The ids follow
-/// the same non-zero rule as [`parse_trace_id`]/[`parse_span_id`] -- all-zero is invalid per the
-/// spec too. The flags octet is hex *because this header defines it so*; the standalone
-/// `trace.flags` attribute stays decimal (`crates/logit-transforms/src/trace_context.rs`), and
-/// the two never mix.
+/// flags>`, 55 ASCII characters, case-insensitive. Returns `(trace_id, parent_id, flags)`.
+///
+/// `parent_id` is the caller's span, never the receiving service's
+/// (`docs/adr/trace-context-span-lifting.md`). Only version `00` is accepted: the spec asks for
+/// leniency toward unknown versions, but `ff` is forbidden and no other version exists. All-zero
+/// ids are invalid. The flags are hex here because this header says so; the standalone
+/// `trace.flags` attribute is decimal.
 pub fn parse_traceparent(s: &str) -> Option<([u8; 16], [u8; 8], u8)> {
     let b = s.as_bytes();
     if b.len() != 55 || b[2] != b'-' || b[35] != b'-' || b[52] != b'-' {
@@ -101,23 +87,17 @@ pub fn parse_traceparent(s: &str) -> Option<([u8; 16], [u8; 8], u8)> {
     Some((trace_id, parent_id, flags))
 }
 
-/// Mints `N` random bytes for a fresh trace or span id -- a per-thread SplitMix64, good enough
-/// to mint distinct ids without a new `rand` dependency or `tracing::span::Id` (a `Registry`
-/// recycles those after a span closes, so they're not a safe source of identity here -- two
-/// spans minutes apart could share one). Not security-relevant: `logit`'s listeners are private
-/// by deployment shape (`docs/OVERVIEW.md`), the same premise `docs/known-gaps.md`'s interner
-/// entry leans on, and a trace id is not a capability. Two callers: `logit`'s own pipeline
-/// `TraceContext` (`crates/logit-pipeline/src/fanout.rs`, where this originally lived) and
-/// `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`). Lives here,
-/// next to `parse_trace_id`/`parse_span_id`, so exactly one module decides what an id is.
+/// Mints `N` random bytes for a trace or span id from a per-thread SplitMix64.
+///
+/// Not `tracing::span::Id`, which a `Registry` recycles after a span closes, and no `rand`
+/// dependency. Not security-relevant: listeners are private by deployment shape
+/// (`docs/OVERVIEW.md`), and a trace id isn't a capability. Callers: the pipeline `TraceContext`
+/// and `trace_context`'s opt-in `mint_id` (`docs/adr/trace-context-span-lifting.md`).
 pub fn random_id_bytes<const N: usize>() -> [u8; N] {
     use std::cell::Cell;
     thread_local! {
-        // Seeded once, lazily, on this thread's first call -- not a compile-time constant.
-        // Caught in review: a `const` seed here is identical on every thread and every process
-        // run, so the *first* call on any two fresh threads returned the same bytes,
-        // deterministically merging unrelated traces. `initial_seed` below is real per-run
-        // (OS-random) and per-thread entropy instead.
+        // Seeded lazily per thread from `initial_seed`, never a constant: a constant seed gives
+        // every fresh thread the same first id, merging unrelated traces.
         static STATE: Cell<u64> = Cell::new(initial_seed());
     }
     let mut out = [0u8; N];
@@ -142,12 +122,9 @@ pub fn random_id_bytes<const N: usize>() -> [u8; N] {
     out
 }
 
-/// This thread's starting seed: real entropy, not a shared constant. `RandomState::new()` is
-/// keyed from OS randomness at process start and refreshed by an internal per-call counter, so it
-/// already differs call to call within one process; mixing in this thread's `ThreadId` makes two
-/// threads calling this at nearly the same instant diverge too, rather than relying on
-/// `RandomState`'s own per-call drift alone. Not security-relevant, same as `random_id_bytes`'s
-/// own doc comment above -- this only needs to not repeat, not resist prediction.
+/// This thread's starting seed. `RandomState::new()` is OS-keyed per process and varies per call;
+/// hashing the `ThreadId` also separates threads that call at the same instant. It needs only
+/// not to repeat, not to resist prediction.
 fn initial_seed() -> u64 {
     use std::hash::BuildHasher;
     std::collections::hash_map::RandomState::new().hash_one(std::thread::current().id())
@@ -281,8 +258,7 @@ mod tests {
         let b: [u8; 16] = random_id_bytes();
         assert_ne!(a, b);
         assert_ne!(a, [0; 16]);
-        // A fresh thread's *first* call must differ from this thread's -- the bug a constant
-        // seed would reintroduce (see `random_id_bytes`'s own comment).
+        // A fresh thread's first call differs, which a constant seed would break.
         let there = std::thread::spawn(random_id_bytes::<16>).join().expect("no panic");
         assert_ne!(a, there);
         let short: [u8; 8] = random_id_bytes();

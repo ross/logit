@@ -6,22 +6,17 @@ license.workspace = true
 publish.workspace = true
 description = "Codec traits, the native logit-to-logit frame format, and the output Buffer trait."
 
-# The vendored OTLP proto comments (crates/logit-proto/proto/, carried into src/otlp/generated/ by
-# prost-build) include prose examples that read as indented/fenced code blocks to rustdoc -- e.g.
-# Span's attributes doc comment. `#![allow(rustdoc::all)]` on those files silences the *lint*, but
-# rustdoc still tries to *run* such a block as a doctest regardless of that lint. Turning doctests
-# off for the whole crate (no hand-written doctest exists here to lose -- house style favors prose
-# doc comments, see AGENTS.md) is the standard fix for third-party-generated code with this shape.
+# The vendored OTLP proto comments carried into src/otlp/generated/ include prose that rustdoc
+# reads as code blocks (Span's attributes doc, for one). `#![allow(rustdoc::all)]` silences the
+# lint, but rustdoc still runs such a block as a doctest, so doctests are off crate-wide. No
+# hand-written doctest exists here.
 [lib]
 doctest = false
 
 [dependencies]
 logit-core.workspace = true
-# `collectd::TypesDb::load` reads operator-supplied files, and the error an unreadable or
-# unparseable one produces has to carry the path alongside the parse error's own line number --
-# `anyhow::Context` is how every other file-reading path in this workspace (`logit-cli`'s config
-# loader, `logit-inputs`' checkpoint files) says that. Already a workspace dependency at this exact
-# version, so this adds nothing to `Cargo.lock` or `script/audit`.
+# `collectd::TypesDb::load` reads an operator-supplied file; `anyhow::Context` puts its path on
+# the error, as every other file-reading path in the workspace does.
 anyhow.workspace = true
 bytes.workspace = true
 prost.workspace = true
@@ -43,12 +38,10 @@ crc32c.workspace = true
 # `docs/known-gaps.md`'s Datadog entry gates the merge on a perf-VM measurement.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 base64.workspace = true
-# Prometheus remote-write's Snappy block compression (crates/logit-proto/src/prometheus) -- not yet
-# used by any codec (that's W2's remote_write.rs); a round-trip sanity test in
-# prometheus/generated/mod.rs exercises it so lint doesn't flag it as unused in the meantime.
+# Prometheus remote-write's Snappy block compression. Only prometheus/generated/mod.rs's round-trip
+# test calls it here; the remote-write sink and receiver compress in logit-outputs/logit-inputs.
 snap.workspace = true
 
 [dev-dependencies]
-# The OTLP fixed-point tests (tests/otlp_fixed_point.rs): decode(encode(b)) == b over a generated
-# corpus of MetricRecords, plus the hand-built fully-populated-batch fixtures.
+# Generated corpora for the property tests (most of tests/*_fixed_point.rs, src/otlp/metrics.rs).
 proptest.workspace = true

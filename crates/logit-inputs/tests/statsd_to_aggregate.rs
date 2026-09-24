@@ -1,11 +1,8 @@
 //! End-to-end: `statsd_in` decodes a relative gauge adjustment, `aggregate` resolves it.
 //!
-//! `statsd.rs`'s own unit tests pin the decode side (`+5|g` -> `MetricKind::GaugeDelta(5.0)`) and
-//! `aggregate.rs`'s own unit tests pin the resolution side directly against a hand-built
-//! `MetricKind::GaugeDelta` event -- neither, on its own, proves the two components actually agree
-//! with each other about what a decoded delta looks like. This is that proof, real decoder into
-//! real transform, no synthetic `MetricKind::GaugeDelta` construction anywhere in this file. See
-//! `docs/adr/relative-gauge-adjustments.md`.
+//! Each side's unit tests use its own idea of a `MetricKind::GaugeDelta`; this proves the real
+//! decoder and the real transform agree, with no hand-built `GaugeDelta` in this file
+//! (`docs/adr/relative-gauge-adjustments.md`).
 
 use bytes::Bytes;
 use logit_core::{MetricKind, Resource};
@@ -29,8 +26,7 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
 
     let batch = decoder.decode(Bytes::from_static(b"conns:+5|g")).expect("should decode");
     assert_eq!(batch.events.len(), 1);
-    // The event's own kind, straight off the decoder -- confirms the wire produced a real
-    // `GaugeDelta`, not a `Gauge`, before it ever reaches `aggregate`.
+    // The wire produced a `GaugeDelta`, not a `Gauge`, before `aggregate` sees it.
     assert!(matches!(batch.events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
     for mut event in batch.events {
         assert!(!agg.process(&resource, &mut event), "a pure gauge delta event should absorb");

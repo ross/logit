@@ -1,12 +1,10 @@
-//! `wait4`-based process reaping: blocks until a spawned child exits and reports exactly that
-//! child's resource usage in the same syscall (docs/adr/load-test-harness.md's "measure the real
-//! binary" decision).
+//! `wait4`-based reaping: blocks until a spawned child exits and reports that child's resource
+//! usage in the same syscall (docs/adr/load-test-harness.md).
 //!
-//! Deliberately `wait4`, never `libc::getrusage(RUSAGE_CHILDREN)`: that call aggregates *every*
-//! child this process has ever reaped -- in `logit-perf run`, that would include the `cargo
-//! build` step already run in the same process before the first scenario spawns, silently
-//! folding a multi-second compile into the first repeat's CPU time. `wait4` is attributed by pid,
-//! so it can only ever report the one child it reaped.
+//! Never `libc::getrusage(RUSAGE_CHILDREN)`: it aggregates every child this process has reaped,
+//! including the `cargo build` that `logit-perf run` spawns before the first scenario, which
+//! would fold a multi-second compile into the first repeat's CPU time. `wait4` reports only the
+//! pid it reaped.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
@@ -20,20 +18,21 @@ compile_error!(
 use std::io;
 use std::time::Duration;
 
-/// One spawned child's resource usage, plus the wall-clock elapsed the caller measured around it.
-/// `wait4` itself has no notion of wall time -- only the caller, watching for a scenario's own
-/// completion signal (the `generation complete` log line), knows when that clock should have
-/// started and stopped, so it's threaded in here as a parameter rather than derived.
+/// One spawned child's resource usage, plus the wall-clock time the caller measured.
+///
+/// `wait4` has no wall time; only the caller, watching for the scenario's completion signal,
+/// knows when that clock starts and stops, so it's passed in.
 #[derive(Debug, Clone, Copy)]
 pub struct Usage {
     pub wall: Duration,
     pub user: Duration,
     pub sys: Duration,
-    /// Peak resident set size, in bytes. `wait4`'s `ru_maxrss` is **kibibytes on Linux** -- POSIX
-    /// leaves the unit unspecified and BSD historically reports bytes there instead. This harness
-    /// only ever runs in this project's Linux dev container / CI image
-    /// (docs/adr/containerized-development.md), so the KiB-to-bytes conversion below is
-    /// unconditional, not `cfg`-gated on `target_os`.
+    /// Peak resident set size, in bytes.
+    ///
+    /// `wait4`'s `ru_maxrss` is kibibytes on Linux; POSIX leaves the unit unspecified and BSD
+    /// reports bytes. The harness runs only in the Linux dev container
+    /// (docs/adr/containerized-development.md), so the KiB-to-bytes conversion is unconditional
+    /// and the module's `compile_error!` rejects any other target.
     pub max_rss_bytes: u64,
     /// The raw wait status `wait4` reported. Decode with `libc::WIFEXITED`/`WEXITSTATUS` (or
     /// [`Usage::exit_code`]) rather than reading it directly.
@@ -41,19 +40,21 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// `Some(code)` if the child exited normally (`WIFEXITED`), `None` if it was killed by a
-    /// signal instead -- the harness's own SIGTERM-after-settle path is expected to end in a
-    /// clean exit (the same graceful-shutdown cascade `logit ready`'s drain test exercises), not
-    /// a signal death, so `None` here is always a failure worth reporting loudly.
+    /// `Some(code)` if the child exited normally (`WIFEXITED`), `None` if a signal killed it.
+    ///
+    /// The harness's SIGTERM-after-settle path ends in a clean exit through graceful shutdown,
+    /// so `None` is a failure to report unless a wrapper died by that SIGTERM
+    /// ([`Usage::termination_signal`]).
     pub fn exit_code(&self) -> Option<i32> {
         libc::WIFEXITED(self.status).then(|| libc::WEXITSTATUS(self.status))
     }
 
-    /// `Some(signal)` if the child was killed by one (`WIFSIGNALED`) -- the complement of
-    /// [`Usage::exit_code`]. The caller needs this to tell its *own* SIGTERM apart from any other
-    /// signal death: `perf record` (the only wrapper this harness runs `logit` under) forwards
-    /// SIGTERM to its workload, waits for it, finalizes `perf.data`, and then dies by that same
-    /// signal itself, which is a completed capture rather than a failure.
+    /// `Some(signal)` if a signal killed the child (`WIFSIGNALED`); the complement of
+    /// [`Usage::exit_code`].
+    ///
+    /// Tells the harness's own SIGTERM apart from any other signal death: `perf record` (the only
+    /// wrapper `logit` runs under) forwards SIGTERM to its workload, waits, finalizes
+    /// `perf.data`, then dies by that signal itself, which is a completed capture.
     pub fn termination_signal(&self) -> Option<i32> {
         libc::WIFSIGNALED(self.status).then(|| libc::WTERMSIG(self.status))
     }
@@ -68,10 +69,8 @@ pub fn wait4(pid: libc::pid_t, wall: Duration) -> io::Result<Usage> {
     // zero bytes, and `wait4` overwrites every field it defines before returning success.
     let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
 
-    // Retried on EINTR: a signal delivered to this process (e.g. this harness's own process
-    // group receiving Ctrl-C, or any other handler-bearing signal) can interrupt a blocking
-    // `wait4` before the child has actually exited -- that's not a real failure, just this
-    // syscall's ordinary contract, so it's retried rather than surfaced as an error.
+    // Retried on EINTR: a signal to this process can interrupt a blocking `wait4` before the
+    // child exits, which isn't a failure.
     loop {
         // SAFETY: `pid` names a live child of this process per the caller's contract above, and
         // `&mut status`/`&mut rusage` are valid, correctly-sized, uniquely-owned out-parameters
@@ -91,9 +90,8 @@ pub fn wait4(pid: libc::pid_t, wall: Duration) -> io::Result<Usage> {
 
     let user = timeval_to_duration(rusage.ru_utime);
     let sys = timeval_to_duration(rusage.ru_stime);
-    // `ru_maxrss` is `c_long` (KiB on Linux); a negative value would mean the kernel reported
-    // nonsense, not a real usage this harness should silently swallow, but that value is
-    // unreachable in practice on this project's supported platform -- clamp rather than panic.
+    // `ru_maxrss` is `c_long` (KiB on Linux). Linux never reports a negative value; clamp rather
+    // than panic.
     let max_rss_kib = rusage.ru_maxrss.max(0) as u64;
 
     Ok(Usage { wall, user, sys, max_rss_bytes: max_rss_kib * 1024, status })

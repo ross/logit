@@ -7,20 +7,17 @@
 #        script/unsafe-check shell
 #        script/unsafe-check --help
 #
-# Out-of-CI, throwaway-image harness for verifying the repo's raw-`libc` `unsafe` code with
-# nightly-only tools (miri, `cargo-careful`) that never touch the stable toolchain
-# (`rust-toolchain.toml`, `Dockerfile.dev`, `script/cibuild`) -- see
-# `docs/adr/out-of-ci-unsafe-verification.md` for what each tool actually verifies and its limits,
-# and `docs/plans/critical-sections-inventory.md` for the inventory this exists to work through.
-# Deliberately NOT part of script/cibuild, for the same reason script/bench/script/perf aren't:
-# this needs a second, nightly image and (for `inject`) elevated container capabilities that have
-# no business in the ordinary edit/check/test loop.
+# Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
+# tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
+# helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
+# force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
 #
-# `miri` and `careful` exercise the pure/real-syscall halves of `crates/logit-inputs/src/udp.rs`
-# (`recvmmsg`), `crates/logit-pipeline/src/sockstat.rs` (`getsockopt`), and
-# `crates/logit-inputs/src/tail/watch.rs` (hand-rolled inotify) -- the codebase's only three
-# production raw-`libc` `unsafe` call sites. `inject` forces the errno paths (EINTR/EAGAIN/ENOSYS/
-# EINVAL) neither tool can reach on a real socket/fd on demand.
+#   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
+#   UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose
+#                                    default seccomp profile blocks ptrace
+#   MIRIFLAGS                        defaults to -Zmiri-disable-isolation
+#
+# Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md).
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -28,59 +25,39 @@ source "${SCRIPT_PATH}/common.sh"
 
 IMAGE=logit-unsafe-check:local
 
-# The miri targets -- the pure halves of the raw-`libc` code, which is all miri can ever reach
-# (`docs/adr/out-of-ci-unsafe-verification.md`'s "miri has no shims for recvmmsg/recvmsg/inotify"
-# explains why only the parsing/pointer logic, not the syscalls around it, is runnable this way):
+# One "<package>|<libtest filter>" per line; `miri` with no arguments runs each in order. Miri
+# can't execute these syscalls, so each entry is a pure helper split out of the code around one
+# (the ADR's "What each tool verifies, and its limits"). Add an entry when a new one lands.
 #
-#   parse_events            the pure `inotify_event` parser in `crates/logit-inputs/src/tail/
-#                           watch.rs`'s `mod inotify::tests` (w0).
-#   batch_reader_helpers    `build_headers`/`harvest_headers` in `crates/logit-inputs/src/udp.rs`
-#                           -- the `mmsghdr`/`iovec` construction and the post-syscall harvest,
-#                           split out of `BatchReader::read_batch`'s closure precisely so a
-#                           provenance checker can execute them (NET-01, w1).
-#
-# One "<package>|<libtest filter>" pair per line -- `miri` with no arguments of its own runs every
-# pair below in order. Later workstreams extend this list as their own pure helpers land
-# (NET-11/NET-12/TAIL-07 in the critical-sections inventory); nothing else in this script needs to
-# change.
+#   parse_events            the `inotify_event` parser in tail/watch.rs
+#   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec` construction and post-call harvest
+#   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
+#                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
 MIRI_TARGETS=(
     "logit-inputs|parse_events"
     "logit-inputs|batch_reader_helpers"
-    # NET-11 (libc/w2): `sockstat`'s two reply parsers, split out of the `getsockopt` calls
-    # precisely so the branches no real kernel reaches are reachable at all. Pure -- they take an
-    # already-filled `[u32; 9]`/`libc::tcp_info` and a length -- so miri runs them, including the
-    # `mem::zeroed::<libc::tcp_info>()` the listen-queue test builds its input with.
     "logit-pipeline|sockstat::tests::reply_parsing"
 )
 
-# Every checkout binds at the same `/work`, so cargo's fingerprints match across branches: two
-# worktrees sharing one target volume can run each other's already-compiled test binaries. One
-# checkout at a time is fine on the default; a second, concurrent one sets
-# `UNSAFE_CHECK_TARGET_VOLUME` to a volume of its own.
+# Every checkout binds at the same `/work`, so cargo fingerprints match across branches and two
+# worktrees sharing one target volume can run each other's stale test binaries.
 TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 
-# The named fault injections, one "<label>|<strace inject spec>|<cargo test args>" per line --
-# `inject-all` runs every one in order. These are the errno paths no test can reach on a real
-# socket (`docs/adr/out-of-ci-unsafe-verification.md`), so unlike MIRI_TARGETS they are **not** all
-# expected to pass: two of the three deliberately force a fatal error and the run is a success when
-# the failure is the clean, named one. What each proves is in the comment beside it; the ADR
-# `udp-intake-batching-and-socket-visibility` amendment records the results.
+# One "<label>|<strace inject spec>|<cargo test args>" per line; `inject-all` runs each in order.
+# Unlike MIRI_TARGETS, not all are expected to pass: two force a fatal error, and they succeed
+# when the failure has the expected shape. ADR `udp-intake-batching-and-socket-visibility`'s
+# amendment records the results.
 INJECT_SCENARIOS=(
-    # The EINTR retry arm in `BatchReader::read_batch`. Unreachable on a non-blocking socket, so a
-    # signal cannot produce it and only this can. EXPECT: the test still PASSES -- every datagram
-    # delivered, because the arm retries the same call rather than failing.
+    # The EINTR retry arm in `BatchReader::read_batch`, which a signal can't reach on a
+    # non-blocking socket. EXPECT: the test passes, every datagram delivered.
     "udp-eintr-retry|recvmmsg:error=EINTR:when=2+3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
-    # A fatal errno mid-stream, after datagrams have already been read. EXPECT: the test FAILS,
-    # having read two full batches first and then stopping *immediately* on the third call -- no
-    # retry, no spin, no hang; the strace shows exactly one injected `recvmmsg` and then the
-    # process exiting. The test panics on its now-closed fanout rather than printing the listener's
-    # error, so the *message* is not what this scenario checks -- that is pinned in CI by
-    # `a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket`.
+    # A fatal errno after two batches. EXPECT: the test fails, and the strace shows one injected
+    # `recvmmsg` and then the process exiting: no retry, spin, or hang. The test panics on its
+    # closed fanout, so the error message isn't checked here;
+    # `a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket` pins it in CI.
     "udp-fatal-mid-stream|recvmmsg:error=EPERM:when=3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
-    # The seccomp case: the syscall refused on the very first call (quinn#1947, bun#42678).
-    # EXPECT: the test FAILS, and the strace shows **one** `recvmmsg` and nothing after it -- the
-    # bun#42678 failure mode is a refused call retried forever at 100% CPU, so a single traced call
-    # is the whole point of the scenario.
+    # A seccomp refusal on the first call (quinn#1947, bun#42678). EXPECT: the test fails, and the
+    # strace shows one `recvmmsg` and nothing after it, not a refused call retried at 100% CPU.
     "udp-seccomp-first-call|recvmmsg:error=ENOSYS:when=1|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
 )
 
@@ -88,14 +65,9 @@ build_image() {
     ${DOCKER} build -q -t "${IMAGE}" -f tools/unsafe-check/Dockerfile tools/unsafe-check >/dev/null
 }
 
-# This worktree bound at /work explicitly (never a compose service, which could cross-mount
-# another checkout), plus this image's *own* named volumes for the cargo registry cache and build
-# artifacts -- never `logit_cargo_home`/`logit_target_cache`, the stable dev container's volumes.
-# Sharing the target dir would poison the stable toolchain's incremental build cache with nightly
-# artifacts; a fresh, never-before-used volume here is what lets Docker's own copy-up behavior
-# (`Dockerfile.dev`'s comment on `/work/target` has the mechanism) seed it from this image's own
-# baked toolchain and `cargo-careful`/`cargo-nextest` installs on first use, and cache registry
-# downloads across runs after that.
+# A plain `docker run`, not a compose service, which could cross-mount another checkout. Its own
+# volumes, never the dev container's `logit_cargo_home`/`logit_target_cache`: nightly artifacts
+# must not mix into the stable toolchain's cache.
 run_in_image() {
     ${DOCKER} run --rm \
         -u 1000:1000 -w /work \
@@ -108,12 +80,9 @@ run_in_image() {
         "${IMAGE}" "$@"
 }
 
-# `inject` alone needs a raw ptrace attach -- strace's fundamental mechanism, and the one thing
-# nothing else this script runs needs. Docker's default capability set drops `CAP_SYS_PTRACE`, so
-# `--cap-add SYS_PTRACE` is the fix; `--security-opt seccomp=unconfined` is the fallback this
-# function reaches for only on a host whose older docker/libseccomp/kernel combination also blocks
-# the syscall in the default seccomp profile (jvns "Why strace doesn't work in Docker", moby#21051
-# -- closed in Docker 19.03; see the `inject` case below).
+# strace needs ptrace, and Docker's default capability set drops CAP_SYS_PTRACE. An older
+# Docker/libseccomp/kernel also blocks ptrace in the default seccomp profile; set
+# UNSAFE_CHECK_SECCOMP_UNCONFINED=1 there (moby#21051).
 run_privileged_in_image() {
     local seccomp_arg=()
     if [ "${UNSAFE_CHECK_SECCOMP_UNCONFINED:-0}" = "1" ]; then
@@ -154,14 +123,10 @@ cmd_careful() {
     run_in_image cargo careful test -p logit-pipeline -p logit-inputs
 }
 
-# Builds the requested test binary, then runs it under strace with the given syscall fault
-# injected -- see the ADR's "strace -e inject=" section for why this is the only way to force
-# EINTR/EAGAIN/ENOSYS/EINVAL on demand against a real socket or fd. `<cargo test args>` is
-# whatever you'd hand to `cargo test` to select and filter one test binary (e.g. `-p logit-inputs
-# --lib a_two_hundred_datagram_burst`) -- everything but a single trailing bare filter token is
-# passed straight to `cargo test --no-run`; that one trailing token (if any) is what's handed to
-# the compiled binary directly afterward, since a libtest binary run standalone takes its filter
-# as a bare positional argument the same way `cargo test` does.
+# Builds one test binary, then runs it under strace with the fault injected. `<cargo test args>`
+# selects and filters one binary (for example `-p logit-inputs --lib a_two_hundred_datagram_burst`).
+# All of it goes to `cargo test --no-run`, and the last bare token, the filter, also goes to the
+# binary.
 cmd_inject() {
     local spec="${1:-}"
     if [ -z "${spec}" ]; then
@@ -198,12 +163,9 @@ cmd_inject() {
 
     build_image
     echo "## inject: tracing ${syscall}, injecting ${spec} #####################"
-    # `cargo test --no-run` prints one "Executable ... (path)" line per compiled test binary --
-    # the path is relative to /work, which is exactly what's needed to hand straight to
-    # `strace`/the binary inside the same container afterward. `tail -1`: this script's supported
-    # usage builds exactly one target (`--lib`/`--bin <name>`/`--test <name>`), so exactly one such
-    # line is expected; a `cargo_args` selecting more than one target isn't a shape this
-    # subcommand tries to support.
+    # `cargo test --no-run` prints one "Executable ... (path)" line per test binary, with a path
+    # relative to /work. `tail -1` assumes one target (`--lib`, `--bin <name>`, or
+    # `--test <name>`); selecting more than one isn't supported.
     local build_output
     build_output="$(run_in_image cargo test --no-run "${cargo_args[@]}" 2>&1)"
     local binary
@@ -218,10 +180,8 @@ cmd_inject() {
         "${binary}" ${filter:+"${filter}"} --test-threads=1
 }
 
-# Every scenario in INJECT_SCENARIOS, in order. Deliberately does not stop at the first non-zero
-# exit: two of the three scenarios are *expected* to make their test fail, and what matters is the
-# shape of that failure, which the operator reads off the output. `set -e` would otherwise end the
-# run at the first one.
+# Runs past a non-zero exit, which `set -e` would otherwise stop at: two scenarios are expected to
+# fail, and the operator reads the shape of each failure off the output.
 cmd_inject_all() {
     build_image
     for scenario in "${INJECT_SCENARIOS[@]}"; do
@@ -248,7 +208,27 @@ cmd_shell() {
 }
 
 usage() {
-    sed -n '2,8p' "${SCRIPT_PATH}/unsafe-check" | sed 's/^# \?//'
+    cat <<'EOF'
+Usage: script/unsafe-check miri [cargo-miri-test args]
+       script/unsafe-check careful [cargo-careful-test args]
+       script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]
+       script/unsafe-check inject-all
+       script/unsafe-check all
+       script/unsafe-check shell
+       script/unsafe-check --help
+
+Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
+tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
+helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
+force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
+
+  UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
+  UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose
+                                   default seccomp profile blocks ptrace
+  MIRIFLAGS                        defaults to -Zmiri-disable-isolation
+
+Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md).
+EOF
 }
 
 case "${1:-}" in

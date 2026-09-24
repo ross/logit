@@ -1,10 +1,6 @@
-//! The built-in `json` transform: parses a log record's message as JSON and merges the resulting
-//! key/values into the event's attributes, where every downstream component -- native transform,
-//! Lua script (via `EventProxy`), or sink -- can already see them. See
-//! `docs/adr/json-parsing-into-attributes.md` for the design decisions this implements.
-//!
-//! Stateless -- unlike `Aggregator`, this never flushes, so `impl Transform` only overrides
-//! `process`, taking the trait's default `flush_interval`/`flush`.
+//! The `json` transform: parses a log message as a JSON object and merges its top-level keys into
+//! the event's attributes (`docs/adr/json-parsing-into-attributes.md`). A nested object stays a
+//! `Value::Map`. Never flushes.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
@@ -14,51 +10,40 @@ use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::fmt;
 use std::sync::Arc;
 
-/// Parses `event.attributes` out of an event's log message, if it has one. An event with no log,
-/// and a log whose message isn't a string, pass through untouched -- there's nothing to parse.
-/// Any metrics/span already on the event ride through unaffected either way -- only `log.message`
-/// is read and only `attributes` is written. A message that fails to parse (or, with
-/// `skip_to_brace` off, isn't a JSON object at all) also passes through untouched, with a
-/// count-throttled diagnostic (`Diagnostics::warn_throttled`,
-/// `docs/adr/service-lifecycle-and-output-retry.md`) -- dropping telemetry over one malformed
-/// line is worse than a no-op, and a high-volume malformed source must not flood stderr one line
-/// per event either.
+/// Parses an event's log message into `event.attributes`.
+///
+/// Reads only `log.message` (a `Str` or `Bytes`) and writes only `attributes`; any other event
+/// passes through untouched. A message that fails to parse, or isn't a JSON object, also passes
+/// through untouched, with a throttled diagnostic (`Diagnostics::warn_throttled`): dropping an
+/// event over one malformed line is worse than a no-op, and a malformed high-volume source must
+/// not flood stderr.
 pub struct JsonParser {
-    /// Skip everything before the first `{` and parse from there, tolerating trailing content
-    /// after the object closes. Off by default: the whole line is assumed to be the JSON data,
-    /// and trailing non-whitespace after it is a parse failure.
+    /// Parse from the first `{` and ignore anything after the object closes. Off by default: the
+    /// whole line is the JSON, and trailing non-whitespace is a parse failure.
     skip_to_brace: bool,
     invalid_utf8: InvalidUtf8,
     diag: Diagnostics,
-    /// Scratch buffer the top-level object's key/value pairs are parsed into, reused across
-    /// events instead of a fresh `AttrMap` built by `deserialize` on every call (mirroring
-    /// `InfluxLineEncoder`'s reused buffers, `crates/logit-outputs/src/influxdb.rs` -- same idea,
-    /// applied to the parsed pairs instead of a `String`). Cleared at the start of every `process`
-    /// (see the comment there for why the *intermediate* still has to exist at all). A nested
-    /// object still becomes its own freshly-allocated `AttrMap` (`Value::Map`, via
-    /// `collect_attrmap`) -- only the top-level result, which is merged into `event.attributes`
-    /// and thrown away, is worth reusing.
+    /// The top-level object's pairs, reused across events. Only the top level is reused: it's
+    /// merged into `event.attributes` and discarded, while a nested object becomes its own
+    /// `AttrMap` via `collect_attrmap`.
     scratch: Vec<(Symbol, Value)>,
-    /// The second reused buffer: object keys seen so far, memoised `&str -> Symbol` so a repeat
-    /// key (which is every key of every line after the first, for a schema-shaped stream) costs
-    /// one `memcmp` instead of a probe of the process-wide interner. Shared by the top-level
-    /// object and every nested one -- their keys repeat just the same. See `KeyCache`'s docs
-    /// for the shape and the bound; the `json-parse` load-test scenario is why it exists.
+    /// Keys seen so far, shared by the top-level and nested objects, so a repeated key costs one
+    /// `memcmp` instead of an interner probe. The `json-parse` load-test scenario is why it
+    /// exists; `KeyCache` documents the bound.
     keys: KeyCache,
 }
 
-/// Mirrors `logit_config::JsonInvalidUtf8` -- `logit-transforms` deliberately doesn't depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the same
-/// pattern `keep_values::Normalize` follows. What [`JsonParser`] does with a message that is not
-/// valid UTF-8; see `docs/adr/http-access-normalization.md` for why `Replace` exists.
+/// What [`JsonParser`] does with a message that isn't valid UTF-8.
+///
+/// Mirrors `logit_config::JsonInvalidUtf8`; `logit-cli` converts.
+/// `docs/adr/http-access-normalization.md` says why `Replace` exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InvalidUtf8 {
-    /// The parse fails and the event passes through untouched -- the strict behaviour `json` has
-    /// always had.
+    /// The parse fails and the event passes through untouched.
     #[default]
     Reject,
-    /// Retry a failed parse on a copy with every invalid sequence replaced by U+FFFD. Failure
-    /// path only: a message that parses as it arrived never pays for the check or the copy.
+    /// Retry a failed parse on a copy with every invalid sequence replaced by U+FFFD. A message
+    /// that parses as it arrived never pays for the check or the copy.
     Replace,
 }
 
@@ -107,26 +92,18 @@ impl Transform for JsonParser {
             raw.clone()
         };
 
-        // Parsed into `self.scratch`, cleared here, rather than a fresh `AttrMap` -- but still
-        // built up separately from `event.attributes` and only merged in on full success: a
-        // failure partway through a malformed object must leave the event's existing attributes
-        // untouched, not half-populated. `scratch` reaching `Ok` is what gates the merge below;
-        // reusing its storage across calls doesn't change that contract, since a fresh
-        // `self.scratch.clear()` at the top of the very next call throws away anything a failed
-        // parse left behind.
+        // Parsed apart from `event.attributes` and merged only on success, so a failure partway
+        // through a malformed object leaves the event's attributes untouched.
         self.scratch.clear();
         let parsed = if self.skip_to_brace {
             parse_object_prefix(&body, &mut self.scratch, &mut self.keys)
         } else {
             parse_object(&body, &mut self.scratch, &mut self.keys)
         };
-        // `Replace` costs nothing until a parse has already failed: only then is the buffer
-        // checked, and only a buffer that really is invalid UTF-8 is copied and retried. The
-        // repaired copy is a fresh `Bytes`, so every zero-copy `Value::Str` the retry produces
-        // borrows *it* rather than the original message (`borrowed_str_bytes`) -- which is what
-        // keeps `Value::Str`'s valid-UTF-8 invariant intact: nothing minted here can point back
-        // into the bytes that failed. A second failure means the line was malformed in some
-        // other way too and falls through to the ordinary `parse_failure` path below.
+        // Only a failed parse of invalid UTF-8 is copied and retried. The repaired copy is a fresh
+        // `Bytes`, so every zero-copy `Value::Str` the retry produces slices it, never the invalid
+        // original: that keeps `Value::Str`'s valid-UTF-8 invariant. A second failure takes the
+        // ordinary `parse_failure` path.
         let parsed = match parsed {
             Err(_)
                 if self.invalid_utf8 == InvalidUtf8::Replace
@@ -151,22 +128,16 @@ impl Transform for JsonParser {
         };
         match parsed {
             Ok(()) => {
-                // Moved out of `scratch`, not cloned: `scratch` is the sole owner of each `Value`
-                // here and is about to be emptied anyway, so there's nothing left for a clone to
-                // preserve. Merged by `Symbol` (`AttrMap::insert_sym`), the same way `logfmt`'s
-                // `merge_into` drains its scratch: the keys were interned straight off the
-                // deserializer (`KeySeed`), so `resolve`-ing each back to a `&str` for
-                // `AttrMap::insert` to re-intern -- what this loop used to do -- was two more
-                // interner probes per key for nothing. On the `json-parse` load-test scenario
-                // that round trip was roughly a fifth of all samples.
+                // By `Symbol`: `KeySeed` already interned each key, and a `resolve` +
+                // `insert(&str)` round trip costs two interner probes per key (about a fifth of
+                // the `json-parse` load-test scenario's samples when measured).
                 for (key, value) in self.scratch.drain(..) {
                     event.attributes.insert_sym(key, value);
                 }
             }
             Err(err) => {
-                // Only ever holds a partial object here; drop it promptly rather than letting it
-                // sit until the next `process` call clears it, since every `Value::Str` in it may
-                // still be a slice of this event's message buffer (see `borrowed_str_bytes`).
+                // Clear now, not at the next call: a partial object's `Value::Str`s may still
+                // slice this event's message buffer and would keep it alive.
                 self.scratch.clear();
                 self.diag.warn_throttled(
                     "parse_failure",
@@ -179,8 +150,7 @@ impl Transform for JsonParser {
     }
 }
 
-/// Parses `json` as a single JSON object into `out`, requiring the whole buffer be consumed (only
-/// trailing whitespace allowed) -- the default-mode contract: "the whole line is the JSON data."
+/// Parses `json` as one JSON object into `out`; anything but trailing whitespace after it fails.
 fn parse_object(
     json: &Bytes,
     out: &mut Vec<(Symbol, Value)>,
@@ -192,9 +162,8 @@ fn parse_object(
     Ok(())
 }
 
-/// Parses the first complete JSON object out of `json` into `out`, ignoring anything after it --
-/// the `skip_to_brace`-mode contract: "start parsing here," which is what makes a line like
-/// `INFO {"a":1} took=3ms` work at all.
+/// Parses the first complete JSON object in `json` into `out` and ignores the rest, so
+/// `skip_to_brace` handles a line like `INFO {"a":1} took=3ms`.
 fn parse_object_prefix(
     json: &Bytes,
     out: &mut Vec<(Symbol, Value)>,
@@ -204,14 +173,11 @@ fn parse_object_prefix(
     TopLevelSeed { base: json, out, keys }.deserialize(&mut de)
 }
 
-/// Reconstructs a `Bytes` sharing `base`'s underlying allocation for a `&str` serde_json reported
-/// as borrowed directly from the input it was given (`Visitor::visit_borrowed_str` -- no
-/// unescaping happened, so `s` is genuinely a sub-slice of `base`). Verifies the pointer range
-/// explicitly and falls back to a copy rather than calling `Bytes::slice_ref` unguarded, which
-/// panics on a non-subset -- a panic here would take down the whole transform node over one
-/// malformed input, not just fail to parse it. See `docs/design/data-model.md`'s "`bytes::Bytes`
-/// everywhere strings and blobs appear" -- this is what keeps an unescaped string value a
-/// zero-copy slice of the original message buffer rather than a fresh allocation.
+/// Slices `base` for a `&str` serde_json borrowed from it (`Visitor::visit_borrowed_str`), so an
+/// unescaped string stays zero-copy (`docs/design/data-model.md`'s "Values" section).
+///
+/// Checks the pointer range and falls back to a copy rather than calling `Bytes::slice_ref`,
+/// which panics on a non-subset and would take down the transform node over one input.
 fn borrowed_str_bytes(base: &Bytes, s: &str) -> Bytes {
     let base_start = base.as_ptr() as usize;
     let base_end = base_start + base.len();
@@ -224,14 +190,11 @@ fn borrowed_str_bytes(base: &Bytes, s: &str) -> Bytes {
     }
 }
 
-/// Deserializes a JSON value directly into a [`Value`], rather than through an intermediate
-/// `serde_json::Value` tree and a separate conversion -- halves the allocation per line, and lets
-/// an unescaped string stay a zero-copy slice of `base` (see [`borrowed_str_bytes`]).
+/// Deserializes a JSON value straight into a [`Value`], skipping a `serde_json::Value` tree and
+/// its conversion, so an unescaped string can stay a slice of `base` ([`borrowed_str_bytes`]).
 struct ValueSeed<'b, 'k> {
     base: &'b Bytes,
-    /// Carried down so a nested object's keys go through the same [`KeyCache`] as the top
-    /// level's (see [`collect_attrmap`]) -- every seed below the top level is built per value,
-    /// so this is a fresh reborrow each time, never a move of the parser's `&mut`.
+    /// Reborrowed per value so nested keys share the top level's [`KeyCache`].
     keys: &'k mut KeyCache,
 }
 
@@ -279,14 +242,12 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
         Ok(Value::F64(v))
     }
 
-    // The unescaped case: `v` is borrowed straight from the input buffer, so it's a genuine
-    // sub-slice of `self.base` -- stays zero-copy.
+    // Unescaped: `v` is a slice of `self.base`, so it stays zero-copy.
     fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Value, E> {
         Ok(Value::Str(borrowed_str_bytes(self.base, v)))
     }
 
-    // The escaped case: serde_json had to unescape into a scratch buffer, so `v` doesn't live in
-    // `self.base` at all -- must copy.
+    // Escaped: `v` is in serde_json's scratch buffer, not `self.base`, so it must be copied.
     fn visit_str<E>(self, v: &str) -> Result<Value, E> {
         Ok(Value::Str(Bytes::copy_from_slice(v.as_bytes())))
     }
@@ -310,12 +271,10 @@ impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
     }
 }
 
-/// The top-level seed: requires the parsed value be a JSON *object*, so a bare scalar or array at
-/// the top level is a parse error by construction (there are no key/values to merge) rather than
-/// a post-hoc check after a successful-but-useless parse. Unlike a nested object
-/// ([`ValueVisitor::visit_map`], via [`collect_attrmap`]), the top-level result is never stored on
-/// an `Event` -- it's merged into `event.attributes` and discarded -- so it's collected straight
-/// into the caller's reused `Vec` instead of a freshly-allocated `AttrMap`.
+/// The top-level seed: a bare scalar or array is a parse error by construction.
+///
+/// The pairs go into the caller's reused `Vec`, not an `AttrMap`, because they're merged into
+/// `event.attributes` and discarded, unlike a nested object ([`collect_attrmap`]).
 struct TopLevelSeed<'b, 'o, 'k> {
     base: &'b Bytes,
     out: &'o mut Vec<(Symbol, Value)>,
@@ -347,11 +306,8 @@ impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_, '_> {
         write!(f, "a JSON object")
     }
 
-    // No last-writer-wins bookkeeping needed here, unlike `collect_attrmap`: a duplicate key
-    // within this object just pushes twice, and merging into `event.attributes` in push order
-    // (see `JsonParser::process`) makes the later push win, since `AttrMap::insert` overwrites an
-    // existing key rather than adding a second entry -- the same outcome, reached without a
-    // binary search per key on a buffer that's thrown away right after.
+    // A duplicate key pushes twice; `process` merges in push order and `insert_sym` overwrites,
+    // so the later value wins without a lookup per key here.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         while let Some(key) = map.next_key_seed(KeySeed { keys: &mut *self.keys })? {
             let value =
@@ -362,14 +318,11 @@ impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_, '_> {
     }
 }
 
-/// Deserializes a JSON object key straight to its interned [`Symbol`], rather than the owned
-/// `String` `next_key::<String>()` would otherwise allocate for every key regardless of whether it
-/// needed unescaping. Measured: that `String` is where most of `json`'s allocations were
-/// (`docs/design/memory.md`), not the intermediate map itself. The `Symbol` comes from the
-/// parser's [`KeyCache`], so a key this parser has seen before -- every key of every line after
-/// the first, on a schema-shaped stream -- is one `memcmp` and never reaches the process-wide
-/// interner at all; it is interned exactly once, on first sight, and merged by `Symbol` from then
-/// on (`AttrMap::insert_sym` in `process` and [`collect_attrmap`]).
+/// Deserializes an object key straight to its [`Symbol`] through the parser's [`KeyCache`].
+///
+/// `next_key::<String>()` would allocate a `String` per key, which was most of `json`'s
+/// allocations (`docs/design/memory.md`). A key seen before costs one `memcmp` and never reaches
+/// the process-wide interner.
 struct KeySeed<'k> {
     keys: &'k mut KeyCache,
 }
@@ -393,15 +346,12 @@ impl<'de> Visitor<'de> for KeyVisitor<'_> {
         write!(f, "a string")
     }
 
-    // The unescaped case: borrowed straight from the input, never materialized as an owned
-    // `String` at all.
     fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Symbol, E> {
         Ok(self.keys.get_or_intern(v))
     }
 
-    // The escaped case: `v` lives in serde_json's own scratch buffer, not `self.base` -- but the
-    // cache only needs it long enough to compare (on a repeat) or for `intern` to hash and copy
-    // (on a never-before-seen key), so still no `String` of our own.
+    // An escaped key sits in serde_json's scratch buffer only long enough to compare or intern,
+    // so it needs no `String` either.
     fn visit_str<E>(self, v: &str) -> Result<Symbol, E> {
         Ok(self.keys.get_or_intern(v))
     }
@@ -411,9 +361,7 @@ impl<'de> Visitor<'de> for KeyVisitor<'_> {
     }
 }
 
-/// Used by [`ValueVisitor::visit_map`] to walk a *nested* JSON object's entries into an owned,
-/// independent `AttrMap` (`Value::Map`) -- unlike the top level, which goes through
-/// [`TopLevelVisitor`] instead and skips building an `AttrMap` at all (see its doc comment).
+/// Collects a nested JSON object into its own `AttrMap` for a `Value::Map`.
 fn collect_attrmap<'de, A: MapAccess<'de>>(
     mut map: A,
     base: &Bytes,
@@ -422,9 +370,7 @@ fn collect_attrmap<'de, A: MapAccess<'de>>(
     let mut attrs = AttrMap::new();
     while let Some(key) = map.next_key_seed(KeySeed { keys: &mut *keys })? {
         let value = map.next_value_seed(ValueSeed { base, keys: &mut *keys })?;
-        // Last-writer-wins on a duplicate key within one object -- `insert_sym` overwrites on an
-        // equal `Symbol`, same as a parsed key overwriting a pre-existing attribute of the same
-        // name. By `Symbol`, not `resolve(key)` -> `insert(&str)`: see `process`'s merge loop.
+        // `insert_sym` overwrites, so a duplicate key's last value wins.
         attrs.insert_sym(key, value);
     }
     Ok(attrs)
@@ -466,10 +412,8 @@ mod tests {
         event
     }
 
-    /// The `key` of every `logit.component.diagnostics` point mirrored into `registry` --
-    /// `Diagnostics::warn_throttled` counts every occurrence, throttled or not. `Registry::drain`
-    /// *takes* the buffered points, so a test drains exactly once and asserts both what fired
-    /// and what didn't against this one result; a second drain would always see nothing.
+    /// The `key` of every diagnostics point in `registry`, throttled or not. `Registry::drain`
+    /// takes the points, so call it once per test.
     fn fired_diagnostics(registry: &Registry) -> Vec<String> {
         registry
             .drain(0)
@@ -564,9 +508,7 @@ mod tests {
         assert!(event.attributes.is_empty());
     }
 
-    /// The genuinely new shape the multi-payload model makes possible: a log event that also
-    /// carries a metric. `json` only ever reads `log.message` and writes `attributes`, so the
-    /// metric should ride through completely untouched while the log half is parsed normally.
+    /// A log event that also carries a metric is parsed, and the metric rides through untouched.
     #[test]
     fn a_log_event_that_also_carries_a_metric_is_parsed_and_keeps_its_metric() {
         let mut parser = JsonParser::new(false);
@@ -592,9 +534,8 @@ mod tests {
         assert_eq!(message_of(&event), &Value::str(r#"{"a":}"#));
     }
 
-    /// nginx's `escape=json` passes bytes >= 0x80 through raw, so a Latin-1 `User-Agent` puts
-    /// a lone 0xE9 (`é`) inside a JSON string. Under the default `Reject` that is a parse failure
-    /// for the whole line, exactly as before this field existed.
+    /// A raw 0xE9 inside a string (nginx's `escape=json` passes high bytes through) fails the
+    /// whole line under the default `Reject`.
     #[test]
     fn invalid_utf8_inside_a_string_is_rejected_by_default() {
         let registry = Registry::new();
@@ -622,7 +563,6 @@ mod tests {
         assert!(parser.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "ua"), Some(&Value::str("caf\u{FFFD} client")));
         assert_eq!(attr(&event, "status"), Some(&Value::U64(200)));
-        // The message itself is left exactly as it arrived -- only `attributes` is written.
         assert_eq!(
             message_of(&event),
             &Value::Bytes(Bytes::from_static(b"{\"ua\":\"caf\xe9 client\",\"status\":200}"))
@@ -632,8 +572,7 @@ mod tests {
         assert!(!fired.iter().any(|k| k == "parse_failure"), "the retry succeeded: {fired:?}");
     }
 
-    /// The `Replace` retry is gated on the buffer actually being invalid UTF-8: a line that is
-    /// valid UTF-8 but malformed JSON takes the ordinary `parse_failure` path with no retry.
+    /// Valid UTF-8 that is malformed JSON takes the `parse_failure` path with no retry.
     #[test]
     fn invalid_utf8_replace_does_not_retry_a_valid_utf8_parse_failure() {
         let registry = Registry::new();
@@ -650,8 +589,7 @@ mod tests {
         assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
     }
 
-    /// Invalid UTF-8 *and* malformed JSON: the retry fails too, and the line reports the
-    /// ordinary parse failure rather than claiming a repair it didn't make.
+    /// Invalid UTF-8 and malformed JSON reports `parse_failure`, not a repair.
     #[test]
     fn invalid_utf8_replace_falls_through_to_parse_failure_when_the_json_is_also_broken() {
         let registry = Registry::new();
@@ -746,9 +684,7 @@ mod tests {
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
     }
 
-    /// Both merge paths -- `process`'s top-level drain and `collect_attrmap`'s nested build --
-    /// insert by `Symbol`, and both must keep last-writer-wins on a key repeated within one
-    /// object (the policy `TopLevelVisitor::visit_map`'s comment relies on).
+    /// Last-writer-wins holds on both merge paths: the top-level drain and `collect_attrmap`.
     #[test]
     fn a_duplicate_key_within_one_object_takes_the_last_value_at_every_depth() {
         let mut parser = JsonParser::new(false);
@@ -785,7 +721,6 @@ mod tests {
         assert_eq!(attr(&third, "b"), Some(&Value::U64(200)));
         assert_eq!(attr(&third, "c"), Some(&Value::U64(300)));
         assert_eq!(attr(&third, "d"), Some(&Value::U64(400)));
-        // Same key, same `Symbol`, whichever event it came from.
         for key in ["a", "b", "c"] {
             let sym =
                 |e: &Event| e.attributes.iter().find(|(k, _)| resolve(*k) == key).map(|(k, _)| k);
@@ -834,7 +769,6 @@ mod tests {
         assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(1)));
         assert_eq!(parser.keys.len(), 1);
 
-        // Escaped and unescaped spellings of the same key are the same key.
         let mut event = log_event("{\"a\nb\":2}".replace('\n', "\\u000a").as_str());
         assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(2)));

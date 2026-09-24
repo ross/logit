@@ -1,10 +1,8 @@
-//! End-to-end proof of `docs/adr/disk-backed-sink-buffer.md`'s core claim: a disk-backed sink
-//! buffer survives a process death with no shutdown signal (the closest in-process analogue of
-//! `SIGKILL` -- dropping the whole runtime future rather than racing a `watch` signal) and, on
-//! restart, delivers every batch pushed before the drop, in order, losing nothing. Modelled on
-//! `otlp_round_trip.rs`, the only other integration test in this crate: builds a graph and its
-//! `NodeSpec`s directly via `logit_pipeline`'s public API rather than parsing a YAML config, since
-//! the sink under test needs to fail on command, which no real `ComponentKind` can express.
+//! End to end, ADR `disk-backed-sink-buffer`'s core claim: a disk-backed sink buffer survives a
+//! process death with no shutdown signal and, on restart, delivers every batch pushed before it,
+//! in order, losing nothing. Aborting the whole `run` task stands in for `SIGKILL`. The graph and
+//! its `NodeSpec`s are built through `logit_pipeline`'s public API rather than parsed from YAML,
+//! because the sink under test has to fail on command, which no real `ComponentKind` can express.
 
 use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, Registry, Resource, Telemetry, Value};
@@ -34,15 +32,11 @@ fn marker_of(batch: &EventBatch) -> usize {
     batch.events[0].attributes.get("marker").and_then(Value::as_str).unwrap().parse().unwrap()
 }
 
-/// Sends every batch in `batches` once, then hangs forever -- the test aborts the whole `run`
-/// task rather than ever letting it finish, simulating `SIGKILL`: no shutdown signal, no chance
-/// for anything downstream to flush or checkpoint on its own initiative.
-///
-/// `gap`: how long to sleep between each `sink.send(...)` call -- `Duration::ZERO` sends the
-/// whole burst as fast as possible (this file's original scenario); a nonzero gap gives delivery
-/// time to keep pace with ingest, which is what parks the reader at the end of the active segment
-/// before each rotation -- the F1 scenario `a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_has_caught_up`
-/// below needs.
+/// Sends each of `batches` once, then hangs forever; the test aborts `run` rather than letting it
+/// finish. `gap` is the sleep between sends: `Duration::ZERO` sends one burst, and a nonzero gap
+/// lets delivery keep pace with ingest, which parks the reader at the end of the active segment
+/// before each rotation (what
+/// `a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_has_caught_up` needs).
 struct BurstThenHangInput {
     batches: Vec<EventBatch>,
     gap: Duration,
@@ -62,10 +56,9 @@ impl Input for BurstThenHangInput {
     }
 }
 
-/// `anyhow::Context` isn't in scope by default for a bare `Err` -- attaching `Fault::Clean` is
-/// exactly what every real sink's own `send` does (`docs/adr/buffered-sink-delivery.md`); a
-/// `Clean` fault is retried under every delivery posture with zero duplicate risk, since the
-/// destination provably never saw the batch.
+/// Attaches `Fault::Clean`, as every real sink's `send` does
+/// (`docs/adr/buffered-sink-delivery.md`). A `Clean` fault is retried under every delivery posture
+/// with no duplicate risk, since the destination never saw the batch.
 trait ContextFault<T> {
     fn context_fault(self) -> anyhow::Result<T>;
 }
@@ -76,12 +69,10 @@ impl<T> ContextFault<T> for anyhow::Result<T> {
     }
 }
 
-/// Records every attempt (`(marker, succeeded)`) it's asked to make. Succeeds on the first
-/// `succeed_first_n_attempts` calls made against this instance (regardless of which batch --
-/// `write_loop` is strictly single-in-flight, so the Nth call is always batch N's first and only
-/// attempt as long as every earlier one succeeded) and fails every call after that, forever --
-/// which is what lets one instance simulate "some batches already delivered, the next one stuck
-/// retrying, the rest never even attempted."
+/// Records every attempt as `(marker, succeeded)`. The first `succeed_first_n_attempts` calls
+/// succeed and every later one fails. `write_loop` is single-in-flight, so while earlier calls
+/// succeed the Nth call is batch N's only attempt: one instance simulates some batches delivered,
+/// the next stuck retrying, and the rest never attempted.
 struct RecordingOutput {
     attempts: Arc<Mutex<Vec<(usize, bool)>>>,
     attempt_count: Arc<AtomicU64>,
@@ -103,8 +94,7 @@ impl Output for RecordingOutput {
     }
 
     fn duplicate_safe(&self) -> bool {
-        // At-least-once: this test's whole point is proving batches survive a restart, which
-        // requires the posture that actually retries/redelivers rather than giving up.
+        // At-least-once: the posture that retries and redelivers, which surviving a restart needs.
         true
     }
 }
@@ -216,21 +206,15 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
             ),
         );
 
-        // No shutdown signal at all -- aborting this task drops the whole `run` future outright,
-        // taking every node task (and the `DiskQueue` inside them) down with it mid-flight. This
-        // is the closest in-process analogue of `SIGKILL`: nothing gets a chance to run
-        // `finish()`.
+        // No shutdown signal: aborting this task drops the whole `run` future, taking every node
+        // task and its `DiskQueue` down mid-flight, so nothing runs `finish()`.
         //
-        // *When* to kill is decided by observation, not a clock. A batch is only durable once
-        // `DiskQueue::push` has written it; anything still in the input's loop or the sink's
-        // inbox at the kill is lost by design, so this test's premise ("every batch was pushed
-        // before the crash") has to be established, not assumed. A fixed 500ms wait used to be
-        // that assumption, and on a loaded CI disk (each of run 1's ~3 segment rotations
-        // `fsync`s twice) 40 pushes did not always fit -- the batches that had not reached the
-        // spool yet were then reported as "never delivered". The sink's own
-        // `logit.component.buffer.batches` gauge (`SINK_QUEUE_METRICS.depth`: pushed minus
-        // committed) reading exactly `TOTAL - SUCCEED_FIRST_RUN` is the precise statement that
-        // all 40 are on disk and the first 10 are committed.
+        // When to kill is decided by observation, not a clock. A batch is durable only once
+        // `DiskQueue::push` has written it, so "every batch was pushed before the crash" has to be
+        // established: on a loaded CI disk, where each segment rotation `fsync`s twice, 40 pushes
+        // don't always fit a fixed wait. The sink's `logit.component.buffer.batches` gauge
+        // (`SINK_QUEUE_METRICS.depth`, pushed minus committed) reading `TOTAL - SUCCEED_FIRST_RUN`
+        // says all 40 are on disk and the first 10 committed.
         let registry = Registry::new();
         let telemetry: HashMap<String, Telemetry> = HashMap::from([(
             "out".to_string(),
@@ -270,7 +254,7 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         );
         assert!(!run.is_finished(), "run should still be going (in should be hanging) when killed");
         run.abort();
-        // Let the abort actually land before reopening the spool: the aborted task still holds
+        // Let the abort land before reopening the spool: the aborted task still holds
         // the `DiskQueue` (and its exclusive lock file) until its future is dropped.
         let joined = tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -327,14 +311,11 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
             let mut rx = shutdown_rx;
             let _ = rx.wait_for(|&fired| fired).await;
         }));
-        // Poll until the spool is drained rather than sleeping a fixed guess -- `run` itself
-        // never returns on its own here (nothing closes `in`'s Fanout), so this drives shutdown
-        // once delivery has caught up. "Drained" is the *last* marker having been delivered,
-        // not a count of deliveries: how many run 2 has to make depends on where run 1's cursor
-        // was last checkpointed (`checkpoint_interval` is time-gated, so all 10 commits may have
-        // landed before the first checkpoint and the whole spool replays -- the at-most-twice
-        // assertion below allows exactly that), and stopping after a fixed count used to cut the
-        // drain short in that case.
+        // Poll until the last marker is delivered, then fire shutdown; `run` never returns on its
+        // own, since nothing closes `in`'s Fanout. Wait on the last marker, not a delivery count:
+        // how many deliveries run 2 makes depends on where run 1's cursor was last checkpointed.
+        // `checkpoint_interval` is time-gated, so all 10 commits may land before the first
+        // checkpoint and the whole spool replay, which the at-most-twice assertion below allows.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let last_delivered =
@@ -359,11 +340,9 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         .map(|(marker, _)| *marker)
         .collect();
 
-    // Every batch pushed in run 1 must have succeeded at least once across the two runs
-    // combined, at most twice (once in each run, if the crash landed between commit and
-    // checkpoint), and in nondecreasing marker order within each run (the spool is strictly
-    // FIFO) -- concatenating the two runs' successes preserves overall chronological order,
-    // since every run-1 success happened before every run-2 one.
+    // Across both runs, every batch succeeded at least once and at most twice (once per run, if
+    // the crash landed between commit and checkpoint). Run 2 delivers in marker order because the
+    // spool is FIFO.
     let mut counts = HashMap::new();
     for &marker in run1_successes.iter().chain(run2_successes.iter()) {
         *counts.entry(marker).or_insert(0u32) += 1;
@@ -380,12 +359,11 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// End-to-end proof of F1: a reader that catches up to the writer *while* its segment is still
-/// active must not stall forever once that segment later rotates away. `gap` between each
-/// `sink.send` gives delivery time to keep pace with ingest, which is exactly what parks the
-/// reader at `read_offset == len` of the still-active segment before the next rotation --
-/// reproducing the bug scenario at the integration level, not just the unit level
-/// (`disk_queue.rs`'s own `the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`).
+/// A reader that catches up to the writer while its segment is still active keeps delivering once
+/// that segment rotates away. `gap` lets delivery keep pace with ingest, parking the reader at
+/// `read_offset == len` of the active segment before each rotation: the integration-level
+/// counterpart of `disk_queue.rs`'s
+/// `the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`.
 #[tokio::test]
 async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_has_caught_up() {
     let dir = std::env::temp_dir().join(format!(
@@ -436,8 +414,8 @@ async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_h
         let _ = rx.wait_for(|&fired| fired).await;
     }));
 
-    // Poll for every batch to have been delivered rather than sleeping a fixed guess -- pre-fix,
-    // this would never reach TOTAL and the loop would run out the deadline instead.
+    // Poll for every delivery rather than sleeping a fixed guess; a reader that stalls after a
+    // rotation runs out the deadline instead.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if attempts.lock().unwrap().len() >= TOTAL || tokio::time::Instant::now() > deadline {

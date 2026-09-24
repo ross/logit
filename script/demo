@@ -1,15 +1,11 @@
 #!/bin/bash
 # Usage: script/demo [compose args...]
-# Runs the self-contained demo stack (demo/, demo/README.md) -- unlike script/server, this builds
-# and runs the *release* image (../Dockerfile) against InfluxDB, Grafana, Loki, Tempo, and a
-# synthetic traffic generator, with no cargo/dev-container involvement at all. Default action is
-# `up --build`; pass your own docker compose subcommand and args to do something else, e.g.
+# Runs the self-contained demo stack (demo/README.md) from the release image (Dockerfile), with no
+# dev container. Defaults to `up --build`; pass any docker compose subcommand instead, such as
 # `script/demo down -v` or `script/demo logs -f logit`.
 #
-# `-f demo/compose.yaml` (not `cd demo`) so demo/compose.yaml's relative paths (`./logit.yaml`,
-# the `context: ..` build) resolve the same way regardless of where this is invoked from -- docker
-# compose treats the first -f file's directory as the project directory unless overridden, which
-# is exactly what's wanted here.
+# Uses `-f demo/compose.yaml`, not `cd demo`: compose takes the first -f file's directory as the
+# project directory, so demo/compose.yaml's relative paths resolve from any working directory.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

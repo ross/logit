@@ -1,8 +1,8 @@
-//! The output buffering trait. See `docs/design/wire-protocol.md`: this boundary is cheap to add
-//! now and expensive to retrofit onto call sites that assumed an in-memory queue, so it's defined
-//! even though only an in-memory implementation ships initially. See
-//! `docs/adr/buffered-sink-delivery.md` for why the ack shape is `peek`/`commit` rather than
-//! `push`/`pop`, and why `Block` is not a variant of [`OverflowPolicy`].
+//! The in-process buffering trait and its one implementation, [`InMemoryBuffer`], which
+//! `logit_pipeline::queue::BoundedQueue` wraps. The disk spool (`DiskQueue`) doesn't implement
+//! [`Buffer`]: a sync, `&mut self` trait is the wrong seam for file I/O
+//! (`docs/design/wire-protocol.md`'s "Buffering" section). ADR `buffered-sink-delivery` says why
+//! the ack shape is `peek`/`commit` rather than `pop`, and why `Block` isn't an [`OverflowPolicy`].
 
 use std::collections::VecDeque;
 
@@ -12,77 +12,65 @@ use std::collections::VecDeque;
 pub enum PushOutcome<T> {
     /// Accepted with room to spare.
     Accepted,
-    /// Accepted; the listed items (oldest evicted first) were evicted to make room
-    /// (`OverflowPolicy::DropOldest`), so the caller can count/log every one of them -- never
-    /// silently. Can be empty: if the head is reserved (see [`Buffer::peek`]) and nothing else is
-    /// evictable, the new item is still accepted (over-bound) rather than evicting the reserved
-    /// item or blocking forever on a batch that can never fit.
+    /// Accepted after evicting these items, oldest first (`OverflowPolicy::DropOldest`), so the
+    /// caller can count every one. Can be empty: when only a reserved head (see [`Buffer::peek`])
+    /// is left, the new item is accepted over the bound rather than evicting the reservation.
     Evicted(Vec<T>),
     /// Not accepted; the item is handed back unchanged (`OverflowPolicy::DropNewest`).
     Rejected(T),
 }
 
-/// What to do when a bounded buffer is full and another item arrives. `Block` is deliberately
-/// NOT a variant here -- a synchronous trait can't block usefully, so `Block` is a concern of the
-/// async wrapper built on top of this (`logit_pipeline::SinkQueue`), not of `Buffer` or its impls.
-/// This trait implements only the two dropping policies.
+/// What to do when a bounded buffer is full and another item arrives.
+///
+/// No `Block`: a synchronous trait can't block usefully, so the async
+/// `logit_pipeline::queue::BoundedQueue` layers it on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowPolicy {
     DropOldest,
     DropNewest,
 }
 
-/// A bounded, in-process queue between a producer and a slower/intermittent consumer, with an
-/// ack-based removal so a consumer can retry a not-yet-confirmed delivery without losing it
-/// (`peek`/`commit`, not `pop`) -- see `docs/adr/buffered-sink-delivery.md`.
+/// A bounded, in-process queue whose consumer acknowledges (`peek`, then `commit`) instead of
+/// popping, so a failed delivery retries the same item.
 pub trait Buffer<T> {
-    /// Push `item`, weighing `weight` bytes for the buffer's byte-aware bound (see
-    /// `EventBatch::estimated_heap_bytes`, `logit-core`; impls that don't bound by weight can
-    /// ignore it). Under `DropOldest`, an overflowing push evicts from the head, in a loop, until
-    /// it fits or nothing more is evictable -- never the reserved head (see `peek`), so `weight()`
-    /// stays within `max_weight` after this call unless nothing evictable was left (a reserved
-    /// solo item, or the buffer already empty), in which case the new item is accepted anyway
-    /// rather than evicting what's reserved or leaving the caller with nothing accepted at all.
+    /// Pushes `item` weighing `weight` bytes (e.g. `EventBatch::estimated_heap_bytes`).
+    ///
+    /// Under `DropOldest`, an overflowing push evicts from the head until the item fits, never
+    /// the reserved head (see `peek`). If nothing evictable is left, the item is accepted over
+    /// the bound anyway.
     fn push(&mut self, item: T, weight: u64) -> PushOutcome<T>;
-    /// The head, without removing it, and **reserves it against `DropOldest` eviction** until
-    /// `commit()` releases the reservation -- the ack invariant depends on this: a caller that
-    /// peeks an item, starts acting on it, and only later calls `commit()` must never have that
-    /// exact item silently evicted out from under it by a concurrent `push()` in between, which
-    /// would make `commit()` remove a *different* item than the one the caller actually acted on.
-    /// `None` iff empty (reservation state unchanged). Call this, then `commit()` only after
-    /// whatever the caller does with the peeked item has actually succeeded.
+    /// The head, without removing it; `None` iff empty.
+    ///
+    /// **Reserves the head against `DropOldest` eviction** until `commit()`. Without that, a
+    /// `push()` between `peek()` and `commit()` could evict the item in flight, and `commit()`
+    /// would remove a different one. Call `commit()` only once delivery succeeded.
     fn peek(&mut self) -> Option<&T>;
-    /// Removes and returns the head, releasing any reservation `peek()` established (even if this
-    /// call finds the buffer empty). A no-op returning `None` when empty.
+    /// Removes and returns the head, releasing any reservation `peek()` made, even when empty.
     fn commit(&mut self) -> Option<T>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Total weight of everything currently held (sum of each held item's `push`-time weight).
+    /// The sum of every held item's `push`-time weight.
     fn weight(&self) -> u64;
 }
 
-/// The one shipping `Buffer` implementation: a `VecDeque` bounded by item count and total weight,
-/// whichever trips first, evicting or rejecting per `overflow`.
+/// A `VecDeque` bounded by item count and total weight, whichever trips first.
 pub struct InMemoryBuffer<T> {
-    /// Each item alongside its push-time weight, so `weight()` never recomputes anything.
+    /// Each item with its push-time weight, so `weight()` never recomputes.
     items: VecDeque<(T, u64)>,
     max_len: usize,
     max_weight: u64,
     weight: u64,
     overflow: OverflowPolicy,
-    /// Set by `peek`, cleared by `commit` -- while true, the item at `items[0]` is off-limits to
-    /// eviction (see `peek`'s doc comment on the trait).
+    /// Set by `peek`, cleared by `commit`; while set, `items[0]` is never evicted.
     head_reserved: bool,
 }
 
 impl<T> InMemoryBuffer<T> {
-    /// Preallocates the underlying `VecDeque`'s capacity to `max_len.min(4096)` -- capped so a
-    /// pathologically large `max_len` can't preallocate gigabytes at startup. Negligible for a
-    /// shallow queue (a sink's default 1024 items); worth it for one many times deeper (a UDP
-    /// listener's receive queue, `crates/logit-pipeline/src/queue.rs`'s `BoundedQueue`), where the
-    /// ~14 warm-up reallocations an empty-start deque would otherwise pay land in the hot path.
+    /// Preallocates `max_len.min(4096)` slots: a deep UDP receive queue otherwise pays ~14
+    /// warm-up reallocations in the hot path, and the cap stops a huge `max_len` from
+    /// preallocating gigabytes.
     pub fn new(max_len: usize, max_weight: u64, overflow: OverflowPolicy) -> Self {
         Self {
             items: VecDeque::with_capacity(max_len.min(4096)),
@@ -94,22 +82,17 @@ impl<T> InMemoryBuffer<T> {
         }
     }
 
-    /// Whether accepting one more item of `weight` bytes (on top of what's already held) would
-    /// trip either bound.
+    /// Whether one more item of `weight` bytes would trip either bound.
     fn would_overflow(&self, weight: u64) -> bool {
         self.items.len() >= self.max_len || self.weight + weight > self.max_weight
     }
 
-    /// Evicts from the front, in a loop, until `weight` would fit or nothing more is evictable --
-    /// never touching a reserved head. Returns every evicted item, oldest first; empty if nothing
-    /// was evictable (the buffer was already empty, or the only item present is the reserved
-    /// head).
+    /// Evicts from the front until `weight` fits or nothing but a reserved head is left. Returns
+    /// the evicted items, oldest first.
     fn evict_to_fit(&mut self, weight: u64) -> Vec<T> {
         let mut evicted = Vec::new();
         while self.would_overflow(weight) {
-            // The reserved head, if any, is always at index 0 -- evict index 1 instead so it's
-            // never touched. If reserved and nothing follows it, there's genuinely nothing left
-            // this call may evict.
+            // A reserved head is at index 0, so evict from index 1 past it.
             let evict_at = usize::from(self.head_reserved);
             if evict_at >= self.items.len() {
                 break;
@@ -177,8 +160,7 @@ mod tests {
         InMemoryBuffer::new(max_len, u64::MAX, overflow)
     }
 
-    /// Push, asserting the push was accepted outright -- for test setup where an eviction or
-    /// rejection would indicate a broken fixture, not the behavior under test.
+    /// Push, asserting `Accepted`: in setup, an eviction means a broken fixture.
     fn push_accepted<T: std::fmt::Debug>(buf: &mut impl Buffer<T>, item: T, weight: u64) {
         match buf.push(item, weight) {
             PushOutcome::Accepted => {}
@@ -237,18 +219,15 @@ mod tests {
 
     #[test]
     fn drop_oldest_evicts_everything_needed_to_actually_fit_in_one_push() {
-        // 100 one-weight items at the weight bound, then one 90-weight push -- a single eviction
-        // (the old, buggy shape) would leave weight at 100-1+90=189, still over the bound. Loop
-        // eviction must keep evicting until it actually fits.
+        // 100 one-weight items at the weight bound, then one 90-weight push: one eviction would
+        // leave weight at 189, still over the bound.
         let mut buf = InMemoryBuffer::new(1000, 100, OverflowPolicy::DropOldest);
         for i in 0..100 {
             push_accepted(&mut buf, i, 1);
         }
         assert_eq!(buf.weight(), 100);
 
-        // Evicting k one-weight items leaves weight = 100-k; the push fits once
-        // (100-k)+90 <= 100, i.e. k >= 90 -- so exactly 90 evictions, leaving weight at
-        // 10, then +90 for the push = 100, right at the bound.
+        // (100-k)+90 <= 100 needs k >= 90 evictions, landing at weight 100.
         match buf.push(999, 90) {
             PushOutcome::Evicted(evicted) => {
                 assert_eq!(
@@ -282,8 +261,6 @@ mod tests {
             other => panic!("expected Evicted, got {other:?}"),
         }
 
-        // "a" is still exactly what commit() returns -- the ack invariant this reservation
-        // exists to protect: a caller that peeked "a" and is mid-delivery must get "a" back.
         assert_eq!(buf.commit(), Some("a"));
         assert_eq!(buf.commit(), Some("c"));
     }
@@ -301,8 +278,7 @@ mod tests {
             other => panic!("expected Evicted([]), got {other:?}"),
         }
 
-        // "a" (the reserved item) must still be exactly what commit() returns -- it was never
-        // evicted despite the buffer now holding both "a" and "b" past its nominal length bound.
+        // The buffer now holds both, past its length bound.
         assert_eq!(buf.commit(), Some("a"));
         assert_eq!(buf.commit(), Some("b"));
     }
@@ -342,8 +318,6 @@ mod tests {
 
     #[test]
     fn length_bound_trips_independently_of_weight_bound() {
-        // Under the weight bound (each item weighs nothing) but at the length bound: still
-        // evicts.
         let mut buf = InMemoryBuffer::new(2, u64::MAX, OverflowPolicy::DropOldest);
         push_accepted(&mut buf, "a", 0);
         push_accepted(&mut buf, "b", 0);
@@ -355,7 +329,6 @@ mod tests {
 
     #[test]
     fn weight_bound_trips_independently_of_length_bound() {
-        // Under the length bound but over the weight bound: still evicts.
         let mut buf = InMemoryBuffer::new(100, 10, OverflowPolicy::DropOldest);
         push_accepted(&mut buf, "a", 6);
         push_accepted(&mut buf, "b", 4);
@@ -380,8 +353,6 @@ mod tests {
         push_accepted(&mut buf, "c", 5);
         assert_eq!(buf.weight(), 35);
 
-        // Pushing something too heavy to fit alongside the rest trips the weight bound and
-        // evicts "a" (weight 10).
         match buf.push("d", 70) {
             PushOutcome::Evicted(evicted) => assert_eq!(evicted, vec!["a"]),
             other => panic!("expected Evicted, got {other:?}"),

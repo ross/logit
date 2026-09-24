@@ -1,27 +1,17 @@
-# statsd/DogStatsD in, a 10s aggregation window, Graphite/Carbon out -- the cross-protocol
-# counterpart to examples/graphite-relay.yaml, for pointing an existing statsd-speaking fleet at a
-# Carbon/Graphite/Grafana Agent stack instead of a statsd receiver.
+# statsd/DogStatsD in, a 10s aggregation window, Graphite/Carbon out: the cross-protocol
+# counterpart to examples/graphite-relay.yaml, for pointing a statsd-speaking fleet at a Carbon
+# stack (docs/adr/graphite-carbon-relay.md). Change `endpoint` to your carbon receiver.
 #
-# `aggregate` matters here in a way it doesn't for the like-for-like relay: statsd is a firehose of
-# individual samples, and a carbon datapoint is one number per second, so something has to turn a
-# window of counter increments/timer samples into the single reading each flush emits. The
-# `windowed` transform below uses its default summarizing config (`distributions: sketch`,
-# `sets: estimate`), which is what makes `multi_value: expand` below meaningful at all: a raw
-# `Samples`/`SetMembers` record (`distributions: samples`/`sets: members` instead) has no lossless
-# carbon wire form either way and is dropped under `multi_value: skip`, the same as any other
-# multi-value kind this pair cannot carry -- summarizing first is what gives `graphite_out`
-# something to expand.
+# `aggregate` does real work here: a carbon datapoint is one number, so a window of counter
+# increments or timer samples has to become the single reading each flush emits. Its default
+# `distributions: sketch`/`sets: estimate` summarizes timers and sets, and `multi_value: expand`
+# on `graphite_out` renders those summaries as dotted sub-paths; `skip` (the default) drops every
+# multi-value record, raw or summarized.
 #
-# A repeated DogStatsD tag key (`#team:a,team:b`) decodes to a `Value::Array`, and `graphite_out`
-# always renders only its **last** element as the carbon tag (counted
-# `logit.output.tags.normalized{reason="multi_value"}`) -- carbon's tag grammar has no way to
-# express "one key, several values" the way DogStatsD's own multi-value tags do, so this is a
-# genuine, counted loss on this cross-protocol hop, not a bug. Resource attributes become carbon
-# tags too, the same rule `influxdb_out`/`statsd_out` follow.
-#
-# Config is a flat graph of components (docs/design/pipeline-graph.md,
-# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
-# a fixed inputs/transforms/outputs pipeline.
+# A repeated DogStatsD tag key (`#team:a,team:b`) decodes to an array, and `graphite_out` renders
+# only its last element as the carbon tag, counted
+# `logit.output.tags.normalized{reason="multi_value"}`: carbon's tag grammar can't express one key
+# with several values. Resource attributes become carbon tags too.
 components:
   statsd_in:
     type: statsd_in
@@ -31,39 +21,26 @@ components:
     type: aggregate
     sources: [statsd_in]
     interval: 10s
-    # Every field below defaults -- an omitted field is exactly the value shown here, commented
-    # out purely as a reference for tuning a real deployment. See docs/adr/
-    # aggregation-window-semantics.md for the full summarizing-vs-raw argument.
-    # distributions: sketch      # sketch (default) summarizes a timer/histogram/distribution into
-    #                            # a DdSketch, which multi_value: expand below can render as
-    #                            # .count/.sum/.q0_5.../q0_99; samples retains every raw value
-    #                            # instead (no lossless carbon wire form either way -- both still
-    #                            # need multi_value: expand or skip on the way out)
-    # sets: estimate             # estimate (default) summarizes a set into a HyperLogLog cardinality
-    #                            # estimate (multi_value: expand renders it as .count); members
-    #                            # retains every distinct member instead
+    # Every field below is its default; omit it for the same effect
+    # (docs/adr/aggregation-window-semantics.md).
+    # distributions: sketch      # sketch (default) | samples -- expand renders either as
+    #                            # .count/.sum/.q0_5.../.q0_99 (raw samples are sketched first)
+    # sets: estimate             # estimate (default) | members -- expand renders either as .count
 
   graphite_out:
     type: graphite_out
     sources: [windowed]
     endpoint: central-carbon:2003
-    # `tags:` is the default; `multi_value:` is not -- these are the two settings this
-    # cross-protocol hop actually depends on (see this file's header comment):
+    # `tags:` is the default; `multi_value:` is not. These are the two settings this hop depends on.
     tags: carbon
-    # skip (this sink's own default) would drop every flushed Distribution/Set record whole,
-    # counted metrics.skipped{metric_kind=...} -- expand is the deliberate override, and is what
-    # turns each into the dotted sub-paths crates/logit-proto/src/graphite/mod.rs's module doc
-    # documents (page.latency.count/.sum/.q0_5.../.q0_99 for a timer, page.uniques.count for a
-    # set). Without it this example would relay nothing at all: skip drops every summarized record
-    # a 10s aggregate window produces.
+    # `skip` (the default) drops every flushed Distribution/Set record, counted
+    # `metrics.skipped{metric_kind=...}`, so this example would relay nothing. `expand` renders
+    # each as the dotted sub-paths `crates/logit-proto/src/graphite/mod.rs`'s module doc lists.
     multi_value: expand
-    # Every other field below defaults -- an omitted field is exactly the value shown here,
-    # commented out purely as a reference for tuning a real deployment.
+    # Every other field below is its default; omit it for the same effect.
     # transport: tcp             # tcp (default) | udp
     # protocol: plaintext        # plaintext (default) | pickle -- pickle requires transport: tcp
-    # max_packet_bytes: "1432"   # udp only: bounds one datagram's worth of packed lines
-    # max_frame_bytes: "1MiB"    # bounds one pickle frame regardless of transport
+    # max_packet_bytes: "1432"   # udp only: one datagram's worth of packed lines
+    # max_frame_bytes: "1MiB"    # one pickle frame, regardless of transport
     # connect_timeout: 5s        # tcp only
-    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
-    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
-    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering)
+    # buffer: (all defaults; examples/statsd-to-influxdb.yaml has the full block)

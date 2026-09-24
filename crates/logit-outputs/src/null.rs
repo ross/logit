@@ -1,6 +1,8 @@
-//! A sink that drops everything, as cheaply as the runtime allows -- the sink end of the perf
-//! harness (`docs/plans/load-test-harness.md`). Pairs with a `generate_in` listener to measure
-//! everything *upstream* of a sink with no real encoder, socket, or filesystem in the number.
+//! `null_out`: a sink that drops everything
+//! ([ADR `load-test-harness`](../../../../docs/adr/load-test-harness.md)). Paired with
+//! `generate_in`, it measures everything upstream of a sink with no encoder, socket, or filesystem
+//! in the number. Also useful for running a config's listener and transform chain against a real
+//! process with nothing downstream.
 //!
 //! ## Config
 //!
@@ -13,52 +15,35 @@
 //!       path: /var/lib/logit/spool
 //! ```
 //!
-//! No fields of its own. `buffer:` (including `buffer.disk`) works exactly as it does on every
-//! other sink -- `build_spec` gives this the same `queue_config`/`write_config` treatment
-//! (`crates/logit-cli/src/pipeline.rs`), so a scenario can put a real disk-backed queue in front
-//! of this sink to measure the spool without a real destination behind it.
-//!
-//! ## Faults
-//!
-//! [`NullOutput::send`] never fails, so it attaches no [`logit_pipeline::Fault`] context --
-//! `logit_pipeline::classify`'s conservative "no marker found" default is never reached because
-//! there is never an `Err` to classify in the first place.
+//! No fields of its own. `buffer:`, including `buffer.disk`, works as on any sink, so a scenario
+//! can measure a disk spool with no destination behind it.
 //!
 //! ## Telemetry
 //!
-//! **Layer 2 only** -- `logit.component.batches.received`/`logit.component.events.received`/
-//! `logit.component.send.duration` come from the generic write loop
-//! (`crates/logit-pipeline/src/runtime.rs`) that wraps every sink's `send` call. A dedicated
-//! counter here would just duplicate `events.received` for a sink that does no work of its own to
-//! report on.
+//! Layer 2 only: the write loop's `logit.component.batches.received`,
+//! `logit.component.events.received`, and `logit.component.send.duration` still count every batch.
+//! This sink emits nothing of its own.
 //!
-//! ## Duplicate safety
+//! ## Faults and duplicate safety
 //!
-//! [`NullOutput::duplicate_safe`] is `true`: `send` has no side effect and no destination to
-//! double-write to -- dropping a batch twice is still just dropping it.
-//!
-//! Two intended uses: a load-test scenario's sink (`perf/scenarios/*.yaml`,
-//! `docs/plans/load-test-harness.md`), and validating the front half of a config -- a listener,
-//! its parsing/transform chain -- against a real running process with nothing on the other end.
+//! [`NullOutput::send`] never fails. [`NullOutput::duplicate_safe`] is `true`: there's no
+//! destination to double-write to.
 
 use logit_core::EventBatch;
 use logit_pipeline::Output;
 
-/// `logit_pipeline::Output` for `null_out`. Unit-like and `Copy` -- there is no state to hold and
-/// no builder needed, unlike every other sink in this crate.
+/// `logit_pipeline::Output` for `null_out`. Stateless, so no builder.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullOutput;
 
 #[async_trait::async_trait]
 impl Output for NullOutput {
-    /// Drops `batch` and returns immediately. No encoding, no I/O -- see the module doc for why
-    /// there is nothing else here, including no early return for an empty batch: an empty batch
-    /// costs exactly as little as a non-empty one already.
+    /// Drops `batch` and returns `Ok`.
     async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// See the module doc's "Duplicate safety" section.
+    /// No destination to double-write to.
     fn duplicate_safe(&self) -> bool {
         true
     }

@@ -1,59 +1,50 @@
-# The `oteldemo` producer's pipeline (tools/shape-survey/producers/oteldemo.sh) -- the
-# OpenTelemetry Demo ("astronomy shop"), a ~20-service polyglot application under its own Locust
-# load generator, exporting through **its own OpenTelemetry Collector** into one `otlp_in` and
-# measured by `shape` (docs/adr/shape-observer-component.md).
+# The `oteldemo` producer's capture (tools/shape-survey/producers/oteldemo.sh): the OpenTelemetry
+# Demo at a pinned tag, a ~20-service polyglot application under its own Locust load generator,
+# exporting through its own Collector into one `otlp_in`, measured by `shape`
+# (docs/adr/shape-observer-component.md). Findings: docs/design/data-shapes.md §5.4.
 #
-# WHAT `shape` IS MEASURING HERE, AND WHERE IN THE CHAIN IT SITS
+# Where `shape` sits in the chain:
 #
 #   application SDK -> (OTLP/gRPC) -> the demo's otel-collector -> (OTLP/HTTP) -> otlp_in -> shape
 #
-# So these numbers are **post-collector**, not raw SDK output, and that is deliberate: a collector
-# in front of a gateway is how OTLP is actually deployed, and it is the shape a `logit` would meet.
-# What the collector's processors add is listed in the producer's appended section of summary.md
-# (`resource_detection` in particular puts a dozen or so `host.*`/`os.*`/`container.*` attributes on
-# every resource), so the resource-width number below is read with that attached.
+# So these numbers are post-collector, not raw SDK output: a collector in front of a gateway is how
+# OTLP is deployed, and it is the shape a `logit` meets. What the collector's processors add is in
+# the producer's summary section (`resource_detection` puts a dozen or so
+# `host.*`/`os.*`/`container.*` attributes on every resource); read the resource-width number with
+# that attached.
 #
-# **One input, one tap.**
+# One input, one tap. One input because `otlp_in`'s HTTP mode takes all three signals on one
+# listener and `shape` tags every measurement with `signal`, so traces, metrics and logs stay
+# separable without a component each. One tap because OTLP arrives finished; there is no
+# `json`/`regex`/`kv` chain an operator would run over it, and a `tap_landed` would measure an
+# identity function (tools/shape-survey/README.md, "The config pattern").
 #
-#   * **One input** because `otlp_in`'s HTTP mode takes all three signals on one listener
-#     (`/v1/traces`, `/v1/metrics`, `/v1/logs`), and `shape` tags every measurement with `signal`
-#     -- so traces, metrics and logs stay separable in the output without a component each. A
-#     second component would only be needed for a second *transport*, and the collector exports
-#     over one.
-#   * **One tap**, not two. The two-tap pattern (tools/shape-survey/README.md's "The config
-#     pattern") measures what a realistic parse/enrichment chain adds -- and there is no such chain
-#     for OTLP. The events arrive fully structured, already carrying their attributes as typed
-#     values; there is nothing an operator would realistically run a `json`, `regex` or `kv` stage
-#     over. A `tap_landed` here would measure `shape` measuring an identity function.
+# How to read the series:
 #
-# HOW TO READ THE SERIES
-#
-#   logit.shape.attributes          attributes on one span / metric point / log record, as the
-#                                   collector exported it (resource attributes are NOT in here --
+#   logit.shape.attributes          attributes on one span / metric point / log record as the
+#                                   collector exported it (resource attributes are not in here:
 #                                   `resource: drop`, and they are reported per batch instead)
 #   logit.shape.batch.events        events in one (Resource, Scope) group of one collector export
-#                                   request -- see below; NOT "one SDK batch"
+#                                   request (see below); not "one SDK batch"
 #   logit.shape.batch.resource_attributes
-#                                   the width of an OTLP `Resource` after the collector's
-#                                   `resource_detection` processor has run: the number that matters
-#                                   for OTLP, since a resource is per batch in the model
+#                                   the width of an OTLP `Resource` after `resource_detection`:
+#                                   the number that matters for OTLP, since a resource is per
+#                                   batch in the model
 #   logit.shape.batch.scope_attributes
-#                                   the width of the `InstrumentationScope` -- usually 0, sometimes
-#                                   populated (the collector's own self-telemetry scopes carry
-#                                   `otelcol.*` attributes, which is why `transform/sanitize_logs`
-#                                   exists upstream)
+#                                   the width of the `InstrumentationScope`, usually 0; the
+#                                   collector's own self-telemetry scopes carry `otelcol.*`
+#                                   attributes, which is why its config has a
+#                                   `transform/sanitize_logs` processor upstream of this tap
 #   logit.shape.span.events/links   span events and links per span, and span-event attribute counts
 #   logit.shape.body_bytes          a log record's body length
 #
-# **What a "batch" is here, precisely.** `otlp_in` bypasses the `BatchAccumulator` entirely, and
-# the OTLP codec never collapses groups: *every* `(ResourceSpans/Metrics/Logs, Scope*)` pair inside
-# one export request becomes its own `EventBatch` (crates/logit-proto/src/otlp/mod.rs). So
-# `logit.shape.batch.events` is **events per (Resource, Scope) group of one collector export
-# request** -- one resource's one instrumentation scope's share of one HTTP POST. It is not the
-# SDK's own batch (the collector received that and may have merged or split it) and it is not a
-# `logit`-side regrouping (there is none). At the demo's 3.1.0 core collector config there is *no*
-# `batch` processor in any pipeline, so what the collector exports is what its receivers and
-# scrapers handed the pipeline, split by resource and scope on the way out.
+# What a "batch" is here. `otlp_in` bypasses the `BatchAccumulator`, and the OTLP codec never
+# collapses groups: every `(ResourceSpans/Metrics/Logs, Scope*)` pair inside one export request
+# becomes its own `EventBatch` (crates/logit-proto/src/otlp/mod.rs). So `logit.shape.batch.events`
+# is events per (Resource, Scope) group of one collector export request: not the SDK's own batch
+# (the collector may have merged or split it) and not a `logit`-side regrouping (there is none).
+# The pinned demo's core collector config has no `batch` processor, so what the collector exports
+# is what its receivers and scrapers handed the pipeline, split by resource and scope.
 admin:
   # start_logit polls `logit ready` against this rather than sleeping.
   bind: 0.0.0.0:9600
@@ -61,27 +52,20 @@ admin:
 components:
   # -- the input ---------------------------------------------------------------------------------
   # OTLP/HTTP on the standard 4318. The demo's collector is pointed here by
-  # tools/shape-survey/oteldemo/otelcol-config-extras.yml, alongside its own `debug` exporter --
-  # the demo's pipelines keep every exporter they ship with.
-  #
-  # HTTP rather than gRPC for one reason that matters to the output: `otlp_in` takes a single
-  # `protocol:`, so a gRPC listener would be a second component and `shape`'s `source` tag (the
-  # origin *component* name) would split one collector's traffic in two for no reason. HTTP carries
-  # all three signals on one listener, so one component sees everything the collector sends.
+  # tools/shape-survey/oteldemo/otelcol-config-extras.yml, alongside the exporters the demo ships
+  # with. HTTP rather than gRPC because `otlp_in` takes a single `protocol:`: a gRPC listener would
+  # be a second component, and `shape`'s `source` tag (the origin component) would split one
+  # collector's traffic in two.
   otlp_gateway:
     type: otlp_in
     bind: 0.0.0.0:4318
     protocol: http
 
   # -- the tap -----------------------------------------------------------------------------------
-  # One `shape`, for the reason in the header: OTLP arrives finished, so there is no chain to
-  # measure across and a second tap would measure an identity function.
-  #
-  # `resource: drop` is the default, stated. It is load-bearing twice over here: no observed
-  # resource attribute leaves this pipeline (which is what lets a summary of a run leave the
-  # environment the traffic could not), and it is why **there is no per-service breakdown in this
-  # producer's output** -- `service.name` is a resource attribute. The count per batch survives
-  # (`logit.shape.batch.resource_attributes`), which for OTLP is the number the survey is after.
+  # One `shape`, for the reason in the header. `resource: drop` is the default, stated, and it is
+  # why there is no per-service breakdown in this producer's output: `service.name` is a resource
+  # attribute. The count per batch survives (`logit.shape.batch.resource_attributes`), which for
+  # OTLP is the number the survey is after; configs/oteldemo-keep.yaml is the per-service variant.
   tap_input:
     type: shape
     sources: [otlp_gateway]
@@ -89,10 +73,9 @@ components:
     resource: drop
 
   # -- the capture -------------------------------------------------------------------------------
-  # `distributions: samples` keeps `shape`'s raw observations raw through the window, and
-  # `max_samples_per_series` is far above what this capture can produce; past it `aggregate` falls
-  # back to a DdSketch and summarize.py fails loudly rather than reporting an approximation as a
-  # measurement.
+  # `distributions: samples` keeps `shape`'s raw observations raw through the window;
+  # `max_samples_per_series` is far above what this capture can produce. Past it `aggregate` falls
+  # back to a DdSketch and summarize.py fails loudly rather than report an approximation.
   shape_rollup:
     type: aggregate
     sources: [tap_input]
@@ -106,6 +89,6 @@ components:
     sources: [shape_rollup]
     path: /out/shape.log
     rotate:
-      # `file_out` requires a rotation trigger, and a survey that rotated would silently lose the
-      # start of its own capture.
+      # `file_out` requires a rotation trigger, and a survey that rotated would lose the start of
+      # its own capture.
       max_bytes: "64GiB"

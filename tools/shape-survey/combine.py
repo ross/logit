@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
 """Fold several `shape-survey` run directories into one cross-producer markdown report.
 
-`summarize.py` answers "what did *this* capture look like". This answers the question
-`docs/design/data-shapes.md` is written from: **across every producer we captured, one table per
-dimension, one row per producer x source x tap x signal** -- so the attribute width of an nginx
-access log, a node_exporter scrape and a recorded statsd datagram sit on adjacent rows of the same
-table rather than in three directories nobody diffs.
+One table per dimension, one row per producer x source x tap x signal; docs/design/data-shapes.md
+is written from this output. Input is N run directories, each with `summary.json` and
+`provenance.txt`. Nothing re-parses `shape.log`: `summary.json`'s value->count tables make any
+fraction recomputable here.
 
-Input is N run directories (each with `summary.json` and `provenance.txt`, exactly as `lib.sh`
-writes them). Nothing re-parses `shape.log`: `summary.json` carries every series' full
-value->count table, which is what makes a fraction like ">8 attributes" recomputable here without
-the capture.
-
-Every row carries its run's **representativeness** line, not just a footnote at the top. These
-tables are the ones that get quoted, and a p90 from a stack this project built to demo itself and a
-p90 from a recorded third-party producer are not the same kind of number. Completeness beats
-prettiness here on purpose -- the output is a working document, not a page.
+Every row carries its run's representativeness line, because these tables get quoted row by row.
 
 What it emits:
 
@@ -29,7 +20,7 @@ What it emits:
   * the cumulative gauges (`distinct_keys`, `distinct_keysets`, `keyset_share.top1`/`top5`,
     `tracking_overflow`) pivoted one row per source x tap.
 
-Stdlib only, like the rest of this directory -- it runs in a bare `python:3.12-slim`.
+Stdlib only.
 
 Usage:
     combine.py perf/results/shape-survey/*/*/ --out combined.md
@@ -43,9 +34,8 @@ import sys
 import tempfile
 from collections import OrderedDict
 
-#: The dimensions that get their own table, in the order a reader wants them: how wide an event is,
-#: then how it is grouped, then what is inside its values, then the signal-specific ones. Anything a
-#: capture contains that is not on this list still gets a table, appended after these.
+#: Table order: width, grouping, value contents, then signal-specific. A dimension not listed still
+#: gets a table, after these.
 DIMENSION_ORDER = (
     "logit.shape.attributes",
     "logit.shape.batch.events",
@@ -65,12 +55,10 @@ DIMENSION_ORDER = (
     "logit.shape.span_links",
 )
 
-#: `logit.shape.attributes` is the series the survey exists for, so its table carries the spill
-#: fractions at every candidate inline capacity rather than percentiles alone.
+#: The `logit.shape.attributes` table adds the spill fraction at each candidate inline capacity.
 WIDTH_THRESHOLDS = (4, 8, 12, 16)
 
-#: The cumulative gauges, pivoted into columns in that order (a gauge a capture did not produce
-#: prints `n/a`). Cumulative since process start, not windowed -- see summarize.py.
+#: The cumulative gauges, pivoted into columns in this order; a missing one prints `n/a`.
 GAUGES = (
     "logit.shape.distinct_keys",
     "logit.shape.distinct_keysets",
@@ -94,9 +82,8 @@ class Run:
         if not summary_file.is_file():
             raise SystemExit(f"combine: {path} has no summary.json -- is it a shape-survey run dir?")
         self.summary = json.loads(summary_file.read_text())
-        # `summarize.py` already folded provenance.txt's banner fields into summary.json; the file
-        # itself is read only for what it adds beyond them (the producer's own software versions),
-        # which is reported as a per-run appendix rather than squeezed into a row.
+        # summary.json already carries the banner fields; provenance.txt is read only for the
+        # producer's software versions, reported as a per-run appendix.
         self.provenance = ""
         if (path / "provenance.txt").is_file():
             self.provenance = (path / "provenance.txt").read_text()
@@ -123,11 +110,7 @@ def label_runs(runs: list[Run]) -> None:
 
 
 def fractions_above(histogram: dict, thresholds=WIDTH_THRESHOLDS) -> dict[int, float] | None:
-    """The fraction of observations strictly above each threshold, from a value->count table.
-
-    `summarize.py` writes that table for every integer-valued series, which is why nothing here
-    needs the capture: a fraction at any N is recoverable from it exactly.
-    """
+    """The fraction of observations strictly above each threshold, from a value->count table."""
     if not histogram:
         return None
     total = sum(histogram.values())

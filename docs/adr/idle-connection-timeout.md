@@ -20,7 +20,8 @@ bounds is what happens *after* that: a connection that completes its
 handshake (or, on a plaintext listener, delivers at least one byte) and then goes silent holds its
 connection-cap permit -- 1024 on every one of the five -- indefinitely, right up to the cap itself. A
 slow-loris-shaped client can exhaust that cap with connections that will never send another byte.
-`docs/known-gaps.md:1291-1332` names this gap and records that it is deliberately not a second use
+[`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle)'s "No idle-connection
+timeout on a TCP listener" entry names this gap and records that it is deliberately not a second use
 of `handshake_timeout:` -- that field landed on 2026-09-13 with this held out explicitly, because an
 idle bound is a different shape from a pre-message one and raises three design questions a knob
 can't answer on its own:
@@ -161,12 +162,13 @@ connection stopped mid-head has state `KA::Busy`, not `Idle`, and keeps waiting 
 hyper-util's own pre-sniff `ReadVersion` future resolves to `Err("Cancelled")` on a graceful shutdown
 signal, and an H2 connection still mid-handshake only sets an internal `close_pending` flag rather
 than closing outright. The bounded grace-then-drop step exists precisely for those three cases,
-where `graceful_shutdown` alone would leave the connection parked. This is also the narrowing
-`docs/known-gaps.md:1333-1359`'s residual row already anticipated: `otlp_in` resets its idle clock on
-request *completion*, not on individual bytes, so a request head that dribbles in more slowly than
-`idle_timeout` on an otherwise-idle keep-alive connection is still closed -- a documented cost, not a
-bug. A body that stalls mid-request gets a narrower, per-frame bound instead (`collect_with_stall_bound`
-over `BodyExt::frame`) and ends in a 408 (HTTP) or gRPC status 4, with the connection closed after
+where `graceful_shutdown` alone would leave the connection parked. This is also the narrowing the
+residual `otlp_in` row in [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle)
+already anticipated: `otlp_in` resets its idle clock on request *completion*, not on individual
+bytes, so a request head that dribbles in more slowly than `idle_timeout` on an otherwise-idle
+keep-alive connection is still closed -- a documented cost, not a bug. A body that stalls
+mid-request gets a narrower, per-frame bound instead (`collect_with_stall_bound` over
+`BodyExt::frame`) and ends in a 408 (HTTP) or gRPC status 4, with the connection closed after
 the handler returns, rather than waiting for the whole-connection idle deadline.
 
 ### The client-side probe: one non-cancellable `poll_read` before the first write
@@ -261,10 +263,11 @@ comment.
   with the service-level-tracker rationale and the hyper evidence above.
 - **W4** (docs closeout): a new `docs/deploying.md` section covering the semantics, the reset rule,
   and the enable-it-wherever-consistent-traffic-is-expected recommendation verbatim; both
-  `docs/known-gaps.md` rows this ADR answers (`:1291-1359`, both the idle-timeout row and the
-  `otlp_in` residual row that pointed at it) struck or narrowed to what remains open; the counter
-  added to `docs/design/internal-telemetry.md`'s bullet for each of the five listeners, and that
-  doc's `connection_error` wording gaining "never an idle close, which is counted, not diagnosed";
+  `docs/known-gaps.md` rows this ADR answers (both the idle-timeout row and the `otlp_in`
+  residual row that pointed at it, under its "TLS and connection lifecycle" section) struck or
+  narrowed to what remains open; the counter added to `docs/design/internal-telemetry.md`'s bullet
+  for each of the five listeners, and that doc's `connection_error` wording gaining "never an idle
+  close, which is counted, not diagnosed";
   amendments or one-line pointers in the four related ADRs this Context section links
   (`syslog-tcp-ingress-and-tls`, `native-transport-handshake-and-ack`, `otlp-tls-and-pooled-grpc-client`,
   `graphite-carbon-relay`); `AGENTS.md`'s current-state sentence; and a commented
