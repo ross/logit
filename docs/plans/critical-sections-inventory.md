@@ -2513,9 +2513,13 @@ surveyor's.
   the crate can write fewer bytes than the buffer holds; nontrivial-3p-use(crc32c) — CRC over compressed bytes, by
   design.
 - **Invariants to verify:**
-  - `Truncated` is produced **only** for a genuine short buffer; every corrupt-length case is `Malformed`. Both
-    `uncompressed_len` (`:230`) and `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN`
-    (`:54-55`) is wide enough that `write_frame` can never emit a frame its own `read_frame` rejects.
+  - A `compressed_len` over `MAX_SANE_COMPRESSED_LEN` is `Malformed`; one at or below the cap but past the bytes
+    actually present is `Truncated` — indistinguishable, at this layer, from a genuine short read. `read_frame`
+    itself has no way to tell "more bytes are still coming" (a live connection) from "there will never be more"
+    (a closed disk segment); that call belongs to the *consumer*, per F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context. Both `uncompressed_len` (`:230`) and
+    `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN` (`:54-55`) is wide enough that
+    `write_frame` can never emit a frame its own `read_frame` rejects.
   - CRC is verified *before* `lz4_flex` sees the bytes (`:246` precedes `:252`).
   - The post-decompress length check (`:263-269`) is not a tautology — depends on `lz4_decompress`'s
     `out.truncate(written)` at `:297`.
@@ -2523,8 +2527,14 @@ surveyor's.
     spurious hit inside a `trace_id` (tested).
   - `HEADER_LEN` and the field offsets used by disk_queue's tests (`CONTEXT_LEN + 16` for `compressed_len`,
     disk_queue `:1908`) stay in sync with `FrameHeader::write` (`:103-113`).
-- **Observed concerns (unverified):** none spotted in the disk-facing behavior. `resync`'s linear scan is the
-  performance term in `walk_segment`'s worst case (see the parse entry), not a correctness issue.
+- **Observed concerns (unverified):**
+  - The consumer gap this layer's correct `Truncated` answer leaves open: `DiskQueue` can't tell, from
+    `Truncated` alone, whether more bytes might still arrive (a live connection) or never will (a closed
+    segment) — on a closed segment that silence means corruption, not a short read. F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context; tracked as DISK-01/DISK-02's finding, fixed in
+    `dur/w3`.
+  - `resync`'s linear scan is the performance term in `walk_segment`'s worst case (see the parse entry), not a
+    correctness issue.
 - **Existing coverage:** `frame.rs:316-514` — 16 unit tests, including
   `a_header_truncated_by_one_byte_is_truncated_not_malformed` (`:393`),
   `a_body_truncated_by_one_byte_is_truncated_not_malformed` (`:400`),
@@ -2539,8 +2549,10 @@ surveyor's.
   total for every payload up to the cap under both compressions.
 - **Verified (`dur/w2`):** `crates/logit-proto/tests/frame_fixed_point.rs` adds that property test (random and
   compressible payloads up to 256 KiB, both compressions, concatenation, the lz4 worst-case bound, and the full
-  64 MiB cap), and pins that a `compressed_len` corrupted below the sanity cap reads as `Truncated` — confirming
-  this layer is correct as-is; the closed-segment consumer behavior F1 flags is `dur/w3`'s fix, not this file's.
+  64 MiB cap), and pins that a `compressed_len` corrupted below the sanity cap reads as `Truncated` — which
+  corrected this entry's first invariant above (it previously claimed every corrupt length is `Malformed`; that
+  was wrong). The closed-segment consumer behavior F1 (ADR `durable-checkpoint-writes-and-fault-injection`'s
+  Context) flags is `dur/w3`'s fix, not this file's.
 - **Priority:** P1 — the caps and CRC are correct and tested, but this is the one decoder standing between corrupt
   disk bytes and an allocation, and the `Truncated`/`Malformed` distinction is load-bearing for disk recovery.
 

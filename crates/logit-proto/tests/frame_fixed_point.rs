@@ -147,8 +147,8 @@ proptest! {
 
 /// A minimal linear congruential generator, seeded and reproducible -- there's no RNG crate in
 /// this workspace (`tests/robustness.rs`'s own doc comment says so), and this only needs
-/// deterministic, non-degenerate filler, not real randomness. Constants are Numerical Recipes'
-/// LCG, same as `tests/robustness.rs`'s copy.
+/// deterministic, non-degenerate filler, not real randomness. Constants are Knuth's MMIX LCG --
+/// the same multiplier and increment `tests/robustness.rs`'s own `Lcg` uses.
 struct Lcg(u64);
 
 impl Lcg {
@@ -222,17 +222,18 @@ fn corrupt_compressed_len(framed: &Bytes, new_len: u32) -> Bytes {
     mutated.freeze()
 }
 
-/// DISK-13's premise for finding F1: a `compressed_len` rewritten to a value that is still under
-/// the sanity cap, but larger than the bytes actually present, reads as `CodecError::Truncated`,
-/// not `Malformed` -- from `read_frame`'s own perspective this is indistinguishable from a genuine
-/// short read (a live socket that hasn't delivered the rest of the frame yet, or a file that ends
-/// mid-write), so `Truncated` is the correct answer *at this layer*. It's the caller that has to
-/// know more: on a live connection "come back with more bytes" is right, but on a closed disk
-/// segment there will never be more bytes, so treating the two the same is what F1 flags -- a
-/// closed segment's reader must not keep waiting on a `Truncated` result forever, and `open` must
-/// not treat it as a legitimate torn tail without first checking whether anything parseable
-/// follows. Fixing that consumer behavior in `DiskQueue` is `dur/w3`; this test only pins that
-/// `frame::read_frame` itself is doing the right thing.
+/// DISK-13's premise for F1 in ADR `durable-checkpoint-writes-and-fault-injection`'s Context: a
+/// `compressed_len` rewritten to a value that is still under the sanity cap, but larger than the
+/// bytes actually present, reads as `CodecError::Truncated`, not `Malformed` -- from
+/// `read_frame`'s own perspective this is indistinguishable from a genuine short read (a live
+/// socket that hasn't delivered the rest of the frame yet, or a file that ends mid-write), so
+/// `Truncated` is the correct answer *at this layer*. It's the caller that has to know more: on a
+/// live connection "come back with more bytes" is right, but on a closed disk segment there will
+/// never be more bytes, so treating the two the same is what F1 flags -- a closed segment's
+/// reader must not keep waiting on a `Truncated` result forever, and `open` must not treat it as
+/// a legitimate torn tail without first checking whether anything parseable follows. Fixing that
+/// consumer behavior in `DiskQueue` is `dur/w3`; this test only pins that `frame::read_frame`
+/// itself is doing the right thing.
 #[test]
 fn a_compressed_len_corrupted_below_the_cap_reads_as_truncated() {
     let data = vec![b'x'; 4096];

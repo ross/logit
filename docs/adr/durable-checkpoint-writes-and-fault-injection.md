@@ -213,8 +213,10 @@ script is needed. This list is filled in as each workstream lands.
     identity on codec, flags, compression, and payload, over generated payloads up to 256 KiB.
   - `concatenated_frames_read_back_in_order_with_nothing_left_over` — one to eight frames read
     back in the order they were written, with nothing left in the buffer.
-  - `lz4_expansion_on_incompressible_payloads_stays_within_n_plus_n_over_255_plus_16` — pins the
-    private `MAX_SANE_COMPRESSED_LEN` cap formula from outside the module.
+  - `lz4_expansion_on_incompressible_payloads_stays_within_n_plus_n_over_255_plus_16` — checks
+    that lz4's real worst-case output stays within the `n + n/255 + 16` bound
+    `MAX_SANE_COMPRESSED_LEN` is built on (it doesn't pin the constant itself: changing it leaves
+    this test green; only the over-the-cap test below would notice).
   - `a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none` — a full 64 MiB payload
     round-trips at the cap; one byte past it is rejected.
   - `a_compressed_len_corrupted_below_the_cap_reads_as_truncated` — pins finding F1's premise: a
