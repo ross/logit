@@ -1435,7 +1435,7 @@ mod tests {
         let err = output.send(&one_metric_batch()).await.expect_err("a 400 should fail send");
         assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
-        // `.context(fault)` makes `err`'s own `Display` just the `Fault`; the send message with
+        // `.context(fault)` makes `err`'s own `Display` the `Fault` alone; the send message with
         // the quoted body is the wrapped cause.
         let message = err.root_cause().to_string();
         assert!(message.contains("unable to parse points"), "got: {message}");
