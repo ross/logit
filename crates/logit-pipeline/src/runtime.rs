@@ -4966,8 +4966,7 @@ mod tests {
         assert!(err.to_string().contains("bad"), "the returned error should be bad's, got: {err}");
     }
 
-    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`. A `delay`
-    /// past the retry budget times that attempt out as `Fault::Ambiguous` instead.
+    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`.
     struct DelayedSecondFailureOutput {
         delay: Duration,
         calls: Arc<std::sync::atomic::AtomicU32>,
@@ -4984,9 +4983,8 @@ mod tests {
         }
     }
 
-    /// The join loop returns `bad1`'s failure, which trips the window at 60 s. `bad2`'s 61 s
-    /// delay exceeds the default 60 s retry budget, so its second batch drops as `Ambiguous`,
-    /// resetting its streak: `bad2` never fails, and the `!contains("bad2")` check holds trivially.
+    /// Both sinks fail permanently: `bad1`'s failure window trips at 60 s and `bad2`'s at 61 s.
+    /// The join loop returns `bad1`'s error, and `bad2`'s later one doesn't overwrite it.
     #[tokio::test(start_paused = true)]
     async fn run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one() {
         let mut components = Map::new();
@@ -5048,9 +5046,14 @@ mod tests {
         let (bad1_tx, bad1_rx) = mpsc::unbounded_channel();
         let (bad2_tx, bad2_rx) = mpsc::unbounded_channel();
 
-        // So one sink's failure-triggered shutdown doesn't cut the other's delay short.
-        let generous_grace = WriteLoopConfig {
-            retry: RetryConfig::default(),
+        // The budget outlasts `bad2`'s 61 s send, which would otherwise time out as `Ambiguous`
+        // and reset its failure streak. The grace keeps one sink's failure-triggered shutdown
+        // from cutting the other's delay short.
+        let generous = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                ..RetryConfig::default()
+            },
             shutdown_grace: Duration::from_secs(3600),
             delivery_override: None,
         };
@@ -5068,7 +5071,7 @@ mod tests {
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous_grace,
+                generous,
             ),
         );
         specs.insert(
@@ -5083,7 +5086,7 @@ mod tests {
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous_grace,
+                generous,
             ),
         );
 

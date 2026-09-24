@@ -222,7 +222,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | in-progress (dur/w7) |
-| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | in-progress (dur/w2) |
+| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | reviewed @e3aa53b |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs:874-928` | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs:167-414` | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs:147-182` | unreviewed |
@@ -488,7 +488,7 @@ All line numbers verified against the worktree at
     `*shutdown.borrow()` check. The two drivers reach the same behavior by different means; worth
     confirming the UDP side really is immune (it compiles, so it is — but the asymmetry suggests one
     of the two comments is imprecise).
-- **Existing coverage:** `udp.rs` tests `shutdown_drains_the_queue_and_delivers_every_already_queued_datagram`
+- **Existing coverage:** `udp.rs` tests `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing`
   (1400), `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered` (1514),
   `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue` (2488),
   `a_block_queue_smaller_than_the_read_batch_still_delivers_every_datagram` (2557),
@@ -2588,9 +2588,13 @@ surveyor's.
   the crate can write fewer bytes than the buffer holds; nontrivial-3p-use(crc32c) — CRC over compressed bytes, by
   design.
 - **Invariants to verify:**
-  - `Truncated` is produced **only** for a genuine short buffer; every corrupt-length case is `Malformed`. Both
-    `uncompressed_len` (`:230`) and `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN`
-    (`:54-55`) is wide enough that `write_frame` can never emit a frame its own `read_frame` rejects.
+  - A `compressed_len` over `MAX_SANE_COMPRESSED_LEN` is `Malformed`; one at or below the cap but past the bytes
+    actually present is `Truncated` — indistinguishable, at this layer, from a genuine short read. `read_frame`
+    itself has no way to tell "more bytes are still coming" (a live connection) from "there will never be more"
+    (a closed disk segment); that call belongs to the *consumer*, per F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context. Both `uncompressed_len` (`:230`) and
+    `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN` (`:54-55`) is wide enough that
+    `write_frame` can never emit a frame its own `read_frame` rejects.
   - CRC is verified *before* `lz4_flex` sees the bytes (`:246` precedes `:252`).
   - The post-decompress length check (`:263-269`) is not a tautology — depends on `lz4_decompress`'s
     `out.truncate(written)` at `:297`.
@@ -2598,8 +2602,14 @@ surveyor's.
     spurious hit inside a `trace_id` (tested).
   - `HEADER_LEN` and the field offsets used by disk_queue's tests (`CONTEXT_LEN + 16` for `compressed_len`,
     disk_queue `:1908`) stay in sync with `FrameHeader::write` (`:103-113`).
-- **Observed concerns (unverified):** none spotted in the disk-facing behavior. `resync`'s linear scan is the
-  performance term in `walk_segment`'s worst case (see the parse entry), not a correctness issue.
+- **Observed concerns (unverified):**
+  - The consumer gap this layer's correct `Truncated` answer leaves open: `DiskQueue` can't tell, from
+    `Truncated` alone, whether more bytes might still arrive (a live connection) or never will (a closed
+    segment) — on a closed segment that silence means corruption, not a short read. F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context; tracked as DISK-01/DISK-02's finding, fixed in
+    `dur/w3`.
+  - `resync`'s linear scan is the performance term in `walk_segment`'s worst case (see the parse entry), not a
+    correctness issue.
 - **Existing coverage:** `frame.rs:316-514` — 16 unit tests, including
   `a_header_truncated_by_one_byte_is_truncated_not_malformed` (`:393`),
   `a_body_truncated_by_one_byte_is_truncated_not_malformed` (`:400`),
@@ -2612,6 +2622,12 @@ surveyor's.
 - **Suggested verification approach:** a `cargo-fuzz` target over `read_frame` (no fuzz targets exist in this repo
   today) asserting no panic and no allocation over the caps; a property test that `write_frame ∘ read_frame` is
   total for every payload up to the cap under both compressions.
+- **Verified (`dur/w2`):** `crates/logit-proto/tests/frame_fixed_point.rs` adds that property test (random and
+  compressible payloads up to 256 KiB, both compressions, concatenation, the lz4 worst-case bound, and the full
+  64 MiB cap), and pins that a `compressed_len` corrupted below the sanity cap reads as `Truncated` — which
+  corrected this entry's first invariant above (it previously claimed every corrupt length is `Malformed`; that
+  was wrong). The closed-segment consumer behavior F1 (ADR `durable-checkpoint-writes-and-fault-injection`'s
+  Context) flags is `dur/w3`'s fix, not this file's.
 - **Priority:** P1 — the caps and CRC are correct and tested, but this is the one decoder standing between corrupt
   disk bytes and an allocation, and the `Truncated`/`Malformed` distinction is load-bearing for disk recovery.
 
