@@ -27,8 +27,9 @@ idle bound is a different shape from a pre-message one and raises three design q
 can't answer on its own:
 
 1. **A stalled downstream must not look like a silent peer.** A connection task blocked handing a
-   batch to `Fanout::send` (`crates/logit-pipeline/src/fanout.rs:311-332`) stops reading its socket
-   for exactly the reason TCP backpressure is supposed to work: the peer feels its own write block.
+   batch to `Fanout::send` (its `deliver` helper, `crates/logit-pipeline/src/fanout.rs`) stops
+   reading its socket for exactly the reason TCP backpressure is supposed to work: the peer feels
+   its own write block.
    A timer that can't tell "the peer sent nothing" from "we haven't read yet" would turn every
    downstream stall into a wave of dropped connections and lost data -- the opposite of the
    no-receive-queue design [ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md) and
@@ -49,11 +50,13 @@ This decision answers all three, adds one opt-in `idle_timeout` field to all fiv
 and adds the client-side complement so a server-side idle close costs a sender as little as
 possible. That complement matters because a server-initiated close is not free for every peer: a
 sink holding a pooled connection can write into a socket the peer has already half-closed.
-`logit_out` (`crates/logit-outputs/src/logit.rs:340-507`) pools one TCP connection per remote and
-reuses it across batches; if the peer's FIN arrives before `logit_out`'s next write, that write
-still leaves the host, the ack read then fails, and the outcome is classified `Fault::Ambiguous` --
-`duplicate_safe()` is false for the native protocol, so the default at-most-once delivery posture
-drops the batch rather than risk a duplicate (`crates/logit-pipeline/src/runtime.rs:4468-4478`).
+`logit_out` (`LogitOutput::send`, `crates/logit-outputs/src/logit.rs`) pools one TCP connection per
+remote and reuses it across batches; if the peer's FIN arrives before `logit_out`'s next write,
+that write still leaves the host, the ack read then fails, and the outcome is classified
+`Fault::Ambiguous` -- `duplicate_safe()` is false for the native protocol, so the default
+at-most-once delivery posture drops the batch rather than risk a duplicate (the test
+`an_ambiguous_fault_is_dropped_immediately_under_at_most_once_with_no_retry`,
+`crates/logit-pipeline/src/runtime.rs`).
 Plaintext `syslog_out`/`statsd_out`/`graphite_out` senders have it worse: nothing in those wire
 protocols tells the sender its peer closed, so a write into a FIN'd socket is silently lost with no
 ambiguity classification to even name the loss. An idle-timeout feature that only closes the server
@@ -94,7 +97,8 @@ Closing an idle connection is an ordinary, expected outcome, never routed throug
 same success path a graceful shutdown takes; the connection-cap permit is released the same way it
 always is, by the task ending. Whatever the connection had already buffered is not silently
 discarded: any complete, accumulated batch is flushed with `FlushReason::Closed`
-(`crates/logit-pipeline/src/accumulator.rs:26-34`, which gains "or closed as idle" to its doc), and
+(`FlushReason::Closed`'s own doc comment in `crates/logit-pipeline/src/accumulator.rs`, which
+gains "or closed as idle"), and
 a partial frame still sitting in the framer is reported through `report_buffered_tail`, counted
 `truncated` -- exactly the accounting a `Failed` or `Shutdown` close already gets, so an idle close
 introduces no new kind of silent loss.

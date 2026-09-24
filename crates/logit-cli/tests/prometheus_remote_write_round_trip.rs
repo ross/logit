@@ -392,14 +392,9 @@ async fn an_exemplar_with_a_trace_reference_survives_the_wire() {
 /// `hits_total 2`.
 #[tokio::test]
 async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_the_wire() {
-    // Reserves an ephemeral port by bind-drop-rebind, as `prometheus_round_trip.rs`'s statsd case
-    // does. `StatsdInput::local_addr` after `bind()` would avoid the race.
-    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let mut input = StatsdInput::new(addr.to_string());
+    let mut input = StatsdInput::new("127.0.0.1:0");
     input.bind().await.expect("binding statsd_in");
+    let addr = input.local_addr().expect("bind() should leave a real address behind");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {
