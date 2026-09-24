@@ -36,7 +36,8 @@ components:
     type: datadog_trace_in
     bind: 127.0.0.1:8126
     # The Agent's Unix socket. Its directory must already exist; a stale socket file from an
-    # earlier run is replaced, and the new one is mode 0666 so any user's tracer can connect.
+    # earlier run is replaced, and the new one is mode 0722, as the Agent's is, so any user's
+    # tracer can connect.
     # socket: /var/run/datadog/apm.socket
 
   stdout:

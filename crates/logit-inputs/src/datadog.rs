@@ -27,7 +27,8 @@
 //! | `POST /api/v2/logs`, `/v1/input` | `decode_logs` | `202` `{}` |
 //! | `POST /api/v0.2/traces` | `decode_agent_payload`, one batch per `TracerPayload` | `200` `{}` |
 //! | `POST /api/v0.2/stats` | `decode_stats_payload`, one batch per `ClientStatsPayload` | `200` `{}` |
-//! | `GET`/`POST /api/v1/validate` | none | `200` `{"valid":true}` |
+//! | `GET`/`POST /api/v1/validate`, `/api/v2/validate` | none | `200` `{"valid":true}` |
+//! | `GET /_health` | none | `200` `{}` |
 //! | `POST /api/v2/host_metadata`, `/api/v1/metadata`, `/api/v1/collector`, `/api/v1/container`, `/api/v2/orch` | none: read, then discarded | `202` `{}` |
 //! | another method on a path above | none | `405` + `Allow` |
 //! | any other path | none | `404` |
@@ -55,9 +56,12 @@
 //!    absent. The cap is on the compressed body, on every route.
 //! 3. **Authentication.** With `api_keys` configured, the request's `DD-API-KEY` header (any case;
 //!    an Agent sends `DD-Api-Key`) must equal one entry, else `403`
-//!    `{"status":"error","code":403,"errors":["Forbidden"]}`. The comparison takes the same time
-//!    for every key of one length, and no key is ever logged or counted. With no `api_keys` every
-//!    request passes, and `/api/v1/validate` answers `200` to any key.
+//!    `{"status":"error","code":403,"errors":["Forbidden"]}`. On the validate and `/_health`
+//!    routes an `api_key` query parameter counts too: an Agent's own key check is
+//!    `GET /api/v1/validate?api_key=<key>` with no header at all
+//!    (`testdata/interop/datadog/agent-api-v1-validate-000.headers`). The comparison takes the
+//!    same time for every key of one length, and no key is ever logged or counted. With no
+//!    `api_keys` every request passes, and the validate routes answer `200` to any key.
 //! 4. **`Content-Encoding`.** `identity` (or none), `gzip`, `deflate` (zlib-wrapped: what the
 //!    Agent's `zlib` compressor kind sends under that name), or `zstd` (the Agent's default), else
 //!    `415`. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
@@ -464,6 +468,7 @@ enum Route {
     Traces,
     Stats,
     Validate,
+    Health,
     /// Answered `202` and discarded; the name is the `route` tag.
     Acknowledged(&'static str),
 }
@@ -481,7 +486,8 @@ impl Route {
             "/api/v2/logs" | "/v1/input" => Self::Logs,
             "/api/v0.2/traces" => Self::Traces,
             "/api/v0.2/stats" => Self::Stats,
-            "/api/v1/validate" => Self::Validate,
+            "/api/v1/validate" | "/api/v2/validate" => Self::Validate,
+            "/_health" => Self::Health,
             "/api/v2/host_metadata" => Self::Acknowledged("host_metadata"),
             "/api/v1/metadata" => Self::Acknowledged("metadata"),
             "/api/v1/collector" => Self::Acknowledged("collector"),
@@ -505,20 +511,30 @@ impl Route {
             Self::Traces => "traces",
             Self::Stats => "stats",
             Self::Validate => "validate",
+            Self::Health => "health",
             Self::Acknowledged(name) => name,
         }
     }
 
     fn allows(self, method: &Method) -> bool {
-        method == Method::POST || (self == Self::Validate && method == Method::GET)
+        match self {
+            Self::Validate => method == Method::GET || method == Method::POST,
+            Self::Health => method == Method::GET,
+            _ => method == Method::POST,
+        }
     }
 
     fn allow_header(self) -> &'static str {
-        if self == Self::Validate {
-            "GET, POST"
-        } else {
-            "POST"
+        match self {
+            Self::Validate => "GET, POST",
+            Self::Health => "GET",
+            _ => "POST",
         }
+    }
+
+    /// Whether the route answers without a body to decode: the key check is the whole request.
+    fn is_probe(self) -> bool {
+        matches!(self, Self::Validate | Self::Health)
     }
 
     fn decompressed_cap(self) -> usize {
@@ -541,6 +557,7 @@ impl Route {
             Self::Sketches => (StatusCode::ACCEPTED, b""),
             Self::Traces | Self::Stats => (StatusCode::OK, b"{}"),
             Self::Validate => (StatusCode::OK, br#"{"valid":true}"#),
+            Self::Health => (StatusCode::OK, b"{}"),
         };
         json_response(status, Bytes::from_static(body))
     }
@@ -572,7 +589,10 @@ async fn respond(
         let response = reject(shared, "oversize", StatusCode::PAYLOAD_TOO_LARGE, &message, true);
         return (name, REJECTED, response);
     }
-    if !authorized(&shared.api_keys, req.headers()) {
+    // An Agent's key check sends its key only in the query string (this module's
+    // "Authentication"), so a probe route also reads `?api_key=`.
+    let query_key = if route.is_probe() { query_api_key(req.uri().query()) } else { None };
+    if !authorized(&shared.api_keys, req.headers(), query_key) {
         shared.telemetry.count("logit.input.requests.rejected", 1.0, &[("reason", "auth")]);
         shared.diag.clone().warn_throttled(
             "request_rejected",
@@ -584,7 +604,7 @@ async fn respond(
         let body = br#"{"status":"error","code":403,"errors":["Forbidden"]}"#;
         return (name, REJECTED, json_response(StatusCode::FORBIDDEN, Bytes::from_static(body)));
     }
-    if route == Route::Validate {
+    if route.is_probe() {
         return (name, OK, route.success());
     }
     let encoding = match Encoding::from_headers(req.headers()) {
@@ -672,7 +692,9 @@ async fn respond(
         Route::Logs => decoder.decode_logs(&body, received_at).map(|b| vec![b]),
         Route::Traces => decoder.decode_agent_payload(&body, received_at),
         Route::Stats => decoder.decode_stats_payload(&body, received_at),
-        Route::Validate | Route::Acknowledged(_) => unreachable!("answered above"),
+        Route::Validate | Route::Health | Route::Acknowledged(_) => {
+            unreachable!("answered above")
+        }
     };
     let batches: Vec<EventBatch> = match decoded {
         Ok(batches) => batches.into_iter().filter(|batch| !batch.events.is_empty()).collect(),
@@ -735,18 +757,24 @@ fn acknowledge(shared: &Shared, route: &'static str) {
     shared.telemetry.count("logit.input.requests.acknowledged", 1.0, &[("route", route)]);
 }
 
-/// Whether the request carries a `DD-API-KEY` equal to one of `api_keys`; always `true` when none
-/// are configured. Every configured key is compared, and each comparison runs over the whole key,
-/// so the time taken doesn't reveal how much of a guess matched.
-fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap) -> bool {
+/// Whether the request carries a `DD-API-KEY` header, or else a `query_key`, equal to one of
+/// `api_keys`; always `true` when none are configured. Every configured key is compared, and each
+/// comparison runs over the whole key, so the time taken doesn't reveal how much of a guess
+/// matched.
+fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap, query_key: Option<&[u8]>) -> bool {
     if api_keys.is_empty() {
         return true;
     }
-    let Some(sent) = headers.get("dd-api-key") else {
+    let Some(sent) = headers.get("dd-api-key").map(HeaderValue::as_bytes).or(query_key) else {
         return false;
     };
-    let sent = sent.as_bytes();
     api_keys.iter().fold(false, |matched, key| matched | constant_time_eq(key, sent))
+}
+
+/// The first `api_key=` parameter of a query string, as sent: an API key is hex, so nothing in it
+/// is percent-encoded.
+fn query_api_key(query: Option<&str>) -> Option<&[u8]> {
+    query?.split('&').find_map(|pair| pair.strip_prefix("api_key=")).map(str::as_bytes)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -979,6 +1007,37 @@ mod tests {
         let response =
             request_raw(&addr, "GET", "/api/v1/validate", "DD-API-KEY: nope\r\n", b"").await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    /// The probe routes a recorded Agent 7.83 sends (`testdata/interop/datadog/`): its key check
+    /// carries the key only in the query string, its trace agent asks `/api/v2/validate` with the
+    /// header, and something asks `GET /_health`.
+    #[tokio::test]
+    async fn the_agent_s_probe_routes_answer_200_with_the_key_in_the_query_or_the_header() {
+        let input = DatadogInput::new("127.0.0.1:0").with_api_keys(vec![KEY.to_string()]);
+        let (addr, _rx) = start(input, 16).await;
+        let header = format!("DD-API-KEY: {KEY}\r\n");
+        let cases = [
+            (format!("/api/v1/validate?api_key={KEY}"), String::new(), "200", r#"{"valid":true}"#),
+            ("/api/v1/validate?api_key=nope".to_string(), String::new(), "403", ""),
+            ("/api/v2/validate".to_string(), header.clone(), "200", r#"{"valid":true}"#),
+            ("/api/v2/validate".to_string(), String::new(), "403", ""),
+            ("/_health".to_string(), header.clone(), "200", "{}"),
+            (format!("/_health?api_key={KEY}"), String::new(), "200", "{}"),
+        ];
+        for (path, headers, status, body) in cases {
+            let response = request_raw(&addr, "GET", &path, &headers, b"").await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{path}: {response}");
+            if !body.is_empty() {
+                assert_eq!(body_of(&response), body, "{path}");
+            }
+        }
+        // Only a probe route reads the query string: a data route still wants the header.
+        let path = format!("/api/v1/series?api_key={KEY}");
+        let response = post_raw(&addr, &path, "", SERIES_V1).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let response = request_raw(&addr, "POST", "/_health", &header, b"").await;
+        assert!(response.starts_with("HTTP/1.1 405"), "{response}");
     }
 
     #[tokio::test]
@@ -1263,7 +1322,15 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(authorized(&[], &HeaderMap::new()), "no keys accepts anything");
+        assert!(authorized(&[], &HeaderMap::new(), None), "no keys accepts anything");
+    }
+
+    #[test]
+    fn query_api_key_reads_the_first_api_key_parameter() {
+        assert_eq!(query_api_key(Some("api_key=abc")), Some(&b"abc"[..]));
+        assert_eq!(query_api_key(Some("x=1&api_key=abc&api_key=def")), Some(&b"abc"[..]));
+        assert_eq!(query_api_key(Some("my_api_key=abc")), None);
+        assert_eq!(query_api_key(None), None);
     }
 
     #[test]

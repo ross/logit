@@ -279,7 +279,9 @@ async fn v07_delivers_the_encoded_batch_with_its_own_fields_winning_over_the_hea
     );
 }
 
-/// Client stats relay as the stats codec decodes them, and take none of the tracer headers.
+/// Client stats relay as the stats codec decodes them, with the three tracer headers the payload
+/// has fields for (language, tracer version, container id) filling the ones it left empty, and
+/// none of the rest.
 #[tokio::test]
 async fn v06_stats_deliver_the_encoded_batch() {
     let (addr, mut rx) = start(DatadogTraceInput::new().with_bind("127.0.0.1:0")).await;
@@ -288,7 +290,22 @@ async fn v06_stats_deliver_the_encoded_batch() {
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(version, None, "the rates header is the trace reply's alone");
     assert_eq!(text, "{}");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv(&mut rx).await, with_stats_headers(batch));
+}
+
+/// A stats `batch` with the three [`TRACER_HEADERS`] its payload has fields for filled in, each
+/// of which [`stats`] leaves empty: what the listener delivers.
+fn with_stats_headers(mut batch: EventBatch) -> EventBatch {
+    let resource = Arc::make_mut(&mut batch.resource);
+    for (attr, value) in [
+        (RESOURCE_ATTR_TRACER_LANGUAGE_NAME, "python"),
+        (RESOURCE_ATTR_TRACER_VERSION, "2.14.0"),
+        (RESOURCE_ATTR_TRACER_CONTAINER_ID, "abc123"),
+    ] {
+        assert!(resource.attributes.get(attr).is_none(), "{attr}: the payload left it empty");
+        resource.attributes.insert(attr, Value::str(value));
+    }
+    batch
 }
 
 /// A fresh directory under the system temp dir, removed on drop. Short, because a Unix socket
@@ -351,5 +368,54 @@ async fn the_unix_socket_delivers_end_to_end() {
     let (batch, body) = stats();
     let response = unix_request(&path, "POST", "/v0.6/stats", &body).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv(&mut rx).await, with_stats_headers(batch));
+}
+
+// -------------------------------------------------------------------------------------------------
+// Recorded tracer traffic (testdata/interop/datadog/, `script/record-fixtures datadog-tracer`)
+// -------------------------------------------------------------------------------------------------
+
+/// Every request a real dd-trace-py 4.15 sent, replayed with its recorded method, path, headers,
+/// and body: `/info`, v0.5 and v0.4 traces, and `/v0.6/stats` are each answered `200`, and each
+/// data route delivers the tracer's spans or stats, named for the tracer's language.
+#[tokio::test]
+async fn every_recorded_tracer_request_is_answered_200() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/datadog");
+    let (addr, mut rx) = start(DatadogTraceInput::new().with_bind("127.0.0.1:0")).await;
+    let addr = addr.unwrap();
+    let mut stems: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the recorded corpus")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("tracer-") && n.ends_with(".headers"))
+        .map(|n| n.trim_end_matches(".headers").to_string())
+        .collect();
+    stems.sort();
+    assert_eq!(stems.len(), 5, "{stems:?}");
+    for stem in &stems {
+        let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers"))).unwrap();
+        let body = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
+        let mut fields = sidecar.lines().filter_map(|l| l.split_once(": "));
+        let (_, method) = fields.next().expect("method first");
+        let (_, path) = fields.next().expect("path second");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = reqwest::Client::new().request(method, format!("http://{addr}{path}"));
+        for (name, value) in fields {
+            if !matches!(name, "host" | "content-length") {
+                request = request.header(name, value);
+            }
+        }
+        let response =
+            request.body(body).send().await.expect("the request reaches datadog_trace_in");
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{stem} ({path})");
+        if path == "/info" {
+            continue;
+        }
+        let batch = recv(&mut rx).await;
+        assert!(!batch.events.is_empty(), "{stem}: delivered nothing");
+        assert_eq!(
+            batch.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
+            Some(&Value::str("python")),
+            "{stem}: the language, from the payload or the header"
+        );
+    }
 }

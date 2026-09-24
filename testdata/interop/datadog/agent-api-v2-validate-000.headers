@@ -1,0 +1,6 @@
+method: GET
+path: /api/v2/validate
+host: capture:8080
+user-agent: Go-http-client/1.1
+dd-api-key: logit-record
+accept-encoding: gzip

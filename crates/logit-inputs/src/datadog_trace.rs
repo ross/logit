@@ -69,7 +69,9 @@
 //!   form.
 //! - `client_drop_p0s: false`: a tracer must not drop priority-0 traces client-side. The relay has
 //!   to see every span (plan §14): a tracer that dropped them would leave its client stats as the
-//!   only record of those spans.
+//!   only record of those spans. A tracer built on libdatadog (dd-trace-py 4.x) computes client
+//!   stats only when this is `true`, so against this document it sends spans and no stats, and
+//!   the downstream Agent computes them (`testdata/interop/datadog/README.md`).
 //! - `span_meta_structs: true` and `span_events: true`: the codec carries `meta_struct` and native
 //!   span events, so a tracer may send them rather than flattening them into `meta`.
 //! - `long_running_spans: false`: partial flushes of an unfinished span aren't something the
@@ -79,22 +81,32 @@
 //!   `obfuscation_version: 0`: no `evp_proxy` passthrough, no peer-tag stats aggregation, no
 //!   span-kind stats, and no Agent-side obfuscation for a tracer to rely on (plan §14). A tracer
 //!   that obfuscates on its own keeps doing so.
-//! - `config`: the Agent's own defaults (`target_tps` 10, `max_eps` 200, `connection_limit`
-//!   1024, `receiver_timeout` 5, `max_request_bytes` 25 MiB, `statsd_port` 8125), with every
-//!   obfuscation switch off because nothing here obfuscates, and the listener's own
-//!   `receiver_port` (0 without `bind`) and `receiver_socket` (empty without `socket`).
+//! - `config`: the recorded Agent's `target_tps` 10, `max_eps` 200, `max_request_bytes` 25 MiB,
+//!   and `statsd_port` 8125, with every obfuscation switch off because nothing here obfuscates.
+//!   The rest are `logit`'s own, not the Agent's: `connection_limit` 1024 is this listener's
+//!   connection cap and `receiver_timeout` 5 matches its 5 s handshake timeout (the recorded Agent
+//!   reports 0 for both), and `receiver_port` (0 without `bind`) and `receiver_socket` (empty
+//!   without `socket`) are where it listens. Every
+//!   field has the JSON type a real Agent's `/info` gives it (`redis`, `valkey`, and `memcached`
+//!   are objects, not switches): libdatadog rejects the whole document over one mistyped field,
+//!   then runs as if no Agent answered. A test holds this document to the recorded
+//!   `testdata/interop/datadog/agent-info.json`.
 //!
 //! # Tracer headers
 //!
 //! v0.3, v0.4, and v0.5 carry no `TracerPayload`, so what a tracer says about itself arrives only
 //! in request headers. `Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`,
 //! `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`,
-//! `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Computed-Stats`, and
-//! `Datadog-Client-Dropped-P0-{Traces,Spans}` become `datadog.tracer.*` batch resource attributes,
+//! `Datadog-External-Env`, `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Computed-Stats`,
+//! and `Datadog-Client-Dropped-P0-{Traces,Spans}` become `datadog.tracer.*` batch resource attributes,
 //! per the codec's Traces table. On v0.7 the payload's own fields win: a header fills a field only
 //! where the payload left it empty. `datadog_trace_out` restores the headers from the same
-//! attributes. `/v0.6/stats` takes none of them: its `ClientStatsPayload` carries the tracer's
-//! identity itself, and the stats encoder has no field for the rest.
+//! attributes. `/v0.6/stats` takes three of them, `Datadog-Meta-Lang`, `-Tracer-Version`, and
+//! `Datadog-Container-ID`, each only where the `ClientStatsPayload` left `Lang`, `TracerVersion`,
+//! or `ContainerID` empty: the Agent fills those three the same way before it forwards a payload,
+//! and a recorded dd-trace-py 4.15 sends its stats with `Lang` and `TracerVersion` empty and the
+//! values in the headers (`testdata/interop/datadog/tracer-v04-v0-6-stats-000.*`). The rest have
+//! no stats field.
 //!
 //! `X-Datadog-Trace-Count` is compared with the number of traces on the wire (v0.3/v0.4's trace
 //! arrays, v0.5's, v0.7's chunks). A mismatch is the throttled diagnostic `trace_count_mismatch`,
@@ -115,16 +127,18 @@
 //! 5. **Delivery**, bounded (below), then the route's `200`. A body that decodes to no events is
 //!    answered without a send.
 //!
-//! # Backpressure: a short bounded wait, then `503`, which a tracer treats as loss
+//! # Backpressure: a short bounded wait, then `503`, which a tracer retries only briefly
 //!
 //! Delivery works as `datadog_in`'s does: the request's one batch is sent through
 //! [`Fanout::send_with_deadline`], reaching every downstream consumer or none, under a
 //! [`BUSY_AFTER`] deadline, and a request that misses it is answered `503` with
 //! `Retry-After: 1`, counted `logit.input.requests{class="busy"}` and
-//! `logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`, that `503` is loss here, not
-//! deferral, and `BUSY_AFTER` is shorter (2 s, not 5 s) — see
-//! [ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! decision 11.
+//! `logit.input.batches.dropped{reason="busy"}`. `BUSY_AFTER` is shorter than `datadog_in`'s (2 s,
+//! not 5 s), because a tracer's patience is: dd-trace-py retries a `503` a few times and then
+//! drops the payload, where an Agent retries for minutes. A stall shorter than the window
+//! [ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md)'s
+//! decision 11 derives defers the payload and a longer one loses it; the counter can't tell which,
+//! so treat a sustained rate as loss.
 //!
 //! # The Unix socket
 //!
@@ -133,9 +147,10 @@
 //! `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. [`Input::bind`] refuses a path whose
 //! directory doesn't exist, replaces a stale socket file left by an earlier run (what the Agent does
 //! at startup), and refuses a path that exists and isn't a socket, so a typo can't delete a
-//! regular file. The socket file is then made mode `0666`, so a tracer running as any user can
-//! connect: the Agent's DogStatsD socket uses `0722`, and its APM socket's mode is UNVERIFIED.
-//! Restrict access with the directory's permissions. The socket file isn't removed on shutdown;
+//! regular file. The socket file is then made mode `0722`, the mode a recorded Agent 7.83 gives its
+//! own `apm.socket` (`testdata/interop/datadog/README.md`): connecting needs only write
+//! permission, so a tracer running as any user can connect. Restrict access with the directory's
+//! permissions. The socket file isn't removed on shutdown;
 //! the next start replaces it.
 //!
 //! Both listeners share one connection cap and one handler. A Unix connection has no TLS and no
@@ -171,8 +186,10 @@ use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::{
     DatadogDecoder, HEADER_CLIENT_COMPUTED_STATS, HEADER_CLIENT_COMPUTED_TOP_LEVEL,
-    HEADER_TRACE_COUNT, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS,
-    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
+    HEADER_CONTAINER_ID, HEADER_META_LANG, HEADER_META_TRACER_VERSION, HEADER_TRACE_COUNT,
+    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL,
+    RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+    RESOURCE_ATTR_TRACER_VERSION, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
 use logit_proto::msgpack::{Reader, Type};
 use logit_proto::CodecError;
@@ -192,7 +209,7 @@ use tokio_rustls::TlsAcceptor;
 const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
-/// socket together: the same 1024 as `datadog_in` and the Agent's own `connection_limit`.
+/// socket together: the same 1024 as `datadog_in`, and the `connection_limit` `/info` reports.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogTraceInput::with_handshake_timeout`]: the same 5s as every other TCP
@@ -213,8 +230,9 @@ const RATES_PAYLOAD_VERSION: &str = "logit-1";
 /// Every service's default rate, 1.0: keep everything (this module's "The trace reply").
 const RATE_BY_SERVICE: &[u8] = br#"{"rate_by_service":{"service:,env:":1.0}}"#;
 
-/// The Unix socket file's mode after binding (this module's "The Unix socket").
-const SOCKET_MODE: u32 = 0o666;
+/// The Unix socket file's mode after binding (this module's "The Unix socket"): the Agent's own
+/// for its APM socket.
+const SOCKET_MODE: u32 = 0o722;
 
 /// `crate::tls::TlsServerSettings`, re-exported as `datadog_in`'s is.
 pub use crate::tls::TlsServerSettings;
@@ -882,6 +900,8 @@ async fn respond(
     if route.is_traces() {
         apply_tracer_headers(&mut batch, &parts.headers, &shared.diag);
         check_trace_count(route, &body, &parts.headers, shared);
+    } else {
+        apply_stats_headers(&mut batch, &parts.headers);
     }
     let success = success(route, &parts.headers);
     if batch.events.is_empty() {
@@ -906,7 +926,7 @@ async fn respond(
                 "busy",
                 format_args!(
                     "datadog_trace_in: answered 503 to {}: the pipeline did not accept a batch \
-                     within {:?}, and a tracer does not retry, so the payload is lost",
+                     within {:?}; a tracer retries a few times, then drops it",
                     shared.peer, shared.busy_after
                 ),
             );
@@ -976,6 +996,34 @@ fn apply_tracer_headers(batch: &mut EventBatch, headers: &HeaderMap, diag: &Diag
         }
     }
     fills.retain(|(attr, _)| batch.resource.attributes.get(attr).is_none());
+    if fills.is_empty() {
+        return;
+    }
+    let resource: &mut Resource = Arc::make_mut(&mut batch.resource);
+    for (attr, value) in fills {
+        resource.attributes.insert(attr, value);
+    }
+}
+
+/// The tracer headers the Agent copies into a `/v0.6/stats` payload whose own field is empty
+/// (this module's "Tracer headers").
+const STATS_HEADERS: [(&str, &str); 3] = [
+    (HEADER_META_LANG, RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
+    (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
+    (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
+];
+
+/// Fills a stats batch's empty `Lang`, `TracerVersion`, and `ContainerID` carriers from the
+/// request's headers, as the Agent's stats receiver does before it forwards the payload.
+fn apply_stats_headers(batch: &mut EventBatch, headers: &HeaderMap) {
+    let fills: Vec<(&'static str, Value)> = STATS_HEADERS
+        .iter()
+        .filter(|(_, attr)| batch.resource.attributes.get(attr).is_none())
+        .filter_map(|&(header, attr)| {
+            let value = headers.get(header)?.to_str().ok()?.trim();
+            (!value.is_empty()).then(|| (attr, Value::str(value)))
+        })
+        .collect();
     if fills.is_empty() {
         return;
     }
@@ -1092,11 +1140,14 @@ fn info_document(receiver_port: u16, receiver_socket: &str) -> String {
             r#""connection_limit":1024,"receiver_timeout":5,"max_request_bytes":26214400,"#,
             r#""statsd_port":8125,"max_memory":0,"max_cpu":0,"analyzed_spans_by_service":{{}},"#,
             r#""obfuscation":{{"elastic_search":false,"mongo":false,"sql_exec_plan":false,"#,
-            r#""sql_exec_plan_normalize":false,"#,
+            r#""sql_exec_plan_normalize":false,"sql_obfuscation_mode":"","#,
             r#""http":{{"remove_query_string":false,"remove_path_digits":false}},"#,
-            r#""remove_stack_traces":false,"redis":false,"memcached":false,"#,
-            r#""credit_cards":{{"enabled":false,"luhn":false}}}}}},"#,
-            r#""peer_tags":[],"span_kinds_stats_computed":[],"obfuscation_version":0}}"#,
+            r#""remove_stack_traces":false,"#,
+            r#""redis":{{"enabled":false,"remove_all_args":false}},"#,
+            r#""valkey":{{"enabled":false,"remove_all_args":false}},"#,
+            r#""memcached":{{"enabled":false,"keep_command":false}}}}}},"#,
+            r#""peer_tags":[],"span_kinds_stats_computed":[],"obfuscation_version":0,"#,
+            r#""filter_tags":{{}},"filter_tags_regex":{{}}}}"#,
         ),
         version = version,
         receiver_port = receiver_port,
@@ -1111,7 +1162,7 @@ mod tests {
     use logit_proto::datadog::{
         RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
         RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_ENTITY_ID,
-        RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
+        RESOURCE_ATTR_TRACER_EXTERNAL_ENV, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
         RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
         RESOURCE_ATTR_TRACER_VERSION,
     };
@@ -1338,8 +1389,151 @@ mod tests {
         assert_eq!(info["config"]["receiver_port"], port);
         assert_eq!(info["config"]["receiver_socket"], "");
         assert_eq!(info["config"]["max_request_bytes"], MAX_REQUEST_BYTES);
-        assert_eq!(info["config"]["obfuscation"]["credit_cards"]["enabled"], false);
+        assert_eq!(info["config"]["obfuscation"]["redis"]["enabled"], false);
         assert_eq!(info["obfuscation_version"], 0);
+    }
+
+    // ---- recorded interop fixtures (testdata/interop/datadog/) --------------------------------
+
+    fn repo_path(relative: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(relative)
+    }
+
+    fn recorded_json(relative: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(repo_path(relative))
+            .unwrap_or_else(|e| panic!("reading {relative}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{relative}: {e}"))
+    }
+
+    /// A recorded request's `.headers` sidecar as the `HeaderMap` the listener would have seen.
+    fn recorded_headers(stem: &str) -> HeaderMap {
+        let path = format!("testdata/interop/datadog/{stem}.headers");
+        let text = std::fs::read_to_string(repo_path(&path))
+            .unwrap_or_else(|e| panic!("reading {path}: {e}"));
+        let mut headers = HeaderMap::new();
+        for (name, value) in text.lines().filter_map(|line| line.split_once(": ")) {
+            if name == "method" || name == "path" {
+                continue;
+            }
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn recorded_body(stem: &str) -> Vec<u8> {
+        let path = format!("testdata/interop/datadog/{stem}.bin");
+        std::fs::read(repo_path(&path)).unwrap_or_else(|e| panic!("reading {path}: {e}"))
+    }
+
+    /// Each field of `ours` exists in `theirs` with the same JSON type, recursing into objects
+    /// and into the first element of two non-empty arrays.
+    fn assert_same_shape(ours: &serde_json::Value, theirs: &serde_json::Value, at: &str) {
+        use serde_json::Value as J;
+        let kind = |v: &J| match v {
+            J::Null => "null",
+            J::Bool(_) => "bool",
+            J::Number(_) => "number",
+            J::String(_) => "string",
+            J::Array(_) => "array",
+            J::Object(_) => "object",
+        };
+        assert_eq!(kind(ours), kind(theirs), "{at}: {ours} against the Agent's {theirs}");
+        match (ours, theirs) {
+            (J::Object(ours), J::Object(theirs)) => {
+                for (key, value) in ours {
+                    let theirs = theirs.get(key).unwrap_or_else(|| {
+                        panic!("{at}.{key}: the recorded Agent has no such field")
+                    });
+                    assert_same_shape(value, theirs, &format!("{at}.{key}"));
+                }
+            }
+            (J::Array(ours), J::Array(theirs)) => {
+                if let (Some(ours), Some(theirs)) = (ours.first(), theirs.first()) {
+                    assert_same_shape(ours, theirs, &format!("{at}[0]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// libdatadog (dd-trace-py 4.x) rejects a whole `/info` document over one mistyped field, and
+    /// then never turns on client stats: the recorded tracer did that to `"redis": false`. Every
+    /// field this listener serves has the type a real Agent 7.83 gives it.
+    #[test]
+    fn the_info_document_has_the_recorded_agent_s_field_types() {
+        let ours: serde_json::Value = serde_json::from_str(&info_document(8126, "")).unwrap();
+        let agent = recorded_json("testdata/interop/datadog/agent-info.json");
+        assert_same_shape(&ours, &agent, "info");
+    }
+
+    /// `script/record-fixtures datadog-tracer` answers `/info` with this file, standing in for
+    /// this listener; it must stay this listener's document.
+    #[test]
+    fn the_recording_s_info_reply_is_this_listener_s_document() {
+        let ours: serde_json::Value = serde_json::from_str(&info_document(8126, "")).unwrap();
+        assert_eq!(recorded_json("tools/record-fixtures/datadog-trace-info.json"), ours);
+    }
+
+    /// A recorded dd-trace-py request's headers become the tracer carriers, `Datadog-External-Env`
+    /// included.
+    #[test]
+    fn a_recorded_tracer_s_headers_become_its_carriers() {
+        let stem = "tracer-v04-v0-4-traces-000";
+        let mut batch =
+            DatadogDecoder::new().decode_traces_v04(&recorded_body(stem), 0).expect("decodes");
+        apply_tracer_headers(&mut batch, &recorded_headers(stem), &Diagnostics::new("apm"));
+        let attr = |key: &str| batch.resource.attributes.get(key).cloned();
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some(Value::str("python")));
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER), Some(Value::str("CPython")));
+        assert!(attr(RESOURCE_ATTR_TRACER_VERSION).is_some());
+        assert!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_VERSION).is_some());
+        assert!(attr(RESOURCE_ATTR_TRACER_ENTITY_ID).is_some_and(|v| v.as_str().is_some()));
+        assert_eq!(
+            attr(RESOURCE_ATTR_TRACER_EXTERNAL_ENV),
+            Some(Value::str("it-false,cn-record-fixtures,pu-00000000-0000-4000-8000-000000000001"))
+        );
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL), Some(Value::Bool(true)));
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS), Some(Value::Bool(true)));
+    }
+
+    /// The recorded client stats name the tracer only in headers; the stats route fills the
+    /// payload's empty fields from them, as the Agent does.
+    #[test]
+    fn recorded_client_stats_take_the_language_and_version_from_headers() {
+        let stem = "tracer-v04-v0-6-stats-000";
+        let mut batch = DatadogDecoder::new()
+            .decode_client_stats_v06(&recorded_body(stem), 0)
+            .expect("decodes");
+        assert_eq!(batch.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), None);
+        let headers = recorded_headers(stem);
+        apply_stats_headers(&mut batch, &headers);
+        let attr = |key: &str| batch.resource.attributes.get(key).and_then(Value::as_str);
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some("python"));
+        assert_eq!(
+            attr(RESOURCE_ATTR_TRACER_VERSION),
+            headers.get(HEADER_META_TRACER_VERSION).and_then(|v| v.to_str().ok())
+        );
+        // Only the three fields the payload has; the rest of the headers stay out.
+        assert_eq!(batch.resource.attributes.get(RESOURCE_ATTR_TRACER_ENTITY_ID), None);
+    }
+
+    /// A field the payload already carries wins over its header.
+    #[test]
+    fn a_stats_payload_s_own_language_wins_over_the_header() {
+        let mut resource = Resource::default();
+        resource.attributes.insert(RESOURCE_ATTR_TRACER_LANGUAGE_NAME, Value::str("go"));
+        let mut batch =
+            EventBatch { resource: Arc::new(resource), scope: None, events: Vec::new() };
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_META_LANG, HeaderValue::from_static("python"));
+        headers.insert(HEADER_CONTAINER_ID, HeaderValue::from_static("abc"));
+        apply_stats_headers(&mut batch, &headers);
+        let attr = |key: &str| batch.resource.attributes.get(key).and_then(Value::as_str);
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_LANGUAGE_NAME), Some("go"));
+        assert_eq!(attr(RESOURCE_ATTR_TRACER_CONTAINER_ID), Some("abc"));
     }
 
     #[test]
@@ -1741,7 +1935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_unix_socket_serves_alongside_tcp_with_mode_0666() {
+    async fn the_unix_socket_serves_alongside_tcp_with_mode_0722() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new("both");
         let path = dir.0.join("apm.socket");
@@ -1750,7 +1944,7 @@ mod tests {
         let (addr, mut rx) = start(input, 16).await;
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o666);
+        assert_eq!(mode, 0o722);
 
         let response = unix_request(&path, "PUT", "/v0.4/traces", MSGPACK, &v04(1)).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");

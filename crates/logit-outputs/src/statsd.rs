@@ -172,7 +172,8 @@
 //!   at the path then; the first datagram of a batch gets one immediate reconnect-and-retry, so
 //!   a receiver restart costs no batch (ADR `datadog-agent-and-intake-relay`, decision 12).
 //! - `transport: unix_stream` writes each packet after its length as a 4-byte little-endian
-//!   integer (the Agent's `dogstatsd_stream_socket` framing; UNVERIFIED, `docs/known-gaps.md`) on
+//!   integer (the Agent's `dogstatsd_stream_socket` framing, as a real client writes it:
+//!   `testdata/interop/datadog/dogstatsd-unix-stream-000.raw`) on
 //!   one connection, with everything [`StatsdOutput::send_tcp`] says about TCP's plaintext arm:
 //!   the lazy connect, the probe of a reused connection, the one reconnect after a zero-byte
 //!   failure, and the flush before a batch is called delivered.
@@ -219,9 +220,11 @@
 //! value; external data keeps its own `,` separators ([`is_forbidden_in_external_data`]).
 //!
 //! On a metric line the segments follow the tag segment, in the order `|c:`, `|e:`, `|card:`, `|T`
-//! (`append_dialect_extras`); on an event or service-check line `c:`, `e:`, `card:` follow the tags
-//! and precede `m:` (`append_origin_fields`). That order is UNVERIFIED against a real DogStatsD
-//! client (`docs/known-gaps.md`); the decoder accepts any order. Under `Format::Statsd` none has
+//! (`append_dialect_extras`), the order the `datadog` Python client writes them in
+//! (`testdata/interop/datadog/dogstatsd-unix-00*.raw`). On an event or service-check line `c:`,
+//! `e:`, `card:` follow the tags and precede `m:` (`append_origin_fields`); that client writes a
+//! service check's `c:` and `card:` after `m:` instead, and the Agent and the decoder accept any
+//! order. Under `Format::Statsd` none has
 //! anywhere to go, so each is dropped and counted (`EncodeStats::dropped_dialect_fields`).
 //!
 //! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`, and the
@@ -270,8 +273,7 @@
 //!
 //! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`,
 //! the `|#...` tag segment, `|c:<container id>`, `|e:<external data>`, `|card:<cardinality>`, and
-//! always last `|m:<message>`, since `m:`
-//! consumes the rest of the line on decode. The event's **first** metric is the check and must be a
+//! last `|m:<message>`, the reference order. The event's **first** metric is the check and must be a
 //! `Gauge`; otherwise the whole event is dropped and counted
 //! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g`
 //! line, since the point is the check, not a gauge that shares its value. `name` is the
@@ -297,8 +299,9 @@
 //!   out-of-set value has no sanitized form that means the same thing. The line is still emitted,
 //!   so this is its own counter rather than `dropped_unencodable_value`, which reports a message
 //!   drop.
-//! - Service-check message: control bytes (a real newline included) -> `_`, with no escape; `|`
-//!   is left alone since `m:` is last ([`is_forbidden_in_service_check_message`]).
+//! - Service-check message: `|` and control bytes (a real newline included) -> `_`, with no
+//!   escape ([`is_forbidden_in_service_check_message`]). The Agent ends `m:` at the next `|`
+//!   wherever it sits, as `statsd_in` does.
 //!
 //! **`Format::Statsd` has no wire form for either shape** (no `_e`/`_sc` sigil), so the whole
 //! event is dropped and counted (`EncodeStats::dropped_dialect_events`) before anything else about
@@ -1516,11 +1519,11 @@ fn is_forbidden_in_external_data(c: char) -> bool {
     c == '|' || c.is_control() || c.is_whitespace()
 }
 
-/// Forbidden in a service check's `m:` message: control bytes only. A newline is substituted, not
-/// escaped, since the decoder has no unescape for this field. `|` is allowed: `m:` is always
-/// rendered and parsed last, so a `|` can't start another field.
+/// Forbidden in a service check's `m:` message: `|` and control bytes. A newline is substituted,
+/// not escaped, since the decoder has no unescape for this field. `|` ends the field at the Agent
+/// and at `statsd_in`, wherever `m:` sits on the line.
 fn is_forbidden_in_service_check_message(c: char) -> bool {
-    c.is_control()
+    c == '|' || c.is_control()
 }
 
 /// The live half of a `statsd_out` sink, as `syslog::Conn`: the UDP arm binds eagerly (a bad
@@ -3557,15 +3560,16 @@ mod tests {
         assert_eq!(msgs, vec!["_sc|my.check|1|d:1700000000|h:web1|#env:prod|c:cid1"]);
     }
 
+    /// A `|` would end the message at the Agent, so it's substituted like any other field's.
     #[test]
-    fn a_service_check_message_containing_a_pipe_is_kept_since_m_is_last() {
+    fn a_service_check_message_s_pipe_is_substituted() {
         let event = service_check_event(
             "chk",
             MetricKind::Gauge(0.0),
             &[("statsd.service_check.message", Value::str("a|b"))],
         );
         let (msgs, _) = encode(vec![event]);
-        assert_eq!(msgs, vec!["_sc|chk|0|m:a|b"]);
+        assert_eq!(msgs, vec!["_sc|chk|0|m:a_b"]);
     }
 
     #[test]
@@ -4965,10 +4969,10 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
-    /// Every optional field, and a `|` inside the last field (`m:a|b`), survives the relay.
+    /// Every optional field survives the relay.
     #[test]
     fn a_service_check_line_round_trips_through_the_real_statsd_decoder() {
-        let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a|b";
+        let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a b";
         let original = decode_one(original_line);
         assert_eq!(original.len(), 1, "one service-check event per line");
         let (msgs, _) = encode(original);
@@ -4981,7 +4985,7 @@ mod tests {
         );
         assert_eq!(
             relayed[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
-            Some("a|b")
+            Some("a b")
         );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
@@ -5327,8 +5331,8 @@ mod tests {
                 opt_word(),
                 tags(),
                 opt_origin(),
-                // `event_piece` includes `|`, which must survive in the last field, `m:`.
-                prop_oneof![Just(None), event_piece().prop_map(Some)],
+                // `event_piece` without its `|`, which ends `m:` like any other field.
+                prop_oneof![Just(None), event_piece().prop_map(|m| Some(m.replace('|', "/")))],
             )
                 .prop_map(|(name, status, secs, host, tags, origin, message)| {
                     GeneratedLine::ServiceCheck { name, status, secs, host, tags, origin, message }

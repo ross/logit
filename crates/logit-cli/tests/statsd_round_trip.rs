@@ -31,8 +31,8 @@
 //! - `dogstatsd-external-data-cardinality`, `event-service-check-external-data-cardinality`: the
 //!   `|e:<external-data>` (protocol v1.5) and `|card:<cardinality>` (v1.6) fields, written from the
 //!   DogStatsD datagram-format reference's grammar for those versions, on a metric line and on an
-//!   event and a service check. No client-emitted capture yet: the segment order a real client
-//!   uses is UNVERIFIED (`docs/known-gaps.md`).
+//!   event and a service check. The metric line's segment order is the one the `datadog` Python
+//!   client writes (`testdata/interop/datadog/README.md`).
 //!
 //! ## Permitted normalizations (per `docs/adr/lossless-transit.md`)
 //!
@@ -90,9 +90,12 @@
 //!    `repeated-tag-exact-duplicate-deduped`, `bare-tag-exact-duplicate-deduped`.
 //! 9. **DogStatsD event and service check fields re-emit in canonical order.** `_e` order is
 //!    `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/`c:`; `_sc` order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:`
-//!    last, since it consumes the rest of the line on decode). Nothing else changes: titles, text,
-//!    names, hosts, aggregation keys, source types, and messages survive verbatim, embedded `|`
-//!    and the `TEXT` `\n` escape included. Fixture: `event-fields-reordered-canonicalized`.
+//!    last, the DogStatsD reference's order). Nothing else changes: titles, text, names, hosts,
+//!    aggregation keys, source types, and messages survive verbatim, an event's embedded `|` and
+//!    the `TEXT` `\n` escape included. Fixtures: `event-fields-reordered-canonicalized`, and
+//!    `service-check-origin-fields-after-message`, a service check in the order the `datadog`
+//!    Python client writes it (`c:`/`card:` after `m:`,
+//!    `testdata/interop/datadog/dogstatsd-unix-008.raw`).
 //!
 //! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
 //! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
@@ -330,6 +333,7 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
         "explicit-rate-one-omitted",
         "number-formatting-trailing-zeros",
         "event-fields-reordered-canonicalized",
+        "service-check-origin-fields-after-message",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;

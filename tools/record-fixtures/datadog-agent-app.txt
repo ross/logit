@@ -1,0 +1,3 @@
+2026-09-24 10:00:00,000 INFO record-fixtures started on port 5050
+{"timestamp":"2026-09-24T10:00:01Z","level":"warn","message":"slow upstream","upstream":"payments","duration_ms":812}
+2026-09-24 10:00:02,000 ERROR record-fixtures request failed: status=500 path=/fail

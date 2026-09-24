@@ -139,7 +139,7 @@
 //!
 //! [`DatadogOutput::duplicate_safe`] is **`false`**: a batch spans several requests, so a retry
 //! re-sends the ones that succeeded, and nobody has yet shown the intake dedupes a resent series
-//! point, log, or span (UNVERIFIED; `docs/plans/datadog-relay.md`'s W7 settles it). So the default
+//! point, log, or span (UNVERIFIED; `docs/plans/datadog-relay.md`'s W7b settles it). So the default
 //! posture is at-most-once, and a 5xx drops the batch; `buffer: { delivery: at_least_once }`
 //! accepts the duplicates instead.
 //!

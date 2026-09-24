@@ -326,3 +326,38 @@ async fn the_pair_relays_equal_over_the_unix_socket() {
     out.send(&batch).await.unwrap();
     assert_eq!(recv(&mut rx).await, batch);
 }
+
+/// A real dd-trace-py 4.15's requests (`testdata/interop/datadog/tracer-*`), sent with their
+/// recorded headers, relay equal through the default `version: v0.4`: its v0.5 and v0.4 traces
+/// and its client stats, with nothing counted as lost.
+#[tokio::test]
+async fn recorded_tracer_requests_relay_equal() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/datadog");
+    let (addr, mut rx) = tcp_listener().await;
+    let (registry, mut out) = metered(DatadogTraceOutput::http(format!("http://{addr}")));
+    for stem in
+        ["tracer-v0-5-traces-000", "tracer-v04-v0-4-traces-000", "tracer-v04-v0-6-stats-000"]
+    {
+        let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers"))).unwrap();
+        let body = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
+        let mut fields = sidecar.lines().filter_map(|l| l.split_once(": "));
+        let (_, method) = fields.next().expect("method first");
+        let (_, path) = fields.next().expect("path second");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = reqwest::Client::new().request(method, format!("http://{addr}{path}"));
+        for (name, value) in fields {
+            if !matches!(name, "host" | "content-length") {
+                request = request.header(name, value);
+            }
+        }
+        let status = request.body(body).send().await.expect("the first hop").status();
+        assert_eq!(status, reqwest::StatusCode::OK, "{stem}");
+        let batch = recv(&mut rx).await;
+
+        out.send(&batch).await.unwrap_or_else(|err| panic!("{stem}: {err:#}"));
+        assert_eq!(recv(&mut rx).await, batch, "{stem}");
+    }
+    let points = registry.drain(0);
+    assert_eq!(counted(&points, "logit.output.spans.degraded", "no_wire_form"), 0.0);
+}

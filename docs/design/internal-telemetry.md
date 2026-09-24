@@ -861,7 +861,7 @@ arriving or which were refused.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
@@ -911,10 +911,11 @@ has no counterpart for, so a `socket:`-only listener has none.
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
 | `logit.input.spans` | count | spans delivered, counted once the batch is accepted |
 
-**A busy request is a lost one.** The wait is 2 seconds, not `datadog_in`'s 5, and a dd-trace
-tracer drops a payload on a `503` instead of retrying it. So `batches.dropped{reason="busy"}` here
-counts spans or stats lost, not deferred. Any nonzero rate calls for more downstream capacity, such
-as a `buffer:` on the sinks.
+**A busy request is soon a lost one.** The wait is 2 seconds, not `datadog_in`'s 5, and a dd-trace
+tracer retries a `503` a few times and then drops the payload, over the window
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s decision 11
+derives. So `batches.dropped{reason="busy"}` here counts batches a retry may still deliver during
+a shorter stall and lost ones during a longer one, and the counter can't tell them apart. Any sustained rate calls for more downstream capacity, such as a `buffer:` on the sinks.
 
 The codec's own counters are in the [`datadog` codec section](#datadog), under this component's id.
 

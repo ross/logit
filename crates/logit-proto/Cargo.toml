@@ -45,3 +45,6 @@ snap.workspace = true
 [dev-dependencies]
 # Generated corpora for the property tests (most of tests/*_fixed_point.rs, src/otlp/metrics.rs).
 proptest.workspace = true
+# tests/datadog_interop.rs undoes a recorded request's Content-Encoding as datadog_in does.
+ruzstd.workspace = true
+flate2.workspace = true

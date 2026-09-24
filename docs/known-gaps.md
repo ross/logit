@@ -871,24 +871,31 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   than losing data silently:
   - The v3 columnar series routes (`/api/intake/metrics/v3/series` and its siblings). An Agent sends
     v3 only to Datadog's own URLs (`use_v3_api.series.enabled: datadog_only`), so a redirected Agent
-    sends v2, which is served. How the Agent classifies a URL as Datadog's is UNVERIFIED until W7.
+    sends v2, which is served: a recorded Agent 7.83 with `dd_url` at another host sent every series
+    request to `/api/v2/series` (`testdata/interop/datadog/README.md`). The rule the Agent uses to classify a URL
+    as Datadog's is UNVERIFIED until W7b.
   - The legacy TCP logs intake (port 10516, `<api-key> <json>\n` or length-prefixed protobuf). That
     isn't HTTP, so it can't share this listener. Set `logs_config.force_use_http: true` on the Agent.
-  - An API key in the query string (`?api_key=`) or the path (`/v1/input/<key>`). Only the
-    `DD-API-KEY` header authenticates, which is what a current Agent sends.
+  - An API key in the query string (`?api_key=`) or the path (`/v1/input/<key>`) on a data route.
+    Only the `DD-API-KEY` header authenticates a data route, which is what a current Agent sends
+    on every one. The validate and `/_health` probes also read `?api_key=`, because an Agent's own
+    key check sends its key that way and no other (`testdata/interop/datadog/README.md`).
   - **Consequence:** an Agent configured for any of these shows errors against `datadog_in`.
-  - **Revisit trigger:** W7's recorded Agent traffic shows one of them from a redirected Agent.
-- **`datadog_in` with no `api_keys` accepts any key, `/api/v1/validate` included.** An Agent
+  - **Revisit trigger:** a later Agent's recorded traffic, re-recorded with
+    `script/record-fixtures datadog-agent`, shows one of them. A 7.83 Agent's doesn't.
+- **`datadog_in` with no `api_keys` accepts any key, the validate routes included.** An Agent
   pointed at it can't detect a mistyped key, because validation always answers `200`.
   - **Consequence:** a key typo surfaces only when the same Agent also talks to Datadog.
-  - **Workaround:** set `api_keys`, which makes `/api/v1/validate` check the key.
+  - **Workaround:** set `api_keys`, which makes `/api/v1/validate` and `/api/v2/validate` check
+    the key.
 - **`datadog_trace_in` doesn't decode JSON trace bodies.** A `/v0.3/traces` or `/v0.4/traces`
   request with `Content-Type: application/json` gets `415`, counted
   `logit.input.requests.rejected{reason="json_traces"}`. The Agent accepts that form; the codec
   implements only msgpack.
   - **Consequence:** a tracer or client that sends JSON traces loses them. No current dd-trace
     library sends JSON by default.
-  - **Revisit trigger:** W7's recorded tracer traffic, or a user, shows a JSON sender.
+  - **Revisit trigger:** a user shows a JSON sender. The recorded dd-trace-py 4.15 sends msgpack
+    on both of its forms (`testdata/interop/datadog/README.md`).
 - **`datadog_trace_in` doesn't speak the v1.0 string-table trace form (`idx`).** `/v1.0/traces`
   gets `404`, and `/info` doesn't list it, so a tracer that reads `/info` falls back to v0.4 or
   v0.5.
@@ -900,27 +907,23 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Consequence:** its output must reach Datadog through a real Agent (`datadog_trace_out`) or go
     to an OTLP backend. Fed straight to `datadog_out`, its spans are skipped as not yet processed.
   - **Revisit trigger:** the Agent-equivalent trace processor the plan defers.
-- **The mode of `datadog_trace_in`'s Unix socket is `0666`, and the Agent's is UNVERIFIED.** The
-  Agent's DogStatsD socket is `0722`; its APM `receiver_socket` mode wasn't found in the source
-  surveyed. `0666` lets a tracer running as any user connect.
-  - **Consequence:** any local user can send spans. Restrict the socket's directory to limit that.
-  - **Revisit trigger:** W7 inspects a real Agent's socket.
-- **`statsd_in`/`statsd_out`'s `transport: unix_stream` framing is UNVERIFIED.** Each packet
-  follows its length as a 4-byte little-endian integer, read from the Agent's
-  `pkg/dogstatsd/listeners/uds_stream.go` and `datadog-go`'s stream writer, but no real Agent or
-  client has exchanged traffic with it.
-  - **Consequence:** if the byte order or the packet shape differs, every connection from a real
-    client closes on its first packet, counted `logit.input.frames.dropped{reason="oversize"}` or
-    decoded as garbage lines (`bad_line`).
-  - **Revisit trigger:** W7 records DogStatsD over the stream socket from a real client.
-- **The order `statsd_out` writes `|c:`, `|e:`, `|card:`, and `|T` in is UNVERIFIED.** A metric line
-  ends `|#tags|c:<id>|e:<data>|card:<card>|T<secs>`; an event or service check carries
-  `c:`/`e:`/`card:` after its tags (and before `m:`). No client capture carrying `|e:` or `|card:`
-  was available, so the fixtures are hand-written from the DogStatsD datagram-format reference.
-  - **Consequence:** none for `statsd_in` or the Agent's parser, which accept any segment order. A
-    byte-level comparison against a real client's output could differ.
-  - **Revisit trigger:** W7 records a client (datadog-go v5.6+ or a current dd-trace library) that
-    sends the two fields.
+- ~~**The mode of `datadog_trace_in`'s Unix socket is `0666`, and the Agent's is UNVERIFIED.**~~
+  **Closed.** A recorded Agent 7.83 makes its APM socket `0722`, as it does its DogStatsD sockets,
+  and `datadog_trace_in` now does too (`testdata/interop/datadog/README.md`).
+- ~~**`statsd_in`/`statsd_out`'s `transport: unix_stream` framing is UNVERIFIED.**~~ **Closed.** The
+  `datadog` Python client writes a 4-byte little-endian length and one packet of `LF`-terminated
+  lines, which `statsd_in` decodes, and a real Agent 7.83 accepted `statsd_out`'s stream in a
+  one-off relay (`testdata/interop/datadog/README.md`).
+- ~~**The order `statsd_out` writes `|c:`, `|e:`, `|card:`, and `|T` in is UNVERIFIED.**~~
+  **Closed.** A metric line's order is the `datadog` Python client's. That client writes a service
+  check's `c:` and `card:` after `m:`, which the Agent reads, so `statsd_in` now ends `m:` at the
+  next `|` (`testdata/interop/datadog/README.md`).
+- **A libdatadog tracer sends `datadog_trace_in` no client stats.** dd-trace-py 4.x computes them
+  only when `/info` says `client_drop_p0s: true`, and `datadog_trace_in` says `false` so that the
+  tracer drops no span before the relay sees it (`testdata/interop/datadog/README.md`).
+  - **Consequence:** none in Datadog, where a downstream Agent computes the stats from the relayed
+    spans. A pipeline that reads the stats themselves from `datadog_trace_in` gets only an older
+    tracer's.
 - **`datadog_out`'s sketches route is UNVERIFIED for a sender that isn't an Agent.** It posts
   `Distribution` records to `/api/beta/sketches` with an API key, as Vector's `datadog_metrics`
   sink does, but the route isn't in Datadog's public API spec.
@@ -928,20 +931,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     `aggregate`'s `distributions: sketch` output never reaches Datadog.
   - **Workaround:** `distributions: samples` on `aggregate`, which sends raw values to the
     documented `/api/v1/distribution_points`.
-  - **Revisit trigger:** W7's trial-org run.
+  - **Revisit trigger:** W7b's trial-org run.
 - **`datadog_out`'s trace route is UNVERIFIED for a sender that isn't an Agent.**
   `/api/v0.2/traces` and `/api/v0.2/stats` are the Agent's own outbound protocol, which Datadog
   doesn't document for third parties
   ([plan §12](plans/datadog-relay.md#12-traces-to-datadog-the-agents-protocol-not-otlp-for-datadog-origin-spans-w5-w7)).
   - **Consequence:** if the intake refuses a third-party `AgentPayload`, relayed traces don't reach
     Datadog; the pair test against `datadog_in` still holds.
-  - **Revisit trigger:** W7 sends traces and stats to the trial org and checks the service pages.
+  - **Revisit trigger:** W7b sends traces and stats to the trial org and checks the service pages.
 - **`datadog_out` sends distribution points zlib-deflated, UNVERIFIED.** The public API survey
   records `/api/v1/distribution_points` as accepting `deflate` only, so that route alone isn't
   gzipped.
   - **Consequence:** if the intake also accepts gzip, nothing is lost; if it wants raw deflate
     rather than zlib-wrapped, every distribution-points request fails.
-  - **Revisit trigger:** W7's trial-org run.
+  - **Revisit trigger:** W7b's trial-org run.
 - **`datadog_out`'s per-request size limits are partly UNVERIFIED.** The series (10,000 points,
   512,000 B compressed, 5,242,880 B uncompressed), logs (1,000 entries, 5,000,000 B), and traces
   (3,200,000 B) limits come from Datadog's docs or the Agent's source; distribution points and
@@ -949,19 +952,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   sent uncapped.
   - **Consequence:** a limit set too high draws a `413`, which drops the request's entries as
     `oversize`; one set too low only costs extra requests.
-  - **Revisit trigger:** W7, or a `413` from a real intake.
+  - **Revisit trigger:** W7b, or a `413` from a real intake.
 - **`datadog_out` isn't duplicate-safe until the intake is shown to dedupe.** A batch is several
   requests, and whether Datadog overwrites a resent series point (it's documented for series, not
   for logs, events, or spans) is UNVERIFIED.
   - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
     `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
-  - **Revisit trigger:** W7 resends a request to the trial org and checks what Datadog shows.
-- **`datadog_trace_out`'s Unix-socket client is UNVERIFIED against a real Agent.** It sends
-  HTTP/1.1 with `Host: localhost` over the socket, which `datadog_trace_in` and the tests' local
-  server accept; no real Agent's `receiver_socket` has received it.
-  - **Consequence:** if the Agent's socket listener wants something else, every request over
-    `socket:` fails; `endpoint:` is unaffected.
-  - **Revisit trigger:** W7 points it at a real Agent's socket.
+  - **Revisit trigger:** W7b resends a request to the trial org and checks what Datadog shows.
+- ~~**`datadog_trace_out`'s Unix-socket client is UNVERIFIED against a real Agent.**~~ **Closed.**
+  A one-off relay sent a real tracer's spans through `datadog_trace_out`'s `socket:` to a real
+  Agent 7.83, which forwarded every one (`testdata/interop/datadog/README.md`).
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   A chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped flag, tags) and the
   tracer payload fields no request header carries (`datadog.tracer.runtime_id`, `.env`,

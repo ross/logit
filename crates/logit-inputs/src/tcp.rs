@@ -173,8 +173,9 @@ pub enum FramingMode {
     /// which is how carbon frames a pickle batch (`crates/logit-proto/src/graphite/pickle.rs`).
     LengthPrefixed,
     /// A 4-byte **little-endian** payload length, then that many bytes: DogStatsD's stream Unix
-    /// socket, where the payload is one datagram's worth of newline-separated lines. UNVERIFIED;
-    /// ADR `datadog-agent-and-intake-relay`, decision 12, has the source.
+    /// socket, where the payload is one datagram's worth of newline-separated lines, each ending
+    /// in `LF`. That is what the `datadog` Python client writes to an Agent's
+    /// `dogstatsd_stream_socket` (`testdata/interop/datadog/dogstatsd-unix-stream-*.raw`).
     LengthPrefixedLe,
 }
 

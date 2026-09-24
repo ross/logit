@@ -36,8 +36,9 @@
 //!
 //! **`unix_stream` is length-prefixed, not LF-delimited**: [`FramingMode::LengthPrefixedLe`], a
 //! 4-byte little-endian length and then one packet, which decodes as one datagram does (any number
-//! of newline-separated lines). UNVERIFIED; ADR `datadog-agent-and-intake-relay`, decision 12, has
-//! the source. A packet declaring more than
+//! of newline-separated lines), as the `datadog` Python client writes it to a real Agent's socket
+//! (`testdata/interop/datadog/README.md`; `interop_fixture_a_unix_stream_capture_*` replays it). A
+//! packet declaring more than
 //! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
 //! `logit.input.frames.dropped{reason="oversize"}`: a length-framed stream has no resync point.
 //! The rest of this section is `tcp`'s.
@@ -186,8 +187,8 @@
 //! Every line has `\r` and leading whitespace trimmed; trailing whitespace is trimmed too, except
 //! on a line starting `_e{` or `_sc|`. `_e{TITLE_LEN,TEXT_LEN}`'s lengths are authoritative, so a
 //! trim would either shrink the line under a correct length (rejecting a legal event) or change
-//! `TEXT`. `_sc|`'s `m:` consumes the rest of the line verbatim, so a trim would drop message
-//! bytes with no error. `event_text_ending_in_whitespace_is_kept` and
+//! `TEXT`. `_sc|`'s `m:` is often the last field, and its trailing whitespace is message bytes a
+//! trim would drop with no error. `event_text_ending_in_whitespace_is_kept` and
 //! `service_check_message_trailing_whitespace_is_kept` pin this.
 //!
 //! **Event**: `_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|d:<secs>|h:<hostname>|p:<normal|low>|
@@ -215,9 +216,11 @@
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
 //! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an integer `0..=3`
-//! (OK/WARNING/CRITICAL/UNKNOWN), or the line is rejected. `m:`, when present, is always last and
-//! consumes the rest of the line verbatim, so a message may contain `|`; other fields come in any
-//! order before it. It decodes to one [`Event::metric`], `MetricKind::Gauge(status as f64)` under
+//! (OK/WARNING/CRITICAL/UNKNOWN), or the line is rejected. The fields come in any order, and each,
+//! `m:` included, ends at the next `|`: the DogStatsD reference puts `m:` last, but the `datadog`
+//! Python client writes `c:` and `card:` after it, and the Agent reads `m:` up to the next `|`
+//! (both recorded, `testdata/interop/datadog/README.md`). So a message can't contain `|`. It
+//! decodes to one [`Event::metric`], `MetricKind::Gauge(status as f64)` under
 //! the check's name (interned, like a metric name), with attributes `statsd.service_check.name`
 //! (always, `Value::Str`: `MetricRecord` has nowhere else to carry it),
 //! `statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`,
@@ -923,7 +926,7 @@ fn parse_service_check(
         || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
 
     let rest = line.strip_prefix("_sc|").ok_or_else(malformed)?;
-    // NAME, STATUS, and the rest: `m:` may contain `|`, so the rest is walked field by field.
+    // NAME, STATUS, and the optional fields, each up to the next `|`.
     let mut parts = rest.splitn(3, '|');
     let name = parts.next().ok_or_else(malformed)?;
     if name.is_empty() {
@@ -941,20 +944,14 @@ fn parse_service_check(
 
     let mut line_timestamp = timestamp;
 
-    if let Some(mut cursor) = parts.next() {
-        loop {
-            if let Some(message) = cursor.strip_prefix("m:") {
+    if let Some(fields) = parts.next() {
+        for field in fields.split('|') {
+            if let Some(message) = field.strip_prefix("m:") {
                 attributes.insert(
                     "statsd.service_check.message",
                     Value::Str(slice_of(bytes, text, message)),
                 );
-                break;
-            }
-            let (field, rest) = match cursor.split_once('|') {
-                Some((field, rest)) => (field, Some(rest)),
-                None => (cursor, None),
-            };
-            if let Some(tags) = field.strip_prefix('#') {
+            } else if let Some(tags) = field.strip_prefix('#') {
                 insert_tags(&mut attributes, bytes, text, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, text, container_id);
@@ -969,11 +966,6 @@ fn parse_service_check(
                     .insert_sym(KEYS.service_check_host, Value::Str(slice_of(bytes, text, host)));
             }
             // Any other field, `|T` included, is ignored.
-
-            match rest {
-                Some(next) => cursor = next,
-                None => break,
-            }
         }
     }
 
@@ -1942,14 +1934,17 @@ mod tests {
         assert!(range.contains(&value.as_ptr()), "expected a slice of the datagram");
     }
 
-    /// `m:` consumes the rest of the line, `|` included.
+    /// `m:` ends at the next `|`, as every other field does and as the Agent reads it: a real
+    /// client writes `c:`/`card:` after `m:` (`testdata/interop/datadog/dogstatsd-unix-008.raw`).
     #[test]
-    fn service_check_message_containing_pipe_decodes_verbatim() {
+    fn service_check_message_ends_at_the_next_pipe() {
+        let events = decode("_sc|check|0|m:slow upstream|c:in-7|card:low");
+        let event = &events[0];
+        assert_eq!(attr_str(event, "statsd.service_check.message"), Some("slow upstream"));
+        assert_eq!(attr_str(event, "statsd.container_id"), Some("in-7"));
+        assert_eq!(attr_str(event, "statsd.cardinality"), Some("low"));
         let events = decode("_sc|check|0|m:a|b|c");
-        assert_eq!(
-            events[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
-            Some("a|b|c")
-        );
+        assert_eq!(attr_str(&events[0], "statsd.service_check.message"), Some("a"));
     }
 
     /// A trailing space on an `_sc|` line is kept as message content.
@@ -2485,6 +2480,109 @@ mod tests {
             event.attributes.get("env").is_none()
                 && event.attributes.get("statsd.container_id").is_none(),
             "the plain-statsd dialect has no tag or container-id syntax at all"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Recorded DogStatsD over the Agent's Unix sockets (testdata/interop/datadog/,
+    // `script/record-fixtures datadog-dogstatsd-unix`)
+    //
+    // The `datadog` Python client's nine constructs, each carrying `|c:`, `|e:` (from
+    // `DD_EXTERNAL_ENV`), and `|card:`, over a Unix datagram socket (one file per datagram) and a
+    // Unix stream socket (one file per connection, length prefixes and all).
+    // -------------------------------------------------------------------------------------------
+
+    /// The `DD_EXTERNAL_ENV` `script/record-fixtures` gives every DogStatsD client.
+    const RECORDED_EXTERNAL_ENV: &str =
+        "it-false,cn-record-fixtures,pu-00000000-0000-4000-8000-000000000001";
+
+    fn datadog_interop_fixture(name: &str) -> Bytes {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/interop/datadog")
+            .join(name);
+        Bytes::from(
+            std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display())),
+        )
+    }
+
+    /// The nine packets of one unbuffered run, checked construct by construct: the capture holds
+    /// the client's calls in `python_dogstatsd_producer.py`'s order.
+    fn assert_the_nine_recorded_constructs(packets: &[Bytes]) {
+        assert_eq!(packets.len(), 9);
+        let mut decoded = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let (events, diagnostics) = decode_interop(packet);
+            assert!(diagnostics.is_empty(), "packet {i} raised {diagnostics:?}");
+            assert_eq!(events.len(), 1, "packet {i}: one construct per unbuffered packet");
+            let event = events.into_iter().next().unwrap();
+            assert!(attr_str(&event, "statsd.container_id").is_some_and(|c| c.starts_with("in-")));
+            decoded.push(event);
+        }
+        let kinds: Vec<&str> =
+            decoded.iter().take(7).map(|e| attr_str(e, "statsd.type").unwrap_or("-")).collect();
+        assert_eq!(kinds, ["-", "-", "h", "d", "-", "ms", "-"], "the type carriers of the metrics");
+        assert!(matches!(decoded[0].metrics[0].kind, MetricKind::Sum(_)));
+        assert!(matches!(decoded[4].metrics[0].kind, MetricKind::SetMembers(_)));
+        for event in &decoded[..7] {
+            assert_eq!(attr_str(event, "statsd.external_data"), Some(RECORDED_EXTERNAL_ENV));
+        }
+        let cards: Vec<&str> =
+            decoded.iter().map(|e| attr_str(e, "statsd.cardinality").unwrap()).collect();
+        assert_eq!(
+            cards,
+            ["low", "high", "low", "low", "low", "low", "low", "orchestrator", "low"]
+        );
+        // `|T` last on the line, and its value the client's own.
+        assert_eq!(decoded[6].attributes.get("statsd.timestamp"), Some(&Value::U64(1_790_000_000)));
+        assert_eq!(decoded[6].timestamp, 1_790_000_000_000_000_000);
+        // The event and the service check: no `e:` on either from this client.
+        assert_eq!(attr_str(&decoded[7], "statsd.event.title"), Some("Deploy finished"));
+        assert_eq!(attr_str(&decoded[7], "statsd.external_data"), None);
+        let check = &decoded[8];
+        assert_eq!(attr_str(check, "statsd.service_check.name"), Some("record.can_connect"));
+        assert_eq!(attr_str(check, "statsd.service_check.message"), Some("slow upstream"));
+        assert_eq!(attr_str(check, "statsd.external_data"), None);
+    }
+
+    #[test]
+    fn interop_fixture_unix_datagrams_carry_every_origin_field() {
+        let packets: Vec<Bytes> = (0..9)
+            .map(|i| datadog_interop_fixture(&format!("dogstatsd-unix-{i:03}.raw")))
+            .collect();
+        assert_the_nine_recorded_constructs(&packets);
+    }
+
+    /// The stream capture, fed to the `unix_stream` framer as it arrived: every frame is a
+    /// little-endian length and one packet, and the buffered connection packs several lines
+    /// into one packet.
+    #[test]
+    fn interop_fixture_a_unix_stream_capture_frames_as_le_length_prefixed_packets() {
+        let frames_of = |name: &str| {
+            let mut framer =
+                crate::tcp::Framer::new(FramingMode::LengthPrefixedLe, crate::tcp::MAX_FRAME_BYTES);
+            framer.push(&datadog_interop_fixture(name));
+            let mut frames = Vec::new();
+            while let Some(frame) = framer.next_frame().expect("a recorded frame is well formed") {
+                frames.push(frame);
+            }
+            frames
+        };
+        let unbuffered = frames_of("dogstatsd-unix-stream-000.raw");
+        assert_the_nine_recorded_constructs(&unbuffered);
+
+        let buffered = frames_of("dogstatsd-unix-stream-001.raw");
+        assert!(buffered.len() < 9, "the buffered client packs lines: {} frames", buffered.len());
+        let mut constructs = 0;
+        for frame in &buffered {
+            let (events, diagnostics) = decode_interop(frame);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            constructs += events.len();
+        }
+        assert_eq!(constructs, 9, "every call arrived");
+        assert!(
+            buffered.iter().any(|f| f.iter().filter(|b| **b == b'\n').count() > 1),
+            "at least one frame holds several lines"
         );
     }
 
