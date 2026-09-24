@@ -20,8 +20,15 @@
 //!
 //! **Only the read cursor is persisted.** The write side resumes at the end of the
 //! highest-numbered segment, validated frame by frame at [`DiskQueue::open`]. Every other segment
-//! was complete before a newer one became active (one producer, one write in flight), so only the
-//! active segment can have a torn tail.
+//! was complete before a newer one became active (one producer, one write in flight, and no
+//! rotation while the active segment has unrepaired bytes), so only the active segment can have a
+//! torn tail.
+//!
+//! **A cancelled `push` leaves its write running.** `tokio::fs::File::poll_write` hands the bytes
+//! to a blocking thread and returns `Ready` at once; dropping the `push` future doesn't recall
+//! them. Only an operation on the *same* `File` waits for that write to finish, so the active
+//! segment has exactly one write handle, which outlives a cancelled push (see
+//! [`HeldWriteFile`]), and the next push repairs through it (see [`State::needs_repair`]).
 //!
 //! **`commit` is synchronous**, like `SinkQueue::commit`: it mutates in-memory cursor state and
 //! occasionally makes one small blocking cursor write (with two `fsync`s) and one file deletion,
@@ -347,6 +354,38 @@ enum ReadOutcome {
     Unavailable,
 }
 
+/// The active segment's write handle, out of [`State::write_file`] for one operation. Dropping
+/// the guard puts the handle back, so a `push` cancelled at any `.await` keeps the handle, and
+/// with it tokio's record of any write still running on a blocking thread, for the next push's
+/// repair to wait on. Its `Drop` locks the state only briefly and allocates nothing.
+struct HeldWriteFile<'a> {
+    queue: &'a DiskQueue,
+    file: Option<tokio::fs::File>,
+}
+
+impl Drop for HeldWriteFile<'_> {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let mut state = self.queue.inner.lock().unwrap_or_else(|p| p.into_inner());
+            // One producer: no other guard can have put a handle back meanwhile.
+            debug_assert!(state.write_file.is_none(), "two write handles on one spool");
+            state.write_file = Some(file);
+        }
+    }
+}
+
+/// Why [`DiskQueue::write_record`] appended nothing. `push` counts the batch dropped with
+/// `reason="disk_full"` or `"disk_io_error"`.
+struct WriteError {
+    disk_full: bool,
+}
+
+impl WriteError {
+    fn from_io(err: &io::Error) -> Self {
+        Self { disk_full: is_disk_full(err) }
+    }
+}
+
 struct HeadCache {
     batch: Arc<EventBatch>,
     ctx: BatchContext,
@@ -360,16 +399,16 @@ struct State {
     total_bytes: u64,
     queued_records: u64,
     head_cache: Option<HeadCache>,
+    /// The active segment's one write handle, while no [`HeldWriteFile`] has it out. `None`
+    /// until the first write after [`DiskQueue::open`].
     write_file: Option<tokio::fs::File>,
-    /// Set just before a write, cleared once it completes. A `push` future dropped mid-write
-    /// (`run_output`'s `select!` drops `drain_inbox` when `write_loop` finishes first) or a
-    /// failed write leaves it `true`, and the next [`DiskQueue::push`] truncates the tail back to
-    /// `write_len_before_flight` before writing. A crash is the same case, repaired at the next
-    /// [`DiskQueue::open`].
-    write_in_flight: bool,
-    write_len_before_flight: u64,
-    /// Whether the last failed write was `ENOSPC`, so `push` can tag the drop it counts.
-    last_write_error_disk_full: bool,
+    /// The active segment's length before a write that hasn't been confirmed. Set just before
+    /// the write and cleared once it's flushed. A failed write, or a `push` future dropped
+    /// mid-write (`run_output`'s `select!` drops `drain_inbox` when `write_loop` finishes first),
+    /// leaves it set, and the next [`DiskQueue::push`] truncates back to it before anything else.
+    /// While it's set, nothing is written and nothing rotates. A crash is the same case, repaired
+    /// at the next [`DiskQueue::open`].
+    needs_repair: Option<u64>,
     read_file: Option<(u64, tokio::fs::File)>,
     last_checkpoint: Instant,
     diag: Diagnostics,
@@ -553,7 +592,6 @@ impl DiskQueue {
 
         let total_bytes: u64 = segments.iter().map(|s| s.len).sum();
         let segment_count = segments.len();
-        let write_len = segments.back().expect("always at least one segment").len;
 
         let state = State {
             segments,
@@ -563,9 +601,7 @@ impl DiskQueue {
             queued_records: replayed,
             head_cache: None,
             write_file: None,
-            write_in_flight: false,
-            write_len_before_flight: write_len,
-            last_write_error_disk_full: false,
+            needs_repair: None,
             read_file: None,
             last_checkpoint: Instant::now(),
             diag,
@@ -633,9 +669,10 @@ impl DiskQueue {
     /// encoded payload exceeds `MAX_SANE_UNCOMPRESSED_LEN`, or whose write fails, is dropped and
     /// counted, never counted as queued.
     ///
-    /// **Cancellation safety.** The record is encoded in memory first; the write-path `.await`s
-    /// run under `write_in_flight` (see [`State::write_in_flight`]), so a dropped future leaves a
-    /// tail the next push repairs.
+    /// **Cancellation safety.** The record is encoded in memory first. A future dropped at any
+    /// write-path `.await` keeps the write handle (see [`HeldWriteFile`]) and leaves at most a
+    /// tail past [`State::needs_repair`], which the next push waits out and truncates before it
+    /// writes anything.
     pub async fn push(&self, item: (Arc<EventBatch>, BatchContext)) {
         let (batch, ctx) = item;
 
@@ -734,59 +771,37 @@ impl DiskQueue {
         }
         drop(blocked_timer);
 
-        if !self.write_record(&record).await {
+        if let Err(err) = self.write_record(&record).await {
             // Never durably written, so count it dropped, not queued. `disk_full` is the one
             // cause the overflow policies can't prevent, so it gets its own reason.
-            let reason =
-                if self.last_write_error_was_disk_full() { "disk_full" } else { "disk_io_error" };
+            let reason = if err.disk_full { "disk_full" } else { "disk_io_error" };
             self.count_dropped(reason, events);
             return;
-        }
-
-        {
-            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let active = state.segments.back_mut().expect("always at least one segment");
-            active.len += record_len;
-            state.total_bytes += record_len;
-            state.queued_records += 1;
         }
         self.not_empty.notify_one();
         self.after_change();
     }
 
-    fn last_write_error_was_disk_full(&self) -> bool {
-        let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.last_write_error_disk_full
+    /// Takes the active segment's write handle out of the state until the guard drops.
+    fn hold_write_file(&self) -> HeldWriteFile<'_> {
+        let file = self.inner.lock().unwrap_or_else(|p| p.into_inner()).write_file.take();
+        HeldWriteFile { queue: self, file }
     }
 
     /// Repairs a torn tail left by a cancelled or failed write, rotates if the active segment has
-    /// reached `segment_bytes`, then appends and flushes `record`. Returns whether the record
-    /// reached the kernel.
-    async fn write_record(&self, record: &[u8]) -> bool {
-        let (needs_repair, repair_len, repair_seq) = {
+    /// reached `segment_bytes`, then appends and flushes `record` and counts it queued. Every
+    /// `.await` on the active segment goes through the one retained handle.
+    ///
+    /// The accounting happens in the same poll as the flush completing, so a cancelled push
+    /// either counted its record or left `needs_repair` set for the next push to truncate.
+    async fn write_record(&self, record: &[u8]) -> Result<(), WriteError> {
+        let mut held = self.hold_write_file();
+        let (seq, needs_repair) = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            (
-                state.write_in_flight,
-                state.write_len_before_flight,
-                state.segments.back().expect("always at least one segment").seq,
-            )
+            (state.segments.back().expect("always at least one segment").seq, state.needs_repair)
         };
-        if needs_repair {
-            let path = segment_path(&self.dir, repair_seq);
-            if let Ok(f) = tokio::fs::File::options().write(true).open(&path).await {
-                let _ = f.set_len(repair_len).await;
-            }
-            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(active) = state.segments.back_mut() {
-                if active.seq == repair_seq {
-                    let old_len = active.len;
-                    active.len = repair_len;
-                    state.total_bytes =
-                        state.total_bytes.saturating_sub(old_len.saturating_sub(repair_len));
-                }
-            }
-            state.write_in_flight = false;
-            state.write_file = None;
+        if let Some(before) = needs_repair {
+            self.repair_torn_tail(&mut held, seq, before).await?;
         }
 
         let needs_rotate = {
@@ -794,43 +809,34 @@ impl DiskQueue {
             state.segments.back().expect("always at least one segment").len >= self.segment_bytes
         };
         if needs_rotate {
-            self.rotate_segment().await;
+            self.rotate_segment(&mut held).await;
         }
 
-        let file_and_seq = {
-            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let (seq, len) = {
-                let active = state.segments.back().expect("always at least one segment");
-                (active.seq, active.len)
-            };
-            state.write_in_flight = true;
-            state.write_len_before_flight = len;
-            state.write_file.take().map(|f| (f, seq))
+        let seq = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.segments.back().expect("always at least one segment").seq
         };
-        let (mut file, seq) = match file_and_seq {
-            Some(pair) => pair,
-            None => {
-                let seq = {
-                    let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                    state.segments.back().expect("always at least one segment").seq
-                };
-                match self.open_append(seq).await {
-                    Ok(f) => (f, seq),
-                    Err(err) => {
-                        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                        state.diag.warn_throttled(
-                            "disk_io_error",
-                            format!("opening segment {seq} for append: {err}"),
-                        );
-                        // Nothing was written, so there is no torn tail to repair.
-                        state.write_in_flight = false;
-                        state.last_write_error_disk_full = is_disk_full(&err);
-                        return false;
-                    }
+        if held.file.is_none() {
+            match self.open_append(seq).await {
+                Ok(file) => held.file = Some(file),
+                Err(err) => {
+                    let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                    state.diag.warn_throttled(
+                        "disk_io_error",
+                        format!("opening segment {seq} for append: {err}"),
+                    );
+                    // Nothing was written, so there is no torn tail to repair.
+                    return Err(WriteError::from_io(&err));
                 }
             }
-        };
+        }
+        let file = held.file.as_mut().expect("opened above");
 
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let len = state.segments.back().expect("always at least one segment").len;
+            state.needs_repair = Some(len);
+        }
         // `write_all` returning `Ok` means only that the bytes reached `tokio::fs::File`'s
         // buffer; `flush()` hands them to the kernel. Without it, a batch counted as queued is
         // lost on an ordinary process crash, not only on power loss. A failed flush is repaired
@@ -843,15 +849,72 @@ impl DiskQueue {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         match result {
             Ok(()) => {
-                state.write_file = Some(file);
-                state.write_in_flight = false;
-                true
+                let record_len = record.len() as u64;
+                state.needs_repair = None;
+                state.segments.back_mut().expect("always at least one segment").len += record_len;
+                state.total_bytes += record_len;
+                state.queued_records += 1;
+                Ok(())
             }
             Err(err) => {
                 state.diag.warn_throttled("disk_io_error", format!("writing segment {seq}: {err}"));
-                state.last_write_error_disk_full = is_disk_full(&err);
-                // Leave `write_in_flight` set for the next push to repair.
-                false
+                Err(WriteError::from_io(&err))
+            }
+        }
+    }
+
+    /// Truncates the active segment back to `before`, its length ahead of an unconfirmed write,
+    /// through the retained handle (opening one only if none is retained).
+    ///
+    /// The `flush` first waits for a cancelled push's write that is still running on a blocking
+    /// thread, and clears the error tokio stores from a failed one (which would otherwise fail
+    /// the next write). Its result doesn't matter: the truncate discards those bytes either way.
+    /// Truncating through any other handle wouldn't wait, and the write could land after it.
+    ///
+    /// A failed truncate is counted `op="truncate"` and diagnosed, fails this push, and leaves
+    /// `needs_repair` set, so nothing is written or rotated until a later push repairs.
+    async fn repair_torn_tail(
+        &self,
+        held: &mut HeldWriteFile<'_>,
+        seq: u64,
+        before: u64,
+    ) -> Result<(), WriteError> {
+        let path = segment_path(&self.dir, seq);
+        let truncated = match held.file.as_mut() {
+            Some(file) => {
+                let _ = file.flush().await;
+                fault_io!(SEGMENT_SET_LEN, &path, seq, file.set_len(before).await)
+            }
+            None => {
+                // `append`, like every other handle on the segment: a positioned handle would
+                // write the next record at offset 0.
+                let opened = fault_io!(
+                    SEGMENT_OPEN,
+                    &path,
+                    seq,
+                    tokio::fs::OpenOptions::new().append(true).open(&path).await
+                );
+                match opened {
+                    Ok(file) => {
+                        let file = held.file.insert(file);
+                        fault_io!(SEGMENT_SET_LEN, &path, seq, file.set_len(before).await)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        match truncated {
+            Ok(()) => {
+                self.inner.lock().unwrap_or_else(|p| p.into_inner()).needs_repair = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.count_fs_error(
+                    "truncate",
+                    format_args!("truncating segment {seq}'s torn tail to {before} bytes"),
+                    &err,
+                );
+                Err(WriteError::from_io(&err))
             }
         }
     }
@@ -866,40 +929,59 @@ impl DiskQueue {
         )
     }
 
-    /// Closes out the active segment (flush and `fsync` it, `fsync` the directory after creating
-    /// the next) and starts a new one. Each failure is counted and diagnosed. A failed flush or
-    /// `fsync` doesn't stop the rotation. A failed `create` leaves `segments` unchanged, so the
-    /// next push appends to the old segment and retries.
-    async fn rotate_segment(&self) {
-        let (old_seq, file) = {
-            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let old_seq = state.segments.back().expect("always at least one segment").seq;
-            (old_seq, state.write_file.take())
+    /// Closes out the active segment and starts the next: flushes and `fsync`s the old segment
+    /// through the retained handle, creates the new one, `fsync`s the directory, then makes the
+    /// new segment active with its handle retained. Each failure is counted and diagnosed. A
+    /// failed flush or `fsync` doesn't stop the rotation. A failed create leaves the old segment
+    /// active, and the next push retries.
+    ///
+    /// The new segment opens without truncating, so a file left by a rotation cancelled after
+    /// its create (always empty: nothing writes to a segment before it's active) is reused.
+    async fn rotate_segment(&self, held: &mut HeldWriteFile<'_>) {
+        let old_seq = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.segments.back().expect("always at least one segment").seq
         };
         let old_path = segment_path(&self.dir, old_seq);
-        // Flush after the guard drops: awaiting under a `std::sync::Mutex` guard trips
-        // `clippy::await_holding_lock`.
-        if let Some(mut f) = file {
-            if let Err(err) = fault_io!(SEGMENT_FLUSH, &old_path, old_seq, f.flush().await) {
-                self.count_fs_error("flush", format_args!("flushing segment {old_seq}"), &err);
+        let synced = match held.file.as_mut() {
+            Some(file) => {
+                if let Err(err) = fault_io!(SEGMENT_FLUSH, &old_path, old_seq, file.flush().await) {
+                    self.count_fs_error("flush", format_args!("flushing segment {old_seq}"), &err);
+                }
+                fault_io!(SEGMENT_SYNC, &old_path, old_seq, file.sync_data().await)
             }
-        }
-        if let Err(err) = fault_io!(SEGMENT_SYNC, &old_path, old_seq, fsync_path(&old_path).await) {
+            None => fault_io!(SEGMENT_SYNC, &old_path, old_seq, fsync_path(&old_path).await),
+        };
+        if let Err(err) = synced {
             self.count_fs_error("fsync", format_args!("syncing segment {old_seq}"), &err);
         }
         let new_seq = old_seq + 1;
         let new_path = segment_path(&self.dir, new_seq);
-        let created =
-            fault_io!(SEGMENT_CREATE, &new_path, new_seq, tokio::fs::File::create(&new_path).await);
-        if let Err(err) = created {
-            self.count_fs_error("create", format_args!("creating segment {new_seq}"), &err);
-            return;
-        }
+        let created = fault_io!(
+            SEGMENT_CREATE,
+            &new_path,
+            new_seq,
+            tokio::fs::OpenOptions::new().create(true).append(true).open(&new_path).await
+        );
+        let new_file = match created {
+            Ok(file) => file,
+            Err(err) => {
+                self.count_fs_error("create", format_args!("creating segment {new_seq}"), &err);
+                return;
+            }
+        };
         if let Err(err) = fault_io!(DIR_SYNC, &self.dir, new_seq, fsync_path(&self.dir).await) {
             self.count_fs_error("fsync", format_args!("syncing {}", self.dir.display()), &err);
         }
-        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        state.segments.push_back(Segment { seq: new_seq, len: 0 });
+        // No `.await` from here on, so a cancelled push can't separate the new handle from the
+        // new segment.
+        let old_file = held.file.replace(new_file);
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .segments
+            .push_back(Segment { seq: new_seq, len: 0 });
+        drop(old_file);
     }
 
     /// `DropOldest` under a full queue: advances the read cursor past the head record without
@@ -1247,29 +1329,44 @@ impl DiskQueue {
     /// Persists the cursor durably regardless of `checkpoint_interval`, flushes and `fsync`s the
     /// active segment, `fsync`s the directory, and closes files. Each failure is counted and
     /// diagnosed. Drops nothing: what is queued delivers after the next open.
+    ///
+    /// Doesn't repair a torn tail. The flush, through the retained handle, waits for any write a
+    /// cancelled push left running, and whatever it leaves past the last whole record is
+    /// [`DiskQueue::open`]'s to truncate.
     pub async fn finish(&self) {
         self.checkpoint_cursor();
-        let (active_seq, file) = {
+        let mut held = self.hold_write_file();
+        let active_seq = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let file = state.write_file.take();
             state.read_file = None;
-            (state.segments.back().expect("always at least one segment").seq, file)
+            state.segments.back().expect("always at least one segment").seq
         };
         let active_path = segment_path(&self.dir, active_seq);
-        // Flush outside the lock, as in `rotate_segment`.
-        if let Some(mut f) = file {
-            if let Err(err) = fault_io!(SEGMENT_FLUSH, &active_path, active_seq, f.flush().await) {
-                self.count_fs_error("flush", format_args!("flushing segment {active_seq}"), &err);
+        let synced = match held.file.as_mut() {
+            Some(file) => {
+                let flushed =
+                    fault_io!(SEGMENT_FLUSH, &active_path, active_seq, file.flush().await);
+                if let Err(err) = flushed {
+                    self.count_fs_error(
+                        "flush",
+                        format_args!("flushing segment {active_seq}"),
+                        &err,
+                    );
+                }
+                fault_io!(SEGMENT_SYNC, &active_path, active_seq, file.sync_data().await)
             }
-        }
-        let synced =
-            fault_io!(SEGMENT_SYNC, &active_path, active_seq, fsync_path(&active_path).await);
+            None => {
+                fault_io!(SEGMENT_SYNC, &active_path, active_seq, fsync_path(&active_path).await)
+            }
+        };
         if let Err(err) = synced {
             self.count_fs_error("fsync", format_args!("syncing segment {active_seq}"), &err);
         }
         if let Err(err) = fault_io!(DIR_SYNC, &self.dir, 0, fsync_path(&self.dir).await) {
             self.count_fs_error("fsync", format_args!("syncing {}", self.dir.display()), &err);
         }
+        // Closes the handle rather than returning it to the state.
+        drop(held.file.take());
     }
 }
 
@@ -1395,6 +1492,7 @@ mod tests {
     use super::*;
     use crate::fault::{self, errno};
     use logit_core::{AttrMap, Event, Registry, Resource, Value};
+    use std::future::Future;
 
     fn open(dir: PathBuf) -> DiskQueue {
         DiskQueue::open(config(dir), Telemetry::default(), Diagnostics::new("test")).unwrap()
@@ -2377,6 +2475,351 @@ mod tests {
         drop(first);
         let reopened = open(dir.clone());
         deliver(&reopened, &["a"]).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A cancelled or failed write never leaves a segment longer on disk than in memory, and a
+    // failed repair never writes past the torn bytes (DISK-03, DISK-05).
+    // -----------------------------------------------------------------------------------------
+
+    /// Every segment's in-memory length beside its length on disk, oldest first.
+    fn segment_lengths(q: &DiskQueue, dir: &Path) -> Vec<(u64, u64, u64)> {
+        let segments: Vec<Segment> = {
+            let state = q.inner.lock().unwrap();
+            state.segments.iter().copied().collect()
+        };
+        segments
+            .into_iter()
+            .map(|s| (s.seq, s.len, std::fs::metadata(segment_path(dir, s.seq)).unwrap().len()))
+            .collect()
+    }
+
+    fn assert_segments_match_disk(q: &DiskQueue, dir: &Path) {
+        for (seq, in_memory, on_disk) in segment_lengths(q, dir) {
+            assert_eq!(on_disk, in_memory, "segment {seq}: on-disk length vs in-memory length");
+        }
+    }
+
+    /// Polls `fut` once inside `rt`, so any blocking work it spawns goes to `rt`'s pool. Returns
+    /// whether it's still pending.
+    fn poll_once_in<F: std::future::Future>(
+        rt: &tokio::runtime::Runtime,
+        mut fut: std::pin::Pin<&mut F>,
+    ) -> bool {
+        rt.block_on(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push() {
+        let dir = scratch_dir("cancel-after-landing");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1024 * 1024;
+        let q = open_with(cfg);
+        q.push((batch("a"), ctx())).await;
+        let path = segment_path(&dir, 0);
+        let before = std::fs::metadata(&path).unwrap().len();
+        let record_len = raw_record(&batch("cancelled"), ctx()).len() as u64;
+
+        {
+            let mut push = std::pin::pin!(q.push((batch("cancelled"), ctx())));
+            // Poll only while the bytes haven't landed. The write goes to the blocking pool on
+            // the first poll, which then parks at the `flush` await until it completes.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::metadata(&path).unwrap().len() < before + record_len {
+                assert!(Instant::now() < deadline, "the write never landed");
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(push.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                assert!(pending, "the push must still be parked at its flush");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        } // dropped at the `flush` await, its bytes on disk
+
+        q.push((batch("b"), ctx())).await;
+        assert_segments_match_disk(&q, &dir);
+        deliver(&q, &["a", "b"]).await;
+        q.close();
+        assert!(peek_within(&q).await.is_none(), "the cancelled record was truncated away");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The orphaned write lands after the next push has repaired and appended: the order a
+    /// fresh-fd repair can't prevent, because nothing makes it wait for a write issued on another
+    /// handle. A second runtime, whose one blocking thread the test holds, parks the orphan.
+    #[test]
+    fn an_orphaned_write_that_lands_after_the_next_push_began_never_desynchronizes_the_segment() {
+        let dir = scratch_dir("orphan-lands-late");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1024 * 1024;
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stalled = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        stalled.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
+        let q = open_with(cfg);
+        main.block_on(q.push((batch("a"), ctx())));
+
+        {
+            let mut push = std::pin::pin!(q.push((batch("orphan"), ctx())));
+            assert!(poll_once_in(&stalled, push.as_mut()), "the write is parked behind the gate");
+        } // cancelled at the `flush` await, its write queued behind the gate
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = release.send(());
+        });
+        main.block_on(q.push((batch("b"), ctx())));
+        releaser.join().unwrap();
+        drop(stalled); // waits for the orphaned write to land
+
+        assert_segments_match_disk(&q, &dir);
+        main.block_on(async {
+            deliver(&q, &["a", "b"]).await;
+            q.close();
+            assert!(peek_within(&q).await.is_none(), "the orphan never becomes a record");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cancels a push after `k` polls, for `k` in 1..=8 over 20 rounds, then pushes a clean
+    /// record. The cancelled push runs on a second runtime whose one blocking thread first sleeps
+    /// a varying amount, so its orphaned work (a write, a flush, a rotation's `fsync` or create, a
+    /// repair's truncate) lands before, during, or after the next push's own.
+    #[test]
+    fn cancelling_pushes_at_every_await_never_desynchronizes_the_segment() {
+        let dir = scratch_dir("cancel-every-await");
+        let mut cfg = config(dir.clone());
+        // Three records a segment, so cancellations land inside rotations too.
+        cfg.segment_bytes = 3 * raw_record(&batch("c00-0"), ctx()).len() as u64;
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let side = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let q = open_with(cfg);
+
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut jitter = move |max_us: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            Duration::from_micros((seed >> 33) % max_us)
+        };
+        let mut expected: Vec<String> = Vec::new();
+        for round in 0..20 {
+            for k in 1..=8u32 {
+                let delay = jitter(3000);
+                side.spawn_blocking(move || std::thread::sleep(delay));
+                let cancelled = format!("x{round:02}-{k}");
+                let completed = {
+                    let mut push = std::pin::pin!(q.push((batch(&cancelled), ctx())));
+                    let mut completed = false;
+                    for _ in 0..k {
+                        if !poll_once_in(&side, push.as_mut()) {
+                            completed = true;
+                            break;
+                        }
+                        std::thread::sleep(jitter(500));
+                    }
+                    completed
+                }; // a push still pending is cancelled here, before the next one starts
+                if completed {
+                    expected.push(cancelled);
+                }
+
+                let clean = format!("c{round:02}-{k}");
+                main.block_on(q.push((batch(&clean), ctx())));
+                expected.push(clean);
+                assert_segments_match_disk(&q, &dir);
+            }
+        }
+        drop(side); // waits for every orphaned operation to land
+        assert_segments_match_disk(&q, &dir);
+
+        let labels: Vec<&str> = expected.iter().map(String::as_str).collect();
+        main.block_on(async {
+            deliver(&q, &labels).await;
+            q.close();
+            assert!(peek_within(&q).await.is_none(), "only completed pushes are ever delivered");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_torn_tail_truncate_drops_and_counts_the_batch_and_never_writes_past_the_torn_bytes(
+    ) {
+        let dir = scratch_dir("repair-truncate-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1024 * 1024;
+        let (q, registry, diag) = open_observed(cfg);
+        q.push((batch("a"), ctx())).await;
+        let path = segment_path(&dir, 0);
+        let a_len = std::fs::metadata(&path).unwrap().len();
+        let torn_len = raw_record(&batch("torn"), ctx()).len() as u64;
+        registry.drain(0);
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(SEGMENT_FLUSH, 1, errno::ENOSPC);
+        q.push((batch("torn"), ctx())).await; // written, then the flush "fails"
+        scope.fail_nth(SEGMENT_SET_LEN, 1, errno::EIO);
+        q.push((batch("blocked"), ctx())).await; // its repair's truncate fails
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            a_len + torn_len,
+            "nothing may be appended after unrepaired bytes"
+        );
+        assert_eq!(segment_lengths(&q, &dir)[0].1, a_len, "the in-memory length never moved");
+        let events = registry.drain(0);
+        let dropped = |reason| {
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", reason)))
+        };
+        assert_eq!(dropped("disk_full"), 1.0, "the torn push");
+        assert_eq!(dropped("disk_io_error"), 1.0, "the push whose repair failed");
+        assert_eq!(metric_sum(&events, DISK_ERRORS, Some(("op", "truncate"))), 1.0);
+        assert_eq!(diag.occurrences("disk_fs_error"), 1);
+
+        q.push((batch("ok"), ctx())).await; // repairs, then lands
+        assert_segments_match_disk(&q, &dir);
+        deliver(&q, &["a", "ok"]).await;
+        q.close();
+        assert!(peek_within(&q).await.is_none());
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_repair_never_rotates_so_only_the_active_segment_can_be_torn() {
+        let dir = scratch_dir("repair-fails-no-rotate");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1; // rotate on every push
+        let (q, registry, _diag) = open_observed(cfg);
+        q.push((batch("a"), ctx())).await;
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(SEGMENT_FLUSH, 2, errno::EIO); // the first is the rotation's flush
+        q.push((batch("torn"), ctx())).await; // rotates to segment 1, then the flush "fails"
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1]);
+        scope.fail(SEGMENT_SET_LEN, errno::EIO);
+        q.push((batch("blocked-1"), ctx())).await;
+        q.push((batch("blocked-2"), ctx())).await;
+
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1], "no rotation past a torn tail");
+        let lengths = segment_lengths(&q, &dir);
+        assert_eq!(lengths[0].1, lengths[0].2, "the closed segment is whole");
+        assert_eq!(lengths[1].1, 0, "segment 1 holds only torn bytes");
+        assert_eq!(
+            lengths[1].2,
+            raw_record(&batch("torn"), ctx()).len() as u64,
+            "and nothing after them"
+        );
+        assert_eq!(disk_errors(&registry, "truncate"), 2.0);
+
+        drop(scope);
+        q.push((batch("ok"), ctx())).await;
+        assert_segments_match_disk(&q, &dir);
+        deliver(&q, &["a", "ok"]).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `push` `expect`s `write_frame` to succeed: it fails only for `Compression::Zstd`, which no
+    /// `disk.compression` value maps to. The exhaustive match fails to compile if
+    /// `logit_config::Compression` gains a variant, so the new one gets checked here.
+    #[tokio::test]
+    async fn every_configurable_disk_compression_is_encodable_by_write_frame() {
+        for configured in [logit_config::Compression::None, logit_config::Compression::Lz4] {
+            let compression = match configured {
+                logit_config::Compression::None => Compression::None,
+                logit_config::Compression::Lz4 => Compression::Lz4,
+            };
+            let payload = native::encode_batch_v2(&batch("x"), Provenance::default());
+            frame::write_frame(native::CODEC_NATIVE_V2, compression, &payload)
+                .unwrap_or_else(|err| panic!("{configured:?} must encode: {err}"));
+
+            let dir = scratch_dir("every-compression");
+            let mut cfg = config(dir.clone());
+            cfg.compression = compression;
+            let q = open_with(cfg);
+            q.push((batch("round-trip"), ctx())).await;
+            deliver(&q, &["round-trip"]).await;
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn drop_oldest_reclaims_space_a_whole_head_segment_at_a_time_and_counts_every_eviction() {
+        let dir = scratch_dir("drop-oldest-whole-segment");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.overflow = OverflowPolicy::DropOldest;
+        cfg.segment_bytes = 3 * one;
+        cfg.max_bytes = 6 * one;
+        let (q, registry, _diag) = open_observed(cfg);
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            q.push((batch(label), ctx())).await;
+        }
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1]);
+        registry.drain(0);
+
+        // Evicting `a` or `b` frees nothing: space comes back only when segment 0 is deleted.
+        q.push((batch("g"), ctx())).await;
+
+        let events = registry.drain(0);
+        let evicted = |metric| metric_sum(&events, metric, Some(("reason", "overflow_oldest")));
+        assert_eq!(evicted(SINK_QUEUE_METRICS.items_dropped), 3.0, "a, b, and c, one push");
+        assert_eq!(evicted(SINK_QUEUE_METRICS.units_dropped), 3.0);
+        assert_eq!(list_segments(&dir).unwrap(), vec![1, 2]);
+        assert!(segment_lengths(&q, &dir).iter().map(|s| s.1).sum::<u64>() <= 6 * one);
+        deliver(&q, &["d", "e", "f", "g"]).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The worst case of whole-segment reclamation: with `segment_bytes == max_bytes`, the head
+    /// segment is the active one, so evicting every queued record frees nothing and the push
+    /// then lands over the bound. Inherent to reclaiming by segment (see the ADR's rejected
+    /// deferred-skip-cursor design); `docs/deploying.md` advises `segment_bytes` well under
+    /// `max_bytes`.
+    #[tokio::test]
+    async fn drop_oldest_with_one_active_segment_evicts_every_queued_record_then_writes_over_bound()
+    {
+        let dir = scratch_dir("drop-oldest-one-segment");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.overflow = OverflowPolicy::DropOldest;
+        cfg.segment_bytes = 3 * one;
+        cfg.max_bytes = 3 * one;
+        let (q, registry, _diag) = open_observed(cfg);
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        registry.drain(0);
+
+        q.push((batch("d"), ctx())).await;
+
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(
+                &events,
+                SINK_QUEUE_METRICS.items_dropped,
+                Some(("reason", "overflow_oldest"))
+            ),
+            3.0,
+            "every queued record is evicted by one push"
+        );
+        let total: u64 = segment_lengths(&q, &dir).iter().map(|s| s.1).sum();
+        assert_eq!(total, 4 * one, "then the push lands over max_bytes");
+        deliver(&q, &["d"]).await;
+        assert_eq!(list_segments(&dir).unwrap(), vec![1], "the evicted segment is reclaimed");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
