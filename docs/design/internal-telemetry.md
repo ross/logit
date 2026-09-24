@@ -1476,6 +1476,35 @@ generic write loop's `logit.component.batches.received`/`events.received`/`send.
 cover a sink that never fails and never varies; a dedicated counter would duplicate
 `events.received`.
 
+#### Codecs
+
+A codec shared by a listener and a sink reports through whichever component's handles it was
+given, so these points appear under `datadog_in`'s or `datadog_out`'s component id.
+
+##### `datadog`
+
+`crates/logit-proto/src/datadog/`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.metrics.skipped{reason="bad_series"\|"bad_point"\|"null_value"\|"non_finite_value"\|"empty_distribution"}` | count | a series or point dropped while the rest of the request decodes: a malformed series, a malformed point, a v1 `null` value, a non-finite protobuf value, or a distribution point with no values |
+| `logit.input.metrics.skipped{reason="bad_sketch"\|"empty_sketch"\|"legacy_distribution"}` | count | a malformed `Dogsketch`, an empty one (no bins, zero count), or a legacy `distributions` entry, which is ignored |
+| `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
+| `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.metrics.skipped{reason="no_recorded_value"\|"non_finite_value"\|"empty_sketch"}` | count | a flagged record, a non-finite value, or a sketch with nothing in it |
+| `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
+| `logit.output.tags.dropped{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `datadog.*` carrier the target route has no field for |
+| `logit.input.logs.skipped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
+| `logit.input.events.skipped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
+| `logit.input.metrics.skipped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
+| `logit.output.metrics.skipped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `statsd.service_check.status` or its gauge |
+| `logit.output.tags.dropped{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
+
+`Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log
+timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
+and `malformed_service_check`.
+
 ## Metrics from Lua scripts
 
 A script's `process()`/`flush()` can call `telemetry.count(name, n, tags?)` and

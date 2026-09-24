@@ -864,6 +864,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `statsd_tag_values_are_copied_not_sliced`, inverted as its doc comment said it would be) asserts
   the zero-copy property structurally. See [memory.md](design/memory.md).
 
+## Datadog
+
+- **`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
+  unmeasured.** The Datadog JSON routes (v1 series, v2 JSON series, distribution points) need an
+  exactly rounded float parser to be a fixed point: `serde_json`'s default parser isn't correctly
+  rounded (it can land a value one or two ulps off the nearest `f64`, and re-parsing its own
+  shortest output can move it again), which would otherwise drift a relayed metric value on every
+  `datadog_in -> datadog_out` hop. `crates/logit-proto/Cargo.toml` enables `float_roundtrip` on
+  its `serde_json` dependency; Cargo unifies features across the workspace, so this also applies
+  to `otlp_in`'s OTLP/JSON decoding and, transitively, the `json` transform's parse path.
+  `serde_json` documents the feature as costing about 2x on float parsing.
+  - **Consequence:** a `json`-heavy pipeline (or `otlp_in`'s JSON leg) may parse floats slower by
+    an unmeasured amount; nothing else in the request changes.
+  - **Revisit trigger:** measure on the perf VM with `script/perf` (the `json` scenarios) against
+    a `main` binary before this stack merges, in the same VM session as W1's sketch-store
+    measurement. If the cost is material, the fallback is a codec-local exact parse of number
+    tokens in `logit_proto::datadog` rather than a workspace-wide tolerance, per
+    [ADR `event-sizing-and-allocation-strategy`](adr/event-sizing-and-allocation-strategy.md)'s
+    rule that a parsing/allocation-strategy change needs a real binary measurement, not a
+    micro-benchmark, before it's believed.
+
 ## syslog
 
 - **Narrowed: `event.timestamp` is still receipt time, not the sender's — but that's no longer the

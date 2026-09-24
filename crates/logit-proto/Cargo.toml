@@ -35,7 +35,13 @@ crc32c.workspace = true
 # ADR `otlp-json-decoding` for why (short version: derives can't express OTLP's hex-vs-base64 or
 # string-or-number dialect rules without fighting the derive, and this crate's generated `prost`
 # types are never hand-edited -- ADR `committed-pregenerated-otlp-protobuf`).
-serde_json.workspace = true
+# serde_json's default float parser isn't correctly rounded (a value can land one or two ulps
+# off, and re-parsing its own shortest output moves it again), so a metric relayed over a JSON
+# route would drift on every hop. `float_roundtrip` makes decode -> encode -> decode the identity.
+# Cargo unifies features, so this also makes OTLP/JSON and the `json` transform parse floats
+# exactly; the feature costs about 2x on float parsing only (serde_json's own documentation), and
+# `docs/known-gaps.md`'s Datadog entry gates the merge on a perf-VM measurement.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 base64.workspace = true
 # Prometheus remote-write's Snappy block compression (crates/logit-proto/src/prometheus) -- not yet
 # used by any codec (that's W2's remote_write.rs); a round-trip sanity test in
