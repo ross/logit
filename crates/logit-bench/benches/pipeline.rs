@@ -1,19 +1,18 @@
 //! Throughput benches over the reference nginx pipeline. Run with `script/bench`.
 //!
-//! Deliberately **not** part of `script/cibuild`: wall-clock benchmarking on shared CI runners
-//! measures the runner. The allocation numbers that *do* need to hold every build are assertions
-//! in `tests/allocations.rs` instead.
+//! **Not** part of `script/cibuild`: wall-clock benchmarking on shared CI runners measures the
+//! runner. The allocation numbers that must hold every build are assertions in
+//! `tests/allocations.rs` instead.
 //!
-//! Almost every bench here calls decoders, transforms, and encoders **directly**, sidestepping the
-//! tokio runtime and the channels between nodes entirely. That's a constraint, not a
-//! simplification: `divan::AllocProfiler` only counts allocations on threads Divan controls. The
-//! actual boundary is **no cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a real OS
-//! thread) -- not "no channel" -- which is what lets `mod runtime` below drive a real
-//! `tokio::sync::mpsc` channel and still trust its allocation column: a `current_thread` runtime's
-//! `block_on` keeps everything on the one thread Divan is already watching. See that module's own
-//! doc comment, and `docs/design/memory.md` §7, for the full account. What a full multi-node graph
-//! costs in wall-clock terms, spread across the real worker/OS threads `run_with_shutdown` actually
-//! spawns, is still a separate question needing a load generator, not a microbenchmark.
+//! Almost every bench here calls decoders, transforms, and encoders **directly**, bypassing the
+//! tokio runtime and the channels between nodes. That's a constraint, not a simplification:
+//! `divan::AllocProfiler` only counts allocations on threads divan controls. The boundary is **no
+//! cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a real OS thread), not "no
+//! channel", which is what lets `mod runtime` below drive a real `tokio::sync::mpsc` channel and
+//! still trust its allocation column: a `current_thread` runtime's `block_on` keeps everything on
+//! the one thread divan is watching. See that module's doc and `docs/design/memory.md` §7. What a
+//! full multi-node graph costs across the worker and OS threads `run_with_shutdown` spawns is
+//! `logit-perf`'s job (`docs/adr/load-test-harness.md`), not a microbenchmark's.
 
 use divan::{AllocProfiler, Bencher};
 use logit_bench::fixtures;
@@ -25,10 +24,9 @@ use logit_pipeline::Transform;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::ScriptWorker;
 
-/// Divan's own allocator, so every bench reports allocation count and bytes alongside its timing.
-/// Note that counting allocations is itself work that happens inside the timed region, so these
-/// timings are slightly pessimistic in absolute terms -- they're for comparing shapes against each
-/// other, not for quoting as throughput ceilings.
+/// divan's counting allocator, so every bench reports allocation count and bytes beside its
+/// timing. The counting runs inside the timed region, so the timings are slightly pessimistic:
+/// compare shapes with each other, don't quote them as throughput ceilings.
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
 
@@ -50,12 +48,11 @@ fn statsd_decode(bencher: Bencher, lines: usize) {
     bencher.bench_local(|| decoder.decode(divan::black_box(datagram.clone())));
 }
 
-/// `generate_in`'s two render paths, called straight through `build_batch` -- no runtime, no
-/// channel, nothing between the measurement and the generator, so this file's "no cross-thread
-/// hop" rule holds and the allocation column is trustworthy. `tests/allocations.rs`'s
-/// `generate_render_literal_100_events`/`generate_render_templated_100_events` pin the exact
-/// counts; these two are their wall-clock view, and the gap between them is what two placeholders
-/// cost per event.
+/// `generate_in`'s two render paths, called straight through `build_batch` with no runtime or
+/// channel in between, so the allocation column is trustworthy. `tests/allocations.rs`'s
+/// `generate_render_literal_100_events`/`generate_render_templated_100_events` pin the counts;
+/// these two are their wall-clock view, and the gap between them is what two placeholders cost per
+/// event.
 #[divan::bench]
 fn generate_render_literal(bencher: Bencher) {
     let mut input = fixtures::generate_literal();
@@ -93,8 +90,8 @@ fn json_parse(bencher: Bencher) {
         .bench_local_refs(|event| json.process(&resource, event));
 }
 
-/// [`json_parse`] on the 28-key pino-shaped line (`fixtures::WIDE_JSON_SYSLOG_LINE`) -- the
-/// per-key cost, which is what the parser's key cache is for, at a width where it dominates.
+/// [`json_parse`] on the 28-key pino-shaped line (`fixtures::WIDE_JSON_SYSLOG_LINE`): the per-key
+/// cost the parser's key cache targets, at a width where it dominates.
 #[divan::bench]
 fn json_parse_wide(bencher: Bencher) {
     let resource = fixtures::resource();
@@ -108,8 +105,8 @@ fn json_parse_wide(bencher: Bencher) {
         .bench_local_refs(|event| json.process(&resource, event));
 }
 
-/// `logfmt` on `fixtures::LOGFMT_LINE` (nine fields, all zero-copy) -- the transform-level
-/// counterpart of the `logfmt-parse` load-test scenario, and `json_parse`'s sibling.
+/// `logfmt` on `fixtures::LOGFMT_LINE` (nine fields, all zero-copy): the transform-level
+/// counterpart of the `logfmt-parse` load-test scenario.
 #[divan::bench]
 fn logfmt_parse(bencher: Bencher) {
     let resource = fixtures::resource();
@@ -167,10 +164,9 @@ fn keep(bencher: Bencher) {
         .bench_local_refs(|event| keep.process(&resource, event));
 }
 
-/// `shape` over the nginx shape (10 attributes, 4 metrics, a log body) -- the whole per-event
-/// path: the recursive attribute walk, the `resolve` per key for its length, the key-set hash, and
-/// the in-place rewrite into a measurement event
-/// (`docs/adr/shape-observer-component.md`).
+/// `shape` over the nginx shape (10 attributes, 4 metrics, a log body): the whole per-event path,
+/// covering the recursive attribute walk, the `resolve` per key for its length, the key-set hash,
+/// and the in-place rewrite into a measurement event (`docs/adr/shape-observer-component.md`).
 #[divan::bench]
 fn shape(bencher: Bencher) {
     let resource = fixtures::resource();
@@ -194,13 +190,13 @@ fn aggregate_absorb(bencher: Bencher) {
         .bench_local_refs(|event| agg.process(&resource, event));
 }
 
-/// The interner's probes in isolation, on the six nginx keys cycled in order -- what one key of
-/// one event costs a parser that goes to the process-wide table (`intern_hit`, `lookup_hit`), an
+/// The interner's probes in isolation, on the six nginx keys cycled in order: what one key of one
+/// event costs a parser that goes to the process-wide table (`intern_hit`, `lookup_hit`), an
 /// encoder that goes back (`resolve`), and a parser that fronts the table with a
-/// `logit_core::interner::KeyCache` instead (`key_cache_hit` for the in-order steady state,
+/// `logit_core::interner::KeyCache` (`key_cache_hit` for the in-order steady state,
 /// `key_cache_resync` for a producer that reverses its key order every line, so every key is a
-/// wrapping scan rather than a cursor hit). Single-threaded, so the shard lock is uncontended here:
-/// the pipeline pays more than this whenever two nodes probe at once.
+/// wrapping scan rather than a cursor hit). Single-threaded, so the shard lock is uncontended: the
+/// pipeline pays more whenever two nodes probe at once.
 mod interner {
     use super::*;
     use logit_core::interner::{self, intern, lookup, KeyCache, Symbol};
@@ -275,9 +271,9 @@ mod interner {
     }
 }
 
-/// What each extra fan-out consumer costs per event (`logit_pipeline::Fanout::send` deep-clones
-/// the batch for every consumer but the last). The `Arc<EventBatch>` copy-on-write change
-/// described in `docs/design/memory.md` is aimed squarely at this number.
+/// `Event::clone` per fixture shape: what a mutating fan-out consumer pays per event when
+/// `unwrap_batch`'s copy-on-write finds the batch still shared (`docs/design/memory.md` §3,
+/// "The `Arc<EventBatch>` copy-on-write change").
 mod clone {
     use super::*;
 
@@ -334,10 +330,10 @@ mod encode {
     }
 }
 
-/// The comparison `docs/known-gaps.md` has been carrying as an open item: `docs/design/lua-api.md`
-/// commits to the userdata proxy over full table conversion on reasoning alone. `proxy` is what a
-/// script pays reading two attributes through `EventProxy`; `to_table` is what the rejected
-/// design would have cost on every event whether the script touched an attribute or not.
+/// `docs/design/lua-api.md`'s userdata proxy against the full table conversion it rejected.
+/// `proxy` is what a script pays reading two attributes through `EventProxy`; `to_table` is what
+/// the rejected design would cost on every event, whether or not the script touches an
+/// attribute.
 mod lua {
     use super::*;
 
@@ -367,11 +363,9 @@ mod lua {
     }
 }
 
-/// Direct-call benches for `logit_proto::buffer::InMemoryBuffer` -- the sync buffer
-/// `logit_pipeline::SinkQueue` wraps (`docs/adr/buffered-sink-delivery.md`). Called directly,
-/// never through `SinkQueue`/tokio, for the same reason every other bench in this file calls its
-/// subject directly: `divan::AllocProfiler` only counts allocations on threads Divan controls, and
-/// a bench that hops through a channel or a tokio task would misreport.
+/// Direct-call benches for `logit_proto::buffer::InMemoryBuffer`, the sync buffer
+/// `logit_pipeline::SinkQueue` wraps (`docs/adr/buffered-sink-delivery.md`). Called directly, never
+/// through `SinkQueue` or tokio, for the module doc's no-cross-thread-hop reason.
 mod sink_queue {
     use super::*;
     use logit_core::EventBatch;
@@ -405,9 +399,9 @@ mod sink_queue {
         bencher.bench_local(|| divan::black_box(buf.peek().is_some()));
     }
 
-    /// The worst case for `DropOldest`: the buffer is held exactly at its bound (one slot, never
-    /// committed), so every push evicts the current head -- isolates what the eviction path itself
-    /// costs, on top of steady-state push/commit above.
+    /// The worst case for `DropOldest`: the buffer sits at its bound (one slot, never committed),
+    /// so every push evicts the current head. Isolates the eviction path's cost on top of the
+    /// steady-state push/commit above.
     #[divan::bench]
     fn push_drop_oldest_always_evicting(bencher: Bencher) {
         let mut buf: InMemoryBuffer<Arc<EventBatch>> =
@@ -421,29 +415,27 @@ mod sink_queue {
     }
 }
 
-/// The six survey-derived shapes (`docs/design/data-shapes.md` §7 follow-up 2,
-/// `docs/plans/event-sizing.md` W1), across the operations a sizing decision turns on: build,
-/// lookup (hit and miss), mutate (one insert, one remove), **clone**, a 1000-event batch scan, and
-/// a native encode/decode. `tests/allocations.rs`'s "Survey-derived shapes" section pins the
-/// allocation counts for the same fixtures; this module is their wall-clock view.
+/// The six survey-derived shapes (`docs/design/memory.md` §7, "The six survey-derived shapes"),
+/// across the operations a sizing decision turns on: build, lookup (hit and miss), mutate (one
+/// insert, one remove), **clone**, a 1000-event batch scan, and a native encode/decode.
+/// `tests/allocations.rs`'s "Survey-derived shapes" section pins the allocation counts for the
+/// same fixtures; this module is their wall-clock view.
 ///
-/// **No number from this module belongs in a document.** `docs/design/memory.md`'s preamble and
-/// `docs/design/performance.md`'s are explicit that a workstation with heterogeneous cores makes
-/// unpinned runs bimodal by about 2x, and that every recorded figure comes from the perf VM. These
-/// benches exist so W3's arms have something to run; the numbers come later, from
-/// `script/vm`/`script/perf`.
+/// **Run pinned** (`taskset -c 2`) on the perf VM. Unpinned runs on heterogeneous cores (Zen 5 and
+/// 5c) are bimodal by about 2x (`docs/design/performance.md` §0), and recorded figures come from
+/// the VM only.
 ///
-/// The parameterisation is by shape rather than by width, because the shapes differ in more than
-/// width: `pino_http_log` is narrower than `flat_json_log` and far more expensive to clone (four
-/// boxed `Value::Map`s), and `collectd_3_record` is narrow enough to stay inline while its
-/// *metric* list spills. A benchmark indexed by attribute count alone would miss both.
+/// Parameterized by shape, not width, because the shapes differ in more than width:
+/// `pino_http_log` is narrower than `flat_json_log` and far more expensive to clone (four boxed
+/// `Value::Map`s), and `collectd_3_record` is narrow enough to stay inline while its *metric* list
+/// spills. A benchmark indexed by attribute count alone would miss both.
 mod survey_shapes {
     use super::*;
     use logit_core::{Event, EventBatch, Value};
     use logit_proto::native::{NativeDecoder, NativeEncoder};
 
-    /// Every shape, and the attribute each lookup bench reads -- one that is really present, so
-    /// `lookup_hit` measures a successful binary search rather than a miss in disguise.
+    /// Every shape. `hit_key` names an attribute each one carries, so `lookup_hit` measures a
+    /// successful binary search rather than a miss in disguise.
     const SHAPES: [&str; 6] = [
         "flat_json_log",
         "pino_http_log",
@@ -453,9 +445,9 @@ mod survey_shapes {
         "otlp_log_record",
     ];
 
-    /// A key no shape carries, for `lookup_miss`. `AttrMap::get` is deliberately non-interning
-    /// (`docs/design/memory.md` §4), so a miss costs a failed interner *lookup* plus a failed
-    /// binary search and never grows the table -- which is exactly the path this measures.
+    /// A key no shape carries, for `lookup_miss`. `AttrMap::get` doesn't intern
+    /// (`docs/design/memory.md` §4), so a miss costs a failed interner *lookup* and never grows the
+    /// table; a key never interned returns before the binary search.
     const MISSING_KEY: &str = "no.such.attribute.anywhere";
 
     fn hit_key(shape: &str) -> &'static str {
@@ -470,8 +462,8 @@ mod survey_shapes {
         }
     }
 
-    /// The fixture for `shape`, already through whatever parser produces it -- so every bench
-    /// below starts from the same event `tests/allocations.rs` measured.
+    /// The fixture for `shape`, already through whatever parser produces it, so every bench below
+    /// starts from the same event `tests/allocations.rs` measures.
     fn event(shape: &str) -> Event {
         let resource = fixtures::resource();
         let mut json = fixtures::json_parser();
@@ -498,8 +490,8 @@ mod survey_shapes {
 
     /// Building the shape from scratch. For the three JSON-bodied shapes this is the real `json`
     /// transform over a `tail_in`-shaped event (the leg `docs/design/data-shapes.md` §5.3
-    /// measured); for the other three it is the fixture's own directly-constructed `insert` loop,
-    /// which is what `AttrMap`'s O(k²)-bytes sorted insert costs with no parser in front of it.
+    /// measured); for the other three it is the fixture's own `insert` loop, `AttrMap`'s
+    /// O(k²)-bytes sorted insert with no parser in front of it.
     #[divan::bench(args = SHAPES)]
     fn build(bencher: Bencher, shape: &str) {
         let resource = fixtures::resource();
@@ -537,9 +529,9 @@ mod survey_shapes {
             .bench_local(|| divan::black_box(&event).attributes.get(divan::black_box(MISSING_KEY)));
     }
 
-    /// One `insert` into an already-built map -- a `set`/`trace_context`/`regex`-shaped mutation.
-    /// The map is rebuilt per iteration (outside the timed region) so the insert is always the
-    /// k+1-th, never an overwrite of the previous iteration's.
+    /// One `insert` into an already-built map: a `set`/`trace_context`/`regex`-shaped mutation.
+    /// The map is rebuilt per iteration (outside the timed region), so the insert is always the
+    /// (k+1)th, never an overwrite of the previous iteration's.
     #[divan::bench(args = SHAPES)]
     fn insert_one(bencher: Bencher, shape: &str) {
         bencher.with_inputs(|| event(shape)).bench_local_refs(|event| {
@@ -547,7 +539,7 @@ mod survey_shapes {
         });
     }
 
-    /// One `remove` -- `keep`/`remove`'s per-attribute cost, an O(k) `Vec::remove` after the same
+    /// One `remove`: `keep`/`remove`'s per-attribute cost, an O(k) `Vec::remove` after the same
     /// binary search `lookup_hit` measures.
     #[divan::bench(args = SHAPES)]
     fn remove_one(bencher: Bencher, shape: &str) {
@@ -567,8 +559,8 @@ mod survey_shapes {
     }
 
     /// A 1000-event batch (`receive.batch_max_events`' default) scanned end to end, reading one
-    /// attribute per event -- the cache-density measurement `size_of::<Event>()` moves and
-    /// `AttrMap::get` alone does not. At 864 bytes an `Event` this walks 864 KB per iteration.
+    /// attribute per event: the cache-density cost `size_of::<Event>()` moves and `AttrMap::get`
+    /// alone doesn't. At 864 bytes an `Event`, this walks 864 KB per iteration.
     #[divan::bench(args = SHAPES)]
     fn scan_1000(bencher: Bencher, shape: &str) {
         let key = hit_key(shape);
@@ -593,11 +585,10 @@ mod survey_shapes {
         bencher.bench_local(|| encoder.encode(divan::black_box(&batch)));
     }
 
-    /// The decode side, where `docs/plans/event-sizing.md`'s lead finding lives: `read_attr_map_at`
-    /// (`crates/logit-proto/src/native/value.rs`) reads the exact attribute count off the wire and
-    /// discards it, then rebuilds the map by k sorted `insert_sym`s -- in the *writer's* symbol
-    /// order, which dictionary remapping has already made unsorted for the reader. So this is the
-    /// O(k²)-bytes build in its purest form.
+    /// The decode side. `read_attr_map_at` (`crates/logit-proto/src/native/value.rs`) reads the
+    /// exact attribute count off the wire but doesn't reserve with it, then rebuilds the map by k
+    /// sorted `insert_sym`s in the *writer's* symbol order, which dictionary remapping can leave
+    /// unsorted for the reader: the O(k²)-bytes build with no parser in front of it.
     #[divan::bench(args = SHAPES)]
     fn native_decode(bencher: Bencher, shape: &str) {
         let batch = one_event_batch(shape);
@@ -620,17 +611,17 @@ mod survey_shapes {
 ///
 /// What is reachable here and what is not:
 ///
-/// - **`retain_mut`** -- reachable, as `logit_pipeline::process_batch`, which *is* the
+/// - **`retain_mut`**: reachable, as `logit_pipeline::process_batch`, which *is* the
 ///   `events.retain_mut(...)` path (ADR `in-place-transform-process`). Benched below.
-/// - **`route_batch`** -- reachable, a plain synchronous call. Benched below.
-/// - **`drain_inbox`** -- reachable but not meaningfully benchable per iteration. It is a loop
-///   that returns only when its inbox closes (`crates/logit-pipeline/src/runtime.rs`), so every
-///   iteration would have to build a fresh `mpsc` channel and `SinkStore`, drop the sender, and
-///   then measure mostly that setup. `tests/allocations.rs`'s
-///   `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc` covers the path where the
-///   one-shot shape does not distort the measurement -- an allocation count, not a timing.
-/// - **`Fanout::send`'s copy-on-write clone** -- reachable and already benched, in `mod runtime`
-///   below (`fanout_send_two_consumers`), on the nginx shape.
+/// - **`route_batch`**: reachable, a plain synchronous call. Benched below.
+/// - **`drain_inbox`**: reachable but not usefully benchable per iteration. It is a loop that
+///   returns only when its inbox closes (`crates/logit-pipeline/src/runtime.rs`), so every
+///   iteration would build a fresh `mpsc` channel and `SinkStore`, drop the sender, and measure
+///   mostly that setup. `tests/allocations.rs`'s
+///   `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc` counts its allocations
+///   instead, where the one-shot shape doesn't distort the measurement.
+/// - **`Fanout::send`'s copy-on-write clone**: benched in `mod runtime` below
+///   (`fanout_send_two_consumers`), on the nginx shape.
 mod survey_batch {
     use super::*;
     use logit_core::{EventBatch, Telemetry};
@@ -639,8 +630,8 @@ mod survey_batch {
 
     /// `EventBatch::clone` over the measured collector batch: five 9-attribute events (one slot
     /// past inline, so every one of them spills) and a 17-attribute `Resource` that is
-    /// `Arc`-shared and therefore *not* copied. The asymmetry is the point -- see
-    /// `tests/allocations.rs`'s `clone_enriched_resource_batch`.
+    /// `Arc`-shared and therefore *not* copied. `tests/allocations.rs`'s
+    /// `clone_enriched_resource_batch` pins that asymmetry.
     #[divan::bench]
     fn clone_enriched_batch(bencher: Bencher) {
         let batch = fixtures::enriched_resource_batch();
@@ -667,9 +658,9 @@ mod survey_batch {
         EventBatch { resource, scope: None, events: (0..count).map(|_| event.clone()).collect() }
     }
 
-    /// `process_batch` -- the `Vec::retain_mut` path every transform node runs -- over 100 of the
-    /// widest survey shape, through `keep`. `keep` rebuilds the map, so this is where a 30-entry
-    /// `AttrMap`'s per-event cost shows up at batch scale rather than one event at a time.
+    /// `process_batch`, the `Vec::retain_mut` path every transform node runs, over 100 of the
+    /// widest survey shape, through `keep`. `keep` rebuilds the map, so this shows a 30-entry
+    /// `AttrMap`'s per-event cost at batch scale.
     #[divan::bench]
     fn process_batch_100_access_logs(bencher: Bencher) {
         let mut keep = fixtures::keep();
@@ -679,10 +670,9 @@ mod survey_batch {
             .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
     }
 
-    /// `route_batch`'s partition-and-move pass over the same 100 wide events -- one
-    /// `size_of::<Event>()` move per event (`docs/design/memory.md` §3's routing section), which
-    /// is the batch-level cost that scales directly with `Event`'s size rather than with its
-    /// allocation count.
+    /// `route_batch`'s partition-and-move pass over the same 100 wide events: one
+    /// `size_of::<Event>()` move per event (`docs/design/memory.md` §3's routing section), the
+    /// batch-level cost that scales with `Event`'s size rather than its allocation count.
     #[divan::bench]
     fn route_batch_100_access_logs(bencher: Bencher) {
         let mut router = logit_transforms::Route::new(
@@ -698,7 +688,7 @@ mod survey_batch {
     }
 }
 
-/// Decode through aggregation for one access-log line -- the number that bounds ingest throughput
+/// Decode through aggregation for one access-log line: the number that bounds ingest throughput
 /// for the reference config.
 #[divan::bench]
 fn full_chain(bencher: Bencher) {
@@ -722,17 +712,16 @@ fn full_chain(bencher: Bencher) {
 }
 
 /// The node-runtime paths `tests/allocations.rs`'s "Runtime" section pins by exact allocation
-/// count -- this module is their throughput/wall-clock view.
+/// count; this module is their wall-clock view.
 ///
 /// `fanout_send_one_consumer`/`fanout_send_two_consumers`/`send_batch_through_a_noop_output` are
-/// the deliberate exceptions to this file's module doc above: they *do* cross a
-/// `tokio::sync::mpsc` channel (the fanout pair) or call through `#[async_trait]` (`send_batch`).
-/// Both are still safe to read the allocation column on, for the reason the module doc above gives
-/// in full: neither ever calls `tokio::spawn`, so nothing here leaves the one thread Divan is
-/// watching. `tests/allocations.rs`'s own `fanout_send_one_consumer_costs_nothing`,
+/// the exceptions to the module doc's direct-call rule: they cross a `tokio::sync::mpsc` channel
+/// (the fanout pair) or call through `#[async_trait]` (`send_batch`). Their allocation column is
+/// still trustworthy, for the reason the module doc gives: nothing calls `tokio::spawn`, so
+/// nothing leaves the one thread divan is watching. Cross-check this module's allocation column
+/// against `tests/allocations.rs`'s `fanout_send_one_consumer_costs_nothing`,
 /// `fanout_send_two_consumers_costs_one_clone_plus_one_arc`, and
-/// `send_batch_through_a_noop_output_disabled_telemetry` use the identical construction and are
-/// the numbers to cross-check this module's allocation column against.
+/// `send_batch_through_a_noop_output_disabled_telemetry`, which use the identical construction.
 mod runtime {
     use super::*;
     use logit_core::{EventBatch, Telemetry};
@@ -740,9 +729,8 @@ mod runtime {
         process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout,
     };
 
-    /// `run_transform`'s per-batch body (`logit_pipeline::process_batch`), with no channel or
-    /// runtime involved at all -- a plain synchronous call, so both of this bench's columns are
-    /// trustworthy the same way every other bench above it is.
+    /// `run_transform`'s per-batch body (`logit_pipeline::process_batch`), a plain synchronous call
+    /// with no channel or runtime.
     #[divan::bench]
     fn process_batch_through_keep(bencher: Bencher) {
         let mut keep = fixtures::keep();
@@ -752,8 +740,8 @@ mod runtime {
             .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
     }
 
-    /// One consumer -- the common case (every listener's first hop, every interior edge of a
-    /// linear chain) -- costing nothing, per `tests/allocations.rs`'s
+    /// One consumer, the common case (every listener's first hop, every interior edge of a linear
+    /// chain), which allocates nothing per `tests/allocations.rs`'s
     /// `fanout_send_one_consumer_costs_nothing`.
     #[divan::bench]
     fn fanout_send_one_consumer(bencher: Bencher) {
@@ -770,9 +758,9 @@ mod runtime {
     }
 
     /// A real fan-out: one branch clones (`Arc::try_unwrap` fails, `unwrap_batch` falls back), the
-    /// other doesn't -- see `tests/allocations.rs`'s
-    /// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` for the exact accounting this
-    /// bench's allocation column should match.
+    /// other doesn't. `tests/allocations.rs`'s
+    /// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` has the accounting this bench's
+    /// allocation column should match.
     #[divan::bench]
     fn fanout_send_two_consumers(bencher: Bencher) {
         let rt =
@@ -790,8 +778,8 @@ mod runtime {
         });
     }
 
-    /// A no-op `Output`, matching `tests/allocations.rs`'s own -- isolates `send_batch`'s own
-    /// accounting from any real sink's encode/write cost.
+    /// A no-op `Output`, matching `tests/allocations.rs`'s, so `send_batch`'s own accounting is
+    /// isolated from any real sink's encode/write cost.
     struct NoopOutput;
 
     #[async_trait::async_trait]
@@ -801,9 +789,8 @@ mod runtime {
         }
     }
 
-    /// `run_output`'s per-batch body (`logit_pipeline::send_batch`) -- added in review alongside
-    /// `tests/allocations.rs`'s own `send_batch` coverage, closing the gap where this module had a
-    /// throughput bench for `run_transform`'s body but none for `run_output`'s.
+    /// `run_output`'s per-batch body (`logit_pipeline::send_batch`), as
+    /// `process_batch_through_keep` is `run_transform`'s.
     #[divan::bench]
     fn send_batch_through_a_noop_output(bencher: Bencher) {
         let rt =
@@ -821,9 +808,8 @@ mod runtime {
             });
     }
 
-    /// Always fails, matching `tests/allocations.rs`'s own -- the throughput counterpart to
-    /// `send_batch_through_a_failing_output_disabled_telemetry`, added alongside it in the second
-    /// round of review (every `send_batch` bench before this one only ever succeeded).
+    /// Always fails, matching `tests/allocations.rs`'s: `send_batch`'s error path, the wall-clock
+    /// counterpart to `send_batch_through_a_failing_output_disabled_telemetry`.
     struct FailingOutput;
 
     #[async_trait::async_trait]

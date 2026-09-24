@@ -1,66 +1,59 @@
-//! **Arm C -- the clone path.** Why `AttrMap::clone` costs what W2 measured, and what a production
-//! fix would look like.
+//! **Arm C: the clone path.** Why `AttrMap::clone` costs far more than copying its bytes, and four
+//! candidate replacements measured against the shipped clone. `benches/size_vs_alloc.rs`'s
+//! `attr_clone` group found the gap; `docs/design/performance.md` §8 has the numbers, and
+//! ADR `event-sizing-and-allocation-strategy` found no candidate worth adopting.
 //!
-//! W2 put `AttrMap::clone` at ~190 ns for eight *inline* `Value::I64` entries -- 392 bytes, no
-//! allocation -- and at ~16 ns per entry past that. A 392-byte copy is single-digit nanoseconds
-//! (`benches/size_vs_alloc.rs`'s `move_value` group measures 0.022 ns/byte), so something other
-//! than the copy is being paid. This module is the search for it, with four candidate replacements
-//! measured against the shipped one.
-//!
-//! **What the code actually does.** `AttrMap` derives `Clone`, so it is `SmallVec::clone`, which in
+//! **What the shipped clone does.** `AttrMap` derives `Clone`, so it is `SmallVec::clone`, which in
 //! smallvec 1.16 is `SmallVec::from(self.as_slice())` -> `slice.iter().cloned().collect()` ->
-//! `SmallVec::new()` + `Extend::extend`. Two consequences follow from reading that, both
-//! measurable here:
+//! `SmallVec::new()` + `Extend::extend`. Two consequences, both measurable here:
 //!
 //! 1. **The copy is an element-at-a-time loop, not a `memcpy`.** `extend` writes through
 //!    `SetLenOnDrop`, which stores the new length to memory on every iteration; each element goes
 //!    through `Value`'s derived `Clone`, a ten-variant match that LLVM outlines rather than
-//!    inlines (four of the variants -- `Bytes`, `Str`, `Array`, `Map` -- carry real work). The
-//!    per-element store to the length field and the outlined call together stop the loop
-//!    vectorizing. smallvec's `Copy` specialization, which would `memcpy`, is behind the nightly
-//!    `specialization` feature and is not enabled -- and `(Symbol, Value)` is not `Copy` anyway.
-//! 2. **A spilled clone over-allocates.** `extend` calls `reserve(9)`, and smallvec's `reserve`
-//!    rounds `len + additional` up to the **next power of two** (`try_reserve`, verified against
-//!    smallvec 1.16's source). So cloning a 9- or 12-entry map allocates 16 × 48 = **768 bytes**
-//!    where 432 or 576 would do, and a 17- or 30-entry map allocates 32 × 48 = **1536**.
-//!    `SmallVec::with_capacity` goes through `reserve_exact` and does not.
+//!    inlines (four of the variants, `Bytes`, `Str`, `Array`, and `Map`, carry real work). The
+//!    per-element length store and the outlined call together stop the loop vectorizing.
+//!    smallvec's `Copy` specialization, which would `memcpy`, needs the nightly `specialization`
+//!    feature, and `(Symbol, Value)` isn't `Copy` anyway.
+//! 2. **A spilled clone over-allocates.** `extend` calls `reserve(len)`, and smallvec's `reserve`
+//!    rounds `len + additional` up to the **next power of two** (`try_reserve` in smallvec 1.16).
+//!    So cloning a 9- or 12-entry map allocates 16 × 48 = **768 bytes** where 432 or 576 would do,
+//!    and a 17- or 30-entry map allocates 32 × 48 = **1536**. `SmallVec::with_capacity` goes
+//!    through `reserve_exact` and does not.
 //!
-//! **The candidates**, each a free function over the same mirror type so the shipped `AttrMap` is
-//! never changed by this PR:
+//! **The candidates**, each over the same mirror type so the shipped `AttrMap` is unchanged:
 //!
-//! - [`MirrorMap::clone_baseline`] -- what ships today, through the same `SmallVec` path.
-//! - [`MirrorMap::clone_exact_loop`] -- `with_capacity(len)` (so: exactly sized) plus a tight write
-//!   loop through a raw pointer that sets the length once, at the end. This is candidate (i).
-//! - [`MirrorMap::clone_scalar_branch`] -- the same loop, with `Value`'s clone reduced to **one**
-//!   branch for the scalar variants and a call for the rest. Candidate (iii).
-//! - [`MirrorMap::clone_detect_pod`] -- scans the entry slice for a non-scalar value and, finding
-//!   none, copies the whole slice with one `copy_nonoverlapping`. Candidate (ii), in its
-//!   no-extra-state form: the question it answers is whether the detection is cheap enough to pay
-//!   for itself on a mix that fails it.
-//! - [`PodFlagMap`] -- candidate (ii) in its cheap-detection form: a per-map `all_scalar` flag
-//!   maintained by `insert`, so the clone branches once on a bool it already has. The cost moves to
-//!   the build, which is why it is a separate type rather than another method.
+//! - [`MirrorMap::clone_baseline`]: the shipped path, through the same `SmallVec` clone.
+//! - [`MirrorMap::clone_exact_loop`], candidate (i): `with_capacity(len)` (exactly sized) plus a
+//!   tight write loop through a raw pointer that sets the length once, at the end.
+//! - [`MirrorMap::clone_scalar_branch`], candidate (iii): the same loop, with `Value`'s clone
+//!   reduced to **one** branch for the scalar variants and a call for the rest.
+//! - [`MirrorMap::clone_detect_pod`], candidate (ii) with no extra state: scans the entry slice
+//!   for a non-scalar value and, finding none, copies the whole slice with one
+//!   `copy_nonoverlapping`. It answers whether the detection pays for itself on a mix that fails
+//!   it.
+//! - [`PodFlagMap`], candidate (ii) with cheap detection: a per-map `all_scalar` flag maintained
+//!   by `insert`, so the clone branches once on a bool it already has. The cost moves to the
+//!   build, which is why it is a separate type rather than another method.
 //!
-//! **The measurement shape matters as much as the candidates, and W2's numbers are distorted by
-//! it.** divan stores each iteration's return value into a pre-allocated `DeferSlot` when the
-//! output needs dropping (`divan-0.1.21`'s `benchmark/mod.rs`: the `size_of::<O>() == 0 ||
-//! !needs_drop::<O>()` branch is the cheap one, everything else goes through `defer_store`). A
-//! `SmallVec<[(Symbol, Value); 8]>` is ~400 bytes and needs dropping, so a bench that *returns* one
-//! writes 400 bytes into a fresh slot of a multi-megabyte buffer on every iteration -- streaming
-//! stores the benched code never performs. `benches/attr_arms.rs` measures every candidate in the
-//! **consumed** shape (clone, `black_box` the reference, drop inside the timed region, return `()`)
-//! and keeps one *returned* bench per candidate purely to show the gap. The same distortion sits
-//! under W2's §3 build comparison, where today's arm returns a 400-byte `AttrMap` and the arm-P
-//! mirror returns a 24-byte `Vec` -- that comparison is not like-for-like.
+//! **Measure consumed, not returned.** divan stores each iteration's return value into a
+//! pre-allocated `DeferSlot` when the output needs dropping (`divan-0.1.21`'s `benchmark/mod.rs`:
+//! the `size_of::<O>() == 0 || !needs_drop::<O>()` branch is the cheap one; everything else goes
+//! through `defer_store`). A `SmallVec<[(Symbol, Value); 8]>` is ~400 bytes and needs dropping, so
+//! a bench that *returns* one writes 400 bytes into a fresh slot of a multi-megabyte buffer every
+//! iteration: stores the benched code never performs. `benches/attr_arms.rs` measures every
+//! candidate **consumed** (clone, `black_box` the reference, drop inside the timed region, return
+//! `()`) and keeps one *returned* bench to show the gap. `size_vs_alloc.rs`'s `attr_clone` and
+//! `build_shape` return their outputs, so they carry this distortion, and `build_shape`'s two arms
+//! return different sizes (a ~400-byte `AttrMap` against a 24-byte `Vec`).
 //!
-//! **Simplifications to hold against these numbers.** The mirror uses the *real*
-//! `logit_core::Value`, so no value-side layout drift is possible; only the map wrapper is local,
-//! and it has the same `SmallVec<[(Symbol, Value); 8]>` backing, the same sorted invariant and the
-//! same `insert_sym` body as `AttrMap`. What it does not mirror is `AttrMap`'s visibility from
-//! `logit-core`: these clones are all in the same codegen unit as their callers, so LLVM may inline
-//! them where a cross-crate `AttrMap::clone` (not `#[inline]`, no LTO in `cargo bench`'s profile)
-//! would not. That flatters every candidate equally, including the baseline, which is what keeps
-//! the *ratios* usable and the absolute numbers merely indicative.
+//! **What the mirror simplifies.** It uses the *real* `logit_core::Value`, so no value-side layout
+//! drift is possible; only the map wrapper is local, with the same
+//! `SmallVec<[(Symbol, Value); 8]>` backing, sorted invariant, and `insert_sym` body as `AttrMap`.
+//! What differs is crate placement: these clones compile in the same crate as their callers, while
+//! `AttrMap::clone` is cross-crate and not `#[inline]`, reachable for inlining only through the
+//! `lto = true` that `cargo bench` inherits from `[profile.release]`. Any inlining advantage
+//! applies to every candidate, the baseline included, so the *ratios* are usable and the absolute
+//! numbers only indicative; `benches/attr_arms.rs`'s `clone_c::real_attrmap` is the control.
 
 use logit_core::interner::Symbol;
 use logit_core::Value;
@@ -69,11 +62,11 @@ use smallvec::SmallVec;
 /// The same backing store `AttrMap` uses: eight inline `(Symbol, Value)` entries, 48 bytes each.
 pub type Entries = SmallVec<[(Symbol, Value); 8]>;
 
-/// Whether `value` is one of the variants that owns nothing on the heap -- so a bitwise copy of it
+/// Whether `value` is one of the variants that owns nothing on the heap, so a bitwise copy of it
 /// is a complete, independent clone and dropping either copy is a no-op.
 ///
-/// Exhaustive on purpose (no `_` arm): a new `Value` variant must be classified here deliberately,
-/// because getting this wrong makes [`clone_scalar_value`] unsound rather than slow.
+/// Exhaustive (no `_` arm), so a new `Value` variant fails to compile until it is classified here:
+/// a wrong answer makes [`clone_scalar_value`] unsound, not slow.
 #[inline]
 pub fn is_scalar(value: &Value) -> bool {
     match value {
@@ -100,8 +93,8 @@ pub fn clone_scalar_value(value: &Value) -> Value {
     }
 }
 
-/// A local stand-in for `AttrMap` -- same backing store, same sorted-by-`Symbol` invariant, same
-/// `insert` semantics (last write wins on a repeated key) -- so the clone strategies below can be
+/// A local stand-in for `AttrMap`, with the same backing store, sorted-by-`Symbol` invariant, and
+/// `insert` semantics (last write wins on a repeated key), so the clone strategies below can be
 /// compared without touching `logit-core`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MirrorMap(Entries);
@@ -119,7 +112,7 @@ impl MirrorMap {
         }
     }
 
-    /// Builds from a parser's arrival-order scratch the way every producer does today.
+    /// Builds from a parser's arrival-order scratch the way every shipped producer does.
     pub fn from_scratch(scratch: &[(Symbol, Value)]) -> Self {
         let mut map = Self::new();
         for (k, v) in scratch {
@@ -128,7 +121,7 @@ impl MirrorMap {
         map
     }
 
-    /// Builds from entries already sorted and deduplicated -- arm **P**'s bulk build, for the arms
+    /// Builds from entries already sorted and deduplicated (arm **P**'s bulk build), for callers
     /// that want a map without paying the O(k²) build first.
     pub fn from_sorted(entries: Vec<(Symbol, Value)>) -> Self {
         debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "sorted and deduplicated");
@@ -214,11 +207,11 @@ impl MirrorMap {
 /// **Candidate (ii), flagged**: the same map carrying a bit that says whether every value is a
 /// scalar, maintained by `insert` so the clone never has to look.
 ///
-/// The bit costs one branch per inserted value on the build path and one `bool` of footprint
-/// (which `AttrMap`'s `SmallVec` has spare padding for -- `size_of` is pinned in
-/// `tests/attr_arms.rs`). It is only ever *cleared*, never re-established: removing the last
-/// non-scalar value leaves the map falsely marked mixed, which costs a slower clone and nothing
-/// else. That asymmetry is deliberate and is what keeps `remove` free of a rescan.
+/// The bit costs one branch per inserted value on the build path and one `bool` of footprint (at
+/// most one word after padding; `tests/attr_arms.rs` bounds `size_of`). It is only ever
+/// *cleared*, never re-established: removing the last non-scalar value would leave the map falsely
+/// marked mixed, which costs a slower clone and nothing else, and keeps a `remove` free of a
+/// rescan.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PodFlagMap {
     entries: Entries,

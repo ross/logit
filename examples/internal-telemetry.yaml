@@ -1,29 +1,22 @@
-# Self-observability: drains logit's own component-level telemetry into the graph like any other
-# source (docs/design/internal-telemetry.md, docs/adr/internal-telemetry-as-pipeline-events.md).
-# `self` here is just a component id -- nothing about `internal`'s type requires that name.
+# Self-observability: `internal` drains logit's own component-level telemetry into the graph like
+# any other source (docs/design/internal-telemetry.md). `self` is an ordinary component id.
+# `influx_out` points at the dev stack's `influxdb` service (compose.yaml), which seeds org `logit`
+# and only the `metrics` bucket: create the `internal` bucket there first, or change `bucket`.
 #
-# `self`'s `interval` is both the drain cadence for every component's buffered points and the
-# sampling tick for logit's own process-level gauges (interner size, uptime). It's picked here to
-# divide evenly into `windowed`'s 60s aggregation interval, per docs/design/internal-telemetry.md's
-# guidance -- a real aggregation window should never straddle two `internal` drains.
+# `self`'s `interval` is the drain cadence and the sampling tick for process-level gauges. Pick
+# one that divides evenly into `windowed`'s 60s interval, so an aggregation window never straddles
+# two drains. `windowed` is optional (`internal` coalesces repeat points between drains), but it's
+# how you get real time-windowed telemetry.
 #
-# `windowed` isn't required -- `internal`'s own buffer already coalesces repeat points between
-# drains -- but attaching `aggregate` here is the intended way to get real time-windowed telemetry:
-# `internal` emits whatever accumulated since the last drain, `aggregate` turns that into actual
-# 60-second windows, using the exact same merge semantics
-# (docs/adr/aggregation-window-semantics.md) as any other metric passing through it.
-#
-# `stat_in` and `logs_only`/`logs_out` below are the workstream D demonstration
-# (docs/plans/operator-surface.md, docs/design/internal-telemetry.md's "Logs" section): `self`'s
-# default `logs: warn` threshold captures every `warn`-and-above self-diagnostic -- including
-# `stat_in`'s own throttled `bad_line` warning -- into the same drain as `self`'s points and
-# spans. Send it a malformed line and watch `logs_out`:
+# `stat_in` and `logs_only`/`logs_out` show the "Logs" capture: `self`'s default `logs: warn`
+# turns every `warn`-and-above self-diagnostic into a log event in the same drain. Send a
+# malformed line and watch `logs_out`:
 #
 #   printf 'not a valid statsd line' | nc -u -w0 localhost 8125
 #
-# A `bad_line` log event should reach `logs_out` on `self`'s next tick (within `interval`
-# below), attributed to `component: stat_in` -- `Diagnostics::warn_throttled` reports the 1st,
-# 2nd, 4th, ... occurrence, so send it a few times if the first doesn't show up.
+# A `bad_line` log event attributed to `component: stat_in` reaches `logs_out` on `self`'s next
+# tick. The warning is throttled to the 1st, 2nd, 4th, ... occurrence, so send it a few times if
+# the first doesn't show up.
 components:
   self:
     type: internal
@@ -42,10 +35,8 @@ components:
     bucket: internal
     token: !env INFLUXDB_TOKEN
 
-  # A real listener whose own throttled diagnostics (a malformed line, chief among them) are
-  # exactly what `self` captures as log events -- see the header comment above for how to trigger
-  # one by hand. `stdout` below is just proof the listener's ordinary decode path also works;
-  # nothing about it is specific to this example.
+  # A real listener whose throttled diagnostics `self` captures as log events; see the header for
+  # how to trigger one. `stdout` shows the listener's ordinary decode path also works.
   stat_in:
     type: statsd_in
     bind: 0.0.0.0:8125
@@ -54,9 +45,8 @@ components:
     type: stdio_out
     sources: [stat_in]
 
-  # Isolates `self`'s log-carrying events from its points and spans -- `keep_signals` clears the
-  # payload slots it isn't given (ADR `signal-filtering-components`), so `logs_out` below never
-  # sees a metric point or a span, only `LogRecord`-carrying events.
+  # `keep_signals` clears the payload slots it isn't given, so `logs_out` sees only
+  # `LogRecord`-carrying events, never a point or a span.
   logs_only:
     type: keep_signals
     sources: [self]

@@ -11,22 +11,17 @@ pub struct Resource {
 }
 
 impl Resource {
-    /// This resource's own contribution to [`crate::EventBatch::estimated_heap_bytes`] -- counted
-    /// once per batch there (a resource is `Arc`-shared across every event, not copied per event),
-    /// so exposed here as its own method rather than inlined, for a caller tracking that total
-    /// incrementally (`logit_pipeline::BatchAccumulator`) to add exactly once per held resource,
-    /// alongside [`crate::Event::estimated_heap_bytes`]'s per-event half of the same formula.
+    /// This resource's share of [`crate::EventBatch::estimated_heap_bytes`], counted once per
+    /// batch; an incremental caller adds it once alongside [`crate::Event::estimated_heap_bytes`].
     pub fn estimated_heap_bytes(&self) -> u64 {
         crate::event::attr_map_heap_bytes(&self.attributes)
             + self.schema_url.as_ref().map(|s| s.len() as u64).unwrap_or(0)
     }
 }
 
-/// The instrumentation scope a batch's events were reported through -- OTLP's `InstrumentationScope`
-/// (a name/version pair, e.g. `"nginx-otel-module"`/`"1.0.0"`), carried at the batch level rather
-/// than duplicated onto every event's own attributes the way an earlier, since-retired convention
-/// did (`docs/adr/lossless-transit.md`). `None` means no scope was reported or carried -- most
-/// non-OTLP producers.
+/// OTLP's `InstrumentationScope` (e.g. `"nginx-otel-module"`/`"1.0.0"`), carried once per batch
+/// rather than on every event (`docs/adr/lossless-transit.md`). Most non-OTLP producers have none
+/// (`EventBatch::scope` is `None`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scope {
     pub name: Bytes,
@@ -37,9 +32,7 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// This scope's own contribution to [`crate::EventBatch::estimated_heap_bytes`] -- counted
-    /// once per batch (a scope is `Arc`-shared across every event, same reasoning as
-    /// [`Resource::estimated_heap_bytes`]).
+    /// This scope's share of [`crate::EventBatch::estimated_heap_bytes`], counted once per batch.
     pub fn estimated_heap_bytes(&self) -> u64 {
         crate::event::attr_map_heap_bytes(&self.attributes)
             + self.name.len() as u64

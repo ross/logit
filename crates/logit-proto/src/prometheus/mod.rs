@@ -2,30 +2,26 @@
 //! `Point`) and its two conversions to and from `logit`'s own event model. The text syntax for both
 //! dialects lives next door in [`text`]; nothing in this file knows what a line looks like.
 //!
-//! **This module doc is the mapping table** (house convention, see `crate::otlp`'s module doc).
+//! **This module doc is the mapping table and the canonical "Permitted normalizations" list**;
+//! docs, tests, and examples point here.
 //!
 //! **Why the split.** [`MetricFamily`] is the seam: [`text`] maps exposition bytes ↔ families,
 //! [`remote_write`] maps prompb 1.0/2.0 ↔ families, [`assemble`] holds the flat-sample reassembly
-//! both of those need, and *this* module maps families ↔ [`Event`]s. The second syntax module
-//! ([ADR `prometheus-remote-write`](../../../../docs/adr/prometheus-remote-write.md)) plugged into
-//! the seam [ADR `prometheus-scrape-and-exposition`](../../../../docs/adr/prometheus-scrape-and-exposition.md)'s
-//! forward-compatibility section reserved for it and **changed none of the mapping tables below** --
-//! remote-write is a transport for exactly the semantics the exposition format already describes
-//! (`docs/design/telemetry-landscape.md`'s remote-write section), so the model mapping must not
-//! depend on wire syntax, and doesn't. What it did add is three switches
-//! ([`PrometheusDecoder::with_timestamp_marker`], [`PrometheusEncoder::with_timestamps_always`],
-//! [`PrometheusEncoder::with_stale_markers`]) and one [`Point`] variant ([`Point::Stale`]), each of
-//! which defaults to the exposition path's existing behaviour.
+//! both of those need, and *this* module maps families ↔ [`Event`]s. Remote-write carries the same
+//! semantics the exposition format describes (`docs/design/telemetry-landscape.md`'s remote-write
+//! section), so the tables below must not depend on wire syntax. What remote-write needs beyond
+//! them is three switches ([`PrometheusDecoder::with_timestamp_marker`],
+//! [`PrometheusEncoder::with_timestamps_always`], [`PrometheusEncoder::with_stale_markers`]) and
+//! one [`Point`] variant ([`Point::Stale`]); each switch defaults to the exposition behaviour
+//! ([ADR `prometheus-remote-write`](../../../../docs/adr/prometheus-remote-write.md)).
 //!
 //! **No [`crate::Encoder`]/[`crate::Decoder`]/[`crate::SignalEncoder`]/[`crate::SignalDecoder`]
-//! implementation here**, deliberately, for the reason `statsd_out`/`syslog_out` don't have one
-//! either (ADR `statsd-output` §"No `logit_proto::Encoder`"): `prometheus_out` is a *stateful*
-//! registry an HTTP handler renders on demand -- there is no `EventBatch -> bytes` call at all, and
-//! `prometheus_in` is an HTTP *client* that already holds the response body, not a framed stream a
-//! `Decoder` gets fed. Both would have to lie about their shape to fit those traits. Plain
-//! functions plus the two builder-configured handle types below ([`PrometheusDecoder`],
-//! [`PrometheusEncoder`], `with_telemetry`/`with_diagnostics` like [`crate::otlp::OtlpEncoder`])
-//! give the counters a home without inventing a trait relationship.
+//! implementation here** (ADR `statsd-output` §"No `logit_proto::Encoder`" has the same reasoning):
+//! `prometheus_out` is a *stateful* registry an HTTP handler renders on demand, with no
+//! `EventBatch -> bytes` call, and `prometheus_in` is an HTTP *client* that already holds the
+//! response body, not a framed stream a `Decoder` gets fed. Plain functions plus the two
+//! builder-configured handles ([`PrometheusDecoder`], [`PrometheusEncoder`],
+//! `with_telemetry`/`with_diagnostics` like [`crate::otlp::OtlpEncoder`]) give the counters a home.
 //!
 //! ## Family naming
 //!
@@ -44,9 +40,8 @@
 //!
 //! So a text 0.0.4 counter family `http_requests_total` and an OpenMetrics counter family
 //! `http_requests` (samples `http_requests_total`) both give `name = "http_requests_total"`: the
-//! *sample* name is what a scraped series is actually called, so that is what the model keeps
-//! ("name kept verbatim, `_total` included"). The `_total` dance is a dialect concern, not a model
-//! one.
+//! *sample* name is what a scraped series is called, so that is what the model keeps ("name kept
+//! verbatim, `_total` included"). The `_total` handling is a dialect concern, not a model one.
 //!
 //! ## Decode: families → events ([`families_to_events`])
 //!
@@ -66,7 +61,7 @@
 //! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `prometheus.type: "stateset"` |
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
-//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which is where the meaning actually lives ([`logit_core::MetricRecord::flags`]). The `prometheus.type` marker is unchanged |
+//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which carries the meaning ([`logit_core::MetricRecord::flags`]). The `prometheus.type` marker is unchanged |
 //! | sample timestamp | `Event::timestamp` + `prometheus.timestamp: true`; absent → `received_at_nanos`, no marker. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
@@ -84,7 +79,7 @@
 //! | `GaugeDelta` | **skipped**, `logit.output.metrics.skipped{metric_kind="gauge_delta"}` + `warn_throttled("gauge_delta_unresolved")` (the same greppable key every other sink uses) |
 //! | `Histogram{Cumulative}` | `histogram`: running-sum buckets, `+Inf` = total, `_sum` only when `Some`; `min`/`max` dropped (known-gaps row); `prometheus.type: "gaugehistogram"` → `_gsum`/`_gcount` |
 //! | `Summary` | `summary` + `_created` (OM) |
-//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_count`, **no `_sum`** (a sketch has no sum; OpenMetrics permits omitting it) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
+//! | `Distribution(sketch)` | `summary` of [`DISTRIBUTION_QUANTILES`] + `_count`, **no `_sum`** (OpenMetrics permits omitting it; `DdSketch::sum` is exact, so this is a `docs/known-gaps.md` entry) -- `logit.output.metrics.degraded{metric_kind="distribution"}` |
 //! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
 //! | `ExponentialHistogram` | **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` -- neither text dialect has native-histogram syntax |
@@ -110,7 +105,7 @@
 //! carried its own timestamp"; [`ATTR_TARGET`] (`Value::Str`, a **resource** attribute stamped by
 //! `prometheus_in`) is the full scrape URL.
 //!
-//! Target identity is the deliberate exception: `prometheus_in` also stamps an **unprefixed**
+//! Target identity is the exception: `prometheus_in` also stamps an **unprefixed**
 //! [`LABEL_INSTANCE`] (`instance`, `host:port`) on the resource, which this encoder therefore
 //! renders as a label like any other resource attribute -- exactly the `instance` label Prometheus's
 //! own scrape adds, so two targets exposing the same exporter don't collapse onto one series through
@@ -177,10 +172,10 @@ pub const ATTR_TIMESTAMP: &str = "prometheus.timestamp";
 /// every other `prometheus.*` attribute.
 pub const ATTR_TARGET: &str = "prometheus.target";
 /// `host:port` of the scraped target: an **unprefixed** resource attribute stamped by
-/// `prometheus_in`, deliberately *outside* the consumed `prometheus.*` namespace so it renders as
+/// `prometheus_in`, *outside* the consumed `prometheus.*` namespace so it renders as
 /// the `instance` label Prometheus's own scrape adds. Two targets exposing the same exporter stay
 /// distinct series through a relay because of it; an event-level `instance` wins over the
-/// resource's (`honor_labels` semantics), which falls out of the resource/event merge for free.
+/// resource's (`honor_labels` semantics), which the resource/event merge already gives.
 pub const LABEL_INSTANCE: &str = "instance";
 
 /// The bit pattern of the NaN Prometheus reserves for a **stale marker**: a sample whose value is
@@ -295,8 +290,8 @@ pub enum Point {
         sum: Option<f64>,
         count: u64,
     },
-    /// `sum`/`count` are `Option` because OpenMetrics permits omitting them, which is exactly what
-    /// the `Distribution`/`Samples` encode path needs (a sketch has no sum to report).
+    /// `sum`/`count` are `Option` because OpenMetrics permits omitting them; the
+    /// `Distribution`/`Samples` encode path emits no `_sum`.
     Summary {
         quantiles: Vec<(f64, f64)>,
         sum: Option<f64>,
@@ -314,12 +309,10 @@ pub enum Point {
     /// [`STALE_NAN_BITS`]; the model spells it as `MetricRecord::flags`'
     /// `FLAG_NO_RECORDED_VALUE` over an empty payload of the family's own kind (see the module
     /// doc's decode table). It is a [`Point`] variant rather than a `bool` on [`Series`] so that
-    /// every exhaustive match in this codec is a compile error until it has been considered, and
-    /// so no existing struct literal had to change.
+    /// every exhaustive match in this codec has to consider it.
     ///
     /// Neither exposition dialect has a spelling for it: [`text::write`] skips a `Stale` series
-    /// and counts `logit.output.metrics.skipped{reason="stale"}`. Under the default encoder
-    /// settings one never reaches the text writer at all, because only
+    /// and counts `logit.output.metrics.skipped{reason="stale"}`. Only
     /// [`PrometheusEncoder::with_stale_markers`]`(true)` produces one.
     Stale,
 }
@@ -348,8 +341,8 @@ impl Series {
 }
 
 /// A metric family: one name, one type, one metadata pair, N series. The syntax-independent seam
-/// between [`text`] (and, later, remote-write) and the model mapping in this module -- see the
-/// module doc's "Family naming" table for what `name` means.
+/// between [`text`]/[`remote_write`] and the model mapping in this module -- see the module doc's
+/// "Family naming" table for what `name` means.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricFamily {
     pub name: String,
@@ -394,14 +387,12 @@ impl PrometheusDecoder {
     }
 
     /// Whether [`families_to_events`] stamps `prometheus.timestamp: true` on a series that carried
-    /// its own timestamp. Default `true`, which is what a *scrape* wants: an exposition sample's
-    /// timestamp is optional, so its presence is a producer choice worth preserving across a round
-    /// trip.
+    /// its own timestamp. Default `true`, for a scrape: an exposition sample's timestamp is
+    /// optional, so its presence is a producer choice worth preserving across a round trip.
     ///
-    /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp --
-    /// it is not optional there -- so the marker would record a choice nobody made, and a
-    /// remote-write → exposition relay would then stamp an explicit timestamp on every line it
-    /// writes, which no scrape of the same data would have produced.
+    /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp, so
+    /// the marker would record a choice nobody made, and a remote-write → exposition relay would
+    /// then stamp a timestamp on every line it writes, which no scrape of the same data would.
     /// `Event::timestamp` is set from the sample either way.
     pub fn with_timestamp_marker(mut self, marker: bool) -> Self {
         self.timestamp_marker = marker;
@@ -425,7 +416,8 @@ impl PrometheusDecoder {
     }
 
     /// `logit.input.metrics.degraded{reason}` -- the input was kept, but something in it was
-    /// normalized away (today: a histogram whose `_count` disagreed with its `+Inf` bucket).
+    /// normalized away (a histogram whose `_count` disagreed with its `+Inf` bucket, a dropped
+    /// exemplar, a seeded type the samples contradicted).
     pub(crate) fn degraded(&self, reason: &'static str) {
         self.telemetry.count("logit.input.metrics.degraded", 1.0, &[("reason", reason)]);
     }
@@ -462,9 +454,8 @@ impl PrometheusEncoder {
     }
 
     /// Whether a record carrying `FLAG_NO_RECORDED_VALUE` becomes a [`Point::Stale`] series instead
-    /// of being skipped. Default `false`, so the exposition path is exactly as it was -- neither
-    /// dialect can express a stale marker, and a bare NaN sample would read as a real reading of
-    /// NaN.
+    /// of being skipped. Default `false`, for exposition: neither dialect can express a stale
+    /// marker, and a bare NaN sample would read as a real reading of NaN.
     ///
     /// A remote-write sender sets this `true`. Only single-series kinds convert (`Gauge`, `Sum`,
     /// and a `prometheus.type`-marked gauge); a flagged `Histogram`, `Summary` or sketch kind stays
@@ -508,7 +499,7 @@ impl PrometheusEncoder {
     }
 
     /// `logit.output.labels.normalized{reason}` -- a label that reached the wire, but not in the
-    /// form the model held it. The only reason so far is `multi_value`: a `Value::Array` attribute
+    /// form the model held it. The one reason is `multi_value`: a `Value::Array` attribute
     /// collapsed to its last representable element by [`build_labels`], because a Prometheus label
     /// set is a map and has no multi-value label at all.
     ///
@@ -528,7 +519,7 @@ impl PrometheusEncoder {
 
 /// Families → events, one [`Event`] per [`Series`] (see the module doc's decode table).
 /// `received_at_nanos` is the scrape's start instant: every series that carried no timestamp of its
-/// own is stamped with it, exactly the contract [`crate::Decoder::decode_into`]'s `received_at`
+/// own is stamped with it, the same contract [`crate::Decoder::decode_into`]'s `received_at`
 /// documents for every other input.
 pub fn families_to_events(
     families: &[MetricFamily],
@@ -544,7 +535,7 @@ pub fn families_to_events(
 ///
 /// The counted-skip telemetry is already emitted either way; this exists for a caller that has to
 /// report, per call, *how much* of its input survived -- a remote-write receiver owes its sender
-/// an `X-Prometheus-Remote-Write-Samples-Written` count of what it actually kept, and the
+/// an `X-Prometheus-Remote-Write-Samples-Written` count of what it kept, and the
 /// assembler's own accepted total is a statement about an earlier stage than this one. Pair it with
 /// [`remote_write::wire_samples`] to turn the skipped series back into the wire samples they were.
 pub fn families_to_events_with(
@@ -596,8 +587,7 @@ pub fn families_to_events_with(
 
 /// One [`Point`] → one [`MetricKind`] and the record `flags` that go with it, or `None` for a
 /// series this codec steps over (counted). The cumulative → per-bucket conversion lives here rather
-/// than in [`text`] on purpose: it is a model rule, not a syntax one, so the remote-write path gets
-/// it for free.
+/// than in [`text`] because it is a model rule, not a syntax one: both syntaxes share it.
 ///
 /// `family` is the point's own family type, which only [`Point::Stale`] needs: a stale marker has
 /// no payload of its own, so the kind it takes is the one the family would have produced anyway.
@@ -649,7 +639,7 @@ fn point_to_kind(
 /// family type without guessing.
 ///
 /// `NaN` rather than `0` for the scalar kinds, because `0` is a perfectly good counter reading and
-/// a consumer that ignores the flag would silently read a reset.
+/// a consumer that ignores the flag would read a reset.
 fn stale_kind(family: FamilyType) -> MetricKind {
     match family {
         FamilyType::Counter => MetricKind::Sum(Sum {
@@ -741,7 +731,7 @@ pub fn events_to_families<'a>(
             let Some((kind, point)) = converted else { continue };
             let name = resolve(record.name);
             // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
-            // per *family*, not per point, and only for a name that really has to change.
+            // per *family*, not per point, and only for a name that has to change.
             let key = sanitize_metric_name(name);
             let labels = build_labels(resource, event, kind, encoder);
             let timestamp = if encoder.timestamps_always {
@@ -942,7 +932,7 @@ fn declared_type(event: &Event) -> Option<FamilyType> {
 /// [`PrometheusEncoder::with_stale_markers`]. `None` -- skipped and counted exactly as an unflagged
 /// skip would be -- for every kind that expands to more than one wire series.
 ///
-/// Temporality is deliberately not consulted: `Sum{Delta}` is normally skipped because Prometheus
+/// Temporality is not consulted: `Sum{Delta}` is normally skipped because Prometheus
 /// cannot express a delta *reading*, and a stale marker has no reading to be delta about. The
 /// family type otherwise follows [`record_to_point`]'s own choices, so a series that went stale
 /// lands on the same family it was on while it had values.
@@ -988,8 +978,8 @@ fn warn_delta(encoder: &mut PrometheusEncoder, name: &str) {
 }
 
 /// A sketch → the summary point the module doc's `Distribution`/`Samples` rows describe: the five
-/// shared [`DISTRIBUTION_QUANTILES`] and a count, with **no** `_sum` -- a sketch has none, and
-/// OpenMetrics permits omitting it.
+/// shared [`DISTRIBUTION_QUANTILES`] and a count, with **no** `_sum`, which OpenMetrics permits.
+/// [`DdSketch::sum`] is exact, so emitting one is an open `docs/known-gaps.md` entry.
 fn sketch_summary(sketch: &DdSketch) -> Point {
     let quantiles = DISTRIBUTION_QUANTILES
         .iter()
@@ -1047,10 +1037,10 @@ fn build_labels(
         // (`logit_inputs::statsd::insert_tags`; `statsd_out` re-expands it to one tag per
         // element). A Prometheus label set is a map -- one name, one value -- so the **last**
         // representable element wins, walked backwards so a trailing unrepresentable element falls
-        // through to the one before it. Last, not first, for the same reason `influxdb_out` picks
-        // last: it reproduces what this sink exposed back when the decoder itself collapsed a
-        // repeated key to its last token. An empty or entirely unrepresentable array has no
-        // element to fall back to and stays on the `unrepresentable` drop path below.
+        // through to the one before it. Last, not first, to match `influxdb_out`, and to keep the
+        // label a last-token-wins collapse of the repeated key would have kept. An empty or
+        // entirely unrepresentable array has no element to fall back to and stays on the
+        // `unrepresentable` drop path below.
         let rendered = match value {
             Value::Array(elements) => match elements.iter().rev().find_map(label_value) {
                 Some(last) => {
@@ -1575,9 +1565,7 @@ mod tests {
         );
     }
 
-    /// `min`/`max` have no exposition representation at all -- the known-gaps row. Nothing in the
-    /// emitted family can carry them, which this pins by encoding the same histogram twice, once
-    /// with and once without, and demanding identical output.
+    /// `min`/`max` have no exposition representation (the known-gaps row): output is identical.
     #[test]
     fn a_histograms_min_and_max_are_dropped_without_changing_anything_else() {
         let with = MetricKind::Histogram(Histogram {
@@ -1794,8 +1782,8 @@ mod tests {
         );
     }
 
-    /// Target identity is deliberately *not* in the consumed namespace: `instance` renders,
-    /// `prometheus.target` does not (the PR #127 review's delta 1).
+    /// Target identity is *not* in the consumed namespace: `instance` renders, `prometheus.target`
+    /// does not.
     #[test]
     fn the_instance_resource_attribute_renders_while_prometheus_target_is_consumed() {
         let resource = resource_with(&[
@@ -1821,10 +1809,8 @@ mod tests {
                 ("null", Value::Null),
                 ("bytes", Value::Bytes(bytes::Bytes::from_static(b"\xff"))),
                 ("ts", Value::Timestamp(1)),
-                // An *empty* array: a non-empty one now renders its last element instead (see
-                // `a_multi_value_label_renders_its_last_element_and_is_counted` below), so the
-                // "no faithful string form" case this row covers is the one with no element to
-                // fall back to.
+                // An *empty* array: a non-empty one renders its last element (see
+                // `a_multi_value_label_renders_its_last_element_and_is_counted`).
                 ("arr", Value::Array(Vec::new())),
                 ("map", Value::Map(Box::new(AttrMap::new()))),
             ],
@@ -1865,11 +1851,7 @@ mod tests {
         points.iter().any(|(n, r)| n == name && r == reason)
     }
 
-    /// A Prometheus label set is a map, so a multi-value attribute (a repeated DogStatsD tag key,
-    /// folded into a `Value::Array` by `logit_inputs::statsd::insert_tags`) has no faithful
-    /// rendering here: the **last** representable element wins, counted -- the same rule, and the
-    /// same "last, not first" reasoning, as `influxdb_out`'s. Without it this label would vanish
-    /// entirely, which is strictly worse than the `team="b"` a collapsing decoder used to produce.
+    /// A multi-value attribute renders its **last** representable element, counted as normalized.
     #[test]
     fn a_multi_value_label_renders_its_last_element_and_is_counted() {
         let event = event_with(
@@ -1905,8 +1887,8 @@ mod tests {
         assert!(counted(&registry, "logit.output.labels.normalized", ("reason", "multi_value")));
     }
 
-    /// An array with no element to fall back to has nothing to normalize *to*, so it stays on the
-    /// pre-existing `dropped{reason="unrepresentable"}` path and counts nothing as normalized.
+    /// An array with no element to fall back to is `dropped{reason="unrepresentable"}`, not
+    /// normalized.
     #[test]
     fn an_all_unrepresentable_array_label_is_dropped_unrepresentable_not_normalized() {
         for elements in [Vec::new(), vec![Value::Null, Value::Timestamp(1)]] {
@@ -2068,11 +2050,9 @@ mod tests {
         assert_eq!(sanitize_label_name("job:rate"), "job_rate");
     }
 
-    // --- review follow-up: post-sanitization metric-name collisions -------------------------------
+    // --- post-sanitization metric-name collisions -----------------------------------------------
 
-    /// Two model names that sanitize onto one wire name cannot both be exposed: a second `# TYPE`
-    /// line for one name makes Prometheus reject the whole scrape, so one clash would poison every
-    /// other metric in the body. The family whose *model* name sorts first wins.
+    /// Two model names sanitizing onto one wire name: the one whose *model* name sorts first wins.
     #[test]
     fn two_metric_names_sanitizing_onto_one_expose_the_first_and_count_the_rest() {
         let (registry, telemetry) = telemetry();
@@ -2091,8 +2071,7 @@ mod tests {
         assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
     }
 
-    /// The same, with the winner arriving *second*: the already-started family is displaced rather
-    /// than the outcome depending on arrival order.
+    /// The same, with the winner arriving *second*: the already-started family is displaced.
     #[test]
     fn a_colliding_name_that_sorts_first_displaces_the_family_already_started() {
         let (registry, telemetry) = telemetry();
@@ -2110,7 +2089,7 @@ mod tests {
         assert!(counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
     }
 
-    /// A name that needs sanitizing but collides with nothing is simply renamed, not counted.
+    /// A name that needs sanitizing but collides with nothing is renamed, not counted.
     #[test]
     fn a_sanitized_name_with_no_collision_is_not_counted() {
         let (registry, telemetry) = telemetry();
@@ -2124,10 +2103,7 @@ mod tests {
 
     // --- stale markers and the three transport switches ----------------------------------------
 
-    /// One `Stale` series per family type, decoded: the *kind* is the one the family would have
-    /// produced anyway, the payload is empty, and `FLAG_NO_RECORDED_VALUE` is what carries the
-    /// meaning. A downstream stage that ignores the flag therefore still sees a shape it
-    /// recognizes rather than a missing series.
+    /// A `Stale` series decodes to its family's own kind, empty, flagged `FLAG_NO_RECORDED_VALUE`.
     #[test]
     fn a_stale_point_decodes_to_its_family_type_with_the_no_recorded_value_flag() {
         for kind in [
@@ -2181,8 +2157,7 @@ mod tests {
         }
     }
 
-    /// The stale NaN is a specific bit pattern, not "a NaN": every other NaN, `f64::NAN` included,
-    /// is an ordinary reading.
+    /// Only the stale NaN's bit pattern is stale; every other NaN, `f64::NAN` included, is not.
     #[test]
     fn only_the_reserved_bit_pattern_is_a_stale_nan() {
         assert!(is_stale_nan(f64::from_bits(STALE_NAN_BITS)));
@@ -2239,8 +2214,7 @@ mod tests {
         (families, registry)
     }
 
-    /// `with_stale_markers(true)`: the single-series kinds convert, on the family type they would
-    /// have been on anyway.
+    /// `with_stale_markers(true)`: single-series kinds convert, on the family type they'd have had.
     #[test]
     fn stale_markers_convert_the_single_series_kinds() {
         let sum = |temporality| MetricKind::Sum(Sum { value: 0.0, temporality, monotonic: true });
@@ -2288,8 +2262,7 @@ mod tests {
         ));
     }
 
-    /// The multi-series kinds stay skipped even with the switch on: one flag says nothing about
-    /// which of a histogram's derived series existed, so there is nothing to reconstruct.
+    /// Multi-series kinds stay skipped even with `with_stale_markers(true)`.
     #[test]
     fn stale_markers_do_not_convert_the_multi_series_kinds() {
         let kinds = [
@@ -2315,8 +2288,7 @@ mod tests {
         }
     }
 
-    /// The default is unchanged: without the switch, a flagged record is skipped exactly as
-    /// `a_no_recorded_value_point_is_skipped_and_counted` pins.
+    /// Without `with_stale_markers(true)`, a flagged record is skipped.
     #[test]
     fn stale_markers_are_off_by_default() {
         let mut rec = record("m", MetricKind::Gauge(0.0));
@@ -2324,8 +2296,7 @@ mod tests {
         assert!(encode(&Resource::default(), &event_with(&[], rec)).is_empty());
     }
 
-    /// The round trip the receiver/sender pair actually runs: a `Stale` family through
-    /// `families_to_events` and back with both switches on comes out unchanged.
+    /// A `Stale` family round-trips unchanged with both remote-write switches on.
     #[test]
     fn a_stale_series_round_trips_through_the_model_with_the_switches_on() {
         for kind in [

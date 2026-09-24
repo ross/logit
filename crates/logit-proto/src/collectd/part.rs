@@ -1,23 +1,19 @@
-//! The collectd binary protocol's part framing -- the one place in this codec that knows what a
-//! byte means. Everything above it ([`super::decode`], [`super::encode`]) works in parts, part
-//! types and [`DsValue`]s, never in offsets or endianness.
+//! The collectd binary protocol's part framing: the one place in this codec that knows what a byte
+//! means. [`super::decode`] and [`super::encode`] work in parts, part types, and [`DsValue`]s.
 //!
 //! A part is `type: u16 BE, len: u16 BE` followed by `len - 4` payload bytes; `len` **includes**
-//! the four-byte header, which is why a `len < 4` is malformed rather than merely empty. String
-//! parts carry NUL-terminated text (`len = 4 + n + 1`), numeric parts one `u64` BE (`len = 12`),
-//! and a Values part a `u16` data-source count, that many data-source type bytes, and that many
-//! eight-byte values (`len = 6 + 9 * count`).
+//! the four-byte header, so a `len < 4` is malformed, not empty. String parts carry NUL-terminated
+//! text (`len = 4 + n + 1`), numeric parts one `u64` BE (`len = 12`), and a Values part a `u16`
+//! data-source count, that many type bytes, and that many eight-byte values
+//! (`len = 6 + 9 * count`).
 //!
-//! **Endianness is not uniform**, which is the single easiest thing to get wrong here: COUNTER,
-//! DERIVE and ABSOLUTE values are big-endian like every other integer on the wire, but a GAUGE is
-//! an IEEE-754 double in **little-endian** byte order -- collectd writes `htole64` for gauges
-//! specifically (`network.c`'s `write_part_values`), a quirk of the protocol rather than a bug in
-//! this file. `crates/logit-proto/src/collectd/decode.rs`'s unit tests pin the exact bytes of
-//! `1.5` in both directions so a "fix" to this asymmetry fails loudly.
+//! **Endianness is not uniform**: COUNTER, DERIVE, and ABSOLUTE values are big-endian like every
+//! other integer on the wire, but a GAUGE is an IEEE-754 double in **little-endian** byte order
+//! (collectd's `network.c` `write_part_values` writes `htole64`). That is the protocol, not a bug;
+//! the decode and encode unit tests pin the bytes of `1.5`, so a "fix" fails.
 
-/// Part types, from collectd's `network.h`. `TYPE_MESSAGE`/`TYPE_SEVERITY` are notification parts
-/// (see [`super`]'s "Notifications" section); `TYPE_SIGNATURE`/`TYPE_ENCRYPTION` are the security
-/// parts this codec deliberately does not verify or decrypt (see [`super`]'s module doc).
+/// Part types, from collectd's `network.h`. `TYPE_MESSAGE`/`TYPE_SEVERITY` are notification parts;
+/// this codec neither verifies `TYPE_SIGNATURE` nor decrypts `TYPE_ENCRYPTION` (see [`super`]).
 pub const TYPE_HOST: u16 = 0x0000;
 pub const TYPE_TIME: u16 = 0x0001;
 pub const TYPE_PLUGIN: u16 = 0x0002;
@@ -52,9 +48,8 @@ pub const BYTES_PER_VALUE: usize = 9;
 /// Bytes of a Values part's own fixed overhead: [`HEADER_LEN`] plus the `u16` data-source count.
 pub const VALUES_OVERHEAD: usize = HEADER_LEN + 2;
 
-/// One data source's value, already interpreted. Keeping the four wire types as one enum is what
-/// lets [`super::decode`] and [`super::encode`] share a single definition of which byte order each
-/// one uses -- see this module's doc comment on why that matters.
+/// One data source's value, interpreted. One enum gives [`super::decode`] and [`super::encode`] a
+/// single definition of each type's byte order.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DsValue {
     Counter(u64),
@@ -84,9 +79,8 @@ impl DsValue {
         }
     }
 
-    /// The inverse of [`DsValue::to_wire`] for a known-good `ds_type` (one of the four [`DS_COUNTER`]
-    /// .. [`DS_ABSOLUTE`] constants -- the caller validates the whole type vector *before* reading
-    /// any value, so an unknown byte never reaches here).
+    /// The inverse of [`DsValue::to_wire`]; `None` for an unknown `ds_type`, which the decoder
+    /// rejects before reading any value.
     pub fn from_wire(ds_type: u8, raw: [u8; 8]) -> Option<DsValue> {
         Some(match ds_type {
             DS_COUNTER => DsValue::Counter(u64::from_be_bytes(raw)),
@@ -97,45 +91,43 @@ impl DsValue {
         })
     }
 
-    /// Whether `ds_type` is one of the four types this protocol defines -- checked over a Values
-    /// part's whole type vector before a single value is read or a single event allocated
-    /// (`decode.rs`'s ordering contract, and the reason a hostile `count` can't make this codec
-    /// allocate).
+    /// Whether `ds_type` is one of the four types this protocol defines. The decoder checks the
+    /// whole type vector before reading a value or allocating, so a hostile `count` can't make it
+    /// allocate.
     pub fn is_known_type(ds_type: u8) -> bool {
         matches!(ds_type, DS_COUNTER | DS_GAUGE | DS_DERIVE | DS_ABSOLUTE)
     }
 }
 
-/// A part's header: its type and its total length *including* the four header bytes, so a caller
-/// advances by exactly `len` to reach the next part.
+/// A part's header: its type and its total length *including* the header, so a caller advances by
+/// `len` to reach the next part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartHeader {
     pub part_type: u16,
     pub len: usize,
 }
 
-/// Why a part could not be read. Every variant means "the rest of this datagram is not
-/// trustworthy": [`super::decode`] turns one into either a `bad_part` diagnostic (when earlier
-/// parts of the same datagram already produced events) or a `CodecError::Malformed`.
+/// Why a part could not be read. Every variant abandons the rest of the datagram: a `bad_part`
+/// diagnostic when earlier parts already produced events, else a `CodecError::Malformed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PartError {
-    /// Fewer than [`HEADER_LEN`] bytes remain -- a trailing fragment, not a part.
+    /// Fewer than [`HEADER_LEN`] bytes remain: a trailing fragment, not a part.
     #[error("part header needs {HEADER_LEN} bytes, only {remaining} remain")]
     ShortHeader { remaining: usize },
-    /// A declared length below [`HEADER_LEN`], which would make the payload negative and (for a
-    /// `len` of 0) never advance the cursor at all.
+    /// A declared length below [`HEADER_LEN`]: a negative payload, and a `len` of 0 would never
+    /// advance the cursor.
     #[error("part declares a length of {len}, below the {HEADER_LEN}-byte header")]
     ShortPart { len: usize },
-    /// A declared length past the end of the datagram -- a truncated packet, or a hostile length.
+    /// A declared length past the end of the datagram: a truncated packet, or a hostile length.
     #[error("part declares {len} bytes, only {remaining} remain")]
     Overlong { len: usize, remaining: usize },
 }
 
-/// Reads the part starting at `at`, returning its header and payload (the `len - 4` bytes after the
-/// header). Validates only what framing requires: that a header fits, that `len` is at least
-/// [`HEADER_LEN`], and that `len` does not run past the end of `bytes`. Payload *shape* -- a
-/// string's NUL terminator, a numeric part's width, a Values part's count -- is the caller's, since
-/// each part type has its own rule.
+/// Reads the part starting at `at`, returning its header and its `len - 4`-byte payload.
+///
+/// Validates framing only: a header fits, `len` is at least [`HEADER_LEN`], and `len` stays inside
+/// `bytes`. Payload *shape* (a string's NUL, a numeric part's width, a Values part's count) is the
+/// caller's, since each part type has its own rule.
 pub fn read_part(bytes: &[u8], at: usize) -> Result<(PartHeader, &[u8]), PartError> {
     let remaining = bytes.len().saturating_sub(at);
     if remaining < HEADER_LEN {
@@ -152,15 +144,14 @@ pub fn read_part(bytes: &[u8], at: usize) -> Result<(PartHeader, &[u8]), PartErr
     Ok((PartHeader { part_type, len }, &bytes[at + HEADER_LEN..at + len]))
 }
 
-/// Writes a NUL-terminated string part. `value` is written byte-verbatim (it is already sanitized
-/// and length-bounded by the encoder -- see [`super::encode`]'s sanitizer), so this function never
-/// inspects or truncates it.
+/// Writes a NUL-terminated string part, `value` byte-verbatim: the encoder has already sanitized
+/// and bounded it.
 ///
 /// # Panics
 ///
-/// Panics rather than truncating a `u16` length, for the reason [`write_values_part`] documents at
-/// length. The encoder's sanitizer caps every identity field at [`super::DATA_MAX_NAME_LEN`] minus
-/// its NUL, so the longest part this can produce is 132 bytes.
+/// Panics rather than truncating a `u16` length, for the reason [`write_values_part`] gives. The
+/// encoder caps an identity field at 127 bytes and a notification message at 255, so the longest
+/// part it produces is 260 bytes.
 pub fn write_string_part(out: &mut Vec<u8>, part_type: u16, value: &[u8]) {
     let len = HEADER_LEN + value.len() + 1;
     let len = u16::try_from(len)
@@ -180,20 +171,16 @@ pub fn write_number_part(out: &mut Vec<u8>, part_type: u16, value: u64) {
 }
 
 /// Writes a Values part: the data-source count, then every type byte, then every eight-byte value
-/// -- the two-vector layout collectd's own `write_part_values` uses, not one interleaved
-/// type/value pair per data source.
+/// (collectd's two-vector layout, not interleaved pairs).
 ///
 /// # Panics
 ///
-/// Both the part length and the data-source count are `u16` on the wire, so this panics rather than
-/// truncating if `values` holds more than [`super::MAX_VALUES_PER_LIST`] entries. That is an
-/// invariant [`super::encode::CollectdEncoder::encode_into`] establishes before ever calling here
-/// -- a longer list is dropped whole and counted
-/// `logit.output.metrics.skipped{reason="too_many_values"}` -- so reaching either check means a
-/// caller bypassed that cap, not that an operator sent something unusual. A silent `as u16` would be
-/// far worse than a panic: at 7282 data sources the declared length wraps to 8, shorter than the
-/// part's own header, and every receiver then reads structural garbage from a datagram that looks
-/// well-formed.
+/// The part length and count are `u16` on the wire, so this panics rather than truncating when
+/// the length overflows (above 7281 values); a debug build also asserts `values` is within
+/// [`super::MAX_VALUES_PER_LIST`]. [`super::encode::CollectdEncoder::encode_into`] drops a longer
+/// list first, so reaching either check is a caller bug. A silent `as u16` would be worse: at
+/// 7282 data sources the length wraps to 8, and a receiver reads garbage from a well-formed-looking
+/// datagram.
 pub fn write_values_part(out: &mut Vec<u8>, values: &[DsValue]) {
     debug_assert!(
         values.len() <= super::MAX_VALUES_PER_LIST,

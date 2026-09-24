@@ -1,5 +1,6 @@
-# One connection, N streams -- the central half. See examples/fan-out-edge.yaml for the full
-# picture, how to run both together, and the `logit_in` field reference this file doesn't repeat.
+# One connection, N streams: the central half. examples/fan-out-edge.yaml is the far side and
+# says how to run both together; examples/forwarder-central.yaml has the `logit_in` field
+# reference this file doesn't repeat.
 #
 # Topology (this file):
 #
@@ -7,25 +8,16 @@
 #   [the wire] --> central_in --> split (route) --> app_stream  (target) -----------------------> app_out
 #                                            \--> (unrouted: split's own consumers) --------------> untagged_out
 #
-# `stdio_out` stands in for a real sink purely so this example is runnable with no external
-# service, the same posture examples/forwarder-central.yaml takes.
+# `stdio_out` stands in for a real sink so the example runs with no external service.
 components:
   central_in:
     type: logit_in
     bind: 0.0.0.0:5150
 
-  # `route` is the native, equality-only router (docs/adr/target-components.md): one key read per
-  # event, `by:` decides which, `routes:` maps the values that key can take onto `target`
-  # components. This is a *partition*, not a fan-out plus filters -- `central_in`'s batch is split
-  # into per-destination buffers in one pass, events moved into whichever buffer matches, never
-  # cloned. That's what replaces the `has_attributes`/`drop_attributes` chain this file used to
-  # have: N filter components each re-scanning the whole batch to keep their own N-th of it, behind
-  # a fan-out that (with no `Output` branch among its all-mutating consumers) paid a full
-  # `EventBatch` clone regardless. Measured exactly for this file's own two-way split
-  # (docs/design/memory.md's "Routing" section): **3** allocations through `route` against **324**
-  # for the equivalent fan-out-plus-two-`has_attributes` shape -- 1 for the returned partition list
-  # plus one `reserve_exact` per destination that actually received events, versus one `Arc::new`,
-  # a forced deep clone of the whole batch, and two full per-event filter passes.
+  # `route` is the native equality-only router (docs/adr/target-components.md): it reads one key
+  # per event (`by:`) and moves each event into the `target` its value maps to. It's a partition,
+  # not a fan-out plus filters, so the batch is split in one pass and never cloned
+  # (docs/design/memory.md's "Routing" section has the allocation counts).
   split:
     type: route
     sources: [central_in]
@@ -35,32 +27,20 @@ components:
       app: app_stream
     # Alternative `by:` forms, same shape:
     #   by: {resource: service.name}      -- match what a `set` with a `resource:` block stamped,
-    #                                         once per batch rather than once per event, the same
-    #                                         trade `has_attributes`'s commented-out `resource:`
-    #                                         block used to show here.
-    #   by: {provenance: origin}          -- route on *which listener* the event arrived through
+    #                                         once per batch rather than once per event.
+    #   by: {provenance: origin}          -- route on which listener the event arrived through:
     #     routes: {host_in: host_stream, app_in: app_stream}
-    #                                      -- rather than on a stamped attribute at all. This reads
-    #                                         examples/fan-out-edge.yaml's own listener ids
-    #                                         (`host_in`/`app_in`) straight off the wire, so it
-    #                                         needs no `set: {attributes: {stream: ..}}` on the edge
-    #                                         side -- provenance already carries the split, at the
-    #                                         cost of coupling `split`'s config to the edge file's
-    #                                         component ids instead of to an attribute name.
+    #                                      -- reads examples/fan-out-edge.yaml's listener ids off
+    #                                         the wire, so the edge needs no `set`, at the cost of
+    #                                         coupling this file to the edge's component ids.
 
-  # Named destinations, fed by direction from `split` above -- no fields, no `sources` of their
-  # own (docs/adr/target-components.md). Each is a zero-cost alias: no task, no inbox, just a
-  # `Fanout` wired straight to its own consumers, so `windowed`/`app_out` below read a target
-  # exactly like any other source.
+  # Named destinations `split` fills: no fields, no `sources` of their own. A target is a
+  # zero-cost alias (no task, no inbox) that consumers read like any other source.
   host_stream: {type: target}
   app_stream: {type: target}
 
-  # The 60s aggregation window happens here, once, centrally -- the edge forwards everything
-  # unaggregated (docs/adr/aggregation-window-semantics.md), same as examples/forwarder-central.yaml.
-  # `sources: [host_stream]` is an ordinary source, nothing new to learn on this side -- but note
-  # that `previous` downstream of a target is the target's own id, never the router's, so a batch
-  # arriving here carries `provenance.previous: host_stream`, not `split`
-  # (docs/adr/target-components.md).
+  # The 60s window happens here, once, centrally; the edge forwards everything unaggregated. A
+  # batch arriving here carries `provenance.previous: host_stream`, the target's id, not `split`.
   windowed:
     type: aggregate
     sources: [host_stream]
@@ -76,12 +56,9 @@ components:
     sources: [app_stream]
     target: stdout
 
-  # The else-branch: everything `stream: host`/`stream: app` didn't claim -- an absent `stream`
-  # attribute, or any other value. Not a chain of complementary filters (this file's old
-  # `not_host`/`untagged` pair): a router's *own* `sources:` edge is where its unrouted events go,
-  # spelled once, however many named targets it has (docs/adr/target-components.md). A `split` with
-  # no consumer here at all would still be legal -- its unrouted events would simply be dropped and
-  # counted `logit.component.events.dropped{reason="unrouted"}`, never silently.
+  # The else branch: everything `stream: host`/`stream: app` didn't claim, including an absent
+  # `stream`. A router's own `sources:` edge is where its unrouted events go. With no consumer here
+  # they'd be dropped and counted `logit.component.events.dropped{reason="unrouted"}`.
   untagged_out:
     type: stdio_out
     sources: [split]

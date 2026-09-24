@@ -1,79 +1,70 @@
-//! `syslog_out` -> `syslog_in` round trip, over real UDP sockets -- the syslog counterpart to
-//! `otlp_round_trip.rs`/`logit_round_trip.rs`. Lives here (not a dev-dependency cycle between
-//! `logit-inputs`/`logit-outputs`) for the same reason those do: `logit-cli` already depends on
-//! both as ordinary dependencies.
+//! `syslog_out` -> `syslog_in` round trip over real UDP, TCP, and TLS sockets. The components
+//! run in-process (a `SyslogOutput` sending to a bound, live `SyslogInput`), not through
+//! `logit run`. This lives in `logit-cli` because it already depends on both `logit-inputs` and
+//! `logit-outputs`; a dev-dependency between those two crates would be a cycle.
 //!
-//! `docs/plans/lossless-transit.md`'s W5 workstream, "Tests" bullet.
+//! Each fixture case asserts two things: the bytes on the wire equal the case's `.expected`
+//! bytes, and the live `syslog_in`'s decode of those bytes equals the original decode as a whole
+//! `EventBatch`, with receipt-time timestamps zeroed. That is the fixed point ADR
+//! `lossless-transit` requires, modulo the normalizations listed below.
 //!
 //! ## Fixture corpus (`tests/fixtures/syslog/`)
 //!
-//! One file pair per case: `<name>.in` (the raw line, exactly as a real sender would put it on
-//! the wire) and `<name>.expected` (the exact bytes `syslog_out` must emit for that line's
-//! decode, or the literal marker [`SAME_AS_INPUT`] when the sink's own canonicalization happens
-//! to reproduce the input verbatim). The six UDP `testdata/interop/syslog/*.raw` captures (every
-//! one but `rsyslog-tcp-000.raw`) are read from there directly at runtime, per that directory's own README ("`logit`'s own encoder never
-//! touches these") -- they are not copied into this corpus.
+//! One file pair per case: `<name>.in` (the raw line as a sender puts it on the wire) and
+//! `<name>.expected` (the bytes `syslog_out` must emit for that decode, or the marker
+//! [`SAME_AS_INPUT`] when the sink reproduces the input verbatim). `rfc5424-example1` through
+//! `-example4` are RFC 5424 section 6.5's worked examples; the other `rfc*` cases are
+//! hand-written. The `interop-*` cases have only an `.expected` file: their input is one of the
+//! six UDP captures in `testdata/interop/syslog/` (all but `rsyslog-tcp-000.raw`; that
+//! directory's README has each sender and version), read from there at runtime, never copied.
 //!
-//! ## Permitted normalizations (recorded here, and in the ADR this test's PR adds)
+//! ## Permitted normalizations (per `docs/adr/lossless-transit.md`)
 //!
-//! `syslog_out` is not byte-identical to its input in general -- these are the specific,
-//! documented ways it differs, each with the reason it's permitted rather than a lossiness bug:
+//! Where `syslog_out`'s output differs from its input, and why each is permitted rather than a
+//! loss. `docs/adr/syslog-output.md` records the sink-side decisions behind them.
 //!
-//! 1. **RFC 5424 §6.4 BOM stripped, never re-emitted.** `syslog_in` strips a leading UTF-8 BOM
-//!    from MSG on decode (it's a `MSG-UTF8` signal, not payload); `syslog_out` never writes one
-//!    back (`docs/adr/syslog-output.md`'s "No RFC 5424 §6.4 BOM" note -- Loki's `| json` stage
-//!    doesn't skip one). Exercised by `rfc5424-example1`/`rfc5424-example3`.
-//! 2. **RFC 5424 TIMESTAMP fractional digits always render as exactly 6, zero-padded, offset
-//!    always UTC (`Z`).** `push_rfc5424_timestamp` reuses `format_rfc3339_utc`'s fixed-width
-//!    output; a `+HH:MM`/`-HH:MM` offset in the input is converted to the same instant in `Z`
-//!    form, and a fraction shorter than 6 digits is zero-padded (`.003Z` -> `.003000Z`). The
-//!    *instant* is unchanged -- only its textual rendering is. Exercised by `rfc5424-example1`
-//!    through `-example4` and `interop-logger-rfc5424-basic`.
-//! 3. **RFC 3164 output always carries a TIMESTAMP, even when the origin had none.** RFC 3164's
-//!    TIMESTAMP is nominally mandatory but real senders sometimes omit it (`python-syslog-handler-*`
-//!    below); `syslog_out`'s RFC 3164 header writer has no "omit" branch, so a relayed line always
-//!    gets *some* TIMESTAMP, falling to `event.timestamp` (receipt time) when the origin carried
-//!    none. Exercised structurally (not byte-for-byte) by the `python_syslog_handler_*` tests.
-//! 4. **A 3164 -> 5424 relay's TIMESTAMP falls to receipt time, in RFC 3339.** RFC 3164's raw
-//!    `Mmm dd hh:mm:ss` token has no year or timezone and can't be resolved to an instant without
-//!    guessing (`syslog_in`'s own module doc); `syslog_out` declines to guess on the way out
-//!    either, so a dialect-changing relay's TIMESTAMP is `event.timestamp`, not a reinterpretation
-//!    of the original token. Exercised by `a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time`.
-//! 5. **A 3164 -> 5424 (or any) relay's STRUCTURED-DATA is always `-`.** RFC 3164 has no such
-//!    field, so there is nothing to carry over. Exercised by the same test as (4).
-//! 6. **Header hostname/app-name may come from `syslog_out`'s own configured defaults when the
-//!    event carries no `syslog.hostname`/`syslog.tag` attribute at all** (`with_hostname`/
-//!    `with_app_name`) -- a real relay config commonly sets these as a fallback identity for
-//!    traffic that never passed through `syslog_in`. This corpus's round-trip encoders leave both
-//!    unset specifically so the byte-for-byte assertions below aren't exercising this
-//!    normalization by accident; it's recorded here because the plan's ADR calls it out
-//!    explicitly, not because any test in this file depends on it.
-//! 7. **SD-ELEMENT and SD-PARAM order is canonicalized by name, not preserved from the wire.**
-//!    `write_structured_data`/`write_sd_element` (`crates/logit-outputs/src/syslog.rs`) sort
-//!    SD-IDs and PARAM-NAMEs by name bytes before writing, since `AttrMap`/attribute iteration
-//!    order is process-global intern order, not wire order -- a relay that saw `[b@2 ..][a@1
-//!    ..]` re-emits `[a@1 ..][b@2 ..]`. A repeated PARAM-NAME's occurrences are emitted grouped
-//!    (already grouped under one `Value::Array` by the decoder), so a wire `a b a` interleaving
-//!    is not preserved -- see `docs/known-gaps.md`. Exercised by `rfc5424-example4` (two
-//!    SD-ELEMENTs, one with three distinct PARAM-NAMEs) and
-//!    `interop-logger-rfc5424-basic` (three PARAM-NAMEs).
-//! 8. **A PARAM-VALUE's bare (non-escape) backslash is re-emitted in canonical escaped form.**
-//!    RFC 5424 section 6.3.3 declares only `\"`, `\\`, `\]` as escapes; a backslash before any
-//!    other byte is a literal backslash followed by that byte, which `syslog_in`'s
-//!    `parse_param_value` keeps literally rather than rejecting. `syslog_out` then re-emits that
-//!    literal backslash the canonical way (`\` -> `\\`), so `p="a\xb"` relays as `p="a\\xb"` --
-//!    the same PARAM-VALUE, per the RFC's own equivalence, just spelled the canonical way.
-//! 9. **A non-UTF-8 RFC 3164 HOSTNAME token is skipped, not relayed.** `parse_3164`
-//!    (`crates/logit-inputs/src/syslog.rs`) never fails the whole line over a bad HOSTNAME (the
-//!    version-sniff fallback in `parse_line` depends on that), so a HOSTNAME candidate that
-//!    isn't valid UTF-8 is simply not stamped as a `syslog.hostname` attribute -- reported
-//!    through a throttled `hostname_not_utf8` diagnostic -- rather than reaching the wire on the
-//!    far end at all.
+//! 1. **An RFC 5424 §6.4 BOM is stripped and never re-emitted.** `syslog_in` strips a leading
+//!    UTF-8 BOM from MSG; `syslog_out` never writes one, because Loki's `| json` stage doesn't skip
+//!    it (`docs/adr/syslog-output.md`, "No RFC 5424 §6.4 BOM"). Fixtures: `rfc5424-example1`,
+//!    `rfc5424-example3`.
+//! 2. **An RFC 5424 TIMESTAMP renders with 6 fractional digits in UTC (`Z`).** An offset is
+//!    converted to the same instant in `Z` form, and a shorter fraction is zero-padded
+//!    (`.003Z` -> `.003000Z`). Fixtures: `rfc5424-example1` through `-example4`,
+//!    `interop-logger-rfc5424-basic`.
+//! 3. **RFC 3164 output always carries a TIMESTAMP.** Some real senders omit it
+//!    (`python-syslog-handler-*`); the RFC 3164 header writer has no "omit" branch, so it falls
+//!    back to `event.timestamp` (receipt time). Asserted structurally, not byte for byte, by
+//!    `python_syslog_handler_captures_relay_with_a_receipt_time_timestamp`.
+//! 4. **A 3164 -> 5424 relay's TIMESTAMP is receipt time, in RFC 3339.** A 3164 `Mmm dd hh:mm:ss`
+//!    token has no year or timezone, and `syslog_out` won't guess one. Test:
+//!    `a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time`.
+//! 5. **A relay's STRUCTURED-DATA is `-` when the event carries no `syslog.sd`**, as on any
+//!    3164 -> 5424 relay. Same test as (4).
+//! 6. **The header hostname and app-name can come from `syslog_out`'s configured defaults**
+//!    (`with_hostname`/`with_app_name`) when the event has no `syslog.hostname`/`syslog.tag`. The
+//!    round-trip encoders here leave both unset so no byte-for-byte case exercises this by
+//!    accident; no test in this file depends on it.
+//! 7. **SD-ELEMENTs and SD-PARAMs are ordered by name, not by wire position.**
+//!    `write_structured_data`/`write_sd_element` sort SD-IDs and PARAM-NAMEs by name bytes, since
+//!    attribute iteration follows process-global intern order: `[b@2 ..][a@1 ..]` re-emits as
+//!    `[a@1 ..][b@2 ..]`. A repeated PARAM-NAME's occurrences, already one `Value::Array` after
+//!    decode, are emitted together, so a wire `a b a` interleaving becomes `a a b`
+//!    (`docs/known-gaps.md`). Fixtures: `rfc5424-example4`, `interop-logger-rfc5424-basic`.
+//! 8. **A bare backslash in a PARAM-VALUE is re-emitted escaped.** RFC 5424 section 6.3.3 defines
+//!    only `\"`, `\\`, and `\]` as escapes, so `\x` is a literal backslash followed by `x`, which
+//!    `parse_param_value` keeps. `syslog_out` writes that backslash as `\\`: `p="a\xb"` relays as
+//!    `p="a\\xb"`, the same PARAM-VALUE under the RFC's equivalence. Pinned by a unit test in
+//!    `logit_outputs::syslog`, not a fixture here:
+//!    `a_bare_backslash_param_value_is_re_emitted_in_canonical_escaped_form`.
+//! 9. **A non-UTF-8 RFC 3164 HOSTNAME is dropped.** `parse_3164` never fails a line over its
+//!    HOSTNAME, because `parse_line`'s version-sniff fallback depends on that, so it skips the
+//!    `syslog.hostname` attribute and reports a throttled `hostname_not_utf8` diagnostic. Pinned by
+//!    a unit test in `logit_inputs::syslog`:
+//!    `a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic`.
 //!
-//! `mod tcp`/`mod tls` below add no new entry to this list -- `transport: tcp` (and TLS on top of
-//! it, RFC 5425) changes framing and, for TLS, transport security, never message content; every
-//! normalization above still applies unchanged, since both transports share the same
-//! `SyslogEncoder`/`SyslogDecoder` (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//! `mod tcp` and `mod tls` add no entry to this list: both transports share
+//! `SyslogEncoder`/`SyslogDecoder`, and TCP (and TLS, RFC 5425) changes only the framing
+//! (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
@@ -87,8 +78,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-/// The `.expected` marker meaning "byte-identical to the `.in` file" -- see this file's module
-/// doc.
+/// The `.expected` marker meaning "byte-identical to the `.in` file".
 const SAME_AS_INPUT: &[u8] = b"== SAME AS INPUT ==";
 
 fn fixtures_dir() -> PathBuf {
@@ -112,7 +102,7 @@ fn read_testdata(name: &str) -> Vec<u8> {
 }
 
 /// The bytes a case's sink output must equal: either the literal `.expected` file, or (when that
-/// file is exactly [`SAME_AS_INPUT`]) the case's own `.in` bytes.
+/// file is [`SAME_AS_INPUT`]) the case's own `.in` bytes.
 fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
     let expected = read_fixture(name, "expected");
     if expected.as_slice() == SAME_AS_INPUT {
@@ -122,24 +112,19 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Zeroes every event's receipt-time `timestamp` -- the one field that legitimately differs
-/// between two independent decodes of equivalent bytes (this process's wall clock at the moment
-/// each decode ran), so a whole-`EventBatch` `assert_eq!` can otherwise be exact. The
-/// `syslog.timestamp` *attribute* is never touched here -- it's origin data, not receipt time,
-/// and every fixture in this corpus carries a `Value::Timestamp`/`Value::Null`/verbatim
-/// `Value::Str` that round-trips to the identical value either way (see the module doc's
-/// normalization list).
+/// Zeroes every event's receipt-time `timestamp`, the one field two independent decodes of the
+/// same bytes legitimately disagree on. The `syslog.timestamp` attribute is origin data and is
+/// left alone.
 fn normalize_receipt_time(batch: &mut EventBatch) {
     for event in &mut batch.events {
         event.timestamp = 0;
     }
 }
 
-/// Real UDP harness: a plain "byte capture" socket (for the raw-datagram half of every
-/// byte-for-byte assertion) alongside a real, bound [`SyslogInput`] draining into a [`Fanout`]
-/// channel (for the decoded-`EventBatch` half) -- the plan's "do BOTH" requirement. Mirrors
-/// `otlp_round_trip.rs`'s `bind()`-then-`local_addr()`-then-spawn pattern; no bind-drop race and
-/// no sleep-based readiness guess.
+/// A plain UDP capture socket (the raw-bytes half of each assertion) beside a bound, live
+/// [`SyslogInput`] draining into a [`Fanout`] channel (the decoded-`EventBatch` half). The input
+/// is bound, then `local_addr()` read, then spawned, so there is no bind-drop race and no
+/// sleep-based readiness guess.
 struct Harness {
     capture: UdpSocket,
     capture_addr: SocketAddr,
@@ -165,10 +150,9 @@ impl Harness {
         Self { capture, capture_addr, input_addr, rx }
     }
 
-    /// Sends `batch` through a fresh [`SyslogOutput`] built from `encoder()` -- once at the raw
-    /// capture socket, once at the live `syslog_in` -- and returns the raw datagram bytes
-    /// alongside the [`EventBatch`] the real input decoded from them (receipt-time `timestamp`
-    /// fields already normalized).
+    /// Sends `batch` once to the capture socket and once to the live `syslog_in`, each through a
+    /// fresh [`SyslogOutput`], and returns the captured bytes and the receipt-time-normalized
+    /// decode.
     async fn round_trip(
         &mut self,
         batch: &EventBatch,
@@ -212,10 +196,8 @@ fn direct_batch(raw: &[u8]) -> EventBatch {
     batch
 }
 
-/// One deterministic byte-for-byte case: a fixture's own decode round-trips through a live
-/// `syslog_in` unchanged (whole-`EventBatch` equality), and the raw datagram the far end actually
-/// received equals the case's `.expected` bytes (module doc's normalization list covers every
-/// place the two differ).
+/// Asserts one fixture's wire bytes equal its `.expected` bytes and its live decode equals its
+/// direct decode.
 async fn assert_byte_for_byte(harness: &mut Harness, fixture: &str, format: Format, raw: &[u8]) {
     let batch = direct_batch(raw); // already receipt-time normalized
     let expected = expected_bytes(fixture, raw);
@@ -255,14 +237,12 @@ async fn rfc5424_fixtures_round_trip_byte_for_byte() {
         assert_byte_for_byte(&mut harness, name, Format::Rfc5424, &raw).await;
     }
 
-    // The one RFC 5424 interop capture -- read live from `testdata/interop/syslog/`, not copied.
+    // The one RFC 5424 interop capture.
     let raw = read_testdata("logger-rfc5424-basic-000.raw");
     assert_byte_for_byte(&mut harness, "interop-logger-rfc5424-basic", Format::Rfc5424, &raw).await;
 }
 
-/// The non-UTF-8 MSG case decodes to `Value::Bytes`, not `Value::Str` -- called out on its own
-/// (the plan's "Non-UTF-8 MSG relays as `Value::Bytes` byte-for-byte" bullet), even though
-/// `rfc5424_fixtures_round_trip_byte_for_byte` above already exercises it end to end.
+/// A non-UTF-8 MSG decodes to `Value::Bytes`, not `Value::Str`, on both ends of the relay.
 #[tokio::test]
 async fn rfc5424_non_utf8_message_relays_as_value_bytes_byte_for_byte() {
     let raw = read_fixture("rfc5424-non-utf8-msg", "in");
@@ -284,17 +264,16 @@ async fn rfc5424_non_utf8_message_relays_as_value_bytes_byte_for_byte() {
     }
 }
 
-/// A 33-byte SD-NAME violates RFC 5424's 32-byte `SD-NAME` limit -- `syslog_in` rejects the whole
-/// line (`bad_line`), so nothing reaches `syslog_out` at all. Decode-only: there is no sink output
-/// to assert on.
+/// A 33-byte SD-NAME breaks RFC 5424's 32-byte limit, so `syslog_in` rejects the whole line
+/// (`bad_line`). Decode-only: nothing reaches the sink.
 #[tokio::test]
 async fn oversize_sd_name_is_rejected_by_the_decoder_and_never_reaches_the_sink() {
     let raw = read_fixture("rfc5424-oversize-sd-name", "in");
     let mut decoder = SyslogDecoder::new(std::sync::Arc::new(logit_core::Resource::default()));
     let mut events = Vec::new();
     let result = decoder.decode_into(Bytes::copy_from_slice(&raw), 0, &mut events);
-    // `decode_into` itself never fails for syslog (a malformed *line* is a skip-and-continue,
-    // reported through diagnostics) -- the rejection shows up as zero events, not an `Err`.
+    // A malformed line is skipped and reported through diagnostics, so the rejection shows up
+    // as zero events, not an `Err`.
     assert!(result.is_ok());
     assert!(events.is_empty(), "a 33-byte SD-NAME must reject the whole line, producing no event");
 }
@@ -310,9 +289,8 @@ async fn rfc3164_fixtures_round_trip_byte_for_byte() {
         assert_byte_for_byte(&mut harness, name, Format::Rfc3164, &raw).await;
     }
 
-    // Interop captures that carry their own well-formed RFC 3164 TIMESTAMP token, so
-    // `write_3164_timestamp` writes it back verbatim (no receipt-time fallback) -- fully
-    // deterministic, unlike the two `python-syslog-handler-*` captures below.
+    // Interop captures with their own RFC 3164 TIMESTAMP token, which `write_3164_timestamp`
+    // writes back verbatim, so these are deterministic (unlike `python-syslog-handler-*`).
     let deterministic: &[(&str, &str)] = &[
         ("logger-rfc3164-basic-000.raw", "interop-logger-rfc3164-basic"),
         ("logger-rfc3164-unicode-000.raw", "interop-logger-rfc3164-unicode"),
@@ -324,8 +302,7 @@ async fn rfc3164_fixtures_round_trip_byte_for_byte() {
     }
 }
 
-/// `tag[pid]` with a non-numeric `pid`, relayed 3164 -> 3164: `syslog.pid` stays a `Value::Str`
-/// end to end, and the bracket contents survive unchanged (the plan's own callout).
+/// A non-numeric `tag[pid]` stays a `Value::Str` `syslog.pid` through a 3164 -> 3164 relay.
 #[tokio::test]
 async fn rfc3164_non_numeric_pid_stays_a_str_through_the_relay() {
     let raw = read_fixture("rfc3164-nonnumeric-pid", "in");
@@ -338,12 +315,9 @@ async fn rfc3164_non_numeric_pid_stays_a_str_through_the_relay() {
     assert_eq!(decoded.events[0].attributes.get("syslog.pid").and_then(Value::as_str), Some("abc"));
 }
 
-/// `python-syslog-handler-{000,001}.raw` carry no TIMESTAMP token at all (Python's stdlib
-/// `SysLogHandler` in its minimal framing) -- module doc normalization (3): a 3164 -> 3164 relay
-/// still emits *a* TIMESTAMP (receipt time), which these two captures can't be fixtured
-/// byte-for-byte against, so they get a structural assertion instead: the PRI and the rest of the
-/// line (hostname/tag/message) round-trip exactly, and the emitted TIMESTAMP is a well-formed RFC
-/// 3164 token in the right position.
+/// Normalization (3) for a capture with no TIMESTAMP token (`python-syslog-handler-*`, Python's
+/// stdlib `SysLogHandler`). The relay adds a receipt-time TIMESTAMP, so the assertion is
+/// structural: a well-formed RFC 3164 TIMESTAMP after the PRI, and everything after it unchanged.
 async fn assert_receipt_time_relay(
     harness: &mut Harness,
     testdata_name: &str,
@@ -371,9 +345,8 @@ async fn assert_receipt_time_relay(
     );
 }
 
-/// Local copy of `logit_outputs::syslog`'s own (private) shape check -- this integration test has
-/// no access to that crate's internals, and the shape itself is simple and RFC-defined: 3-letter
-/// month, space, a space- or zero-padded day, space, `hh:mm:ss`.
+/// Copy of `logit_outputs::syslog`'s private shape check: 3-letter month, space, a space- or
+/// zero-padded day, space, `hh:mm:ss`.
 fn is_rfc3164_timestamp_shape(s: &str) -> bool {
     const MONTHS: [&str; 12] =
         ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -417,10 +390,8 @@ async fn python_syslog_handler_captures_relay_with_a_receipt_time_timestamp() {
 
 // ---- 3164 -> 5424, documented normalizations ---------------------------------------------------
 
-/// The plan's explicit 3164 -> 5424 case: TIMESTAMP falls to receipt time (rendered in RFC 3339,
-/// not reinterpreted from the 3164 token), and STRUCTURED-DATA is always `-` (module doc
-/// normalizations 4 and 5). Everything dialect-independent (PRI, hostname, tag/pid, message)
-/// still carries over.
+/// Normalizations (4) and (5) on a 3164 -> 5424 relay. PRI, hostname, tag, pid, and message
+/// still carry over.
 #[tokio::test]
 async fn a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time() {
     let raw = read_fixture("rfc3164-nonnumeric-pid", "in"); // has a real 3164 TIMESTAMP token
@@ -445,7 +416,7 @@ async fn a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time() {
         "expected an RFC 3339 TIMESTAMP, got {ts_field:?} in {text:?}"
     );
 
-    // STRUCTURED-DATA is always `-` on a relay that never carried `syslog.sd` to begin with.
+    // STRUCTURED-DATA is `-`: the event carries no `syslog.sd`.
     assert!(text.contains(" - hello world"), "expected a nil SD field before the message: {text}");
 
     // Dialect-independent fields still round-trip.
@@ -459,9 +430,8 @@ async fn a_3164_to_5424_relay_falls_the_timestamp_to_receipt_time() {
 
 // ---- opt-in `structured_data` ------------------------------------------------------------------
 
-/// An event with non-`syslog.*` attributes, relayed through a 5424 sink configured with
-/// `structured_data: { sd_id: "logit@32473" }`, decodes on the far end with those attributes
-/// lifted under `syslog.sd["logit@32473"]` -- the plan's opt-in `structured_data` bullet.
+/// With `structured_data: { sd_id: "logit@32473" }`, an event's non-`syslog.*` attributes decode
+/// on the far end under `syslog.sd["logit@32473"]`.
 #[tokio::test]
 async fn opt_in_structured_data_lifts_non_syslog_attributes_into_syslog_sd() {
     let mut attrs = logit_core::AttrMap::new();
@@ -505,27 +475,22 @@ async fn opt_in_structured_data_lifts_non_syslog_attributes_into_syslog_sd() {
         panic!("expected the SD-ELEMENT to be a Value::Map, got {element:?}")
     };
     assert_eq!(params.get("env").and_then(Value::as_str), Some("prod"));
-    // The opt-in element's PARAM-VALUEs always render as strings (module doc's "STRUCTURED-DATA"
-    // section) -- `retries` comes back as `Value::Str("3")`, not `Value::U64(3)`.
+    // PARAM-VALUEs always render as strings (`logit_outputs::syslog`'s "STRUCTURED-DATA"), so
+    // `retries` comes back as `Value::Str("3")`.
     assert_eq!(params.get("retries").and_then(Value::as_str), Some("3"));
 }
 
 // ---- transport: tcp -----------------------------------------------------------------------
 
-/// `syslog_out(transport: tcp) -> syslog_in(transport: tcp)`, over the same fixture corpus the
-/// UDP tests above use, plus the two cases only a stream transport can exercise at all: a raw
-/// LF-framed client with no `syslog_out` involved, and an octet-counted MSG whose body contains an
-/// embedded newline. `docs/adr/syslog-tcp-ingress-and-tls.md`.
+/// `syslog_out(transport: tcp) -> syslog_in(transport: tcp)` over the UDP fixture corpus, plus two
+/// stream-only cases: a raw LF-framed client, and an octet-counted MSG with an embedded newline.
 mod tcp {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 
-    /// TCP twin of the top-level [`Harness`]: same `bind()`-then-`local_addr()` readiness for the
-    /// live `syslog_in`, plus a raw TCP "capture" listener standing in for the UDP capture socket
-    /// above -- it accepts one connection per round trip and reads it to EOF, since a fresh
-    /// `SyslogOutput::tcp` per call closes its connection (and so EOFs the peer) the moment it is
-    /// dropped.
+    /// TCP twin of [`Harness`]. The capture listener reads each connection to EOF, which works
+    /// because each round trip uses a fresh `SyslogOutput::tcp` and drops it after sending.
     struct TcpHarness {
         capture_addr: SocketAddr,
         capture_rx: mpsc::Receiver<Vec<u8>>,
@@ -565,11 +530,7 @@ mod tcp {
             Self { capture_addr, capture_rx, input_addr, rx }
         }
 
-        /// Sends `batch` through a fresh TCP [`SyslogOutput`] built from `encoder()` -- once at the
-        /// raw capture listener, once at the live `syslog_in` -- and returns the captured
-        /// octet-counted frame alongside the [`EventBatch`] the real input decoded from it
-        /// (receipt-time `timestamp` fields already normalized). Mirrors the UDP
-        /// [`Harness::round_trip`] exactly, modulo the transport.
+        /// TCP twin of [`Harness::round_trip`]; the captured bytes are an octet-counted frame.
         async fn round_trip(
             &mut self,
             batch: &EventBatch,
@@ -600,10 +561,8 @@ mod tcp {
         }
     }
 
-    /// Splits an RFC 6587 section 3.4.1 octet-counted frame into `MSG-LEN` and `MSG`, asserting
-    /// the count matches the message's actual length -- `syslog_out`'s TCP transport emits no
-    /// other framing (`docs/adr/syslog-output.md`'s "Transport" section), so this is the one thing
-    /// a TCP round trip needs to check that the UDP path above doesn't.
+    /// Strips an RFC 6587 section 3.4.1 octet-counted frame's `MSG-LEN`, asserting it equals the
+    /// MSG's length. It's the only framing `syslog_out`'s TCP transport adds.
     fn split_octet_counted(frame: &[u8]) -> &[u8] {
         let sp = frame.iter().position(|&b| b == b' ').expect("a leading MSG-LEN SP");
         let len: usize =
@@ -613,9 +572,7 @@ mod tcp {
         msg
     }
 
-    /// TCP twin of the top-level `assert_byte_for_byte`: same fixture, same `.expected` bytes, but
-    /// the captured wire bytes are an octet-counted frame around them rather than a bare UDP
-    /// datagram.
+    /// TCP twin of `assert_byte_for_byte`, against the same `.expected` bytes.
     async fn assert_byte_for_byte_tcp(
         harness: &mut TcpHarness,
         fixture: &str,
@@ -638,9 +595,7 @@ mod tcp {
         );
     }
 
-    /// `syslog_out(transport: tcp) -> syslog_in(transport: tcp)`, over the same corpus the UDP
-    /// tests above use -- the framing changes (RFC 6587 octet-counting), the content and
-    /// permitted normalizations don't (this file's module doc).
+    /// The UDP corpus over TCP, byte for byte inside the octet-counted frame.
     #[tokio::test]
     async fn fixture_corpus_round_trips_over_tcp() {
         let mut harness = TcpHarness::new().await;
@@ -675,8 +630,7 @@ mod tcp {
             let raw = read_fixture(name, "in");
             assert_byte_for_byte_tcp(&mut harness, name, Format::Rfc3164, &raw).await;
         }
-        // Interop captures carrying their own well-formed RFC 3164 TIMESTAMP -- deterministic,
-        // exactly the UDP corpus's own "deterministic" list above.
+        // The UDP test's deterministic interop captures.
         let deterministic: &[(&str, &str)] = &[
             ("logger-rfc3164-basic-000.raw", "interop-logger-rfc3164-basic"),
             ("logger-rfc3164-unicode-000.raw", "interop-logger-rfc3164-unicode"),
@@ -688,10 +642,8 @@ mod tcp {
         }
     }
 
-    /// A raw client speaking non-transparent (LF-delimited) framing -- rsyslog's `omfwd` default,
-    /// and the framing this listener falls back to whenever the first byte isn't an ASCII digit
-    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`) -- decodes exactly like the UDP path, with no
-    /// `syslog_out` involved at all.
+    /// A raw client using LF-delimited framing (rsyslog `omfwd`'s default, and what the listener
+    /// picks when the first byte isn't an ASCII digit) decodes like UDP.
     #[tokio::test]
     async fn a_raw_lf_framed_client_is_decoded_like_udp() {
         let mut input = SyslogInput::tcp("127.0.0.1:0");
@@ -708,7 +660,7 @@ mod tcp {
             .write_all(b"<13>1 2023-01-01T00:00:00Z myhost app - - - hello over raw tcp\n")
             .await
             .expect("writing the LF-framed message");
-        drop(stream); // a clean close is fine -- the message already ended in its own LF
+        drop(stream); // the message already ended in its own LF
 
         let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
             .await
@@ -722,11 +674,9 @@ mod tcp {
         assert_eq!(event.log.as_ref().unwrap().message.as_str(), Some("hello over raw tcp"));
     }
 
-    /// The framing case only TCP can exercise at all: an octet-counted MSG whose body contains a
-    /// literal embedded newline. The framer delimits by count, not by `\n`, and `SyslogInput::tcp`
-    /// turns off the decoder's own line splitting for exactly this reason (this file's module doc,
-    /// and `SyslogDecoder::with_line_splitting`'s own doc comment) -- so the whole two-line body
-    /// must land in one event's message, not be shredded into two.
+    /// An octet-counted MSG with an embedded newline is one event: the framer delimits by count,
+    /// and `SyslogInput::tcp` turns off the decoder's line splitting
+    /// (`SyslogDecoder::with_line_splitting`).
     #[tokio::test]
     async fn a_multiline_octet_counted_message_arrives_as_one_event() {
         let mut input = SyslogInput::tcp("127.0.0.1:0");
@@ -765,10 +715,8 @@ mod tcp {
 
 // ---- transport: tls (RFC 5425) -------------------------------------------------------------
 
-/// `syslog_out`/`syslog_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative case,
-/// modelled on `logit_round_trip.rs`'s own `mod tls` -- both use `bind()`+`local_addr()` for
-/// readiness rather than a probe socket plus a sleep.
-/// `docs/adr/syslog-tcp-ingress-and-tls.md`.
+/// `syslog_out` -> `syslog_in` over TLS: server TLS, mutual TLS, and the wrong-CA negative case
+/// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 mod tls {
     use super::*;
     use logit_inputs::tcp::TlsServerSettings;
@@ -776,15 +724,11 @@ mod tls {
     use logit_pipeline::{classify, Fault};
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
-        // `testdata/tls` -- two levels up from `CARGO_MANIFEST_DIR`, exactly
-        // `logit_round_trip.rs`'s own `mod tls::testdata_dir`.
+        // The repo root's `testdata/tls`, two levels up from `crates/logit-cli`.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
-    /// One log event with a message worth asserting on -- this file's TLS coverage is about the
-    /// transport, not about syslog decoding itself, which the UDP and `mod tcp` tests above
-    /// already exercise thoroughly.
+    /// One log event. The TLS tests cover the transport; the UDP and TCP tests cover decoding.
     fn sample_batch() -> EventBatch {
         let mut attrs = logit_core::AttrMap::new();
         attrs.insert("host", "tls-test-host");
@@ -808,9 +752,8 @@ mod tls {
         }
     }
 
-    /// Stands up a TLS-terminating TCP `syslog_in` with `settings`, returning its bound address
-    /// and the `Fanout` receiver every decoded batch lands on -- `bind()`-then-`local_addr()`
-    /// readiness, the same idiom the UDP [`Harness`] and `mod tcp` above use, no sleep needed.
+    /// Spawns a TLS-terminating TCP `syslog_in`, returning its bound address and the receiver
+    /// its decoded batches land on.
     async fn spawn_tls_input(
         settings: &TlsServerSettings,
     ) -> (SocketAddr, mpsc::Receiver<Delivered>) {
@@ -827,9 +770,7 @@ mod tls {
         (addr, rx)
     }
 
-    /// Server TLS only: `syslog_out` trusts `ca.pem`, `syslog_in` presents
-    /// `server.pem`/`server.key` with no `client_ca_file` -- any client is accepted once the
-    /// handshake itself completes.
+    /// Server TLS only: `syslog_in` sets no `client_ca_file`, so it accepts any client.
     #[tokio::test]
     async fn server_tls_round_trips_a_batch() {
         let (addr, mut rx) = spawn_tls_input(&TlsServerSettings {
@@ -904,19 +845,13 @@ mod tls {
         );
     }
 
-    /// The negative case: `syslog_out` trusts `other-ca.pem`, which never signed `server.pem`, so
-    /// *this* side's own certificate verification fails the handshake before a single byte of the
-    /// batch has left the host -- `Fault::Clean`, and deterministically so.
-    ///
-    /// This is the server-cert half of PR #159's finding, not the client-cert half: under TLS 1.3
-    /// the *server* sends its whole flight before it ever sees the client's certificate message, so
-    /// a client-cert rejection (`crates/logit-outputs/src/syslog.rs`'s
-    /// `tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`)
-    /// is invisible to this write-only sink -- `send` can report success even though the collector
-    /// rejected the connection. A *server*-cert rejection is the opposite: it happens inside the
-    /// client's own certificate verification, before `TlsConnector::connect` even completes, let
-    /// alone before any byte is written -- so it is always observable here, deterministically, as
-    /// `Fault::Clean`.
+    /// A `syslog_out` trusting `other-ca.pem` fails its own certificate verification before any
+    /// batch byte is written, so the error is `Fault::Clean`. That's deterministic because a
+    /// server-cert rejection happens inside `TlsConnector::connect`. A client-cert rejection is
+    /// the opposite: under TLS 1.3 the server sends its whole flight before seeing the client's
+    /// certificate, so this write-only sink can report success
+    /// (`logit_outputs::syslog`'s
+    /// `tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`).
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_classified_clean() {
         let (addr, _rx) = spawn_tls_input(&TlsServerSettings {

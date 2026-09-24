@@ -1,11 +1,9 @@
-//! `otlp_output_to_otlp_input_round_trips_a_batch_through_http`/`_through_grpc` --
-//! `docs/plans/otlp-end-to-end.md`'s "strongest single test, needing no external service" for
-//! PR3: stand an [`OtlpInput`] up on an ephemeral port in-process, point an [`OtlpOutput`] at it,
-//! and assert what comes out the far end's [`Fanout`] matches what went in. Lives here (an
-//! integration test in `logit-cli`, which already depends on both `logit-inputs` and
-//! `logit-outputs` as ordinary dependencies -- see that crate's `Cargo.toml`) rather than as a
-//! dev-dependency cycle between the two sibling crates, neither of which otherwise has any reason
-//! to know about the other.
+//! `otlp_out -> otlp_in` over real sockets, the OTLP pair of ADR `lossless-transit`: an
+//! [`OtlpInput`] bound on an ephemeral port in-process, an [`OtlpOutput`] pointed at it, and a
+//! whole-value check that what leaves the far end's [`Fanout`] matches what went in. Covers HTTP
+//! and gRPC, each plain, gzip-compressed, and over TLS. It lives in `logit-cli`, which already
+//! depends on both `logit-inputs` and `logit-outputs`, rather than as a dev-dependency between
+//! those two sibling crates.
 
 use logit_core::interner::intern;
 use logit_core::{
@@ -22,9 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Reserves an ephemeral port by binding then immediately dropping a listener, the same
-/// bind-drop-rebind idiom `crates/logit-inputs/src/otlp.rs`'s own tests use to learn a free port
-/// before constructing the component that will actually bind it.
+/// Reserves an ephemeral port by binding and dropping a listener (bind-drop-rebind), as
+/// `crates/logit-inputs/src/otlp.rs`'s tests do.
 async fn ephemeral_addr() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().to_string()
@@ -32,12 +29,10 @@ async fn ephemeral_addr() -> String {
 
 // -- The fixture: fully populated, shared by every field this file asserts on -------------------
 //
-// `mixed_signal_batch` carries one event per signal (plus a second metric event, to exercise
-// `MetricRecord::flags`), which means it shatters into three separate batches on the wire
-// (`crates/logit-proto/src/otlp/mod.rs`'s module doc: "OTLP's wire protocol does [split by
-// signal]") -- by design, not a gap. `assert_round_tripped` below reassembles by finding each
-// signal's own batch and asserting whole-value equality against these same builder functions,
-// rather than the field-by-field spot checks this file used before W4 closed the remaining gaps.
+// `mixed_signal_batch` carries one event per signal, plus a second metric event for
+// `MetricRecord::flags`, so it splits into three batches on the wire: OTLP sends each signal
+// separately (`logit_proto::Signal`'s doc). `assert_round_tripped` finds each signal's batch and
+// asserts whole-value equality against these builders.
 
 fn fixture_resource() -> Arc<Resource> {
     let mut attributes = AttrMap::new();
@@ -61,12 +56,11 @@ fn fixture_scope() -> Arc<Scope> {
     })
 }
 
-/// Already in the shape a real OTLP decode would itself produce -- `otel.severity_number`/
-/// `otel.severity_text` match `Severity::Info`'s `INFO2` (10) band member, the same discipline
-/// `crates/logit-proto/tests/otlp_fixed_point.rs`'s own module doc requires and for the same
-/// reason: encode consumes these two attributes (removes them from the emitted attribute set) and
-/// decode re-stamps them fresh from the wire's real severity fields, so a fixture whose attributes
-/// don't already match its `Severity` would round-trip to something other than itself.
+/// In the shape a real OTLP decode produces: `otel.severity_number`/`otel.severity_text` match
+/// `Severity::Info`'s `INFO2` (10) band member. Encode consumes these two attributes and decode
+/// re-stamps them from the wire's severity fields, so attributes that disagree with the `Severity`
+/// wouldn't round-trip to themselves (the rule `crates/logit-proto/tests/otlp_fixed_point.rs`'s
+/// module doc states).
 fn fixture_log_attrs() -> AttrMap {
     let mut attrs = AttrMap::new();
     attrs.insert("otel.severity_number", Value::I64(10));
@@ -102,10 +96,8 @@ fn fixture_described_metric() -> MetricRecord {
             fixture_exemplar(Some(TraceRef {
                 trace_id: [7; 16],
                 span_id: Some([6; 8]),
-                // OTLP's own Exemplar message has no flags field at all
-                // (`decode_exemplar` always passes 0) -- an exemplar's trace flags cannot
-                // round-trip through OTLP, so the fixture must already be 0 to be a fixed
-                // point.
+                // OTLP's `Exemplar` has no flags field (`decode_exemplar` always passes 0), so
+                // the fixture's must be 0 to be a fixed point.
                 flags: 0,
             })),
             fixture_exemplar(None),
@@ -121,10 +113,9 @@ fn fixture_described_metric() -> MetricRecord {
     }
 }
 
-/// `flags = FLAG_NO_RECORDED_VALUE`, `start_timestamp` left at `MetricRecord::new`'s `0` default --
-/// a genuine fixed point now that encode writes `start_timestamp` through verbatim with no
-/// fallback to the data point's own `time_unix_nano` (`otlp/metrics.rs`'s `start_time`); no longer
-/// needs an explicit non-zero value to dodge that old substitution.
+/// `FLAG_NO_RECORDED_VALUE`, with `start_timestamp` at `MetricRecord::new`'s `0`: encode writes
+/// `start_timestamp` through verbatim (`crates/logit-proto/src/otlp/metrics.rs`'s module doc), so
+/// a zero start time is a fixed point.
 fn fixture_flagged_metric() -> MetricRecord {
     MetricRecord {
         flags: MetricRecord::FLAG_NO_RECORDED_VALUE,
@@ -172,8 +163,7 @@ fn fixture_span() -> SpanRecord {
 }
 
 /// One log, two metric events (one described, one flagged), and one span, sharing a fully
-/// populated `Resource`/`Scope` -- shatters into three OTLP payloads/batches on the wire (see this
-/// section's own doc comment).
+/// populated `Resource`/`Scope`. Splits into three batches on the wire.
 fn mixed_signal_batch() -> EventBatch {
     let log = Event::log(1_000, fixture_log_attrs(), fixture_log());
     let metric_described = Event::metric(2_000, AttrMap::new(), fixture_described_metric());
@@ -194,9 +184,8 @@ async fn round_trip(
     mut output: OtlpOutput,
     batch: &EventBatch,
 ) -> Vec<EventBatch> {
-    // `Input::bind` (docs/plans/operator-surface.md, workstream B) opens the listener before
-    // `run`'s accept loop starts -- the readiness primitive this test used to fake with a 50 ms
-    // sleep now does the real thing: `output.send` below can't race the bind at all.
+    // `Input::bind` opens the listener before `run`'s accept loop starts, so `output.send` below
+    // can't race the bind.
     input.bind().await.expect("binding the otlp listener");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
@@ -215,12 +204,10 @@ async fn round_trip(
     received
 }
 
-/// Reassembles `received` (`mixed_signal_batch`'s three shattered payloads) and asserts each
-/// record, and each batch's `resource`/`scope`, whole-value against the fixture -- not just a
-/// field-by-field spot check the way this test used to, before W4 closed the remaining OTLP
-/// fidelity gaps. Timestamps are included in that equality: `fixture_log`'s `observed_timestamp`
-/// is non-zero, which is what makes `LogRecord`'s encode path deterministic
-/// (`crates/logit-proto/src/otlp/logs.rs`'s module doc).
+/// Reassembles `received` (`mixed_signal_batch`'s three per-signal batches) and asserts each
+/// record, and each batch's `resource`/`scope`, whole-value against the fixture, timestamps
+/// included. `fixture_log`'s non-zero `observed_timestamp` is what makes `LogRecord`'s encode
+/// deterministic (`crates/logit-proto/src/otlp/logs.rs`'s module doc).
 fn assert_round_tripped(received: &[EventBatch]) {
     assert!(!received.is_empty(), "expected at least one batch out the far end");
 
@@ -310,9 +297,8 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
     assert_round_tripped(&received);
 }
 
-/// The pair `docs/adr/otlp-compression-and-decompression-bounds.md` exists for: proves
-/// `otlp_out`'s gzip compression and `otlp_in`'s matching decode landed together, not just that
-/// each side's own unit tests pass in isolation.
+/// The pair `docs/adr/otlp-compression-and-decompression-bounds.md` exists for: `otlp_out`'s gzip
+/// and `otlp_in`'s decode interoperate, beyond each side's own unit tests.
 #[tokio::test]
 async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_http() {
     let addr = ephemeral_addr().await;
@@ -337,16 +323,15 @@ async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_g
     assert_round_tripped(&received);
 }
 
-/// The TLS counterpart to the four round trips above -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`'s
-/// own strongest single test, the same role the gzip pair plays for compression: proves
-/// `otlp_out`'s client TLS and `otlp_in`'s server TLS actually interoperate, not just that each
-/// side's own unit tests pass against a hand-built canned peer in isolation.
+/// TLS counterparts to the round trips above, for `docs/adr/otlp-tls-and-pooled-grpc-client.md`:
+/// `otlp_out`'s client TLS and `otlp_in`'s server TLS interoperate, beyond each side's own unit
+/// tests against a canned peer.
 mod tls {
     use super::*;
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
-        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        // The certs are the repo root's `testdata/tls` (`testdata/tls/README.md`), two levels
+        // above `CARGO_MANIFEST_DIR`.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 

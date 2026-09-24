@@ -1,15 +1,11 @@
-# The native encoder in situ (docs/plans/load-test-harness.md's scenario table): the same shape as
-# encode-human-devnull, generate_in straight into file_out at /dev/null, but under
-# `format: native` -- logit_proto::native's dictionary-first wire encoder
-# (docs/adr/file-output-native-format.md) instead of the human-readable render. There is no
-# `influx` file format to compare against -- these two (`human`/`native`) are the only encoders
-# `file_out` has, and the pair is what a real `stdio_out`/`file_out`/`logit_out` deployment would
-# actually choose between.
+# The native encoder in situ: the same shape as encode-human-devnull, but under `format: native`
+# (logit_proto::native's dictionary-first wire encoder, docs/adr/file-output-native-format.md).
+# `human` and `native` are the only two formats `file_out` has. Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios".
 #
 #   script/perf run --scenario encode-native-devnull
 #
-# `rotate:` is required for the same reason as encode-human-devnull -- see that scenario's comment
-# for why `max_bytes: "100GiB"` rather than `interval:`.
+# `rotate:` is required for the reason encode-human-devnull gives.
 components:
   gen:
     type: generate_in

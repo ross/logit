@@ -1,170 +1,146 @@
-//! OTLP input -- accepts logs, metrics, and traces over either OTLP/HTTP (protobuf-over-POST) or
-//! OTLP/gRPC, selected by `protocol` in config (`logit_config::OtlpProtocol`). See
-//! `docs/adr/hand-rolled-grpc-over-hyper.md` for why the gRPC server is a ~200-line hand-rolled
-//! `hyper::server::conn::http2` service rather than `tonic`, and why that's budgeted as roughly
-//! half of this whole PR's effort -- HTTP/2 trailers, per-method routing, and gRPC status-code
-//! framing are all things `tonic` gives away for free and this input has to build by hand.
+//! `otlp_in`: OTLP logs, metrics, and traces over OTLP/HTTP (`POST` to `/v1/logs`,
+//! `/v1/metrics`, `/v1/traces`, protobuf or JSON) or OTLP/gRPC (the three `Export` methods,
+//! [`Signal::grpc_method`]), selected by `protocol` in config (`logit_config::OtlpProtocol`).
+//! The gRPC server is a hand-rolled `hyper::server::conn::http2` service rather than `tonic`
+//! (`docs/adr/hand-rolled-grpc-over-hyper.md`): each request and response body is one message
+//! behind a 5-byte prefix (compressed flag, big-endian `u32` length), and the outcome rides in
+//! `grpc-status`/`grpc-message` trailers on an HTTP `200`. A rejection maps to `12`
+//! (`UNIMPLEMENTED`: a non-`POST`, an unknown method, an unsupported `grpc-encoding`), `3`
+//! (`INVALID_ARGUMENT`: a malformed frame, gzip, or payload), `8` (`RESOURCE_EXHAUSTED`: over
+//! [`MAX_REQUEST_BYTES`]), or `4` (`DEADLINE_EXCEEDED`: a stalled body).
 //!
-//! **One listener, one accept loop, one handler per connection.** [`Input::run`] binds a single
-//! `TcpListener` and `tokio::spawn`s a handler per accepted connection -- [`Fanout`] is already
-//! `Clone`, which is the whole mechanism that lets an arbitrary number of concurrent connections
-//! each hold their own handle to the same downstream sink. HTTP connections are served by
-//! [`hyper_util::server::conn::auto::Builder`], which transparently handles both HTTP/1.1 (what a
-//! `curl`/most OTel HTTP exporters speak) and h2c (prior-knowledge HTTP/2 without TLS, what
-//! `curl --http2-prior-knowledge` and some exporters prefer); gRPC connections are served by
-//! [`hyper::server::conn::http2::Builder`] directly, since gRPC *is* HTTP/2 -- there's no h1
-//! fallback to auto-detect.
+//! **One accept loop, one task per connection.** [`Input::run`] spawns a task per accepted
+//! connection, each holding its own [`Fanout`] clone. HTTP connections are served by
+//! [`hyper_util::server::conn::auto::Builder`], which handles HTTP/1.1 (what `curl` and most OTel
+//! HTTP exporters speak) and h2c (prior-knowledge HTTP/2 without TLS) off one socket; gRPC
+//! connections by [`hyper::server::conn::http2::Builder`] directly, since gRPC is HTTP/2 only.
 //!
-//! **This is the first listener with real backpressure to its source.** Every other input here is
-//! UDP (statsd, syslog): a slow downstream just means the kernel silently drops datagrams. TCP
-//! (both OTLP transports) has no such escape hatch -- a slow `sink.send(batch).await` blocks the
-//! handler, which stalls reading the next request off that connection, which the client
-//! eventually feels as its own write blocking. Correct for a reliable protocol (an OTLP exporter
-//! is expected to retry/buffer on its own timeout, not silently lose data), and worth knowing
-//! going in: `docs/design/pipeline-graph.md`'s backpressure section.
+//! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
+//! datagrams; TCP has no such escape hatch. A slow `sink.send(batch).await` blocks the handler,
+//! which stops reading that connection, which the client feels as its own write blocking. That
+//! is correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
+//! `docs/design/pipeline-graph.md`'s "Backpressure" section.
 //!
-//! **TLS termination is optional, per listener.** `tls:` in config (see [`TlsServerSettings`])
-//! turns it on for both transports; a listener with none accepts plaintext HTTP/1.1, h2c, and h2
-//! exactly as before. The TLS handshake itself runs *inside* the per-connection spawned task,
-//! after that connection's [`MAX_CONCURRENT_CONNECTIONS`] permit is acquired -- a slow or hostile
-//! handshake stalls only its own connection, counts against the same concurrency bound as a slow
-//! request, and can't block the accept loop from serving the next connection
+//! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
+//! both transports; without it the listener accepts plaintext. The handshake runs inside the
+//! per-connection task, after that connection's [`MAX_CONCURRENT_CONNECTIONS`] permit is
+//! acquired, so a slow or hostile handshake stalls only its own connection, counts against the
+//! same bound as a slow request, and never blocks the accept loop
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
 //!
 //! **Connection limit: reject, don't queue.** A [`tokio::sync::Semaphore`] capped at
-//! [`MAX_CONCURRENT_CONNECTIONS`], acquired with `try_acquire_owned` -- at capacity the accepted
-//! stream is dropped immediately and counted as
-//! `logit.input.connections.rejected{reason="limit"}`, rather than being parked behind a permit
-//! that may never come. Exactly `syslog_in`'s driver
-//! (`crates/logit-inputs/src/tcp.rs`'s "Connection limit" section) and `logit_in`, and the
-//! rejection happens *before* any TLS accept: OTLP has no in-band "try later" of its own to
-//! deliver, so there is nothing to say and no reason to spend a handshake saying it. The
-//! `logit.input.connections` gauge counts permit holders only. This replaces an earlier blocking
-//! `acquire_owned().await`, under which a connection past the cap stalled the accept loop itself
-//! -- enough silent connections then stopped this listener draining its backlog at all.
+//! [`MAX_CONCURRENT_CONNECTIONS`], acquired with `try_acquire_owned`: at capacity the accepted
+//! stream is dropped and counted `logit.input.connections.rejected{reason="limit"}` rather than
+//! parked behind a permit that may never come. A blocking `acquire_owned().await` would stall the
+//! accept loop itself, and enough silent connections would stop this listener draining its
+//! backlog. The rejection happens *before* any TLS accept: OTLP has no in-band "try later", so
+//! there is nothing to spend a handshake saying. `crate::tcp`'s driver makes the same call
+//! (`crates/logit-inputs/src/tcp.rs`'s "Connection limit" section; `logit_in` differs, finishing
+//! the TLS accept first to send a `Reject` frame). The `logit.input.connections` gauge counts
+//! permit holders only.
 //!
-//! **Handshake timeout.** [`OtlpInput::handshake_timeout`] (a field, defaulted to
-//! [`HANDSHAKE_TIMEOUT`] and set from config by [`OtlpInput::with_handshake_timeout`]) bounds each
-//! of a connection's pre-request phases, the same shape `syslog_in`'s driver uses
-//! (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake timeout" section): on a TLS listener the
-//! TLS accept, and on a plaintext one -- which has no TLS accept for it to bound -- the wait for
-//! the connection's very first byte. Without either, a client that completes the TCP connect and
-//! then never speaks pins a connection-limit permit forever.
+//! **Handshake timeout.** [`OtlpInput::handshake_timeout`] (default [`HANDSHAKE_TIMEOUT`], set
+//! from `handshake_timeout:` by [`OtlpInput::with_handshake_timeout`]) bounds each pre-request
+//! phase, as `crate::tcp`'s driver does (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake
+//! timeout" section): the TLS accept on a TLS listener, the wait for the first byte on a
+//! plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
+//! permit forever.
 //!
 //! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
-//! `recv(..., MSG_PEEK)`: it waits for the first byte to become *available* and leaves it in the
-//! socket's receive queue, so the stream handed to `hyper` afterwards is byte-for-byte the one it
-//! would have been with no bound at all. [`hyper_util::server::conn::auto::Builder`]'s own
-//! `ReadVersion` sniff (up to 24 bytes, telling HTTP/1.1 from an h2 preface) then reads those
-//! bytes itself and needs no rewind buffer -- which is the whole reason the bound is a peek and
-//! not a wrapper around the sniff, since wrapping the sniff would mean reimplementing it. The TLS
-//! arm deliberately gets no peek: `acceptor.accept` already waits on that connection's first
-//! bytes under the same budget, so a peek ahead of it would bound nothing the handshake does not.
+//! `recv(..., MSG_PEEK)`: it waits for the first byte and leaves it queued, so the stream handed
+//! to `hyper` is untouched. [`hyper_util::server::conn::auto::Builder`]'s `ReadVersion` sniff (up
+//! to 24 bytes, telling HTTP/1.1 from an h2 preface) then reads those bytes itself with no rewind
+//! buffer; bounding the sniff instead would mean reimplementing it. The TLS arm gets no peek:
+//! `acceptor.accept` already waits on the first bytes under the same budget.
 //!
-//! **A peer that closes cleanly before sending anything is not a fault.** That is what every TCP
-//! health check looks like -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
-//! `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` -- and
-//! before this peek existed `auto::Builder`'s `ReadVersion` read the immediate EOF as
-//! `Version::H1` and the connection ended silently. So a `peek` of `Ok(0)` returns `Ok(())`, and
-//! only the *deadline* (a connection held open saying nothing) and a genuine read error reach
-//! `connection_error`. `crate::tcp` makes the same call for an EOF before its first frame.
+//! **A peer that closes before sending anything is not a fault.** That is every TCP health
+//! check: `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against `demo/logit.yaml`'s
+//! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` returns
+//! `Ok(())`; only the deadline (a connection held open saying nothing) and a read error reach
+//! `connection_error`, which a probe would otherwise hit once per interval, forever. `crate::tcp`
+//! makes the same call for an EOF before its first frame.
 //!
-//! **Idle timeout.** [`OtlpInput::with_idle_timeout`] -- `otlp_in`'s operator-facing
-//! `idle_timeout:` field, and off unless set -- bounds how long a connection may sit with no
-//! request in flight before this listener closes it and hands its permit back
-//! (`docs/adr/idle-connection-timeout.md`). Without it, a connection that sends *one* byte and
-//! then stops has cleared the peek, is inside `hyper`'s own read loop, and holds its permit
-//! indefinitely -- and under `protocol: grpc` the same is true of one byte of the HTTP/2 preface.
+//! **Idle timeout.** [`OtlpInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds how
+//! long a connection may sit with no request in flight before this listener closes it and
+//! returns its permit (`docs/adr/idle-connection-timeout.md`). Without it, a connection that
+//! sends one byte and stops has cleared the peek, sits in `hyper`'s read loop, and holds its
+//! permit indefinitely; under `protocol: grpc`, likewise one byte of the HTTP/2 preface.
 //!
-//! *Tracked at the service, not at the socket.* One [`Activity`] per connection counts the
-//! requests in flight and stamps the instant the last one finished ([`InFlight`](crate::http::InFlight), the guard
-//! `service_fn` wraps each handler in, so an early return or an unwind stamps it too); the clock
-//! is armed only while that count is zero. A timer wrapped around the IO instead would be wrong
-//! here: hyper 1.11.1's h1 server polls the socket read *mid-message*
-//! (`mid_message_detect_eof`'s `force_io_read`, so it can notice a peer closing while a handler
-//! is still working), so an IO-level timer would tick during ordinary backpressure and read a
-//! stalled downstream as a silent peer -- the exact failure the shared driver's reset rule exists
-//! to avoid (`crates/logit-inputs/src/tcp.rs`'s "Idle timeout" section), relocated into hyper's
-//! internals where this module could not see it.
+//! *Tracked at the service, not the socket.* One [`Activity`] per connection counts the requests
+//! in flight and stamps when the last one finished; its guard,
+//! [`InFlight`](crate::http::InFlight), wraps each handler inside `service_fn`, so an early
+//! return or an unwind stamps it too. The clock runs only while the count is zero. A timer around
+//! the IO would be wrong: hyper 1.11.1's h1 server polls the socket read *mid-message*
+//! (`mid_message_detect_eof`'s `force_io_read`, to notice a peer closing while a handler works),
+//! so an IO-level timer would tick during ordinary backpressure and read a stalled downstream as
+//! a silent peer. That is the failure the shared driver's reset rule exists to avoid
+//! (`crates/logit-inputs/src/tcp.rs`'s "Idle timeout" section), hidden inside hyper's internals.
 //!
-//! *Reset on request completion, not on bytes.* hyper owns the bytes, so the finest grain this
-//! listener can see is a request starting and finishing. A request *head* that dribbles in more
-//! slowly than `idle_timeout` on an otherwise-quiet keep-alive connection is therefore closed:
-//! a documented narrowing of the one semantic every other listener implements, not a bug. A
-//! request *body* that stalls mid-upload gets a narrower bound of its own instead --
-//! [`collect_with_stall_bound`] puts a per-frame `timeout` on the body, answers `408` (HTTP) or
-//! `grpc-status: 4` (gRPC), and closes the connection once the handler has returned, rather than
-//! leaving a half-uploaded request to the whole-connection deadline.
+//! *Reset on request completion, not on bytes.* hyper owns the bytes, so the finest grain visible
+//! here is a request starting and finishing. A request *head* that dribbles in more slowly than
+//! `idle_timeout` on an otherwise-quiet keep-alive connection is therefore closed: a documented
+//! narrowing of the semantic every other listener implements, not a bug. A request *body* that
+//! stalls mid-upload gets its own narrower bound: [`collect_with_stall_bound`] puts a per-frame
+//! timeout on the body, answers `408` (HTTP) or `grpc-status: 4` (gRPC), and closes the
+//! connection once the handler returns, rather than leaving it to the whole-connection deadline.
 //!
 //! *`graceful_shutdown`, then a bounded grace, then drop.* [`drive_with_idle`] never drops a live
 //! socket out from under hyper: it calls `graceful_shutdown`, polls the connection for at most
-//! `handshake_timeout` (reused as the grace -- no new knob), and then drops it whatever that poll
-//! returned. Both steps are load-bearing, verified against the pinned hyper 1.11.1 / hyper-util
-//! 0.1.20 sources rather than assumed: `graceful_shutdown` closes an *idle keep-alive* h1
-//! connection promptly (`disable_keep_alive` calls `state.close()` when the connection's `KA`
-//! state is `Idle`) and GOAWAYs an established h2 one -- the common case for a connection this
-//! tracker considers idle. But a *fresh* h1 connection stopped mid-head is `KA::Busy` and keeps
-//! waiting regardless, hyper-util's own pre-sniff `ReadVersion` future resolves to
-//! `Err("Cancelled")`, and an h2 connection still handshaking only sets an internal
-//! `close_pending` flag. The bounded grace-then-drop step exists for exactly those three, which
-//! is why the post-shutdown result is deliberately ignored. The one thing the drop waits for is
-//! a request that *started* inside the grace window and has not returned: dropping the
+//! `handshake_timeout` (reused as the grace; no new knob), then drops it whatever that poll
+//! returned. Both steps are needed, per the pinned hyper 1.11.1 / hyper-util 0.1.20 sources:
+//! `graceful_shutdown` closes an *idle keep-alive* h1 connection promptly (`disable_keep_alive`
+//! calls `state.close()` when the connection's `KA` state is `Idle`) and GOAWAYs an established
+//! h2 one, the common cases. But a *fresh* h1 connection stopped mid-head is `KA::Busy` and keeps
+//! waiting, hyper-util's pre-sniff `ReadVersion` future resolves to `Err("Cancelled")`, and an h2
+//! connection still handshaking only sets an internal `close_pending` flag. The grace-then-drop
+//! exists for those three, which is why the post-shutdown result is ignored. The drop waits for
+//! one thing: a request that *started* inside the grace and has not returned. Dropping the
 //! connection while its handler is parked in `Fanout::send` would discard a batch that never
 //! reached the fanout, so [`drive_with_idle`] polls that request out and then lets the grace run
-//! again for its response. Nothing a *silent* peer does can extend the window -- only being
-//! served can.
+//! again for its response. Nothing a *silent* peer does can extend the window; only being served
+//! can.
 //!
 //! *Policy, not a fault.* An idle close counts `logit.input.connections.closed{reason="idle"}`
-//! and returns `Ok(())`, so it never reaches the `connection_error` diagnostic below -- counted,
-//! not diagnosed, the same call `crate::tcp` makes for its own idle closes.
+//! and returns `Ok(())`, so it never reaches the `connection_error` diagnostic: counted, not
+//! diagnosed, as `crate::tcp` does for its own idle closes.
 //!
-//! *Why not `hyper`'s own `http1().header_read_timeout(..)`.* Still rejected, and still not
-//! installed: in the pinned hyper 1.11.1 (`src/proto/h1/conn.rs`) that timer is armed at the
-//! *top* of `poll_read_head`, before a single header byte has been parsed, and `State::idle` sets
-//! `notify_read = true` whenever it is configured, with the comment "Next read will start and
-//! poll the header read timeout, so we can close the connection if another header isn't received
-//! in a timely manner" -- so it re-arms across every idle keep-alive gap. That is an idle timeout
-//! wearing a first-head name, reachable only by also bounding first heads, and h1-only
-//! ([`hyper::server::conn::http2::Builder`] has no equivalent knob). `idle_timeout` is that bound
-//! made explicit, opt-in, and available on both transports.
+//! *Why not hyper's `http1().header_read_timeout(..)`.* In the pinned hyper 1.11.1
+//! (`src/proto/h1/conn.rs`) that timer is armed at the *top* of `poll_read_head`, before a header
+//! byte is parsed, and `State::idle` sets `notify_read = true` whenever it is configured ("Next
+//! read will start and poll the header read timeout, so we can close the connection if another
+//! header isn't received in a timely manner"), so it re-arms across every idle keep-alive gap. It
+//! is an idle timeout under a first-head name, reachable only by also bounding first heads, and
+//! h1-only ([`hyper::server::conn::http2::Builder`] has no equivalent). `idle_timeout` is that
+//! bound made explicit, opt-in, and available on both transports.
 //!
-//! **Gzip is supported; nothing else is.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's own
-//! compressed flag plus `grpc-encoding: gzip` are both decoded via [`inflate`]; any other declared
-//! encoding is rejected (`415`/`grpc-status: 12`) rather than silently mishandled. Decompressing
-//! untrusted input is real, security-relevant surface (a compression-bomb-shaped request), so
-//! `inflate` bounds the *decompressed* size to [`MAX_REQUEST_BYTES`] -- the same cap already
-//! enforced on the compressed body -- rather than trusting the input to be well-behaved. See
-//! `docs/adr/otlp-compression-and-decompression-bounds.md`.
+//! **Gzip, and nothing else.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's compressed flag
+//! with `grpc-encoding: gzip` are decoded via [`inflate`]; any other declared encoding is
+//! rejected (`415`/`grpc-status: 12`). `inflate` bounds the *decompressed* size to
+//! [`MAX_REQUEST_BYTES`], the cap already on the compressed body, so a compression bomb is
+//! rejected rather than inflated (`docs/adr/otlp-compression-and-decompression-bounds.md`).
 //!
 //! **OTLP/HTTP accepts protobuf or JSON; OTLP/gRPC accepts protobuf only.** `handle_http` picks
-//! the decode path off `Content-Type` (absent/empty means protobuf, preserved for every client
-//! that predates OTLP/JSON support); the success response mirrors whichever encoding the request
-//! used, per spec. gRPC is unaffected -- OTLP/gRPC's framing *is* protobuf by definition, and no
-//! OTel SDK speaks `application/grpc+json`. See
-//! [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md) for the JSON dialect
-//! itself (hex vs. base64 ids, string-or-number 64-bit fields, and why it's hand-parsed rather
-//! than generated). Every error response, on both encodings, stays `text/plain` -- the spec wants
-//! a protobuf-encoded `Status` message even for a JSON request's error; tracked in
-//! `docs/known-gaps.md` as a pre-existing deviation, not something this input's OTLP/JSON support
-//! introduced.
+//! the decode path off `Content-Type` (absent or empty means protobuf, for every client that
+//! predates OTLP/JSON); the success response mirrors the request's encoding, per spec. No OTel SDK
+//! speaks `application/grpc+json`.
+//! [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md) covers the JSON dialect
+//! (hex vs. base64 ids, string-or-number 64-bit fields, and why it's hand-parsed rather than
+//! generated). Every error response, on both encodings, is `text/plain`, where the spec wants a
+//! protobuf-encoded `Status`; tracked in `docs/known-gaps.md`.
 //!
-//! **Size and concurrency limits.** `MAX_REQUEST_BYTES` (4 MiB) matches the OTel collector's own
-//! default `max_recv_msg_size`; a request over that is rejected (`413`/`grpc-status: 8`,
-//! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection's
-//! worst case, not the listener's as a whole -- `MAX_CONCURRENT_CONNECTIONS` bounds how many
-//! connections `run` serves at once (rejecting past it, see "Connection limit" above), so total
-//! worst-case memory stays a real (if generous) number rather than unbounded.
+//! **Size and concurrency limits.** [`MAX_REQUEST_BYTES`] (4 MiB) matches the OTel collector's
+//! default `max_recv_msg_size`; a larger request is rejected (`413`/`grpc-status: 8`,
+//! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection;
+//! [`MAX_CONCURRENT_CONNECTIONS`] bounds how many are served at once, so the listener's worst-case
+//! memory is finite.
 //!
-//! **The response's `partial_success` is always empty on a successful decode.** OTLP's own
-//! `Export*ServiceResponse.partial_success` exists to report *which* records within an otherwise-
-//! accepted request were rejected -- but `logit_proto::SignalDecoder::decode_signal` doesn't
-//! return a per-call skip/reject count today (it only counts skips against its own
+//! **`partial_success` is always empty on a successful decode.** It exists to report which
+//! records in an accepted request were rejected, but `logit_proto::SignalDecoder::decode_signal`
+//! returns no per-call reject count (it counts skips only in its own
 //! `logit.input.metrics.skipped{metric_kind, reason}` telemetry, `logit-proto`'s `otlp::metrics`
-//! module doc); there's nothing for this input to echo back into the wire response yet. A fully
-//! malformed request (bad protobuf, an out-of-range span id) still fails the *whole* request
-//! (`400`/`grpc-status: 3`), which is the one case this input's response does reflect correctly.
-//! Threading a real per-call count through would be a `SignalDecoder` API change, out of this PR's
-//! scope -- tracked in `docs/known-gaps.md`.
+//! module doc), so there is nothing to echo. A malformed request (bad protobuf, an out-of-range
+//! span id) fails whole (`400`/`grpc-status: 3`). Threading a count through is a `SignalDecoder`
+//! API change, tracked in `docs/known-gaps.md`.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_with_idle, Activity, BodyReadError,
@@ -173,8 +149,7 @@ use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
-// Only this module's own tests still collect a body directly -- `collect_with_stall_bound`, the
-// lib path's only body reader, moved to `crate::http`.
+// Only this module's tests collect a body directly; the lib path uses `collect_with_stall_bound`.
 #[cfg(test)]
 use http_body_util::BodyExt;
 use hyper::body::{Frame, Incoming};
@@ -185,8 +160,7 @@ use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
-// Only the test module's own `tls_connector` (a canned TLS client) still reads PEM files
-// directly -- server-side TLS config building moved to `crate::tls` (workstream B).
+// Only the test module's `tls_connector` reads PEM files directly; server TLS is `crate::tls`.
 #[cfg(test)]
 use rustls_pki_types::pem::PemObject;
 #[cfg(test)]
@@ -199,61 +173,42 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-/// Matches the OTel collector's own default `max_recv_msg_size` -- see this module's doc comment.
+/// Matches the OTel collector's default `max_recv_msg_size`.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the number of connections [`Input::run`] serves concurrently -- without this, the
-/// per-request cap [`MAX_REQUEST_BYTES`] bounds only *one* connection's worst case, and an
-/// unbounded number of them can each be holding that much. 1024 is
-/// the same order of magnitude `logit_pipeline::SinkQueueConfig::default`'s `max_batches` already
-/// uses elsewhere in this codebase for "a generous but real bound, not unlimited" -- worst case
-/// `1024 * MAX_REQUEST_BYTES` = 4 GiB in flight, not unbounded. The same number `logit_in` and
-/// `syslog_in` use: there is no protocol reason for an OTLP listener to differ, and one shared
-/// figure is one thing for an operator to learn. Not (yet) operator-tunable; revisit
-/// as a config field if a real deployment needs a different number.
+/// Bounds the connections [`Input::run`] serves at once. [`MAX_REQUEST_BYTES`] bounds one
+/// connection's worst case; this bounds how many there are: `1024 * MAX_REQUEST_BYTES` = 4 GiB in
+/// flight. The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an
+/// OTLP listener to differ, and one figure for an operator to learn. Not operator-tunable; make it
+/// a config field if a deployment needs a different number.
 ///
-/// **A connection past the cap is rejected, not queued** -- see this module's "Connection limit"
-/// doc section. [`OtlpInput::with_max_connections`] overrides this in tests, so the cap is
-/// reachable with two connections instead of 1025.
+/// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
+/// `OtlpInput::with_max_connections` lowers it in tests.
 ///
-/// **That 4 GiB figure is the protobuf path's worst case, not the JSON one's.** An OTLP/JSON
-/// request (`docs/adr/otlp-json-decoding.md`) is parsed into a `serde_json::Value` tree before it
-/// ever reaches the decoded event model -- a `Map`/`Vec`/`String`/`Number` allocation per JSON
-/// node, several times the source bytes for a typically-nested OTLP payload, where the protobuf
-/// path's `prost::Message::decode` builds the target structs directly with none of that
-/// intermediate tree. The *bound* still holds -- one connection's JSON body is still capped at
-/// `MAX_REQUEST_BYTES` before parsing starts, so total worst-case memory across all connections is
-/// still a real, finite multiple of 4 GiB, not unbounded -- it just isn't exactly 4 GiB any more
-/// for an all-JSON worst case. No number is asserted here rather than guessed; tracked in
-/// `docs/known-gaps.md` for whoever needs a measured one.
+/// **The 4 GiB figure is the protobuf path's worst case, not JSON's.** An OTLP/JSON request is
+/// parsed into a `serde_json::Value` tree first, one `Map`/`Vec`/`String`/`Number` allocation per
+/// node, several times the source bytes for a nested OTLP payload, where `prost::Message::decode`
+/// builds the target structs directly. The bound still holds (a JSON body is capped at
+/// `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a finite multiple of 4 GiB,
+/// unmeasured; tracked in `docs/known-gaps.md`.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-/// Default for [`OtlpInput::handshake_timeout`] -- how long a connection has, per pre-request
-/// phase, before this listener gives up on it and releases its
-/// [`MAX_CONCURRENT_CONNECTIONS`] permit: its TLS accept on a TLS listener, its first byte on a
-/// plaintext one. The same 5s `logit_in` and `syslog_in` default to
-/// (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`), and mirrored by hand in
-/// `logit_config`'s own `default_handshake_timeout`: one number across every TCP listener is one
-/// thing for an operator to learn. Overridden by `otlp_in`'s `handshake_timeout:` config field
-/// through [`OtlpInput::with_handshake_timeout`]. Reused as the grace period an idle close gives
-/// hyper to shut down in -- see this module's "Handshake timeout" and "Idle timeout" doc
-/// sections.
+/// Default for [`OtlpInput::handshake_timeout`]: how long a connection has, per pre-request phase,
+/// before this listener releases its [`MAX_CONCURRENT_CONNECTIONS`] permit. The same 5s as
+/// `logit_in` and `crate::tcp`, mirrored by hand in `logit_config::default_handshake_timeout`.
+/// Also the grace an idle close gives hyper (this module's "Idle timeout").
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
-/// identical doc comment -- same reasoning, mirrored independently rather than shared, since this
-/// crate doesn't depend on `logit-config` any more than `logit-outputs` does.
+/// Which OTLP wire transport this listener accepts. Mirrors `logit_outputs::otlp::OtlpTransport`
+/// rather than sharing a type, since neither crate depends on `logit-config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtlpTransport {
     Http,
     Grpc,
 }
 
-/// `crate::tls::TlsServerSettings`, re-exported at this path -- `logit_in` (`crates/logit-inputs/
-/// src/logit.rs`) shares the same type and TLS-config builder now (`docs/plans/
-/// native-transport.md` workstream B); kept reachable as `otlp::TlsServerSettings` so
-/// `logit-cli::pipeline::build_spec`'s existing `logit_inputs::otlp::TlsServerSettings` path needs
-/// no change.
+/// `crate::tls::TlsServerSettings`, re-exported so `logit-cli::pipeline::build_spec` imports it as
+/// `logit_inputs::otlp::TlsServerSettings`.
 pub use crate::tls::TlsServerSettings;
 
 pub struct OtlpInput {
@@ -262,18 +217,15 @@ pub struct OtlpInput {
     diag: Diagnostics,
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
-    /// Set by [`Input::bind`], taken back out by [`Input::run`] -- `docs/plans/operator-surface.md`,
-    /// workstream B. `None` after a run, so a second run rebinds, same as before this field
-    /// existed.
+    /// Set by [`Input::bind`], taken by [`Input::run`]. `None` after a run, so a second run
+    /// rebinds.
     listener: Option<TcpListener>,
-    /// See this module's own "Handshake timeout" doc section.
+    /// See this module's "Handshake timeout" section.
     handshake_timeout: std::time::Duration,
-    /// `None` -- the default -- means no idle timeout at all, the behaviour this listener had
-    /// before the field existed. See [`Self::with_idle_timeout`] and this module's "Idle timeout"
-    /// doc section.
+    /// `None`, the default, means no idle timeout. See [`Self::with_idle_timeout`].
     idle_timeout: Option<std::time::Duration>,
     /// [`MAX_CONCURRENT_CONNECTIONS`] unless [`OtlpInput::with_max_connections`] (test-only)
-    /// lowers it -- see this module's "Connection limit" doc section.
+    /// lowers it.
     max_connections: usize,
 }
 
@@ -292,8 +244,8 @@ impl OtlpInput {
         }
     }
 
-    /// The address actually bound, once [`Input::bind`] has run -- lets a caller (a test, or a
-    /// future admin-server precedent) learn the OS-assigned port without a bind-drop-rebind race.
+    /// The address bound, once [`Input::bind`] has run, so a caller can learn the OS-assigned port
+    /// without a bind-drop-rebind race.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.listener.as_ref().and_then(|l| l.local_addr().ok())
     }
@@ -308,9 +260,8 @@ impl OtlpInput {
         self
     }
 
-    /// Turns on TLS termination for this listener (`tls:` in config) -- both transports. Every
-    /// path in `settings` is resolved against `base_dir` (the config file's own directory), same
-    /// as `logit-cli::pipeline::build_spec` resolves `lua_file`.
+    /// Turns on TLS termination (`tls:` in config) for either transport. Paths in `settings`
+    /// resolve against `base_dir`, the config file's directory.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
@@ -324,35 +275,26 @@ impl OtlpInput {
         Ok(self)
     }
 
-    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-request budgets -- the TLS accept on a TLS
-    /// listener, the first-byte peek on a plaintext one -- which is what `otlp_in`'s
-    /// `handshake_timeout:` config field sets. The constant stays the default when this is never
-    /// called; a test uses it to observe a silent connection actually being closed without a
-    /// multi-second sleep. Graph rule 45 rejects `0s` before it can reach here. See this module's
-    /// "Handshake timeout" doc section.
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-request budgets, the TLS accept and the
+    /// plaintext first-byte peek (`handshake_timeout:` in config). Graph rule 45 rejects `0s`.
     pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
         self
     }
 
     /// Bounds how long a connection may sit with no request in flight before this listener closes
-    /// it -- `otlp_in`'s `idle_timeout:` config field, and off (`None`) when never called. See
-    /// this module's "Idle timeout" doc section for why the clock lives at the service rather than
-    /// around the socket, why it resets on request *completion* rather than on bytes, and why the
-    /// close is `graceful_shutdown` plus a bounded grace rather than a drop. Graph rule 53 rejects
-    /// `Some(0s)` before it can reach here.
+    /// it (`idle_timeout:` in config; off when `None` or never called). This module's "Idle
+    /// timeout" section has the semantics. Graph rule 53 rejects `Some(0s)`.
     ///
-    /// Takes the `Option` rather than a bare `Duration`, exactly like
-    /// `crate::tcp::TcpListener::with_idle_timeout`: the "no idle timeout" case is then one call
-    /// from a config that omitted the field rather than a caller-side `if let`.
+    /// Takes the `Option`, like `crate::tcp::TcpListener::with_idle_timeout`, so a config that
+    /// omitted the field needs no caller-side `if let`.
     pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
         self.idle_timeout = idle_timeout;
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
-    /// exercise the cap would be slow and flaky; this makes the cap reachable with two. The twin
-    /// of `crate::tcp::TcpListener::with_max_connections`.
+    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so the cap is reachable with two
+    /// connections instead of 1025.
     #[cfg(test)]
     fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
@@ -375,28 +317,21 @@ impl Input for OtlpInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         self.bind().await?;
         let listener = self.listener.take().expect("bind() leaves a listener behind");
-        // Bounds this input's worst-case memory the same way `MAX_REQUEST_BYTES` bounds one
-        // request's -- see [`MAX_CONCURRENT_CONNECTIONS`]'s own doc comment for the reasoning and
-        // the resulting worst case.
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
-        // Built once outside the loop -- `TlsAcceptor::from` just wraps the `Arc<ServerConfig>`,
-        // so cloning it per connection below is cheap (an `Arc` clone, not a config rebuild).
+        // `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so a per-connection clone is an `Arc`
+        // clone, not a config rebuild.
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
-        // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented: the same
-        // `accept()` this loop already awaited, plus `logit.input.accept_queue.depth`/
-        // `.utilization` sampled before each accept and once a second while waiting for one.
+        // `crate::tcp`'s accept-queue gauges: `logit.input.accept_queue.depth`/`.utilization`,
+        // sampled before each accept and once a second while waiting for one.
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         loop {
             let (stream, _peer) = accept_queue.accept(&listener).await?;
 
-            // Non-blocking (`try_acquire_owned`, not `acquire_owned`): at capacity the connection
-            // is closed immediately rather than queued behind a permit that may never come. And
-            // it is closed *here*, before any TLS accept -- see this module's "Connection limit"
-            // doc section. Copied from `crate::tcp`'s accept loop.
+            // Non-blocking, and before any TLS accept (this module's "Connection limit").
             let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
                 self.telemetry.count(
                     "logit.input.connections.rejected",
@@ -416,27 +351,18 @@ impl Input for OtlpInput {
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
-                // Published from the read-modify-write's own return value, not a separate `load`:
-                // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an
-                // add and a load would leave the stale one as the published value until the next
-                // transition. `crate::tcp`'s own accept loop publishes this gauge the same way.
+                // Published from the read-modify-write's return value, not a separate `load`:
+                // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
+                // and a load would leave the stale one published until the next transition.
                 let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
                 telemetry.gauge("logit.input.connections", live as f64, &[]);
 
-                // The TLS handshake itself runs here, inside the spawned task and after the
-                // permit above -- a slow or hostile handshake stalls only this connection and
-                // counts against `MAX_CONCURRENT_CONNECTIONS` like any other slow request, rather
-                // than blocking `run`'s own accept loop (this module's doc comment).
+                // The handshake runs here, after the permit, so it stalls only this connection.
                 let result = match tls_acceptor {
-                    // Bounded exactly the way `logit_in`/`syslog_in` bound their own
-                    // (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`): an
-                    // unbounded accept lets a client that connects and then sends no ClientHello
-                    // pin this permit forever. Both the failure and the timeout fall through to
-                    // the `warn_throttled("connection_error", ..)` below, and the permit comes
-                    // back because this task ends -- no explicit release needed. No first-byte
-                    // peek on this arm: `acceptor.accept` is already waiting on this connection's
-                    // first bytes under this same budget, so a peek ahead of it would bound
-                    // nothing the handshake does not (this module's "peek, not a read" section).
+                    // Bounded, or a client that sends no ClientHello pins this permit forever.
+                    // Failure and timeout both reach `connection_error` below, and the permit
+                    // comes back when this task ends. No first-byte peek: `acceptor.accept`
+                    // already waits on the first bytes under the same budget.
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
                         {
@@ -457,26 +383,15 @@ impl Input for OtlpInput {
                             )),
                         }
                     }
-                    // The plaintext arm's equivalent budget. `peek` is `recv(..., MSG_PEEK)`: it
-                    // waits for the first byte to be *available* and consumes nothing, so
-                    // `auto::Builder`'s own `ReadVersion` sniff below still sees a pristine
-                    // stream and needs no `Rewind`-shaped buffer -- the reason this is the bound
-                    // rather than a wrapper around the sniff, which would mean reimplementing it.
-                    // A read error and the deadline become an `Err(String)` on the same
-                    // `connection_error` path as the TLS arm's. A *clean* close before the first
-                    // byte (`Ok(0)`) does not: that is what every TCP health check looks like --
-                    // `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` probing
-                    // `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe,
-                    // `nc -z` -- and before this peek existed hyper-util's `ReadVersion` read the
-                    // immediate EOF as `Version::H1` and the connection ended silently. Turning it
-                    // into a warn would log one line and one `connection_error` count per probe
-                    // interval, forever. The shared driver makes the same call (`crate::tcp`'s
-                    // `ReadStep::Eof` before any frame is `Ok(())`, and only the deadline is an
-                    // error). The permit comes back on either path, when this task ends.
+                    // The plaintext arm's budget: a `peek` that consumes nothing (this module's
+                    // "peek, not a read"). A read error and the deadline reach `connection_error`
+                    // like the TLS arm's; a clean close before the first byte (`Ok(0)`) is a TCP
+                    // health check (this module's "not a fault"), as `crate::tcp`'s
+                    // `ReadStep::Eof` before any frame is.
                     None => {
-                        // Bound to a local rather than matched on directly: the scrutinee's
-                        // temporaries (including `peek`'s borrow of `stream`) would otherwise
-                        // outlive the arms, and the success arm moves `stream` into `hyper`.
+                        // Bound to a local, not matched directly: the scrutinee's temporaries
+                        // (`peek`'s borrow of `stream`) would outlive the arms, and the success
+                        // arm moves `stream` into `hyper`.
                         let first_byte =
                             tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
                                 .await;
@@ -504,10 +419,8 @@ impl Input for OtlpInput {
                 let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
                 telemetry.gauge("logit.input.connections", live as f64, &[]);
 
-                // One connection's I/O error (a client disconnecting mid-request, a malformed
-                // TLS-looking preamble on a plaintext port, ...) shouldn't be fatal to the
-                // listener or its sibling connections -- only `TcpListener::accept` failing in
-                // `run`'s own loop is.
+                // One connection's I/O error (a client disconnecting mid-request, a TLS preamble
+                // on a plaintext port) is not fatal to the listener; only `accept` failing is.
                 if let Err(err) = result {
                     diag.warn_throttled("connection_error", err);
                 }
@@ -516,15 +429,11 @@ impl Input for OtlpInput {
     }
 }
 
-/// Serves one already-accepted (and, if this listener has TLS on, already-handshaken) connection
-/// to completion -- generic over the IO type so the plaintext (`TokioIo<TcpStream>`) and TLS
-/// (`TokioIo<tokio_rustls::server::TlsStream<TcpStream>>`) cases share every line of dispatch
-/// below `run`'s own `tls_acceptor` branch.
+/// Serves one accepted (and, with TLS on, handshaken) connection to completion. Generic over the
+/// IO type so the plaintext and TLS cases share everything below `run`'s `tls_acceptor` branch.
 ///
-/// `idle_timeout` and `grace` are this connection's idle bound and the budget
-/// [`drive_with_idle`] gives hyper to shut down in once that bound fires (`handshake_timeout`,
-/// reused -- this module's "Idle timeout" doc section). With `idle_timeout: None` the connection
-/// is simply awaited, exactly as it was before the field existed.
+/// `grace` is the budget [`drive_with_idle`] gives hyper to shut down in once `idle_timeout`
+/// fires (`handshake_timeout`, reused). With `idle_timeout: None` the connection is awaited.
 async fn serve_connection<IO>(
     io: IO,
     transport: OtlpTransport,
@@ -536,10 +445,9 @@ async fn serve_connection<IO>(
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    // One tracker per connection, shared between the service (which stamps it as requests start
-    // and finish) and the driver below (which reads it). The body-frame stall bound is
-    // `idle_timeout` as well: a connection with no idle bound configured gets no per-frame one
-    // either, which keeps "no `idle_timeout` means exactly today's behaviour" literally true.
+    // One tracker per connection: the service stamps it as requests start and finish, the driver
+    // below reads it. The body-frame stall bound is `idle_timeout` too, so a connection with no
+    // idle bound gets no per-frame one either.
     let activity = Arc::new(Activity::new());
     match transport {
         OtlpTransport::Http => {
@@ -547,9 +455,8 @@ where
                 let activity = Arc::clone(&activity);
                 let (sink, telemetry) = (sink.clone(), telemetry.clone());
                 move |req| {
-                    // `enter` here rather than inside the returned future: hyper calls the
-                    // service the moment a request head is parsed, so the in-flight count rises
-                    // then, not whenever the future first happens to be polled.
+                    // `enter` here, not inside the returned future: hyper calls the service as
+                    // soon as a request head is parsed, so the in-flight count rises then.
                     let in_flight = activity.enter();
                     let (sink, telemetry) = (sink.clone(), telemetry.clone());
                     let activity = Arc::clone(&activity);
@@ -619,10 +526,8 @@ async fn handle_http(
         Ok(encoding) => encoding,
         Err(message) => return Ok(text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message)),
     };
-    // `identity` and `gzip` are the only encodings this input speaks -- rejecting on the header's
-    // mere *presence* would 415 a client that explicitly (if redundantly) declares no compression,
-    // not just one sending an encoding this input can't decode. Mirrors the gRPC handler's
-    // `grpc-encoding` check just below.
+    // Matched on value, not presence: an explicit `identity` declares no compression and must not
+    // be a `415`.
     let gzip_encoded = match req.headers().get("content-encoding") {
         None => false,
         Some(enc) if enc.as_bytes() == b"identity" => false,
@@ -639,8 +544,7 @@ async fn handle_http(
     let bytes = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
         // A body that stopped arriving is the client's clock, not its size: `408`, and the
-        // connection closes once this response is out rather than waiting for the whole-
-        // connection idle deadline (this module's "Idle timeout" doc section).
+        // connection closes once this response is out (this module's "Idle timeout").
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
             return Ok(text_response(
@@ -682,11 +586,9 @@ async fn handle_http(
             for batch in batches {
                 sink.send(batch).await;
             }
-            // Mirrors the request's own encoding -- the spec: "The server MUST use the same
-            // Content-Type in the response as it received in the request." A protobuf request
-            // gets `export_response`'s empty-on-success body; a JSON request gets `{}`, not a
-            // zero-length body -- `opentelemetry-js`'s exporter parses the success body looking
-            // for `partialSuccess`, and `JSON.parse("")` throws.
+            // The spec: "The server MUST use the same Content-Type in the response as it received
+            // in the request." A JSON request gets `{}`, not an empty body
+            // ([`export_response_json`]).
             let (content_type, body) = match encoding {
                 RequestEncoding::Protobuf => ("application/x-protobuf", export_response(0, "")),
                 RequestEncoding::Json => ("application/json", export_response_json()),
@@ -701,19 +603,16 @@ async fn handle_http(
     }
 }
 
-/// Which OTLP/HTTP wire encoding a request's `Content-Type` declares -- protobuf (this input's
-/// original, and still default, encoding) or JSON (`docs/adr/otlp-json-decoding.md`). `Err`
-/// carries the 415 message for anything else.
+/// Which OTLP/HTTP encoding a request's `Content-Type` declares: protobuf (the default) or JSON
+/// (`docs/adr/otlp-json-decoding.md`).
 enum RequestEncoding {
     Protobuf,
     Json,
 }
 
-/// Absent or empty `Content-Type` means protobuf -- **not new leniency, a preserved compatibility
-/// promise**: every client this input accepted before OTLP/JSON existed sent no `Content-Type` at
-/// all, or an empty one, and none of them meant JSON. Matched via `eq_ignore_ascii_case`: HTTP
-/// media types are case-insensitive (`Content-Type: Application/JSON` is conformant), and the
-/// exact-string match this replaces was a latent bug that would have 415'd it.
+/// Absent or empty `Content-Type` means protobuf, a compatibility promise: clients predating
+/// OTLP/JSON sent none, and none of them meant JSON. Matched case-insensitively, since HTTP media
+/// types are (`Content-Type: Application/JSON` is conformant). `Err` carries the `415` message.
 fn request_encoding(headers: &HeaderMap) -> Result<RequestEncoding, String> {
     let Some(ct) = headers.get("content-type") else {
         return Ok(RequestEncoding::Protobuf);
@@ -752,10 +651,8 @@ async fn handle_grpc(
     else {
         return Ok(grpc_response(12, &format!("unknown method {path}"), None));
     };
-    // `grpc-encoding` names the algorithm the client used; the frame's own compressed flag (read
-    // below, via `grpc_unframe`) is what actually drives decompression -- this check exists to
-    // reject an encoding this input can't decode with a clear message, up front, rather than
-    // failing obscurely against the frame later.
+    // The frame's compressed flag (`grpc_unframe`) drives decompression; this check only rejects
+    // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
         if enc.as_bytes() != b"identity" && enc.as_bytes() != b"gzip" {
             return Ok(grpc_response(
@@ -769,8 +666,8 @@ async fn handle_grpc(
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let framed = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
-        // `4`, `DEADLINE_EXCEEDED` -- the HTTP `408`'s gRPC twin, and the connection closes once
-        // this response is out (this module's "Idle timeout" doc section).
+        // `4`, `DEADLINE_EXCEEDED`: the HTTP `408`'s gRPC twin, and the connection closes once
+        // this response is out.
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
             return Ok(grpc_response(4, &format!("request body stalled for {stall:?}"), None));
@@ -825,11 +722,9 @@ fn text_response(status: StatusCode, message: &str) -> http::Response<Full<Bytes
         .expect("a well-formed response always builds")
 }
 
-/// Builds a gRPC response: `200` status, the framed `payload` (empty when `None`) as one data
-/// frame, and `grpc-status`/`grpc-message` as trailers -- always via a real trailers frame after
-/// the body, never a Trailers-Only (headers-only) response, which keeps this server's shape
-/// uniform for every outcome including an immediate rejection (an unknown method, say) rather than
-/// needing a second response-building path for that case.
+/// Builds a gRPC response: `200`, the framed `payload` (empty when `None`) as one data frame, and
+/// `grpc-status`/`grpc-message` as trailers. Never Trailers-Only (headers-only), so every outcome,
+/// an immediate rejection included, takes one response-building path.
 fn grpc_response(status: u32, message: &str, payload: Option<Vec<u8>>) -> http::Response<GrpcBody> {
     let mut trailers = HeaderMap::new();
     trailers.insert(
@@ -853,12 +748,10 @@ fn grpc_response(status: u32, message: &str, payload: Option<Vec<u8>>) -> http::
         .expect("a well-formed response always builds")
 }
 
-/// A response body that yields exactly one data frame, then one trailers frame, then ends -- the
-/// shape every unary gRPC response takes on the wire: a single framed message (possibly
-/// zero-length, for an error response with no payload), followed by the `grpc-status` trailer.
-/// `http_body_util::Full` can't express this -- it has no trailers concept at all -- so this is
-/// hand-rolled directly against [`hyper::body::Body`], the same "small enough to write by hand"
-/// call this whole transport makes (`docs/adr/hand-rolled-grpc-over-hyper.md`).
+/// A body that yields one data frame, then one trailers frame, then ends: a unary gRPC response's
+/// wire shape (a framed message, zero-length for an error, then the `grpc-status` trailer).
+/// `http_body_util::Full` has no trailers, so this implements [`hyper::body::Body`] by hand
+/// (`docs/adr/hand-rolled-grpc-over-hyper.md`).
 struct GrpcBody {
     data: Option<Bytes>,
     trailers: Option<HeaderMap>,
@@ -882,9 +775,8 @@ impl hyper::body::Body for GrpcBody {
     }
 }
 
-/// Frames `payload` as one unary gRPC message. See
-/// `logit_outputs::otlp::grpc_frame`'s identical doc comment -- duplicated, not shared: these are
-/// two independent crates, and this one function is a handful of lines.
+/// Frames `payload` as one uncompressed unary gRPC message: `[compressed:u8][len:u32 BE][payload]`.
+/// Duplicated from `logit_outputs::otlp::grpc_frame` rather than shared across crates.
 fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5 + payload.len());
     buf.push(0u8);
@@ -893,12 +785,10 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// The mirror of [`grpc_frame`] -- but unlike `logit_outputs::otlp::grpc_unframe`, this side
-/// *does* accept a compressed frame (`compressed:u8 == 1`): an `otlp_in` request may legally be
-/// gzipped, where `otlp_out` never accepts a compressed *response* (see that function's own doc
-/// comment for why). Returns the frame's own compressed flag alongside its payload slice, so the
-/// caller can decide whether `inflate` needs to run -- `None` for anything short of one complete
-/// frame, or a declared length longer than what's actually present.
+/// The mirror of [`grpc_frame`], returning the compressed flag with the payload so the caller
+/// knows whether to [`inflate`]. Unlike `logit_outputs::otlp::grpc_unframe`, a compressed frame
+/// is accepted: a request may be gzipped. `None` for less than one complete frame, a flag byte
+/// other than `0`/`1`, or a declared length past the end.
 fn grpc_unframe(bytes: &[u8]) -> Option<(bool, &[u8])> {
     if bytes.len() < 5 {
         return None;
@@ -912,20 +802,17 @@ fn grpc_unframe(bytes: &[u8]) -> Option<(bool, &[u8])> {
     bytes.get(5..5 + len).map(|payload| (compressed, payload))
 }
 
-/// Why [`inflate`] failed -- distinguished so the caller can respond `400`/`INVALID_ARGUMENT`
-/// (this was never valid gzip) rather than `413`/`RESOURCE_EXHAUSTED` (this decompressed to more
-/// than we were willing to hold) for what are two very different client mistakes.
+/// Why [`inflate`] failed: `400`/`INVALID_ARGUMENT` (not valid gzip) versus
+/// `413`/`RESOURCE_EXHAUSTED` (decompressed past the cap).
 enum InflateError {
     Malformed,
     TooLarge,
 }
 
-/// Inflates `compressed` (gzip), bounded to [`MAX_REQUEST_BYTES`] -- the same cap [`Limited`]
-/// already enforces on the *compressed* body above, applied again to the *decompressed* output so
-/// a small, highly-compressible payload ("a few KiB of gzipped zeros") can't inflate to gigabytes
-/// in memory (a compression-bomb-shaped request). `Read::take` stops reading one byte past the
-/// cap rather than after it, so an input that would inflate to exactly `MAX_REQUEST_BYTES + 1`
-/// bytes is caught, not silently truncated to fit.
+/// Inflates `compressed` (gzip), bounded to [`MAX_REQUEST_BYTES`], the cap [`Limited`] already
+/// puts on the compressed body, so a few KiB of gzipped zeros can't inflate to gigabytes.
+/// `Read::take` allows one byte past the cap, so an input inflating to `MAX_REQUEST_BYTES + 1`
+/// is caught rather than truncated to fit.
 fn inflate(compressed: &[u8]) -> Result<Bytes, InflateError> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(compressed).take(MAX_REQUEST_BYTES as u64 + 1);
@@ -949,13 +836,10 @@ fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// Builds an `Export*ServiceResponse`'s bytes by hand -- see
-/// `logit_outputs::otlp::parse_partial_success`'s doc comment for why the wire shape is identical
-/// across all three signals and why neither side generates the collector-service types for it.
-/// Empty when `rejected == 0` and `error_message` is empty: proto3's own "an unset field reads
-/// back as its default" rule already makes an all-default message serialize to zero bytes, so a
-/// fully successful response is simply an empty body -- exactly what every response this input
-/// sends today looks like (see this module's doc comment on why `rejected` is always `0` for now).
+/// Builds an `Export*ServiceResponse`'s bytes by hand (`logit_outputs::otlp::parse_partial_success`
+/// says why the shape is identical across signals and neither side generates the types). Empty
+/// when `rejected == 0` and `error_message` is empty: proto3 serializes an all-default message to
+/// zero bytes, and `rejected` is always `0` today (this module's "`partial_success`").
 fn export_response(rejected: i64, error_message: &str) -> Vec<u8> {
     if rejected == 0 && error_message.is_empty() {
         return Vec::new();
@@ -977,19 +861,13 @@ fn export_response(rejected: i64, error_message: &str) -> Vec<u8> {
     out
 }
 
-/// The OTLP/JSON mirror of [`export_response`], for exactly the same reason and the same current
-/// limitation: `rejected` is always `0` here too (this module's doc comment), so there's only ever
-/// the all-default `ExportTraceServiceResponse` to render. Unlike the protobuf case, that does
-/// **not** mean an empty body -- proto3 JSON's own rule is that an unset message field is simply
-/// omitted from the object, and `partial_success` (a message-typed field) unset renders as no key
-/// at all, giving `{}`, not `""`. Sending `""` with `content-type: application/json` would be
-/// spec-conformant nowhere: `opentelemetry-js`'s HTTP exporter parses the success body looking for
-/// `partialSuccess`, and `JSON.parse("")` throws before it gets the chance to find none. When
-/// `partial_success` gains a real per-signal reject count (`docs/known-gaps.md`), this grows the
-/// same `rejected`/`error_message` parameters `export_response` already has, rendering
-/// `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints` (the JSON key differs per [`Signal`],
-/// unlike the protobuf field, which shares one tag number across all three
-/// `Export*ServiceResponse` messages).
+/// The OTLP/JSON mirror of [`export_response`], with `rejected` always `0`. Proto3 JSON omits an
+/// unset message field, so the all-default response is `{}`, **not** an empty body:
+/// `opentelemetry-js`'s HTTP exporter parses the success body for `partialSuccess`, and
+/// `JSON.parse("")` throws. A real reject count (`docs/known-gaps.md`) would render as
+/// `rejectedSpans`/`rejectedLogRecords`/`rejectedDataPoints`: the JSON key differs per
+/// [`Signal`], where the protobuf field shares one tag number across all three
+/// `Export*ServiceResponse` messages.
 fn export_response_json() -> Vec<u8> {
     b"{}".to_vec()
 }
@@ -1008,10 +886,9 @@ mod tests {
         (addr.to_string(), OtlpInput::new(addr.to_string(), transport))
     }
 
-    /// `Input::bind` (docs/plans/operator-surface.md, workstream B) makes the port live *before*
-    /// `run`'s accept loop starts, and `local_addr` makes the OS-assigned port observable --
-    /// retiring the bind-drop-rebind idiom `bound_input` above still uses for every other test in
-    /// this module (kept there since it predates `bind`, but no longer the only way).
+    /// `Input::bind` makes the port live *before* `run`'s accept loop starts, and `local_addr`
+    /// exposes the OS-assigned port, with no bind-drop-rebind (which `bound_input` above still
+    /// uses).
     #[tokio::test]
     async fn bind_makes_the_port_live_before_run_and_local_addr_reports_it() {
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http);
@@ -1020,8 +897,7 @@ mod tests {
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() should leave a real address behind");
 
-        // Connects successfully with `run` never having been spawned -- the listening socket is
-        // already live purely from `bind()`.
+        // Connects with `run` never spawned: the socket is live from `bind()` alone.
         tokio::net::TcpStream::connect(addr)
             .await
             .expect("the port should already be accepting connections after bind() alone");
@@ -1042,9 +918,8 @@ mod tests {
         fanout_into_channel_with_capacity(16)
     }
 
-    /// [`fanout_into_channel`] with the channel capacity spelled out. Capacity 1 with nothing
-    /// draining it is how a test parks a handler inside `Fanout::send`: the first batch is
-    /// buffered, the second blocks until something receives.
+    /// [`fanout_into_channel`] with an explicit capacity. Capacity 1 with nothing draining parks a
+    /// handler inside `Fanout::send`: the first batch is buffered, the second blocks.
     fn fanout_into_channel_with_capacity(
         capacity: usize,
     ) -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
@@ -1123,8 +998,7 @@ mod tests {
         assert!(received.events[0].span.is_some());
     }
 
-    /// One span, as an OTLP/JSON literal describing the same span [`one_span_payload`] encodes --
-    /// used everywhere the JSON decode path needs a real, spec-shaped body.
+    /// The span [`one_span_payload`] encodes, as an OTLP/JSON literal.
     fn one_span_json() -> Vec<u8> {
         br#"{"resourceSpans": [{"scopeSpans": [{"spans": [{
             "traceId": "09090909090909090909090909090909",
@@ -1159,10 +1033,8 @@ mod tests {
         assert_eq!(span.span_id, [8; 8]);
     }
 
-    /// The interop guard: `opentelemetry-js`'s HTTP exporter parses the success response body
-    /// looking for `partialSuccess`, so a JSON request must never get protobuf's empty-body
-    /// shortcut back -- `{}`, with a JSON content type, or a conformant client's own response
-    /// parsing breaks before it ever sees "this succeeded."
+    /// A JSON request's success is `{}` with a JSON content type, never protobuf's empty body,
+    /// which breaks `opentelemetry-js`'s response parsing.
     #[tokio::test]
     async fn a_json_request_gets_a_json_response_body_and_content_type() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1182,8 +1054,7 @@ mod tests {
         assert!(response.trim_end().ends_with("{}"), "expected a `{{}}` body, got: {response}");
     }
 
-    /// Regression guard on the arm that didn't change: a protobuf request must keep getting
-    /// protobuf's response shape, not JSON's, now that both exist side by side.
+    /// A protobuf request gets protobuf's response shape, not JSON's.
     #[tokio::test]
     async fn a_protobuf_request_still_gets_a_protobuf_content_type() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1202,8 +1073,7 @@ mod tests {
         assert!(response.contains("content-type: application/x-protobuf"), "got: {response}");
     }
 
-    /// The surviving half of the old JSON-always-415 test: an actually-unsupported type is still
-    /// rejected, and the message now names every type this input *does* accept.
+    /// An unsupported type is a `415` whose message names every accepted type.
     #[tokio::test]
     async fn an_unknown_content_type_is_rejected_with_415_listing_what_is_accepted() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1224,8 +1094,7 @@ mod tests {
         assert!(response.contains("application/json"), "got: {response}");
     }
 
-    /// HTTP media types are case-insensitive (`Content-Type: Application/JSON` is conformant) --
-    /// the exact-string match this replaced would have 415'd this.
+    /// HTTP media types are case-insensitive: `Content-Type: Application/JSON` is JSON.
     #[tokio::test]
     async fn a_content_type_is_matched_case_insensitively() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1261,8 +1130,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
-    /// The two headers compose: `Content-Encoding` and `Content-Type` are handled independently,
-    /// so a gzipped JSON body is exactly as valid as a gzipped protobuf one.
+    /// `Content-Encoding` and `Content-Type` compose: a gzipped JSON body decodes.
     #[tokio::test]
     async fn a_gzipped_json_body_is_decoded() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1286,7 +1154,7 @@ mod tests {
         assert!(received.events[0].span.is_some());
     }
 
-    /// The scope decision made testable: all three signals, not traces only.
+    /// All three signals decode, not traces only.
     #[tokio::test]
     async fn a_json_post_to_v1_logs_and_v1_metrics_also_works() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1323,9 +1191,7 @@ mod tests {
         assert!(!received.events[0].metrics.is_empty());
     }
 
-    /// `identity` is the standard, legal way to declare "not compressed" -- it must not be
-    /// mistaken for "compressed, unsupported." Regression guard for rejecting on the header's mere
-    /// *presence* rather than its value.
+    /// `Content-Encoding: identity` declares no compression and is accepted, not a `415`.
     #[tokio::test]
     async fn a_content_encoding_of_identity_is_accepted_not_rejected() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1437,10 +1303,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
-    /// A compression-bomb-shaped request: a few KiB of gzipped zeros that would inflate to well
-    /// over `MAX_REQUEST_BYTES` -- `inflate`'s own bound on the *decompressed* size must catch
-    /// this, since `Limited`'s bound on the compressed body (checked first, and satisfied here)
-    /// does not.
+    /// A few KiB of gzipped zeros inflating past `MAX_REQUEST_BYTES` is caught by `inflate`'s
+    /// decompressed bound, which `Limited`'s compressed bound (satisfied here) cannot.
     #[tokio::test]
     async fn a_gzip_body_that_would_inflate_past_the_size_cap_is_rejected_with_413() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -1540,15 +1404,10 @@ mod tests {
         let bytes_b =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &span_batch("b", 2)).unwrap();
 
-        // Combine the two single-resource requests into one two-ResourceSpans request by simple
-        // byte concatenation, not by decoding and re-encoding through a generated type (`logit-
-        // proto`'s `generated` module is `pub(crate)`, unreachable from here). This works because
-        // `TracesData`'s only field is `repeated ResourceSpans resource_spans = 1` -- each of
-        // `bytes_a`/`bytes_b` is a complete encoding of *one* such occurrence, and concatenating
-        // two complete, self-delimited protobuf field occurrences is indistinguishable on the wire
-        // from a single message that had both all along (the same "concatenation of encoded
-        // messages is a valid merge" property `logit-proto`'s own two-`ResourceSpans` test relies
-        // on, just exercised externally here instead of via the generated types directly).
+        // Two single-resource requests concatenated into one two-`ResourceSpans` request
+        // (`logit-proto`'s generated types are `pub(crate)`). Valid because `TracesData`'s only
+        // field is `repeated ResourceSpans resource_spans = 1`, and concatenated encodings of a
+        // message are a valid merge.
         let mut combined_bytes = Vec::new();
         combined_bytes.extend_from_slice(&bytes_a[0].1);
         combined_bytes.extend_from_slice(&bytes_b[0].1);
@@ -1577,8 +1436,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // `OtlpOutput` always sends well-formed frames -- to exercise "garbage protobuf" this
-        // drives the raw framing directly instead, over a real HTTP/2 client connection.
+        // `OtlpOutput` always sends well-formed frames, so this drives the raw framing over a
+        // real HTTP/2 client connection.
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -1675,8 +1534,7 @@ mod tests {
     // ---- TLS: server termination against a real `tokio-rustls` client. ----
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
-        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        // The repo root's `testdata/tls` (`testdata/tls/README.md`), two levels up.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
@@ -1688,9 +1546,8 @@ mod tests {
         }
     }
 
-    /// A `tokio-rustls` client trusting `testdata/tls/ca.pem` -- `client_cert` is `(cert, key)`
-    /// file names under `testdata/tls`, for the mTLS tests; `None` for a client presenting no
-    /// certificate at all.
+    /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`. `client_cert` is `(cert, key)` file
+    /// names under `testdata/tls` for the mTLS tests; `None` presents no certificate.
     async fn tls_connector(client_cert: Option<(&str, &str)>) -> tokio_rustls::TlsConnector {
         let dir = testdata_dir();
         let mut roots = rustls::RootCertStore::empty();
@@ -1720,8 +1577,7 @@ mod tests {
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg))
     }
 
-    /// The TLS twin of `post_raw`: connects, performs a real TLS handshake against `addr`, then
-    /// sends a plaintext HTTP/1.1 request over the encrypted stream.
+    /// The TLS twin of `post_raw`: a real TLS handshake, then HTTP/1.1 over the encrypted stream.
     async fn post_raw_tls(
         connector: &tokio_rustls::TlsConnector,
         addr: &str,
@@ -1817,10 +1673,9 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // A plain (non-TLS) client speaking straight HTTP at a TLS-only listener: the server
-        // reads what looks like garbage TLS record framing, sends a TLS alert, and closes --
-        // this must not panic or otherwise take the listener down for the next connection. The
-        // client never gets a valid HTTP response back (it may see raw alert bytes, or nothing).
+        // Plain HTTP at a TLS-only listener: the server reads garbage TLS framing, sends an
+        // alert, and closes, without taking the listener down. The client may see alert bytes or
+        // nothing, never an HTTP response.
         let response = post_raw(
             &addr,
             "/v1/traces",
@@ -1830,7 +1685,7 @@ mod tests {
         .await;
         assert!(!response.starts_with("HTTP/1.1"), "expected no valid HTTP response: {response:?}");
 
-        // The listener itself must still be alive for the next (well-formed, TLS) connection.
+        // The listener still serves the next (TLS) connection.
         let connector = tls_connector(None).await;
         let response = post_raw_tls(
             &connector,
@@ -1880,13 +1735,9 @@ mod tests {
         );
     }
 
-    /// The handshake timeout's whole purpose (this module's "Handshake timeout" doc section):
-    /// a client that completes the TCP connect and never sends a ClientHello must not pin a
-    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. What is asserted here is the observable half
-    /// -- the silent connection is *closed* from the server side inside the budget, and the
-    /// listener is still serving TLS traffic afterwards. Its plaintext twin,
-    /// `a_silent_plaintext_connection_is_closed_after_the_handshake_timeout`, goes on to prove
-    /// the permit itself came back, under `with_max_connections(1)`. Modelled on `crate::tcp`'s
+    /// A client that connects and sends no ClientHello is closed server-side inside the budget,
+    /// and the listener still serves TLS afterwards. The plaintext twin proves the permit returns.
+    /// Modelled on `crate::tcp`'s
     /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
     #[tokio::test]
     async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
@@ -1899,9 +1750,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Raw TCP, not a byte sent, and held (not dropped) until the close is observed -- so
-        // nothing but the server's own deadline could have closed it. A 1s read budget against a
-        // 50ms handshake timeout.
+        // Raw TCP, no byte sent, held until the close is observed, so only the server's deadline
+        // could have closed it. A 1s read budget against a 50ms handshake timeout.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let mut buf = [0u8; 1];
         let result = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut buf))
@@ -1913,7 +1763,7 @@ mod tests {
             Err(err) => panic!("read failed outright: {err}"),
         }
 
-        // And the listener is still serving real TLS traffic afterwards.
+        // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
@@ -1935,8 +1785,8 @@ mod tests {
 
     // ---- connection limit, the plaintext first-byte bound, and the connections gauge ----------
 
-    /// Reads one byte, expecting the peer to have closed instead. The twin of `crate::tcp`'s own
-    /// test helper of the same name.
+    /// Reads one byte, expecting the peer to have closed instead. This helper, `sum_of`, and
+    /// `expect_still_open` are copies of `crate::tcp`'s test helpers of the same names.
     async fn expect_closed<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
         let mut buf = [0u8; 1];
         let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
@@ -1951,7 +1801,7 @@ mod tests {
     }
 
     /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
-    /// the point carrying `tag` -- copied from `crate::tcp`'s test module.
+    /// the point carrying `tag`.
     fn sum_of(
         events: &[logit_core::Event],
         metric: &str,
@@ -1975,8 +1825,7 @@ mod tests {
         })
     }
 
-    /// `sum_of`'s gauge twin -- `Telemetry::gauge` is last-write-wins per `(name, tags)` until the
-    /// next drain, so one drain reports whatever value the listener last wrote.
+    /// `sum_of` for a gauge: last-write-wins per `(name, tags)` until the next drain.
     fn gauge_of(events: &[logit_core::Event], metric: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| {
@@ -1991,10 +1840,10 @@ mod tests {
         })
     }
 
-    /// The cap rejects rather than queues, and closes before any TLS handshake -- OTLP has no
-    /// in-band "try later" to spend a handshake delivering (this module's "Connection limit" doc
-    /// section). Modelled on `crate::tcp`'s
-    /// `the_connection_cap_drops_a_connection_past_the_limit_and_counts_it`.
+    /// The cap rejects rather than queues, before any TLS handshake, and counts the rejection.
+    /// Modelled on `crate::tcp`'s
+    /// `the_connection_cap_drops_a_connection_past_the_limit_and_counts_it`, whose accept loop
+    /// this one copies.
     #[tokio::test]
     async fn a_connection_past_the_cap_is_dropped_and_counted() {
         let registry = logit_core::Registry::new();
@@ -2005,8 +1854,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // The first connection takes the one permit and holds it. One byte, so it clears the
-        // first-byte peek and settles inside `hyper` rather than being closed by the deadline.
+        // The first connection holds the one permit. One byte, so it clears the first-byte peek
+        // rather than being closed by the deadline.
         let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
         first.write_all(b"P").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2026,14 +1875,8 @@ mod tests {
         drop(first);
     }
 
-    /// A TCP health check -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
-    /// `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` --
-    /// connects and closes without sending a byte, at whatever interval it is configured with.
-    /// Before the first-byte peek existed, `auto::Builder`'s own `ReadVersion` read that immediate
-    /// EOF as `Version::H1` and the connection ended silently; the peek must not turn it into a
-    /// warn plus a `connection_error` count per probe. Only the *deadline* (and a real read error)
-    /// is a fault on that arm -- the same call `crate::tcp` makes for an EOF before its first
-    /// frame.
+    /// A TCP health check (connect, close, no byte) is not a `connection_error`: no warn and no
+    /// count per probe.
     #[tokio::test]
     async fn a_plaintext_probe_that_closes_before_sending_is_not_a_connection_error() {
         let registry = logit_core::Registry::new();
@@ -2046,9 +1889,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Three probes, so a throttle that reports on powers of two could not hide a regression
-        // behind suppression: `warn_throttled` counts `logit.component.diagnostics` on *every*
-        // occurrence, reported or not.
+        // Three probes, so power-of-two throttling can't hide a regression: `warn_throttled`
+        // counts `logit.component.diagnostics` on every occurrence, reported or not.
         for _ in 0..3 {
             let probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
             drop(probe);
@@ -2066,11 +1908,9 @@ mod tests {
         );
     }
 
-    /// The plaintext twin of `a_silent_tls_connection_is_closed_after_the_handshake_timeout`, and
-    /// the case that actually matters in production: `otlp_in` with no `tls:` block is the default
-    /// shape, and until the first-byte peek landed it had no pre-request bound at all. Under
-    /// `with_max_connections(1)` the follow-up request can only be served if the silent
-    /// connection's permit genuinely came back.
+    /// A silent plaintext connection (the default, no-`tls:` shape) is closed at the handshake
+    /// timeout. Under `with_max_connections(1)` the follow-up request is served only if its permit
+    /// came back.
     #[tokio::test]
     async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
@@ -2080,8 +1920,8 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Connected, not a byte sent, and held (not dropped) until the close is observed -- so
-        // nothing but the server's own deadline could have closed it.
+        // No byte sent, held until the close is observed, so only the server's deadline could
+        // have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         expect_closed(&mut silent, "a plaintext connection that sent no bytes").await;
 
@@ -2102,11 +1942,9 @@ mod tests {
         drop(silent);
     }
 
-    /// A first-byte deadline must not become a request deadline: the peek resolves on the very
-    /// first byte, and everything after it belongs to `hyper`'s own read loop, which this module
-    /// deliberately installs no timer on (this module's "What it still does not bound" section --
-    /// `header_read_timeout` would re-arm across idle keep-alive gaps). So a client that dribbles
-    /// its request head out over four times the budget still gets a 200.
+    /// The first-byte deadline is not a request deadline: after the first byte, `hyper`'s read
+    /// loop has no timer (this module's "Why not hyper's `http1().header_read_timeout(..)`"), so a
+    /// head dribbled out over four times the budget still gets a 200.
     #[tokio::test]
     async fn the_first_byte_deadline_does_not_apply_once_a_request_has_started() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
@@ -2128,7 +1966,7 @@ mod tests {
         .into_bytes();
 
         let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        // The first byte immediately -- that is all the peek ever waits for.
+        // The first byte immediately: all the peek waits for.
         stream.write_all(&head[..1]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await; // 4x the budget
         stream.write_all(&head[1..]).await.unwrap();
@@ -2141,9 +1979,8 @@ mod tests {
         recv_batch(&mut rx).await;
     }
 
-    /// `peek` is `MSG_PEEK`: it consumes nothing, so `auto::Builder`'s own `ReadVersion` sniff
-    /// still sees the full 24-byte HTTP/2 preface and no rewind buffer is needed. h2c
-    /// prior-knowledge is the case that would break first if the bound were an ordinary read.
+    /// The peek consumes nothing, so h2c prior-knowledge (the case an ordinary read would break
+    /// first) still gets its full 24-byte preface to `ReadVersion`.
     #[tokio::test]
     async fn an_h2c_prior_knowledge_request_still_negotiates_after_the_first_byte_peek() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -2175,9 +2012,7 @@ mod tests {
         recv_batch(&mut rx).await;
     }
 
-    /// The gauge counts permit holders: 1 while a connection is being served, back to 0 once it
-    /// ends. `Telemetry::gauge` is last-write-wins until a drain, so each drain reports the value
-    /// the listener last wrote.
+    /// The gauge counts permit holders: 1 while a connection is served, 0 once it ends.
     #[tokio::test]
     async fn the_connections_gauge_tracks_a_live_connection_and_returns_to_zero() {
         let registry = logit_core::Registry::new();
@@ -2188,7 +2023,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // One byte, so the connection clears the peek and stays open inside `hyper`.
+        // One byte, so the connection clears the peek and stays open.
         let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
         open.write_all(b"P").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2216,15 +2051,12 @@ mod tests {
 
     // ---- idle timeout -------------------------------------------------------------------------
     //
-    // Real durations (50-300ms), never `tokio::time::pause()`: these tests are about a timer
-    // racing hyper's own read loop, and paused time would advance straight past the reads that
-    // loop is sitting in. The "closed within" assertions go through `expect_closed`'s 2s ceiling
-    // against deadlines of at most 300ms; the "still open" ones assert
-    // `timeout(50ms, read) == Err(Elapsed)`, which scheduler lag can only make *more* true.
+    // Real durations (50-300ms), never `tokio::time::pause()`: these tests race a timer against
+    // hyper's read loop, and paused time would skip past the reads that loop is in. "Closed
+    // within" goes through `expect_closed`'s 2s ceiling against deadlines of at most 300ms;
+    // "still open" asserts `timeout(50ms, read) == Err(Elapsed)`, which lag only makes truer.
 
-    /// [`metric_batch`] encoded as one OTLP/protobuf `/v1/metrics` body -- the three lines
-    /// several tests above spell out inline, hoisted for the ones below that need a real request
-    /// more than once.
+    /// [`metric_batch`] encoded as one OTLP/protobuf `/v1/metrics` body.
     fn metric_body() -> Bytes {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -2232,11 +2064,9 @@ mod tests {
         payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap().1
     }
 
-    /// Asserts a connection is still open by reading from it and expecting nothing: this
-    /// listener never speaks unprompted, so a blocked read means the connection is live, while a
-    /// closed one returns `Ok(0)` (or `ECONNRESET`) immediately. The inverse of [`expect_closed`]
-    /// and the twin of `crate::tcp`'s own helper of this name, and lag-proof in the direction
-    /// that matters -- a slow scheduler makes the read *more* likely to time out, never less.
+    /// Asserts a connection is still open: this listener never speaks unprompted, so a blocked
+    /// read means live, while a closed one returns `Ok(0)` (or `ECONNRESET`) at once. The inverse
+    /// of [`expect_closed`]; scheduler lag only makes the read likelier to time out.
     async fn expect_still_open<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
         let mut buf = [0u8; 1];
         match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
@@ -2247,10 +2077,8 @@ mod tests {
         }
     }
 
-    /// [`post_raw`]'s keep-alive half: writes one complete HTTP/1.1 POST on an already-open
-    /// stream and, crucially, sends **no** `Connection: close`, so hyper parks on the next
-    /// request rather than closing once this one is answered. For the tests that send more than
-    /// one request down one connection, or that keep reading from it afterwards.
+    /// [`post_raw`]'s keep-alive half: one complete HTTP/1.1 POST on an open stream with **no**
+    /// `Connection: close`, so hyper waits for the next request rather than closing.
     async fn write_request<S: tokio::io::AsyncWrite + Unpin>(
         stream: &mut S,
         addr: &str,
@@ -2266,11 +2094,9 @@ mod tests {
         stream.write_all(body).await.unwrap();
     }
 
-    /// Reads exactly one response head (through the blank line) off a keep-alive connection --
-    /// `read_to_end` would block until the *connection* ends, which is the thing under test here.
-    /// Every response read this way is a protobuf success, whose body is empty
-    /// (`export_response(0, "")`), so the head is all there is to consume before the next
-    /// request.
+    /// Reads one response head (through the blank line) off a keep-alive connection, where
+    /// `read_to_end` would block until the connection ends. Every response read this way is a
+    /// protobuf success with an empty body, so the head is all there is.
     async fn read_response_head<S: tokio::io::AsyncRead + Unpin>(
         stream: &mut S,
         what: &str,
@@ -2294,10 +2120,8 @@ mod tests {
         String::from_utf8_lossy(&head).into_owned()
     }
 
-    /// [`expect_closed`] for a peer that has already written something of its own: an HTTP/2
-    /// server sends its `SETTINGS` frame the instant a connection arrives, *before* it has read
-    /// the client's preface, so "the next byte off this socket is a close" is simply not true of
-    /// `protocol: grpc`. Reads to EOF instead -- the same assertion, a few frames later.
+    /// [`expect_closed`] for `protocol: grpc`, whose server sends `SETTINGS` before reading the
+    /// client's preface, so the next byte is not the close. Reads to EOF instead.
     async fn expect_closed_after_draining<S: tokio::io::AsyncRead + Unpin>(
         stream: &mut S,
         what: &str,
@@ -2312,10 +2136,8 @@ mod tests {
         }
     }
 
-    /// A request body that yields `.0` once and then never yields again *and never wakes* --
-    /// what a client that starts uploading and stalls looks like from the server's side, and the
-    /// only thing [`collect_with_stall_bound`]'s per-frame bound can be driven by. `Pending` with
-    /// no registered waker is the whole point: nothing will ever poll this body again.
+    /// A body that yields `.0` once, then returns `Pending` with no registered waker, so nothing
+    /// polls it again: a stalled upload, as [`collect_with_stall_bound`] sees it.
     struct StalledBody(Option<Bytes>);
 
     impl hyper::body::Body for StalledBody {
@@ -2333,17 +2155,10 @@ mod tests {
         }
     }
 
-    /// The whole point of `idle_timeout:` on this listener: a pooled keep-alive connection that
-    /// finished its export and then went quiet gives up its connection-cap permit instead of
-    /// holding it forever. Proven under `with_max_connections(1)`, so the follow-up request can
-    /// only be served if the first connection's permit genuinely came back.
-    ///
-    /// Also the pin for "policy, not a fault": the close is counted
-    /// `logit.input.connections.closed{reason="idle"}` and the listener's `connection_error`
-    /// diagnostic never fires, which is what `drive_with_idle` returning `Ok(())` rather than an
-    /// `Err` buys (this module's "Idle timeout" doc section). The h1 case here is the one
-    /// `graceful_shutdown` closes on its own -- an idle keep-alive connection is `KA::Idle`, so
-    /// `disable_keep_alive` closes it immediately and the grace is never spent.
+    /// A keep-alive connection that finished its export and went quiet gives its permit back:
+    /// under `with_max_connections(1)` the follow-up request is served only if it did. The close
+    /// is counted `logit.input.connections.closed{reason="idle"}` and `connection_error` never
+    /// fires. `KA::Idle`, so `graceful_shutdown` closes it without spending the grace.
     #[tokio::test]
     async fn an_idle_keep_alive_http_connection_is_closed_after_the_idle_timeout_and_releases_its_permit(
     ) {
@@ -2361,8 +2176,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // One complete export, keep-alive, so the connection settles idle inside hyper with the
-        // first-byte peek long behind it -- the idle clock is the only thing that can end it.
+        // One complete export, keep-alive, so only the idle clock can end the connection.
         let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_request(&mut keep_alive, &addr, "/v1/metrics", &metric_body()).await;
         let head = read_response_head(&mut keep_alive, "the keep-alive export").await;
@@ -2398,14 +2212,10 @@ mod tests {
         drop(keep_alive);
     }
 
-    /// The narrowing this listener's idle clock carries, made a test: it resets on request
-    /// *completion*, so a connection that produced one head byte and then stopped has never
-    /// completed anything and is closed at the idle deadline measured from the connection's own
-    /// start. This is also the case `graceful_shutdown` alone cannot close -- one byte leaves
-    /// hyper-util's `auto` builder inside its pre-sniff `ReadVersion` (`P` could still begin
-    /// either `POST` or the h2 `PRI` preface), and a fresh h1 connection mid-head is `KA::Busy`
-    /// -- so the bounded grace and the drop after it are what actually end it. The grace is
-    /// `handshake_timeout`, set to 50ms here purely so that bound is visible inside
+    /// A connection that sent one head byte has completed nothing, so it is closed at the idle
+    /// deadline from its own start. One byte leaves `auto`'s pre-sniff `ReadVersion` undecided
+    /// (`P` begins `POST` or the h2 `PRI` preface), which `graceful_shutdown` alone cannot close,
+    /// so the grace-then-drop ends it. `handshake_timeout` (the grace) is 50ms to fit inside
     /// `expect_closed`'s 2s ceiling.
     #[tokio::test]
     async fn a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout() {
@@ -2417,8 +2227,7 @@ mod tests {
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // One byte, immediately -- enough to clear the first-byte peek, so the close that
-        // follows can only have come from the idle clock, not from `handshake_timeout`.
+        // One byte clears the first-byte peek, so the close can only come from the idle clock.
         let mut dribbling = tokio::net::TcpStream::connect(&addr).await.unwrap();
         dribbling.write_all(b"P").await.unwrap();
 
@@ -2426,11 +2235,8 @@ mod tests {
             .await;
     }
 
-    /// The gRPC transport's twin of the keep-alive case: an established h2 connection that
-    /// finished its export and went quiet is GOAWAY'd and closed. "Closed" is observed from the
-    /// client's own connection future ending -- an h2 client has no socket to read directly, and
-    /// its connection task is exactly what a GOAWAY plus a close terminates. `sender` is held
-    /// alive throughout, so nothing on this side could have initiated the shutdown.
+    /// An established, quiet h2 connection is GOAWAY'd and closed, observed as the client's
+    /// connection future ending. `sender` is held throughout, so the client didn't initiate it.
     #[tokio::test]
     async fn an_idle_grpc_connection_is_closed_after_the_idle_timeout() {
         let registry = logit_core::Registry::new();
@@ -2469,15 +2275,15 @@ mod tests {
         );
         recv_batch(&mut rx).await;
 
-        // Either outcome proves the close: hyper's client connection future ends `Ok` on a clean
-        // GOAWAY-then-FIN and `Err` if the socket goes first.
+        // Either outcome is the close: `Ok` on a clean GOAWAY-then-FIN, `Err` if the socket goes
+        // first.
         let _closed = tokio::time::timeout(Duration::from_secs(2), client_conn)
             .await
             .expect("an idle gRPC connection should be closed within 2s")
             .expect("the client's connection task should not panic");
 
-        // The client's future ends on the GOAWAY, which the server writes *during* its grace
-        // poll -- so the count, which lands after that poll returns, is a moment behind it.
+        // The client's future ends on the GOAWAY, written during the grace poll; the count lands
+        // after that poll returns, a moment later.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
@@ -2487,10 +2293,8 @@ mod tests {
         drop(sender);
     }
 
-    /// `protocol: grpc`'s equivalent of the one-head-byte case, and the third state
-    /// `graceful_shutdown` cannot close on its own: an h2 connection still `Handshaking` only
-    /// gets an internal `close_pending` flag set, so the bounded grace (`handshake_timeout`,
-    /// 50ms here) and the drop after it are what free the permit.
+    /// An h2 connection still `Handshaking` only gets `close_pending` from `graceful_shutdown`, so
+    /// the grace (`handshake_timeout`, 50ms here) and the drop free the permit.
     #[tokio::test]
     async fn a_stalled_h2_preface_is_closed_after_the_idle_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Grpc).await;
@@ -2508,15 +2312,10 @@ mod tests {
         expect_closed_after_draining(&mut stalled, "a connection stalled mid-h2-preface").await;
     }
 
-    /// **The test the reset rule exists for.** A connection whose downstream is full is not
-    /// idle -- it is waiting on *us* -- so a request parked in `Fanout::send` must hold the idle
-    /// clock off entirely, however long that park lasts. A capacity-1 channel with nothing
-    /// draining it puts the second request exactly there, and three idle timeouts' worth of
-    /// sleep must not close the connection. Then the drain happens, the blocked request's
-    /// response arrives, and the same connection serves a third request.
-    ///
-    /// A clock that ran while a request was in flight would close this connection and lose a
-    /// request that had already been fully received.
+    /// **The reset rule.** A request parked in `Fanout::send` holds the idle clock off however
+    /// long it parks: three idle timeouts don't close the connection, the drain delivers the
+    /// response, and the connection serves another request. A clock running during the park
+    /// would lose a fully received request.
     #[tokio::test]
     async fn a_request_blocked_on_a_full_downstream_is_not_closed_as_idle() {
         let idle = Duration::from_millis(100);
@@ -2545,18 +2344,15 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
         recv_batch(&mut rx).await;
 
-        // And the connection really was untouched: it still serves another request.
+        // The connection still serves another request.
         write_request(&mut client, &addr, "/v1/metrics", &body).await;
         let head = read_response_head(&mut client, "a third export").await;
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
         recv_batch(&mut rx).await;
     }
 
-    /// The body half of the bound: a request head that arrived in full followed by a body that
-    /// stops mid-upload is answered `408` per *frame* rather than left to the whole-connection
-    /// deadline, and the connection closes behind the response instead of waiting for another
-    /// request that can never come. `read_to_end` asserts both halves at once -- it returns only
-    /// when the peer closes, and what it returns is the response.
+    /// A full head then a body that stops mid-upload gets `408` and the connection closes behind
+    /// it. `read_to_end` asserts both: it returns only on close, and returns the response.
     #[tokio::test]
     async fn a_request_body_that_stalls_gets_408_and_the_connection_is_closed() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
@@ -2589,10 +2385,8 @@ mod tests {
         assert!(response.contains("stalled"), "the message should say what happened: {response}");
     }
 
-    /// [`a_request_body_that_stalls_gets_408_and_the_connection_is_closed`]'s gRPC twin: the same
-    /// per-frame bound, reported as `grpc-status: 4` (`DEADLINE_EXCEEDED`), and the same close
-    /// once the response is out -- observed here through the client's connection future ending,
-    /// since the client still believes it has a request body open.
+    /// The gRPC twin: a stalled body gets `grpc-status: 4` (`DEADLINE_EXCEEDED`) and the
+    /// connection closes, observed as the client's connection future ending.
     #[tokio::test]
     async fn a_stalled_grpc_request_body_gets_status_four_and_the_connection_is_closed() {
         let (addr, input) = bound_input(OtlpTransport::Grpc).await;
@@ -2631,33 +2425,25 @@ mod tests {
         drop(sender);
     }
 
-    /// The grace window's one real hazard, closed. A request that *starts* inside the grace --
-    /// after `graceful_shutdown` has been called, before the connection has actually gone -- must
-    /// be served, not dropped: on h1 the handler's own future is polled inside the connection
-    /// future, so dropping the connection while that handler is parked in `Fanout::send` would
-    /// discard a batch that never reached the fanout, the backpressure-causes-loss outcome
+    /// A request that *starts* inside the grace (after `graceful_shutdown`, before the connection
+    /// is gone) is served, not dropped: on h1 the handler is polled inside the connection future,
+    /// so dropping it while parked in `Fanout::send` would lose a batch, the outcome
     /// `docs/adr/idle-connection-timeout.md` exists to prevent.
     ///
-    /// **Two bytes at the start, not one.** One byte leaves hyper-util's `auto` builder inside
-    /// its pre-sniff `ReadVersion` (`P` could still begin either `POST` or the h2 `PRI` preface),
-    /// which `graceful_shutdown` cancels outright -- that is
-    /// [`a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout`]'s
-    /// case, and it has nothing in flight to wait for. `PO` commits the sniff to HTTP/1.1, so
-    /// what this test closes is a real h1 connection stopped mid-head: `KA::Busy`, which
-    /// `graceful_shutdown` leaves running, which is exactly the state that can still pick a
-    /// request up during the grace.
+    /// **Two bytes, not one.** One byte leaves `auto`'s `ReadVersion` sniff undecided, which
+    /// `graceful_shutdown` cancels outright
+    /// (`a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout`).
+    /// `PO` commits to HTTP/1.1, giving an h1 connection stopped mid-head: `KA::Busy`, which
+    /// `graceful_shutdown` leaves running and which can still pick a request up in the grace.
     ///
-    /// The pre-filled capacity-1 channel is what parks the handler, and the batch it holds is a
-    /// metric while the request carries a span, so "the request's batch arrived" is a distinct
-    /// assertion from "the pre-filled one drained".
+    /// The pre-filled capacity-1 channel parks the handler; its batch is a metric and the
+    /// request's a span, so the two arrivals are distinct assertions.
     ///
-    /// **The timings, and why they are what they are.** A 200ms idle timeout and a 100ms grace,
-    /// so the grace window runs from roughly 200ms to 300ms after this connection's first byte,
-    /// and the rest of the request lands at 260ms -- 60ms *past* the idle deadline, so the
-    /// request cannot have been in flight when it fired (which would make the test vacuous), and
-    /// 40ms *inside* the grace, so it is genuinely picked up in the window under test. The
-    /// downstream is then left blocked until 600ms, 300ms past the grace's expiry, which is what
-    /// the old drop-on-expiry close would have lost the batch in.
+    /// **Timings.** A 200ms idle timeout and a 100ms grace put the window at roughly 200-300ms
+    /// after the first byte. The rest of the request lands at 260ms: 60ms *past* the idle
+    /// deadline, so nothing was in flight when it fired, and 40ms *inside* the grace. The
+    /// downstream stays blocked until 600ms, 300ms past the grace, where a drop-on-expiry close
+    /// would have lost the batch.
     #[tokio::test]
     async fn a_request_that_starts_inside_the_grace_window_is_served_not_dropped() {
         let registry = logit_core::Registry::new();
@@ -2666,8 +2452,7 @@ mod tests {
         let mut input = input
             .with_telemetry(telemetry)
             .with_idle_timeout(Some(Duration::from_millis(200)))
-            // Doubles as the grace. Both halves of this test's margin are tens of milliseconds
-            // wide (see the timings above), which is why neither number is any tighter.
+            // Doubles as the grace. Both margins are tens of milliseconds (see the timings above).
             .with_handshake_timeout(Duration::from_millis(100));
         let (sink, mut rx) = fanout_into_channel_with_capacity(1);
         // Pre-filled, so the handler's own `Fanout::send` parks until this test drains it.
@@ -2686,16 +2471,13 @@ mod tests {
         let mut late = tokio::net::TcpStream::connect(&addr).await.unwrap();
         late.write_all(&head[..2]).await.unwrap();
 
-        // t+260ms: 60ms past the 200ms idle deadline, so `graceful_shutdown` has certainly been
-        // called and nothing was in flight when it fired -- and 40ms inside the 100ms grace, so
-        // the rest of the request is picked up by a connection that is already shutting down.
+        // t+260ms: 60ms past the idle deadline and 40ms inside the grace, so a connection already
+        // shutting down picks the rest of the request up.
         tokio::time::sleep(Duration::from_millis(260)).await;
         late.write_all(&head[2..]).await.unwrap();
         late.write_all(&body).await.unwrap();
 
-        // t+600ms: three further graces' worth of parked handler, 300ms past the window's
-        // expiry. Under a close that dropped on grace expiry, this connection and this batch
-        // would both be long gone by now.
+        // t+600ms: 300ms past the window, where a drop-on-expiry close would have lost this batch.
         tokio::time::sleep(Duration::from_millis(340)).await;
 
         let prefilled = recv_batch(&mut rx).await;
@@ -2709,8 +2491,7 @@ mod tests {
         let response = read_response_head(&mut late, "a request served inside the grace").await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        // And it still closes afterwards -- waiting the request out defers the close, it does
-        // not cancel it.
+        // It still closes afterwards: waiting the request out defers the close, not cancels it.
         expect_closed(&mut late, "a connection that served a request inside its grace").await;
         assert_eq!(
             sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
@@ -2719,10 +2500,8 @@ mod tests {
         );
     }
 
-    /// The default, and the promise that turning nothing on changes nothing: with no
-    /// `idle_timeout` configured, a keep-alive connection that finished its export and went
-    /// quiet stays open -- which is exactly what a long-interval OTLP exporter's pooled
-    /// connection looks like between exports.
+    /// With no `idle_timeout`, a quiet keep-alive connection (a long-interval exporter's pooled
+    /// connection between exports) stays open.
     #[tokio::test]
     async fn no_idle_timeout_leaves_a_keep_alive_connection_open() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -2736,7 +2515,7 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
         recv_batch(&mut rx).await;
 
-        // Three times the idle timeout every other test in this section configures.
+        // Three times the idle timeout the other tests in this section configure.
         tokio::time::sleep(Duration::from_millis(300)).await;
         expect_still_open(&mut keep_alive, "a keep-alive connection with no idle_timeout").await;
     }
