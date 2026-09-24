@@ -296,6 +296,22 @@ it), and each segment when it rotates away and at shutdown, not per push. A proc
 (including `SIGKILL`) loses nothing already written; a power loss can lose the most recent,
 not-yet-synced tail of the active segment.
 
+**The spool survives a restart, not an outage longer than `retry_budget`.** A batch the sink
+gives up on is removed from the spool and counted `batches.dropped{reason="send_failed"}`,
+exactly as an in-memory queue drops it, and a restart doesn't bring it back. The sink gives up
+when a failure isn't retryable under its delivery posture (a configuration error, or a timeout or
+5xx under `at_most_once`; see the
+[retry table](adr/buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)),
+or when a retryable failure is still failing once `retry_budget` runs out. To ride out a longer
+destination outage, raise `retry_budget` as well as `disk.max_bytes`. That only helps for failures
+the posture retries: an `at_most_once` sink drops a batch on its first ambiguous failure, with no
+budget spent
+([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md#amendment-a-dropped-batch-is-committed-off-the-spool-2026-09-24)).
+
+**`file_out` never fsyncs**, with or without a `buffer.disk:` block: a power loss can lose its most
+recent writes or an in-progress rotation, by design
+([ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24)).
+
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
 the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
