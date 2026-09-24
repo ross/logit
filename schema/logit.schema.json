@@ -1806,6 +1806,82 @@
           }
         },
         {
+          "description": "Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a tracer's spans can pass through `logit` on their way to a real Agent, which still does all trace processing. Spans and stats are sent as they arrive; nothing is sampled, normalized, or derived, so a span that didn't come from a Datadog tracer arrives with empty service, resource, and type fields: send OpenTelemetry spans with `otlp_out` instead. Set `endpoint` or `socket`, not both.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "compression": {
+              "description": "How request bodies are compressed: `none` (the default, what tracers send) or `gzip`, worth it only when the Agent is across a slow link.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogTraceCompression"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "The Agent's trace API as an absolute `http://` or `https://` URL: `http://127.0.0.1:8126` for an Agent on the same host.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "headers": {
+              "description": "Extra headers sent on every request. A value is a plain string, so `!env` works on it. A name this sink sets itself (`content-type`, `content-encoding`, `content-length`, `host`, `user-agent`, and every `datadog-*` and `x-datadog-*` header) or an HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "socket": {
+              "description": "The absolute path of the Agent's trace Unix socket (its `receiver_socket`, `/var/run/datadog/apm.socket` by default), instead of `endpoint`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no verification. A non-default block is rejected with an `http://` endpoint or a `socket`.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_trace_out"
+              ]
+            },
+            "version": {
+              "description": "The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7` carries all of them.",
+              "default": "v0.4",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogTraceVersion"
+                }
+              ]
+            }
+          }
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -2592,6 +2668,44 @@
         }
       },
       "additionalProperties": false
+    },
+    "DatadogTraceCompression": {
+      "description": "How `datadog_trace_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "Every body uncompressed, as tracers send.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "gzip, which the Agent accepts.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        }
+      ]
+    },
+    "DatadogTraceVersion": {
+      "description": "Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.",
+      "oneOf": [
+        {
+          "description": "`/v0.4/traces`: what most tracers send and every Agent accepts.",
+          "type": "string",
+          "enum": [
+            "v0.4"
+          ]
+        },
+        {
+          "description": "`/v0.7/traces`: carries the trace chunk and tracer payload fields v0.4 has no room for.",
+          "type": "string",
+          "enum": [
+            "v0.7"
+          ]
+        }
+      ]
     },
     "DeliveryPosture": {
       "description": "Whether re-delivering an already-delivered batch is acceptable for a sink's destination. `at_least_once` retries as aggressively as fault classification allows and risks a duplicate; `at_most_once` is the conservative posture.",

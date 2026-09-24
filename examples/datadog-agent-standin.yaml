@@ -16,7 +16,8 @@
 # OTLP backend (`otlp_out`), never straight to Datadog's intake through `datadog_out`, which
 # skips spans no Agent has processed. A tracer drops a payload it can't deliver rather than
 # retrying it, so a stalled pipeline loses spans (`docs/deploying.md` has the detail); give the
-# real sinks a `buffer:`.
+# real sinks a `buffer:`. For where the data goes next, `datadog-agent-relay.yaml` relays both
+# listeners to a real Agent.
 components:
   dogstatsd:
     type: statsd_in

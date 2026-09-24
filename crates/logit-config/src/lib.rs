@@ -525,6 +525,29 @@ pub enum DatadogCompression {
     None,
 }
 
+/// Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum DatadogTraceVersion {
+    /// `/v0.4/traces`: what most tracers send and every Agent accepts.
+    #[default]
+    #[serde(rename = "v0.4")]
+    V04,
+    /// `/v0.7/traces`: carries the trace chunk and tracer payload fields v0.4 has no room for.
+    #[serde(rename = "v0.7")]
+    V07,
+}
+
+/// How `datadog_trace_out` compresses its request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DatadogTraceCompression {
+    /// Every body uncompressed, as tracers send.
+    #[default]
+    None,
+    /// gzip, which the Agent accepts.
+    Gzip,
+}
+
 /// `datadog_out`'s default `site:`, Datadog's US1 site.
 pub fn default_datadog_site() -> String {
     "datadoghq.com".to_string()
@@ -1581,6 +1604,49 @@ pub enum ComponentKind {
         /// Tunes TLS for every `https://` request: a private CA, a client certificate, or no
         /// verification. A non-default block is rejected when every intake is a plain `http://`
         /// `endpoints` override.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
+    /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
+    /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
+    /// tracer's spans can pass through `logit` on their way to a real Agent, which still does all
+    /// trace processing. Spans and stats are sent as they arrive; nothing is sampled, normalized,
+    /// or derived, so a span that didn't come from a Datadog tracer arrives with empty service,
+    /// resource, and type fields: send OpenTelemetry spans with `otlp_out` instead. Set `endpoint`
+    /// or `socket`, not both.
+    DatadogTraceOut {
+        /// The Agent's trace API as an absolute `http://` or `https://` URL:
+        /// `http://127.0.0.1:8126` for an Agent on the same host.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// The absolute path of the Agent's trace Unix socket (its `receiver_socket`,
+        /// `/var/run/datadog/apm.socket` by default), instead of `endpoint`.
+        #[serde(default)]
+        socket: Option<String>,
+        /// The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers
+        /// send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or
+        /// a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7`
+        /// carries all of them.
+        #[serde(default)]
+        version: DatadogTraceVersion,
+        /// How request bodies are compressed: `none` (the default, what tracers send) or `gzip`,
+        /// worth it only when the Agent is across a slow link.
+        #[serde(default)]
+        compression: DatadogTraceCompression,
+        /// Timeout for one request. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_datadog_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every request. A value is a plain string, so `!env` works on it.
+        /// A name this sink sets itself (`content-type`, `content-encoding`, `content-length`,
+        /// `host`, `user-agent`, and every `datadog-*` and `x-datadog-*` header) or an HTTP/2
+        /// pseudo-header starting with `:` is rejected, as are two keys naming the same header
+        /// once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no
+        /// verification. A non-default block is rejected with an `http://` endpoint or a
+        /// `socket`.
         #[serde(default)]
         tls: TlsClientConfig,
     },
@@ -4650,6 +4716,51 @@ mod tests {
         // A misspelled intake name is an error, not a silently ignored override.
         assert!(serde_json::from_str::<Component>(
             r#"{"type": "datadog_out", "api_key": "k", "endpoints": {"log": "http://x"}}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn datadog_trace_out_defaults_to_v04_uncompressed() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_out", "endpoint": "http://127.0.0.1:8126"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceOut {
+                endpoint,
+                socket,
+                version,
+                compression,
+                timeout,
+                headers,
+                tls,
+            } => {
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
+                assert_eq!(socket, None);
+                assert_eq!(version, DatadogTraceVersion::V04);
+                assert_eq!(compression, DatadogTraceCompression::None);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert!(tls.is_empty());
+            }
+            other => panic!("expected DatadogTraceOut, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_out", "socket": "/var/run/datadog/apm.socket",
+                "version": "v0.7", "compression": "gzip"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceOut { socket, version, compression, .. } => {
+                assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
+                assert_eq!(version, DatadogTraceVersion::V07);
+                assert_eq!(compression, DatadogTraceCompression::Gzip);
+            }
+            other => panic!("expected DatadogTraceOut, got {other:?}"),
+        }
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "datadog_trace_out", "endpoint": "http://x", "version": "v0.5"}"#,
         )
         .is_err());
     }

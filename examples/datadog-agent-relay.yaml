@@ -1,0 +1,44 @@
+# Sits between an application's Datadog libraries and a real Datadog Agent: the tracer-direct
+# topology of docs/plans/datadog-relay.md §14. The application talks to `logit` as if it were the
+# local Agent, and `logit` relays what arrives to the Agent at `agent`: traces and client stats
+# through `datadog_trace_in` -> `datadog_trace_out`, DogStatsD through `statsd_in` -> `statsd_out`.
+# Both are lossless relays (docs/adr/datadog-agent-and-intake-relay.md), so anything added between
+# them (a `sample`, a `set`, a tee to another backend) sees what the application sent.
+#
+# The application sets what it would for a local Agent:
+#
+#   DD_AGENT_HOST=<this-host>                    # traces on :8126, DogStatsD on :8125
+#   DD_TRACE_AGENT_URL=http://<this-host>:8126   # or this, for traces alone
+#   DD_DOGSTATSD_URL=udp://<this-host>:8125      # or this, for DogStatsD alone
+#
+# The Agent still does all trace processing: obfuscation, normalization, `_top_level` marking,
+# sampling, and the APM stats behind Datadog's service pages. Nothing here does any of it, which
+# is why the traces go on to an Agent rather than straight to Datadog's intake (`datadog_out`
+# skips spans no Agent has processed). A tracer drops a payload it can't deliver rather than
+# retrying it, so give `agent_apm` a `buffer:` if the Agent may be unreachable for longer than a
+# stall `datadog_trace_in` can absorb (docs/deploying.md).
+components:
+  apm:
+    type: datadog_trace_in
+    bind: 127.0.0.1:8126
+
+  agent_apm:
+    type: datadog_trace_out
+    sources: [apm]
+    endpoint: http://agent:8126
+    # Or the Agent's Unix socket instead of `endpoint`:
+    # socket: /var/run/datadog/apm.socket
+    # Every field below is its default; omit it for the same effect.
+    # version: v0.4        # v0.4 | v0.7 -- v0.4 drops trace chunk fields, counted
+    # compression: none    # none | gzip
+    # timeout: 10s
+
+  dogstatsd:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  agent_dogstatsd:
+    type: statsd_out
+    sources: [dogstatsd]
+    endpoint: agent:8125
+    format: dogstatsd

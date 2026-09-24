@@ -6,6 +6,7 @@
 mod attrs;
 pub mod collectd;
 pub mod datadog;
+pub mod datadog_trace;
 pub mod file;
 pub mod graphite;
 mod http;

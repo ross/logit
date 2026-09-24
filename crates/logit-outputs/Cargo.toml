@@ -18,6 +18,8 @@ reqwest.workspace = true
 # transport uses `reqwest`.
 hyper.workspace = true
 hyper-util.workspace = true
+# datadog_trace_out's Unix-socket connector for `hyper-util`'s pooled client.
+tower-service.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 # otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md).

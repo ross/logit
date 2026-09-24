@@ -189,6 +189,11 @@
 //!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name rule 22 would reject against
 //!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing rule 24's checks, the scheme one only when no
 //!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 66. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't
+//!     an absolute `http://`/`https://` URL, a `socket` that isn't an absolute path, `timeout:
+//!     0s`, a `headers:` name rule 22 would reject against `RESERVED_DATADOG_TRACE_HEADERS` or
+//!     starting `datadog-`/`x-datadog-`, or a `tls` failing rule 24's checks, or set with a
+//!     `socket` (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -286,6 +291,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         InfluxDbOut { .. }
         | OtlpOut { .. }
         | DatadogOut { .. }
+        | DatadogTraceOut { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -349,6 +355,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
         DatadogOut { .. } => "datadog_out",
+        DatadogTraceOut { .. } => "datadog_trace_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -445,6 +452,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::DatadogOut { .. }
+            | ComponentKind::DatadogTraceOut { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -565,6 +573,13 @@ const RESERVED_REMOTE_WRITE_HEADERS: &[&str] = &[
 /// and `host`, which `reqwest` sets. Compared case-insensitively.
 const RESERVED_DATADOG_HEADERS: &[&str] =
     &["dd-api-key", "content-type", "content-encoding", "content-length", "host", "user-agent"];
+
+/// Header names `datadog_trace_out` sets itself (rule 66), beyond every `datadog-*` and
+/// `x-datadog-*` name, which rule 66 reserves by prefix: the tracer headers and
+/// `X-Datadog-Trace-Count` are the protocol's (`crates/logit-outputs/src/datadog_trace.rs`'s "The
+/// wire"). `content-length` and `host` are set by the HTTP client. Compared case-insensitively.
+const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
+    &["content-type", "content-encoding", "content-length", "host", "user-agent"];
 
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
@@ -2855,6 +2870,111 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  TLS is selected by each URL's scheme, so a 'tls:' block here would have no \
                  effect"
             );
+        }
+    }
+
+    // Rule 66: `datadog_trace_out` (`docs/adr/datadog-agent-and-intake-relay.md`). It sends to
+    // one Agent over TCP or its Unix socket, so it names one of the two, not both. A relative
+    // `socket` would resolve against whatever directory `logit` was started in (rule 63's
+    // reasoning). The
+    // headers get rule 22's checks against this sink's reserved set, plus every `datadog-*` and
+    // `x-datadog-*` name by prefix, since the tracer API's headers are the protocol's. `tls`
+    // gets rule 24's checks; the Unix socket is always plaintext.
+    for (id, component) in &components {
+        let ComponentKind::DatadogTraceOut { endpoint, socket, timeout, headers, tls, .. } =
+            &component.kind
+        else {
+            continue;
+        };
+        match (endpoint, socket) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "component '{id}': datadog_trace_out takes 'endpoint' or 'socket', not both -- \
+                 it sends to one Agent"
+            ),
+            (None, None) => anyhow::bail!(
+                "component '{id}': datadog_trace_out needs 'endpoint' (the Agent's \
+                 http://host:8126) or 'socket' (its Unix socket path)"
+            ),
+            _ => {}
+        }
+        if let Some(endpoint) = endpoint {
+            if !is_absolute_http_url(endpoint) {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_out 'endpoint' must be an absolute http:// \
+                     or https:// URL with a host, got {endpoint:?}"
+                );
+            }
+        }
+        if let Some(socket) = socket {
+            if !std::path::Path::new(socket).is_absolute() {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_out 'socket' must be an absolute path, got \
+                     '{socket}'"
+                );
+            }
+        }
+        if timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': datadog_trace_out 'timeout: 0s' would fail every request \
+                 before it was sent"
+            );
+        }
+        let mut seen_lowercase = BTreeSet::new();
+        for name in headers.keys() {
+            if name.is_empty() {
+                anyhow::bail!("component '{id}': 'headers' has an empty header name");
+            }
+            if name.starts_with(':') {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                     (starting with ':') can't be set as a custom header"
+                );
+            }
+            let lowercase = name.to_ascii_lowercase();
+            if RESERVED_DATADOG_TRACE_HEADERS.contains(&lowercase.as_str())
+                || lowercase.starts_with("datadog-")
+                || lowercase.starts_with("x-datadog-")
+            {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?}, which datadog_trace_out sets \
+                     itself -- it can't be overridden"
+                );
+            }
+            if !seen_lowercase.insert(lowercase) {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?}, which differs only in case from \
+                     another entry -- HTTP header names are case-insensitive, so which value \
+                     would actually be sent is undefined"
+                );
+            }
+        }
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if !tls.is_empty() {
+            if socket.is_some() {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_out 'tls' can't be used with 'socket' -- \
+                     the Unix socket is always plaintext"
+                );
+            }
+            if endpoint.as_ref().is_some_and(|e| !e.to_ascii_lowercase().starts_with("https://")) {
+                anyhow::bail!(
+                    "component '{id}': 'tls' is set, but 'endpoint' isn't 'https://' -- TLS is \
+                     selected by the endpoint's scheme, so a 'tls:' block here would have no \
+                     effect"
+                );
+            }
         }
     }
 
@@ -5316,6 +5436,141 @@ mod tests {
             }
         }));
         assert!(err.contains("every 'endpoints' entry is plain http://"), "got: {err}");
+    }
+
+    // ---- rule 66: datadog_trace_out --------------------------------------------------------
+
+    /// A `datadog_trace_out` with every optional field at its default, the shape rule 66 reads.
+    fn datadog_trace_out(endpoint: Option<&str>, socket: Option<&str>) -> ComponentKind {
+        ComponentKind::DatadogTraceOut {
+            endpoint: endpoint.map(String::from),
+            socket: socket.map(String::from),
+            version: logit_config::DatadogTraceVersion::default(),
+            compression: logit_config::DatadogTraceCompression::default(),
+            timeout: logit_config::default_datadog_timeout(),
+            headers: HashMap::new(),
+            tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    fn datadog_trace_out_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+    }
+
+    /// Edits one field of a default `datadog_trace_out` on an `https://` endpoint.
+    fn datadog_trace_out_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        let mut kind = datadog_trace_out(Some("https://agent:8126"), None);
+        edit(&mut kind);
+        kind
+    }
+
+    #[test]
+    fn a_datadog_trace_out_with_an_endpoint_or_a_socket_resolves() {
+        for kind in [
+            datadog_trace_out(Some("http://127.0.0.1:8126"), None),
+            datadog_trace_out(None, Some("/var/run/datadog/apm.socket")),
+            datadog_trace_out_with(|k| {
+                if let ComponentKind::DatadogTraceOut { headers, tls, .. } = k {
+                    headers.insert("Proxy-Authorization".into(), "Basic x".into());
+                    tls.insecure_skip_verify = true;
+                }
+            }),
+        ] {
+            resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+                .expect("one destination, a custom header, and tls on https are valid");
+        }
+    }
+
+    /// Rule 66: one Agent, named once.
+    #[test]
+    fn a_datadog_trace_out_with_both_or_neither_destination_is_rejected() {
+        let err = datadog_trace_out_err(datadog_trace_out(None, None));
+        assert!(err.contains("'out'") && err.contains("needs 'endpoint'"), "got: {err}");
+        let err =
+            datadog_trace_out_err(datadog_trace_out(Some("http://a:8126"), Some("/run/apm.sock")));
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    /// Rule 66: an absolute http(s) URL, or an absolute socket path.
+    #[test]
+    fn a_datadog_trace_out_relative_destination_is_rejected() {
+        for bad in ["127.0.0.1:8126", "unix:///var/run/datadog/apm.socket", "http://"] {
+            let err = datadog_trace_out_err(datadog_trace_out(Some(bad), None));
+            assert!(err.contains("'endpoint' must be an absolute"), "{bad:?}: {err}");
+        }
+        let err = datadog_trace_out_err(datadog_trace_out(None, Some("run/apm.socket")));
+        assert!(err.contains("'socket' must be an absolute path"), "got: {err}");
+    }
+
+    #[test]
+    fn a_datadog_trace_out_with_a_zero_timeout_is_rejected() {
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { timeout, .. } = k {
+                *timeout = Duration::ZERO;
+            }
+        }));
+        assert!(err.contains("'timeout: 0s'"), "got: {err}");
+    }
+
+    /// Rule 66: rule 22's checks, with every `datadog-*`/`x-datadog-*` name reserved by prefix.
+    #[test]
+    fn a_datadog_trace_out_reserved_or_colliding_header_is_rejected() {
+        for name in [
+            "Datadog-Meta-Lang",
+            "datadog-anything",
+            "X-Datadog-Trace-Count",
+            "Content-Type",
+            "user-agent",
+            ":path",
+            "",
+        ] {
+            let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+                if let ComponentKind::DatadogTraceOut { headers, .. } = k {
+                    headers.insert(name.into(), "x".into());
+                }
+            }));
+            assert!(err.contains("'headers'"), "{name:?}: {err}");
+        }
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { headers, .. } = k {
+                headers.insert("X-Proxy".into(), "a".into());
+                headers.insert("x-proxy".into(), "b".into());
+            }
+        }));
+        assert!(err.contains("differs only in case"), "got: {err}");
+    }
+
+    /// Rule 66: rule 24's `tls` checks, and no TLS on the Unix socket.
+    #[test]
+    fn a_datadog_trace_out_tls_block_that_cant_take_effect_is_rejected() {
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { tls, .. } = k {
+                tls.key_file = Some("client.key".into());
+            }
+        }));
+        assert!(err.contains("must both be set"), "got: {err}");
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { tls, .. } = k {
+                tls.insecure_skip_verify = true;
+                tls.ca_file = Some("ca.pem".into());
+            }
+        }));
+        assert!(err.contains("can't both be set"), "got: {err}");
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { endpoint, tls, .. } = k {
+                *endpoint = Some("http://agent:8126".into());
+                tls.insecure_skip_verify = true;
+            }
+        }));
+        assert!(err.contains("isn't 'https://'"), "got: {err}");
+        let err = datadog_trace_out_err(datadog_trace_out_with(|k| {
+            if let ComponentKind::DatadogTraceOut { endpoint, socket, tls, .. } = k {
+                *endpoint = None;
+                *socket = Some("/var/run/datadog/apm.socket".into());
+                tls.insecure_skip_verify = true;
+            }
+        }));
+        assert!(err.contains("can't be used with 'socket'"), "got: {err}");
     }
 
     /// A `datadog_trace_in` with every optional field at its default, the shape rule 63 reads.

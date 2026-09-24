@@ -169,18 +169,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::Fanout;
-use logit_proto::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
 use logit_proto::datadog::{
     DatadogDecoder, HEADER_CLIENT_COMPUTED_STATS, HEADER_CLIENT_COMPUTED_TOP_LEVEL,
-    HEADER_CLIENT_DROPPED_P0_SPANS, HEADER_CLIENT_DROPPED_P0_TRACES, HEADER_CONTAINER_ID,
-    HEADER_ENTITY_ID, HEADER_META_LANG, HEADER_META_LANG_INTERPRETER,
-    HEADER_META_LANG_INTERPRETER_VENDOR, HEADER_META_LANG_VERSION, HEADER_META_TRACER_VERSION,
     HEADER_TRACE_COUNT, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS,
-    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, RESOURCE_ATTR_TRACER_CONTAINER_ID,
-    RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS, RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES,
-    RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
-    RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
-    RESOURCE_ATTR_TRACER_VERSION,
+    RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL, TRACER_STR_HEADERS, TRACER_U64_HEADERS,
 };
 use logit_proto::msgpack::{Reader, Type};
 use logit_proto::CodecError;
@@ -942,23 +934,6 @@ fn success(route: Route, request_headers: &HeaderMap) -> http::Response<Full<Byt
     response
 }
 
-/// The tracer headers' `Str` carriers: header, then attribute.
-const STR_HEADERS: [(&str, &str); 7] = [
-    (HEADER_META_LANG, RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
-    (HEADER_META_LANG_VERSION, RESOURCE_ATTR_TRACER_LANGUAGE_VERSION),
-    (HEADER_META_LANG_INTERPRETER, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER),
-    (HEADER_META_LANG_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR),
-    (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
-    (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
-    (HEADER_ENTITY_ID, RESOURCE_ATTR_TRACER_ENTITY_ID),
-];
-
-/// The tracer headers' `U64` carriers: header, then attribute.
-const U64_HEADERS: [(&str, &str); 2] = [
-    (HEADER_CLIENT_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES),
-    (HEADER_CLIENT_DROPPED_P0_SPANS, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS),
-];
-
 /// Copies the tracer headers into `batch`'s resource, each only where the resource has no value
 /// for its attribute: on v0.3–v0.5 the resource starts empty, and on v0.7 the payload's own
 /// fields win (this module's "Tracer headers").
@@ -971,7 +946,7 @@ fn apply_tracer_headers(batch: &mut EventBatch, headers: &HeaderMap, diag: &Diag
             .filter(|v| !v.is_empty())
     };
     let mut fills: Vec<(&'static str, Value)> = Vec::new();
-    for (header, attr) in STR_HEADERS {
+    for (header, attr) in TRACER_STR_HEADERS {
         if let Some(value) = text(header) {
             fills.push((attr, Value::str(value)));
         }
@@ -986,7 +961,7 @@ fn apply_tracer_headers(batch: &mut EventBatch, headers: &HeaderMap, diag: &Diag
     {
         fills.push((RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)));
     }
-    for (header, attr) in U64_HEADERS {
+    for (header, attr) in TRACER_U64_HEADERS {
         let Some(value) = text(header) else { continue };
         match value.parse::<u64>() {
             Ok(n) => fills.push((attr, Value::U64(n))),
@@ -1132,6 +1107,14 @@ fn info_document(receiver_port: u16, receiver_socket: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_proto::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
+    use logit_proto::datadog::{
+        RESOURCE_ATTR_TRACER_CONTAINER_ID, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
+        RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_ENTITY_ID,
+        RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER,
+        RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_NAME,
+        RESOURCE_ATTR_TRACER_VERSION,
+    };
     use logit_proto::msgpack::Writer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;

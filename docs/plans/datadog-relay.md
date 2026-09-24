@@ -262,8 +262,10 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
   `Datadog-Client-Computed-{Stats,Top-Level}` headers kept as `datadog.tracer.*` resource
   attributes; stub answers for telemetry, config, and `evp_proxy`, counted. Responds
   `rate_by_service` with rate 1.0.
-- `datadog_trace_out` (W6): msgpack `/v0.4/traces` and `/v0.6/stats` to an Agent, with the
-  `Datadog-Meta-*` headers restored from `datadog.tracer.*`; `endpoint:`, `timeout`.
+- `datadog_trace_out` (W6): msgpack `PUT /v0.4/traces` (or `/v0.7/traces` under `version: v0.7`)
+  and `POST /v0.6/stats` to an Agent, with the tracer headers restored from `datadog.tracer.*`;
+  `endpoint:` (http or https) or `socket:` (the Agent's `receiver_socket`), `compression: none |
+  gzip`, `timeout`, `headers`, `tls`.
 
 ### 3. Reuse (W3–W6)
 
@@ -441,7 +443,7 @@ the OTel-direct topology is `otlp_out`.
 | W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
 | W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
 | W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
-| W6 | `datadog_trace_out`: Agent client | S | W4a |
+| W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 66; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
 | W7 | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); trial-org end-to-end for `datadog_out`, including the `/api/v0.2/traces` leg and the stale window; pair fixed-point tests over the corpus; UNVERIFIED items resolved in this plan | M | W5, W6 |
 | W8 | `trace_context` 64-bit and decimal ids; `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
 
@@ -450,11 +452,12 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, and W5 complete on
-their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once
-it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real Agent,
-tracer, or client, and W5's `datadog_out` has sent only to `datadog_in`, never to Datadog; W7 does
-both.
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, and W6 complete
+on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main`
+once it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real
+Agent, tracer, or client; W5's `datadog_out` has sent only to `datadog_in`, never to Datadog; and
+W6's `datadog_trace_out` has sent only to `datadog_trace_in`, never to a real Agent. W7 does all
+three.
 
 ## Verification
 

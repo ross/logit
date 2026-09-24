@@ -378,7 +378,7 @@ impl DatadogEncoder {
         if chunks.is_empty() {
             return None;
         }
-        self.resource_carriers_lost(&batch.resource, Form::Agent);
+        self.resource_carriers_lost(&batch.resource, Form::Agent, false);
         let tracer = self.wire_tracer(&batch.resource, chunks);
         let agent = self.wire_agent(&batch.resource, tracer);
         Some(Bytes::from(pb_agent(&agent)))

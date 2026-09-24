@@ -956,6 +956,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
     `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
   - **Revisit trigger:** W7 resends a request to the trial org and checks what Datadog shows.
+- **`datadog_trace_out`'s Unix-socket client is UNVERIFIED against a real Agent.** It sends
+  HTTP/1.1 with `Host: localhost` over the socket, which `datadog_trace_in` and the tests' local
+  server accept; no real Agent's `receiver_socket` has received it.
+  - **Consequence:** if the Agent's socket listener wants something else, every request over
+    `socket:` fails; `endpoint:` is unaffected.
+  - **Revisit trigger:** W7 points it at a real Agent's socket.
+- **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
+  A chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped flag, tags) and the
+  tracer payload fields no request header carries (`datadog.tracer.runtime_id`, `.env`,
+  `.hostname`, `.app_version`, `.tags`, `.container_debug`) have no v0.4 field. Each is counted
+  `logit.output.spans.degraded{reason="no_wire_form"}`.
+  - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
+    priority and origin from the root span again on its side.
+  - **Workaround:** `version: v0.7`, which carries all of them.
+- **`datadog_trace_out` derives no Datadog fields from an OTel span.** A span without
+  `service.name`, `resource.name`, or `span.type` reaches the Agent with `service`, `resource`, or
+  `type` empty, and no stats are computed for it.
+  - **Consequence:** OTel-origin spans through this sink show up in Datadog poorly named.
+  - **Workaround:** send OTel spans with `otlp_out`, to the Agent's OTLP receiver or to Datadog.
+  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers
+    ([plan §14](plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
 - ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
   unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
   (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the

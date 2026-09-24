@@ -35,6 +35,9 @@ use logit_outputs::datadog::{
     DatadogCompression as DatadogOutCompression, DatadogEndpoints as DatadogOutEndpoints,
     DatadogOutput,
 };
+use logit_outputs::datadog_trace::{
+    DatadogTraceCompression as DatadogTraceOutCompression, DatadogTraceOutput, TracerApiForm,
+};
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
@@ -760,6 +763,33 @@ fn build_spec(
                 .with_compression(match compression {
                     logit_config::DatadogCompression::Gzip => DatadogOutCompression::Gzip,
                     logit_config::DatadogCompression::None => DatadogOutCompression::None,
+                })
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        DatadogTraceOut { endpoint, socket, version, compression, timeout, headers, tls } => {
+            // Rule 66 has already required one of `endpoint`/`socket`, not both.
+            let output = match (endpoint, socket) {
+                (Some(endpoint), _) => DatadogTraceOutput::http(endpoint.clone()),
+                (None, Some(socket)) => DatadogTraceOutput::unix(socket),
+                (None, None) => anyhow::bail!("datadog_trace_out needs 'endpoint' or 'socket'"),
+            };
+            let output = output
+                .with_version(match version {
+                    logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
+                    logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
+                })
+                .with_compression(match compression {
+                    logit_config::DatadogTraceCompression::None => DatadogTraceOutCompression::None,
+                    logit_config::DatadogTraceCompression::Gzip => DatadogTraceOutCompression::Gzip,
                 })
                 .with_timeout(*timeout)
                 .with_headers(headers)?

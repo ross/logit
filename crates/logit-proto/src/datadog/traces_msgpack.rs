@@ -803,15 +803,52 @@ impl Dictionary {
     }
 }
 
+/// The two trace forms `datadog_trace_out` sends to an Agent's tracer API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TracerApiForm {
+    /// `/v0.4/traces`, [`DatadogEncoder::encode_traces_v04`]'s body.
+    V04,
+    /// `/v0.7/traces`, [`DatadogEncoder::encode_tracer_payload_v07`]'s body.
+    V07,
+}
+
+/// One tracer-API trace body, and how many traces (chunks) it holds: the value of its
+/// `X-Datadog-Trace-Count` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracerApiTraces {
+    pub body: Bytes,
+    pub traces: usize,
+}
+
 impl DatadogEncoder {
     /// `/v0.4/traces`: one trace array per 128-bit trace id. `None` when the batch has no span.
     /// Chunk and payload carriers have no v0.4 field: dropped, counted `no_wire_form`.
     pub fn encode_traces_v04(&mut self, batch: &EventBatch) -> Option<Bytes> {
+        self.traces_v04(batch, false).map(|t| t.body)
+    }
+
+    /// A tracer-API trace body in `form`, for a sender that also writes the batch resource's
+    /// tracer headers ([`super::TRACER_STR_HEADERS`] and its siblings) onto the request, as
+    /// `datadog_trace_out` does. The body is [`Self::encode_traces_v04`]'s or
+    /// [`Self::encode_tracer_payload_v07`]'s; the one difference is that a header's carrier isn't
+    /// counted `no_wire_form`, since the header carries it. `None` when the batch has no span.
+    pub fn encode_tracer_api_traces(
+        &mut self,
+        batch: &EventBatch,
+        form: TracerApiForm,
+    ) -> Option<TracerApiTraces> {
+        match form {
+            TracerApiForm::V04 => self.traces_v04(batch, true),
+            TracerApiForm::V07 => self.tracer_payload_v07(batch, true),
+        }
+    }
+
+    fn traces_v04(&mut self, batch: &EventBatch, headers: bool) -> Option<TracerApiTraces> {
         let chunks = self.batch_chunks(batch, Form::V04);
         if chunks.is_empty() {
             return None;
         }
-        self.resource_carriers_lost(&batch.resource, Form::V04);
+        self.resource_carriers_lost(&batch.resource, Form::V04, headers);
         let mut w = Writer::new();
         w.write_array_len(chunks.len());
         for c in &chunks {
@@ -820,7 +857,7 @@ impl DatadogEncoder {
                 write_span(&mut w, s);
             }
         }
-        Some(Bytes::from(w.into_inner()))
+        Some(TracerApiTraces { body: Bytes::from(w.into_inner()), traces: chunks.len() })
     }
 
     /// `/v0.5/traces`: `[dictionary, traces]`. v0.5 spans have no `meta_struct`, links, or events
@@ -830,7 +867,7 @@ impl DatadogEncoder {
         if chunks.is_empty() {
             return None;
         }
-        self.resource_carriers_lost(&batch.resource, Form::V05);
+        self.resource_carriers_lost(&batch.resource, Form::V05, false);
         let mut dict = Dictionary::new();
         let mut body = Writer::new();
         body.write_array_len(chunks.len());
@@ -873,15 +910,20 @@ impl DatadogEncoder {
 
     /// `/v0.7/traces`: one `TracerPayload` from the batch resource, one chunk per trace id.
     pub fn encode_tracer_payload_v07(&mut self, batch: &EventBatch) -> Option<Bytes> {
+        self.tracer_payload_v07(batch, false).map(|t| t.body)
+    }
+
+    fn tracer_payload_v07(&mut self, batch: &EventBatch, headers: bool) -> Option<TracerApiTraces> {
         let chunks = self.batch_chunks(batch, Form::V07);
         if chunks.is_empty() {
             return None;
         }
-        self.resource_carriers_lost(&batch.resource, Form::V07);
+        self.resource_carriers_lost(&batch.resource, Form::V07, headers);
+        let traces = chunks.len();
         let tracer = self.wire_tracer(&batch.resource, chunks);
         let mut w = Writer::new();
         write_tracer(&mut w, &tracer);
-        Some(Bytes::from(w.into_inner()))
+        Some(TracerApiTraces { body: Bytes::from(w.into_inner()), traces })
     }
 }
 
@@ -1345,6 +1387,68 @@ mod tests {
         assert!(again.events[0].attributes.is_empty());
         let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
         assert_eq!(lost, 2.0, "the chunk priority and the tracer's language name");
+    }
+
+    /// A tracer header's carrier never becomes a span tag. Under the tracer-API encoder its header
+    /// carries it, so only the carriers no header has (the hostname) count as lost; the plain
+    /// encoder counts every one.
+    #[test]
+    fn tracer_header_carriers_are_never_span_tags_and_count_only_when_no_header_carries_them() {
+        use crate::datadog::traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION;
+        use crate::datadog::{
+            RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS,
+            RESOURCE_ATTR_TRACER_ENTITY_ID, RESOURCE_ATTR_TRACER_HOSTNAME,
+        };
+        let mut resource = Resource::default();
+        for (key, value) in [
+            (RESOURCE_ATTR_TRACER_LANGUAGE_NAME, Value::str("python")),
+            (RESOURCE_ATTR_TRACER_LANGUAGE_VERSION, Value::str("3.12")),
+            (RESOURCE_ATTR_TRACER_ENTITY_ID, Value::str("ci-1")),
+            (RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS, Value::Bool(true)),
+            (RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS, Value::U64(3)),
+            (RESOURCE_ATTR_TRACER_HOSTNAME, Value::str("web-1")),
+        ] {
+            resource.attributes.insert(key, value);
+        }
+        let (mut d, _, _) = with_registry();
+        let span = d.decode_traces_v04(
+            &span_bytes(|w| {
+                w.write_array_len(1);
+                w.write_array_len(1);
+                w.write_map_len(1);
+                w.write_str("span_id");
+                w.write_u64(1);
+            }),
+            0,
+        );
+        let batch = new_batch(resource, span.unwrap().events);
+
+        let (_, mut e, registry) = with_registry();
+        reasons(&registry);
+        let out = e.encode_tracer_api_traces(&batch, TracerApiForm::V04).unwrap();
+        assert_eq!(out.traces, 1);
+        let again = d.decode_traces_v04(&out.body, 0).unwrap();
+        assert!(again.events[0].attributes.is_empty(), "{:?}", again.events[0].attributes);
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 1.0, "the hostname alone");
+
+        let (_, mut e, registry) = with_registry();
+        reasons(&registry);
+        let body = e.encode_traces_v04(&batch).unwrap();
+        assert_eq!(body, out.body, "one body either way");
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 6.0, "every carrier");
+
+        let (_, mut e, registry) = with_registry();
+        reasons(&registry);
+        let out = e.encode_tracer_api_traces(&batch, TracerApiForm::V07).unwrap();
+        let again = d.decode_tracer_payload_v07(&out.body, 0).unwrap();
+        assert!(again.events[0].attributes.is_empty());
+        let res = &again.resource.attributes;
+        assert_eq!(res.get(RESOURCE_ATTR_TRACER_HOSTNAME), Some(&Value::str("web-1")));
+        assert_eq!(res.get(RESOURCE_ATTR_TRACER_ENTITY_ID), None, "no payload field");
+        let lost = counted(&registry, "logit.output.spans.degraded", ("reason", "no_wire_form"));
+        assert_eq!(lost, 0.0);
     }
 
     #[test]

@@ -95,6 +95,11 @@ hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 # -- a `hyper_util::client::legacy::Client` replaces the hand-rolled per-request TcpStream connect,
 # which is what gives the gRPC transport both TLS and connection pooling in one move.
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http2"] }
+# datadog_trace_out's Unix-socket connector for that client (docs/adr/datadog-agent-and-intake-relay.md,
+# decision 13): `hyper-util`'s client takes any `tower_service::Service<Uri>` as its connector.
+# Already present transitively (via `hyper-util` and `reqwest`) at this exact version -- a direct
+# dependency adds no new crate version to the graph.
+tower-service = "0.3.3"
 http = "1"
 http-body-util = "0.1"
 # otlp_out's optional gzip request compression and otlp_in's matching decode

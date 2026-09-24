@@ -1042,6 +1042,7 @@ dependencies = [
  "snap",
  "tokio",
  "tokio-rustls",
+ "tower-service",
  "tracing-subscriber",
  "webpki-roots",
 ]

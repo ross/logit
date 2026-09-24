@@ -160,6 +160,27 @@ Three facts from the survey drive the shape of the decision:
       receiver restart between batches costs no batch and no duplicate. Each connect after the
       first counts `logit.output.reconnects`.
 
+13. **`datadog_trace_out` speaks the tracer API to one Agent, over TCP or the Agent's Unix
+    socket, and restores the tracer's request headers.** It sends `PUT /v0.4/traces` (or
+    `/v0.7/traces` under `version: v0.7`) and `POST /v0.6/stats`, msgpack, with no sampler: the
+    Agent's `rate_by_service` reply is ignored. The rest of the decision:
+    - **v0.4 is the default form**, because most tracers send it and every Agent takes it. The
+      tracer carriers a v0.4 request keeps only in headers (`datadog.tracer.language_name` and the
+      rest `datadog_trace_in` reads) go back out as those headers under either form, so a
+      v0.4-origin batch relays with nothing lost; a tracer header's carrier is never written into
+      a span's `meta`, on any trace form. Under v0.4 the chunk carriers and the payload carriers no
+      header has are dropped and counted `no_wire_form`; v0.7 carries them.
+    - **`socket:` is an HTTP/1.1 client over the Unix socket**, a pooled `hyper_util` client whose
+      connector dials the path for each new connection, beside `reqwest` for `endpoint:`; the two
+      share request building and fault classification. A missing socket file or a refused connect
+      is `Fault::Clean`, as a refused TCP connect is. UNVERIFIED against a real Agent's socket
+      until W7.
+    - **Requests are cut by trace**, at most 1,000 traces and 25 MiB (the Agent's
+      `max_request_bytes`) on the wire, through `datadog_out`'s splitter. The Agent has no count
+      limit; the 1,000 bounds one request's encode and send.
+    - **`duplicate_safe()` is `false`**: an Agent dedupes nothing, and one batch is up to two
+      requests.
+
 ## Alternatives considered
 
 - **OTLP as the only trace egress.** Nothing to build, and the documented direct path. Rejected
@@ -223,5 +244,6 @@ Three facts from the survey drive the shape of the decision:
   the deferral `datadog_in`'s is (decision 11); the tracer short-timeout, no-retry behavior behind
   that is UNVERIFIED until W7.
 - `statsd_in`/`statsd_out`'s `unix_stream` framing and `datadog_trace_in`'s `0666` socket mode
-  are UNVERIFIED until W7 (decision 12). A `unix` `statsd_out` whose receiver restarts mid-batch
+  are UNVERIFIED until W7 (decision 12), as is `datadog_trace_out`'s Unix-socket client
+  (decision 13). A `unix` `statsd_out` whose receiver restarts mid-batch
   fails that batch under the sink's usual rules; only a restart between batches is absorbed.

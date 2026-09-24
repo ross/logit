@@ -1486,6 +1486,28 @@ the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't repeat the
 itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
 bytes of the body with the key redacted), and `oversize` (an event dropped for its size).
 
+##### `datadog_trace_out`
+
+`crates/logit-outputs/src/datadog_trace.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+One `send` is up to two routes' requests, so every point carries `route`: `traces` or `stats`.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout, over TCP or the Unix socket alike |
+| `logit.output.request.duration{route}` | timing | one per request |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, or every record of a request the Agent answered `413` |
+
+The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
+repeat them. The one to watch here is `logit.output.spans.degraded{reason="no_wire_form"}` under
+`version: v0.4`: the trace chunk and tracer payload fields v0.4 can't carry. A tracer header's
+carrier doesn't count there, because the request header carries it.
+
+`Diagnostics` keys, each throttled: `request_rejected` (a non-retryable `4xx`, `3xx`, or `1xx`,
+quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and
+`bad_header` (a tracer header left out because its attribute isn't a legal header value).
+
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,
@@ -1595,7 +1617,8 @@ cover a sink that never fails and never varies; a dedicated counter would duplic
 #### Codecs
 
 A codec shared by a listener and a sink reports through whichever component's handles it was
-given, so these points appear under `datadog_in`'s or `datadog_out`'s component id.
+given, so these points appear under the component id of `datadog_in`, `datadog_trace_in`,
+`datadog_out`, or `datadog_trace_out`.
 
 ##### `datadog`
 

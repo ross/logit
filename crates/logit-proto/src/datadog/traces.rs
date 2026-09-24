@@ -605,7 +605,8 @@ fn sort_map<V>(map: &mut [(String, V)]) {
 /// Whether `key` is a carrier [`DatadogEncoder::wire_span`] consumes rather than sends as a
 /// `meta`/`metrics`/`meta_struct` entry. A carrier of the wrong `Value` type isn't one: it goes
 /// out by its type like any attribute, so a Datadog span whose own `meta` happens to use a
-/// carrier's name still relays. A payload carrier counts only on the resource.
+/// carrier's name still relays. A payload carrier, or a tracer header's
+/// ([`super::is_tracer_header_attr`]), counts only on the resource.
 fn is_carrier(key: &str, value: &Value, event: &Event) -> bool {
     match (key, value) {
         // Empty isn't a carrier either: decode never makes one (the wire's `""` is no attribute),
@@ -617,7 +618,9 @@ fn is_carrier(key: &str, value: &Value, event: &Event) -> bool {
         (ATTR_CHUNK_DROPPED_TRACE, Value::Bool(_)) | (ATTR_CHUNK_TAGS, Value::Map(_)) => true,
         (ATTR_SPAN_ERROR | ATTR_CHUNK_PRIORITY, Value::I64(i)) => i32::try_from(*i).is_ok(),
         (k, _) => {
-            (TRACER_CARRIERS.contains(&k) || AGENT_CARRIERS.contains(&k))
+            (TRACER_CARRIERS.contains(&k)
+                || AGENT_CARRIERS.contains(&k)
+                || super::is_tracer_header_attr(k))
                 && event.attributes.get(k).is_none()
         }
     }
@@ -891,16 +894,27 @@ impl DatadogEncoder {
     }
 
     /// Counts, once per batch, every batch-resource carrier `form` has no field for: the
-    /// `datadog.agent.*` ones below `AgentPayload`, the `datadog.tracer.*` ones below v0.7.
-    pub(super) fn resource_carriers_lost(&self, resource: &Resource, form: Form) {
+    /// `datadog.agent.*` ones below `AgentPayload`, the `datadog.tracer.*` ones below v0.7, and the
+    /// tracer headers' carriers no payload has a field for. With `headers`, the caller sends every
+    /// tracer header as a request header, so no header's carrier is lost.
+    pub(super) fn resource_carriers_lost(&self, resource: &Resource, form: Form, headers: bool) {
         let attrs = &resource.attributes;
+        let lost_here =
+            |key: &str| attrs.get(key).is_some() && !(headers && super::is_tracer_header_attr(key));
         let mut lost = 0;
         if form != Form::Agent {
             lost += AGENT_CARRIERS.iter().filter(|k| attrs.get(k).is_some()).count();
         }
         if !form.has_chunks() {
-            lost += TRACER_CARRIERS.iter().filter(|k| attrs.get(k).is_some()).count();
+            lost += TRACER_CARRIERS.iter().filter(|k| lost_here(k)).count();
         }
+        let header_only = super::TRACER_STR_HEADERS
+            .iter()
+            .chain(&super::TRACER_FLAG_HEADERS)
+            .chain(&super::TRACER_U64_HEADERS)
+            .map(|&(_, attr)| attr)
+            .filter(|attr| !TRACER_CARRIERS.contains(attr));
+        lost += header_only.filter(|attr| lost_here(attr)).count();
         self.span_out_degraded("no_wire_form", lost);
     }
 

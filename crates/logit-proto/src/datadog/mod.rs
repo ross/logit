@@ -328,6 +328,7 @@
 //! | `datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
 //! | batch resource `datadog.tracer.*` / `datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
 //! | a carrier the form has no field for: `datadog.chunk.*` in v0.4/v0.5 (per span), `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (per batch), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
+//! | a tracer header's carrier ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]) on the batch resource | never a span tag: a payload field where the form has one (v0.7's `language_name`, say), else dropped | `no_wire_form`, per batch, except under [`DatadogEncoder::encode_tracer_api_traces`], whose caller sends each as its request header |
 //! | `status: Ok`, span `flags`, `SpanExt` status message / `trace_state` / dropped counts, a link's or event's dropped-attribute count | dropped: Datadog has no field | `degraded{reason="no_wire_form"}`, one per field |
 //!
 //! The encoders write the Agent's key sets and orders (`EncodeMsg`), omitting what its
@@ -545,6 +546,40 @@ pub const HEADER_CLIENT_DROPPED_P0_TRACES: &str = "datadog-client-dropped-p0-tra
 pub const HEADER_CLIENT_DROPPED_P0_SPANS: &str = "datadog-client-dropped-p0-spans";
 /// `X-Datadog-Trace-Count`: how many traces the tracer says the body holds.
 pub const HEADER_TRACE_COUNT: &str = "x-datadog-trace-count";
+
+/// The tracer headers whose value is a `Str` resource attribute: header, then attribute.
+/// `datadog_trace_in` reads them and `datadog_trace_out` writes them back.
+pub const TRACER_STR_HEADERS: [(&str, &str); 7] = [
+    (HEADER_META_LANG, RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
+    (HEADER_META_LANG_VERSION, traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION),
+    (HEADER_META_LANG_INTERPRETER, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER),
+    (HEADER_META_LANG_INTERPRETER_VENDOR, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR),
+    (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
+    (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
+    (HEADER_ENTITY_ID, RESOURCE_ATTR_TRACER_ENTITY_ID),
+];
+
+/// The tracer headers whose resource attribute is `Bool(true)` when set and absent otherwise.
+pub const TRACER_FLAG_HEADERS: [(&str, &str); 2] = [
+    (HEADER_CLIENT_COMPUTED_TOP_LEVEL, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL),
+    (HEADER_CLIENT_COMPUTED_STATS, RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS),
+];
+
+/// The tracer headers whose value is a `U64` resource attribute.
+pub const TRACER_U64_HEADERS: [(&str, &str); 2] = [
+    (HEADER_CLIENT_DROPPED_P0_TRACES, RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES),
+    (HEADER_CLIENT_DROPPED_P0_SPANS, RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS),
+];
+
+/// Whether `key` is the resource attribute of one of the tracer headers
+/// ([`TRACER_STR_HEADERS`], [`TRACER_FLAG_HEADERS`], [`TRACER_U64_HEADERS`]).
+pub fn is_tracer_header_attr(key: &str) -> bool {
+    TRACER_STR_HEADERS
+        .iter()
+        .chain(&TRACER_FLAG_HEADERS)
+        .chain(&TRACER_U64_HEADERS)
+        .any(|(_, attr)| *attr == key)
+}
 /// `service.name` / `resource.name` / `span.type` / `span.kind`: a span's `service`, `resource`,
 /// `type`, and (a `meta` key, kept verbatim, that also sets `SpanRecord::kind`) `span.kind` — the
 /// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 8). An
@@ -667,18 +702,8 @@ pub fn is_datadog_span(resource: &Resource, event: &Event) -> bool {
 /// first with no parent; failing that, the first span in chunk order whose parent isn't in the
 /// chunk; failing that (a parent cycle), the last span.
 pub fn trace_readiness(batch: &EventBatch) -> Vec<Option<TraceReadiness>> {
-    let mut chunks: Vec<Vec<usize>> = Vec::new();
-    let mut index: HashMap<[u8; 16], usize> = HashMap::new();
-    for (i, event) in batch.events.iter().enumerate() {
-        let Some(span) = &event.span else { continue };
-        let chunk = *index.entry(span.trace_id).or_insert_with(|| {
-            chunks.push(Vec::new());
-            chunks.len() - 1
-        });
-        chunks[chunk].push(i);
-    }
     let mut out = vec![None; batch.events.len()];
-    for members in &chunks {
+    for members in &trace_chunks(batch) {
         let root = &batch.events[chunk_root(batch, members)];
         let verdict = if is_agent_processed(root) {
             TraceReadiness::Ready
@@ -692,6 +717,23 @@ pub fn trace_readiness(batch: &EventBatch) -> Vec<Option<TraceReadiness>> {
         }
     }
     out
+}
+
+/// `batch`'s span events grouped into trace chunks, as every trace encoder groups them: one chunk
+/// per 128-bit trace id in first-appearance order, each the indices into `batch.events` of its
+/// spans in batch order. Events without a span are in no chunk.
+pub fn trace_chunks(batch: &EventBatch) -> Vec<Vec<usize>> {
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut index: HashMap<[u8; 16], usize> = HashMap::new();
+    for (i, event) in batch.events.iter().enumerate() {
+        let Some(span) = &event.span else { continue };
+        let chunk = *index.entry(span.trace_id).or_insert_with(|| {
+            chunks.push(Vec::new());
+            chunks.len() - 1
+        });
+        chunks[chunk].push(i);
+    }
+    chunks
 }
 
 /// The index into `batch.events` of the root of the chunk `members`, by [`trace_readiness`]'s

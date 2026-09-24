@@ -355,6 +355,10 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 65. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
     scheme or `/`, an `endpoints` entry that isn't an absolute `http://`/`https://` URL,
     `timeout: 0s`, a reserved or colliding header, or a bad `tls`.
+66. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't an
+    absolute `http://`/`https://` URL, a relative `socket` path, `timeout: 0s`, a reserved
+    (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
+    `tls` with `socket`).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

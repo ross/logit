@@ -1596,6 +1596,61 @@ is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
 reason}` everything held back. `docs/design/internal-telemetry.md`'s `datadog_out` section has every
 counter.
 
+## `datadog_trace_out`: sending to an Agent's APM API
+
+`datadog_trace_out` sends APM traces and tracer-computed stats to a real Datadog Agent's trace API,
+as a dd-trace tracer does. It's the sending half of `datadog_trace_in`: a tracer's spans pass
+through `logit` on their way to the Agent, which still does all the trace processing Datadog
+expects. [`examples/datadog-agent-relay.yaml`](../examples/datadog-agent-relay.yaml) relays a
+tracer's traces and its DogStatsD to an Agent this way.
+
+```yaml
+components:
+  agent_apm:
+    type: datadog_trace_out
+    sources: [apm]
+    endpoint: http://agent:8126             # or:
+    # socket: /var/run/datadog/apm.socket   # the Agent's receiver_socket
+```
+
+**`endpoint` or `socket`, exactly one.** `endpoint` is the Agent's trace API as an `http://` or
+`https://` URL; `tls:` tunes an `https://` one. `socket` is the absolute path of the Agent's Unix
+socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always plaintext.
+
+**Pick `version` by where the spans came from.** `v0.4`, the default, is what most tracers send and
+every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
+tags) or for a tracer payload's hostname, environment, runtime ID, app version, and tags. Those
+are dropped and counted `logit.output.spans.degraded{reason="no_wire_form"}`. A tracer that sent
+v0.4 never had them, so v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`,
+set `version: v0.7`, which carries all of them. The tracer's language, versions, container ID, and
+the rest of its request headers go out as the same headers under either version.
+
+**It relays; it doesn't process.** Spans go to the Agent as they arrived, and the Agent does the
+obfuscation, normalization, sampling, and stats computation. The Agent's reply carries sampling
+rates for a tracer to apply; this sink samples nothing and ignores them. It derives no Datadog
+fields either, so an OpenTelemetry span without `service.name`, `resource.name`, and `span.type`
+reaches the Agent with those fields empty. Send OTel spans with `otlp_out` instead.
+
+**Compression and headers.** `compression: none`, the default, sends bodies as tracers do; `gzip`
+is worth it only across a slow link. `headers:` adds headers to every request; a name the sink sets
+itself (`content-type`, `user-agent`, and every `datadog-*` or `x-datadog-*` header) is rejected.
+
+**Size limits.** A request holds at most 1,000 traces (or stats groups) and 25 MiB on the wire, the
+Agent's `max_request_bytes`. A trace too large to send alone is dropped and counted
+`logit.output.records.dropped{reason="oversize"}`.
+
+**Delivery.** Traces go first, then stats. The first request that fails stops the rest, and the
+batch is retried or dropped as one. `408`, `429`, `5xx`, and timeouts are retryable; a refused
+connection or a missing socket file is retried as a clean failure; any other `4xx` isn't retried.
+The sink isn't duplicate-safe (an Agent dedupes nothing), so the default is at-most-once; `buffer:
+{delivery: at_least_once}` retries and accepts duplicates. A `buffer:` here is also what keeps
+`datadog_trace_in` from answering tracers `503` while the Agent is unreachable.
+
+**What to watch.** `logit.output.requests{route, class}` (`route` is `traces` or `stats`),
+`logit.output.records{route}` for what the Agent accepted, and
+`logit.output.spans.degraded{reason="no_wire_form"}` for what `v0.4` couldn't carry.
+`docs/design/internal-telemetry.md`'s `datadog_trace_out` section has every counter.
+
 ## Prometheus remote-write: receiving, sending, and picking a version
 
 `prometheus_in` and `prometheus_out` each have two modes, chosen by which field is set:
