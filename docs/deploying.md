@@ -797,6 +797,52 @@ components:
   `logit.input.frames.dropped{reason="oversize"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.component.diagnostics{key="bad_line"}`, not a framing error.
 
+### `statsd_in`: DogStatsD over a Unix socket
+
+A Datadog Agent also listens for DogStatsD on a Unix datagram socket (`dogstatsd_socket`, by
+default `/var/run/datadog/dsd.socket`), which is how Kubernetes clients usually reach it. To stand
+in for that socket, set `transport: unix` and put the socket's absolute path in `bind:`. Clients
+then use `DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`:
+
+```yaml
+components:
+  dogstatsd:
+    type: statsd_in
+    bind: 127.0.0.1:8125           # UDP, as before
+  dsd_socket:
+    type: statsd_in
+    transport: unix                # unix (datagram) | unix_stream
+    bind: /var/run/datadog/dsd.socket
+```
+
+- **One `statsd_in` per transport.** A component listens on one socket, so to accept UDP and the
+  Unix socket at once, configure two components, as above, and list both as sources downstream.
+  [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml) carries the
+  socket component, commented out.
+- **Create the directory first.** `logit` never creates the socket's directory, because its owner
+  and mode are the access control. At startup a stale socket file from an earlier run is replaced;
+  anything else at the path (a regular file, say) fails startup rather than being deleted. The
+  socket file isn't removed on shutdown.
+- **The socket file is mode `0722`**, the Agent's own mode for this socket: a client needs only
+  write permission to send, so any user's process can send to it. Restrict senders with the
+  directory's permissions.
+- **`transport: unix` behaves like UDP.** One datagram carries one or more newline-separated lines,
+  and the whole `receive:` block applies. The kernel counters differ: a full Unix datagram queue
+  makes the *client's* send block or fail with `EAGAIN` rather than dropping in the kernel, so
+  `logit.input.kernel.drops` stays at zero and any loss shows up in the client's own telemetry
+  (`datadog-go` counts dropped packets). `logit.input.receive_buffer.*` is still reported.
+- **`transport: unix_stream` is the Agent's `dogstatsd_stream_socket`.** Each packet (one
+  datagram's worth of lines) follows its length as a 4-byte little-endian integer; clients use
+  `DD_DOGSTATSD_URL=unixstream:///path`. It runs on the TCP stream driver, so `handshake_timeout:`,
+  `idle_timeout:`, and the batch-assembly half of `receive:` apply, and the queue fields are
+  rejected. A packet declaring more than 64 KiB closes its connection
+  (`logit.input.frames.dropped{reason="oversize"}`), since a length-framed stream has no point to
+  resynchronize at. This framing hasn't yet been checked against a real Agent or client
+  ([`known-gaps.md`](known-gaps.md)).
+- **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
+  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 64),
+  which a client's `unix:///` URL couldn't name.
+
 ### `collectd_out`: relaying back onto the wire
 
 Use `collectd_out` when the destination is another collectd (or anything else speaking its
@@ -924,8 +970,37 @@ components:
 - **What to watch.** `logit.output.requests{class="ok"|"error"}` (one per attempt) and, on TCP,
   `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
-  way, since both take the same connect path. `logit.output.datagrams` exists only under
-  `transport: udp`.
+  way, since both take the same connect path. `logit.output.datagrams` exists only under the
+  datagram transports, `udp` and `unix`.
+
+### `statsd_out`: sending to a DogStatsD Unix socket
+
+To hand metrics to a local Datadog Agent over its Unix socket, set `transport: unix` (the
+`dogstatsd_socket`) or `unix_stream` (the `dogstatsd_stream_socket`) and put the socket's absolute
+path in `endpoint:`:
+
+```yaml
+components:
+  to_agent:
+    type: statsd_out
+    sources: [enrich]
+    transport: unix
+    endpoint: /var/run/datadog/dsd.socket
+    max_packet_bytes: 8192          # DogStatsD clients' default over a Unix socket
+```
+
+- **Raise `max_packet_bytes:` to `8192`.** The `1432` default is sized for a UDP path MTU; DogStatsD
+  clients pack up to 8192 bytes into a Unix-socket packet, which is also the Agent's default read
+  buffer. Lines are packed into packets exactly as into UDP datagrams, on both Unix transports.
+- **A full Agent queue makes a `unix` send wait, not drop.** Unlike UDP, a Unix datagram socket
+  pushes back on the sender. Each datagram's wait is bounded by `connect_timeout:` (default `5s`);
+  past it the send fails and the batch is retried or dropped under the sink's usual rules.
+- **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
+  4-byte little-endian integer (unverified against a real Agent,
+  [`known-gaps.md`](known-gaps.md)). A write that fails having accepted zero bytes is retried once
+  on a fresh connection, as on plaintext TCP.
+- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
+  `endpoint:` (rule 64).
 
 ## Tailing files and Docker logs
 

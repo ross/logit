@@ -8,10 +8,18 @@
 //! **Framing is chosen per listener, not guessed per driver.** [`FramingMode`] is set once, at
 //! construction, through [`TcpListener::with_framing`]: RFC 6587's auto-detecting pair for
 //! `syslog_in`, LF-delimited lines for a line protocol whose messages may *start* with a digit
-//! (`graphite_in` plaintext, `statsd_in`), or carbon's 4-byte big-endian length prefix
-//! (`docs/adr/graphite-carbon-relay.md`). A builder rather than a [`TcpListenerConfig`] field:
+//! (`graphite_in` plaintext, `statsd_in`), carbon's 4-byte big-endian length prefix
+//! (`docs/adr/graphite-carbon-relay.md`), or DogStatsD's 4-byte little-endian one (`statsd_in`'s
+//! `transport: unix_stream`). A builder rather than a [`TcpListenerConfig`] field:
 //! that struct is the image of the `receive:` config block, and framing is not something an
 //! operator sets.
+//!
+//! **A Unix stream socket runs on the same loop.** [`TcpListener::unix`] binds a `SOCK_STREAM`
+//! Unix socket (`statsd_in`'s `transport: unix_stream`) through [`crate::unix`] and serves each
+//! connection exactly as a plaintext TCP one: the same cap, first-byte and idle deadlines, framing,
+//! and batching. Two things don't carry over: TLS ([`TcpListener::with_tls`] refuses it, since a
+//! Unix socket is local and plaintext), and the accept-queue gauges ([`AcceptQueueSampler`] reads
+//! `TCP_INFO`, which a Unix socket has no counterpart for).
 //!
 //! **`D: Clone` is load-bearing.** Every connection gets its own decoder clone, because a decoder
 //! may hold per-connection state (scratch buffers, or sticky identity the way `collectd`'s
@@ -90,12 +98,14 @@ use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener as TokioTcpListener;
-use tokio::sync::watch;
+use tokio::net::UnixListener as TokioUnixListener;
+use tokio::sync::{watch, OwnedSemaphorePermit};
 use tokio_rustls::TlsAcceptor;
 
 /// `crate::tls::TlsServerSettings`, re-exported for symmetry with `crate::logit`/`crate::otlp`.
@@ -162,6 +172,11 @@ pub enum FramingMode {
     /// A 4-byte big-endian payload length, then that many bytes: Twisted's `Int32StringReceiver`,
     /// which is how carbon frames a pickle batch (`crates/logit-proto/src/graphite/pickle.rs`).
     LengthPrefixed,
+    /// A 4-byte **little-endian** payload length, then that many bytes: DogStatsD's stream Unix
+    /// socket, where the payload is one datagram's worth of newline-separated lines. That is what
+    /// the Datadog Agent's `pkg/dogstatsd/listeners/uds_stream.go` reads and `datadog-go`'s stream
+    /// writer sends; UNVERIFIED against either (`docs/known-gaps.md`).
+    LengthPrefixedLe,
 }
 
 /// What [`FramingMode::Lines`] does with a line past the frame bound.
@@ -198,6 +213,9 @@ pub enum Framing {
     /// A 4-byte big-endian payload length, then that many payload bytes
     /// ([`FramingMode::LengthPrefixed`]).
     LengthPrefixed,
+    /// A 4-byte little-endian payload length, then that many payload bytes
+    /// ([`FramingMode::LengthPrefixedLe`]).
+    LengthPrefixedLe,
 }
 
 impl Framing {
@@ -206,6 +224,7 @@ impl Framing {
             Framing::OctetCounting => "octet_counting",
             Framing::NonTransparent => "non_transparent",
             Framing::LengthPrefixed => "length_prefixed",
+            Framing::LengthPrefixedLe => "length_prefixed_le",
         }
     }
 }
@@ -309,6 +328,7 @@ impl Framer {
             FramingMode::Rfc6587Auto => None,
             FramingMode::Lines { .. } => Some(Framing::NonTransparent),
             FramingMode::LengthPrefixed => Some(Framing::LengthPrefixed),
+            FramingMode::LengthPrefixedLe => Some(Framing::LengthPrefixedLe),
         };
         Self {
             mode,
@@ -370,7 +390,12 @@ impl Framer {
             match self.framing {
                 None => return Ok(None),
                 Some(Framing::OctetCounting) => return self.next_octet_counted(),
-                Some(Framing::LengthPrefixed) => return self.next_length_prefixed(),
+                Some(Framing::LengthPrefixed) => {
+                    return self.next_length_prefixed(u32::from_be_bytes)
+                }
+                Some(Framing::LengthPrefixedLe) => {
+                    return self.next_length_prefixed(u32::from_le_bytes)
+                }
                 Some(Framing::NonTransparent) => match self.next_line()? {
                     // An empty line carries no message (a stray `LF` after a `CRLF`, a
                     // keepalive newline), and RFC 6587 §3.4.2 gives a receiver nothing to do with
@@ -413,7 +438,7 @@ impl Framer {
                      buffered"
                 )))
             }
-            Some(Framing::LengthPrefixed) => {
+            Some(Framing::LengthPrefixed | Framing::LengthPrefixedLe) => {
                 let held = self.buf.len();
                 self.buf.clear();
                 self.scanned = 0;
@@ -457,7 +482,9 @@ impl Framer {
                     // "the sender died mid-message", and permits a final message with no
                     // terminator, so this is an ordinary message. (`LengthPrefixed` never gets
                     // here: its framing is never `NonTransparent`.)
-                    FramingMode::Rfc6587Auto | FramingMode::LengthPrefixed => Ok(Some(line)),
+                    FramingMode::Rfc6587Auto
+                    | FramingMode::LengthPrefixed
+                    | FramingMode::LengthPrefixedLe => Ok(Some(line)),
                     // A line protocol's terminator is its completeness signal, so a remainder
                     // without one is a truncated frame, not a short message; carbon's own
                     // receiver discards it. Emitting it would turn a sender dying mid-line into a
@@ -486,7 +513,9 @@ impl Framer {
     fn oversize_policy(&self) -> Oversize {
         match self.mode {
             FramingMode::Lines { oversize } => oversize,
-            FramingMode::Rfc6587Auto | FramingMode::LengthPrefixed => Oversize::Fatal,
+            FramingMode::Rfc6587Auto
+            | FramingMode::LengthPrefixed
+            | FramingMode::LengthPrefixedLe => Oversize::Fatal,
         }
     }
 
@@ -559,19 +588,24 @@ impl Framer {
         Ok(Some(strip_cr(line)))
     }
 
-    /// Twisted's `Int32StringReceiver`: a 4-byte **big-endian** payload length, then that many
-    /// payload bytes. The prefix is validated and stripped here, so the decoder gets one unframed
-    /// payload, which `GraphiteDecoder`'s pickle path expects (framing is the listener's job).
+    /// A 4-byte payload length, then that many payload bytes: big-endian for Twisted's
+    /// `Int32StringReceiver` ([`FramingMode::LengthPrefixed`]), little-endian for DogStatsD's
+    /// stream socket ([`FramingMode::LengthPrefixedLe`]); `read_len` is the byte order. The prefix
+    /// is validated and stripped here, so the decoder gets one unframed payload, which
+    /// `GraphiteDecoder`'s pickle path expects (framing is the listener's job).
     ///
     /// A declared length past the bound is [`FrameError::Oversize`] and fatal: unlike an
     /// LF-delimited stream there is no resync point to skip to. A short buffer is `Ok(None)`.
-    fn next_length_prefixed(&mut self) -> Result<Option<Bytes>, FrameError> {
+    fn next_length_prefixed(
+        &mut self,
+        read_len: fn([u8; LENGTH_PREFIX_BYTES]) -> u32,
+    ) -> Result<Option<Bytes>, FrameError> {
         if self.buf.len() < LENGTH_PREFIX_BYTES {
             return Ok(None);
         }
         let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
         prefix.copy_from_slice(&self.buf[..LENGTH_PREFIX_BYTES]);
-        let payload_len = u32::from_be_bytes(prefix) as usize;
+        let payload_len = read_len(prefix) as usize;
         if payload_len > self.max_frame_bytes {
             return Err(FrameError::Oversize(format!(
                 "a length-prefixed frame declared {payload_len} bytes, over the {}-byte frame \
@@ -906,7 +940,7 @@ impl Default for TcpListenerConfig {
 /// decoded events. This module's doc has the accept, cap, handshake, framing, and batching
 /// contracts.
 pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
-    bind: String,
+    target: StreamTarget,
     decoder: D,
     config: TcpListenerConfig,
     diag: Diagnostics,
@@ -920,17 +954,51 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     /// Set by [`Input::bind`], taken by [`Input::run_until_shutdown`]: the bind pre-pass `otlp_in`
     /// and `logit_in` also use, so `logit run` fails startup on a bind error before anything is
     /// spawned and a test can learn the real address.
-    listener: Option<TokioTcpListener>,
+    listener: Option<BoundListener>,
     max_connections: usize,
     handshake_timeout: Duration,
     /// `None` (the default) means no idle timeout. See this module's "Idle timeout" doc section.
     idle_timeout: Option<Duration>,
 }
 
+/// Where a [`TcpListener`] binds: a TCP `host:port`, or a Unix stream socket path.
+enum StreamTarget {
+    Tcp(String),
+    /// `kind` names the component in a bind error; `mode` is the socket file's mode after bind.
+    Unix {
+        path: PathBuf,
+        mode: u32,
+        kind: &'static str,
+    },
+}
+
+/// The bound listening socket, per [`StreamTarget`].
+enum BoundListener {
+    Tcp(TokioTcpListener),
+    Unix(TokioUnixListener),
+}
+
 impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     pub fn new(bind: impl Into<String>, decoder: D, config: TcpListenerConfig) -> Self {
+        Self::with_target(StreamTarget::Tcp(bind.into()), decoder, config)
+    }
+
+    /// A listener on a Unix stream socket at `path`, made mode `mode` once bound. `kind` names the
+    /// component in a bind error. This module's "A Unix stream socket runs on the same loop" says
+    /// what differs from TCP.
+    pub fn unix(
+        kind: &'static str,
+        path: impl Into<PathBuf>,
+        mode: u32,
+        decoder: D,
+        config: TcpListenerConfig,
+    ) -> Self {
+        Self::with_target(StreamTarget::Unix { path: path.into(), mode, kind }, decoder, config)
+    }
+
+    fn with_target(target: StreamTarget, decoder: D, config: TcpListenerConfig) -> Self {
         Self {
-            bind: bind.into(),
+            target,
             decoder,
             config,
             diag: Diagnostics::default(),
@@ -946,9 +1014,20 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     }
 
     /// The address bound, once [`Input::bind`] has run; lets a test learn the OS-assigned port
-    /// without a bind-drop-rebind race.
+    /// without a bind-drop-rebind race. `None` on a Unix socket; see [`Self::socket_path`].
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.listener.as_ref().and_then(|l| l.local_addr().ok())
+        match self.listener.as_ref()? {
+            BoundListener::Tcp(listener) => listener.local_addr().ok(),
+            BoundListener::Unix(_) => None,
+        }
+    }
+
+    /// The configured socket path of a Unix stream listener, bound or not; `None` for TCP.
+    pub fn socket_path(&self) -> Option<&std::path::Path> {
+        match &self.target {
+            StreamTarget::Unix { path, .. } => Some(path),
+            StreamTarget::Tcp(_) => None,
+        }
     }
 
     /// Sets *this listener's own* diagnostics: the `connection_error`, `bad_frame` and
@@ -985,12 +1064,18 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
 
     /// Turns on TLS termination (`tls:` in config), with no ALPN: as with `logit_in`, the
     /// protocol isn't HTTP-shaped, so there's nothing to negotiate. Every path in `settings`
-    /// resolves against `base_dir` (the config file's directory).
+    /// resolves against `base_dir` (the config file's directory). Fails on a Unix socket, which
+    /// is always plaintext.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
+        if let StreamTarget::Unix { kind, .. } = &self.target {
+            anyhow::bail!(
+                "{kind}: 'tls:' needs 'transport: tcp' -- a Unix socket is always plaintext"
+            );
+        }
         self.tls = Some(Arc::new(crate::tls::build_server_config(settings, base_dir, &[])?));
         Ok(self)
     }
@@ -1065,8 +1150,18 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let listener = TokioTcpListener::bind(&self.bind).await?;
-        self.diag.info("bound", format_args!("listening on {}", self.bind));
+        let listener = match &self.target {
+            StreamTarget::Tcp(bind) => {
+                let listener = TokioTcpListener::bind(bind).await?;
+                self.diag.info("bound", format_args!("listening on {bind}"));
+                BoundListener::Tcp(listener)
+            }
+            StreamTarget::Unix { path, mode, kind } => {
+                let listener = crate::unix::bind_listener(kind, path, *mode)?;
+                self.diag.info("bound", format_args!("listening on {}", path.display()));
+                BoundListener::Unix(listener)
+            }
+        };
         self.listener = Some(listener);
         Ok(())
     }
@@ -1086,26 +1181,41 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         self.bind().await?;
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
-        // Built once: `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so cloning it per
-        // connection is an `Arc` clone, not a config rebuild.
-        let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
-        let handshake_timeout = self.handshake_timeout;
-        let idle_timeout = self.idle_timeout;
-        let config = self.config;
-        let framing = self.framing;
-        let max_frame_bytes = self.max_frame_bytes;
-        // All three diagnostic keys (`connection_error`, `framing_error`, `bad_frame`) throttle
-        // listener-wide through the per-connection `Diagnostics` clone below: a clone shares its
-        // original's counts (`logit_core::Diagnostics`' type doc).
-        //
+        let spawner = ConnectionSpawner {
+            // Built once: `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so cloning it per
+            // connection is an `Arc` clone, not a config rebuild.
+            tls_acceptor: self.tls.clone().map(TlsAcceptor::from),
+            live_connections: Arc::new(AtomicI64::new(0)),
+            handshake_timeout: self.handshake_timeout,
+            idle_timeout: self.idle_timeout,
+            config: self.config,
+            framing: self.framing,
+            max_frame_bytes: self.max_frame_bytes,
+            sink,
+            // All three diagnostic keys (`connection_error`, `framing_error`, `bad_frame`)
+            // throttle listener-wide through the per-connection `Diagnostics` clone
+            // `ConnectionSpawner::spawn` takes: a clone shares its original's counts
+            // (`logit_core::Diagnostics`' type doc).
+            diag: self.diag.clone(),
+            telemetry: self.telemetry.clone(),
+            shutdown: shutdown.clone(),
+            decoder: self.decoder.clone(),
+        };
         // `accept_queue.accept(&listener)` has `listener.accept()`'s cancellation safety against
-        // the `shutdown` arm, plus the kernel accept-queue gauges (`AcceptQueueSampler`).
+        // the `shutdown` arm, plus the kernel accept-queue gauges (`AcceptQueueSampler`). A Unix
+        // listener has no such gauges (this module's "A Unix stream socket runs on the same
+        // loop"); `UnixListener::accept` is cancellation-safe on its own.
         let mut accept_queue = AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         loop {
-            let (stream, _peer) = tokio::select! {
-                accepted = accept_queue.accept(&listener) => accepted?,
-                _ = shutdown.wait_for(|&due| due) => return Ok(()),
+            let accepted = match &listener {
+                BoundListener::Tcp(listener) => tokio::select! {
+                    accepted = accept_queue.accept(listener) => Accepted::Tcp(accepted?.0),
+                    _ = shutdown.wait_for(|&due| due) => return Ok(()),
+                },
+                BoundListener::Unix(listener) => tokio::select! {
+                    accepted = listener.accept() => Accepted::Unix(accepted?.0),
+                    _ = shutdown.wait_for(|&due| due) => return Ok(()),
+                },
             };
 
             // `try_acquire_owned`, not `acquire_owned`: at capacity the connection is closed
@@ -1118,87 +1228,125 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                     1.0,
                     &[("reason", "limit")],
                 );
-                drop(stream);
+                drop(accepted);
                 continue;
             };
 
-            // Every connection task holds a `Fanout` clone, so the shutdown cascade
-            // (`docs/adr/service-lifecycle-and-output-retry.md`) completes only once every one has
-            // dropped, which `serve_connection`'s shutdown race guarantees.
-            let sink = sink.clone();
-            let mut diag = self.diag.clone();
-            let telemetry = self.telemetry.clone();
-            let tls_acceptor = tls_acceptor.clone();
-            let conn_shutdown = shutdown.clone();
-            let live_connections = Arc::clone(&live_connections);
-            let decoder = self.decoder.clone();
-
-            tokio::spawn(async move {
-                // Held for as long as this task runs: a TLS accept that fails or times out gives
-                // the permit back here.
-                let _permit = permit;
-                let framer = Framer::new(framing, max_frame_bytes);
-                // Published from the read-modify-write's return value, not a separate `load`:
-                // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
-                // and a load would publish the stale value until the next transition.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-                let result = match tls_acceptor {
-                    Some(acceptor) => {
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
-                        {
-                            Ok(Ok(tls_stream)) => {
-                                serve_connection(
-                                    tls_stream,
-                                    decoder,
-                                    framer,
-                                    config,
-                                    handshake_timeout,
-                                    idle_timeout,
-                                    sink,
-                                    telemetry.clone(),
-                                    &mut diag,
-                                    conn_shutdown,
-                                )
-                                .await
-                            }
-                            Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
-                            Err(_elapsed) => Err(anyhow::anyhow!(
-                                "TLS handshake did not complete within {handshake_timeout:?}"
-                            )),
-                        }
-                    }
-                    // No TLS to bound, but `serve_connection`'s first-byte deadline still applies
-                    // (this module's "Pre-handshake timeout" doc section).
-                    None => {
-                        serve_connection(
-                            stream,
-                            decoder,
-                            framer,
-                            config,
-                            handshake_timeout,
-                            idle_timeout,
-                            sink,
-                            telemetry.clone(),
-                            &mut diag,
-                            conn_shutdown,
-                        )
-                        .await
-                    }
-                };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-                // One connection's error (a peer vanishing mid-frame, a TLS accept that failed or
-                // timed out) is never fatal to the listener or its siblings; only
-                // `TcpListener::accept` failing in the loop above is.
-                if let Err(err) = result {
-                    diag.warn_throttled("connection_error", err);
-                }
-            });
+            match accepted {
+                Accepted::Tcp(stream) => spawner.spawn(stream, permit),
+                Accepted::Unix(stream) => spawner.spawn(stream, permit),
+            }
         }
+    }
+}
+
+/// One accepted connection, per [`BoundListener`].
+enum Accepted {
+    Tcp(tokio::net::TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+/// Everything a connection task needs from its listener, cloned per connection by
+/// [`Self::spawn`]. One value so the TCP and Unix arms of the accept loop spawn identically.
+struct ConnectionSpawner<D> {
+    tls_acceptor: Option<TlsAcceptor>,
+    live_connections: Arc<AtomicI64>,
+    handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
+    config: TcpListenerConfig,
+    framing: FramingMode,
+    max_frame_bytes: usize,
+    sink: Fanout,
+    diag: Diagnostics,
+    telemetry: Telemetry,
+    shutdown: watch::Receiver<bool>,
+    decoder: D,
+}
+
+impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
+    /// Spawns the task serving `stream`, which holds `permit` for as long as it runs.
+    fn spawn<S>(&self, stream: S, permit: OwnedSemaphorePermit)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // Every connection task holds a `Fanout` clone, so the shutdown cascade
+        // (`docs/adr/service-lifecycle-and-output-retry.md`) completes only once every one has
+        // dropped, which `serve_connection`'s shutdown race guarantees.
+        let sink = self.sink.clone();
+        let mut diag = self.diag.clone();
+        let telemetry = self.telemetry.clone();
+        let tls_acceptor = self.tls_acceptor.clone();
+        let conn_shutdown = self.shutdown.clone();
+        let live_connections = Arc::clone(&self.live_connections);
+        let decoder = self.decoder.clone();
+        let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
+        let config = self.config;
+        let framer = Framer::new(self.framing, self.max_frame_bytes);
+
+        tokio::spawn(async move {
+            // Held for as long as this task runs: a TLS accept that fails or times out gives
+            // the permit back here.
+            let _permit = permit;
+            // Published from the read-modify-write's return value, not a separate `load`:
+            // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
+            // and a load would publish the stale value until the next transition.
+            let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
+            telemetry.gauge("logit.input.connections", live as f64, &[]);
+
+            let result = match tls_acceptor {
+                Some(acceptor) => {
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            serve_connection(
+                                tls_stream,
+                                decoder,
+                                framer,
+                                config,
+                                handshake_timeout,
+                                idle_timeout,
+                                sink,
+                                telemetry.clone(),
+                                &mut diag,
+                                conn_shutdown,
+                            )
+                            .await
+                        }
+                        Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
+                        Err(_elapsed) => Err(anyhow::anyhow!(
+                            "TLS handshake did not complete within {handshake_timeout:?}"
+                        )),
+                    }
+                }
+                // No TLS to bound, but `serve_connection`'s first-byte deadline still applies
+                // (this module's "Pre-handshake timeout" doc section).
+                None => {
+                    serve_connection(
+                        stream,
+                        decoder,
+                        framer,
+                        config,
+                        handshake_timeout,
+                        idle_timeout,
+                        sink,
+                        telemetry.clone(),
+                        &mut diag,
+                        conn_shutdown,
+                    )
+                    .await
+                }
+            };
+
+            let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+            telemetry.gauge("logit.input.connections", live as f64, &[]);
+
+            // One connection's error (a peer vanishing mid-frame, a TLS accept that failed or
+            // timed out) is never fatal to the listener or its siblings; only an accept failing
+            // in the accept loop is.
+            if let Err(err) = result {
+                diag.warn_throttled("connection_error", err);
+            }
+        });
     }
 }
 

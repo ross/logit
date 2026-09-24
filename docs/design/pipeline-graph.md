@@ -350,6 +350,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     whitespace.
 63. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
     path, or `tls` without `bind`.
+64. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
+    `transport: unix`/`unix_stream`, or `tls:` under either Unix transport.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

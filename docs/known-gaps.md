@@ -905,6 +905,22 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   surveyed. `0666` lets a tracer running as any user connect.
   - **Consequence:** any local user can send spans. Restrict the socket's directory to limit that.
   - **Revisit trigger:** W7 inspects a real Agent's socket.
+- **`statsd_in`/`statsd_out`'s `transport: unix_stream` framing is UNVERIFIED.** Each packet
+  follows its length as a 4-byte little-endian integer, read from the Agent's
+  `pkg/dogstatsd/listeners/uds_stream.go` and `datadog-go`'s stream writer, but no real Agent or
+  client has exchanged traffic with it.
+  - **Consequence:** if the byte order or the packet shape differs, every connection from a real
+    client closes on its first packet, counted `logit.input.frames.dropped{reason="oversize"}` or
+    decoded as garbage lines (`bad_line`).
+  - **Revisit trigger:** W7 records DogStatsD over the stream socket from a real client.
+- **The order `statsd_out` writes `|c:`, `|e:`, `|card:`, and `|T` in is UNVERIFIED.** A metric line
+  ends `|#tags|c:<id>|e:<data>|card:<card>|T<secs>`; an event or service check carries
+  `c:`/`e:`/`card:` after its tags (and before `m:`). No client capture carrying `|e:` or `|card:`
+  was available, so the fixtures are hand-written from the DogStatsD datagram-format reference.
+  - **Consequence:** none for `statsd_in` or the Agent's parser, which accept any segment order. A
+    byte-level comparison against a real client's output could differ.
+  - **Revisit trigger:** W7 records a client (datadog-go v5.6+ or a current dd-trace library) that
+    sends the two fields.
 - ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
   unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
   (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the

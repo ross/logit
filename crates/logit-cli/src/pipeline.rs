@@ -291,13 +291,20 @@ fn build_spec(
     let spec = match &component.kind {
         // The transport picks the constructor and the `receive:` translation: a TCP listener has
         // no receive queue, so it takes `tcp_receive_config`, not `receive_config` (graph rule 17).
-        // `tls:` is TCP-only: rule 43 rejects it under UDP, and `with_tls` refuses it again.
+        // `tls:` is TCP-only: rules 43 and 64 reject it elsewhere, and `with_tls` refuses it again.
         StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
                     StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
                 }
                 logit_config::StatsdTransport::Tcp => StatsdInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+                // The Unix transports take the same two translations: `unix` is a datagram
+                // listener, `unix_stream` a stream one (rules 17 and 64).
+                logit_config::StatsdTransport::Unix => {
+                    StatsdInput::unix(bind).with_receive(receive_config(&component.receive))
+                }
+                logit_config::StatsdTransport::UnixStream => StatsdInput::unix_stream(bind)
                     .with_tcp_receive(tcp_receive_config(&component.receive)),
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -841,11 +848,18 @@ fn build_spec(
             connect_timeout,
             tls,
         } => {
-            // Eager for UDP, lazy for TCP, as `SyslogOut`.
+            // Eager for the datagram transports, lazy for the stream ones, as `SyslogOut`. A Unix
+            // datagram send's wait on a full receiver is bounded by `connect_timeout`.
             let output = match transport {
                 logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
                 logit_config::StatsdTransport::Tcp => {
                     StatsdOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+                logit_config::StatsdTransport::Unix => {
+                    StatsdOutput::unix_datagram(endpoint.clone(), *connect_timeout)?
+                }
+                logit_config::StatsdTransport::UnixStream => {
+                    StatsdOutput::unix_stream(endpoint.clone(), *connect_timeout)
                 }
             };
             let encoder =

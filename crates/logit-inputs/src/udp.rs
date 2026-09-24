@@ -14,6 +14,14 @@
 //! group, so every UDP listener (`collectd_in`'s standard group is `239.192.74.66`) gets it
 //! without a field of its own. That function's doc says why each step is needed.
 //!
+//! **A Unix datagram socket is a datagram socket too.** [`UdpListener::unix`] binds a
+//! `SOCK_DGRAM` Unix socket (`statsd_in`'s `transport: unix`, the Datadog Agent's
+//! `dogstatsd_socket`) and drives it through the same read loop, queue, and decode loop, over the
+//! [`DatagramSocket`] seam. What differs is the bind ([`crate::unix`]) and what the kernel counters
+//! mean: on `AF_UNIX` a full receive queue makes the *sender's* `send` block or fail with `EAGAIN`
+//! rather than dropping in the kernel, so `logit.input.kernel.drops` stays at zero there and the
+//! loss, if any, is the client's to count (`net/unix/af_unix.c`, `unix_dgram_sendmsg`).
+//!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
 //! no `receive:` block; don't generalize this module toward it.
 
@@ -23,6 +31,8 @@ use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
 use logit_proto::Decoder;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -169,23 +179,121 @@ struct BatchingConfig {
     pop_batch: usize,
 }
 
-/// The read/decode split every UDP listener reduces to (`docs/adr/decoupled-listener-io.md`),
-/// generic over the decoder.
+/// A tokio datagram socket the read half can drive: [`tokio::net::UdpSocket`], or
+/// [`tokio::net::UnixDatagram`] for a Unix datagram listener. The read path needs only readiness
+/// plus a raw-fd syscall ([`Self::async_io`], `recvmmsg` on Linux), the descriptor for the kernel
+/// counters, and a name for its errors; both tokio types have the first two with identical
+/// signatures, so this trait only forwards.
+pub(crate) trait DatagramSocket: std::os::fd::AsRawFd + Send + Sync {
+    /// Waits for `interest` and calls `f`, retrying on `WouldBlock`: tokio's own `async_io`.
+    fn async_io<R: Send>(
+        &self,
+        interest: tokio::io::Interest,
+        f: impl FnMut() -> std::io::Result<R> + Send,
+    ) -> impl Future<Output = std::io::Result<R>> + Send;
+
+    /// One datagram into `buf`, for the non-Linux reader.
+    #[cfg(not(target_os = "linux"))]
+    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send;
+
+    /// The bound address or path, for [`describe_read_failure`].
+    fn describe_local(&self) -> String;
+}
+
+impl DatagramSocket for tokio::net::UdpSocket {
+    fn async_io<R: Send>(
+        &self,
+        interest: tokio::io::Interest,
+        f: impl FnMut() -> std::io::Result<R> + Send,
+    ) -> impl Future<Output = std::io::Result<R>> + Send {
+        tokio::net::UdpSocket::async_io(self, interest, f)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send {
+        async move { self.recv_from(buf).await.map(|(n, _peer)| n) }
+    }
+
+    fn describe_local(&self) -> String {
+        match self.local_addr() {
+            Ok(addr) => addr.to_string(),
+            Err(_) => "an unknown address".to_string(),
+        }
+    }
+}
+
+impl DatagramSocket for tokio::net::UnixDatagram {
+    fn async_io<R: Send>(
+        &self,
+        interest: tokio::io::Interest,
+        f: impl FnMut() -> std::io::Result<R> + Send,
+    ) -> impl Future<Output = std::io::Result<R>> + Send {
+        tokio::net::UnixDatagram::async_io(self, interest, f)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recv(&self, buf: &mut [u8]) -> impl Future<Output = std::io::Result<usize>> + Send {
+        tokio::net::UnixDatagram::recv(self, buf)
+    }
+
+    fn describe_local(&self) -> String {
+        match self.local_addr().ok().and_then(|addr| addr.as_pathname().map(Path::to_path_buf)) {
+            Some(path) => path.display().to_string(),
+            None => "an unnamed Unix socket".to_string(),
+        }
+    }
+}
+
+/// Where a [`UdpListener`] binds: an IP `host:port`, or a Unix datagram socket path.
+enum BindTarget {
+    Ip(String),
+    /// `kind` names the component in a bind error; `mode` is the socket file's mode after bind.
+    Unix {
+        path: PathBuf,
+        mode: u32,
+        kind: &'static str,
+    },
+}
+
+/// The bound socket, per [`BindTarget`].
+enum BoundSocket {
+    Udp(tokio::net::UdpSocket),
+    Unix(tokio::net::UnixDatagram),
+}
+
+/// The read/decode split every datagram listener reduces to (`docs/adr/decoupled-listener-io.md`),
+/// generic over the decoder. UDP by default; [`Self::unix`] for a Unix datagram socket.
 pub struct UdpListener<D: Decoder + Send> {
-    bind: String,
+    target: BindTarget,
     decoder: D,
     config: UdpListenerConfig,
     diag: Diagnostics,
     telemetry: Telemetry,
     /// Set by [`Input::bind`], taken by [`Input::run_until_shutdown`]. `None` after a run, so a
     /// second run rebinds.
-    socket: Option<tokio::net::UdpSocket>,
+    socket: Option<BoundSocket>,
 }
 
 impl<D: Decoder + Send> UdpListener<D> {
     pub fn new(bind: impl Into<String>, decoder: D, config: UdpListenerConfig) -> Self {
+        Self::with_target(BindTarget::Ip(bind.into()), decoder, config)
+    }
+
+    /// A listener on a Unix datagram socket at `path`, made mode `mode` once bound. `kind` names
+    /// the component in a bind error. Path handling is [`crate::unix`]'s.
+    pub fn unix(
+        kind: &'static str,
+        path: impl Into<PathBuf>,
+        mode: u32,
+        decoder: D,
+        config: UdpListenerConfig,
+    ) -> Self {
+        Self::with_target(BindTarget::Unix { path: path.into(), mode, kind }, decoder, config)
+    }
+
+    fn with_target(target: BindTarget, decoder: D, config: UdpListenerConfig) -> Self {
         Self {
-            bind: bind.into(),
+            target,
             decoder,
             config,
             diag: Diagnostics::default(),
@@ -195,9 +303,20 @@ impl<D: Decoder + Send> UdpListener<D> {
     }
 
     /// The bound address once [`Input::bind`] has run, so a test can learn the OS-assigned port
-    /// without a bind-drop-rebind race.
+    /// without a bind-drop-rebind race. `None` on a Unix socket; see [`Self::socket_path`].
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.socket.as_ref().and_then(|s| s.local_addr().ok())
+        match self.socket.as_ref()? {
+            BoundSocket::Udp(socket) => socket.local_addr().ok(),
+            BoundSocket::Unix(_) => None,
+        }
+    }
+
+    /// The configured socket path of a Unix datagram listener, bound or not; `None` for UDP.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.target {
+            BindTarget::Unix { path, .. } => Some(path),
+            BindTarget::Ip(_) => None,
+        }
     }
 
     /// Sets this listener's own diagnostics, the ones behind `decode_loop`'s `bad_datagram`
@@ -255,24 +374,34 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         if self.socket.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract
         }
-        let (socket, multicast_group) = bind_socket(
-            &self.bind,
-            self.config.receive_buffer_bytes,
-            &self.telemetry,
-            &mut self.diag,
-        )
-        .await?;
+        let bind = match &self.target {
+            BindTarget::Ip(bind) => bind,
+            BindTarget::Unix { path, mode, kind } => {
+                let socket = crate::unix::bind_datagram(kind, path, *mode)?;
+                finish_unix_bind(
+                    &socket,
+                    self.config.receive_buffer_bytes,
+                    &self.telemetry,
+                    &mut self.diag,
+                )?;
+                self.diag.info("bound", format_args!("listening on {}", path.display()));
+                self.socket = Some(BoundSocket::Unix(socket));
+                return Ok(());
+            }
+        };
+        let (socket, multicast_group) =
+            bind_socket(bind, self.config.receive_buffer_bytes, &self.telemetry, &mut self.diag)
+                .await?;
         match multicast_group {
             Some(group) => self.diag.info(
                 "bound",
                 format_args!(
-                    "listening on {} -- joined multicast group {group} on the default interface",
-                    self.bind
+                    "listening on {bind} -- joined multicast group {group} on the default interface"
                 ),
             ),
-            None => self.diag.info("bound", format_args!("listening on {}", self.bind)),
+            None => self.diag.info("bound", format_args!("listening on {bind}")),
         }
-        self.socket = Some(socket);
+        self.socket = Some(BoundSocket::Udp(socket));
         Ok(())
     }
 
@@ -290,6 +419,21 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
     ) -> anyhow::Result<()> {
         self.bind().await?;
         let socket = self.socket.take().expect("bind() leaves a socket behind");
+        match &socket {
+            BoundSocket::Udp(socket) => self.drive(socket, sink, shutdown).await,
+            BoundSocket::Unix(socket) => self.drive(socket, sink, shutdown).await,
+        }
+    }
+}
+
+impl<D: Decoder + Send> UdpListener<D> {
+    /// [`Input::run_until_shutdown`]'s body over either socket family.
+    async fn drive<S: DatagramSocket>(
+        &mut self,
+        socket: &S,
+        sink: Fanout,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let queue = Arc::new(BoundedQueue::with_metrics(
             self.config.queue_config(),
             &RECEIVE_QUEUE_METRICS,
@@ -297,7 +441,7 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         ));
 
         let mut read = Box::pin(read_loop_sampled(
-            &socket,
+            socket,
             Arc::clone(&queue),
             self.telemetry.clone(),
             self.diag.clone(),
@@ -489,6 +633,37 @@ fn finish_bind(
 ) -> anyhow::Result<tokio::net::UdpSocket> {
     use anyhow::Context;
 
+    report_receive_buffer(&socket, receive_buffer_bytes, telemetry, diag);
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket).context("converting to a tokio UdpSocket")
+}
+
+/// [`finish_bind`] for a Unix datagram socket, which [`crate::unix`] has already bound:
+/// `SO_RCVBUF` (as [`bind_one`] sets it before an IP bind), then the same gauges.
+fn finish_unix_bind(
+    socket: &tokio::net::UnixDatagram,
+    receive_buffer_bytes: Option<u64>,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let sock = socket2::SockRef::from(socket);
+    if let Some(requested) = receive_buffer_bytes {
+        sock.set_recv_buffer_size(requested as usize)
+            .with_context(|| format!("setting SO_RCVBUF to {requested} bytes"))?;
+    }
+    report_receive_buffer(&sock, receive_buffer_bytes, telemetry, diag);
+    Ok(())
+}
+
+/// Gauges the granted `SO_RCVBUF` and warns if the kernel clamped a requested size.
+fn report_receive_buffer(
+    socket: &socket2::Socket,
+    receive_buffer_bytes: Option<u64>,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) {
     // Read once: SO_RCVBUF doesn't change after bind. `ReceiveBufferSampler::sample_once`
     // re-emits this gauge every second (from `SO_MEMINFO`'s `SK_MEMINFO_RCVBUF`, the same
     // `sk_rcvbuf`), because a point written once would survive one `internal` drain window. This
@@ -510,9 +685,6 @@ fn finish_bind(
             ));
         }
     }
-
-    let std_socket: std::net::UdpSocket = socket.into();
-    tokio::net::UdpSocket::from_std(std_socket).context("converting to a tokio UdpSocket")
 }
 
 /// Reads datagrams off `socket` into `queue` as fast as the queue's bounds and overflow policy
@@ -538,8 +710,8 @@ fn finish_bind(
 ///
 /// A `read_batch` above the queue's `max_datagrams` is legal: `push_many` evicts or blocks per
 /// policy, per item, as `push` would, so rejecting it would only refuse a working config.
-async fn read_loop(
-    socket: &tokio::net::UdpSocket,
+async fn read_loop<S: DatagramSocket>(
+    socket: &S,
     queue: Arc<ReceiveQueue>,
     telemetry: Telemetry,
     mut shutdown: watch::Receiver<bool>,
@@ -593,7 +765,7 @@ const READ_SYSCALL: &str = "recvfrom(2)";
 ///
 /// The address comes from `getsockname(2)`, not the configured `bind:`: it's the one in use (a
 /// `:0` port resolved, or whichever candidate won [`bind_first_available`]).
-fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) -> anyhow::Error {
+fn describe_read_failure<S: DatagramSocket>(socket: &S, err: std::io::Error) -> anyhow::Error {
     // Matched on `ErrorKind`, not `libc::E*`: `libc` is a Linux-only dependency and this function
     // also serves the non-Linux `recv_from` path. std's Unix mapping (`decode_error_kind`) is
     // `ENOSYS` -> `Unsupported`, `EPERM`/`EACCES` -> `PermissionDenied`, `ECONNABORTED` ->
@@ -614,10 +786,7 @@ fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) ->
         }
         _ => "",
     };
-    let addr = match socket.local_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => "an unknown address".to_string(),
-    };
+    let addr = socket.describe_local();
     anyhow::Error::new(err)
         .context(format!("{READ_SYSCALL} on the listener socket bound to {addr}{hint}"))
 }
@@ -776,13 +945,11 @@ impl BatchReader {
     /// so a `select!` that drops this future drops it before the syscall or not at all: the same
     /// guarantee `recv_from`'s cancel-safety rests on, since `recv_from` is the same `async_io`
     /// call with a different closure.
-    async fn read_batch(
+    async fn read_batch<S: DatagramSocket>(
         &mut self,
-        socket: &tokio::net::UdpSocket,
+        socket: &S,
         out: &mut Vec<Datagram>,
     ) -> std::io::Result<usize> {
-        use std::os::fd::AsRawFd;
-
         let fd = socket.as_raw_fd();
         let vlen = self.vlen;
         // Borrowed field by field so the closure captures plain-data buffers, not all of `self`.
@@ -1046,10 +1213,12 @@ fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mu
 fn assert_batch_read_future_is_send(
     reader: &mut BatchReader,
     socket: &tokio::net::UdpSocket,
+    unix: &tokio::net::UnixDatagram,
     out: &mut Vec<Datagram>,
 ) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&reader.read_batch(socket, out));
+    assert_send(&reader.read_batch(unix, out));
 }
 
 /// The non-Linux read half: one `recv_from` per datagram, behind the same interface as the
@@ -1078,12 +1247,12 @@ impl BatchReader {
 
     /// One datagram, appended to `out`; returns `1` on success. Cancel-safe as
     /// `tokio::net::UdpSocket::recv_from` is.
-    async fn read_batch(
+    async fn read_batch<S: DatagramSocket>(
         &mut self,
-        socket: &tokio::net::UdpSocket,
+        socket: &S,
         out: &mut Vec<Datagram>,
     ) -> std::io::Result<usize> {
-        let (n, _peer) = socket.recv_from(&mut self.buf).await?;
+        let n = socket.recv(&mut self.buf).await?;
         out.push(Datagram {
             bytes: Bytes::copy_from_slice(&self.buf[..n]),
             received_at: now_nanos(),
@@ -1133,8 +1302,8 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// memory with no I/O wait, cheaper than a `spawn_blocking` around it.
 ///
 /// The `select!`'s arm ordering matters; see [`sample_while`].
-async fn read_loop_sampled(
-    socket: &tokio::net::UdpSocket,
+async fn read_loop_sampled<S: DatagramSocket>(
+    socket: &S,
     queue: Arc<ReceiveQueue>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -1240,7 +1409,7 @@ struct ReceiveBufferSampler {
 }
 
 impl ReceiveBufferSampler {
-    fn new(socket: &tokio::net::UdpSocket, telemetry: Telemetry, diag: Diagnostics) -> Self {
+    fn new<S: DatagramSocket>(socket: &S, telemetry: Telemetry, diag: Diagnostics) -> Self {
         Self {
             fd: sockstat::fd_of(socket),
             drops: sockstat::DropCounter::new(),

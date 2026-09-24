@@ -41,6 +41,10 @@ Superset of statsd's grammar: `<name>:<value>[:<value>...]|<type>|@<rate>|#<tag>
   `c:ci-<container-id>` / `c:in-<cgroup-inode>` for the same slot.
 - **Timestamp `|T<unix-seconds>`** (v1.3+): valid only on `c` and `g`. The receiving agent doesn't
   aggregate a timestamped point; it submits each as its own instant.
+- **External data `|e:<data>`** (v1.5+, Agent 7.57+): origin-detection data a client reads from its
+  environment, itself a comma-separated list (`it-<bool>,cn-<container-name>,pu-<pod-uid>`).
+- **Cardinality `|card:<none|low|orchestrator|high>`** (v1.6+, Agent 7.64+): the tag cardinality
+  the agent should enrich this point with.
 - **Events:** `_e{<title-utf8-len>,<text-utf8-len>}:<title>|<text>|d:<ts>|h:<host>|p:<priority>|t:<alert_type>|#<tags>`,
   plus `k:<aggregation_key>` and `s:<source_type_name>`. The format fixes only that `_e{...}:`
   leads and title/text follow the first `|`; the optional pipe-segments can come in any order.
@@ -420,5 +424,5 @@ the residual debt, which `docs/known-gaps.md` tracks.
 12. Syslog structured data round-trips as structured data, not as discarded bytes.
 13. Syslog's 8-level severity, facility, and the sender's own origin timestamp all survive a relay,
     independent of the normalized `Severity`/receipt-time fields.
-14. DogStatsD's container id, `|T` timestamp, events, and service checks are representable, not
-    silently ignored.
+14. DogStatsD's container id, `|T` timestamp, `|e:` external data, `|card:` cardinality, events,
+    and service checks are representable, not silently ignored.

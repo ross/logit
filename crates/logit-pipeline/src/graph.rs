@@ -121,8 +121,9 @@
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 //! 44. A `syslog_out` `tls:` failing 24's two consistency checks, or under `transport: udp`, since
 //!     RFC 5425 is TLS over TCP (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-//! 45. A `handshake_timeout` of `0s` on any kind that has one (either transport), or a non-default
-//!     one on a UDP `syslog_in`/`graphite_in`/`statsd_in`, which has no handshake. Compared against
+//! 45. A `handshake_timeout` of `0s` on any kind that has one (any transport), or a non-default
+//!     one on a UDP `syslog_in`/`graphite_in`/`statsd_in` or a `transport: unix` `statsd_in`,
+//!     which has no handshake. Compared against
 //!     `default_handshake_timeout`, so the default stays legal everywhere
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 //! 46. A `graphite_in`/`graphite_out` `protocol: pickle` off TCP (its length prefix means nothing
@@ -144,7 +145,7 @@
 //!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
 //!     also checks its own block.
 //! 53. An `idle_timeout` of `0s` (omit it to disable), or any `idle_timeout` on a UDP
-//!     `syslog_in`/`graphite_in`/`statsd_in`. It's an `Option`, so there is no default to exempt
+//!     `syslog_in`/`graphite_in`/`statsd_in` or a `transport: unix` `statsd_in`. It's an `Option`, so there is no default to exempt
 //!     (`docs/adr/idle-connection-timeout.md`).
 //! 54. A `keep_values` with nothing configured, an empty field name, an empty `allow` (that's
 //!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
@@ -179,6 +180,10 @@
 //!     isn't an absolute path, or `tls` without `bind`: the Unix socket has no TLS. Its zero
 //!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 64. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
+//!     `transport: unix`/`unix_stream` (a client names the socket as `unix:///<path>`), or `tls:`
+//!     under either: a Unix socket is always plaintext. `unix` is a datagram transport for 17/18/57
+//!     and 45/53, `unix_stream` a stream one (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -903,8 +908,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 if is_stream_listener(&component.kind) {
                     anyhow::bail!(
                         "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                         listener (collectd_in, or a UDP statsd_in, syslog_in or graphite_in) -- \
-                         a stream listener has no receive queue; the connection's own flow \
+                         listener (collectd_in, a UDP statsd_in, syslog_in or graphite_in, or a \
+                         transport: unix statsd_in) -- a stream listener has no receive queue; the connection's own flow \
                          control is the backpressure. Only receive.batch_max_events, \
                          batch_max_bytes, batch_flush_interval, and shutdown_grace apply (per \
                          connection)"
@@ -912,8 +917,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 }
                 anyhow::bail!(
                     "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                     listener (collectd_in, or a UDP statsd_in, syslog_in or graphite_in) -- a \
-                     tail listener has no receive queue; \
+                     listener (collectd_in, a UDP statsd_in, syslog_in or graphite_in, or a \
+                     transport: unix statsd_in) -- a tail listener has no receive queue; \
                      only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
                      shutdown_grace apply"
                 );
@@ -1871,9 +1876,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 45: `handshake_timeout` must be non-zero on every kind that has one: no TLS accept,
     // first-byte read, or `Hello` read completes in zero time, so every connection would close on
-    // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection to hand shake, so a set
-    // value there is rejected (rule 33's shape). Only a non-default value counts as set, so the
-    // default stays legal under UDP. `otlp_in`, `datadog_in`, and `datadog_trace_in` get only the
+    // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix` `statsd_in`) has
+    // no connection to hand shake, so a set value there is rejected (rule 33's shape). Only a
+    // non-default value counts as set, so the default stays legal under UDP. `otlp_in`, `datadog_in`, and `datadog_trace_in` get only the
     // zero check: the budget also bounds a plaintext connection's first-byte wait
     // (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout"), so it is live with or without
     // `tls:`.
@@ -1897,22 +1902,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if handshake_timeout == default_handshake_timeout() {
             continue; // a defaulted value is not a set one -- see this rule's comment
         }
-        let (kind_name, datagram) = match &component.kind {
-            ComponentKind::SyslogIn { transport, .. } => {
-                ("syslog_in", *transport == SyslogTransport::Udp)
-            }
-            ComponentKind::GraphiteIn { transport, .. } => {
-                ("graphite_in", *transport == GraphiteTransport::Udp)
-            }
-            ComponentKind::StatsdIn { transport, .. } => {
-                ("statsd_in", *transport == StatsdTransport::Udp)
-            }
-            _ => continue,
-        };
-        if datagram {
+        if let Some((kind_name, transport)) = datagram_transport_of(&component.kind) {
             anyhow::bail!(
-                "component '{id}': 'handshake_timeout' needs 'transport: tcp' -- a UDP \
-                 {kind_name} has no connection to hand shake, so the value could never take effect"
+                "component '{id}': 'handshake_timeout' needs {} -- a {transport} {kind_name} has \
+                 no connection to hand shake, so the value could never take effect",
+                stream_transports_for(kind_name)
             );
         }
     }
@@ -1922,28 +1916,19 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // absence means "no idle timeout", so every `Some` is set: the UDP check rejects any value, and
     // the zero message says to omit the field. And `0s` is impossible because a connection is idle
     // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, `datadog_in`,
-    // `datadog_trace_in`, and `prometheus_in` have no datagram transport, so their arms pass
-    // `false`; a scrape-mode `prometheus_in`'s value is rule 55's wrong-mode check.
+    // `datadog_trace_in`, and `prometheus_in` have no datagram transport, so
+    // `datagram_transport_of` never names them; a scrape-mode `prometheus_in`'s value is rule 55's
+    // wrong-mode check.
     for (id, component) in &components {
-        let (kind_name, idle_timeout, datagram) = match &component.kind {
-            ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
-                ("syslog_in", *idle_timeout, *transport == SyslogTransport::Udp)
-            }
-            ComponentKind::GraphiteIn { idle_timeout, transport, .. } => {
-                ("graphite_in", *idle_timeout, *transport == GraphiteTransport::Udp)
-            }
-            ComponentKind::StatsdIn { idle_timeout, transport, .. } => {
-                ("statsd_in", *idle_timeout, *transport == StatsdTransport::Udp)
-            }
-            ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
-            ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
-            ComponentKind::DatadogIn { idle_timeout, .. } => ("datadog_in", *idle_timeout, false),
-            ComponentKind::DatadogTraceIn { idle_timeout, .. } => {
-                ("datadog_trace_in", *idle_timeout, false)
-            }
-            ComponentKind::PrometheusIn { idle_timeout, .. } => {
-                ("prometheus_in", *idle_timeout, false)
-            }
+        let idle_timeout = match &component.kind {
+            ComponentKind::SyslogIn { idle_timeout, .. }
+            | ComponentKind::GraphiteIn { idle_timeout, .. }
+            | ComponentKind::StatsdIn { idle_timeout, .. }
+            | ComponentKind::LogitIn { idle_timeout, .. }
+            | ComponentKind::OtlpIn { idle_timeout, .. }
+            | ComponentKind::DatadogIn { idle_timeout, .. }
+            | ComponentKind::DatadogTraceIn { idle_timeout, .. }
+            | ComponentKind::PrometheusIn { idle_timeout, .. } => *idle_timeout,
             _ => continue,
         };
         let Some(idle_timeout) = idle_timeout else { continue };
@@ -1953,10 +1938,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  disable the idle timeout"
             );
         }
-        if datagram {
+        if let Some((kind_name, transport)) = datagram_transport_of(&component.kind) {
             anyhow::bail!(
-                "component '{id}': 'idle_timeout' needs 'transport: tcp' -- a UDP {kind_name} has \
-                 no connection to time out, so the value could never take effect"
+                "component '{id}': 'idle_timeout' needs {} -- a {transport} {kind_name} has no \
+                 connection to time out, so the value could never take effect",
+                stream_transports_for(kind_name)
             );
         }
     }
@@ -2714,6 +2700,41 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 64: `statsd_in`/`statsd_out` on a Unix socket (`docs/adr/datadog-agent-and-intake-relay.md`).
+    // The address field holds the socket's path, and a relative one would resolve against whatever
+    // directory `logit` was started in, which a client's `DD_DOGSTATSD_URL=unix:///...` can't
+    // follow (rule 63's reasoning). A Unix socket is always plaintext, so `tls:` could never take
+    // effect; rules 43/52 cover `tls:` under UDP.
+    for (id, component) in &components {
+        let (kind_name, field, address, transport, has_tls) = match &component.kind {
+            ComponentKind::StatsdIn { bind, transport, tls, .. } => {
+                ("statsd_in", "bind", bind, *transport, tls.is_some())
+            }
+            ComponentKind::StatsdOut { endpoint, transport, tls, .. } => {
+                ("statsd_out", "endpoint", endpoint, *transport, tls.is_some())
+            }
+            _ => continue,
+        };
+        let transport_name = match transport {
+            StatsdTransport::Unix => "unix",
+            StatsdTransport::UnixStream => "unix_stream",
+            StatsdTransport::Udp | StatsdTransport::Tcp => continue,
+        };
+        if !std::path::Path::new(address).is_absolute() {
+            anyhow::bail!(
+                "component '{id}': {kind_name} '{field}' must be the socket's absolute path under \
+                 'transport: {transport_name}', got '{address}' -- clients name it as \
+                 unix:///<path>"
+            );
+        }
+        if has_tls {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'tls:' needs 'transport: tcp' -- a Unix socket \
+                 ('transport: {transport_name}') is always plaintext"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -2737,8 +2758,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     Ok(Graph { components: resolved, topological_order })
 }
 
-/// Rules 17/18/57's datagram predicate: the kinds the UDP listener driver backs
-/// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`). An explicit list, not
+/// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
+/// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
+/// `statsd_in` included. An explicit list, not
 /// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
@@ -2748,12 +2770,43 @@ fn is_datagram_listener(kind: &ComponentKind) -> bool {
             // [`is_stream_listener`]).
             | ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. }
             | ComponentKind::GraphiteIn { transport: GraphiteTransport::Udp, .. }
-            | ComponentKind::StatsdIn { transport: StatsdTransport::Udp, .. }
+            | ComponentKind::StatsdIn { transport: StatsdTransport::Udp | StatsdTransport::Unix, .. }
     )
 }
 
+/// Rules 45/53's datagram test for the kinds that also have a stream transport: the kind's name
+/// and how to name its transport in the error (`"UDP"`, or `'transport: unix'` for a Unix datagram
+/// `statsd_in`), or `None` when the listener has connections.
+fn datagram_transport_of(kind: &ComponentKind) -> Option<(&'static str, &'static str)> {
+    match kind {
+        ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. } => {
+            Some(("syslog_in", "UDP"))
+        }
+        ComponentKind::GraphiteIn { transport: GraphiteTransport::Udp, .. } => {
+            Some(("graphite_in", "UDP"))
+        }
+        ComponentKind::StatsdIn { transport: StatsdTransport::Udp, .. } => {
+            Some(("statsd_in", "UDP"))
+        }
+        ComponentKind::StatsdIn { transport: StatsdTransport::Unix, .. } => {
+            Some(("statsd_in", "'transport: unix'"))
+        }
+        _ => None,
+    }
+}
+
+/// The stream transports a rule 45/53 error points `kind_name` at.
+fn stream_transports_for(kind_name: &str) -> &'static str {
+    if kind_name == "statsd_in" {
+        "'transport: tcp' or 'transport: unix_stream'"
+    } else {
+        "'transport: tcp'"
+    }
+}
+
 /// Rules 17/18's stream predicate: the kinds on the shared stream driver
-/// (`logit_inputs::tcp::TcpListener`), which are `syslog_in`/`graphite_in`/`statsd_in` under TCP.
+/// (`logit_inputs::tcp::TcpListener`), which are `syslog_in`/`graphite_in`/`statsd_in` under TCP,
+/// and `statsd_in` under `unix_stream`.
 /// Such a listener assembles batches per connection but has no receive queue: TCP flow control is
 /// the backpressure, so a blocked `Fanout::send` stops the socket being read and the peer's window
 /// closes. Batch bounds are per connection, so N connections can hold N × `batch_max_events` in
@@ -2764,7 +2817,10 @@ fn is_stream_listener(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::SyslogIn { transport: SyslogTransport::Tcp, .. }
             | ComponentKind::GraphiteIn { transport: GraphiteTransport::Tcp, .. }
-            | ComponentKind::StatsdIn { transport: StatsdTransport::Tcp, .. }
+            | ComponentKind::StatsdIn {
+                transport: StatsdTransport::Tcp | StatsdTransport::UnixStream,
+                ..
+            }
     )
 }
 
@@ -9554,5 +9610,198 @@ mod tests {
         ]))
         .expect("batch_max_events is one of the fields a stream listener may override");
         assert_eq!(graph.components["in"].receive.batch_max_events, 1);
+    }
+
+    // ---- `statsd_in`/`statsd_out` on a Unix socket: rule 64, and 17/18/45/53/57 ----------------
+
+    const DSD_SOCKET: &str = "/var/run/datadog/dsd.socket";
+
+    fn statsd_in_on(bind: &str, transport: StatsdTransport) -> ComponentKind {
+        ComponentKind::StatsdIn {
+            bind: bind.to_string(),
+            transport,
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
+        }
+    }
+
+    fn statsd_out_on(endpoint: &str, transport: StatsdTransport) -> ComponentKind {
+        ComponentKind::StatsdOut {
+            endpoint: endpoint.to_string(),
+            transport,
+            format: logit_config::StatsdFormat::default(),
+            relative_gauges: false,
+            max_packet_bytes: 8192,
+            connect_timeout: Duration::from_secs(5),
+            tls: None,
+        }
+    }
+
+    const UNIX_TRANSPORTS: [StatsdTransport; 2] =
+        [StatsdTransport::Unix, StatsdTransport::UnixStream];
+
+    /// Rule 64: an absolute path resolves on both kinds under both Unix transports.
+    #[test]
+    fn a_statsd_in_and_out_on_an_absolute_socket_path_resolve() {
+        for transport in UNIX_TRANSPORTS {
+            resolve(cfg(vec![
+                ("in", vec![], statsd_in_on(DSD_SOCKET, transport)),
+                ("out", vec!["in"], statsd_out_on("/run/relay/dsd.socket", transport)),
+            ]))
+            .unwrap_or_else(|e| panic!("{transport:?}: {e}"));
+        }
+    }
+
+    /// Rule 64: a relative path (or a `host:port` left over from UDP) is rejected on both kinds.
+    #[test]
+    fn a_relative_socket_path_is_rejected_on_both_statsd_kinds() {
+        for transport in UNIX_TRANSPORTS {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], statsd_in_on("dsd.socket", transport)),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains("'in'") && err.contains("statsd_in 'bind'"), "got: {err}");
+            assert!(err.contains("absolute path"), "got: {err}");
+
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], statsd_out_on("127.0.0.1:8125", transport)),
+            ]));
+            assert!(err.contains("'out'") && err.contains("statsd_out 'endpoint'"), "got: {err}");
+            assert!(err.contains("absolute path"), "got: {err}");
+        }
+    }
+
+    /// Rule 64: `tls:` under either Unix transport is rejected on both kinds.
+    #[test]
+    fn tls_on_a_unix_socket_is_rejected_on_both_statsd_kinds() {
+        for transport in UNIX_TRANSPORTS {
+            let mut input = statsd_in_on(DSD_SOCKET, transport);
+            if let ComponentKind::StatsdIn { tls, .. } = &mut input {
+                *tls = Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                });
+            }
+            let err = expect_err(cfg(vec![("in", vec![], input), ("out", vec!["in"], sink())]));
+            assert!(err.contains("always plaintext"), "{transport:?}: {err}");
+
+            let mut output = statsd_out_on(DSD_SOCKET, transport);
+            if let ComponentKind::StatsdOut { tls, .. } = &mut output {
+                *tls = Some(logit_config::TlsClientConfig::default());
+            }
+            let err =
+                expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], output)]));
+            assert!(err.contains("always plaintext"), "{transport:?}: {err}");
+        }
+    }
+
+    /// `transport: unix` is a datagram listener: the whole `receive:` block applies (17), its
+    /// queue bounds are checked (18), and `read_batch` is capped (57).
+    #[test]
+    fn a_unix_statsd_in_takes_the_whole_receive_block() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_on(DSD_SOCKET, StatsdTransport::Unix),
+                ReceiveConfig { read_batch: 128, ..non_default_receive() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a Unix datagram statsd_in has a real receive queue");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_on(DSD_SOCKET, StatsdTransport::Unix),
+                ReceiveConfig { max_datagrams: 0, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'receive.max_datagrams' must be at least 1"), "got: {err}");
+
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_on(DSD_SOCKET, StatsdTransport::Unix),
+                ReceiveConfig { read_batch: MAX_READ_BATCH + 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("read_batch"), "got: {err}");
+    }
+
+    /// `transport: unix_stream` is a stream listener: queue fields are rejected (17), the
+    /// batch-assembly half applies.
+    #[test]
+    fn a_unix_stream_statsd_in_rejects_receive_queue_fields() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_on(DSD_SOCKET, StatsdTransport::UnixStream),
+                non_default_receive(),
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("a stream listener has no receive queue"), "got: {err}");
+
+        resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_on(DSD_SOCKET, StatsdTransport::UnixStream),
+                ReceiveConfig { batch_max_events: 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("batch_max_events applies per connection on a stream listener");
+    }
+
+    /// Rules 45/53: the connection timeouts are rejected on `unix` and apply on `unix_stream`.
+    #[test]
+    fn connection_timeouts_are_rejected_on_unix_and_accepted_on_unix_stream() {
+        let mut on_unix = statsd_in_on(DSD_SOCKET, StatsdTransport::Unix);
+        if let ComponentKind::StatsdIn { handshake_timeout, .. } = &mut on_unix {
+            *handshake_timeout = Duration::from_secs(2);
+        }
+        let err = expect_err(cfg(vec![("in", vec![], on_unix), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'handshake_timeout' needs"), "got: {err}");
+        assert!(err.contains("'transport: unix' statsd_in"), "got: {err}");
+        assert!(err.contains("'transport: unix_stream'"), "got: {err}");
+
+        let err = expect_err(cfg(vec![
+            ("in", vec![], {
+                let mut kind = statsd_in_on(DSD_SOCKET, StatsdTransport::Unix);
+                if let ComponentKind::StatsdIn { idle_timeout, .. } = &mut kind {
+                    *idle_timeout = Some(Duration::from_secs(30));
+                }
+                kind
+            }),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'idle_timeout' needs"), "got: {err}");
+        assert!(err.contains("'transport: unix' statsd_in"), "got: {err}");
+
+        let mut on_stream = statsd_in_on(DSD_SOCKET, StatsdTransport::UnixStream);
+        if let ComponentKind::StatsdIn { handshake_timeout, idle_timeout, .. } = &mut on_stream {
+            *handshake_timeout = Duration::from_secs(2);
+            *idle_timeout = Some(Duration::from_secs(30));
+        }
+        resolve(cfg(vec![("in", vec![], on_stream), ("out", vec!["in"], sink())]))
+            .expect("a unix_stream statsd_in has connections to time out");
+
+        let mut zero = statsd_in_on(DSD_SOCKET, StatsdTransport::UnixStream);
+        if let ComponentKind::StatsdIn { handshake_timeout, .. } = &mut zero {
+            *handshake_timeout = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], zero), ("out", vec!["in"], sink())]));
+        assert!(err.contains("must be greater than 0s"), "got: {err}");
     }
 }

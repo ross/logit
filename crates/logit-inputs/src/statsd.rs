@@ -1,10 +1,11 @@
-//! statsd / DogStatsD-tagged metrics over UDP or TCP: the input half of the `statsd_in ->
+//! statsd / DogStatsD-tagged metrics over UDP, TCP, or a Unix socket: the input half of the `statsd_in ->
 //! statsd_out` lossless-relay pair (`docs/adr/lossless-transit.md`; the mirror is
 //! `docs/adr/statsd-output.md`).
 //!
 //! ## Transports
 //!
-//! One component, two shared drivers, chosen by `transport:`. This type is the decoder choice plus
+//! One component, two shared drivers, chosen by `transport:`; each serves an IP socket or a Unix
+//! one. This type is the decoder choice plus
 //! the builder surface `logit-cli::pipeline` and these tests use, as
 //! [`crate::syslog::SyslogInput`] and [`crate::graphite::GraphiteInput`] are.
 //!
@@ -12,6 +13,14 @@
 //! |---|---|---|
 //! | `udp` (the default) | [`UdpListener<StatsdDecoder>`](crate::udp::UdpListener) | the read/decode split, the receive queue, datagram->batch assembly, `SO_RCVBUF` (`docs/adr/decoupled-listener-io.md`); the whole `receive:` block applies |
 //! | `tcp` | [`TcpListener<StatsdDecoder>`](crate::tcp::TcpListener) | an accept loop, the 1024-connection cap, a per-connection decoder clone and batch accumulator, the first-byte deadline, and, with a `tls:` block, TLS termination (`docs/adr/syslog-tcp-ingress-and-tls.md`) |
+//! | `unix` | [`UdpListener::unix`](crate::udp::UdpListener::unix) | everything `udp` brings, on a `SOCK_DGRAM` Unix socket: the Datadog Agent's `dogstatsd_socket` |
+//! | `unix_stream` | [`TcpListener::unix`](crate::tcp::TcpListener::unix) | everything `tcp` brings but TLS and the accept-queue gauges, on a `SOCK_STREAM` Unix socket: the Agent's `dogstatsd_stream_socket` |
+//!
+//! Under both Unix transports `bind:` is the socket's path. [`crate::unix`] prepares it (the
+//! directory must exist, a stale socket is replaced, anything else is refused) and the file is made
+//! mode [`SOCKET_MODE`], `0722`, the Agent's own for this socket: a client only needs write
+//! permission to send or connect, and the directory's permissions are the access control. The file
+//! isn't removed on shutdown.
 //!
 //! A TCP listener has **no [`ReceiveQueue`](crate::udp::ReceiveQueue)**: TCP's flow control is
 //! the backpressure, and ADR `decoupled-listener-io` exists for UDP's silent drops, which a stream
@@ -25,7 +34,16 @@
 //!
 //! ## Framing
 //!
-//! **LF-delimited lines, always**: [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`],
+//! **`unix_stream` is length-prefixed, not LF-delimited**: [`FramingMode::LengthPrefixedLe`], a
+//! 4-byte little-endian length and then one packet, which decodes exactly as one datagram does
+//! (any number of newline-separated lines). That is what the Agent's
+//! `pkg/dogstatsd/listeners/uds_stream.go` reads and `datadog-go`'s stream writer sends;
+//! UNVERIFIED against either (`docs/known-gaps.md`). A packet declaring more than
+//! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
+//! `logit.input.frames.dropped{reason="oversize"}`: a length-framed stream has no resync point.
+//! The rest of this section is `tcp`'s.
+//!
+//! **Under `tcp`, LF-delimited lines, always**: [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`],
 //! never [`FramingMode::Rfc6587Auto`]. That mode reads a leading ASCII digit as an RFC 6587 octet
 //! count, which is right for syslog (every non-transparent message starts `<`) and wrong here:
 //! `1.hits:1|c` is an ordinary statsd line, and latching octet counting on it would reframe the
@@ -58,7 +76,10 @@
 //! `logit.input.connections.rejected{reason="limit"}`, `logit.input.frames`/`.frame.bytes` (one
 //! frame is one statsd line), `logit.input.frames.dropped{reason="oversize"|"truncated"}`,
 //! `logit.component.receive.flushed{reason}` from the per-connection batch assembly, and
-//! `framing_error`/`connection_error` diagnostics.
+//! `framing_error`/`connection_error` diagnostics. `unix` reports what `udp` does, but a full
+//! Unix datagram queue blocks or refuses the sender instead of dropping, so
+//! `logit.input.kernel.drops` stays at zero there (`crate::udp`'s module doc). `unix_stream`
+//! reports what `tcp` does, less the `logit.input.accept_queue.*` gauges.
 //!
 //! The decoder's own `bad_line` diagnostic is the same under both: **a malformed line is skipped
 //! and reported as `bad_line`, and the rest of its datagram still decodes.** It throttles per
@@ -72,7 +93,7 @@
 //! A superset covering plain statsd and the DogStatsD tag/container-id/timestamp extensions:
 //!
 //! ```text
-//! <name>:<value>[:<value>...]|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>][|<ignored>]
+//! <name>:<value>[:<value>...]|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|e:<external-data>][|card:<cardinality>][|T<unix-seconds>][|<ignored>]
 //! ```
 //!
 //! `<type>` is one of:
@@ -112,6 +133,13 @@
 //! that line as `bad_line`. Both attributes are protocol-namespaced carriers
 //! (`docs/adr/lossless-transit.md`). Every other unrecognized `|` segment is accepted and ignored,
 //! for forward compatibility.
+//!
+//! **`|e:<external-data>` (v1.5, Agent 7.57+) and `|card:<cardinality>` (v1.6, Agent 7.64+)** stamp
+//! `statsd.external_data` and `statsd.cardinality`, both `Value::Str` zero-copy slices, on every
+//! metric type and on events and service checks (as `e:`/`card:` fields). Both are carried
+//! verbatim: `card:` isn't checked against the Agent's `none`/`low`/`orchestrator`/`high`, since
+//! a relay carries what the client sent, and an empty `|e:` stamps an empty string, as an empty
+//! `|c:` does.
 //!
 //! A line is rejected as `bad_line` when it has no `:` or an empty name, no `|<type>`, an unknown
 //! type, a `c`/`g`/`ms`/`h`/`d` value that doesn't parse or isn't finite (`NaN`/`inf` parse as
@@ -165,7 +193,7 @@
 //!
 //! **Event**: `_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|d:<secs>|h:<hostname>|p:<normal|low>|
 //! t:<info|success|warning|error>|k:<aggregation_key>|s:<source_type_name>|#<tags>|
-//! c:<container_id>`. `TITLE_LEN`/`TEXT_LEN` are byte lengths as on the wire and decide the split,
+//! c:<container_id>|e:<external_data>|card:<cardinality>`. `TITLE_LEN`/`TEXT_LEN` are byte lengths as on the wire and decide the split,
 //! since `TEXT` may contain `|` and `:`. The line is rejected when a length runs past the line,
 //! lands mid-UTF-8-char (checked via `str::get`, so never a panic), or no `|` follows the title,
 //! when the `{a,b}` header is malformed, or when a `t:`/`p:` value is unrecognized. It decodes to
@@ -181,12 +209,13 @@
 //!   `statsd.event.priority` (`p:`, raw), `statsd.event.alert_type` (`t:`, raw),
 //!   `statsd.event.aggregation_key` (`k:`), `statsd.event.source_type` (`s:`),
 //!   `statsd.event.host` (`h:`), each only if present, plus `statsd.timestamp`,
-//!   `statsd.container_id` and `#tags` as on a metric line. `d:<secs>` plays `|T`'s role (same
+//!   `statsd.container_id`, `statsd.external_data`, `statsd.cardinality` and `#tags` as on a
+//!   metric line. `d:<secs>` plays `|T`'s role (same
 //!   checked parse, same event timestamp and carrier); `|T` itself is an unrecognized field here
 //!   and is ignored.
 //!
 //! **Service check**: `_sc|<NAME>|<STATUS>|d:<secs>|h:<hostname>|#<tags>|c:<container_id>|
-//! m:<message>`. `NAME` must be non-empty and `STATUS` an integer `0..=3`
+//! e:<external_data>|card:<cardinality>|m:<message>`. `NAME` must be non-empty and `STATUS` an integer `0..=3`
 //! (OK/WARNING/CRITICAL/UNKNOWN), or the line is rejected. `m:`, when present, is always last and
 //! consumes the rest of the line verbatim, so a message may contain `|`; other fields come in any
 //! order before it. It decodes to one [`Event::metric`], `MetricKind::Gauge(status as f64)` under
@@ -194,7 +223,7 @@
 //! (always, `Value::Str`: `MetricRecord` has nowhere else to carry it),
 //! `statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`,
 //! verbatim) and `statsd.service_check.host` (`h:`), plus `statsd.timestamp`,
-//! `statsd.container_id` and `#tags` as above.
+//! `statsd.container_id`, `statsd.external_data`, `statsd.cardinality` and `#tags` as above.
 //!
 //! **Tag values, `|c:<id>`, and set members are zero-copy slices of the datagram**, like every
 //! field [`crate::syslog`] extracts: `slice_of` rebuilds each `Bytes` by pointer arithmetic into
@@ -217,9 +246,15 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
+/// The socket file's mode under `transport: unix`/`unix_stream`: the Datadog Agent's for its
+/// DogStatsD socket (this module's "Transports").
+pub const SOCKET_MODE: u32 = 0o722;
+
 /// Which driver a [`StatsdInput`] wraps, chosen once by `transport:`. An enum rather than a
 /// `Box<dyn Input>` so each arm's concrete builders ([`TcpListener::with_tls`],
 /// [`UdpListener::with_config`]) stay reachable; [`crate::syslog::SyslogInput`] does the same.
+/// `Udp` also covers `transport: unix` and `Tcp` covers `unix_stream`: the drivers own the socket
+/// family.
 enum Inner {
     Udp(UdpListener<StatsdDecoder>),
     Tcp(TcpListener<StatsdDecoder>),
@@ -262,6 +297,37 @@ impl StatsdInput {
                     FramingMode::Lines { oversize: Oversize::DrainToNextLine },
                     crate::tcp::MAX_FRAME_BYTES,
                 ),
+            ),
+        }
+    }
+
+    /// A listener on a Unix datagram socket at `path` (`transport: unix`), on the UDP driver.
+    pub fn unix(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: Inner::Udp(UdpListener::unix(
+                "statsd_in",
+                path,
+                SOCKET_MODE,
+                StatsdDecoder::new(Arc::new(Resource::default())),
+                UdpListenerConfig::default(),
+            )),
+        }
+    }
+
+    /// A listener on a Unix stream socket at `path` (`transport: unix_stream`), on the stream
+    /// driver with [`FramingMode::LengthPrefixedLe`] (this module's "Framing"). [`Self::with_tls`]
+    /// fails on it.
+    pub fn unix_stream(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: Inner::Tcp(
+                TcpListener::unix(
+                    "statsd_in",
+                    path,
+                    SOCKET_MODE,
+                    StatsdDecoder::new(Arc::new(Resource::default())),
+                    TcpListenerConfig::default(),
+                )
+                .with_framing(FramingMode::LengthPrefixedLe, crate::tcp::MAX_FRAME_BYTES),
             ),
         }
     }
@@ -347,8 +413,9 @@ impl StatsdInput {
     /// Terminates TLS on a TCP listener (`tls:`); paths in `settings` resolve against `base_dir`.
     ///
     /// Fails on a UDP listener: DTLS is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s
-    /// Alternatives) and no statsd client speaks it. Graph rule 43 is what an operator sees; this
-    /// arm backstops a caller that skipped validation.
+    /// Alternatives) and no statsd client speaks it. Fails on either Unix socket too, which is
+    /// always plaintext. Graph rules 43 and 64 are what an operator sees; this backstops a caller
+    /// that skipped validation.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
@@ -358,7 +425,8 @@ impl StatsdInput {
             Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
             Inner::Udp(_) => anyhow::bail!(
                 "statsd_in: 'tls:' needs 'transport: tcp' -- TLS is defined over a byte stream, \
-                 and DTLS is out of scope (docs/adr/syslog-tcp-ingress-and-tls.md)"
+                 and DTLS is out of scope (docs/adr/syslog-tcp-ingress-and-tls.md); a Unix socket \
+                 is always plaintext"
             ),
         };
         Ok(self)
@@ -375,11 +443,19 @@ impl StatsdInput {
     }
 
     /// The bound address after `bind()`, so a caller learns an ephemeral port with no bind-drop
-    /// race.
+    /// race. `None` on a Unix socket.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.inner {
             Inner::Udp(listener) => listener.local_addr(),
             Inner::Tcp(listener) => listener.local_addr(),
+        }
+    }
+
+    /// The socket path under `transport: unix`/`unix_stream`; `None` otherwise.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.inner {
+            Inner::Udp(listener) => listener.socket_path(),
+            Inner::Tcp(listener) => listener.socket_path(),
         }
     }
 }
@@ -504,6 +580,8 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
 /// because the parsers are free functions; `KEYS.x` is one acquire load after first use.
 static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
     container_id: intern("statsd.container_id"),
+    external_data: intern("statsd.external_data"),
+    cardinality: intern("statsd.cardinality"),
     timestamp: intern("statsd.timestamp"),
     type_: intern("statsd.type"),
     event_title: intern("statsd.event.title"),
@@ -518,6 +596,8 @@ static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
 
 struct StatsdKeys {
     container_id: Symbol,
+    external_data: Symbol,
+    cardinality: Symbol,
     timestamp: Symbol,
     type_: Symbol,
     event_title: Symbol,
@@ -584,6 +664,23 @@ fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, text: &str, cont
     attributes.insert_sym(KEYS.container_id, Value::Str(slice_of(bytes, text, container_id)));
 }
 
+/// Stamps `statsd.external_data` (`|e:`) or `statsd.cardinality` (`|card:`) when `field` is one
+/// of them, returning whether it was. The metric, event, and service-check parsers share it: both
+/// are protocol-namespaced carriers (`docs/adr/lossless-transit.md`), zero-copy datagram slices
+/// kept verbatim, last segment wins. `card:` values aren't checked against the Agent's
+/// `none|low|orchestrator|high`: a relay carries what the client sent.
+fn insert_origin_field(attributes: &mut AttrMap, bytes: &Bytes, text: &str, field: &str) -> bool {
+    if let Some(external_data) = field.strip_prefix("e:") {
+        attributes.insert_sym(KEYS.external_data, Value::Str(slice_of(bytes, text, external_data)));
+        true
+    } else if let Some(cardinality) = field.strip_prefix("card:") {
+        attributes.insert_sym(KEYS.cardinality, Value::Str(slice_of(bytes, text, cardinality)));
+        true
+    } else {
+        false
+    }
+}
+
 /// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value into `(nanos, secs)`: `nanos` for
 /// `Event::timestamp`, `secs` for the `statsd.timestamp` carrier.
 ///
@@ -645,6 +742,8 @@ fn parse_line(
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // Carried verbatim, `ci-`/`in-` prefixes included, on every metric type.
             insert_container_id(&mut attributes, bytes, text, container_id);
+        } else if insert_origin_field(&mut attributes, bytes, text, extra) {
+            // `|e:`/`|card:`, stamped by the call itself.
         } else if let Some(secs) = extra.strip_prefix('T') {
             // DogStatsD v1.3+ point timestamp, accepted on every type.
             let (nanos, secs) = parse_wire_seconds(secs, line)?;
@@ -738,6 +837,8 @@ fn parse_event(
                 insert_tags(&mut attributes, bytes, text, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, text, container_id);
+            } else if insert_origin_field(&mut attributes, bytes, text, field) {
+                // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
@@ -858,6 +959,8 @@ fn parse_service_check(
                 insert_tags(&mut attributes, bytes, text, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, text, container_id);
+            } else if insert_origin_field(&mut attributes, bytes, text, field) {
+                // `e:`/`card:`, stamped by the call itself.
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
@@ -1756,6 +1859,90 @@ mod tests {
         );
     }
 
+    fn attr_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// `|e:`/`|card:` on a metric line, alongside `|c:` and `|T`, on every metric type.
+    #[test]
+    fn external_data_and_cardinality_become_attributes_on_a_metric_line() {
+        for line in [
+            "x:1|c|#env:prod|c:cid|e:it-false,cn-web,pu-abc|card:high|T1700000000",
+            "x:1|g|card:high|e:it-false,cn-web,pu-abc",
+            "x:1:2|ms|e:it-false,cn-web,pu-abc|card:high",
+            "x:a:b|s|e:it-false,cn-web,pu-abc|card:high",
+        ] {
+            let events = decode(line);
+            assert_eq!(events.len(), 1, "line: {line:?}");
+            let event = &events[0];
+            assert_eq!(
+                attr_str(event, "statsd.external_data"),
+                Some("it-false,cn-web,pu-abc"),
+                "line: {line:?}"
+            );
+            assert_eq!(attr_str(event, "statsd.cardinality"), Some("high"), "line: {line:?}");
+        }
+    }
+
+    /// `card:` carries what the client sent; the Agent's four values aren't enforced.
+    #[test]
+    fn an_unrecognized_cardinality_is_carried_verbatim() {
+        let events = decode("x:1|c|card:bogus");
+        assert_eq!(attr_str(&events[0], "statsd.cardinality"), Some("bogus"));
+    }
+
+    #[test]
+    fn external_data_and_cardinality_become_attributes_on_an_event() {
+        let event = only_log_event(decode("_e{5,4}:title|text|c:cid|e:ext1|card:low"));
+        assert_eq!(attr_str(&event, "statsd.container_id"), Some("cid"));
+        assert_eq!(attr_str(&event, "statsd.external_data"), Some("ext1"));
+        assert_eq!(attr_str(&event, "statsd.cardinality"), Some("low"));
+    }
+
+    #[test]
+    fn external_data_and_cardinality_become_attributes_on_a_service_check() {
+        let events = decode("_sc|check|0|e:ext2|card:orchestrator|m:all good");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(attr_str(event, "statsd.external_data"), Some("ext2"));
+        assert_eq!(attr_str(event, "statsd.cardinality"), Some("orchestrator"));
+        assert_eq!(attr_str(event, "statsd.service_check.message"), Some("all good"));
+    }
+
+    #[test]
+    fn absent_external_data_and_cardinality_leave_no_attribute() {
+        for line in ["x:1|c|c:cid", "_e{5,4}:title|text", "_sc|check|0"] {
+            let events = decode(line);
+            let event = &events[0];
+            assert!(event.attributes.get("statsd.external_data").is_none(), "line: {line:?}");
+            assert!(event.attributes.get("statsd.cardinality").is_none(), "line: {line:?}");
+        }
+    }
+
+    /// An empty `|e:`/`|card:` stamps an empty string, as an empty `|c:` does.
+    #[test]
+    fn an_empty_external_data_or_cardinality_is_an_empty_string_like_an_empty_container_id() {
+        let events = decode("x:1|c|c:|e:|card:");
+        let event = &events[0];
+        assert_eq!(attr_str(event, "statsd.container_id"), Some(""));
+        assert_eq!(attr_str(event, "statsd.external_data"), Some(""));
+        assert_eq!(attr_str(event, "statsd.cardinality"), Some(""));
+    }
+
+    /// Both carriers are zero-copy slices of the datagram, like `|c:`.
+    #[test]
+    fn external_data_is_a_zero_copy_slice_of_the_datagram() {
+        let datagram = Bytes::from_static(b"x:1|c|e:ext");
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let mut out = Vec::new();
+        decoder.decode_into(datagram.clone(), 0, &mut out).unwrap();
+        let Some(Value::Str(value)) = out[0].attributes.get("statsd.external_data") else {
+            panic!("expected a Str");
+        };
+        let range = datagram.as_ptr_range();
+        assert!(range.contains(&value.as_ptr()), "expected a slice of the datagram");
+    }
+
     /// `m:` consumes the rest of the line, `|` included.
     #[test]
     fn service_check_message_containing_pipe_decodes_verbatim() {
@@ -2300,5 +2487,199 @@ mod tests {
                 && event.attributes.get("statsd.container_id").is_none(),
             "the plain-statsd dialect has no tag or container-id syntax at all"
         );
+    }
+
+    // ---- transport: unix / unix_stream (`StatsdInput::{unix, unix_stream}`) ----------------------
+    //
+    // `crate::unix` covers the path rules and `crate::tcp`/`crate::udp` the drivers. These cover
+    // the wiring: the family, the mode, the stream framing, and the kernel-counter sampler.
+
+    use crate::unix::tests::TempDir;
+
+    /// A running Unix listener; `RunningTcp`'s twin without an address.
+    struct RunningUnix {
+        rx: tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>,
+        shutdown: watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        registry: Arc<logit_core::telemetry::Registry>,
+    }
+
+    impl RunningUnix {
+        /// Events from deliveries until `n` have arrived, or a panic naming `what`.
+        async fn events(&mut self, n: usize, what: &str) -> Vec<Event> {
+            let mut events = Vec::new();
+            while events.len() < n {
+                let delivered = tokio::time::timeout(Duration::from_secs(5), self.rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                    .expect("the channel should not have closed");
+                events.extend(logit_pipeline::unwrap_batch(delivered).events);
+            }
+            events
+        }
+
+        fn stop(self) {
+            self.shutdown.send(true).ok();
+            self.handle.abort();
+        }
+    }
+
+    async fn start_unix(input: StatsdInput) -> RunningUnix {
+        let registry = logit_core::telemetry::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut input = input
+            .with_diagnostics(Diagnostics::new("statsd_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_receive(UdpListenerConfig {
+                batch_max_events: 1,
+                batch_flush_interval: Duration::ZERO,
+                ..UdpListenerConfig::default()
+            })
+            .with_tcp_receive(TcpListenerConfig {
+                batch_max_events: 1,
+                batch_flush_interval: Duration::ZERO,
+                ..TcpListenerConfig::default()
+            });
+        input.bind().await.expect("binding the Unix socket should succeed");
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let fanout = Fanout::new(vec![tx]);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
+        RunningUnix { rx, shutdown, handle, registry }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn names(events: &[Event]) -> Vec<&'static str> {
+        events.iter().map(metric_name).collect()
+    }
+
+    /// One LE-length-prefixed `unix_stream` packet.
+    fn packet(body: &[u8]) -> Vec<u8> {
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(body);
+        framed
+    }
+
+    #[tokio::test]
+    async fn a_unix_listener_has_a_socket_path_and_no_address() {
+        let dir = TempDir::new("statsd-addr");
+        let path = dir.path().join("dsd.socket");
+        for mut input in [StatsdInput::unix(&path), StatsdInput::unix_stream(&path)] {
+            input.bind().await.expect("bind");
+            assert_eq!(input.local_addr(), None);
+            assert_eq!(input.socket_path(), Some(path.as_path()));
+        }
+        assert_eq!(StatsdInput::new("127.0.0.1:0").socket_path(), None);
+    }
+
+    /// A multi-line datagram decodes as it would over UDP, the file is mode `0722`, and the
+    /// kernel-counter sampler reads `SO_MEMINFO` off the Unix socket (the `used.bytes` gauge is
+    /// emitted only by a successful read).
+    #[tokio::test]
+    async fn a_unix_datagram_round_trips_a_multi_line_packet_and_is_sampled() {
+        let dir = TempDir::new("statsd-dgram");
+        let path = dir.path().join("dsd.socket");
+        let mut running = start_unix(StatsdInput::unix(&path)).await;
+        assert_eq!(mode_of(&path), SOCKET_MODE);
+
+        let client = tokio::net::UnixDatagram::unbound().unwrap();
+        client.send_to(b"a:1|c\nb:2|g|e:ext|card:low\nc:3:4|ms", &path).await.unwrap();
+
+        let events = running.events(3, "the three lines of one datagram").await;
+        assert_eq!(names(&events), vec!["a", "b", "c"]);
+        assert_eq!(
+            events[1].attributes.get("statsd.cardinality").and_then(Value::as_str),
+            Some("low")
+        );
+
+        let drained = running.registry.drain(0);
+        assert_eq!(metric_sum(&drained, "logit.input.datagrams", None), 1.0);
+        assert!(
+            drained
+                .iter()
+                .flat_map(|e| &e.metrics)
+                .any(|m| { m.name == intern("logit.input.receive_buffer.used.bytes") }),
+            "SO_MEMINFO should be readable on an AF_UNIX socket"
+        );
+        assert!(
+            !drained.iter().any(|e| {
+                e.log.as_ref().is_some_and(|log| {
+                    log.message.as_str().is_some_and(|m| m.contains("not available"))
+                })
+            }),
+            "the sampler must not have disabled itself"
+        );
+        running.stop();
+    }
+
+    /// Two length-prefixed packets, the second split across writes, decode as three events; the
+    /// file is mode `0722`.
+    #[tokio::test]
+    async fn a_unix_stream_round_trips_length_prefixed_packets() {
+        let dir = TempDir::new("statsd-stream");
+        let path = dir.path().join("dsd-stream.socket");
+        let mut running = start_unix(StatsdInput::unix_stream(&path)).await;
+        assert_eq!(mode_of(&path), SOCKET_MODE);
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        client.write_all(&packet(b"a:1|c\nb:2|c")).await.unwrap();
+        let second = packet(b"1.c:3|c");
+        client.write_all(&second[..3]).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(&second[3..]).await.unwrap();
+        client.flush().await.unwrap();
+
+        let events = running.events(3, "two packets' lines").await;
+        assert_eq!(names(&events), vec!["a", "b", "1.c"], "a leading digit is not an octet count");
+        running.stop();
+    }
+
+    /// A declared length past the frame bound closes the connection and is counted; nothing is
+    /// delivered.
+    #[tokio::test]
+    async fn an_oversize_unix_stream_packet_closes_the_connection_and_is_counted() {
+        let dir = TempDir::new("statsd-oversize");
+        let path = dir.path().join("dsd-stream.socket");
+        let mut running = start_unix(StatsdInput::unix_stream(&path)).await;
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let declared = (crate::tcp::MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
+        client.write_all(&declared).await.unwrap();
+        client.flush().await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0))), "the listener closes the connection: {read:?}");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), running.rx.recv()).await.is_err(),
+            "nothing is delivered"
+        );
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
+            1.0
+        );
+        running.stop();
+    }
+
+    /// A Unix socket is always plaintext: `with_tls` fails on both transports.
+    #[test]
+    fn with_tls_fails_on_either_unix_transport() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        for input in [StatsdInput::unix("/tmp/x.socket"), StatsdInput::unix_stream("/tmp/x.socket")]
+        {
+            let err = input.with_tls(&settings, &testdata_tls_dir()).err().expect("must fail");
+            assert!(err.to_string().contains("plaintext"), "{err}");
+        }
     }
 }

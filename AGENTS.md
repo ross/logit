@@ -65,7 +65,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default) or `transport: tcp` | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
+| `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default), `transport: tcp`, or a Unix socket (`unix`, `unix_stream`) | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
 | `syslog_in` | `crates/logit-inputs/src/syslog.rs` | syslog over UDP (default) or `transport: tcp`, optional TLS (RFC 5425) | [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) |
 | `graphite_in` | `crates/logit-inputs/src/graphite/` | carbon plaintext and pickle, UDP or TCP | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `collectd_in` | `crates/logit-inputs/src/collectd.rs` | collectd's binary `network` protocol, unicast or multicast | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
@@ -89,7 +89,7 @@ Sinks live in `crates/logit-outputs`.
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs` | human-readable render (default) or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
-| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP or TCP, optionally TLS | [ADR `statsd-output`](docs/adr/statsd-output.md) |
+| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP, TCP (optionally TLS), or a Unix socket (`unix`, `unix_stream`) | [ADR `statsd-output`](docs/adr/statsd-output.md) |
 | `otlp_out` | `crates/logit-outputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP and OTLP/gRPC | [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md) |
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
@@ -220,7 +220,7 @@ the first three pairs. What the model and codecs carry for them:
   status-message field, and dropped-attribute counts.
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
-- **statsd**: raw timers/sets, `|c:`/`|T`, and events/service checks.
+- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
 
 Residual debt lives in `docs/known-gaps.md`: post-sketch metric kinds at `statsd_out`;
 `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress timestamp only
@@ -229,8 +229,9 @@ TIMESTAMP follows the precedence table.
 
 Per pair:
 
-- **`statsd_in -> statsd_out`**: `statsd_out` is the mirror of `statsd_in`, over UDP or TCP
-  (optionally TLS, the `syslog_out` arrangement ported verbatim), with DogStatsD tags
+- **`statsd_in -> statsd_out`**: `statsd_out` is the mirror of `statsd_in`, over UDP, TCP
+  (optionally TLS, the `syslog_out` arrangement ported verbatim), or the Datadog Agent's two Unix
+  sockets (`transport: unix`/`unix_stream`, graph rule 64), with DogStatsD tags
   round-tripped through the real decoder. It encodes `Sum` (delta, monotonic),
   `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD events/service checks. A relay with
   no `aggregate` in between, or one configured `distributions: samples`/`sets: members`,

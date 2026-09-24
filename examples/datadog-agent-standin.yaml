@@ -9,6 +9,7 @@
 #   DD_TRACE_AGENT_URL=http://<this-host>:8126             # or this, overriding both
 #   DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket  # or the Unix socket, with `socket:`
 #   DD_DOGSTATSD_URL=udp://<this-host>:8125                # metrics, events, service checks
+#   DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket    # or the Unix socket, with `dsd_socket`
 #
 # Spans pass through unprocessed: nothing here obfuscates, normalizes, samples, or computes APM
 # stats the way an Agent does. So send them on to a real Agent (`datadog_trace_out`) or to an
@@ -20,6 +21,15 @@ components:
   dogstatsd:
     type: statsd_in
     bind: 127.0.0.1:8125
+
+  # The Agent's DogStatsD Unix datagram socket, beside UDP rather than instead of it: one
+  # `statsd_in` per transport. Its directory must already exist; a stale socket file from an
+  # earlier run is replaced, and the new one is mode 0722, as the Agent's is, so any user's client
+  # can send. Uncomment it and add `dsd_socket` to `stdout`'s sources.
+  # dsd_socket:
+  #   type: statsd_in
+  #   transport: unix
+  #   bind: /var/run/datadog/dsd.socket
 
   apm:
     type: datadog_trace_in

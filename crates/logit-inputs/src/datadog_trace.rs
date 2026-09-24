@@ -160,7 +160,6 @@ use crate::http::{
     media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
 };
 use crate::Input;
-use anyhow::Context as _;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
@@ -414,36 +413,10 @@ impl Input for DatadogTraceInput {
     }
 }
 
-/// Binds the Unix socket at `path` (this module's "The Unix socket").
+/// Binds the Unix socket at `path` (this module's "The Unix socket"), through the path rules
+/// `crate::unix` shares with `statsd_in`.
 fn bind_unix(path: &Path) -> anyhow::Result<UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if !parent.is_dir() {
-            anyhow::bail!(
-                "datadog_trace_in: can't bind the Unix socket {}: its directory {} does not \
-                 exist (create it first; the Agent's is /var/run/datadog)",
-                path.display(),
-                parent.display()
-            );
-        }
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)
-            .with_context(|| format!("removing the stale socket file {}", path.display()))?,
-        Ok(_) => anyhow::bail!(
-            "datadog_trace_in: {} exists and is not a socket; refusing to replace it",
-            path.display()
-        ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting {}", path.display()));
-        }
-    }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("binding the Unix socket {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
-        .with_context(|| format!("setting {}'s mode to {SOCKET_MODE:o}", path.display()))?;
-    Ok(listener)
+    crate::unix::bind_listener("datadog_trace_in", path, SOCKET_MODE)
 }
 
 /// What both accept loops share, built once per [`Input::run`].

@@ -47,7 +47,7 @@ Datadog ingests five kinds of data. Each cell reads today → after this stack.
 | Signal | Direct API, no Agent | Through a local Agent | Agent stand-in (receive from apps) | Intake stand-in (receive from Agents) |
 |---|---|---|---|---|
 | Logs | `otlp_out` agentless (unverified) → `datadog_out` `/api/v2/logs` (W5) | `otlp_out` to the Agent's OTLP receiver (its `logs.enabled` defaults to false), or `syslog_out` over TCP to the Agent's `logs` TCP listener, which accepts syslog-formatted lines; `syslog_out` writes a `Str` body verbatim, but whether the Agent then parses a JSON body into attributes is UNVERIFIED | `syslog_in`; apps that write JSON lines to an Agent TCP port have no plain-lines listener (documented gap, §7) | none → `datadog_in` `/api/v2/logs` and legacy `/v1/input` (W3) |
-| Metrics | `otlp_out` agentless, delta only → `datadog_out` `/api/v2/series` + `/api/v1/distribution_points` + sketches (W5, §4) | `statsd_out format: dogstatsd` (no UDS → W4b); `otlp_out` | `statsd_in` (no UDS; drops `\|e:`/`\|card:` → W4b); `otlp_in` | none → `datadog_in` series v1/v2 + sketches (W3) |
+| Metrics | `otlp_out` agentless, delta only → `datadog_out` `/api/v2/series` + `/api/v1/distribution_points` + sketches (W5, §4) | `statsd_out format: dogstatsd`, over UDP or either Agent Unix socket (W4b); `otlp_out` | `statsd_in` over UDP or either Agent Unix socket, `\|e:`/`\|card:` carried (W4b); `otlp_in` | none → `datadog_in` series v1/v2 + sketches (W3) |
 | Traces | `otlp_out` agentless, lossy for Datadog-origin spans → `datadog_out` `/api/v0.2/traces` + `/api/v0.2/stats`, the Agent's own protocol (W5, §12); `otlp_out` stays the path for OTel-origin spans | `otlp_out` → also `datadog_trace_out` msgpack `/v0.4/traces` + `/v0.6/stats` (W6) | `otlp_in` (dd-trace OTLP export is Preview) → `datadog_trace_in` on `:8126`, traces and client stats (W4a) | none → `datadog_in` `AgentPayload` + `StatsPayload` (W3) |
 | Events | none → `datadog_out` `/api/v1/events` (W5) | `statsd_out` `_e{}` | `statsd_in` `_e{}` | none → `datadog_in` `/intake/` (W3) |
 | Service checks | none → `datadog_out` `/api/v1/check_run` (W5) | `statsd_out` `_sc` | `statsd_in` `_sc` | none → `datadog_in` `/api/v1/check_run` (W3) |
@@ -81,9 +81,10 @@ Sites: `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`
 
 - **DogStatsD**: UDP `:8125`, a datagram Unix socket at `dogstatsd_socket`
   (default `/var/run/datadog/dsd.socket`; what Kubernetes clients use), and an optional stream
-  Unix socket (`dogstatsd_stream_socket`; framing UNVERIFIED). Buffer 8,192 B. Grammar as
+  Unix socket (`dogstatsd_stream_socket`; a 4-byte little-endian length per packet, UNVERIFIED).
+  Buffer 8,192 B. Grammar as
   [`telemetry-landscape.md`](../design/telemetry-landscape.md)'s DogStatsD section, plus two
-  suffixes `statsd_in` ignores today: `|e:<external data>` (v1.5, Agent 7.57+) and
+  suffixes `statsd_in` carries since W4b: `|e:<external data>` (v1.5, Agent 7.57+) and
   `|card:none|low|orchestrator|high` (v1.6, 7.64+). Agent semantics: `c` is time-normalized
   into a rate over the 10 s flush; `s` becomes a gauge of distinct values; `h`/`ms` become
   `.avg`/`.count`/`.median`/`.95percentile`/`.max` per `histogram_aggregates` and
@@ -350,9 +351,25 @@ parsing plus an optional `trace_id_high` field for logs an Agent ships with `dd.
 
 ### 10. `statsd` additions (W4b)
 
-`transport: unix` (datagram) and `unix_stream` on `statsd_in` and `statsd_out`, with `path:`;
-`|e:` → `statsd.external_data` and `|card:` → `statsd.cardinality`, round-tripped, so superset
-requirement 14 holds for the two suffixes added since it was written.
+`StatsdTransport` gains `unix` (a `SOCK_DGRAM` socket, the Agent's `dogstatsd_socket`) and
+`unix_stream` (a `SOCK_STREAM` socket, `dogstatsd_stream_socket`) on `statsd_in` and `statsd_out`.
+Under either, the existing address field (`bind:`, `endpoint:`) holds the socket's absolute path,
+as a client's `DD_DOGSTATSD_URL=unix:///…` does, so no new field and no "at least one of" rule is
+needed; an operator who wants UDP and the socket at once runs two `statsd_in` components. Graph
+rule 64 requires an absolute path and rejects `tls:` under either. The listener's socket file is
+mode `0722`, the Agent's own, through path handling shared with `datadog_trace_in`
+(`crates/logit-inputs/src/unix.rs`). `unix` runs on the UDP driver (receive queue, `recvmmsg`,
+`SO_MEMINFO` sampler); `unix_stream` runs on the TCP driver with each packet (one datagram's worth
+of lines) after a 4-byte little-endian length, the framing `uds_stream.go` reads and `datadog-go`
+writes, UNVERIFIED until W7. `statsd_out` packs packets as for UDP under both, sends a Unix datagram
+with its wait on a full receiver bounded by `connect_timeout`, and connects a stream lazily as for
+TCP.
+
+`|e:` → `statsd.external_data` and `|card:` → `statsd.cardinality` (the raw token; the Agent's
+four values aren't enforced) on metric, event, and service-check lines, round-tripped. `statsd_out`
+writes them after `|c:` and before `|T` (segment order UNVERIFIED until W7) and counts each as a
+dropped dialect field under `format: statsd`, so superset requirement 14 holds for the two suffixes
+added since it was written.
 
 ### 11. Timestamp windows (W5)
 
@@ -422,7 +439,7 @@ the OTel-direct topology is `otlp_out`.
 | W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
 | W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
 | W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
-| W4b | `statsd_in`/`statsd_out` Unix sockets, `\|e:`, `\|card:` | S | W0 |
+| W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
 | W5 | `datadog_out`: direct API client, stale filter, graph rules, schema | M | W3 |
 | W6 | `datadog_trace_out`: Agent client | S | W4a |
 | W7 | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); trial-org end-to-end for `datadog_out`, including the `/api/v0.2/traces` leg and the stale window; pair fixed-point tests over the corpus; UNVERIFIED items resolved in this plan | M | W5, W6 |
@@ -433,10 +450,10 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, and W4a complete on their
-stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it
-merges. Neither W3's receiver nor W4a's has yet been pointed at a real Agent or tracer; W7 does
-that.
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, and W4b complete on
+their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once
+it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real Agent,
+tracer, or client; W7 does that.
 
 ## Verification
 

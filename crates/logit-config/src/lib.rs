@@ -508,7 +508,21 @@ fn default_span_sample_rate() -> f64 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
-    /// statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.
+    /// statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.
+    ///
+    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path under
+    /// `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory
+    /// must exist; a stale socket file left by an earlier run is replaced, and anything else at the
+    /// path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running
+    /// as any user can send; restrict access with the directory's permissions. To listen on UDP and
+    /// a socket at once, configure two `statsd_in` components.
+    ///
+    /// `transport: unix` behaves as UDP does: the whole `receive:` block applies. Under
+    /// `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of
+    /// newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and
+    /// `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its
+    /// connection, counted as `logit.input.frames.dropped{reason="oversize"}`: a length-framed
+    /// stream has no point to resynchronize at.
     ///
     /// Under `transport: tcp` a message is one LF-delimited line; there is no `framing:` field
     /// and no octet-counted alternative, because a statsd line may begin with a digit. A line
@@ -516,12 +530,12 @@ pub enum ComponentKind {
     /// the connection stays open and the next line still decodes.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
-    /// listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected.
+    /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
     /// Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or
     /// stunnel-shaped relay hop.
     ///
-    /// A TCP listener has no receive queue (the connection's own flow control is the
-    /// backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// A TCP or `unix_stream` listener has no receive queue (the connection's own flow control is
+    /// the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
     /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
     /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
     /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
@@ -537,7 +551,8 @@ pub enum ComponentKind {
         /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
         /// the connection's first byte. Each phase gets its own budget, so a silent TLS
         /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
-        /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
+        /// `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or
+        /// `unix` is rejected.
         ///
         /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
         /// next line is bounded by `idle_timeout` if set, and unbounded otherwise.
@@ -547,7 +562,8 @@ pub enum ComponentKind {
         /// How long one connection may stay quiet before this listener closes it and frees its
         /// connection-cap slot. Off unless set: with no value, a connection that sent one line
         /// and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to
-        /// disable. `transport: tcp` only: any value under `transport: udp` is rejected.
+        /// disable. `transport: tcp` or `unix_stream` only: any value under `transport: udp` or
+        /// `unix` is rejected.
         ///
         /// Recommended wherever steady traffic is expected: a connection quiet for longer than
         /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
@@ -1591,10 +1607,17 @@ pub enum ComponentKind {
         #[serde(default)]
         structured_data: Option<SyslogStructuredData>,
     },
-    /// statsd / DogStatsD egress over UDP or TCP, the mirror of `statsd_in` and a real relay:
-    /// names, values, and tags round-trip through the decoder on the other end.
+    /// statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a
+    /// real relay: names, values, and tags round-trip through the decoder on the other end.
+    ///
+    /// Under `transport: unix` each packet is one datagram sent to the socket; under
+    /// `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian
+    /// integer, on a connection opened on the first send and reopened after an error, as under
+    /// TCP.
     StatsdOut {
-        /// `host:port`. Resolved at connect/bind time, never at config-load time.
+        /// `host:port` under `udp`/`tcp`, resolved at connect/send time, never at config-load
+        /// time. The socket file's absolute path under `unix`/`unix_stream` (the Datadog Agent's
+        /// datagram socket is `/var/run/datadog/dsd.socket`).
         endpoint: String,
         #[serde(default)]
         transport: StatsdTransport,
@@ -1608,26 +1631,31 @@ pub enum ComponentKind {
         /// `aggregate`, so this is an opt-in relay behavior.
         #[serde(default)]
         relative_gauges: bool,
-        /// Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined
-        /// per send), not a single line's length. A byte-count string. Defaults to `"1432"`, the
-        /// statsd and DogStatsD client default: a 1500-byte MTU minus IPv4/UDP headers minus
+        /// Bounds one packet's worth of packed lines (several statsd lines newline-joined per
+        /// send), not a single line's length: a UDP or Unix datagram, or one length-prefixed
+        /// `unix_stream` packet. A byte-count string. Defaults to `"1432"`, the statsd and
+        /// DogStatsD client default over UDP: a 1500-byte MTU minus IPv4/UDP headers minus
         /// headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently
-        /// fragment or fail `EMSGSIZE`. `0` is rejected. Ignored for `transport: tcp`.
+        /// fragment or fail `EMSGSIZE`. DogStatsD clients default to `"8192"` over a Unix socket,
+        /// the Agent's receive buffer size, which is the most a Datadog Agent reads per packet.
+        /// `0` is rejected. Ignored for `transport: tcp`.
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) may take before `send` reports a failure. Also bounds the TLS
-        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice
-        /// this value. Defaults to `5s`.
+        /// How long a connect attempt (including a reconnect after a dropped connection) may take
+        /// before `send` reports a failure, under `tcp` and `unix_stream`. Also bounds the TLS
+        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this
+        /// value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a
+        /// Unix socket pushes back on the sender where UDP would drop). Ignored for `udp`.
+        /// Defaults to `5s`.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
         /// Turns on TLS for this connection when present, and makes it required: a bare
         /// `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS
-        /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under `transport: udp`
-        /// is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or
-        /// stunnel-shaped relay hop.
+        /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under any other
+        /// transport is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit`
+        /// or stunnel-shaped relay hop.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
     },
@@ -2434,6 +2462,10 @@ pub struct SyslogStructuredData {
 /// `statsd_in`'s and `statsd_out`'s transport. `udp` (the default) matches classic statsd and
 /// DogStatsD clients; `tcp` is the reliable, framed transport, and what `tls:` needs underneath
 /// it. A TCP message is one LF-delimited line in both directions.
+///
+/// `unix` and `unix_stream` are the Datadog Agent's two DogStatsD Unix sockets. Under either,
+/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, not a
+/// `host:port`, and `tls:` is rejected.
 // Its own enum rather than a shared one: schemars publishes a type's name into the schema's
 // `$defs`, so sharing would document this transport by pointing at a syslog-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2442,6 +2474,15 @@ pub enum StatsdTransport {
     #[default]
     Udp,
     Tcp,
+    /// A Unix datagram socket, the Agent's `dogstatsd_socket` (default
+    /// `/var/run/datadog/dsd.socket`), which a client reaches with
+    /// `DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`. One datagram carries one or more
+    /// newline-separated lines, as over UDP, and the whole `receive:` block applies.
+    Unix,
+    /// A Unix stream socket, the Agent's `dogstatsd_stream_socket`. Each packet (one datagram's
+    /// worth of newline-separated lines) is preceded by its length as a 4-byte little-endian
+    /// integer, what `datadog-go`'s stream writer sends, reached with `unixstream://<path>`.
+    UnixStream,
 }
 
 /// Which statsd dialect `statsd_out` emits. `dogstatsd` (the default) includes the tag segment.
@@ -5931,6 +5972,41 @@ mod tests {
                 assert_eq!(tls, None);
             }
             other => panic!("expected StatsdIn, got {other:?}"),
+        }
+    }
+
+    /// The two Unix-socket transports deserialize from their snake_case names on both statsd
+    /// kinds, with the socket path in the existing address field.
+    #[test]
+    fn statsd_unix_and_unix_stream_transports_deserialize_on_both_kinds() {
+        for (name, expected) in
+            [("unix", StatsdTransport::Unix), ("unix_stream", StatsdTransport::UnixStream)]
+        {
+            let input: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_in", "bind": "/var/run/datadog/dsd.socket",
+                    "transport": "{name}"}}"#
+            ))
+            .unwrap();
+            match input.kind {
+                ComponentKind::StatsdIn { bind, transport, .. } => {
+                    assert_eq!(bind, "/var/run/datadog/dsd.socket");
+                    assert_eq!(transport, expected);
+                }
+                other => panic!("expected StatsdIn, got {other:?}"),
+            }
+
+            let output: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_out", "endpoint": "/var/run/datadog/dsd.socket",
+                    "transport": "{name}"}}"#
+            ))
+            .unwrap();
+            match output.kind {
+                ComponentKind::StatsdOut { endpoint, transport, .. } => {
+                    assert_eq!(endpoint, "/var/run/datadog/dsd.socket");
+                    assert_eq!(transport, expected);
+                }
+                other => panic!("expected StatsdOut, got {other:?}"),
+            }
         }
     }
 }

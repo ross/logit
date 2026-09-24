@@ -629,6 +629,14 @@ LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only two re
 `malformed` can't occur: it's an octet count RFC 6587's grammar doesn't permit, and this listener
 never reads one.
 
+**Under `transport: unix`:** the `udp` set, from the same driver on a Unix datagram socket. The
+`SO_MEMINFO` sampler reads it as it reads a UDP socket, but `AF_UNIX` makes a full receive queue
+block or refuse the *sender* rather than drop, so `logit.input.kernel.drops` stays at zero there.
+
+**Under `transport: unix_stream`:** the `tcp` set, less `logit.input.accept_queue.*` (a Unix
+listener has no `TCP_INFO`). One frame is one length-prefixed packet, which may hold several lines,
+and `oversize` is a packet declaring more than 64 KiB, which closes the connection.
+
 **On either transport:** a line that *parses* badly isn't a framing error. It's the decoder's own
 `bad_line`, throttled per listener because every connection's decoder clone shares one set of
 counts. The driver's `bad_frame` key fires only for the single whole-frame failure
