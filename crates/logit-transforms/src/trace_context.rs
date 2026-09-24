@@ -1,20 +1,16 @@
-//! `trace_context`: lifts an application trace/span reference off an event's attributes onto its
-//! `LogRecord` (`docs/adr/log-record-trace-context.md`) -- the common "my JSON log body already
-//! has a `trace.id` field" case, without writing Lua (`event.log.trace_id`,
-//! `crates/logit-script/src/proxy.rs`'s `LogProxy`) -- and, with a `span:` block
-//! (`docs/adr/trace-context-span-lifting.md`), turns that log line into a real `SpanRecord` on
-//! the same event: an access log's ids plus its own start/end/duration become a server span
-//! whose start is the event's timestamp, so a request crossing haproxy -> nginx -> app shows up
-//! in a trace store as one trace with one span per tier.
+//! `trace_context`: lifts a trace/span reference off an event's attributes onto its `LogRecord`
+//! (`docs/adr/log-record-trace-context.md`). With a `span:` block it also turns an access-log line
+//! into a `SpanRecord` on the same event, whose start becomes the event's timestamp
+//! (`docs/adr/trace-context-span-lifting.md`), so a request through haproxy -> nginx -> app shows
+//! up as one trace with a span per tier.
 //!
-//! Reads the well-known attribute names in `docs/design/data-model.md`'s "Well-known attribute
-//! names" section: `traceparent` (W3C, parsed natively -- `logit_core::trace::parse_traceparent`),
-//! `trace.id`/`trace.flags`/`span.id` (the three renameable ones), `span.parent_id`, `span.name`,
-//! `span.kind`, `span.status`, and the timing attributes `span.start`/`span.end`/`span.duration`
-//! in integer nanoseconds or one of their unit-suffixed forms (`_us`/`_ms`/`_s`/`_rfc3339`).
-//! Everything is parsed before anything is mutated: a lift either applies completely (log trace
-//! set, span minted, timestamp rewritten, consumed attributes removed) or leaves the event
-//! exactly as it arrived and counts one `.skipped{reason}` -- never a partial result.
+//! Reads the attribute names in `docs/design/data-model.md`'s "Well-known attribute names"
+//! section: `traceparent`, `trace.id`/`trace.flags`/`span.id` (the three renameable ones),
+//! `span.parent_id`, `span.name`, `span.kind`, `span.status`, and `span.start`/`span.end`/
+//! `span.duration` in integer nanoseconds or a unit-suffixed form (`_us`/`_ms`/`_s`/`_rfc3339`).
+//!
+//! All-or-nothing: everything is parsed before anything is mutated, so a lift either applies
+//! completely or leaves the event as it arrived and counts one `.skipped{reason}`.
 
 use logit_core::trace::{parse_span_id, parse_trace_id};
 use logit_core::{
@@ -25,19 +21,17 @@ use logit_pipeline::Transform;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The W3C header, logged as-is by a tier that received one -- yields the trace id, this span's
-/// *parent* id, and the flags, each overridable by the explicit attribute.
+/// The W3C header as a tier received it: the trace id, this span's parent id, and the flags,
+/// each overridden by its explicit attribute.
 const TRACEPARENT: &str = "traceparent";
 const SPAN_PARENT_ID: &str = "span.parent_id";
 const SPAN_NAME: &str = "span.name";
 const SPAN_KIND: &str = "span.kind";
 const SPAN_STATUS: &str = "span.status";
 
-/// How a timing attribute's value is denominated -- the unit is only ever in the attribute's
-/// *name* (`docs/design/data-model.md`), never inside the value. The base form is integer
-/// nanoseconds, OTLP's own `*_time_unix_nano` unit; the suffixed forms exist for producers whose
-/// clocks are coarser than that (haproxy's `request_date(us)`, nginx's `$msec`), as an honest
-/// label of the source's resolution rather than a convenience.
+/// A timing attribute's unit, which only the attribute's name carries, never the value. The base
+/// form is integer nanoseconds (OTLP's unit); a suffix labels a coarser source clock (haproxy's
+/// `request_date(us)`, nginx's `$msec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unit {
     Nanos,
@@ -70,8 +64,7 @@ const DURATION_FORMS: [(&str, Unit); 4] = [
     ("span.duration_s", Unit::Seconds),
 ];
 
-/// The `span:` block, as the transform consumes it (`logit_config::SpanLiftConfig` is the config
-/// vocabulary; `crates/logit-cli/src/pipeline.rs` maps between them).
+/// The `span:` block. Mirrors `logit_config::SpanLiftConfig`; `logit-cli` converts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpanLift {
     /// Mint a fresh span id when the `span_id` attribute is absent instead of skipping the event.
@@ -85,8 +78,8 @@ pub struct SpanLift {
     pub max_skew: Duration,
 }
 
-/// [`SpanLift`] pre-digested for the per-event path: the default name is a `Value` built once
-/// (so the success path only refcount-bumps its `Bytes`), the skew window is already in nanos.
+/// [`SpanLift`] prepared once: the default name is a `Value` the per-event path only
+/// refcount-bumps, and the skew window is in nanoseconds.
 struct SpanDefaults {
     mint_id: bool,
     name: Value,
@@ -94,8 +87,8 @@ struct SpanDefaults {
     max_skew_nanos: u64,
 }
 
-/// Why a lift didn't apply -- each is a `reason` tag on `.skipped`. All `&'static str` by
-/// construction, per `docs/design/internal-telemetry.md`'s cardinality rule.
+/// Why a lift didn't apply: the `reason` tag on `.skipped`, a `&'static str` per
+/// `docs/design/internal-telemetry.md`'s cardinality rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Skip {
     /// No trace id anywhere: neither the configured attribute nor a `traceparent`.
@@ -124,8 +117,7 @@ impl Skip {
     }
 }
 
-/// Everything a successful lift will write, computed against a borrowed `AttrMap` before
-/// anything is mutated -- the all-or-nothing contract in one type.
+/// Everything a successful lift writes, computed from a borrowed `AttrMap` before any mutation.
 struct Lifted {
     trace: TraceRef,
     /// `Some` only with a `span:` block; the span's start is `timestamp` below.
@@ -134,10 +126,10 @@ struct Lifted {
     minted: bool,
 }
 
-/// An attribute counts as present only if it carries a value: `Null`, `""`, and `"-"` are how
-/// nginx (`escape=json` renders an unset variable as `""`, the plain formats as `-`) and haproxy
-/// (an unset `txn` var) spell "nothing here," and treating them as present-but-invalid would
-/// make every non-proxied or edge request a noisy skip instead of a quiet one.
+/// An attribute is present only if it carries a value. `Null`, `""`, and `"-"` are how nginx
+/// (`escape=json` renders unset as `""`, plain formats as `-`) and haproxy (an unset `txn` var)
+/// spell "nothing here"; as present-but-invalid they would turn every edge request into an
+/// `invalid` skip.
 fn present<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a Value> {
     match attrs.get(key)? {
         Value::Null => None,
@@ -149,11 +141,9 @@ fn present<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// `flags` as a plain integer 0-255, decimal only -- never hex, since a W3C `traceparent`'s own
-/// two-hex-digit flags octet would silently parse as a *different* decimal value if accepted
-/// here (`"08"` is 8 as decimal, not the flags byte `0x08`). A `traceparent` is parsed whole by
-/// `parse_traceparent`, where the octet *is* hex by that header's definition; this reads only a
-/// standalone numeric field, and the two never mix.
+/// A standalone `flags` field as an integer 0-255, decimal only. Never hex: a `traceparent`'s
+/// hex flags octet pasted here would parse as a different value (`"10"` is 10, not `0x10`).
+/// `parse_traceparent` reads that octet as hex; the two paths never mix.
 fn numeric_flags(value: &Value) -> Option<u8> {
     match value {
         Value::I64(n) => u8::try_from(*n).ok(),
@@ -163,13 +153,12 @@ fn numeric_flags(value: &Value) -> Option<u8> {
     }
 }
 
-/// One timing value to exact nanoseconds, by the unit its attribute name declared. `instant`
-/// distinguishes a start/end (which may also arrive as a `Value::Timestamp` or, under the
-/// `_rfc3339` form, a date string) from a duration (which may not). A float in an integer-
-/// denominated form (`Nanos`/`Micros`/`Millis`) is rejected outright rather than rounded: an
-/// `f64` can't represent an epoch-nanosecond instant (2^53 < 1.7e18), so a JSON float there is a
-/// producer bug, not a value to guess at. The `Seconds` form is the one place a float is
-/// legitimate (nginx's `$msec`/`$request_time`), and a `Str` there is walked digit-exact.
+/// One timing value to exact nanoseconds, in the unit its attribute name declared.
+///
+/// `instant` marks a start/end, which may also be a `Value::Timestamp` or an `_rfc3339` string;
+/// a duration may not. A float in `Nanos`/`Micros`/`Millis` is rejected, not rounded: an `f64`
+/// can't hold an epoch-nanosecond instant (2^53 < 1.7e18), so it's a producer bug. `Seconds`
+/// accepts a float (nginx's `$msec`/`$request_time`), and parses a `Str` digit-exact.
 fn timing_nanos(value: &Value, unit: Unit, instant: bool) -> Option<i64> {
     let scale = match unit {
         Unit::Nanos => 1,
@@ -190,27 +179,25 @@ fn timing_nanos(value: &Value, unit: Unit, instant: bool) -> Option<i64> {
     }
 }
 
-/// `f64` seconds to nanoseconds without going through one `f64` multiply: the integer part is
-/// scaled exactly (in `i128`, so a huge float is a `None`, not a wrap), only the sub-second part
-/// is rounded. At epoch magnitude an `f64` carries ~16 significant digits, so the fraction is
-/// good to roughly a microsecond -- already finer than any producer that emits float seconds.
+/// `f64` seconds to nanoseconds, scaling the integer part exactly (in `i128`, so a huge float is
+/// `None`, not a wrap) and rounding only the fraction. At epoch magnitude that's good to about a
+/// microsecond, finer than any producer that emits float seconds.
 fn f64_seconds_to_nanos(seconds: f64) -> Option<i64> {
     if !seconds.is_finite() {
         return None;
     }
     let whole = seconds.trunc();
     let frac = seconds - whole;
-    // `as i128` saturates on out-of-range floats rather than wrapping; the range check below
-    // then catches it.
+    // `as i128` saturates rather than wrapping; `checked_mul`/`try_from` then reject it.
     let whole_nanos = (whole as i128).checked_mul(i128::from(NANOS_PER_SECOND))?;
     let whole_nanos = i64::try_from(whole_nanos).ok()?;
     let frac_nanos = (frac * NANOS_PER_SECOND as f64).round() as i64;
     whole_nanos.checked_add(frac_nanos)
 }
 
-/// Looks one quantity (start, end, or duration) up across every form it may arrive in. Exactly
-/// one form may be present -- two (`span.start` and `span.start_ms`, say) is a contradiction
-/// this refuses to resolve by precedence. `Ok(None)` is "not supplied at all."
+/// Looks up one quantity (start, end, or duration) across all its forms. Two forms at once
+/// (`span.start` and `span.start_ms`) is `Invalid`, not resolved by precedence. `Ok(None)` means
+/// none was supplied.
 fn quantity(attrs: &AttrMap, forms: &[(&str, Unit)], instant: bool) -> Result<Option<i64>, Skip> {
     let mut found = None;
     for (key, unit) in forms {
@@ -224,10 +211,11 @@ fn quantity(attrs: &AttrMap, forms: &[(&str, Unit)], instant: bool) -> Result<Op
     Ok(found)
 }
 
-/// Lifts `trace_id`/`span_id`/`flags` off configured attribute names (and, with [`with_span`],
-/// the rest of the span convention) onto `event.log.trace` and `event.span`, overwriting on
-/// success -- operator intent, the same posture `Set` has toward wire-carried data. Stateless:
-/// no `flush_interval`/`flush`.
+/// Lifts `trace_id`/`span_id`/`flags` (and, with [`with_span`], a whole span) off configured
+/// attributes onto `event.log.trace` and `event.span`.
+///
+/// A successful lift overwrites what's there: operator intent beats wire-carried data, as with
+/// `Set`.
 ///
 /// [`with_span`]: TraceContext::with_span
 pub struct TraceContext {
@@ -256,7 +244,7 @@ impl TraceContext {
         }
     }
 
-    /// Opts in to minting a `SpanRecord` per lifted line -- the `span:` block.
+    /// Mints a `SpanRecord` per lifted line (the `span:` block).
     pub fn with_span(mut self, span: SpanLift) -> Self {
         self.span = Some(SpanDefaults {
             mint_id: span.mint_id,
@@ -267,15 +255,17 @@ impl TraceContext {
         self
     }
 
-    /// See [`crate::Set::with_telemetry`] -- same reasoning, no `Diagnostics` here either: a
-    /// missing or unparseable attribute is a documented skip, not a warning-worthy failure.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: a missing or unparseable attribute is a counted skip,
+    /// not a warning.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
 
-    /// The whole lift, computed without touching the event. Precedence throughout: an explicit
-    /// attribute beats the corresponding piece of a `traceparent`.
+    /// Computes the whole lift without touching the event. An explicit attribute beats the same
+    /// piece of a `traceparent`.
     fn lift(&self, attrs: &AttrMap, receipt: i64) -> Result<Lifted, Skip> {
         let traceparent = match present(attrs, TRACEPARENT) {
             None => None,
@@ -288,9 +278,8 @@ impl TraceContext {
         };
 
         let flags = match self.flags_field.as_deref().and_then(|field| present(attrs, field)) {
-            // Present but unparseable is a harder failure than absent -- an operator configured
-            // this field expecting it to mean something, so silently dropping it (as "absent"
-            // would) could hide a real upstream problem.
+            // Unparseable is `Invalid`, not treated as absent: the operator configured this
+            // field, and ignoring it could hide an upstream problem.
             Some(value) => numeric_flags(value).ok_or(Skip::Invalid)?,
             None => traceparent.map(|(_, _, flags)| flags).unwrap_or(0),
         };
@@ -339,10 +328,10 @@ impl TraceContext {
         if duration.is_some_and(|d| d < 0) {
             return Err(Skip::Timing);
         }
-        // Any two determine the third; a lone start or duration borrows receipt time as the
-        // end (a line written at request end arrives moments later, so this is the honest
-        // fallback -- and the only way an unchanged nginx line carrying just `request_time`
-        // yields a span at all). A lone end is not enough: nothing says when it began.
+        // Any two determine the third. A lone start or duration takes receipt time as the end:
+        // a line is written at request end and arrives moments later, and it's the only way a
+        // stock nginx line carrying just `request_time` yields a span. A lone end says nothing
+        // about the start.
         let (start, end) = match (start, end, duration) {
             (Some(s), Some(e), _) => (s, e),
             (Some(s), None, Some(d)) => (s, s.checked_add(d).ok_or(Skip::Timing)?),
@@ -376,9 +365,7 @@ impl TraceContext {
                 events: Vec::new(),
                 links: Vec::new(),
                 end_timestamp: end,
-                // Same W3C trace flags this lifted span's own `TraceRef` carries (`flags` above)
-                // -- the minted span represents the same trace/span identity, so its `SAMPLED`
-                // bit should match rather than default to unset.
+                // The `TraceRef`'s flags, so the span's `SAMPLED` bit matches its log's.
                 flags: flags as u32,
                 ext: None,
             }),
@@ -387,8 +374,8 @@ impl TraceContext {
         })
     }
 
-    /// Removes exactly the convention attributes this configuration reads -- an absent key is a
-    /// free probe, so this needn't track which were actually present.
+    /// Removes every attribute this configuration reads; removing an absent key is a cheap probe,
+    /// so nothing tracks which were present.
     fn remove_consumed(&self, attrs: &mut AttrMap) {
         attrs.remove(&self.trace_id_field);
         if let Some(field) = &self.span_id_field {
@@ -410,15 +397,11 @@ impl TraceContext {
 }
 
 impl Transform for TraceContext {
-    /// An event with no log passes through untouched -- there is nowhere to put a lifted
-    /// `TraceRef`, and no access line to derive a span from. Otherwise the outcome is one of:
-    /// a complete lift (`.lifted`, plus `.spans{id}` with a `span:` block), or a
-    /// `.skipped{reason}` that leaves the event exactly as it arrived -- attributes, timestamp,
-    /// `log.trace`, and `span` all untouched. `missing` is "no trace id at all"; `invalid` is
-    /// "something present didn't parse"; `span_id`, `timing`, and `skew` are the `span:` block's
-    /// own reasons (see [`Skip`]). A successful lift overwrites `log.trace` (and, with `span:`,
-    /// `event.span` and `event.timestamp` -- the span's start) and, unless `keep_source`,
-    /// removes every convention attribute it read.
+    /// An event with no log passes through untouched. Otherwise it's either a complete lift
+    /// (`.lifted`, plus `.spans{id}` with a `span:` block) or a `.skipped{reason}` ([`Skip`])
+    /// that leaves the event as it arrived. A lift overwrites `log.trace` (with `span:`, also
+    /// `event.span` and `event.timestamp`, the span's start) and, unless `keep_source`, removes
+    /// every convention attribute it read.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.log.is_none() {
             return true;
@@ -510,7 +493,7 @@ mod tests {
         "cd".repeat(8)
     }
 
-    /// The pre-convention shape: explicit underscore field names, no span block.
+    /// Underscore field names, no span block.
     fn legacy() -> TraceContext {
         TraceContext::new("trace_id".to_string(), None, None, false)
     }
@@ -548,9 +531,8 @@ mod tests {
         ]
     }
 
-    /// Finds one counter in an already-drained set of telemetry events. Callers drain once --
-    /// `Registry::drain` empties the buffer, so two lookups against the registry itself would
-    /// only ever find the first.
+    /// Finds one counter in already-drained telemetry; `Registry::drain` empties the buffer, so
+    /// a test checking several counters drains once.
     fn find_counter(events: &[Event], name: &str, tag: Option<(&str, &str)>) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
@@ -567,8 +549,7 @@ mod tests {
         })
     }
 
-    /// One-shot lookup: drains the registry. Use [`find_counter`] on a single drain when a test
-    /// needs more than one counter.
+    /// Drains the registry and finds one counter.
     fn counter(registry: &Registry, name: &str, tag: Option<(&str, &str)>) -> Option<f64> {
         find_counter(&registry.drain(0), name, tag)
     }
@@ -579,7 +560,7 @@ mod tests {
         (t.with_telemetry(telemetry), registry)
     }
 
-    // -- The log-only lift, unchanged in behavior from before the span block ---------------------
+    // -- The log-only lift ------------------------------------------------------------------------
 
     #[test]
     fn a_valid_trace_id_is_lifted_and_removed_by_default() {
@@ -1077,10 +1058,8 @@ mod tests {
 
     #[test]
     fn the_seconds_form_takes_floats_and_is_digit_exact_from_a_string() {
-        // nginx: `$msec` as a JSON float (ms resolution), `$request_time` likewise. An f64 at
-        // epoch magnitude resolves to ~0.24us, so the float route lands within a microsecond of
-        // the decimal it was printed from -- finer than the ms the source actually had, but
-        // *not* exact; the quoted route below is.
+        // nginx's `$msec`/`$request_time` as JSON floats. An f64 at epoch magnitude resolves to
+        // ~0.24us, so this lands within a microsecond but isn't exact; the quoted form below is.
         let end_s = 1_725_400_000.123_f64;
         let (start, end) =
             span_with(&[("span.end_s", Value::F64(end_s)), ("span.duration_s", Value::F64(0.004))])
@@ -1144,7 +1123,7 @@ mod tests {
 
     #[test]
     fn the_rfc3339_form_parses_instants_only() {
-        // RECEIPT = 2024-09-03T21:46:40.5Z, exactly.
+        // RECEIPT = 2024-09-03T21:46:40.5Z.
         let got = span_with(&[
             ("span.start_rfc3339", Value::str("2024-09-03T21:46:40.4Z")),
             ("span.end_rfc3339", Value::str("2024-09-03T23:46:40.5+02:00")),

@@ -1,53 +1,28 @@
-# The `applogs` producer: real structured-logging libraries, at pinned versions, in their own
-# documented production configuration inside tiny HTTP apps -- plus one Django app under
-# OpenTelemetry auto-instrumentation, exporting OTLP straight to `logit` with no Collector in
-# between.
+# The `applogs` producer: real structured-logging libraries at pinned versions, in their documented
+# production configuration inside tiny HTTP apps, plus one Django app under OpenTelemetry
+# auto-instrumentation exporting OTLP straight to `logit`. configs/applogs.yaml's header explains
+# the two-tap arrangement; tools/shape-survey/applogs/ has one directory per app.
 #
-# Sourced by script/shape-survey, which discovers this file by glob. Everything specific to this
-# producer lives here, in tools/shape-survey/configs/applogs.yaml (read its header: it is where the
-# two-tap arrangement and the per-app `shape` components are justified) and under
-# tools/shape-survey/applogs/ (one directory per app: source, Dockerfile, pinned versions).
+# Representativeness and caveats: README "Producers" and "Caveats each author recorded". The
+# library envelope is the library's own; the fields are not. structlog, python-json-logger,
+# log/slog, and zap have no request serializer, so every app supplies the same eight access-log
+# fields and nothing else, and widths are a floor. The Django leg is SDK defaults on Django's
+# development server.
 #
-# ---------------------------------------------------------------------------------------------
-# WHAT THESE NUMBERS ARE WORTH
-#
-# Good evidence: the **record structure each logging library produces** -- how many keys its own
-# envelope contributes, how it nests (pino-http's `req`/`res`, semantic_logger's `payload`), how
-# long its keys and values are, how many distinct key-sets one library emits across a mixed
-# request stream, and what an exception does to all of that. Every library is at a pinned version
-# in the configuration its own documentation prescribes, cited in each app's header comment.
-#
-# Not evidence: **application field counts.** structlog, python-json-logger, log/slog and zap have
-# no request serializer of their own, so the *app* supplies the fields. Every app here supplies the
-# same eight canonical access-log fields and nothing else -- no tenant id, no user id, no feature
-# flags, no `service.version`, none of the ten or twenty context fields a real service accumulates.
-# Widths here are therefore a FLOOR, and the library envelope is the part that is not.
-#
-# Nor is the Django leg evidence about a tuned deployment: it is SDK defaults, auto-instrumentation
-# only, sqlite rather than Postgres, and Django's own development server. What it measures well is
-# exactly what it claims to -- what the OpenTelemetry Python auto-instrumentation emits when nobody
-# has configured anything.
-# ---------------------------------------------------------------------------------------------
+# Environment: SHAPE_SURVEY_DURATION (default 300s).
 
-#: The capture window, in seconds. At the per-app rates below this is >=5k lines per app; the two
-#: default-configuration streams are sampled at one request in four, so they land near 1.8k.
-#: `SHAPE_SURVEY_DURATION=900 script/shape-survey applogs` for longer.
+#: The capture window, in seconds. At the rates below that is at least 5k lines per app; the two
+#: default-configuration streams log one request in four, so they land near 1.8k.
 SHAPE_SURVEY_APPLOGS_DURATION_DEFAULT=300
 
-#: Requests per second the driver aims at each logging-library app, and at Django. The apps are
-#: single small containers and Django is on `runserver`; these rates keep every one of them far
-#: from saturation, because a survey that measured a saturated app would be measuring the host.
+#: Requests per second at each logging-library app, and at Django. They stay far from saturation,
+#: because a saturated app would measure the host.
 SHAPE_SURVEY_APPLOGS_RATE=25
 SHAPE_SURVEY_APPLOGS_DJANGO_RATE=8
 
-# The five images, built from tools/shape-survey/applogs/<dir>/. Built here rather than pulled:
-# they are this survey's own apps, pinned inside their Dockerfiles, and a rebuild is seconds once
-# the base layers are cached. Named `shape-survey-applogs-*` like everything else this harness
-# creates, and deliberately NOT removed at cleanup -- an image is not run state, and re-running the
-# survey should not pay for five rebuilds. Not gated on `SHAPE_SURVEY_SKIP_IMAGE` either (the same
-# call `hostagents` makes for its collectd image): that variable exists for the one shared
-# `logit:shape-survey` tag two concurrent surveys race on, and these five are producer-local, so
-# nothing else can be rebuilding them underneath a running capture.
+# The five app images, built from tools/shape-survey/applogs/<dir>/. They aren't removed at
+# cleanup, since an image isn't run state, and SHAPE_SURVEY_SKIP_IMAGE doesn't apply: they're
+# producer-local, so no concurrent run races on them.
 survey_applogs_images() {
     local dir name
     for name in python node go ruby django; do
@@ -58,9 +33,7 @@ survey_applogs_images() {
     done
 }
 
-# Every app, on this producer's network under its own alias, each writing its JSON lines into the
-# shared log directory the `tail_in`s follow. `--ready-http` against each app's own `/healthz`
-# (`/` for Django, which has no such route) -- never a blind sleep.
+# Every app, each writing JSON lines into the shared log directory the `tail_in`s follow.
 survey_applogs_services() {
     local logs="${SURVEY_RUN_DIR}/applogs"
 
@@ -85,16 +58,12 @@ survey_applogs_services() {
         ruby /app/app.rb /logs/semlog-prod.log 8000
 }
 
-# Django, under `opentelemetry-instrument`, exporting to `logit`'s own otlp_in. Started AFTER
-# `start_logit` (see survey_applogs below) so its first export has somewhere to go.
+# Django, under `opentelemetry-instrument`, exporting to `otlp_in`. Start it after `start_logit`
+# so its first export has somewhere to go.
 survey_applogs_django() {
-    #
-    # The ONLY OpenTelemetry settings given are the endpoint, the service name, and the logging
-    # opt-in. `OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED` is the documented switch for the
-    # logging instrumentation and defaults to false -- without it this leg would carry traces and
-    # metrics but no logs at all, and the brief asks for all three. Everything else (protocol,
-    # sampler, batch sizes, export intervals, resource detectors, semantic-convention opt-in) is
-    # left at the SDK's own default, which is the whole point of this leg.
+    # The only OpenTelemetry settings are the endpoint, the service name, and the logging opt-in,
+    # which defaults to false and without which this leg carries no logs. Everything else stays at
+    # the SDK's default, which is what this leg measures.
     #
     # `--ready-timeout 180` covers the migrate/seed step in entrypoint.sh.
     survey_start_service django --ready-http http://django:8000/ --ready-timeout 180 -- \
@@ -105,9 +74,8 @@ survey_applogs_django() {
         shape-survey-applogs-django:latest
 }
 
-# The producer's own section of summary.md, generated into the run directory and run there rather
-# than committed beside this file -- this producer's reading of its own numbers, computed from
-# `summary.json`'s exact value->count tables and never from shape.log.
+# The producer's own summary.md section, written into the run directory and computed from
+# summary.json alone.
 survey_applogs_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
@@ -182,8 +150,7 @@ def dist(metric, source, tap, signal=None):
 
 
 def stats_cells(stats):
-    """p50/p90/max in ONE table cell -- `/`-joined, not `|`-joined, or the row would grow three
-    columns per measure and stop lining up with its header."""
+    """p50/p90/max in one cell, `/`-joined so the row keeps its header's column count."""
     return f"{num(stats.get('p50'))} / {num(stats.get('p90'))} / {num(stats.get('max'))}"
 
 
@@ -367,11 +334,10 @@ out.append(
 )
 out.append("")
 
-# The pooled span distribution, split back into the three span kinds by attribute count. The
-# partition boundaries are the gaps in the histogram itself, and the identification is checked
-# against the traffic mix rather than asserted: the `requests` CLIENT spans must number exactly
-# the /fanout/ requests, and the SERVER spans exactly the requests plus those same fanout-internal
-# calls. If a future run's counts stop matching that, the labels below are the thing to re-derive.
+# The pooled span distribution, split back into three span kinds by attribute count at the gaps in
+# the histogram. Nothing here verifies the split; it matched the traffic mix when written
+# (`requests` CLIENT spans equal the /fanout/ requests, SERVER spans the requests plus those
+# fanout-internal calls). If a run's counts stop matching, re-derive the ranges below.
 SPAN_KINDS = [
     ("sqlite3 dbapi CLIENT", range(0, 4), "3 / 6 / 7"),
     ("`requests` CLIENT", range(4, 7), "3 / 4 / 6"),
@@ -514,8 +480,7 @@ survey_applogs() {
     start_logit "${config}"
     survey_applogs_django
 
-    # The driver *is* the capture window: it runs in the foreground for `duration` seconds,
-    # printing a progress line every 15s.
+    # The driver is the capture window: it runs in the foreground for `duration` seconds.
     survey_python driver --network "${SURVEY_NET}" -- \
         python3 /tools/applogs/drive.py "${duration}" \
         "app=http://structlog:8000,${SHAPE_SURVEY_APPLOGS_RATE}" \
@@ -525,15 +490,12 @@ survey_applogs() {
         "app=http://semlog:8000,${SHAPE_SURVEY_APPLOGS_RATE}" \
         "django=http://django:8000,${SHAPE_SURVEY_APPLOGS_DJANGO_RATE}"
 
-    # Let the tailers drain the last writes and the SDK's batch processors fire once more before
-    # the final flush. The OTLP BatchSpanProcessor's default schedule is 5s, so 20s is comfortably
-    # more than one of them.
+    # Let the tailers drain and the SDK's batch processors (5s default schedule) fire again before
+    # the final flush.
     survey_capture_for 20
 
-    # File *names*, not paths: `wc -l ${run_dir}/applogs/*.log` writes this checkout's absolute
-    # path into provenance.txt, which `combine.py` then quotes verbatim in its appendix. A run
-    # directory's own layout is not something a shared summary should carry off the machine --
-    # the same reason `shape` reports counts and lengths and nothing else.
+    # File names, not paths: combine.py quotes provenance.txt verbatim, and this checkout's
+    # absolute path shouldn't leave the machine in a shared summary.
     {
         echo "lines written per app log file:"
         ( cd "${run_dir}/applogs" && wc -l ./*.log ) | sed -e 's#\./##' -e 's/^/  /'

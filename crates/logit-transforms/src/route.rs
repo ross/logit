@@ -1,54 +1,33 @@
-//! `route`: equality-only routing, the native half of `docs/adr/target-components.md`'s two
-//! router kinds (`lua`/`lua_file`'s `event:to(..)` is the other, W5). `by:` names exactly one key
-//! to read per event -- a batch's cached provenance `origin`/`previous`, an event's own
-//! attribute, or the batch's resource attribute -- and `routes:` maps each value that key might
-//! take to a target id. An absent key, or a value no route names, is unrouted
-//! (`logit_pipeline::Destination::Forward`): the router's own consumers, or dropped and counted
-//! `logit.component.events.dropped{reason="unrouted"}` if it has none (`crate::runtime::
-//! run_router`, not this module -- see below).
+//! `route`: native equality-only routing, one of `docs/adr/target-components.md`'s two router
+//! kinds (`lua`'s `event:to(..)` is the other). `by:` names one key to read per event (the
+//! batch's provenance `origin`/`previous`, an event attribute, or a resource attribute), and
+//! `routes:` maps each value of it to a target id. An absent key, or a value no route names, is
+//! `Destination::Forward`: it goes to the router's own consumers, or, with none,
+//! `logit_pipeline::runtime::run_router` drops and counts it as
+//! `logit.component.events.dropped{reason="unrouted"}`.
 //!
-//! **Every route value is resolved to its target's slot once, in [`Route::new`], not per event.**
-//! `targets` is [`logit_pipeline::graph::targets_of`]'s output for this component -- the same
-//! slot order the node runtime builds its `Vec<Fanout>` in -- so `Destination::To(n)` here means
-//! exactly `targets[n]` there. Rules 48/51 (`docs/design/pipeline-graph.md`) guarantee every
-//! `routes:` value names a target in that list before this is ever constructed; if one didn't,
-//! that would be a graph-validation bug, not a runtime condition to recover from, so
-//! [`Route::new`] panics rather than threading a `Result` through a hot-path constructor nothing
-//! else on this trait needs.
+//! **Every route value is resolved to its target's slot once, in [`Route::new`].** `targets` is
+//! [`logit_pipeline::graph::targets_of`]'s output, the slot order the node runtime builds its
+//! `Vec<Fanout>` in, so `Destination::To(n)` means `targets[n]` there. Graph rules 48/51
+//! guarantee every `routes:` value names a target in that list, so a miss is a validation bug and
+//! [`Route::new`] panics rather than returning a `Result`.
 //!
-//! **`Origin`/`Previous` compare interned `Symbol`s -- plain integer equality, no string compare,
-//! no allocation.** This is `has_provenance`'s own `origin`/`previous` matching
-//! (`crate::provenance`), pointed at a destination instead of a keep/drop verdict: the route
-//! values are interned once here, the batch's provenance is cached from `observe_provenance`
-//! exactly as `has_provenance` caches it, and `route` is a linear scan of a handful of `Symbol`s
-//! per event.
+//! **`Origin`/`Previous` compare interned `Symbol`s,** with provenance cached from
+//! `observe_provenance` as `has_provenance` does.
 //!
-//! **`Attribute`/`Resource` reuse `has_attributes`' own coercing comparator (`crate::
-//! value_matches`), not a second equality.** A route value is always a plain YAML string (`routes:`
-//! is a `BTreeMap<String, String>`, `logit_config::ComponentKind::Route`), converted once to
-//! `Value::str(..)` at construction; `value_matches` is what lets a configured `"500"` match an
-//! attribute that arrived as `Value::I64(500)` off JSON and vice versa, the same coercion
-//! `has_attributes` guarantees. The key itself is interned once and read back with `AttrMap::
-//! get_sym`, `has_attributes`' own allocation-free lookup -- no string hashing, no allocation, on
-//! the hot path.
+//! **`Attribute`/`Resource` compare through `crate::value_matches`,** `has_attributes`' coercing
+//! comparator. A route value is always a YAML string, so this is what lets a configured `"500"`
+//! match an attribute that arrived as `Value::I64(500)`, and vice versa. The key is interned once
+//! and read with `AttrMap::get_sym`, so the per-event path allocates nothing.
 //!
-//! **Why a linear scan, not a `HashMap`.** `routes:` is an operator-authored list of a handful of
-//! alternatives (`has_provenance`/`has_attributes` make the same call for the same reason) --
-//! `Symbol`/`Value` equality is a few integer or byte compares, and a hash map would pay a hash
-//! and a probe for no measurable win at this size while costing an allocation to build.
+//! **Linear scan, not a `HashMap`:** `routes:` is a handful of operator-authored alternatives, and
+//! a map would pay a hash, a probe, and a build allocation for no win at that size.
 //!
-//! **Why no predicate.** `by:` is exactly one of `{provenance: origin}`, `{provenance: previous}`,
-//! `{attribute: <key>}`, `{resource: <key>}` -- one key read per event, equality only, no
-//! operators, no boolean algebra across keys. `docs/adr/routing-by-condition-is-lua.md`'s holding
-//! is unchanged: anything needing an operator is still a `lua` component with `targets:` (W5).
+//! **No predicate.** One key, equality only, no operators or boolean algebra across keys;
+//! anything more is a `lua` component with `targets:` (`docs/adr/routing-by-condition-is-lua.md`).
 //!
-//! **No layer-3 telemetry.** Like `generate_in` (`crates/logit-inputs/src/generate.rs`'s own
-//! "Telemetry" section), this component records no points of its own: the node runtime's uniform
-//! per-component instrumentation (`crate::runtime::run_router`/`route_batch`) already counts
-//! batches/events in and out on every destination's own `Fanout`, plus `events.dropped{reason=
-//! "unrouted"}` for the forward partition when there are no ordinary consumers -- a second counter
-//! here would only restate what layer 2 already has. `Route` therefore carries no `Telemetry`
-//! field at all, rather than one nothing ever reads.
+//! **No layer-3 telemetry, and so no `Telemetry` field.** The runtime's `run_router`/`route_batch`
+//! already count batches and events on every destination's `Fanout`, plus the unrouted drops.
 
 use crate::value_matches;
 use logit_config::{ProvenanceField, RouteBy};
@@ -58,9 +37,7 @@ use logit_pipeline::{Destination, Router};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// What [`Route`] reads from each event, with every configured value already resolved to a
-/// target slot (see the module doc). `Origin`/`Previous` compare `Symbol`s; `Attribute`/
-/// `Resource` compare `Value`s through [`value_matches`] after an interned-key lookup.
+/// What [`Route`] reads from each event, with every configured value resolved to a target slot.
 enum By {
     Origin(Vec<(Symbol, u16)>),
     Previous(Vec<(Symbol, u16)>),
@@ -68,22 +45,18 @@ enum By {
     Resource(Symbol, Vec<(Value, u16)>),
 }
 
-/// The native `route` component (`docs/adr/target-components.md`). See the module doc for the
-/// per-`by:` semantics and why each is allocation-free per event.
+/// The native `route` component; see the module doc.
 pub struct Route {
     by: By,
-    /// Cached from `observe_provenance`, which fires once per incoming batch before any of that
-    /// batch's events reach `route` -- `crate::provenance::Matcher`'s own caching, applied here.
-    /// Irrelevant (and never read) for `Attribute`/`Resource` routing.
+    /// Cached from `observe_provenance`, which fires once per batch before its events reach
+    /// `route`. Read only for `Origin`/`Previous`.
     provenance: Provenance,
 }
 
 impl Route {
-    /// `targets` is the slot order (`logit_pipeline::graph::targets_of`'s output for this
-    /// component, `ResolvedComponent::targets`) -- every `routes` value is resolved to its
-    /// position in it, once, here. Panics if a value isn't in `targets`: rules 48/51 guarantee
-    /// every `routes:` value names a target this router directs at, so that can only happen if a
-    /// caller builds a `Route` from a `routes`/`targets` pair that didn't come from a resolved
+    /// Resolves every `routes` value to its slot in `targets` (`ResolvedComponent::targets`).
+    ///
+    /// Panics if a value isn't in `targets`, which graph rules 48/51 rule out for a resolved
     /// graph.
     pub fn new(by: RouteBy, routes: &BTreeMap<String, String>, targets: &[String]) -> Self {
         let slot_of = |target: &str| -> u16 {
@@ -152,8 +125,7 @@ impl Router for Route {
     }
 }
 
-/// Linear scan for `Origin`/`Previous`: `Symbol` equality is a plain integer compare, and
-/// `routes` is a handful of alternatives at most (see the module doc's "why a linear scan").
+/// The slot of the route naming `actual`, else `Forward`.
 fn by_symbol(routes: &[(Symbol, u16)], actual: Symbol) -> Destination {
     routes
         .iter()
@@ -161,9 +133,7 @@ fn by_symbol(routes: &[(Symbol, u16)], actual: Symbol) -> Destination {
         .map_or(Destination::Forward, |(_, slot)| Destination::To(*slot))
 }
 
-/// Linear scan for `Attribute`/`Resource`, through [`value_matches`] -- `has_attributes`' own
-/// coercing comparator, so a configured `"500"` matches an actual `Value::I64(500)` and vice
-/// versa.
+/// The slot of the first route whose value [`value_matches`] `actual`, else `Forward`.
 fn by_value(routes: &[(Value, u16)], actual: &Value) -> Destination {
     routes
         .iter()

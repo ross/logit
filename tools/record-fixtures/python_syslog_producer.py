@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Drives `demo/app/pages/syslog_handler.py`'s `NoNulSysLogHandler` to produce real fixture
-datagrams for `script/record-fixtures`'s `python-syslog-handler` producer.
+"""Drives the demo app's `NoNulSysLogHandler` (`demo/app/pages/syslog_handler.py`) to produce
+fixture datagrams for `script/record-fixtures`'s `python-syslog-handler` producer.
 
-This is the actual handler the demo app configures in production (`demo/logit.yaml`'s app tier),
-not a hand-rolled stand-in for it -- `script/record-fixtures` bind-mounts
-`demo/app/pages/syslog_handler.py` alongside this file so the import below is the real module, not
-a copy. Two messages are sent, both through the same handler/formatter path a real Django
-`logging` call would use:
+`script/record-fixtures` bind-mounts the real module beside this file, so the import is the
+handler the demo app configures, not a copy. Two messages go through the handler/formatter path a
+Django `logging` call uses:
 
-1. A plain text message, to exercise the ordinary case.
-2. A JSON body, the shape `demo/logit.yaml`'s app tier actually emits -- and the exact case
-   `NoNulSysLogHandler` exists for: the base `SysLogHandler` appends a trailing NUL byte that used
-   to land right after this message's closing `}` and break `logit`'s `json` transform. Recording
-   it as a fixture pins that behavior (or catches a regression in Python's stdlib) going forward.
+1. A plain text message.
+2. A JSON body, the shape the demo's app tier emits and the case `NoNulSysLogHandler` exists for:
+   the base `SysLogHandler` appends a trailing NUL after the closing `}`, which breaks `logit`'s
+   `json` transform. The fixture pins the fix and catches a stdlib regression.
 
 Usage: python3 python_syslog_producer.py --host <capture-container-name> --port 5514
 """
