@@ -222,7 +222,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | unreviewed |
-| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | unreviewed |
+| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | reviewed @e3aa53b |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs:874-928` | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs:167-414` | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs:147-182` | unreviewed |
@@ -2536,6 +2536,10 @@ surveyor's.
 - **Suggested verification approach:** a `cargo-fuzz` target over `read_frame` (no fuzz targets exist in this repo
   today) asserting no panic and no allocation over the caps; a property test that `write_frame ∘ read_frame` is
   total for every payload up to the cap under both compressions.
+- **Verified (`dur/w2`):** `crates/logit-proto/tests/frame_fixed_point.rs` adds that property test (random and
+  compressible payloads up to 256 KiB, both compressions, concatenation, the lz4 worst-case bound, and the full
+  64 MiB cap), and pins that a `compressed_len` corrupted below the sanity cap reads as `Truncated` — confirming
+  this layer is correct as-is; the closed-segment consumer behavior F1 flags is `dur/w3`'s fix, not this file's.
 - **Priority:** P1 — the caps and CRC are correct and tested, but this is the one decoder standing between corrupt
   disk bytes and an allocation, and the `Truncated`/`Malformed` distinction is load-bearing for disk recovery.
 
