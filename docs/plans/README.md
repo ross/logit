@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: Dynatrace — OTLP and the ingest APIs, OneAgent-local stand-in, intake stand-in](dynatrace-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: Splunk — HEC in both directions, and Observability Cloud over OTLP](splunk-relay.md) | 2026-09-24 | 2026-09-24 |
