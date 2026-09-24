@@ -1235,10 +1235,10 @@ data loss.
 - `logit.output.messages.truncated` and
   `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`: per-message size
   handling (`docs/adr/syslog-output.md`'s "Sizing" section).
-- `logit.output.structured_data.dropped{reason="invalid_sd_name"}`: an SD element skipped because
-  its SD-ID isn't a valid RFC 5424 `SD-NAME`, its `syslog.sd` value isn't a nested map of
-  PARAM-NAME to value, or an opt-in element collides with one the event already carries; or one
-  param skipped for an invalid PARAM-NAME.
+- `logit.output.structured_data.dropped{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
+  an SD-ID or PARAM-NAME that isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID skips the
+  element, an invalid PARAM-NAME that param); a `syslog.sd` element whose value isn't a map of
+  PARAM-NAME to value; the opt-in element colliding with an SD-ID the event already carries.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both take the same connect path
