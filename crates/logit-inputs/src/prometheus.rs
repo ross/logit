@@ -1433,11 +1433,11 @@ async fn write_response(
     // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a
     // missing header is as unusable as a wrong one.
     let encoding = header_str(req.headers(), http::header::CONTENT_ENCODING);
-    if !encoding.eq_ignore_ascii_case(remote_write::CONTENT_ENCODING_SNAPPY) {
+    if !encoding.eq_ignore_ascii_case(logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY) {
         let message = format!(
             "unsupported Content-Encoding {encoding:?} -- remote-write is always \
              '{}' (block format)",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY
         );
         diag.warn_throttled(
             "write_rejected",
@@ -2327,7 +2327,7 @@ mod tests {
         format!(
             "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nUser-Agent: test\r\n",
             version.content_type(),
-            remote_write::CONTENT_ENCODING_SNAPPY,
+            logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY,
             remote_write::HEADER_VERSION,
             version.header_version()
         )
@@ -2543,7 +2543,7 @@ mod tests {
         let headers = format!(
             "Content-Type: application/x-protobuf;proto=some.other.Message\r\n\
              Content-Encoding: {}\r\nConnection: close\r\n",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY
         );
 
         let response = post_raw(&addr, "/api/v1/write", &headers, &snappy(b"")).await;
@@ -2560,7 +2560,7 @@ mod tests {
         let _rx = spawn_receiver(receiver, 4);
         let headers = format!(
             "Content-Encoding: {}\r\nConnection: close\r\n",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY
         );
 
         let response = post_raw(&addr, "/api/v1/write", &headers, &snappy(b"")).await;
@@ -3149,7 +3149,7 @@ mod tests {
              {}\r\nContent-Encoding: {}\r\n\r\n",
             body.len(),
             remote_write::Version::V1.content_type(),
-            remote_write::CONTENT_ENCODING_SNAPPY
+            logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY
         );
         keep_alive.write_all(request.as_bytes()).await.unwrap();
         keep_alive.write_all(&body).await.unwrap();

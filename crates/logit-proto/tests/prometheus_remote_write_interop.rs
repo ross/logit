@@ -36,18 +36,23 @@
 //!   the inline-metadata path; `prometheus_remote_write_fixed_point.rs` and the round-trip test
 //!   cover that against `logit`'s own sender, which does populate it.
 //! - **vmagent sends its default wire, the "VictoriaMetrics remote write protocol": 1.0 with
-//!   `Content-Encoding: zstd`.** This codec has no zstd yet, so the `vmagent-zstd-*` captures are
-//!   checked only for what their sidecars say until
-//!   `docs/plans/victoriametrics-interop.md`'s W2 (Design §4, "A shared compression seam") lands;
-//!   the `vmagent-snappy-*` captures, recorded under `-remoteWrite.forcePromProto`, decode fully.
+//!   `Content-Encoding: zstd`.** The `vmagent-zstd-*` captures decompress through
+//!   `logit_proto::prometheus::compression`, the bounded decoder `prometheus_in` uses, under
+//!   `prometheus_in`'s own 4 MiB cap; the `vmagent-snappy-*` captures, recorded under
+//!   `-remoteWrite.forcePromProto`, are the same scrape on plain remote-write 1.0. Both pairs
+//!   decode fully and to the same families.
 //! - **vmagent doesn't sort a series' labels**: it appends the target's `instance`/`job` after the
 //!   exposition's own labels. The decoder sorts them (`remote_write.rs`'s `invalid_labels` row).
 
 use logit_core::Registry;
+use logit_proto::prometheus::compression::{decompress_bounded, Encoding};
 use logit_proto::prometheus::remote_write::{decode_with, Declarations, Version};
 use logit_proto::prometheus::{FamilyType, MetricFamily, PrometheusDecoder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// `prometheus_in`'s `MAX_REQUEST_BYTES`, the cap a recorded body has to fit under at the receiver.
+const RECEIVER_CAP: usize = 4 * 1024 * 1024;
 
 fn interop_dir() -> PathBuf {
     // `crates/logit-proto/` -> repository root.
@@ -81,16 +86,20 @@ impl Capture {
     }
 
     /// The body, decompressed per the sidecar's `Content-Encoding`: the only transformation this
-    /// test performs on a captured body. `snappy` means the **block** format, as in both specs.
-    /// Any other encoding is `Err` with its name; `zstd` joins `snappy` in W2.
-    fn decompressed(&self) -> Result<Vec<u8>, String> {
+    /// test performs on a captured body. `snappy` means the **block** format, as in both specs,
+    /// decoded with `snap` directly; `zstd` goes through the receiver's own bounded decoder, under
+    /// the receiver's cap, since that decoder is what a vmagent request meets.
+    fn decompressed(&self) -> Vec<u8> {
         match self.encoding() {
-            "snappy" => {
-                Ok(snap::raw::Decoder::new().decompress_vec(&self.body).unwrap_or_else(|e| {
-                    panic!("{}: a real sender's body must decompress: {e}", self.name)
-                }))
+            "snappy" => snap::raw::Decoder::new().decompress_vec(&self.body).unwrap_or_else(|e| {
+                panic!("{}: a real sender's body must decompress: {e}", self.name)
+            }),
+            "zstd" => {
+                decompress_bounded(Encoding::Zstd, &self.body, RECEIVER_CAP).unwrap_or_else(|e| {
+                    panic!("{}: a real vmagent body must decompress: {e}", self.name)
+                })
             }
-            other => Err(other.to_string()),
+            other => panic!("{}: unexpected Content-Encoding {other:?}", self.name),
         }
     }
 }
@@ -130,9 +139,7 @@ fn replay_with(capture: &Capture, seed: &Declarations) -> Replayed {
         "prometheus_in",
         "source",
     ));
-    let body = capture
-        .decompressed()
-        .unwrap_or_else(|encoding| panic!("{}: no {encoding} decoder yet", capture.name));
+    let body = capture.decompressed();
     let decoded = decode_with(&body, capture.version(), &mut decoder, seed)
         .unwrap_or_else(|e| panic!("{}: a real sender's request must decode: {e}", capture.name));
 
@@ -230,11 +237,6 @@ fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
             Some(expected_user_agent(name)),
             "{name}: the provenance table's producer and the capture must agree"
         );
-        if capture.encoding() == "zstd" {
-            // Nothing to decode with until W2; `vmagent_zstd_captures_are_the_victoriametrics_wire`
-            // checks what the sidecar says.
-            continue;
-        }
         let replayed = replay(&capture);
         assert_eq!(
             replayed.reasons,
@@ -473,15 +475,14 @@ fn vmagent_split(names: [&str; 2]) -> (Capture, Capture) {
 }
 
 /// The zstd captures are the "VictoriaMetrics remote write protocol" as vmagent sends it: 1.0,
-/// zstd, and vmagent's own version header in place of Prometheus's. This test's decoder has no
-/// zstd yet, so it asserts what the sidecar says and that the body is a zstd frame;
-/// `docs/plans/victoriametrics-interop.md`'s W2 makes them decode.
+/// zstd, and vmagent's own version header in place of Prometheus's, and a zstd frame that
+/// decompresses to the same sample body the Snappy wire carried.
 #[test]
 fn vmagent_zstd_captures_are_the_victoriametrics_wire() {
     for name in VMAGENT_ZSTD {
         let capture = read_capture(name);
         assert_eq!(capture.encoding(), "zstd", "{name}");
-        assert_eq!(capture.decompressed(), Err("zstd".to_string()), "{name}");
+        assert_eq!(Encoding::from_header(capture.encoding()), Some(Encoding::Zstd), "{name}");
         assert_eq!(
             capture.headers.get("x-victoriametrics-remote-write-version").map(String::as_str),
             Some("1"),
@@ -495,6 +496,13 @@ fn vmagent_zstd_captures_are_the_victoriametrics_wire() {
         // RFC 8878 §3.1.1's magic number, little-endian.
         assert_eq!(capture.body.get(..4), Some(&[0x28, 0xb5, 0x2f, 0xfd][..]), "{name}");
     }
+    let (zstd_samples, _) = vmagent_split(VMAGENT_ZSTD);
+    let (snappy_samples, _) = vmagent_split(VMAGENT_SNAPPY);
+    assert_eq!(
+        zstd_samples.decompressed().len(),
+        snappy_samples.decompressed().len(),
+        "one scrape's sample request, whichever wire carried it"
+    );
 }
 
 /// Under `-remoteWrite.forcePromProto`, vmagent sends plain Snappy 1.0 with Prometheus's version
@@ -510,8 +518,21 @@ fn a_vmagent_snappy_sample_request_decodes_every_series() {
             "{name}"
         );
     }
-    let (samples, _) = vmagent_split(VMAGENT_SNAPPY);
+    assert_vmagent_samples_decode_every_series(VMAGENT_SNAPPY);
+}
+
+/// vmagent's default zstd wire decodes to the same series as its Snappy one.
+#[test]
+fn a_vmagent_zstd_sample_request_decodes_every_series() {
+    assert_vmagent_samples_decode_every_series(VMAGENT_ZSTD);
+}
+
+/// The target's flat families plus vmagent's own `up`/`scrape_*` series, each with the scrape
+/// identity as labels and its unsorted labels sorted.
+fn assert_vmagent_samples_decode_every_series(names: [&str; 2]) {
+    let (samples, _) = vmagent_split(names);
     let replayed = replay(&samples);
+    assert_eq!(replayed.reasons, Vec::<String>::new(), "{}: nothing skipped", samples.name);
 
     let names: BTreeSet<&str> =
         replayed.families.iter().map(|family| family.name.as_str()).collect();
@@ -541,10 +562,16 @@ fn a_vmagent_snappy_sample_request_decodes_every_series() {
 
 /// vmagent's metadata request declares the target's four families, and seeding its sample request
 /// with them types those four while vmagent's own `up`/`scrape_*` series, which no `# TYPE` line
-/// declared, stay untyped.
+/// declared, stay untyped. The same on both wires.
 #[test]
 fn vmagent_metadata_types_its_own_sample_request() {
-    let (samples, metadata) = vmagent_split(VMAGENT_SNAPPY);
+    for names in [VMAGENT_SNAPPY, VMAGENT_ZSTD] {
+        assert_vmagent_metadata_types_its_samples(names);
+    }
+}
+
+fn assert_vmagent_metadata_types_its_samples(names: [&str; 2]) {
+    let (samples, metadata) = vmagent_split(names);
     let declared = replay(&metadata);
     assert!(declared.families.is_empty(), "{}: metadata only", metadata.name);
 

@@ -6,9 +6,10 @@
 //! [`super`]'s module doc already states: remote-write is a *transport* for the semantics the
 //! exposition format describes.
 //!
-//! Neither Snappy nor HTTP is this module's business. The caller decompresses (block format,
-//! `snap::raw`, **not** the framed one), enforces its own body cap, and hands over plain protobuf;
-//! [`Version`] holds the header knowledge both the receiver and the sender need.
+//! Neither compression nor HTTP is this module's business. The caller decompresses through
+//! [`super::compression`], which holds the `Content-Encoding`s and the body cap's enforcement, and
+//! hands over plain protobuf; [`Version`] holds the header knowledge both the receiver and the
+//! sender need.
 //!
 //! References:
 //! <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
@@ -22,7 +23,7 @@
 //! | message | `prometheus.WriteRequest` | `io.prometheus.write.v2.Request` |
 //! | `Content-Type` | `application/x-protobuf`, and `application/x-protobuf;proto=prometheus.WriteRequest` is what Prometheus itself sends | `application/x-protobuf;proto=io.prometheus.write.v2.Request` |
 //! | `X-Prometheus-Remote-Write-Version` | `0.1.0` | `2.0.0` |
-//! | `Content-Encoding` | `snappy` (block) | `snappy` (block) |
+//! | `Content-Encoding` | `snappy` (block), or `zstd` in the VictoriaMetrics variant | `snappy` (block) |
 //! | metadata | `WriteRequest.metadata[]`, one entry per family, naming the family explicitly | `TimeSeries.metadata`, inline per series, with **no family-name field** -- the family is derived from the sample name and the type ([`assemble::family_base`]) |
 //! | strings | inline | a request-wide `symbols` table, `symbols[0] == ""`, everything referenced by index |
 //! | created timestamp | no equivalent field | `Sample.start_timestamp` (milliseconds, `0` = unset) |
@@ -191,8 +192,6 @@ pub const HEADER_SAMPLES_WRITTEN: &str = "x-prometheus-remote-write-samples-writ
 pub const HEADER_HISTOGRAMS_WRITTEN: &str = "x-prometheus-remote-write-histograms-written";
 /// 2.0's report of how many exemplars the receiver stored.
 pub const HEADER_EXEMPLARS_WRITTEN: &str = "x-prometheus-remote-write-exemplars-written";
-/// The only `Content-Encoding` either version defines -- Snappy **block** format, not framed.
-pub const CONTENT_ENCODING_SNAPPY: &str = "snappy";
 
 /// The media type both versions build on; the `proto=` parameter is what tells them apart.
 const MEDIA_TYPE: &str = "application/x-protobuf";

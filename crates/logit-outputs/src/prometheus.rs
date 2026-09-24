@@ -871,7 +871,7 @@ impl RemoteWriteOutput {
         );
         headers.insert(
             http::header::CONTENT_ENCODING,
-            HeaderValue::from_static(remote_write::CONTENT_ENCODING_SNAPPY),
+            HeaderValue::from_static(logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY),
         );
         headers.insert(
             HeaderName::from_static(remote_write::HEADER_VERSION),

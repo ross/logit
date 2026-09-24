@@ -91,8 +91,8 @@ that:
   sorted, and its own metadata request types the target's four families while `up` and the
   `scrape_*` series stay untyped.
 - The zstd captures carry `content-encoding: zstd`, vmagent's version header and no Prometheus
-  one, and a zstd frame. The test has no zstd decoder, so it stops there;
-  `docs/plans/victoriametrics-interop.md`'s W2 adds one and makes both decode.
+  one, and a zstd frame. They decompress through `prometheus_in`'s own bounded decoder, under its
+  4 MiB cap, and decode to the same series and types as the Snappy pair.
 
 **This corpus found a codec bug, which is what it was for.** Recorded against the assembler as it
 stood, the first of those assertions read `["unknown_suffix"]` for every sample capture.
