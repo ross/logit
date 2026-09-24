@@ -1,37 +1,33 @@
 //! `set`: stamps operator-configured constant values onto every event's attributes and/or the
-//! batch's resource -- the mechanism `docs/adr/operator-declared-resource-attributes.md` settles
-//! on for "give this traffic a real `service.name`" instead of a per-input config field. See that
-//! ADR for why a graph component, not a listener-specific field.
+//! batch's resource, such as a real `service.name`. See
+//! `docs/adr/operator-declared-resource-attributes.md` for why this is a graph component rather
+//! than a per-input config field.
 
 use logit_core::interner::{intern, Symbol};
 use logit_core::{Event, Resource, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// Stamps a fixed set of key/value pairs onto every event's attributes (`process`) and/or every
-/// batch's resource (`map_resource`), overwriting on key collision -- a configured value always
-/// wins over whatever the wire carried. Either list may be empty; a `Set` with both empty is
-/// rejected at graph-validation time (`crates/logit-pipeline/src/graph.rs`) as a certain no-op,
-/// the same rule `kv_metrics` already has.
+/// Stamps fixed key/value pairs onto event attributes (`process`) and/or the batch resource
+/// (`map_resource`).
+///
+/// A configured value overwrites whatever the wire carried. Either list may be empty; graph rule
+/// 12 rejects a `Set` with both empty.
 pub struct Set {
-    /// Interned once, at construction, from `logit-cli::pipeline::to_set_pairs`'s config
-    /// conversion -- keeps the per-event hot path free of interner lookups
-    /// (`AttrMap::insert_sym`'s doc comment).
+    /// Interned once in [`Set::new`] to keep interner lookups off the per-event path.
     resource_pairs: Vec<(Symbol, Value)>,
     attribute_pairs: Vec<(Symbol, Value)>,
-    /// A one-entry cache of the last resource this component mapped, keyed by `Arc::ptr_eq` on
-    /// the *input* -- every listener shipped today stamps one `Arc<Resource>` per decoder
-    /// instance onto every batch it produces (`docs/design/data-model.md`), so in practice this
-    /// turns every `map_resource` call after the first into a free `Arc` clone rather than a
-    /// rebuild. `None` until the first batch with a non-empty `resource_pairs` arrives.
+    /// The last `(input, output)` resource pair, matched by `Arc::ptr_eq` on the input.
+    ///
+    /// A listener stamps one `Arc<Resource>` per decoder instance on every batch
+    /// (`docs/design/data-model.md`), so after the first batch `map_resource` is an `Arc` clone
+    /// rather than a rebuild.
     cache: Option<(Arc<Resource>, Arc<Resource>)>,
     telemetry: Telemetry,
 }
 
 impl Set {
-    /// `resource`/`attributes` are plain `(String, Value)` pairs -- `logit-transforms` doesn't
-    /// depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the
-    /// `SetValue -> Value` conversion happens in `logit-cli::pipeline` before this is called.
+    /// Builds a `Set` from pairs `logit-cli`'s `to_set_pairs` has converted from config.
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
         Self {
             resource_pairs: resource.into_iter().map(|(k, v)| (intern(&k), v)).collect(),
@@ -41,8 +37,9 @@ impl Set {
         }
     }
 
-    /// Attaches a telemetry handle -- see [`Keep::with_telemetry`](crate::Keep::with_telemetry)
-    /// for why there's no `Diagnostics` builder alongside it: stamping fixed values can't fail.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: stamping fixed values can't fail.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -70,9 +67,8 @@ impl Transform for Set {
         for (key, value) in &self.resource_pairs {
             attrs.insert_sym(*key, value.clone());
         }
-        // `dropped_attributes_count`/`schema_url` aren't configurable through `set` -- carry them
-        // over from the input resource explicitly rather than defaulting them, so rebuilding the
-        // resource here doesn't silently discard what it already reported.
+        // Carry `dropped_attributes_count`/`schema_url` over; defaulting them would discard what
+        // the input resource reported.
         let out = Arc::new(Resource {
             attributes: attrs,
             dropped_attributes_count: resource.dropped_attributes_count,
