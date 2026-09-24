@@ -31,9 +31,9 @@ Two of VictoriaMetrics's wires are its own:
 The data model is a strict subset of `Event`'s: a series is a label set, a millisecond
 timestamp, and an `f64`. VictoriaMetrics stores no metric type, unit, description, or
 exemplar, accepts remote-write native histograms and converts them to its own `vmrange`
-buckets, and rejects remote-write 2.0 outright. So a `logit -> VictoriaMetrics` relay loses
-only what VictoriaMetrics can't hold, and a `VictoriaMetrics -> logit` relay over `/federate`
-returns every series untyped.
+buckets, and doesn't accept remote-write 2.0: it answers `204` and stores nothing. So a
+`logit -> VictoriaMetrics` relay loses only what VictoriaMetrics can't hold, and a
+`VictoriaMetrics -> logit` relay over `/federate` returns every series untyped.
 
 The workspace keeps zstd out on purpose: the `zstd` crate builds C through `zstd-sys`, which
 [ADR `containerized-development`](containerized-development.md) rules out, and
@@ -50,7 +50,7 @@ by the existing standard-protocol components:
 
 | Surface | Component and setting |
 |---|---|
-| VictoriaMetrics `/api/v1/write` (remote-write 1.0) | `prometheus_out` with `endpoint:` and `version: 1`. `version: 2` is rejected by VictoriaMetrics |
+| VictoriaMetrics `/api/v1/write` (remote-write 1.0) | `prometheus_out` with `endpoint:` and `version: 1`. `version: 2` gets a `204` and is stored nowhere |
 | vmagent scraping `logit` | `prometheus_out` with `bind:` |
 | VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` |
 | VictoriaMetrics `-graphiteListenAddr` | `graphite_out`, plaintext, `tags: carbon` |
@@ -134,8 +134,8 @@ Compression is a sink-configured transport choice, so under
 - A verification harness, `script/victoria-interop` over `tools/victoria-interop/`, runs the
   three products and vmagent in compose and confirms each leg above against real software. It
   is outside `script/cibuild`, like `script/shape-survey`. The recorded vmagent requests it
-  captures, one zstd and one Snappy, join `testdata/interop/prometheus/` and the interop test
+  captures, on the zstd wire and the Snappy one, join `testdata/interop/prometheus/` and the interop test
   that replays that corpus.
 - Every remaining unknown, from vmagent's header requirements to what VictoriaMetrics does with
-  a delta OTLP sum, is listed in the plan's "Unverified, to be settled by W1" section and
+  a delta OTLP sum, is listed in the plan's "Unverified, settled by W1" section and
   answered there, not here.
