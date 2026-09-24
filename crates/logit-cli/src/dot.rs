@@ -1,14 +1,13 @@
 //! `logit graph`: renders a config's component graph as graphviz DOT
 //! (`docs/design/pipeline-graph.md`'s "`logit graph`: visualizing the resolved DAG" section).
 //!
-//! Deliberately renders straight off `Config`, not a resolved `Graph`: it needs only that a
-//! `source` id can be written as an edge target, which is true even for a config that ultimately
-//! fails validation (an undefined source becomes a bare auto-created node in the rendered
-//! graph -- exactly the kind of thing this command exists to make visible). This is what lets
-//! `logit graph` print *something* useful for a cyclic or otherwise-broken config, rather than
-//! only ever working on configs `logit run` would already accept. It still needs a fully-typed
-//! `Config`, though -- every `!env` reference (including one on a field this command never reads,
-//! like a token) must resolve first, same as `run`/`validate` (`docs/adr/env-yaml-tag.md`).
+//! Renders off `Config`, not a resolved `Graph`, so a cyclic or otherwise invalid config still
+//! renders: an undefined source becomes a bare node graphviz auto-creates, which is what this
+//! command exists to show. It still needs a typed `Config`, so every `!env` reference must
+//! resolve first, even on a field this never reads (`docs/adr/env-yaml-tag.md`).
+//!
+//! Conventions: a listener is a rounded box, a transform an ellipse, a sink a bold box, and a
+//! target a dashed box. A `sources` edge is solid; a router -> target edge is dashed.
 
 use logit_config::Config;
 use logit_pipeline::graph::{self, role, Role};
@@ -21,9 +20,8 @@ pub fn render(config: &Config) -> String {
             Role::Listener => ("box", "filled,rounded"),
             Role::Transform => ("ellipse", "filled"),
             Role::Sink => ("box", "filled,bold"),
-            // A target is a named destination, not a component that does anything to an event
-            // (`docs/adr/target-components.md`) -- dashed, matching the dashed router -> target
-            // edges below.
+            // A target does nothing to an event (`docs/adr/target-components.md`); dashed, like
+            // the router -> target edges into it.
             Role::Target => ("box", "filled,dashed"),
         };
         out.push_str(&format!("  {id:?} [shape={shape}, style=\"{style}\", label={id:?}];\n"));
@@ -33,11 +31,9 @@ pub fn render(config: &Config) -> String {
         for source in &component.sources {
             out.push_str(&format!("  {source:?} -> {id:?};\n"));
         }
-        // Router -> target edges run the other way round from a `sources` edge -- they're
-        // declared on the *producer* (`docs/adr/target-components.md`) -- so they're drawn
-        // dashed, labelled with the route key that directs an event down each one. A
-        // `lua`/`lua_file` `targets:` entry has no key (the destination is chosen in the script),
-        // so it gets no label rather than an empty one.
+        // Router -> target edges are declared on the producer, not the consumer
+        // (`docs/adr/target-components.md`), so they're dashed and labelled with the route key.
+        // A `lua`/`lua_file` `targets:` entry has no key (the script picks), so no label.
         for (key, target) in graph::target_edges(component) {
             match key {
                 Some(key) => out
@@ -97,9 +93,7 @@ mod tests {
         assert!(dot.contains("\"in\" -> \"out\";"), "got: {dot}");
     }
 
-    /// A dangling source reference (would fail validation) still renders -- graphviz auto-creates
-    /// a bare node for an edge target with no explicit definition, which is exactly the point:
-    /// `logit graph` should make a typo'd source visible, not refuse to render around it.
+    /// A dangling source reference still renders as an edge, making a typo'd source visible.
     #[test]
     fn a_dangling_source_reference_still_renders_an_edge() {
         let mut components = HashMap::new();
@@ -132,8 +126,7 @@ mod tests {
         }
     }
 
-    /// A target is a named destination rather than a component that does anything to an event, so
-    /// it renders dashed -- the same styling as the edges directed into it.
+    /// A target renders as a dashed node.
     #[test]
     fn a_target_renders_as_a_dashed_node() {
         let mut components = HashMap::new();
@@ -143,10 +136,7 @@ mod tests {
         assert!(dot.contains("\"host_stream\" [shape=box, style=\"filled,dashed\""), "got: {dot}");
     }
 
-    /// Router -> target edges are declared on the producer, not the consumer, so they're drawn
-    /// dashed and labelled with the route key -- except a `lua` `targets:` entry, whose
-    /// destination is chosen in the script and so carries no key to label
-    /// (`docs/adr/target-components.md`).
+    /// Router -> target edges are dashed and labelled with the route key; a `lua` one has no label.
     #[test]
     fn router_to_target_edges_render_dashed_and_labelled() {
         let mut components = HashMap::new();
