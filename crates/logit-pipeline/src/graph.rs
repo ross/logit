@@ -186,8 +186,8 @@
 //!     and 45/53, `unix_stream` a stream one (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 65. A `datadog_out` with an empty `api_key` or one with leading or trailing whitespace, an
 //!     empty `site` or one with a scheme or `/`, an `endpoints` entry that isn't an absolute
-//!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name 22 would reject against
-//!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing 24's checks, the scheme one only when no
+//!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name rule 22 would reject against
+//!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing rule 24's checks, the scheme one only when no
 //!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like

@@ -1,12 +1,12 @@
 //! `datadog_out -> datadog_in` over a real socket: the sink's `endpoints` point every intake at a
-//! listener on `127.0.0.1:0`, and each route's batch arrives exactly as sent.
+//! listener on `127.0.0.1:0`, and each route's batch arrives as sent.
 //!
 //! Each batch is one decode of a hand-written wire payload, so it sits on the codec's fixed point
 //! (`crates/logit-proto/tests/datadog_*_fixed_point.rs`), and `datadog_out` re-encoding it gives
 //! the same batch back through `datadog_in`. Timestamps are relative to now, since `datadog_out`
 //! drops points outside Datadog's windows before sending. What this file adds over the codec
 //! tests is both HTTP hops: routing, `Content-Type`, gzip and deflate, the `DD-API-KEY` check,
-//! and the two things `datadog_out` deliberately doesn't send.
+//! and the two things `datadog_out` doesn't send.
 
 use logit_core::interner::{intern, resolve};
 use logit_core::{
