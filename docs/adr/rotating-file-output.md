@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-08
+updated: 2026-09-24
 ---
 
 # `file_out`: a rotating file sink, sharing `stdio_out`'s implementation
@@ -305,3 +305,20 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   away. `RotationState::seed_period` and the `unix_seconds`/`now_unix` mtime-conversion path are
   new; `FileTarget::open` now calls both `open_active` (also new, shared with `rotate_inner`'s two
   re-open sites) and `seed_period`.
+
+## Amendment: `file_out` makes no durability promise (2026-09-24)
+
+"Retention: logrotate's own numbered-suffix cascade, commit-point first" above says an
+interrupted rotation loses nothing. That holds against a process crash, not a power loss.
+Nothing in `crates/logit-outputs/src/file.rs` fsyncs: not the active file after a write, not the
+`.rotating` staging file, and not the directory after the commit-point rename or a cascade rename.
+A rename is atomic against a process crash, but after a power loss the kernel may not have
+written the rename, the file's most recent data, or both.
+
+This is by design for a log-file sink. `file_out` writes for a human or a downstream tool to
+read, and an fsync per batch or per rotation would cost every deployment for a guarantee few of
+them need. A sink that must survive a power loss belongs behind `buffer.disk:`
+([ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)) with a destination that has its own
+durability. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
+records this as its decision 6, and `docs/known-gaps.md` lists it under "File, stdio, and InfluxDB
+sinks".

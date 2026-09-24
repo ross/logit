@@ -295,6 +295,17 @@ filesystem defeats the point, as it would for any durable state (`tail_in`'s che
 shutdown, not per push. A process crash (including `SIGKILL`) loses nothing already written; a
 power loss can lose the most recent, not-yet-synced tail of the active segment.
 
+**The spool survives a restart, not an outage longer than `retry_budget`.** A batch the sink
+gives up on (a permanent failure, or one still failing when `buffer.retry_budget` runs out) is
+removed from the spool and counted `batches.dropped{reason="send_failed"}`, exactly as an
+in-memory queue drops it. A restart doesn't bring it back. To ride out a longer destination
+outage, raise `retry_budget` as well as `disk.max_bytes`
+([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md#amendment-a-dropped-batch-is-committed-off-the-spool-2026-09-24)).
+
+**`file_out` never fsyncs**, with or without a `buffer.disk:` block: a power loss can lose its most
+recent writes or an in-progress rotation, by design
+([ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24)).
+
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
 the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
