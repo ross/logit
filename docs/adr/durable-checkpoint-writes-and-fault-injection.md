@@ -46,15 +46,15 @@ DISK-09, DISK-10, DISK-13, TAIL-05). Reading them against their ADRs found this:
   the disk ADR nor `docs/deploying.md` says so.
 - **A leaked spool segment is never deleted.** `roll_read_cursor` drops a segment from memory
   whether or not its unlink succeeds. The next `DiskQueue::open` re-lists the file, counts it in
-  `total_bytes`, and never deletes it, so enough of them fill `max_bytes`. Closed by `dur/w5`.
+  `total_bytes`, and never deletes it, so enough of them fill `max_bytes`. Closed by #333.
 - **A full `block` spool with nothing queued waits forever.** Once the reader has consumed
   everything, the active segment's bytes still count toward `max_bytes`, and the active segment
   is never deleted. With `segment_bytes` close to `max_bytes`, a push that doesn't fit parks on
   `not_full` while the reader parks on `not_empty`, and nothing wakes either; `drop_newest` drops
-  every later push. Closed by `dur/w5`.
+  every later push. Closed by #333.
 - **A batch parked in a `block` push is lost uncounted at shutdown.** `run_output` drops
   `drain_inbox` when `write_loop` finishes first, and the batch `drain_inbox` was pushing goes
-  with the future: not spooled, not counted `reason="shutdown"`. Closed by `dur/w5`.
+  with the future: not spooled, not counted `reason="shutdown"`. Closed by #333.
 - **None of the crash paths above has a test.** A test can't make `fsync` fail or stop a process
   between a `rename` and the next syscall. `crates/logit-cli/tests/durable_buffer_restart.rs`
   covers one `SIGKILL` at one point. `FileTarget::rotate_with` injects a failing opener and
