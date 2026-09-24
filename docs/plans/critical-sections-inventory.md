@@ -177,8 +177,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs:77-162` | unreviewed |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs:59-158` | in-progress (dur/w6) |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs:141-154` | unreviewed |
-| [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | in-progress (dur/w3) |
-| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | in-progress (dur/w3) |
+| [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | findings → dur/w3 |
+| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | findings → dur/w3 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | in-progress (dur/w4) |
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | in-progress (dur/w5) |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | in-progress (dur/w5) |
@@ -1999,6 +1999,19 @@ surveyor's.
   - `list_segments` (`:121-125`) silently skips anything not matching the pattern, including a file whose seq
     parses but whose name isn't zero-padded; harmless today but the sort is on the parsed `u64`, not the name, so
     keep that the invariant.
+- **Verified 2026-09-24 (`dur/w3`):** the in-cap corrupt length (F1) was confirmed: `open`
+  truncated every record after it. `walk_segment` now resyncs on `Truncated` too and treats it as a
+  torn tail only if nothing after it parses. `list_segments` accepts only 16-digit names, since an
+  unpadded twin was counted twice and a lone unpadded name failed `open`. A second `open` fails at
+  the lock and leaves the spool untouched. Checked by
+  `a_corrupted_length_field_below_the_sanity_cap_does_not_truncate_the_records_after_it`,
+  `a_segment_file_whose_name_is_not_zero_padded_is_ignored`,
+  `a_second_open_of_the_same_spool_directory_fails_at_the_lock`, and the proptest
+  `open_never_truncates_a_record_that_would_have_parsed`, which drives one mutation of a real
+  segment through `open` and a full drain. Each failed against the pre-fix code except the lock
+  test, which passed and failed only with the lock removed. Still open: the startup double read,
+  and `open` counting `events.dropped{reason="disk_corrupt"}` as the number of corrupt regions
+  rather than events.
 - **Existing coverage:** `disk_queue.rs` tests
   `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_truncated` (`:1426`),
   `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted` (`:1458`),
@@ -2050,6 +2063,16 @@ surveyor's.
   - When nothing is recoverable, `walk_segment` sets `pos = bytes.len()` and counts exactly **one**
     `corrupt_skipped` (`:223-227`) regardless of how many records' worth of bytes were discarded — the drop counter
     under-reports. High confidence; may be deliberate.
+- **Verified 2026-09-24 (`dur/w3`):** the `candidate < pos` rewind was confirmed reachable: a
+  record, 1 to 23 filler bytes, then a context-less frame emits a phantom record starting inside
+  the first. It can't loop forever, because the phantom's frame starts past `pos`. The resync scan
+  now starts at `pos + CONTEXT_LEN + 1`, so every candidate is past `pos`. The single
+  `corrupt_skipped` for an unrecoverable run is kept and documented as a lower bound. Checked by
+  `a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards` and the
+  proptest `walk_segment_recovers_every_record_outside_the_mutated_range` (bit flip, overwrite,
+  insert, truncation, or in-cap length rewrite over real segments with `MAGIC` in some
+  `trace_id`s; oracle: terminates, offsets strictly increase, every untouched record exactly once
+  at its offset, corruption counted exactly when present), both failing against the pre-fix code.
 - **Existing coverage:** the corruption tests listed in the previous entry, plus
   `a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance` (`:1369`) and
   `provenance_survives_a_spool_round_trip` (`:1345`). No fuzz target.
@@ -2287,6 +2310,14 @@ surveyor's.
     **forever** (`:1132-1137`) — it never re-checks `closed()` on that branch (the `closed()` check at `:1108` is
     only reachable when `has_data` is false). If a segment file is removed out of band, `write_loop` never sees
     `Closed` and shutdown depends entirely on the grace timer. Medium confidence, liveness only.
+- **Partly addressed in `dur/w3`:** `read_record_at` now returns `Record`/`Skip`/`Unavailable`
+  and reads no further than the segment's in-memory length, so an in-cap corrupt length, or
+  garbage with nothing parseable after it, skips to the segment's end (counted `disk_corrupt`, zero
+  events) instead of making `peek` retry forever
+  (`a_closed_segment_with_an_in_cap_corrupt_length_does_not_stall_peek`,
+  `unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted`). The over-count,
+  the whole-remainder re-walk, and the `Unavailable` retry that never checks `closed()` are
+  unchanged; this entry stays unreviewed.
 - **Existing coverage:** `peek_is_cached_across_repeated_calls_until_commit` (`:1385`),
   `live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes` (`:1830`),
   `a_corrupted_length_field_does_not_silently_discard_the_rest_of_the_segment` (`:1897`);

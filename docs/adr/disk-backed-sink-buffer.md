@@ -286,3 +286,42 @@ Segment durability is unchanged: a segment is `fsync`ed when it rotates away and
 per push. Each of these operations is preceded by a `logit_pipeline::fault` check, so tests can fail
 or freeze it; see ADR
 [`durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md).
+
+## Amendment: an in-cap corrupt length is corruption, not a torn tail (2026-09-24)
+
+"Recovery" above says `MAX_SANE_COMPRESSED_LEN` keeps a corrupted length field from reading as
+`Truncated`. It does so only for a length over the 64 MiB cap. `frame::read_frame` reports any
+in-cap `compressed_len` longer than the bytes present as `Truncated`, exactly like a torn write
+(`crates/logit-proto/tests/frame_fixed_point.rs`'s
+`a_compressed_len_corrupted_below_the_cap_reads_as_truncated` pins this). So a record whose length
+field was corrupted to, say, 1 MiB mid-segment stopped `DiskQueue::open`'s walk, and `open`
+truncated every real record after it out of the active segment: permanent loss. On a closed
+segment the same record made `peek` retry forever, on every restart.
+
+**The walk tells a torn tail from corruption by what follows it.** On `Truncated`, `walk_segment`
+runs the same forward resync it runs for any other parse failure. If a later record parses, the
+region is corruption: counted `disk_corrupt`, and the walk continues from that record. Only if
+nothing after it parses is it a torn tail, truncated at its start. A torn write is always the last
+thing in the active segment, so this changes nothing for a real torn tail.
+
+**The resync never walks backwards.** The scan for the next `MAGIC` now starts `CONTEXT_LEN + 1`
+bytes past the failed record rather than one byte past it. The next real record's `MAGIC` can be
+no nearer, and every candidate record start then lies past the failed one. Before, a spurious
+`MAGIC` within 24 bytes of the failed record could parse as a phantom record starting inside the
+record before it.
+
+**The read path skips what it can't parse.** `DiskQueue::read_record_at` reads no further than the
+segment's in-memory length, which covers only whole, flushed records. A record that reads as
+`Truncated` with every byte up to that length in hand is corrupt, not waiting on a write. If a
+later record in the segment parses, it's delivered as before. If none does, the cursor skips to
+the segment's end as a commit would, counting one `disk_corrupt` batch with zero events (the count
+of events in undecodable bytes is unknowable).
+
+**Segment names must be zero-padded.** `list_segments` accepts only `segment-<16 digits>.lgit`, the
+form the spool writes. An unpadded name such as `segment-0.lgit` parsed to a sequence number that
+already named another file, which was then counted twice.
+
+**Known limit.** A resync accepts the first candidate that parses, so a record payload that embeds
+a complete, CRC-valid spool record could be read as a phantom record after corruption before it.
+That needs a batch carrying a whole frame as data, and it was already true of the resync before
+this change.

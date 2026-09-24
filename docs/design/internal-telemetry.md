@@ -479,6 +479,15 @@ Each `disk.errors` point is also diagnosed: `op="cursor"` under
 `logit.component.diagnostics{key="cursor_error"}` (the key `DiskQueue::open` already uses for an
 unreadable or stale cursor), every other `op` under `key="disk_fs_error"`.
 
+`batches.dropped{reason="disk_corrupt"}` counts spooled bytes that don't parse as a record, in
+two places. `DiskQueue::open` counts each corrupt region it resyncs past, or skips to the end of a
+segment, from the resume point on. The delivery read path counts one when it resyncs past a
+corrupt region to the next record, or skips a corrupt region that runs to the end of its segment
+(advancing the cursor as a commit would). The same region can count once at open and again when
+delivery reaches it. A region counts once however many records it spanned, so the count is a lower
+bound, and a skipped region to the end of a segment counts zero `events.dropped`: how many events
+undecodable bytes held is unknowable.
+
 Two metrics from this document's original design were never built: a per-batch
 `buffer.wait.duration` (push-to-commit latency) and an `outcome`-tagged
 `send.attempts{outcome="ok"|"retryable"|"permanent"}` breakdown. `buffer.batches`/`.bytes`/

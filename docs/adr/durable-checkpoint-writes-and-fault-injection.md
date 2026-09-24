@@ -234,8 +234,27 @@ script is needed. This list is filled in as each workstream lands.
     - `a_persistently_failing_cursor_write_is_counted_every_time`: `op="cursor"` and `cursor_error`
       on every persist, and a restart replays rather than loses.
 - **`dur/w2`, frame fixed-point properties (DISK-13):** to be listed when `dur/w2` lands.
-- **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):** to be listed when `dur/w3`
-  lands.
+- **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):**
+  - `crates/logit-pipeline/src/disk_queue_verification.rs`:
+    - `walk_segment_recovers_every_record_outside_the_mutated_range`: a proptest over real
+      segments (some `trace_id`s containing `MAGIC`) with one bit flip, overwrite, insert,
+      truncation, or in-cap length rewrite. The walk terminates, never overlaps or goes
+      backwards, recovers every untouched record exactly once at its own offset, and counts
+      corruption exactly when there is some.
+    - `open_never_truncates_a_record_that_would_have_parsed`: the same generator through
+      `DiskQueue::open` and a peek/commit drain, checking `disk.truncated` and `disk_corrupt`.
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_corrupted_length_field_below_the_sanity_cap_does_not_truncate_the_records_after_it`:
+      `open` keeps and delivers the record after an in-cap corrupt length.
+    - `a_closed_segment_with_an_in_cap_corrupt_length_does_not_stall_peek`: `peek` resyncs past
+      it on a closed segment instead of retrying forever.
+    - `unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted`: `peek` skips
+      to the next segment, counting one `disk_corrupt` batch with zero events.
+    - `a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards`: no
+      phantom record inside the record before the corruption.
+    - `a_segment_file_whose_name_is_not_zero_padded_is_ignored`: unpadded and signed names.
+    - `a_second_open_of_the_same_spool_directory_fails_at_the_lock`: and leaves the spool
+      untouched.
 - **`dur/w4`, the spool write path (DISK-03, DISK-05):** to be listed when `dur/w4` lands.
 - **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):** to be listed when `dur/w5`
   lands.
