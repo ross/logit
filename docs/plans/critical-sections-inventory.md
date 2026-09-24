@@ -2217,6 +2217,8 @@ surveyor's.
   `a_failed_segment_unlink_is_counted`); `a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation`
   confirms the self-heal. The fresh-fd `sync_data` holds (Linux `fsync(2)` flushes the inode, not the fd); moving it
   to the retained write handle is #331.
+- **Perf follow-up (dur/w8):** `finish` now waits for the spool's persist worker to run every queued cursor
+  persist and unlink before its own flush and fsyncs (`finish_waits_for_every_queued_persist`).
 
 ---
 
@@ -2341,6 +2343,14 @@ surveyor's.
   of the bound and unlinks it after persisting the cursor, counted `op="unlink"` on failure
   (`a_segment_left_behind_by_a_failed_unlink_is_removed_at_the_next_open`). The blocking cursor
   write inside `commit` is unchanged and still unmeasured.
+- **Perf follow-up (dur/w8):** measured, then moved. The durable persist on every roll cost
+  16–27% of `buffered-small-segments`'s events/s on the perf VM (`docs/design/performance.md` §3),
+  so a roll now queues its cursor and unlinks to a per-spool worker thread and `commit` returns
+  without waiting. The worker still persists before it unlinks, and jobs queue under the state lock
+  in cursor order; `a_segment_roll_returns_before_its_cursor_is_durable_and_unlinks_after_it_is`,
+  `a_crash_before_the_worker_persists_replays_and_loses_nothing`,
+  `a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open`, and
+  `persist_jobs_never_move_the_cursor_backwards` pin it.
 
 ---
 

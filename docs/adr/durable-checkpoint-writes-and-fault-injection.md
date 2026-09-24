@@ -444,3 +444,75 @@ script is needed. This list is filled in as each workstream lands.
 - **Every new filesystem mutation on these paths needs a `fault::check` before it.** An
   unchecked one makes the freeze model's "exactly a `kill -9`" claim false for any test that
   crosses it.
+
+## Amendment: the spool persists its cursor on a worker thread (2026-09-24)
+
+**The spool's cursor persists and segment unlinks now run on one worker thread per spool, in the
+order they were queued, and `commit` never waits for them.** Every persist is still durable
+(decision 1), and a segment is still unlinked only after the persist of the cursor that leaves it
+(decision 5).
+
+**Why.** Decision 2 ran the persist "inline from `DiskQueue::checkpoint_cursor`", on the committing
+task, and judged that cheap because it "runs at most once per `checkpoint_interval` (1s by default)
+and once per segment roll". The per-roll cost was the part that mattered. On the perf VM's Azure
+Premium disk a durable persist takes 5–10 ms. `perf/scenarios/buffered-small-segments.yaml`
+(`buffered` with 1 MiB segments, about 70 rolls per 1.2M-event run) lost 16–27% of its events/s
+against `main` on each of three passes, and `script/perf attribute` put the whole delta in the
+generator's time blocked on a full sink. At `buffered`'s 64 MiB default the delta was inside noise.
+`docs/design/performance.md` §3 has the numbers.
+
+**What changes.**
+
+- `DiskQueue::open` starts a `std::thread` after its own persist and its F4 cleanup, which stay
+  inline and durable. From then on the worker is the only writer of `cursor.json`, so
+  `cursor_write` is gone.
+- `roll_read_cursor` keeps its in-memory work where it was: it removes the segments the cursor
+  left, reduces `total_bytes`, and notifies `not_full`. Then it queues one job, the new cursor plus
+  the segments to unlink, instead of persisting and unlinking inline. An interval checkpoint queues
+  a job with no unlinks.
+- A job is queued while the state lock is held, so jobs reach the worker in the order the cursor
+  moved, from any task. Each job carries a cursor at or past the one before it, and the cursor on
+  disk never moves backward. This replaces decision 2's `cursor_write` argument.
+- The worker counts and diagnoses a failed persist (`op="cursor"`, `cursor_error`) and a failed
+  unlink (`op="unlink"`, `disk_fs_error`) exactly as the inline code did.
+- `finish` queues a last job for the final cursor and waits for it, which is the one place the
+  sink task waits on the worker. It waits on a blocking-pool thread, so a test runtime with a
+  paused clock doesn't advance time while it waits. Then it drops the channel, and the worker exits
+  once the job has run. A persist after `finish` runs inline.
+
+**Crash semantics.** `DiskQueue` still has no `Drop` impl, and a process death stops the worker
+wherever it is:
+
+- A job not yet persisted leaves an older cursor on disk, and every segment it would have unlinked
+  still exists. The next `open` replays from the older cursor: duplicates, never loss, by the same
+  argument as decision 5.
+- A job persisted but not yet unlinked leaves segments behind the cursor, which `open` removes
+  (F4's cleanup).
+
+**Consequences.** The Consequences bullet "Each cursor persist costs two fsyncs more than today,
+inline in the persisting task, serialized by `cursor_write`" no longer holds: the fsyncs cost the
+worker thread, not the committing task, and nothing serializes on `cursor_write`. A roll's segments
+can stay on disk for a few milliseconds after `commit` returns, still counted out of `max_bytes`,
+so the spool's disk use can briefly exceed `max_bytes` by the segments waiting to be unlinked. Each
+spool adds one thread. A job is allocated only on a roll, an interval checkpoint, or `finish`, so
+the allocation pins `disk_queue_push_one_batch` and `disk_queue_peek_cached_costs_nothing` are
+unchanged.
+
+**Tests.** In `crates/logit-pipeline/src/disk_queue.rs`:
+
+- `a_segment_roll_returns_before_its_cursor_is_durable_and_unlinks_after_it_is`: with the worker
+  paused, `commit` across a roll returns before any cursor or unlink step runs. Once the worker
+  runs, the steps are cursor `Write`, `SyncFile`, `Rename`, `SyncDir`, then the unlink.
+- `a_crash_before_the_worker_persists_replays_and_loses_nothing`: a freeze at the worker's cursor
+  write, then a reopen, replays the committed record ahead of the uncommitted one.
+- `a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open`: the F4 path.
+- `finish_waits_for_every_queued_persist`: `finish` doesn't complete while a roll's job is held.
+- `persist_jobs_never_move_the_cursor_backwards`: two queued rolls land in order, the later
+  cursor last.
+
+Existing tests that assert on disk after a `commit` wait for the worker first
+(`DiskQueue::wait_for_persists`). The spool model proptests in `disk_queue_verification.rs` do too,
+and their reopen without `finish` discards every job the worker hadn't started
+(`DiskQueue::abandon_queued_persists`), as a `kill -9` would. Without that, the old worker could
+unlink a segment under the reopened queue. Before the helper existed, one generated case failed
+with a peek that stopped responding while draining, which is consistent with that race.

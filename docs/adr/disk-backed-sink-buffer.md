@@ -448,3 +448,23 @@ plus one batch.
 grace. Dropping the runtime waits for blocking file work anyway, so bounding `finish` alone
 wouldn't bound exit. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
 "Running it" section lists the tests that pin this amendment.
+
+## Amendment: cursor persists and segment unlinks run on a worker thread (2026-09-24)
+
+"Cursor writes are fsynced and every fsync is observed" above says a persist "still runs
+synchronously inside `commit`". It no longer does. Each spool starts one persist worker thread at
+`DiskQueue::open`, and a segment roll, an interval checkpoint, and `finish` each queue it a job: the
+cursor to persist durably and, for a roll, the segments the cursor left, unlinked after the
+persist. `commit` stays synchronous and now does no disk I/O at all. Jobs are queued under the
+state lock, so the cursor on disk never moves backward. `finish` waits for every queued job before
+its own flush and `fsync`s.
+
+The in-memory side of a roll is unchanged: the segments leave `total_bytes` and the segment count
+at once, whether or not their unlink has run yet. A crash before a job's persist leaves an older
+cursor and the segments it names, and the next open replays from there. A crash after the persist
+but before the unlinks leaves segments behind the cursor, which `open` removes, as it does after a
+failed unlink.
+
+The reason is measured: with 1 MiB segments, the inline durable persist cost 16–27% of throughput
+on the perf VM. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+"Amendment: the spool persists its cursor on a worker thread" has the numbers and the tests.
