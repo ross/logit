@@ -217,7 +217,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | findings → libc/w3 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs:229-321` | unreviewed |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs:325-346` | unreviewed |
-| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | findings → dur/w1 |
+| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | findings → #324 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | in-progress (dur/w4) |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
@@ -1992,7 +1992,7 @@ surveyor's.
     the ADR's durability claim doesn't cover it.
   - A persistently failing `persist_cursor` is only `warn_throttled` — replay grows without bound and nothing
     counts it. Low-medium.
-  - *Closed by `dur/w1`:* both `persist_cursor` concerns above. The cursor now goes through
+  - *Closed by #324:* both `persist_cursor` concerns above. The cursor now goes through
     `atomic_write::write_file_durably` (tmp `fsync`, rename, directory `fsync`), and every failure counts
     `buffer.disk.errors{op="cursor"}` (`a_cursor_persist_is_fsynced_before_its_rename_and_the_directory_after`,
     `a_persistently_failing_cursor_write_is_counted_every_time`). The rest of this entry is `dur/w3`'s.
@@ -2153,7 +2153,7 @@ surveyor's.
   reordering) to confirm only the active segment's tail can be lost.
 - **Priority:** P1 — the policy is documented and the loss window is accepted, but the silent failure of every
   fsync/create means a real durability regression would be invisible.
-- **Verified 2026-09-24** (`dur/w1`): both concerns confirmed and fixed. Every rotation, `finish`, and unlink
+- **Verified 2026-09-24** (#324): both concerns confirmed and fixed. Every rotation, `finish`, and unlink
   fs call is now preceded by a `logit_pipeline::fault` check, and `disk_queue.rs`'s tests inject `EIO`/`ENOSPC`/
   `EACCES` at each one and assert `logit.component.buffer.disk.errors{op}` plus a `disk_fs_error` diagnostic
   (`a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed`, `a_failed_directory_fsync_is_counted`,

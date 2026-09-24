@@ -235,6 +235,29 @@ actual code; each is resolved as follows.
   disk backing, per-push fsync, encryption at rest, a spool shared across sinks, segment
   compaction/rewrite, out-of-order acknowledgement (window > 1).
 
+## Amendment: a dropped batch is committed off the spool (2026-09-24)
+
+"Shutdown" above says a disk-backed sink drops nothing at shutdown, and "Scope" says a restart
+resumes from the last committed cursor. Neither covers a batch the destination never accepts.
+`runtime::write_loop` calls `store.commit()` on `Delivery::Dropped` exactly as on
+`Delivery::Delivered`, and it does so whatever the store is. Per `output::is_retryable`, a batch
+is dropped when its fault isn't retryable under the sink's delivery posture (a permanent fault, or
+an ambiguous one such as a timeout under `at_most_once`), or when a retryable fault is still
+failing once `buffer.retry_budget` (60s by default) runs out; see
+[ADR `buffered-sink-delivery`](buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)'s
+retry table. So a destination outage longer than the retry budget discards the spooled batches it
+couldn't take, each counted `batches.dropped{reason="send_failed"}`, and a restart doesn't replay
+them.
+
+This is deliberate. The spool bounds loss across a process restart; the retry budget bounds loss
+across a destination outage. It's [ADR `buffered-sink-delivery`](buffered-sink-delivery.md)'s
+budget-exhausted rule, inherited unchanged: the sink degrades to dropping and moves to the next
+batch instead of holding one it can't deliver at the head. Raising `buffer.retry_budget` rides out
+a longer outage only for faults the posture retries: an `at_most_once` sink drops a batch on its
+first ambiguous failure, with no budget spent.
+[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
+records this as its decision 7.
+
 ## Amendment: cursor writes are fsynced and every fsync is observed (2026-09-24)
 
 The "Durability" section above says `fdatasync` runs "on the cursor file". In the code, only
@@ -263,26 +286,3 @@ Segment durability is unchanged: a segment is `fsync`ed when it rotates away and
 per push. Each of these operations is preceded by a `logit_pipeline::fault` check, so tests can fail
 or freeze it; see ADR
 [`durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md).
-
-## Amendment: a dropped batch is committed off the spool (2026-09-24)
-
-"Shutdown" above says a disk-backed sink drops nothing at shutdown, and "Scope" says a restart
-resumes from the last committed cursor. Neither covers a batch the destination never accepts.
-`runtime::write_loop` calls `store.commit()` on `Delivery::Dropped` exactly as on
-`Delivery::Delivered`, and it does so whatever the store is. Per `output::is_retryable`, a batch
-is dropped when its fault isn't retryable under the sink's delivery posture (a permanent fault, or
-an ambiguous one such as a timeout under `at_most_once`), or when a retryable fault is still
-failing once `buffer.retry_budget` (60s by default) runs out; see
-[ADR `buffered-sink-delivery`](buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)'s
-retry table. So a destination outage longer than the retry budget discards the spooled batches it
-couldn't take, each counted `batches.dropped{reason="send_failed"}`, and a restart doesn't replay
-them.
-
-This is deliberate. The spool bounds loss across a process restart; the retry budget bounds loss
-across a destination outage. It's [ADR `buffered-sink-delivery`](buffered-sink-delivery.md)'s
-budget-exhausted rule, inherited unchanged: the sink degrades to dropping and moves to the next
-batch instead of holding one it can't deliver at the head. Raising `buffer.retry_budget` rides out
-a longer outage only for faults the posture retries: an `at_most_once` sink drops a batch on its
-first ambiguous failure, with no budget spent.
-[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
-records this as its decision 7.
