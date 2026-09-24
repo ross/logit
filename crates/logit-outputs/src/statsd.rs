@@ -157,13 +157,20 @@
 //! octet-counting: statsd has no such convention and no receiver auto-detects one, unlike syslog's
 //! `go-syslog`.
 //!
-//! The two Unix transports carry **packets**, packed exactly as UDP datagrams are (newline-joined,
-//! no trailing newline, at most `max_packet_bytes`):
+//! The two Unix transports carry **packets**, packed as UDP datagrams are (newline-joined, no
+//! trailing newline, at most `max_packet_bytes`):
 //!
-//! - `transport: unix` sends each packet as one datagram to the socket at `endpoint`, from an
-//!   unbound socket, as UDP sends to an address. A receiver whose queue stays full makes the
+//! - `transport: unix` sends each packet as one datagram on a socket connected to the path in
+//!   `endpoint`, connected lazily on the first send. A receiver whose queue stays full makes the
 //!   send wait, not drop (unlike UDP, `AF_UNIX` pushes back on the sender), so each datagram's
-//!   wait is bounded by `connect_timeout` and a timeout fails the send like any other socket error.
+//!   wait is bounded by `connect_timeout` and a timeout fails the send like any other socket
+//!   error. The socket must be connected: Linux parks a sender on a full receiver, and wakes it
+//!   when the receiver drains, only when it's connected. An unconnected sender is reported
+//!   writable again right after each `EAGAIN`, so behind other clients' datagrams it retries in a
+//!   busy loop. A connected socket follows the receiver's socket, not the path, so a
+//!   timeout, `ECONNREFUSED`, or `ENOTCONN` drops it and the next send connects to whatever is
+//!   at the path then; the first datagram of a batch gets one immediate reconnect-and-retry, so
+//!   a receiver restart costs no batch (ADR `datadog-agent-and-intake-relay`, decision 12).
 //! - `transport: unix_stream` writes each packet after its length as a 4-byte little-endian
 //!   integer (the Agent's `dogstatsd_stream_socket` framing; UNVERIFIED, `docs/known-gaps.md`) on
 //!   one connection, with everything [`StatsdOutput::send_tcp`] says about TCP's plaintext arm:
@@ -1516,9 +1523,9 @@ fn is_forbidden_in_service_check_message(c: char) -> bool {
     c.is_control()
 }
 
-/// The live half of a `statsd_out` sink, as `syslog::Conn`: the datagram arms bind eagerly (a bad
-/// local socket is a config error); the stream arms connect lazily inside `send`, so a receiver
-/// that isn't up yet can't block startup.
+/// The live half of a `statsd_out` sink, as `syslog::Conn`: the UDP arm binds eagerly (a bad
+/// local socket is a config error); the Unix datagram and stream arms connect lazily inside
+/// `send`, so a receiver that isn't up yet can't block startup.
 enum Conn {
     Udp(UdpSocket),
     /// `Box<dyn AsyncStream>` covers plaintext and TLS without making [`StatsdOutput`] generic,
@@ -1528,10 +1535,11 @@ enum Conn {
         stream: Option<Box<dyn AsyncStream>>,
         connect_timeout: Duration,
     },
-    /// Unbound: each packet is a `send_to` the socket path in `endpoint`, each bounded by
+    /// Connected to the path in `endpoint` on first use, and `None` again after a send that shows
+    /// the receiver gone or stuck, so the next send reconnects; each send is bounded by
     /// `send_timeout` (module doc's "Packing and framing").
     UnixDatagram {
-        socket: UnixDatagram,
+        socket: Option<UnixDatagram>,
         send_timeout: Duration,
     },
     /// Always plaintext (graph rule 64); boxed like `Tcp` so both share
@@ -1577,12 +1585,10 @@ impl StatsdOutput {
         Self::new(endpoint, Conn::Tcp { stream: None, connect_timeout })
     }
 
-    /// Creates an unbound Unix datagram socket now; `path` is where each packet is sent, and
-    /// `send_timeout` bounds each send's wait on a full receiver.
-    pub fn unix_datagram(path: impl Into<String>, send_timeout: Duration) -> anyhow::Result<Self> {
-        let socket =
-            UnixDatagram::unbound().context("creating statsd_out's Unix datagram socket")?;
-        Ok(Self::new(path, Conn::UnixDatagram { socket, send_timeout }))
+    /// Never connects here; see [`Conn`]. `send_timeout` bounds each send's wait on a full
+    /// receiver.
+    pub fn unix_datagram(path: impl Into<String>, send_timeout: Duration) -> Self {
+        Self::new(path, Conn::UnixDatagram { socket: None, send_timeout })
     }
 
     /// Never connects here; see [`Conn`].
@@ -1780,13 +1786,15 @@ impl Output for StatsdOutput {
                 .await
             }
             Conn::UnixDatagram { socket, send_timeout } => {
-                let dest = DatagramDest::Unix {
+                let mut dest = DatagramDest::Unix(UnixDest {
                     socket,
                     path: Path::new(&self.endpoint),
                     send_timeout: *send_timeout,
-                };
+                    telemetry: &self.telemetry,
+                    has_connected_once: &mut self.has_connected_once,
+                });
                 Self::send_datagrams(
-                    &dest,
+                    &mut dest,
                     &self.lines,
                     self.max_packet_bytes,
                     &mut self.packet_buf,
@@ -1892,13 +1900,13 @@ impl StatsdOutput {
             .next()
             .context("statsd_out endpoint resolved to no addresses")
             .context(Fault::Clean)?;
-        let dest = DatagramDest::Udp { socket, addr };
-        Self::send_datagrams(&dest, lines, max_packet_bytes, packet_buf, diag, telemetry).await
+        let mut dest = DatagramDest::Udp { socket, addr };
+        Self::send_datagrams(&mut dest, lines, max_packet_bytes, packet_buf, diag, telemetry).await
     }
 
     /// [`Self::send_udp`]'s packing loop over either datagram family.
     async fn send_datagrams(
-        dest: &DatagramDest<'_>,
+        dest: &mut DatagramDest<'_>,
         lines: &MessageBuf,
         max_packet_bytes: usize,
         packet_buf: &mut Vec<u8>,
@@ -1930,13 +1938,13 @@ impl StatsdOutput {
     /// or, when the kernel rejects the datagram as too large,
     /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
     async fn flush_datagram(
-        dest: &DatagramDest<'_>,
+        dest: &mut DatagramDest<'_>,
         packet_buf: &mut Vec<u8>,
         counts: &mut UdpSendCounts,
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<()> {
-        match dest.send(packet_buf).await {
+        match dest.send(packet_buf, counts.datagrams == 0).await {
             Ok(_) => {
                 counts.messages += counts.entries_in_packet;
                 counts.datagrams += 1;
@@ -2096,7 +2104,7 @@ impl StatsdOutput {
 struct TcpDial<'a> {
     endpoint: &'a str,
     connect_timeout: Duration,
-    /// `Some` exactly when a `tls:` block was configured -- see [`StatsdOutput::tls`]. Always
+    /// `Some` if and only if a `tls:` block was configured -- see [`StatsdOutput::tls`]. Always
     /// `None` for [`StreamKind::Unix`].
     tls: Option<&'a Arc<rustls::ClientConfig>>,
     /// What `endpoint` names and how a batch is framed on it.
@@ -2160,11 +2168,16 @@ impl TcpDial<'_> {
     /// Counts every connect after the first as `logit.output.reconnects`. Counted at connect, not
     /// after the write, so a reconnect whose first write fails still shows up.
     fn count_connect(&mut self) {
-        if *self.has_connected_once {
-            self.telemetry.count("logit.output.reconnects", 1.0, &[]);
-        } else {
-            *self.has_connected_once = true;
-        }
+        count_connect(self.telemetry, self.has_connected_once);
+    }
+}
+
+/// [`TcpDial::count_connect`]'s rule, shared with [`UnixDest`].
+fn count_connect(telemetry: &Telemetry, has_connected_once: &mut bool) {
+    if *has_connected_once {
+        telemetry.count("logit.output.reconnects", 1.0, &[]);
+    } else {
+        *has_connected_once = true;
     }
 }
 
@@ -2212,29 +2225,90 @@ fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, fram
 /// Where [`StatsdOutput::send_datagrams`] sends each packed packet.
 enum DatagramDest<'a> {
     Udp { socket: &'a UdpSocket, addr: std::net::SocketAddr },
-    Unix { socket: &'a UnixDatagram, path: &'a Path, send_timeout: Duration },
+    Unix(UnixDest<'a>),
 }
 
 impl DatagramDest<'_> {
-    /// One datagram. On a Unix socket a full receiver queue makes `send_to` wait rather than drop;
-    /// the wait is bounded by `send_timeout` and a timeout is an ordinary send error.
-    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+    /// One datagram; `first_of_batch` is whether nothing of this batch has been sent yet.
+    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
         match self {
             DatagramDest::Udp { socket, addr } => socket.send_to(buf, *addr).await,
-            DatagramDest::Unix { socket, path, send_timeout } => {
-                match tokio::time::timeout(*send_timeout, socket.send_to(buf, path)).await {
-                    Ok(result) => result,
-                    Err(_elapsed) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "the receiver at {} did not take a datagram within {send_timeout:?}",
-                            path.display()
-                        ),
-                    )),
-                }
-            }
+            DatagramDest::Unix(dest) => dest.send(buf, first_of_batch).await,
         }
     }
+}
+
+/// A `transport: unix` sender: a datagram socket connected to `path` (module doc's "Packing and
+/// framing" has why it's connected and when it reconnects).
+struct UnixDest<'a> {
+    socket: &'a mut Option<UnixDatagram>,
+    path: &'a Path,
+    send_timeout: Duration,
+    telemetry: &'a Telemetry,
+    has_connected_once: &'a mut bool,
+}
+
+impl UnixDest<'_> {
+    /// Sends one datagram. When it's the batch's first and an inherited socket finds its receiver
+    /// gone, reconnects and retries once: nothing of the batch has left, so the retry can't
+    /// duplicate.
+    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
+        let inherited = self.socket.is_some();
+        match self.send_once(buf).await {
+            Err(err) if first_of_batch && inherited && is_receiver_gone(&err) => {
+                self.send_once(buf).await
+            }
+            result => result,
+        }
+    }
+
+    /// Connects when there's no socket, then sends under `send_timeout`. Drops the socket on a
+    /// timeout or a gone receiver, so the next send reconnects to whatever is at `path`. A connect
+    /// doesn't block on a datagram socket; its failure reaches `flush_datagram` as a send error,
+    /// `Fault::Clean` on a batch's first datagram.
+    async fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let socket: &UnixDatagram = match &mut *self.socket {
+            Some(socket) => socket,
+            slot @ None => {
+                let socket = UnixDatagram::unbound()
+                    .and_then(|socket| socket.connect(self.path).map(|()| socket))
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            err.kind(),
+                            format!(
+                                "connecting to statsd_out socket {}: {err}",
+                                self.path.display()
+                            ),
+                        )
+                    })?;
+                count_connect(self.telemetry, self.has_connected_once);
+                slot.insert(socket)
+            }
+        };
+        let result = match tokio::time::timeout(self.send_timeout, socket.send(buf)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the receiver at {} did not take a datagram within {:?}",
+                    self.path.display(),
+                    self.send_timeout
+                ),
+            )),
+        };
+        if let Err(err) = &result {
+            if err.kind() == std::io::ErrorKind::TimedOut || is_receiver_gone(err) {
+                *self.socket = None;
+            }
+        }
+        result
+    }
+}
+
+/// `ECONNREFUSED` (the connected receiver's socket closed) or `ENOTCONN` (a later send on a socket
+/// the kernel already disconnected): the path may now name a new receiver.
+fn is_receiver_gone(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotConnected)
 }
 
 /// `90` is `EMSGSIZE` on Linux, the only target (`syslog::is_message_too_large` has more).
@@ -3647,7 +3721,7 @@ mod tests {
         let dir = SocketDir::new("dgram");
         let path = dir.socket();
         let receiver = UnixDatagram::bind(&path).unwrap();
-        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1)).unwrap();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1));
         output.send(&two_counters()).await.expect("send should succeed");
         let mut buf = vec![0u8; 4096];
         let n = tokio::time::timeout(Duration::from_secs(2), receiver.recv(&mut buf))
@@ -3663,9 +3737,8 @@ mod tests {
         let dir = SocketDir::new("dgram-cap");
         let path = dir.socket();
         let receiver = UnixDatagram::bind(&path).unwrap();
-        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1))
-            .unwrap()
-            .with_max_packet_bytes(10);
+        let mut output =
+            StatsdOutput::unix_datagram(&path, Duration::from_secs(1)).with_max_packet_bytes(10);
         output.send(&two_counters()).await.expect("send should succeed");
         let mut buf = vec![0u8; 4096];
         for expected in [&b"a:1|c"[..], b"b:2|c"] {
@@ -3678,7 +3751,7 @@ mod tests {
     #[tokio::test]
     async fn unix_datagram_to_a_missing_socket_fails_clean() {
         let dir = SocketDir::new("dgram-missing");
-        let mut output = StatsdOutput::unix_datagram(dir.socket(), Duration::from_secs(1)).unwrap();
+        let mut output = StatsdOutput::unix_datagram(dir.socket(), Duration::from_secs(1));
         let err = output.send(&two_counters()).await.expect_err("no receiver");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
@@ -3691,7 +3764,6 @@ mod tests {
         let path = dir.socket();
         let _receiver = UnixDatagram::bind(&path).unwrap();
         let mut output = StatsdOutput::unix_datagram(&path, Duration::from_millis(200))
-            .unwrap()
             .with_max_packet_bytes(16); // one line per datagram
         let events =
             (0..5000).map(|i| metric_event("m", MetricKind::counter(f64::from(i)), &[])).collect();
@@ -3703,6 +3775,101 @@ mod tests {
         assert!(format!("{err:#}").contains("did not take a datagram"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "earlier datagrams landed");
+    }
+
+    /// Other clients' datagrams fill the receiver's queue; the pending send parks until the
+    /// receiver drains, then completes. Linux parks a sender on a full receiver only when it's
+    /// connected to it; an unconnected one is reported writable again right after each `EAGAIN`
+    /// and retries in a busy loop, which the poll count catches.
+    #[tokio::test]
+    async fn unix_datagram_send_behind_other_clients_completes_when_the_receiver_drains() {
+        let dir = SocketDir::new("dgram-fanin");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        // One filler socket is capped by its own send buffer before the receiver's queue length,
+        // so add fillers until a fresh one can't queue a single datagram.
+        let mut fillers = Vec::new();
+        loop {
+            assert!(fillers.len() < 256, "the receiver's queue never filled");
+            let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            filler.connect(&path).unwrap();
+            filler.set_nonblocking(true).unwrap();
+            let mut sent = 0;
+            loop {
+                match filler.send(b"filler:1|c") {
+                    Ok(_) => sent += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("filler send: {err}"),
+                }
+            }
+            fillers.push(filler);
+            if sent == 0 {
+                break;
+            }
+        }
+
+        let send_timeout = Duration::from_secs(5);
+        let mut output = StatsdOutput::unix_datagram(&path, send_timeout);
+        let batch = batch_with(vec![metric_event("mine", MetricKind::counter(1.0), &[])]);
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(3), receiver.recv(&mut buf))
+                    .await
+                    .expect("the sink's datagram should arrive once the queue drains")
+                    .unwrap();
+                if &buf[..n] == b"mine:1|c" {
+                    break;
+                }
+            }
+        };
+        let polls = std::cell::Cell::new(0u32);
+        let mut send = std::pin::pin!(output.send(&batch));
+        let counted = std::future::poll_fn(|cx| {
+            polls.set(polls.get() + 1);
+            std::future::Future::poll(send.as_mut(), cx)
+        });
+        let started = std::time::Instant::now();
+        let (result, ()) = tokio::join!(counted, drain);
+        result.expect("the send should complete once the receiver drains");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "woken by the drain, not by send_timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(polls.get() < 50, "the send spun instead of parking: {} polls", polls.get());
+    }
+
+    /// A receiver restarted at the same path between batches receives the second batch: the
+    /// refused send on the old connection reconnects and retries once, counted as a reconnect.
+    #[tokio::test]
+    async fn unix_datagram_follows_a_receiver_rebound_at_the_same_path() {
+        let dir = SocketDir::new("dgram-rebind");
+        let path = dir.socket();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_out", "statsd_out", "sink");
+        let mut output =
+            StatsdOutput::unix_datagram(&path, Duration::from_secs(1)).with_telemetry(telemetry);
+        let mut buf = vec![0u8; 4096];
+
+        let first = UnixDatagram::bind(&path).unwrap();
+        let batch = batch_with(vec![metric_event("first", MetricKind::counter(1.0), &[])]);
+        output.send(&batch).await.expect("first send");
+        let n = first.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"first:1|c");
+
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let second = UnixDatagram::bind(&path).unwrap();
+        let batch = batch_with(vec![metric_event("second", MetricKind::counter(2.0), &[])]);
+        output.send(&batch).await.expect("the send should reconnect to the new receiver");
+        let n = tokio::time::timeout(Duration::from_secs(2), second.recv(&mut buf))
+            .await
+            .expect("the new receiver should get the second batch")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second:2|c");
+        assert_eq!(reconnects_in(registry.drain(0)), Some(1.0));
     }
 
     #[test]
@@ -3773,7 +3940,6 @@ mod tests {
             .expect("a Unix socket is always plaintext");
         assert!(err.to_string().contains("plaintext"), "{err}");
         let err = StatsdOutput::unix_datagram("/tmp/x.socket", Duration::from_secs(1))
-            .unwrap()
             .with_tls(&settings, Path::new("."))
             .err()
             .expect("a Unix socket is always plaintext");

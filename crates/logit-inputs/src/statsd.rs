@@ -18,9 +18,9 @@
 //!
 //! Under both Unix transports `bind:` is the socket's path. [`crate::unix`] prepares it (the
 //! directory must exist, a stale socket is replaced, anything else is refused) and the file is made
-//! mode [`SOCKET_MODE`], `0722`, the Agent's own for this socket: a client only needs write
-//! permission to send or connect, and the directory's permissions are the access control. The file
-//! isn't removed on shutdown.
+//! mode [`SOCKET_MODE`], `0722`. The file isn't removed on shutdown. ADR
+//! `datadog-agent-and-intake-relay`, decision 12, has why the path lives in `bind:` and why the
+//! mode is `0722`.
 //!
 //! A TCP listener has **no [`ReceiveQueue`](crate::udp::ReceiveQueue)**: TCP's flow control is
 //! the backpressure, and ADR `decoupled-listener-io` exists for UDP's silent drops, which a stream
@@ -35,10 +35,9 @@
 //! ## Framing
 //!
 //! **`unix_stream` is length-prefixed, not LF-delimited**: [`FramingMode::LengthPrefixedLe`], a
-//! 4-byte little-endian length and then one packet, which decodes exactly as one datagram does
-//! (any number of newline-separated lines). That is what the Agent's
-//! `pkg/dogstatsd/listeners/uds_stream.go` reads and `datadog-go`'s stream writer sends;
-//! UNVERIFIED against either (`docs/known-gaps.md`). A packet declaring more than
+//! 4-byte little-endian length and then one packet, which decodes as one datagram does (any number
+//! of newline-separated lines). UNVERIFIED; ADR `datadog-agent-and-intake-relay`, decision 12, has
+//! the source. A packet declaring more than
 //! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
 //! `logit.input.frames.dropped{reason="oversize"}`: a length-framed stream has no resync point.
 //! The rest of this section is `tcp`'s.

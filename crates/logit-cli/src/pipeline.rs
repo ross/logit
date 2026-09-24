@@ -848,15 +848,15 @@ fn build_spec(
             connect_timeout,
             tls,
         } => {
-            // Eager for the datagram transports, lazy for the stream ones, as `SyslogOut`. A Unix
-            // datagram send's wait on a full receiver is bounded by `connect_timeout`.
+            // Eager for UDP, lazy for the Unix and stream transports. A Unix datagram send's wait
+            // on a full receiver is bounded by `connect_timeout`.
             let output = match transport {
                 logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
                 logit_config::StatsdTransport::Tcp => {
                     StatsdOutput::tcp(endpoint.clone(), *connect_timeout)
                 }
                 logit_config::StatsdTransport::Unix => {
-                    StatsdOutput::unix_datagram(endpoint.clone(), *connect_timeout)?
+                    StatsdOutput::unix_datagram(endpoint.clone(), *connect_timeout)
                 }
                 logit_config::StatsdTransport::UnixStream => {
                     StatsdOutput::unix_stream(endpoint.clone(), *connect_timeout)

@@ -1321,7 +1321,6 @@ mod unix {
             let encoder = || StatsdEncoder::new(Format::DogStatsd);
 
             let mut to_capture = StatsdOutput::unix_datagram(&capture_path, Duration::from_secs(1))
-                .unwrap()
                 .with_encoder(encoder());
             to_capture.send(&batch).await.expect("send to the capture socket");
             let mut buf = vec![0u8; 65_536];
@@ -1332,7 +1331,6 @@ mod unix {
             assert_eq!(buf[..n], expected_bytes(name, &raw), "{name}: datagram bytes");
 
             let mut to_input = StatsdOutput::unix_datagram(&input_path, Duration::from_secs(1))
-                .unwrap()
                 .with_encoder(encoder());
             to_input.send(&batch).await.expect("send to the live statsd_in");
             assert_eq!(next_decoded(&mut rx).await, batch, "{name}: decode(sink_output)");

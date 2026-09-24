@@ -129,6 +129,37 @@ Three facts from the survey drive the shape of the decision:
     `datadog_trace_in -> datadog_trace_out` pair's lossless-relay contract (decision 1) holds only
     while that channel drains; the counter makes a stall long enough to break it visible.
 
+12. **`statsd_in` and `statsd_out` gain `transport: unix` and `transport: unix_stream`, the
+    Agent's `dogstatsd_socket` and `dogstatsd_stream_socket`, with the socket path in the existing
+    `bind`/`endpoint` field.** There's no separate `path:` field. One `statsd_in` listens on one
+    socket, so an Agent's UDP port plus its socket is two components, as a TCP and a UDP listener
+    already are; and a client names the socket the same way, one address under a scheme
+    (`DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`). Rule 64 requires an absolute path and
+    rejects `tls:` under either Unix transport. The rest of the decision:
+    - **`unix_stream` frames each packet as a 4-byte little-endian length, then one datagram's
+      worth of newline-separated lines**: what the Agent's `pkg/dogstatsd/listeners/uds_stream.go`
+      reads and `datadog-go`'s stream writer sends. It's a separate framing mode from carbon's
+      big-endian `LengthPrefixed`, not a flag on it. UNVERIFIED against a real Agent or client
+      until W7.
+    - **`statsd_in` makes its socket mode `0722`; `datadog_trace_in` makes its `0666`.** `0722` is
+      the Agent's own mode for the DogStatsD socket, and it's enough because a datagram sender or a
+      stream client needs only write permission on the socket file; the directory's permissions
+      are the access control. The Agent's mode for its APM `receiver_socket` wasn't found in the
+      source surveyed (UNVERIFIED), so `datadog_trace_in` uses `0666`, which lets a tracer running
+      as any user connect whatever the Agent's mode turns out to be.
+    - **`statsd_out`'s `unix` sender connects its datagram socket to the path**, as `datadog-go`
+      does with `net.Dial("unixgram", path)`, rather than calling `send_to(path)` on an unbound
+      socket. Linux parks a sender on a full receiver queue, and wakes it when the receiver
+      drains, only when the sender is connected to that receiver. An unconnected sender is
+      reported writable again right after each `EAGAIN`, so behind other clients' datagrams (the
+      usual DogStatsD fan-in) it retries in a busy loop until the queue has room. A connected
+      socket follows the receiver's socket, not the path, so the sink drops it on a send timeout,
+      `ECONNREFUSED`, or `ENOTCONN`, and the next send connects to whatever is at the path then.
+      The first datagram of a batch gets one immediate reconnect-and-retry on `ECONNREFUSED` or
+      `ENOTCONN`, as the stream transports get one reconnect: nothing of the batch has left, so a
+      receiver restart between batches costs no batch and no duplicate. Each connect after the
+      first counts `logit.output.reconnects`.
+
 ## Alternatives considered
 
 - **OTLP as the only trace egress.** Nothing to build, and the documented direct path. Rejected
@@ -191,3 +222,6 @@ Three facts from the survey drive the shape of the decision:
 - `datadog_trace_in`'s `503` counts as loss (`logit.input.batches.dropped{reason="busy"}`), not
   the deferral `datadog_in`'s is (decision 11); the tracer short-timeout, no-retry behavior behind
   that is UNVERIFIED until W7.
+- `statsd_in`/`statsd_out`'s `unix_stream` framing and `datadog_trace_in`'s `0666` socket mode
+  are UNVERIFIED until W7 (decision 12). A `unix` `statsd_out` whose receiver restarts mid-batch
+  fails that batch under the sink's usual rules; only a restart between batches is absorbed.

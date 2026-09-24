@@ -1342,14 +1342,14 @@ data loss.
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
   `logit.output.requests{class="ok"|"error"}`: `syslog_out`'s shape.
-- `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on both transports,
+- `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on every transport,
   matching `syslog_out`'s. Usually one entry is one statsd line. A negative-absolute-gauge metric's
-  two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once,
-  over UDP and TCP alike, as does its `messages.dropped{reason="oversize_datagram"}` if a packed
+  two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once
+  on every transport, as does its `messages.dropped{reason="oversize_datagram"}` if a packed
   datagram carrying it is rejected.
-- `logit.output.datagrams` (UDP only): the packed datagrams a batch of lines was sent as. It's the
-  number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike `syslog_out`)
-  packs several lines per datagram.
+- `logit.output.datagrams` (`udp` and `unix`): the packed datagrams a batch of lines was sent as.
+  It's the number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike
+  `syslog_out`) packs several lines per datagram.
 - `logit.output.messages.dropped{reason=...}`, with `reason` one of:
   `"unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
   "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
@@ -1369,10 +1369,12 @@ data loss.
 - `logit.output.messages.normalized{reason="dialect"|"member_sanitized"}`: a lossless-but-different
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
-- `logit.output.reconnects` (count, TCP only): every connect *after* the first, as for
-  `syslog_out`. Counted on plaintext and TLS connections alike, because both take the same
-  `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment). UDP is
-  connectionless and never reports it.
+- `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
+  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because both take the
+  same `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment).
+  Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
+  receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
+  decision 12). UDP is connectionless and never reports it.
 
 A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges: false` reports under
 `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the same key `influxdb_out` uses, so
