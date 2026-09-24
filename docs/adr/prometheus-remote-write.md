@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-18
+updated: 2026-09-24
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -528,3 +528,23 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   record an exchange that needs a response, and a real Prometheus will not send a second request to
   a listener that never answered the first. That mode is reusable by any future HTTP-shaped
   recorded-fixture work, not remote-write-specific.
+
+## Amendment: zstd beside Snappy on both ends (2026-09-24)
+
+[ADR `victoriametrics-interop`](victoriametrics-interop.md) adds a second `Content-Encoding` to
+the transport this ADR describes as Snappy-only: the VictoriaMetrics remote write protocol, the
+same 1.0 `WriteRequest` with `zstd` in place of Snappy, which vmagent sends by default. Three
+statements above change:
+
+- The transport table's `Content-Encoding` row and "Sender behaviour": `prometheus_out`'s send
+  mode gains `compression: snappy | zstd`, default `snappy`, explicit with no negotiation, the
+  posture "The sender's wire version is explicit" already gives `version:`. `version: 2` with
+  `zstd` is a config-time error under rule 56, because 2.0 mandates Snappy.
+- "The receiver's response table": `Content-Encoding: zstd` decodes like `snappy`. Every other
+  encoding stays `415`, which is the signal vmagent's own downgrade to Snappy keys on.
+- "A constant 4 MiB decompressed body cap": the cap is unchanged, and the zstd path checks it
+  three ways (the frame header's content size when present, the window size, and a streaming
+  decode that stops one byte past the cap), because zstd's content-size field is optional where
+  Snappy's `decompress_len` is not.
+
+`ruzstd`, pure Rust, is the implementation; the trade-off is recorded in that ADR.
