@@ -16,11 +16,14 @@
 //! [`Mapping::agent`] is the default every sketch built in this process uses, so `aggregate`'s
 //! output can be sent to Datadog as native sketches; [`Mapping::logarithmic`] is what a decoded
 //! stats sketch keeps, so it relays exactly. A merge across mappings re-bins the incoming sketch
-//! by each bin's representative value, a bounded-error normalization, never a failure.
+//! by each bin's representative value, a bounded-error normalization, never a failure; a merge
+//! into an empty sketch adopts the incoming mapping instead, so `aggregate` relays a stats sketch
+//! unchanged.
 //!
 //! A quantile is the representative value of the bin holding the rank (see
-//! [`DdSketch::quantile`] for why not the Agent's own interpolation), so the relative error is the
-//! mapping's: `1 - 1/√γ` (0.78%) under the Agent mapping, `1 - 2/(1+γ)` under a logarithmic one.
+//! [`DdSketch::quantile`] for why not the Agent's own interpolation), clamped to the exact
+//! `[min, max]`, so the relative error is at most the mapping's: `1 - 1/√γ` (0.78%) under the
+//! Agent mapping, `1 - 2/(1+γ)` under a logarithmic one.
 
 use std::fmt;
 
@@ -75,16 +78,23 @@ impl Mapping {
     /// collapsing-lowest store of `bin_limit` bins. `gamma` must be greater than 1; anything
     /// else falls back to the Agent mapping, since a mapping that can't key a value has no use.
     pub fn logarithmic(gamma: f64, index_offset: f64, bin_limit: u32) -> Self {
-        if !(gamma.is_finite() && gamma > 1.0 && index_offset.is_finite()) {
-            return Self::agent();
+        Self::try_logarithmic(gamma, index_offset, bin_limit.max(2)).unwrap_or_else(Self::agent)
+    }
+
+    /// [`Mapping::logarithmic`] without its fallbacks: `None` unless `gamma` is finite and
+    /// greater than 1, `index_offset` is finite, and `bin_limit` is at least 2. A decoder uses it
+    /// to reject a corrupt header rather than read bins in the wrong key space.
+    pub fn try_logarithmic(gamma: f64, index_offset: f64, bin_limit: u32) -> Option<Self> {
+        if !(gamma.is_finite() && gamma > 1.0 && index_offset.is_finite() && bin_limit >= 2) {
+            return None;
         }
-        Mapping {
+        Some(Mapping {
             kind: MappingKind::Logarithmic,
             gamma,
             gamma_ln: gamma.ln(),
             offset: index_offset,
-            bin_limit: bin_limit.max(2),
-        }
+            bin_limit,
+        })
     }
 
     pub fn kind(&self) -> MappingKind {
@@ -328,22 +338,39 @@ impl DdSketch {
 
     /// Merges `other` into `self`. Same mapping: bin-for-bin, exactly. Different mapping: each of
     /// `other`'s bins is re-binned at its representative value, within the coarser mapping's
-    /// relative-error bound, and the merged sketch keeps `self`'s mapping.
+    /// relative-error bound, and the merged sketch keeps `self`'s mapping. An empty `self` (no
+    /// observations, whatever its mapping) first adopts `other`'s mapping, so merging into a fresh
+    /// [`DdSketch::new`] yields a copy of `other` rather than a re-binned one.
+    ///
+    /// A re-binned bin whose representative isn't finite (the Agent's ∞ key) lands in the
+    /// receiving mapping's key for `f64::MAX`: the Agent's own ∞ key, or a logarithmic mapping's
+    /// highest finite one, which has no ∞ key. Its count is kept either way, and
+    /// [`DdSketch::quantile`] clamps whatever that bin answers to the exact maximum.
     pub fn merge(&mut self, other: &DdSketch) {
         if other.count == 0.0 && other.zero_count == 0.0 {
             return;
+        }
+        if self.mapping != other.mapping
+            && self.count == 0.0
+            && self.zero_count == 0.0
+            && self.positive.is_empty()
+            && self.negative.is_empty()
+        {
+            self.mapping = other.mapping;
         }
         if self.mapping == other.mapping {
             self.positive = merge_bins(&self.positive, &other.positive, self.mapping.bin_limit);
             self.negative = merge_bins(&self.negative, &other.negative, self.mapping.bin_limit);
         } else {
+            let rebin = |key: i32| {
+                let v = other.mapping.representative(key);
+                self.mapping.key(if v.is_finite() { v } else { f64::MAX })
+            };
             for bin in &other.positive {
-                let key = self.mapping.key(other.mapping.representative(bin.key));
-                insert_bin(&mut self.positive, key, bin.count, self.mapping.bin_limit);
+                insert_bin(&mut self.positive, rebin(bin.key), bin.count, self.mapping.bin_limit);
             }
             for bin in &other.negative {
-                let key = self.mapping.key(other.mapping.representative(bin.key));
-                insert_bin(&mut self.negative, key, bin.count, self.mapping.bin_limit);
+                insert_bin(&mut self.negative, rebin(bin.key), bin.count, self.mapping.bin_limit);
             }
         }
         self.zero_count += other.zero_count;
@@ -396,6 +423,12 @@ impl DdSketch {
     /// interpolates upward from `f64(k)` to `f64(k) * γ`, which can miss a single-bin population
     /// by `γ^1.5 - 1`; it isn't what Datadog's backend evaluates for a shipped sketch (that code
     /// is closed), so the bin center, whose `1 - 1/√γ` bound the Agent documents, is used here.
+    ///
+    /// That representative is then clamped to `[min, max]`, where the true quantile always lies,
+    /// so a clamp only ever moves an estimate toward the truth. It matters at the extremes: a
+    /// single-bin population near its minimum or maximum answers with that exact value rather
+    /// than the bin's representative, and a finite population never answers `±∞`, which the
+    /// Agent's ∞ keys (`|v| ≥ γ^31428.5`, about `4.17e211`) would otherwise represent.
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.count <= 0.0 || q.is_nan() {
             return None;
@@ -407,13 +440,15 @@ impl DdSketch {
         if q >= 1.0 {
             return Some(self.max);
         }
-        let rank = q * (self.count - 1.0);
+        // A total count below 1 (fractional weights) would make the rank negative and walk an
+        // empty negative store; rank 0 is the lowest observation's.
+        let rank = (q * (self.count - 1.0)).max(0.0);
         let rank = match self.mapping.kind {
             MappingKind::Agent => rank.round_ties_even(),
             MappingKind::Logarithmic => rank,
         };
         let negative_count: f64 = self.negative.iter().map(|b| b.count).sum();
-        Some(if rank < negative_count {
+        let estimate = if rank < negative_count {
             let key = key_at_rank(&self.negative, negative_count - 1.0 - rank);
             -self.mapping.representative(key)
         } else if rank < negative_count + self.zero_count {
@@ -421,7 +456,9 @@ impl DdSketch {
         } else {
             let key = key_at_rank(&self.positive, rank - negative_count - self.zero_count);
             self.mapping.representative(key)
-        })
+        };
+        // `max`/`min` rather than `clamp`, which panics on a decoded summary with `min > max`.
+        Some(estimate.max(self.min).min(self.max))
     }
 
     fn derive_stats(&mut self) {
@@ -491,7 +528,8 @@ impl DdSketch {
                 let gamma = r.f64()?;
                 let offset = r.f64()?;
                 let bin_limit = r.u32()?;
-                Mapping::logarithmic(gamma, offset, bin_limit)
+                Mapping::try_logarithmic(gamma, offset, bin_limit)
+                    .ok_or(SketchDecodeError::Malformed)?
             }
             _ => return Err(SketchDecodeError::Malformed),
         };
@@ -1004,6 +1042,110 @@ mod tests {
         let total: f64 = sketch.positive_bins().iter().map(|b| b.count).sum();
         assert_eq!(total, 200.0);
         assert_eq!(sketch.count(), 200);
+    }
+
+    /// A finite population never answers `±∞`: under the Agent mapping `1e300` keys to the ∞
+    /// key, whose representative is `f64::INFINITY`, and the clamp to `[min, max]` pulls it back.
+    #[test]
+    fn quantile_of_a_finite_population_is_finite_under_both_mappings() {
+        for mapping in [Mapping::agent(), Mapping::logarithmic(1.02, 0.0, 2048)] {
+            let mut sketch = DdSketch::with_mapping(mapping);
+            sketch.add(1.0);
+            sketch.add(1e300);
+            sketch.add(1e300);
+            let median = sketch.quantile(0.5).unwrap();
+            assert!(median.is_finite(), "{:?}: median {median}", mapping.kind());
+            assert!(
+                (median - 1e300).abs() / 1e300 <= 0.02,
+                "{:?}: median {median}",
+                mapping.kind()
+            );
+        }
+    }
+
+    /// Re-binning an Agent ∞-key bin into a logarithmic sketch lands it on a finite key, never a
+    /// saturated `i32::MAX`, and re-binning a huge logarithmic bin into the Agent's ∞ key still
+    /// answers finitely; both keep every count.
+    #[test]
+    fn cross_mapping_merge_of_an_infinite_key_stays_finite() {
+        let mut agent = DdSketch::new();
+        agent.add(1e300);
+        agent.add(1e300);
+        assert_eq!(agent.positive_bins()[0].key, Mapping::AGENT_INF_KEY);
+        let mut log = DdSketch::with_mapping(Mapping::logarithmic(1.02, 0.0, 2048));
+        log.add(1.0);
+        log.merge(&agent);
+        assert_eq!(log.mapping().kind(), MappingKind::Logarithmic);
+        assert_eq!(log.count(), 3);
+        assert!(log.positive_bins().iter().all(|b| b.key != i32::MAX), "{:?}", log.positive_bins());
+        assert_eq!(log.quantile(0.5), Some(1e300));
+
+        let mut huge = DdSketch::with_mapping(Mapping::logarithmic(1.02, 0.0, 2048));
+        huge.add(1e300);
+        huge.add(1e300);
+        let mut agent = DdSketch::new();
+        agent.add(1.0);
+        agent.merge(&huge);
+        assert_eq!(agent.mapping().kind(), MappingKind::Agent);
+        assert_eq!(agent.count(), 3);
+        assert_eq!(agent.quantile(0.5), Some(1e300));
+    }
+
+    /// A total count below 1 (fractional weights) keeps the rank at 0 rather than walking an
+    /// empty negative store and flipping the sign.
+    #[test]
+    fn quantile_with_a_total_count_below_one_keeps_its_sign() {
+        let mut log = DdSketch::with_mapping(Mapping::logarithmic(1.02, 0.0, 2048));
+        log.add_count(100.0, 0.5);
+        let median = log.quantile(0.5).unwrap();
+        assert!(median > 0.0, "median {median}");
+        assert!((median - 100.0).abs() / 100.0 <= 0.02 / 2.02, "median {median}");
+
+        let mut agent = DdSketch::new();
+        agent.add_count(100.0, 0.3);
+        let p90 = agent.quantile(0.9).unwrap();
+        assert!(p90 > 0.0, "p90 {p90}");
+        assert!((p90 - 100.0).abs() / 100.0 <= 1.0 - 1.0 / Mapping::AGENT_GAMMA.sqrt());
+
+        let zeros = DdSketch::from_parts(Mapping::agent(), vec![], vec![], 0.5, None);
+        assert_eq!(zeros.quantile(0.5), Some(0.0));
+    }
+
+    /// A logarithmic header whose `gamma`, `index_offset`, or `bin_limit` no real mapping could
+    /// have is malformed, not silently decoded under `Mapping::logarithmic`'s Agent fallback.
+    #[test]
+    fn corrupt_logarithmic_header_is_malformed() {
+        let mut sketch = DdSketch::with_mapping(Mapping::logarithmic(1.02, 0.5, 2048));
+        sketch.add(3.0);
+        let bytes = sketch.to_bytes();
+        assert_eq!(DdSketch::from_bytes(&bytes).as_ref(), Ok(&sketch));
+        // Version byte, tag byte, then gamma (8), offset (8), bin_limit (4).
+        let patched = |at: usize, with: &[u8]| {
+            let mut b = bytes.clone();
+            b[at..at + with.len()].copy_from_slice(with);
+            b
+        };
+        for blob in [
+            patched(2, &f64::NAN.to_le_bytes()),
+            patched(2, &1.0f64.to_le_bytes()),
+            patched(10, &f64::INFINITY.to_le_bytes()),
+            patched(18, &1u32.to_le_bytes()),
+        ] {
+            assert_eq!(DdSketch::from_bytes(&blob), Err(SketchDecodeError::Malformed));
+        }
+    }
+
+    /// `aggregate` starts from `DdSketch::new()`, so an empty sketch adopts the incoming mapping
+    /// and a relayed stats sketch comes out bin-for-bin identical.
+    #[test]
+    fn merge_into_an_empty_sketch_adopts_the_incoming_mapping() {
+        let mut stats = DdSketch::with_mapping(Mapping::logarithmic(1.0202, 0.25, 2048));
+        for v in [0.5, 10.0, 20.0, -30.0, 0.0] {
+            stats.add(v);
+        }
+        let mut a = DdSketch::new();
+        a.merge(&stats);
+        assert_eq!(a, stats);
     }
 
     /// Randomized checks against the exact answer. A population is a list of `(value, weight)`
