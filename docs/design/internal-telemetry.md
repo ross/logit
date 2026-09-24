@@ -76,9 +76,9 @@ Inputs fall into three categories:
   which is what the demo's `nginx_identity` does. `set`'s `map_resource` overlays onto whatever
   resource it's handed, so `container.*` survives downstream of it untouched.
 
-**Why `service.name` alone, and not `service.version`.** In the demo, `influx_out` also sources
-`self`, and its encoder folds resource attributes into InfluxDB tags
-(`crates/logit-outputs/src/influxdb.rs`'s `render_tag_suffix`), so this attribute is a tag on every
+**Why `service.name` alone, and not `service.version`.** In the demo, `victoria_out` also sources
+`self`, and `prometheus_out` folds resource attributes into labels (`logit_proto::prometheus`'s
+"Encode" table), as `influxdb_out` folds them into tags, so this attribute is a label on every
 `logit.*` series. A constant tag is a one-time, harmless addition to series identity; a version tag
 would re-key every series on each release. The OTLP instrumentation scope carries the version
 instead, without that cost: `internal` stamps

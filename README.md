@@ -15,8 +15,8 @@ Vector, the OpenTelemetry Collector, Fluent Bit, and Telegraf, see
 ## Try the demo
 
 The demo runs `logit` against a small web stack and sends its logs, metrics, and traces to Loki,
-InfluxDB, and Tempo, with Grafana dashboards already provisioned. It needs only Docker with the
-Compose plugin.
+VictoriaMetrics, and Tempo, with Grafana dashboards already provisioned. It needs only Docker with
+the Compose plugin.
 
 ```sh
 cd demo
