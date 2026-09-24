@@ -144,3 +144,78 @@ commit it by hand. To bump the vendored version: update the tag/commit above, re
 `metrics/agent_payload.proto` from
 `https://raw.githubusercontent.com/DataDog/agent-payload/<tag>/proto/metrics/agent_payload.proto`,
 run `script/protogen`, and review both diffs together.
+
+## Vendored Datadog Agent trace/stats and sketches-go DDSketch `.proto` sources
+
+Fetched verbatim (no local edits) from
+[`DataDog/datadog-agent`](https://github.com/DataDog/datadog-agent) at:
+
+- **Tag:** `7.83.3`
+- **Commit:** `8c639c92581e6f5da73f90f1886b21b9a2441bca`
+
+Files vendored under `datadog/datadog-agent/pkg/proto/datadog/trace/`:
+
+```
+span.proto              9eb62328fd74b0eb8f3684abc4745b048da316e654977e44351ac2d828e55a09
+tracer_payload.proto    390e813a112bff307f9afdf5a4795ee56f616600abf2b33864953a521d84d3fb
+agent_payload.proto     8f84d14d2bcb8bd5d8ab204b9d0e521d20a790da23bb10c8f2b422193180865c
+stats.proto             bbd27b1eebec01d30c324c82267a0aac30c149352592ae18e33feb361c7189c9
+idx/span.proto              275fc4f4ec5f5bcdf9276737152c0112c5e5a11ea03969b13d5112bdef2fb546
+idx/tracer_payload.proto    cffba85298181887f11bc0fdbb31d299e0eb7f71da34aeed170bc46ba4764ddb
+```
+
+(sha256, in the same order as the file list; `idx/` paths are relative to the same `trace/`
+directory.)
+
+All four non-`idx` files declare `package datadog.trace;` and merge into one generated output file
+(`datadog.trace.rs`), the same rule as Prometheus's `remote.proto`/`types.proto`. `tracer_payload.proto`
+imports its sibling `span.proto`; `agent_payload.proto` (this one, the trace-agent's own, not the
+agent-payload family's `metrics/agent_payload.proto` above -- same upstream basename, different
+package, different repo) imports both `tracer_payload.proto` and `idx/tracer_payload.proto`.
+
+**`idx/span.proto` and `idx/tracer_payload.proto` (package `datadog.trace.idx`) are vendored only
+because `agent_payload.proto` imports `idx/tracer_payload.proto`** for its `idxTracerPayloads`
+field -- the string-table-indexed v1.0 wire form the `idx` package describes isn't implemented by
+this crate; nothing here constructs an `idx::TracerPayload`. They're vendored (not stubbed or
+elided) because `protoc` needs the real import target to resolve, and because a real, complete
+upstream file is easier to keep honest across a version bump than a hand-trimmed one.
+
+`tools/protogen`'s Datadog family resolves `import "datadog/trace/..."` against a third include
+root, `crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/` (matching upstream's own
+`pkg/proto/` layout, so the vendored `import` lines need no rewriting).
+
+`idx/tracer_payload.proto`'s `AgentPayload.idx_tracer_payloads` field (in `datadog.trace.rs`) types
+as the bare, unqualified `idx::TracerPayload` -- `datadog.trace.idx` is a genuine **child** package
+of `datadog.trace`, not a sibling, so prost-build emits no `super::` at all. See
+`crates/logit-proto/src/datadog/generated/mod.rs`'s module doc for how that's satisfied: rather
+than a hand-nested level in that file (which can't inject an item into a `#[path] mod trace;`
+file-module's fixed content from outside), `tools/protogen` itself appends `idx`'s own `#[path =
+"datadog.trace.idx.rs"] pub mod idx;` declaration straight into the generated `datadog.trace.rs`.
+
+Also vendored, verbatim, from [`DataDog/sketches-go`](https://github.com/DataDog/sketches-go) at:
+
+- **Tag:** `v1.4.8`
+- **Commit:** `36e98e05d756ccb225b94882831c1443fb4ed535`
+
+File vendored under `datadog/sketches-go/ddsketch/pb/`:
+
+```
+ddsketch.proto    8cf53bf5f29a750b015be6e4caac032a2b2856fb4d50797967a861549f006734
+```
+
+`ddsketch.proto` has no imports of its own; its root (`crates/logit-proto/proto/datadog/sketches-go/`)
+is still a fourth include root because `protoc` requires every input file to sit under some
+declared include directory. It declares **`package test;`** -- upstream's own placeholder package
+name, never renamed there -- which `tools/protogen`'s `rename_datadog` rewrites on disk from
+prost-build's package-derived `test.rs` to `ddsketch.rs` (a plain filename rewrite; the package
+name itself, and so the generated code's own internal references, are untouched). It has no
+cross-package references, so (like `datadog.agentpayload`) it's one flat module with nothing to
+nest.
+
+Regenerating this pair works the same way as the rest of the Datadog family above:
+`script/protogen` overwrites `crates/logit-proto/src/datadog/generated/{datadog.trace.rs,
+datadog.trace.idx.rs,ddsketch.rs}`; review the diff and commit it by hand. To bump either vendored
+version: update the relevant tag/commit above, re-fetch the changed files from
+`https://raw.githubusercontent.com/DataDog/datadog-agent/<tag>/pkg/proto/datadog/trace/...` and/or
+`https://raw.githubusercontent.com/DataDog/sketches-go/<tag>/ddsketch/pb/ddsketch.proto`, run
+`script/protogen`, and review both diffs together.
