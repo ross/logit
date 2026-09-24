@@ -1,11 +1,11 @@
 //! Consistent sampling: the keep/drop compare and the hash every sampler keys it on.
 //!
-//! Two callers. [`crate::telemetry::trace_is_sampled`] feeds [`keep`] raw trace-id bits -- `logit`'s
-//! own pipeline trace ids, random by construction, need no hash. The `sample` transform
+//! Two callers. [`crate::telemetry::trace_is_sampled`] feeds [`keep`] raw trace-id bits: `logit`'s
+//! own pipeline trace ids are random and need no hash. The `sample` transform
 //! (`crates/logit-transforms/src/sample.rs`) feeds it a hash of an application key through
 //! [`hash_value`]/[`hash_trace_id`], so a key that isn't uniformly random (`request_id: "{seq}"`,
-//! a `service.name`) still samples at the configured rate. The two reach different verdicts for
-//! the same 16 bytes on purpose: they sample different populations.
+//! a `service.name`) still samples at the configured rate. The two can reach different verdicts
+//! for the same 16 bytes; they sample different populations.
 //!
 //! **The hash is a frozen, cross-process contract** (`docs/adr/consistent-sampling-component.md`):
 //! XXH64, seed 0, over the canonical bytes [`hash_value`] documents. Every `logit` process in a
@@ -26,25 +26,18 @@ use std::hash::Hasher as _;
 use twox_hash::XxHash64;
 
 /// The frozen seed. Not configurable: a per-deployment seed would make two processes configured
-/// differently disagree, which is exactly what this module exists to prevent.
+/// differently disagree, which is what this module exists to prevent.
 const SEED: u64 = 0;
 
 /// Whether a uniformly distributed 64-bit `x` falls inside `rate`. Compares the top 53 bits, not
 /// all 64: `rate * 2f64.powi(64)` loses precision near 1.0, which would reject values it should
-/// keep. 53 bits is `f64`'s exact-integer range, so the comparison below is exact, not an
-/// approximation of one. A NaN or `>= 1` rate keeps everything; a `<= 0` rate keeps nothing.
+/// keep. 53 bits is `f64`'s exact-integer range, so the comparison is exact. A NaN or `>= 1` rate
+/// keeps everything; a `<= 0` rate keeps nothing.
 ///
-/// Moved here verbatim from `trace_is_sampled` (which now calls it with the low 8 trace-id bytes,
-/// big-endian) so the internal-span sampler and the `sample` transform share one compare.
+/// The internal-span sampler and the `sample` transform share this one compare.
 pub fn keep(x: u64, rate: f64) -> bool {
-    // `!(rate < 1.0)` rather than `rate >= 1.0` -- also catches NaN (every comparison against NaN
-    // is false, so `rate < 1.0` is false and this branch is taken): keep everything rather than
-    // silently drop everything on a malformed rate. Graph validation (rules 16 and 61,
-    // `crates/logit-pipeline/src/graph.rs`) is what actually rejects a NaN/out-of-range config
-    // value before this is ever called with one in practice; the negated comparison is what makes
-    // this fn's own behavior correct even if that guarantee is ever bypassed (a direct caller, a
-    // future one), so it's kept as-is rather than rewritten to a `partial_cmp` form that would
-    // lose the "NaN falls through to `true`" property clippy's lint can't see is deliberate here.
+    // `!(rate < 1.0)`, not `rate >= 1.0`, so NaN keeps everything rather than dropping
+    // everything. Graph rules 16 and 61 reject NaN in config; this holds for any other caller.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(rate < 1.0) {
         return true;
@@ -135,11 +128,9 @@ pub fn hash_trace_id(trace_id: &[u8; 16]) -> u64 {
 }
 
 /// A per-event draw for a sampler with no key: the contract's hash over `counter ^ seed`'s
-/// little-endian bytes. With a fresh, random `seed` per sampler instance and a `counter` that
-/// increments per event, this is a uniform draw with no RNG dependency -- and with a fixed seed
-/// it is reproducible, which is what a test wants. Not itself part of the cross-process contract
-/// (an unkeyed draw can't agree with anything), but the byte order is fixed anyway so a test's
-/// seeded sequence is the same on every host.
+/// little-endian bytes. With a random `seed` per sampler and a per-event `counter`, a uniform draw
+/// with no RNG dependency; with a fixed seed, reproducible. Not part of the cross-process contract,
+/// but the byte order is fixed so a test's seeded sequence is the same on every host.
 pub fn mix(counter: u64, seed: u64) -> u64 {
     hash_bytes(&(counter ^ seed).to_le_bytes())
 }
@@ -150,11 +141,9 @@ mod tests {
     use crate::AttrMap;
     use bytes::Bytes;
 
-    /// Published XXH64 seed-0 vectors. `""` is the xxHash reference's own sanity value; `"a"` and
-    /// `"abc"` are the widely published values (`"abc"`'s is in the `xxhash` Python package's
-    /// documentation) and were cross-checked against an independent implementation written from
-    /// xxHash's `doc/xxhash_spec.md`, not against this crate. If one of these fails, the hash
-    /// changed underneath us and every existing deployment's verdicts with it.
+    /// Published XXH64 seed-0 vectors, cross-checked against an implementation written from
+    /// xxHash's `doc/xxhash_spec.md`. A failure means the hash changed, and every deployment's
+    /// verdicts with it.
     #[test]
     fn xxh64_matches_the_published_seed_zero_vectors() {
         assert_eq!(hash_bytes(b""), 0xEF46_DB37_51D8_E999);
@@ -162,10 +151,8 @@ mod tests {
         assert_eq!(hash_bytes(b"abc"), 0x44BC_2CF5_AD77_0999);
     }
 
-    /// `logit`'s own frozen vectors: the canonicalization table, value by value. Computed with the
-    /// same independent spec implementation as above. A failure here is a wire-breaking change
-    /// between `logit` versions (`docs/adr/consistent-sampling-component.md`), not a test to
-    /// update.
+    /// Frozen vectors for the canonicalization table. A failure is a wire-breaking change between
+    /// `logit` versions (`docs/adr/consistent-sampling-component.md`), not a test to update.
     #[test]
     fn hash_value_is_pinned_for_every_keyable_variant() {
         assert_eq!(hash_value(&Value::str("abc")), Some(0x44BC_2CF5_AD77_0999));
