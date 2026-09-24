@@ -205,8 +205,34 @@ The harness is the set of ordinary tests listed here. Every workspace test build
 `fault-injection`, so `script/test` and `script/cibuild` run them all; no separate image or
 script is needed. This list is filled in as each workstream lands.
 
-- **`dur/w1`, the seam, the helper, and spool I/O observability (DISK-04):** to be listed when
-  `dur/w1` lands.
+- **`dur/w1`, the seam, the helper, and spool I/O observability (DISK-04):**
+  - `crates/logit-pipeline/src/fault.rs`:
+    - `a_disarmed_seam_passes_every_point_through`: no rule means every `Op` at every site passes.
+    - `an_armed_failure_fires_only_under_its_scope_directory`: matching is by path component, and
+      only the armed `Point` fails.
+    - `fail_nth_fires_once_on_the_nth_hit`: the nth hit fails and the hits either side pass.
+    - `a_crash_freezes_every_later_operation_under_the_scope_until_revived`: the freeze model,
+      including paths outside the scope staying live.
+    - `dropping_a_scope_disarms_it`: a dropped scope leaves no rule or frozen state behind.
+  - `crates/logit-pipeline/src/atomic_write.rs`:
+    - `a_durable_write_runs_write_sync_rename_then_directory_sync_in_that_order`: decision 1's
+      step order and paths, from recorded hits.
+    - `the_tmp_name_appends_to_the_full_file_name`: no `with_extension` collision.
+    - `a_failure_at_any_step_leaves_the_previous_document_readable`: old document unless
+      `replaced()`, which is true only at `SyncDir`.
+    - `a_crash_at_any_step_leaves_either_the_old_or_the_new_document`: a freeze at each step.
+    - `a_stray_longer_tmp_is_overwritten_not_appended`: a leftover tmp never leaks into the target.
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_cursor_persist_is_fsynced_before_its_rename_and_the_directory_after`: the cursor's four
+      steps, and every segment unlink after the cursor's directory `fsync`.
+    - `a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed`: `op="fsync"` plus
+      `disk_fs_error`, and the rotation still completes.
+    - `a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation`: `op="create"`, and
+      the next push self-heals with nothing lost.
+    - `a_failed_directory_fsync_is_counted`: at rotation and at `finish`.
+    - `a_failed_segment_unlink_is_counted`: `op="unlink"`, with the segment left on disk.
+    - `a_persistently_failing_cursor_write_is_counted_every_time`: `op="cursor"` and `cursor_error`
+      on every persist, and a restart replays rather than loses.
 - **`dur/w2`, frame fixed-point properties (DISK-13):** to be listed when `dur/w2` lands.
 - **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):** to be listed when `dur/w3`
   lands.
