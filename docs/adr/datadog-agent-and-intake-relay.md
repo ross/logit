@@ -74,11 +74,22 @@ Three facts from the survey drive the shape of the decision:
    zstd by default and `additional_endpoints` can't vary the compressor per endpoint. The
    workspace's rationale against the `zstd` crate stays for compressing; senders use gzip.
 
-5. **msgpack is hand-rolled** in `logit_proto::msgpack` (`nil`, bool, int, float, str, bin, array,
+5. **`datadog_in`'s backpressure is a bounded wait on delivery, then `503` with
+   `Retry-After: 1`**, not `otlp_in`'s blocked connection. A Datadog Agent's forwarder times a
+   request out at 20 seconds and retries it with backoff, so a connection held open until the
+   pipeline drains costs the Agent a slot for 20 seconds and still ends in a retry: only an
+   expensive `503`. The wait is `BUSY_AFTER` (5 s) per request. Delivery under it is
+   all-edges-or-nothing (`Fanout::send_with_deadline`): every downstream consumer's channel slot
+   is reserved before any consumer is sent the batch, so a `503` means no consumer holds the batch
+   that timed out, and the Agent's retry is the only copy. Batches of a multi-batch request
+   (traces, stats) fully delivered before the deadline are delivered again by that retry, which
+   is what Datadog's own intake does with a resent request.
+
+6. **msgpack is hand-rolled** in `logit_proto::msgpack` (`nil`, bool, int, float, str, bin, array,
    map), the pickle precedent; `agent-payload`'s protos are vendored at a pinned tag and generated
    by `script/protogen` ([ADR `committed-pregenerated-otlp-protobuf`](committed-pregenerated-otlp-protobuf.md)).
 
-6. **Protobuf is decoded through prost and encoded by hand for the two map-bearing families.**
+7. **Protobuf is decoded through prost and encoded by hand for the two map-bearing families.**
    Every Datadog protobuf is decoded with prost's generated types. `AgentPayload` and the DDSketch
    protobuf are encoded by hand instead (`crates/logit-proto/src/datadog/traces_proto.rs`,
    `stats.rs`). prost holds a map field as a `HashMap`, whose iteration order makes its bytes
@@ -89,7 +100,7 @@ Three facts from the survey drive the shape of the decision:
    [ADR `committed-pregenerated-otlp-protobuf`](committed-pregenerated-otlp-protobuf.md)'s
    rejection of hand-rolled protobuf to decoding, and to families without maps.
 
-7. **Attribute vocabulary.** `datadog.*` for raw encodings (`datadog.type`, `datadog.interval`,
+8. **Attribute vocabulary.** `datadog.*` for raw encodings (`datadog.type`, `datadog.interval`,
    `datadog.resources`, `datadog.source_type_name`, `datadog.origin.*`, `datadog.chunk.*`,
    `datadog.tracer.*`, `datadog.agent.*`, `datadog.stats.*`); Datadog's own OTLP-honored names for
    span fields (`service.name`, `resource.name`, `span.type`); `meta`/`metrics` keys verbatim;
@@ -97,12 +108,12 @@ Three facts from the survey drive the shape of the decision:
    Datadog concepts DogStatsD carries. A Datadog `rate` is a `Gauge` with `datadog.type: rate`,
    not a `Sum`, because folding a per-second value into a delta multiplies and rounds.
 
-8. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
+9. **Trace ids** are built from a uint64 and `_dd.p.tid` on decode, and emitted as the low 64
    bits plus `_dd.p.tid` when the high bits are nonzero.
 
-9. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
-   never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
-   than Datadog's windows (1 h for metrics, 18 h for logs, 10 min for checks) before sending.
+10. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
+    never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
+    than Datadog's windows (1 h for metrics, 18 h for logs, 10 min for checks) before sending.
 
 ## Alternatives considered
 
@@ -133,6 +144,12 @@ Three facts from the survey drive the shape of the decision:
 - **Decide trace readiness by batch provenance (`origin == datadog_in`).** Rejected in favor of
   the `_top_level` mark so a future transform that does the Agent's processing makes the same
   data ready by writing the same mark, with no change to `datadog_out`.
+- **Block the connection on a full pipeline, as `otlp_in` and `prometheus_in` do.** No new
+  `Fanout` method, and the precedent every other HTTP listener follows. Rejected: those listeners'
+  clients wait for as long as the pipeline takes; an Agent gives up at 20 seconds and retries,
+  so blocking buys nothing a `503` doesn't and holds a connection and an Agent worker for the
+  whole wait. A plain timeout around `Fanout::send` was rejected with it: it sends consumer by
+  consumer, so a deadline between two leaves the first holding a batch the Agent then resends.
 - **Require `serializer_compressor_kind: gzip` on redirected Agents instead of a zstd decoder.**
   Rejected: it changes what Datadog receives too under dual-shipping, and it's one more edit per
   Agent in a migration whose point is that only the URL changes.

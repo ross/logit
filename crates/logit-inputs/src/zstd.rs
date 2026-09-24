@@ -4,9 +4,10 @@
 //!
 //! [`decompress`] reads every frame in a request body into one buffer, bounded three ways:
 //!
-//! - **The output.** Frames are read through `Read::take(cap + 1)` into a `Vec` allocated once at
-//!   `cap + 1`, so the buffer never grows and a body inflating past `cap` is caught rather than
-//!   truncated to fit: the `otlp_in` `inflate` pattern
+//! - **The output.** Frames are read through `Read::take(cap + 1)` into a `Vec` that starts at
+//!   [`INITIAL_OUTPUT_CAPACITY`] and grows as `read_to_end` fills it, so a small body reserves
+//!   little and a body inflating past `cap` is caught rather than truncated to fit: the `otlp_in`
+//!   `inflate` pattern
 //!   ([ADR `otlp-compression-and-decompression-bounds`](../../../../docs/adr/otlp-compression-and-decompression-bounds.md)).
 //! - **The window.** Each frame's decoder caps the declared window at
 //!   `max(cap, MIN_WINDOW_CAP)` (8 MiB). `ruzstd` reserves a frame's declared window up front,
@@ -18,6 +19,11 @@
 //!   data a route accepts: the output bound below is still `cap`, unaffected by the floor. A frame
 //!   declaring a window above `max(cap, MIN_WINDOW_CAP)` is [`ZstdError::TooLarge`], the same
 //!   answer an oversized output gets.
+//!
+//!   That window is the remaining up-front cost: a zstd request reserves `ruzstd`'s buffer for
+//!   its frame's declared window, up to `max(cap, MIN_WINDOW_CAP)` of virtual memory, before a
+//!   byte decodes (8 MiB for an Agent's usual frame; 16 MiB on the traces route at most). Resident
+//!   memory follows what the frame actually writes.
 //! - **The checksum.** `ruzstd` reads a frame's content checksum but never compares it. With the
 //!   crate's `hash` feature on, [`decompress`] compares it with the one computed while decoding,
 //!   and a mismatch is [`ZstdError::Malformed`].
@@ -39,6 +45,10 @@ use std::io::Read;
 /// `413` every legitimate body that writer produces.
 const MIN_WINDOW_CAP: usize = 8 * 1024 * 1024;
 
+/// The output buffer's starting capacity. `read_to_end` grows it from here, bounded by
+/// `take(cap + 1)`, so a small body doesn't reserve the whole cap up front.
+const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
+
 /// Why [`decompress`] failed. The caller answers `413` for [`Self::TooLarge`] and `400` for
 /// [`Self::Malformed`], as `otlp_in` does for gzip.
 #[derive(Debug, PartialEq, Eq)]
@@ -55,7 +65,7 @@ pub(crate) enum ZstdError {
 /// empty `input` holds no frames and decompresses to an empty body.
 pub(crate) fn decompress(input: &[u8], cap: usize) -> Result<Vec<u8>, ZstdError> {
     let mut frames = Frames { rest: input, current: None, spare: None, cap, error: None };
-    let mut out = Vec::with_capacity(cap + 1);
+    let mut out = Vec::with_capacity(INITIAL_OUTPUT_CAPACITY.min(cap + 1));
     let read = (&mut frames).take(cap as u64 + 1).read_to_end(&mut out);
     // `Frames::read` stores the typed cause before it returns the `io::Error` that stops
     // `read_to_end`, so the stored value is what failed.

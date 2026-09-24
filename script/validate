@@ -15,6 +15,9 @@ export INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-logit-dev-token}"
 # examples/prometheus-remote-write-send.yaml's `headers:` map. The whole header value, `Bearer `
 # prefix included: `!env` substitutes a field rather than interpolating into one.
 export PROMETHEUS_REMOTE_WRITE_AUTHORIZATION="${PROMETHEUS_REMOTE_WRITE_AUTHORIZATION:-Bearer logit-dev-token}"
+# examples/datadog-intake-standin.yaml's `api_keys:` list: the one key its Agents send as
+# `DD-API-KEY`.
+export DD_API_KEY="${DD_API_KEY:-logit-dev-key}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

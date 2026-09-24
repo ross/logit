@@ -95,7 +95,7 @@ pub const STATS_BIN_LIMIT: u32 = 2048;
 /// Written when non-empty on decode, read back as `Str` on encode. `ATTR_SERVICE_NAME` /
 /// `ATTR_RESOURCE_NAME` / `ATTR_SPAN_TYPE` / `ATTR_SPAN_KIND` carry the group's `Service` /
 /// `Resource` / `Type` / `SpanKind`, under the names a span carries them by (ADR
-/// `datadog-agent-and-intake-relay` decision 7); they're [`super`]'s constants, shared with
+/// `datadog-agent-and-intake-relay` decision 8); they're [`super`]'s constants, shared with
 /// [`super::traces`].
 const GROUP_STRINGS: [&str; 10] = [
     ATTR_SERVICE_NAME,

@@ -76,21 +76,23 @@
 //! doesn't: its forwarder times a request out after 20 seconds and retries it, so a blocked
 //! connection costs the Agent a slot for 20 seconds and still ends in a retry.
 //!
-//! So each `sink.send` runs under one deadline per request, [`BUSY_AFTER`] from the start of
-//! delivery. When it passes, the request is answered `503` with `Retry-After: 1` and
+//! So ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
+//! decision 5) each batch is sent under one deadline per request, [`BUSY_AFTER`] from the start of
+//! delivery, through [`Fanout::send_with_deadline`]: a batch reaches every downstream consumer or
+//! none. When the deadline passes, the request is answered `503` with `Retry-After: 1` and
 //! `{"status":"error","errors":["busy"]}`, counted `logit.input.requests{class="busy"}`, and the
-//! batches not yet delivered are counted `logit.input.batches.dropped{reason="busy"}`. The Agent
-//! retries a `503` with backoff, which makes the pair at-least-once end to end:
+//! batches not yet delivered are counted `logit.input.batches.dropped{reason="busy"}`, disjoint
+//! from `logit.component.batches.sent`. The Agent retries a `503` with backoff, which makes the
+//! pair at-least-once end to end:
 //!
-//! - **The timed-out batch is never delivered.** A cancelled `mpsc` send never enqueues its
-//!   message, so the Agent's retry is the only copy, with no duplicate from this side. With several
-//!   downstream consumers, `Fanout` sends to each in turn, so a timeout between two of them leaves
-//!   the earlier ones holding the batch: that batch reaches them twice once the retry lands.
+//! - **The timed-out batch is delivered to no consumer.** `send_with_deadline` reserves room on
+//!   every consumer's channel before sending to any of them, and releases what it holds if the
+//!   deadline passes first, so the Agent's retry is the only copy, whatever the fan-out.
 //! - **A request that decodes to several batches** (traces and stats: one per tracer or client
 //!   payload) is sent in order and answered `503` as a whole if the deadline passes partway. The
-//!   batches already delivered are delivered again by the retry. This matches what Datadog's own
-//!   intake does with a resent request: a resent series point overwrites the one it repeats, and a
-//!   resent log or span duplicates.
+//!   batches fully delivered before the deadline are delivered again by the retry. This matches
+//!   what Datadog's own intake does with a resent request: a resent series point overwrites the
+//!   one it repeats, and a resent log or span duplicates.
 //!
 //! A `503` is also cheaper for the Agent than the block it replaces: it releases the connection at
 //! once, and the Agent's retry queue, not this listener, holds the payload while the pipeline
@@ -778,7 +780,9 @@ async fn respond(
 }
 
 /// Sends `batches` in order under one deadline, `busy_after` from now (this module's
-/// "Backpressure" section). `Err` carries how many were not delivered, the timed-out one included.
+/// "Backpressure" section). Each batch reaches every consumer or none
+/// ([`Fanout::send_with_deadline`]). `Err` carries how many were not delivered, the timed-out one
+/// included.
 async fn deliver(
     sink: &Fanout,
     batches: Vec<EventBatch>,
@@ -787,7 +791,7 @@ async fn deliver(
     let deadline = tokio::time::Instant::now() + busy_after;
     let total = batches.len();
     for (sent, batch) in batches.into_iter().enumerate() {
-        if tokio::time::timeout_at(deadline, sink.send(batch)).await.is_err() {
+        if sink.send_with_deadline(batch, deadline).await.is_err() {
             return Err(total - sent);
         }
     }
@@ -1290,6 +1294,37 @@ mod tests {
 
         let events = registry.drain(0);
         assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(1.0));
+        assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
+    }
+
+    /// With two consumers and the second full, a `503` leaves the first holding nothing, and the
+    /// timed-out batch counts as busy, never as sent (the module doc's "Backpressure" section).
+    #[tokio::test]
+    async fn a_503_with_one_of_two_consumers_full_delivers_to_neither_and_counts_busy_not_sent() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("dd", "datadog_in", "listener");
+        let mut input = DatadogInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry.clone())
+            .with_busy_after(Duration::from_millis(200));
+        input.bind().await.expect("binding an ephemeral port");
+        let addr = input.local_addr().expect("bind() leaves an address").to_string();
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let sink = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let response = post_raw(&addr, "/api/v1/series", "", SERIES_V1).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        recv_batch(&mut rx_a).await; // `a` drains; `b` stays full
+
+        let response = post_raw(&addr, "/api/v1/series", "", SERIES_V1).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(rx_a.try_recv().is_err(), "a must not hold a batch the Agent will resend");
+        recv_batch(&mut rx_b).await;
+        assert!(rx_b.try_recv().is_err(), "b never had room for the 503'd batch");
+
+        let events = registry.drain(0);
+        assert_eq!(sum_of(&events, "logit.component.batches.sent", ("", "")), Some(1.0));
         assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
     }
 

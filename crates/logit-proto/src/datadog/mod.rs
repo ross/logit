@@ -376,7 +376,7 @@
 //! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
 //! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's | `skipped{reason="interpolation"}` |
 //! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `skipped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
-//! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 7), when non-empty | -- |
+//! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 8), when non-empty | -- |
 //! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
 //! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
 //! | `HTTPStatusCode` | `datadog.stats.http_status_code` (`U64`), when nonzero | -- |
@@ -495,7 +495,7 @@ pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
 pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
 /// `service.name` / `resource.name` / `span.type` / `span.kind`: a span's `service`, `resource`,
 /// `type`, and (a `meta` key, kept verbatim, that also sets `SpanRecord::kind`) `span.kind` — the
-/// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 7). An
+/// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 8). An
 /// APM stats group's `Service`/`Resource`/`Type`/`SpanKind` carry the same names, so these live
 /// here rather than in [`traces`] or [`stats`] alone.
 pub const ATTR_SERVICE_NAME: &str = "service.name";

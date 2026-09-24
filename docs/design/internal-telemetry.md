@@ -399,7 +399,7 @@ every producer the send-side numbers for free:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width |
+| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` (`datadog_in`) that times out sends nothing and counts nothing, span and `send.blocked.duration` included |
 | `logit.component.events.sent` | count | events in that batch |
 | `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
 | `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed |
@@ -858,16 +858,21 @@ arriving or which were refused.
 | `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
 | `logit.input.requests.acknowledged{route}` | count | a payload answered `2xx` and never sent: `host_metadata`, `metadata`, `collector`, `container`, and `orch` on every request, and `intake` for host metadata posted to `/intake/` |
-| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`: a batch is one or the other. See below |
 
 **A busy request is not a lost one.** When the pipeline doesn't accept a request's batches within
 5 seconds, the request gets `503` with `Retry-After: 1`, counted `class="busy"`, and its
 undelivered batches are counted `batches.dropped{reason="busy"}`. The Agent keeps the payload and
 retries it, so "dropped" here means "not delivered by this request", not "lost". Read a steady busy
 rate as a pipeline that can't keep up with its Agents: the Agent's retry queue is absorbing the
-difference and drops payloads only once it fills. A traces or stats request that decodes to several
-batches can be answered `503` after some of them were delivered; the Agent's retry delivers those
-again (the module doc's "Backpressure" section).
+difference and drops payloads only once it fills.
+
+Each batch reaches every downstream consumer or none (`Fanout::send_with_deadline`), so the batch
+that timed out is counted only under `batches.dropped{reason="busy"}`, never under
+`logit.component.batches.sent`, and no consumer holds it. A traces or stats request that decodes to
+several batches can still be answered `503` after some of them were fully delivered; those count as
+`batches.sent`, and the Agent's retry delivers them again (the module doc's "Backpressure" section,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) decision 5).
 
 The codec's own counters (a series, sketch, log, event, check, span, or stats group dropped while
 the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this

@@ -1328,15 +1328,18 @@ retries a `503` with backoff and holds the payload in its retry queue meanwhile,
 until that queue fills. A blocked connection would instead cost the Agent 20 seconds before its own
 timeout, and then the same retry.
 
+- **A `503` means no consumer holds the batch that timed out.** Each batch goes to every consumer
+  downstream of `datadog_in` or to none, however many there are, so the Agent's retry is its only
+  copy.
 - **Delivery is at-least-once.** A traces or stats request carries one batch per tracer or client
-  payload, and a `503` partway through means the retry delivers the earlier batches again. With
-  several consumers downstream of `datadog_in`, a `503` can also leave a batch delivered to some of
-  them, which the retry then delivers to those again. Datadog's own intake has the same shape: a
-  resent series point overwrites, a resent log or span duplicates.
+  payload, and a `503` partway through means the retry delivers the batches already delivered
+  before the deadline again. Datadog's own intake has the same shape: a resent series point
+  overwrites, a resent log or span duplicates.
 - **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
   with its Agents, and the Agents' retry queues are absorbing the difference.
   `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
-  deferred to the Agent, not lost.
+  deferred to the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
+  counts under one or the other, never both.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
 they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
