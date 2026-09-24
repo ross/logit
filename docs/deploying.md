@@ -1391,6 +1391,9 @@ components:
   `path:`. `path:` belongs to the other mode, and setting it here violates rule 56.
 - **TLS is selected by the scheme**, and `endpoint_tls:` tunes it: a private CA, a client
   certificate, or the deliberately awkward `insecure_skip_verify`, which logs a startup warning.
+- **`compression:` is `snappy` (the default) or `zstd`.** `zstd` is the VictoriaMetrics remote
+  write protocol, which Prometheus and Mimir reject; see
+  [Sending with `compression: zstd`](#sending-with-compression-zstd).
 - **Five headers are reserved:** the four protocol headers (`Content-Type`, `Content-Encoding`,
   `X-Prometheus-Remote-Write-Version`, `User-Agent`) plus `Content-Length`. Rule 56 rejects them in
   `headers:` at config time instead of letting the sink silently override them.
@@ -1399,17 +1402,25 @@ components:
 receiver speaks, as you pick an exposition dialect. The choice depends on the destination:
 
 - **`version: 1`** (`prometheus.WriteRequest`) is the default, and every remote-write receiver
-  deployed today accepts it. Use it unless you know the receiver speaks 2.0. Its one real cost: 1.0
-  has no field for a counter's start time, so `Series::created` (an OpenMetrics `_created` series,
-  an OTLP `start_time_unix_nano`) is dropped on the way out.
+  deployed today accepts it. Use it unless you know the receiver speaks 2.0, and always for
+  VictoriaMetrics (below). Its one real cost: 1.0 has no field for a counter's start time, so
+  `Series::created` (an OpenMetrics `_created` series, an OTLP `start_time_unix_nano`) is dropped on
+  the way out.
 - **`version: 2`** (`io.prometheus.write.v2.Request`) is worth setting when the receiver is a recent
-  Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a Prometheus 3.x started with
+  Mimir, Thanos, Grafana Cloud, or a Prometheus 3.x started with
   `--web.enable-remote-write-receiver`. It interns every label and metadata string in a request-wide
   symbol table (smaller bodies for the same series), carries `Metadata` inline on each series instead
   of in separate requests, carries the created timestamp per sample, and answers with
   `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
   stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as permanent:
   the misconfiguration is reported immediately instead of retried.
+
+**Use `version: 1` for VictoriaMetrics: it discards 2.0 without an error.** VictoriaMetrics doesn't
+accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `204` with an empty
+body, stores nothing, logs nothing, and leaves its `vm_http_request_errors_total` at zero. The
+sender can't detect this: a `204` is success under both specs, and `prometheus_out` doesn't read the
+2.0 `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` response headers, so its counters report every batch
+delivered. Only a query against VictoriaMetrics shows the loss (`docs/known-gaps.md` has the row).
 
 Native histograms are skipped and counted on both wires regardless of version
 (`docs/known-gaps.md`), so this choice doesn't affect them.
@@ -1427,6 +1438,99 @@ Native histograms are skipped and counted on both wires regardless of version
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
   receiver with no out-of-order window. That is the topology, not the sink; `docs/known-gaps.md` has
   the row.
+
+## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
+
+There's no VictoriaMetrics-specific component. All three products ingest standard wires that
+existing components speak, and each row below was checked against VictoriaMetrics and vmagent
+v1.152.0, VictoriaLogs v1.52.0, and VictoriaTraces v0.11.1 by `script/victoria-interop`
+([`tools/victoria-interop/README.md`](../tools/victoria-interop/README.md)).
+[ADR `victoriametrics-interop`](adr/victoriametrics-interop.md) records why, and
+[`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings" section
+has what each check showed. The default ports are VictoriaMetrics `:8428`, VictoriaLogs `:9428`,
+and VictoriaTraces `:10428`.
+
+| Surface | Component | Configuration | What to know |
+|---|---|---|---|
+| VictoriaMetrics `/api/v1/write` | `prometheus_out` | `endpoint: http://HOST:8428/api/v1/write`, `version: 1`, optionally `compression: zstd` | `version: 2` is stored nowhere, with a `204` (see "Choosing `version: 1` or `2`" above) |
+| vmagent scraping `logit` | `prometheus_out` | `bind:` | vmagent adds `job` and `instance` |
+| VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` | `url: http://HOST:8428`; `org`, `bucket`, and `token` are required but any value works | A field arrives as `<measurement>_<field>`. `org` and `bucket` become no label |
+| VictoriaMetrics `-graphiteListenAddr` | `graphite_out` | `protocol: plaintext`, `tags: carbon` (the default) | The listener is off until VictoriaMetrics starts with the flag. There's no pickle listener |
+| VictoriaMetrics `/opentelemetry/v1/metrics` | `otlp_out` | `endpoint: http://HOST:8428/opentelemetry` | HTTP only; VictoriaMetrics has no OTLP/gRPC listener |
+| VictoriaLogs `/insert/opentelemetry/v1/logs` | `otlp_out` | `endpoint: http://HOST:9428/insert/opentelemetry`, `headers: {VL-Stream-Fields: service.name}` | The OTLP body becomes `_msg` without a `VL-Msg-Field` header. HTTP only |
+| VictoriaLogs `-syslog.listenAddr.tcp` | `syslog_out` | `transport: tcp` (or TLS) | VictoriaLogs detects `syslog_out`'s octet counting and the RFC 5424 format |
+| VictoriaTraces `/insert/opentelemetry/v1/traces` | `otlp_out` | `endpoint: http://HOST:10428/insert/opentelemetry` | The recommended trace leg |
+| VictoriaTraces `-otlpGRPCListenAddr` | `otlp_out` | `protocol: grpc`, `endpoint: http://HOST:4317` | Off by default. A plaintext listener also needs `-otlpGRPC.tls=false`, because TLS is on by default and then requires a certificate. Drops batches; see below |
+| VictoriaMetrics `/federate` | `prometheus_in` | `scrape_targets: ["http://HOST:8428/federate?match%5B%5D=SELECTOR"]` | Percent-encode `match[]`. Every series comes back an untyped `Gauge`, because `/federate` emits no `# TYPE` |
+| vmagent `-remoteWrite.url` | `prometheus_in` | `bind:` | No configuration on either side; see below |
+
+Runnable configs:
+[`examples/victoriametrics-remote-write.yaml`](../examples/victoriametrics-remote-write.yaml),
+[`examples/victoriametrics-otlp.yaml`](../examples/victoriametrics-otlp.yaml), and
+[`examples/victoriametrics-vmagent-receive.yaml`](../examples/victoriametrics-vmagent-receive.yaml).
+
+**Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
+it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
+permanent fault that drops the whole batch, including the signals it did store. Split the flow with
+`keep_signals` (or `has_signal`) so each sink sees only its product's signal.
+
+**Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
+VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
+per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` skips a
+delta `Sum` outright. The `aggregate` keeps a running total, as it does ahead of any Prometheus
+receiver ([Counter temporality](#counter-temporality-delta-vs-cumulative)).
+
+**An empty OTLP scope costs two labels per series.** VictoriaMetrics and VictoriaLogs add
+`scope.name="unknown"` and `scope.version="unknown"` to a record whose OTLP scope is empty, which is
+every batch that didn't arrive through `otlp_in` with a scope of its own. To drop the labels on
+VictoriaMetrics, start it with `-opentelemetry.promoteScopeMetadata=false`. To give them a
+meaningful value on either product, write `scope.name` and `scope.version` in a `lua` stage
+([`lua-api.md`](design/lua-api.md)'s "Reading and writing `scope`").
+
+**Send traces to VictoriaTraces over HTTP, not gRPC.** VictoriaTraces's gRPC listener closes every
+connection about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`. A request in flight
+at that moment fails as ambiguous, because the server may have processed it, and `otlp_out` is
+at-most-once by default, so it drops that batch. `buffer: { delivery: at_least_once }` retries it
+instead, at the cost of a duplicate span whenever VictoriaTraces had stored the first attempt. The
+HTTP endpoint has neither problem (`docs/known-gaps.md`'s OTLP section has the row).
+
+### Sending with `compression: zstd`
+
+`prometheus_out`'s `compression: zstd` sends the VictoriaMetrics remote write protocol: the same
+remote-write 1.0 request, compressed with zstd instead of Snappy. VictoriaMetrics, vmagent, and
+`logit`'s own `prometheus_in` accept it; Prometheus and Mimir don't. VictoriaMetrics accepts Snappy
+too, so the default is never wrong there. Choose `zstd` when you want the wire vmagent sends, for
+example for a `logit` hop that stands in for vmagent in front of VictoriaMetrics.
+
+- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A `415` or
+  `400` under `zstd` is a permanent fault that drops the batch, and the `remote_write_rejected`
+  diagnostic names `compression: snappy` as the remedy.
+- **`zstd` needs `version: 1`.** Remote-write 2.0 mandates Snappy, so `version: 2` with
+  `compression: zstd` is a config error.
+- **Expect about libzstd level 1's ratio.** `logit` compresses with `ruzstd`, a pure-Rust
+  implementation whose encoder goes no higher than that. The goal is VictoriaMetrics's default
+  wire, not the bandwidth a higher zstd level would save.
+
+### Receiving from vmagent
+
+Point vmagent's `-remoteWrite.url` at a `prometheus_in` `bind:`, path included:
+
+```text
+-remoteWrite.url=http://logit:9201/api/v1/write
+```
+
+Neither side needs any other setting. vmagent sends zstd first, `prometheus_in` accepts it, and
+vmagent stays on zstd. A `logit` receiver without zstd support answers `415`, which makes vmagent
+log "Downgrading protocol from VictoriaMetrics to Prometheus remote write" and send Snappy from then
+on. `logit.input.writes` carries an `encoding` tag on every request that named a supported one, so
+you can see which wire a sender is on. `logit` decodes zstd with `ruzstd`, which runs 1.4 to 3.5
+times slower than libzstd. If that CPU matters more than bandwidth, start vmagent with
+`-remoteWrite.forcePromProto` to send Snappy.
+
+The receiver advice in
+[Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version)
+applies unchanged: bind loopback or pod-local, front it with something that authenticates, and set
+`idle_timeout:`.
 
 ## TLS
 
