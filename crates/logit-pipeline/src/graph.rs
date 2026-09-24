@@ -49,8 +49,9 @@
 //! 18. A `receive.max_datagrams`/`max_bytes`/`read_batch` (datagram listeners) or
 //!     `batch_max_events`/`batch_max_bytes` (all three drivers) of `0`. `batch_flush_interval: 0s`
 //!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end.
-//! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name: it could never
-//!     match an attribute (`null`, not `""`, disables an optional lookup)
+//! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name, after its
+//!     `format`'s defaults fill the absent ones: it could never match an attribute (`null`, not
+//!     `""`, disables an optional lookup)
 //!     (`docs/adr/log-record-trace-context.md`).
 //! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
 //!     (`docs/adr/scale-transform.md`).
@@ -194,6 +195,8 @@
 //!     0s`, a `headers:` name rule 22 would reject against `RESERVED_DATADOG_TRACE_HEADERS` or
 //!     starting `datadog-`/`x-datadog-`, or a `tls` failing rule 24's checks, or set with a
 //!     `socket` (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 67. A `trace_context` `trace_id_high` under a `format` other than `datadog`, where no trace id
+//!     lacks its high half, or with an empty name (`docs/adr/log-record-trace-context.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -205,7 +208,7 @@ use logit_config::{
     default_handshake_timeout, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MetadataCacheConfig,
-    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, MAX_READ_BATCH,
+    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -1086,7 +1089,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 19: an empty `trace_context` field name could never name an attribute. `span_id`/`flags`
     // are disabled with `null`; `""` there is a typo, not an opt-out.
     for (id, component) in &components {
-        if let ComponentKind::TraceContext { trace_id, span_id, flags, .. } = &component.kind {
+        if let ComponentKind::TraceContext { format, trace_id, span_id, flags, .. } =
+            &component.kind
+        {
+            let (trace_id, span_id, flags) = format.resolve_fields(trace_id, span_id, flags);
             if trace_id.is_empty() {
                 anyhow::bail!(
                     "component '{id}': a trace_context with an empty 'trace_id' field name can \
@@ -2978,6 +2984,29 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 67: `trace_context`'s `trace_id_high` (`docs/adr/log-record-trace-context.md`'s
+    // Datadog amendment). Only a Datadog decimal id arrives without its high half, so under
+    // `format: otel` the field would never be read; an empty name can't match (rule 19).
+    for (id, component) in &components {
+        let ComponentKind::TraceContext { format, trace_id_high: Some(field), .. } =
+            &component.kind
+        else {
+            continue;
+        };
+        if *format != TraceIdFormat::Datadog {
+            anyhow::bail!(
+                "component '{id}': trace_context 'trace_id_high' is read only under 'format: \
+                 datadog' -- an otel trace id is always 128 bits, so it would have no effect"
+            );
+        }
+        if field.is_empty() {
+            anyhow::bail!(
+                "component '{id}': a trace_context with an empty 'trace_id_high' field name \
+                 could never match an attribute -- omit it to disable the lookup"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -4616,21 +4645,24 @@ mod tests {
         assert_eq!(graph.components["identity"].role(), Role::Transform);
     }
 
+    /// A `trace_context` with `null` span id and flags lookups and no span block.
+    fn trace_context(trace_id: &str) -> ComponentKind {
+        ComponentKind::TraceContext {
+            format: TraceIdFormat::Otel,
+            trace_id: Some(trace_id.to_string()),
+            span_id: Some(None),
+            flags: Some(None),
+            trace_id_high: None,
+            keep_source: false,
+            span: None,
+        }
+    }
+
     #[test]
     fn a_trace_context_with_an_empty_trace_id_field_name_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            (
-                "trace",
-                vec!["in"],
-                ComponentKind::TraceContext {
-                    trace_id: String::new(),
-                    span_id: None,
-                    flags: None,
-                    keep_source: false,
-                    span: None,
-                },
-            ),
+            ("trace", vec!["in"], trace_context("")),
             ("out", vec!["trace"], sink()),
         ]));
         assert!(err.contains("no-op"), "got: {err}");
@@ -4638,16 +4670,20 @@ mod tests {
 
     #[test]
     fn a_trace_context_with_an_empty_optional_field_name_is_rejected() {
-        for (span_id, flags) in [(Some(String::new()), None), (None, Some(String::new()))] {
+        for (span_id, flags) in
+            [(Some(Some(String::new())), Some(None)), (Some(None), Some(Some(String::new())))]
+        {
             let err = expect_err(cfg(vec![
                 ("in", vec![], listener()),
                 (
                     "trace",
                     vec!["in"],
                     ComponentKind::TraceContext {
-                        trace_id: "trace.id".to_string(),
+                        format: TraceIdFormat::Otel,
+                        trace_id: Some("trace.id".to_string()),
                         span_id,
                         flags,
+                        trace_id_high: None,
                         keep_source: false,
                         span: None,
                     },
@@ -4660,23 +4696,69 @@ mod tests {
 
     #[test]
     fn a_trace_context_with_a_trace_id_field_name_resolves_as_a_transform() {
+        let mut kind = trace_context("trace_id");
+        if let ComponentKind::TraceContext { span, .. } = &mut kind {
+            *span = Some(logit_config::SpanLiftConfig::default());
+        }
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("trace", vec!["in"], kind),
+            ("out", vec!["trace"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["trace"].role(), Role::Transform);
+    }
+
+    /// Rules 19 and 67 read the names after the format's defaults fill the absent ones.
+    #[test]
+    fn a_datadog_trace_context_with_every_default_resolves() {
         let graph = resolve(cfg(vec![
             ("in", vec![], listener()),
             (
                 "trace",
                 vec!["in"],
                 ComponentKind::TraceContext {
-                    trace_id: "trace_id".to_string(),
+                    format: TraceIdFormat::Datadog,
+                    trace_id: None,
                     span_id: None,
                     flags: None,
+                    trace_id_high: Some("_dd.p.tid".to_string()),
                     keep_source: false,
-                    span: Some(logit_config::SpanLiftConfig::default()),
+                    span: None,
                 },
             ),
             ("out", vec!["trace"], sink()),
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["trace"].role(), Role::Transform);
+    }
+
+    /// Rule 67: `trace_id_high` only under `format: datadog`, and never empty.
+    #[test]
+    fn a_trace_context_trace_id_high_outside_datadog_or_empty_is_rejected() {
+        for (format, field, needle) in [
+            (TraceIdFormat::Otel, "_dd.p.tid", "only under 'format: datadog'"),
+            (TraceIdFormat::Datadog, "", "empty 'trace_id_high'"),
+        ] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                (
+                    "trace",
+                    vec!["in"],
+                    ComponentKind::TraceContext {
+                        format,
+                        trace_id: None,
+                        span_id: None,
+                        flags: None,
+                        trace_id_high: Some(field.to_string()),
+                        keep_source: false,
+                        span: None,
+                    },
+                ),
+                ("out", vec!["trace"], sink()),
+            ]));
+            assert!(err.contains(needle), "got: {err}");
+        }
     }
 
     #[test]
@@ -4690,19 +4772,13 @@ mod tests {
             ..logit_config::SpanLiftConfig::default()
         };
         for (span, needle) in [(empty_name, "requires every span"), (zero_skew, "0s")] {
+            let mut kind = trace_context("trace.id");
+            if let ComponentKind::TraceContext { span: slot, .. } = &mut kind {
+                *slot = Some(span);
+            }
             let err = expect_err(cfg(vec![
                 ("in", vec![], listener()),
-                (
-                    "trace",
-                    vec!["in"],
-                    ComponentKind::TraceContext {
-                        trace_id: "trace.id".to_string(),
-                        span_id: None,
-                        flags: None,
-                        keep_source: false,
-                        span: Some(span),
-                    },
-                ),
+                ("trace", vec!["in"], kind),
                 ("out", vec!["trace"], sink()),
             ]));
             assert!(err.contains(needle), "got: {err}");

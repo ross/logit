@@ -20,6 +20,7 @@ use super::{
 };
 use bytes::Bytes;
 use logit_core::interner::resolve;
+use logit_core::trace::{parse_trace_id_high, trace_id_bytes, trace_id_halves};
 use logit_core::{
     format_rfc3339_utc, AttrMap, Event, EventBatch, Resource, SpanEvent, SpanKind, SpanLink,
     SpanRecord, SpanStatus, Value,
@@ -272,30 +273,6 @@ impl Form {
     fn has_chunks(self) -> bool {
         matches!(self, Form::V07 | Form::Agent)
     }
-}
-
-/// `_dd.p.tid`'s value as the high 64 bits, by Go's `strconv.ParseUint(v, 16, 64)` (what the
-/// Agent's `Get128BitTraceID` calls): 1 to 16 hex digits, either case, no prefix.
-pub(super) fn parse_trace_id_high(s: &str) -> Option<u64> {
-    if s.is_empty() || s.len() > 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    u64::from_str_radix(s, 16).ok()
-}
-
-/// A 128-bit id from its halves, big-endian.
-fn trace_id_bytes(high: u64, low: u64) -> [u8; 16] {
-    let mut id = [0u8; 16];
-    id[..8].copy_from_slice(&high.to_be_bytes());
-    id[8..].copy_from_slice(&low.to_be_bytes());
-    id
-}
-
-/// A 128-bit id's `(high, low)` halves.
-fn trace_id_halves(id: &[u8; 16]) -> (u64, u64) {
-    let high = u64::from_be_bytes(id[..8].try_into().expect("8 bytes"));
-    let low = u64::from_be_bytes(id[8..].try_into().expect("8 bytes"));
-    (high, low)
 }
 
 fn str_attrs(map: &StrMap) -> AttrMap {

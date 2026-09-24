@@ -129,8 +129,8 @@ as an ordinary tag. That is what makes `prometheus_in -> prometheus_out` an exac
 | `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target. Deliberately **unprefixed**, so it renders as a label like any other resource attribute: the same `instance` label Prometheus's own scrape adds. Without it, two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
 
 The next table starts with the trace/span names `trace_context`'s `span:` block reads
-([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)), then lists the syslog
-and statsd carriers. The trace/span names are reserved attributes that several producers write and
+([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)), and the two Datadog
+id names it reads under `format: datadog`, then lists the syslog and statsd carriers. The trace/span names are reserved attributes that several producers write and
 a transform reads, so they are listed here rather than left to that transform's source.
 
 A protocol whose tag/param namespace is a **multiset** (a key can legally repeat on one line, each
@@ -158,6 +158,8 @@ repeated tag key) produce this shape; see
 | `span.duration_{us,ms}` | integer | haproxy's `%Ta` → `span.duration_ms`. |
 | `span.duration_s` | decimal seconds (number or `Str`) | nginx's `$request_time`. |
 | `span.{start,end}_rfc3339` | RFC 3339 string | Parsed by `logit_core::parse_rfc3339_to_nanos`, up to 9 fractional digits. |
+| `dd.trace_id` | `Value::Str`, a decimal uint64 or 32 hex; or `Value::U64`/`I64`, non-zero | **Datadog.** The trace id a Datadog tracer injects into its logs, read by `trace_context` under `format: datadog` ([plan §9](../plans/datadog-relay.md#9-trace-ids-w2b-w8)). A decimal id is the low 64 bits, high half zero; `trace_id_high` can name an attribute holding the high half in `_dd.p.tid`'s 1-16 hex form. A 16-digit string here is decimal, never hex. |
+| `dd.span_id` | `Value::Str`, a decimal uint64; or `Value::U64`/`I64`, non-zero | **Datadog.** This line's own span, as `span.id` is for the OTel names; decimal only. |
 | `syslog.sd` | `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str \| Value::Array<Value::Str> } }` | `syslog_in`'s parsed RFC 5424 STRUCTURED-DATA (absent when the wire carried the nil `-`); a repeated PARAM-NAME within one SD-ELEMENT becomes the `Array` form, in order. `syslog_out` re-emits every element, escaped per RFC 5424 §6.3.3; see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md). |
 | *(any DogStatsD tag key)* | `Value::Str`\|`Value::Bool`, or `Value::Array` of either when the key repeated | `statsd_in`'s `insert_tags` folds a repeated `\|#` tag key into a `Value::Array` in wire order (`#team:a,team:b` -> `Array[Str("a"), Str("b")]`), the same multiset fold `syslog.sd` above uses; an exact-duplicate token dedupes at decode instead, so a non-repeated tag's shape is unchanged (`Value::Str` for `key:value`, `Value::Bool(true)` for a bare `key`). `statsd_out` expands an `Array` back into one wire tag per element. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |
 | `statsd.type` | `Value::Str`: `ms`\|`h`\|`d` | `statsd_in`'s wire-type letter for a timer/histogram/distribution line, stamped on the `MetricKind::Samples` record it decodes to since all three land on the same shape; `statsd_out` reads it to pick the wire-type letter it re-emits, defaulting to `ms` when absent or unrecognized. See [ADR `statsd-output`](../adr/statsd-output.md)'s amendment. |

@@ -48,7 +48,7 @@ pub use scale::Scale;
 pub use set::Set;
 pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
-pub use trace_context::{SpanLift, TraceContext};
+pub use trace_context::{IdFormat, SpanLift, TraceContext};
 
 /// Coerces a `Value` to a finite `f64`.
 ///

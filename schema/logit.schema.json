@@ -1015,18 +1015,26 @@
           }
         },
         {
-          "description": "Lifts an application trace/span reference off an event's attributes onto its log record, for the common \"my JSON log body already has a `trace.id` field\" case, and with a `span:` block also turns that log line into a real span on the same event: an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`, `span_id`, and `flags` rename the three id sources. A successful lift overwrites any trace reference the log already had. An event with no log, or with missing or unparseable attributes, passes through untouched; it is never an error.",
+          "description": "Lifts an application trace/span reference off an event's attributes onto its log record, for the common \"my JSON log body already has a `trace.id` field\" case, and with a `span:` block also turns that log line into a real span on the same event: an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`, `span_id`, and `flags` rename the three id sources. `format: datadog` reads the ids a Datadog tracer injects into its logs (`dd.trace_id`, `dd.span_id`) instead. A successful lift overwrites any trace reference the log already had. An event with no log, or with missing or unparseable attributes, passes through untouched; it is never an error.",
           "type": "object",
           "required": [
             "type"
           ],
           "properties": {
             "flags": {
-              "description": "The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to `trace.flags`; `null` disables the lookup, and an empty string is rejected. A `traceparent` attribute supplies the flags when this one is absent.",
-              "default": "trace.flags",
+              "description": "The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to `trace.flags` (no lookup under `format: datadog`); `null` disables the lookup, and an empty string is rejected. A `traceparent` attribute supplies the flags when this one is absent.",
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "format": {
+              "description": "The id grammar, and the attribute names the three id fields default to. `otel` (the default): a 32-character hex trace id and a 16-character hex span id, read from `trace.id`/`span.id`/`trace.flags`. `datadog`: what a Datadog tracer injects into a log, read from `dd.trace_id`/`dd.span_id` with no flags field: a trace id that is a decimal 64-bit number or 32 hex characters, and a span id that is a decimal 64-bit number. A 16-digit value is hex under `otel` and decimal under `datadog`; the format decides, never the value.",
+              "default": "otel",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TraceIdFormat"
+                }
               ]
             },
             "keep_source": {
@@ -1047,17 +1055,27 @@
               ]
             },
             "span_id": {
-              "description": "The attribute holding this line's own 16-character hex span id. Defaults to `span.id`; `null` disables the lookup, and an empty string is rejected. An absent attribute means \"no span id\", not a skip (unless a `span:` block needs one); only a present but unparseable value is an error.",
-              "default": "span.id",
+              "description": "The attribute holding this line's own span id, in `format`'s grammar. Defaults to `span.id` (`dd.span_id` under `format: datadog`); `null` disables the lookup, and an empty string is rejected. An absent attribute means \"no span id\", not a skip (unless a `span:` block needs one); only a present but unparseable value is an error.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "trace_id": {
-              "description": "The attribute holding a 32-character hex trace id. Defaults to `trace.id`; an empty string is rejected. A `traceparent` attribute supplies the trace id when this one is absent.",
-              "default": "trace.id",
-              "type": "string"
+              "description": "The attribute holding the trace id, in `format`'s grammar. Defaults to `trace.id` (`dd.trace_id` under `format: datadog`); an empty string is rejected. A `traceparent` attribute supplies the trace id when this one is absent.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trace_id_high": {
+              "description": "`format: datadog` only: the attribute holding a 128-bit trace id's high 64 bits as 1 to 16 hex characters, the form a Datadog span's `_dd.p.tid` tag takes. Used only when the trace id itself carried no high half (a decimal id); a present but unparseable value is an error. Unset (the default) means no lookup.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
@@ -3737,6 +3755,25 @@
           "type": "string"
         }
       }
+    },
+    "TraceIdFormat": {
+      "description": "`trace_context`'s id grammar, which also picks its field-name defaults.",
+      "oneOf": [
+        {
+          "description": "W3C/OpenTelemetry: 32 hex characters for a trace id, 16 for a span id.",
+          "type": "string",
+          "enum": [
+            "otel"
+          ]
+        },
+        {
+          "description": "Datadog log injection: decimal 64-bit ids, or a 32-hex-character trace id.",
+          "type": "string",
+          "enum": [
+            "datadog"
+          ]
+        }
+      ]
     },
     "UserAgentRule": {
       "description": "One entry of `http_access`'s `user_agent_rules`: a regex over the uncapped `user_agent.original` (the identifying token of a spoofed UA is often at its tail) and the literal `user_agent.class` it assigns. Rules are tried in order, before the built-in table. A `class` of `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, as the built-in classes do. `match` is compiled by `logit validate`; an empty `match` or `class` is rejected.",

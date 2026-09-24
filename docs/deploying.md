@@ -1596,6 +1596,33 @@ is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
 reason}` everything held back. `docs/design/internal-telemetry.md`'s `datadog_out` section has every
 counter.
 
+### Correlating dd-trace logs: `trace_context` with `format: datadog`
+
+A Datadog tracer with log injection on writes the active trace and span into every log line as
+`dd.trace_id` and `dd.span_id`: decimal 64-bit numbers, or the trace id as 32 hex characters when
+the tracer generates 128-bit ids. `trace_context`'s default `otel` format reads only W3C hex ids,
+so those lines pass through uncorrelated. `format: datadog` reads them:
+
+```yaml
+  dd_trace:
+    type: trace_context
+    sources: [dd_flat]
+    format: datadog      # reads dd.trace_id / dd.span_id, decimal or 128-bit hex
+```
+
+- **A 16-digit id is decimal under `datadog` and hex under `otel`.** The format decides; nothing
+  is guessed from the value. A 16-hex `dd.span_id` is `skipped{reason="invalid"}`.
+- **A decimal trace id fills the low 64 bits**; the high half stays zero. When the log carries the
+  high half separately, in `_dd.p.tid`'s 1-16 hex form, name that attribute in `trace_id_high:`.
+- **Both kinds of sink send the lifted ids.** `datadog_out` writes a log's trace reference as
+  `trace_id`/`span_id` in hex, which Datadog's log intake correlates on, unless the log already
+  has an attribute of either name. An OTLP sink sends them as OTLP's native `trace_id`/`span_id`.
+- **Some libraries nest the ids** under a `dd` object (`"dd":{"trace_id":"..."}`); a `flatten`
+  with `attributes: [dd]` ahead of `trace_context` turns that into the dotted names.
+
+[`examples/datadog-logs-correlation.yaml`](../examples/datadog-logs-correlation.yaml) runs
+`tail_in` → `json` → `flatten` → `trace_context` into both `datadog_out` and `otlp_out`.
+
 ## `datadog_trace_out`: sending to an Agent's APM API
 
 `datadog_trace_out` sends APM traces and tracer-computed stats to a real Datadog Agent's trace API,

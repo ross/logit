@@ -291,7 +291,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 17. A non-default `receive:` outside a datagram, stream, or tail listener, or a receive-queue field
     on a stream or tail listener.
 18. A `0` receive-queue or batch-assembly bound (`batch_flush_interval: 0s` is legal).
-19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name.
+19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
+    defaults.
 20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
 21. An empty `signals:` list, or all three signals on `keep_signals`/`drop_signals`.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
@@ -359,6 +360,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     absolute `http://`/`https://` URL, a relative `socket` path, `timeout: 0s`, a reserved
     (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
     `tls` with `socket`).
+67. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

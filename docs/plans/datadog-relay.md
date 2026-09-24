@@ -168,7 +168,7 @@ The event model already carries every Datadog field either in a typed field or i
 | distribution points (raw values) | `Samples` | lossless |
 | Agent-side `s`/`h`/`ms` semantics | `aggregate` plus a sink; nothing emits the Agent's `.avg`/`.count`/`.median`/`.95percentile`/`.max` set today | a documented recipe, not a codec gap (§7) |
 | log `message`, `status`, `timestamp`, `hostname`, `service`, `ddsource`, `ddtags` | `LogRecord.message`; `severity` plus the raw `status`; `Event::timestamp`; the rest verbatim as attributes, `ddtags` `k:v` pairs expanded the way DogStatsD tags are | lossless |
-| log `dd.trace_id`/`dd.span_id` (decimal, 64-bit) | `TraceRef` holds 16 bytes; `trace_context` accepts only 32-hex ids (`crates/logit-core/src/trace.rs:68`) | **gap: §9, W8** |
+| log `dd.trace_id`/`dd.span_id` (decimal, 64-bit, or a 128-bit hex trace id) | `TraceRef` via `trace_context` under `format: datadog`: a decimal id in the low 64 bits, high half from an optional `trace_id_high` (`_dd.p.tid`'s form) | lossless (§9, W8a) |
 | span ids uint64 + `_dd.p.tid` | `[u8; 16]`/`[u8; 8]`, high bits from `_dd.p.tid`, re-emitted when nonzero | lossless |
 | span `service`, `resource`, `type`, `name` | `service.name`, `resource.name`, `span.type` attributes (the names the Agent's own OTLP receiver honors); `SpanRecord.name` | lossless, and an OTLP egress to an Agent reconstructs them for free |
 | span `error`, `meta`, `metrics`, `meta_struct`, `_sampling_priority_v1`, `_dd.*` | `status: Error`; attributes verbatim as `Str`/`F64`/`Bytes` | lossless |
@@ -343,13 +343,19 @@ verbatim, and the `statsd.*` names for events and service checks. `datadog_out` 
 names back, and derives the rest: `hostname` from `host.name`, `service` from `service.name`,
 `status` from `severity`, `message` from the body (a `Map` body serialized as JSON), `timestamp`
 from `Event::timestamp` in milliseconds, `trace_id`/`span_id` as OTel-form hex from `TraceRef`,
-which Datadog auto-detects.
+which Datadog auto-detects, unless the log already carries a `trace_id` or `span_id` attribute
+(W8a).
 
 ### 9. Trace ids (W2b, W8)
 
 Decoders build 16-byte ids from a uint64 and `_dd.p.tid`; encoders emit the low 64 bits and
-write `_dd.p.tid` when the high bits are nonzero. `trace_context` gains 16-hex and decimal id
-parsing plus an optional `trace_id_high` field for logs an Agent ships with `dd.trace_id`.
+write `_dd.p.tid` when the high bits are nonzero. `trace_context` gains `format: datadog` (W8a):
+`dd.trace_id`/`dd.span_id` by default, a decimal uint64 or 32-hex trace id and a decimal span id,
+and an optional `trace_id_high` attribute in `_dd.p.tid`'s form, applied only when the id's high
+half is zero. 16 hex isn't a Datadog form, so a 16-digit id is decimal under `datadog` and hex
+under the default `otel`, never guessed from the value
+([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s Datadog amendment; graph
+rule 67). The parsers live in `logit_core::trace`, shared with the traces codec.
 
 ### 10. `statsd` additions (W4b)
 
@@ -416,7 +422,8 @@ tracked gap.
 
 Receive side first: W2's decoders fix the vocabulary and mappings, W3 and W4 consume them, W5
 and W6 mirror them. W1 lands before W2 because sketch bin access shapes the sketches codec. W4b
-and W8's `trace_context` change are independent and can be pulled forward.
+and W8's `trace_context` change are independent and can be pulled forward; the latter was, as
+W8a.
 
 ### 14. Not in this stack: an Agent-equivalent trace processor
 
@@ -445,19 +452,22 @@ the OTel-direct topology is `otlp_out`.
 | W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
 | W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 66; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
 | W7 | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); trial-org end-to-end for `datadog_out`, including the `/api/v0.2/traces` leg and the stale window; pair fixed-point tests over the corpus; UNVERIFIED items resolved in this plan | M | W5, W6 |
-| W8 | `trace_context` 64-bit and decimal ids; `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
+| W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 67; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
+| W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
 
-Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W7 → W8, linear; W4b stacks
-after W4a to keep the stack linear even though it depends only on W0. Each PR is based on and
+Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7 → W8b, linear; W4b
+stacks after W4a to keep the stack linear even though it depends only on W0, and W8a after W6
+because it needs nothing from W7. Each PR is based on and
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, and W6 complete
-on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main`
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, and W8a
+complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main`
 once it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real
 Agent, tracer, or client; W5's `datadog_out` has sent only to `datadog_in`, never to Datadog; and
 W6's `datadog_trace_out` has sent only to `datadog_trace_in`, never to a real Agent. W7 does all
-three.
+three. W8a's `format: datadog` has read only hand-written log lines, never a real tracer's; W7's
+`ddtrace` producer can check it.
 
 ## Verification
 

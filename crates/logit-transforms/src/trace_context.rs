@@ -9,10 +9,27 @@
 //! `span.parent_id`, `span.name`, `span.kind`, `span.status`, and `span.start`/`span.end`/
 //! `span.duration` in integer nanoseconds or a unit-suffixed form (`_us`/`_ms`/`_s`/`_rfc3339`).
 //!
+//! [`IdFormat`] picks the grammar of the trace and span id attributes, and nothing else (the
+//! flags stay decimal 0-255 under either):
+//!
+//! | Attribute | `Otel` (default) | `Datadog` |
+//! |---|---|---|
+//! | trace id (`trace.id` / `dd.trace_id`) | `Str`, 32 hex | `Str`, a decimal uint64 (low 64 bits, high zero) or 32 hex; `U64`, or an `I64` above 0, as the same uint64 |
+//! | span id (`span.id` / `dd.span_id`) | `Str`, 16 hex | `Str` decimal uint64, `U64`, or an `I64` above 0 |
+//! | high half (`trace_id_high`, unset by default) | -- | `Str`, 1 to 16 hex (`_dd.p.tid`'s form), applied only when the trace id's high half is zero |
+//!
+//! A 16-digit string is therefore hex under `Otel` and decimal under `Datadog`: the configured
+//! format decides, never the value. `traceparent` and `span.parent_id` are W3C hex under either
+//! format, and 16 hex is never a Datadog id. See `docs/adr/log-record-trace-context.md`'s
+//! Datadog amendment.
+//!
 //! All-or-nothing: everything is parsed before anything is mutated, so a lift either applies
 //! completely or leaves the event as it arrived and counts one `.skipped{reason}`.
 
-use logit_core::trace::{parse_span_id, parse_trace_id};
+use logit_core::trace::{
+    parse_span_id, parse_span_id_datadog, parse_trace_id, parse_trace_id_datadog,
+    parse_trace_id_high, trace_id_bytes, trace_id_halves,
+};
 use logit_core::{
     parse_decimal_nanos, parse_rfc3339_to_nanos, parse_traceparent, random_id_bytes, AttrMap,
     Event, Resource, SpanKind, SpanRecord, SpanStatus, Telemetry, TraceRef, Value,
@@ -78,6 +95,60 @@ pub struct SpanLift {
     pub max_skew: Duration,
 }
 
+/// The id grammar of the trace id and span id attributes (the module doc's table). Mirrors
+/// `logit_config::TraceIdFormat` plus its `trace_id_high` field; `logit-cli` converts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum IdFormat {
+    /// 32-hex trace ids and 16-hex span ids.
+    #[default]
+    Otel,
+    /// Decimal uint64 ids as Datadog tracers inject them into logs, or a 32-hex trace id.
+    Datadog {
+        /// The attribute holding the high 64 bits of a trace id that arrived without them.
+        trace_id_high: Option<String>,
+    },
+}
+
+impl IdFormat {
+    fn trace_id(&self, value: &Value) -> Option<[u8; 16]> {
+        match self {
+            IdFormat::Otel => value.as_str().and_then(parse_trace_id),
+            IdFormat::Datadog { .. } => match value {
+                Value::Str(_) => value.as_str().and_then(parse_trace_id_datadog),
+                _ => datadog_integer(value).map(|low| trace_id_bytes(0, low)),
+            },
+        }
+    }
+
+    fn span_id(&self, value: &Value) -> Option<[u8; 8]> {
+        match self {
+            IdFormat::Otel => value.as_str().and_then(parse_span_id),
+            IdFormat::Datadog { .. } => match value {
+                Value::Str(_) => value.as_str().and_then(parse_span_id_datadog),
+                _ => datadog_integer(value).map(u64::to_be_bytes),
+            },
+        }
+    }
+
+    fn trace_id_high_field(&self) -> Option<&str> {
+        match self {
+            IdFormat::Otel => None,
+            IdFormat::Datadog { trace_id_high } => trace_id_high.as_deref(),
+        }
+    }
+}
+
+/// A Datadog id that a JSON decoder turned into a number (an unquoted `"dd.trace_id": 123`): the
+/// uint64 itself, non-zero. A float loses a 64-bit id's low digits, so it's never one.
+fn datadog_integer(value: &Value) -> Option<u64> {
+    match value {
+        Value::U64(n) => Some(*n),
+        Value::I64(n) => u64::try_from(*n).ok(),
+        _ => None,
+    }
+    .filter(|&n| n != 0)
+}
+
 /// [`SpanLift`] prepared once: the default name is a `Value` the per-event path only
 /// refcount-bumps, and the skew window is in nanoseconds.
 struct SpanDefaults {
@@ -93,7 +164,8 @@ struct SpanDefaults {
 enum Skip {
     /// No trace id anywhere: neither the configured attribute nor a `traceparent`.
     Missing,
-    /// Something present didn't parse: an id, the flags, a `traceparent`, a `span.kind`/
+    /// Something present didn't parse: an id in the configured [`IdFormat`]'s grammar (a 16-hex
+    /// `dd.span_id`, say), a `trace_id_high`, the flags, a `traceparent`, a `span.kind`/
     /// `span.status` name, a timing value, or two forms of one timing quantity at once.
     Invalid,
     /// A `span:` block needs this line's own span id, none was present, and `mint_id` is off.
@@ -222,12 +294,15 @@ pub struct TraceContext {
     trace_id_field: String,
     span_id_field: Option<String>,
     flags_field: Option<String>,
+    format: IdFormat,
     keep_source: bool,
     span: Option<SpanDefaults>,
     telemetry: Telemetry,
 }
 
 impl TraceContext {
+    /// Takes the resolved field names: [`IdFormat`] changes only how their values parse, not
+    /// which attributes are read (`logit_config::TraceIdFormat::resolve_fields` picks those).
     pub fn new(
         trace_id_field: String,
         span_id_field: Option<String>,
@@ -238,10 +313,18 @@ impl TraceContext {
             trace_id_field,
             span_id_field,
             flags_field,
+            format: IdFormat::Otel,
             keep_source,
             span: None,
             telemetry: Telemetry::default(),
         }
+    }
+
+    /// Parses the trace id and span id attributes in `format`'s grammar instead of the default
+    /// [`IdFormat::Otel`].
+    pub fn with_format(mut self, format: IdFormat) -> Self {
+        self.format = format;
+        self
     }
 
     /// Mints a `SpanRecord` per lifted line (the `span:` block).
@@ -273,8 +356,20 @@ impl TraceContext {
         };
 
         let trace_id = match present(attrs, &self.trace_id_field) {
-            Some(value) => value.as_str().and_then(parse_trace_id).ok_or(Skip::Invalid)?,
+            Some(value) => self.format.trace_id(value).ok_or(Skip::Invalid)?,
             None => traceparent.map(|(trace, _, _)| trace).ok_or(Skip::Missing)?,
+        };
+        // Parsed whenever present, like `flags`, so a bad value is `Invalid` even when a 128-bit
+        // trace id leaves it unused.
+        let trace_id = match self.format.trace_id_high_field().and_then(|f| present(attrs, f)) {
+            Some(value) => {
+                let high = value.as_str().and_then(parse_trace_id_high).ok_or(Skip::Invalid)?;
+                match trace_id_halves(&trace_id) {
+                    (0, low) => trace_id_bytes(high, low),
+                    _ => trace_id,
+                }
+            }
+            None => trace_id,
         };
 
         let flags = match self.flags_field.as_deref().and_then(|field| present(attrs, field)) {
@@ -286,7 +381,7 @@ impl TraceContext {
 
         let own_span_id =
             match self.span_id_field.as_deref().and_then(|field| present(attrs, field)) {
-                Some(value) => Some(value.as_str().and_then(parse_span_id).ok_or(Skip::Invalid)?),
+                Some(value) => Some(self.format.span_id(value).ok_or(Skip::Invalid)?),
                 None => None,
             };
 
@@ -382,6 +477,9 @@ impl TraceContext {
             attrs.remove(field);
         }
         if let Some(field) = &self.flags_field {
+            attrs.remove(field);
+        }
+        if let Some(field) = self.format.trace_id_high_field() {
             attrs.remove(field);
         }
         attrs.remove(TRACEPARENT);
@@ -1255,5 +1353,237 @@ mod tests {
         assert!(t.process(&default_resource(), &mut event));
         assert!(event.span.is_none());
         assert_eq!(event.attributes.len(), 4);
+    }
+
+    // -- `IdFormat::Datadog` ---------------------------------------------------------------------
+
+    /// Datadog's documented examples: a decimal `dd.trace_id`, a 128-bit hex one, and a
+    /// `_dd.p.tid` carrying that hex id's high half.
+    const DD_DECIMAL: &str = "1234567890123456789";
+    const DD_DECIMAL_LOW: u64 = 1_234_567_890_123_456_789;
+    const DD_HEX_128: &str = "64de8e2b0000000012345678abcdef12";
+    const DD_TID: &str = "64de8e2b00000000";
+    const DD_TID_HIGH: u64 = 0x64de_8e2b_0000_0000;
+
+    /// `format: datadog`'s resolved defaults (`logit_config`'s), no span block.
+    fn datadog(trace_id_high: Option<&str>, keep_source: bool) -> TraceContext {
+        TraceContext::new(
+            "dd.trace_id".to_string(),
+            Some("dd.span_id".to_string()),
+            None,
+            keep_source,
+        )
+        .with_format(IdFormat::Datadog { trace_id_high: trace_id_high.map(str::to_string) })
+    }
+
+    /// Runs `t` over `pairs` and returns the lifted reference, or the skip reason.
+    fn lift_with(t: TraceContext, pairs: &[(&str, Value)]) -> Result<TraceRef, &'static str> {
+        let (mut t, registry) = instrumented(t);
+        let mut event = log_event(pairs);
+        assert!(t.process(&default_resource(), &mut event));
+        match event.log.unwrap().trace {
+            Some(trace) => Ok(trace),
+            None => {
+                let drained = registry.drain(0);
+                for reason in ["invalid", "missing", "span_id", "timing", "skew"] {
+                    if find_counter(
+                        &drained,
+                        "logit.transform.trace_context.skipped",
+                        Some(("reason", reason)),
+                    )
+                    .is_some()
+                    {
+                        return Err(reason);
+                    }
+                }
+                panic!("no trace and no skip counter")
+            }
+        }
+    }
+
+    #[test]
+    fn datadog_decimal_ids_are_lifted_into_the_low_half_and_consumed() {
+        let mut t = datadog(None, false);
+        let mut event = log_event(&[
+            ("dd.trace_id", Value::str(DD_DECIMAL)),
+            ("dd.span_id", Value::str("987654321")),
+            ("dd.service", Value::str("web")),
+        ]);
+        assert!(t.process(&default_resource(), &mut event));
+        assert_eq!(
+            event.log.unwrap().trace,
+            Some(TraceRef {
+                trace_id: trace_id_bytes(0, DD_DECIMAL_LOW),
+                span_id: Some(987_654_321_u64.to_be_bytes()),
+                flags: 0,
+            })
+        );
+        assert!(event.attributes.get("dd.trace_id").is_none());
+        assert!(event.attributes.get("dd.span_id").is_none());
+        assert!(event.attributes.get("dd.service").is_some(), "only the ids are consumed");
+    }
+
+    #[test]
+    fn datadog_accepts_a_128_bit_hex_trace_id() {
+        let trace =
+            lift_with(datadog(None, false), &[("dd.trace_id", Value::str(DD_HEX_128))]).unwrap();
+        assert_eq!(trace_id_halves(&trace.trace_id), (DD_TID_HIGH, 0x1234_5678_abcd_ef12));
+    }
+
+    #[test]
+    fn datadog_accepts_integer_ids_from_an_unquoted_json_number() {
+        let trace = lift_with(
+            datadog(None, false),
+            &[("dd.trace_id", Value::U64(u64::MAX)), ("dd.span_id", Value::I64(42))],
+        )
+        .unwrap();
+        assert_eq!(trace.trace_id, trace_id_bytes(0, u64::MAX));
+        assert_eq!(trace.span_id, Some(42_u64.to_be_bytes()));
+        for bad in [Value::I64(-1), Value::I64(0), Value::U64(0), Value::F64(1.0)] {
+            assert_eq!(
+                lift_with(datadog(None, false), &[("dd.trace_id", bad.clone())]),
+                Err("invalid"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_16_digit_id_is_hex_under_otel_and_decimal_under_datadog() {
+        let digits = "1234567890123456";
+        let otel = lift_with(
+            convention(),
+            &[("trace.id", Value::str(hex_trace())), ("span.id", Value::str(digits))],
+        )
+        .unwrap();
+        assert_eq!(otel.span_id, Some([0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]));
+        let dd = lift_with(
+            datadog(None, false),
+            &[("dd.trace_id", Value::str(digits)), ("dd.span_id", Value::str(digits))],
+        )
+        .unwrap();
+        assert_eq!(dd.trace_id, trace_id_bytes(0, 1_234_567_890_123_456));
+        assert_eq!(dd.span_id, Some(1_234_567_890_123_456_u64.to_be_bytes()));
+    }
+
+    #[test]
+    fn datadog_rejects_16_hex_and_otel_rejects_decimal() {
+        assert_eq!(
+            lift_with(datadog(None, false), &[("dd.trace_id", Value::str(hex_span()))]),
+            Err("invalid"),
+            "16 hex is no Datadog form"
+        );
+        assert_eq!(
+            lift_with(
+                datadog(None, false),
+                &[("dd.trace_id", Value::str(DD_DECIMAL)), ("dd.span_id", Value::str(hex_span()))]
+            ),
+            Err("invalid")
+        );
+        assert_eq!(
+            lift_with(convention(), &[("trace.id", Value::str(DD_DECIMAL))]),
+            Err("invalid"),
+            "otel is unchanged: decimal is not an otel form"
+        );
+        assert_eq!(
+            lift_with(datadog(None, false), &[("dd.trace_id", Value::str("18446744073709551616"))]),
+            Err("invalid"),
+            "above u64::MAX"
+        );
+    }
+
+    #[test]
+    fn trace_id_high_fills_a_zero_high_half_and_is_consumed() {
+        let mut t = datadog(Some("_dd.p.tid"), false);
+        let mut event = log_event(&[
+            ("dd.trace_id", Value::str("1311768467750121234")),
+            ("_dd.p.tid", Value::str(DD_TID)),
+        ]);
+        assert!(t.process(&default_resource(), &mut event));
+        let trace = event.log.unwrap().trace.unwrap();
+        assert_eq!(trace.trace_id, logit_core::trace::parse_trace_id(DD_HEX_128).unwrap());
+        assert!(event.attributes.get("_dd.p.tid").is_none(), "consumed with the ids");
+    }
+
+    #[test]
+    fn trace_id_high_never_replaces_a_nonzero_high_half() {
+        let trace = lift_with(
+            datadog(Some("_dd.p.tid"), false),
+            &[("dd.trace_id", Value::str(DD_HEX_128)), ("_dd.p.tid", Value::str("ffff"))],
+        )
+        .unwrap();
+        assert_eq!(trace_id_halves(&trace.trace_id).0, DD_TID_HIGH, "the id's own high half wins");
+    }
+
+    #[test]
+    fn trace_id_high_absent_leaves_the_high_half_zero_and_invalid_skips() {
+        let trace = lift_with(
+            datadog(Some("_dd.p.tid"), false),
+            &[("dd.trace_id", Value::str(DD_DECIMAL))],
+        )
+        .unwrap();
+        assert_eq!(trace_id_halves(&trace.trace_id), (0, DD_DECIMAL_LOW));
+        for bad in [Value::str("0x64de"), Value::str("11112222333344445"), Value::U64(1)] {
+            assert_eq!(
+                lift_with(
+                    datadog(Some("_dd.p.tid"), false),
+                    &[("dd.trace_id", Value::str(DD_HEX_128)), ("_dd.p.tid", bad.clone())]
+                ),
+                Err("invalid"),
+                "validated even when a 128-bit id leaves it unused: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_source_keeps_trace_id_high_too() {
+        let mut t = datadog(Some("_dd.p.tid"), true);
+        let mut event = log_event(&[
+            ("dd.trace_id", Value::str(DD_DECIMAL)),
+            ("dd.span_id", Value::str("7")),
+            ("_dd.p.tid", Value::str(DD_TID)),
+        ]);
+        assert!(t.process(&default_resource(), &mut event));
+        assert!(event.log.unwrap().trace.is_some());
+        assert_eq!(event.attributes.len(), 3, "nothing consumed: {:?}", event.attributes);
+    }
+
+    #[test]
+    fn a_traceparent_is_still_honored_under_datadog() {
+        let trace =
+            lift_with(datadog(None, false), &[("traceparent", Value::str(W3C_EXAMPLE))]).unwrap();
+        assert_eq!(trace, TraceRef { trace_id: W3C_TRACE, span_id: None, flags: 1 });
+        let trace = lift_with(
+            datadog(None, false),
+            &[("traceparent", Value::str(W3C_EXAMPLE)), ("dd.trace_id", Value::str(DD_DECIMAL))],
+        )
+        .unwrap();
+        assert_eq!(trace.trace_id, trace_id_bytes(0, DD_DECIMAL_LOW), "an explicit id wins");
+        assert_eq!(trace.flags, 1, "flags still come from the header");
+    }
+
+    #[test]
+    fn the_span_block_works_under_datadog_with_hex_w3c_parents() {
+        let mut t = datadog(Some("_dd.p.tid"), false).with_span(span_lift());
+        let mut event = log_event(&[
+            ("dd.trace_id", Value::str(DD_DECIMAL)),
+            ("dd.span_id", Value::str("42")),
+            ("_dd.p.tid", Value::str(DD_TID)),
+            ("span.parent_id", Value::str("ef".repeat(8))),
+            ("span.start", Value::I64(RECEIPT - 10_000_000)),
+            ("span.duration", Value::I64(4_000_000)),
+        ]);
+        assert!(t.process(&default_resource(), &mut event));
+        let span = event.span.as_ref().expect("a span");
+        assert_eq!(span.trace_id, trace_id_bytes(DD_TID_HIGH, DD_DECIMAL_LOW));
+        assert_eq!(span.span_id, 42_u64.to_be_bytes());
+        assert_eq!(span.parent_span_id, Some([0xef; 8]), "span.parent_id stays W3C hex");
+        assert_eq!(event.timestamp, RECEIPT - 10_000_000);
+        assert_eq!(event.log.as_ref().unwrap().trace.unwrap().span_id, Some(42_u64.to_be_bytes()));
+        assert!(
+            event.attributes.is_empty(),
+            "every read attribute consumed: {:?}",
+            event.attributes
+        );
     }
 }

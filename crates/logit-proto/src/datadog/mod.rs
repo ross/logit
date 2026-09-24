@@ -227,6 +227,7 @@
 //! | `ddtags` | `ddtags`, verbatim | -- |
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
 //! | an attribute named `message` or `timestamp` | dropped: it would collide with the wire's own | `logit.output.tags.dropped{reason="reserved_key"}` |
+//! | `LogRecord::trace`, when no `trace_id` or `span_id` attribute is present | `trace_id` (32 lowercase hex) and, when the ref has one, `span_id` (16 lowercase hex), after the attributes: the OTel form Datadog's log intake detects. An attribute of either name suppresses both, so a relayed intake log re-encodes unchanged | -- |
 //! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |

@@ -69,13 +69,13 @@ use logit_transforms::{
     Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, HttpAccess as HttpAccessTransform, HttpAccessConfig,
-    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    IdFormat as TraceIdFormatTransform, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
+    Kv as KvTransform, KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform,
+    MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
+    Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
+    Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -626,14 +626,17 @@ fn build_spec(
             SetTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
-        TraceContext { trace_id, span_id, flags, keep_source, span } => {
-            let mut transform = TraceContextTransform::new(
-                trace_id.clone(),
-                span_id.clone(),
-                flags.clone(),
-                *keep_source,
-            )
-            .with_telemetry(telemetry.clone());
+        TraceContext { format, trace_id, span_id, flags, trace_id_high, keep_source, span } => {
+            let (trace_id, span_id, flags) = format.resolve_fields(trace_id, span_id, flags);
+            let id_format = match format {
+                logit_config::TraceIdFormat::Otel => TraceIdFormatTransform::Otel,
+                logit_config::TraceIdFormat::Datadog => {
+                    TraceIdFormatTransform::Datadog { trace_id_high: trace_id_high.clone() }
+                }
+            };
+            let mut transform = TraceContextTransform::new(trace_id, span_id, flags, *keep_source)
+                .with_format(id_format)
+                .with_telemetry(telemetry.clone());
             if let Some(span) = span {
                 transform = transform.with_span(to_span_lift(span));
             }
@@ -3564,9 +3567,11 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
-                trace_id: "tid".to_string(),
-                span_id: Some("sid".to_string()),
-                flags: None,
+                format: logit_config::TraceIdFormat::Otel,
+                trace_id: Some("tid".to_string()),
+                span_id: Some(Some("sid".to_string())),
+                flags: Some(None),
+                trace_id_high: None,
                 keep_source: true,
                 span: None,
             },
@@ -3615,9 +3620,11 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
-                trace_id: "trace.id".to_string(),
-                span_id: Some("span.id".to_string()),
-                flags: None,
+                format: logit_config::TraceIdFormat::Otel,
+                trace_id: None,
+                span_id: None,
+                flags: Some(None),
+                trace_id_high: None,
                 keep_source: false,
                 span: Some(logit_config::SpanLiftConfig {
                     kind: logit_config::SpanKindConfig::Client,
@@ -3657,6 +3664,56 @@ mod tests {
         assert_eq!(span.name.as_str(), Some("http.request"));
         assert_eq!(event.timestamp, 1_725_000_000_000_000_000);
         assert_eq!(span.end_timestamp, 1_725_000_000_005_000_000);
+    }
+
+    /// `format: datadog` reaches the transform with its `dd.*` defaults and `trace_id_high`.
+    #[test]
+    fn build_spec_builds_a_datadog_trace_context_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::TraceContext {
+                format: logit_config::TraceIdFormat::Datadog,
+                trace_id: None,
+                span_id: None,
+                flags: None,
+                trace_id_high: Some("_dd.p.tid".to_string()),
+                keep_source: false,
+                span: None,
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("trace", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("dd.trace_id", logit_core::Value::str("1311768467750121234"));
+        attrs.insert("dd.span_id", logit_core::Value::str("42"));
+        attrs.insert("_dd.p.tid", logit_core::Value::str("64de8e2b00000000"));
+        let mut event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        let trace = event.log.expect("log should survive").trace.expect("trace should be lifted");
+        assert_eq!(logit_core::trace::to_hex(&trace.trace_id), "64de8e2b0000000012345678abcdef12");
+        assert_eq!(trace.span_id, Some(42_u64.to_be_bytes()));
+        assert!(event.attributes.is_empty(), "all three consumed: {:?}", event.attributes);
     }
 
     /// Runs the built transform: the configured factor reaches `Scale::new`.

@@ -1197,26 +1197,53 @@ pub enum ComponentKind {
     /// the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`,
     /// `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`,
     /// `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`,
-    /// `span_id`, and `flags` rename the three id sources. A successful lift overwrites any trace
-    /// reference the log already had. An event with no log, or with missing or unparseable
-    /// attributes, passes through untouched; it is never an error.
+    /// `span_id`, and `flags` rename the three id sources. `format: datadog` reads the ids a
+    /// Datadog tracer injects into its logs (`dd.trace_id`, `dd.span_id`) instead. A successful
+    /// lift overwrites any trace reference the log already had. An event with no log, or with
+    /// missing or unparseable attributes, passes through untouched; it is never an error.
     TraceContext {
-        /// The attribute holding a 32-character hex trace id. Defaults to `trace.id`; an empty
-        /// string is rejected. A `traceparent` attribute supplies the trace id when this one is
-        /// absent.
-        #[serde(default = "default_trace_id_field")]
-        trace_id: String,
-        /// The attribute holding this line's own 16-character hex span id. Defaults to `span.id`;
-        /// `null` disables the lookup, and an empty string is rejected. An absent attribute means
-        /// "no span id", not a skip (unless a `span:` block needs one); only a present but
-        /// unparseable value is an error.
-        #[serde(default = "default_span_id_field")]
-        span_id: Option<String>,
+        /// The id grammar, and the attribute names the three id fields default to. `otel` (the
+        /// default): a 32-character hex trace id and a 16-character hex span id, read from
+        /// `trace.id`/`span.id`/`trace.flags`. `datadog`: what a Datadog tracer injects into a
+        /// log, read from `dd.trace_id`/`dd.span_id` with no flags field: a trace id that is a
+        /// decimal 64-bit number or 32 hex characters, and a span id that is a decimal 64-bit
+        /// number. A 16-digit value is hex under `otel` and decimal under `datadog`; the format
+        /// decides, never the value.
+        #[serde(default)]
+        format: TraceIdFormat,
+        /// The attribute holding the trace id, in `format`'s grammar. Defaults to `trace.id`
+        /// (`dd.trace_id` under `format: datadog`); an empty string is rejected. A `traceparent`
+        /// attribute supplies the trace id when this one is absent.
+        #[serde(default)]
+        trace_id: Option<String>,
+        /// The attribute holding this line's own span id, in `format`'s grammar. Defaults to
+        /// `span.id` (`dd.span_id` under `format: datadog`); `null` disables the lookup, and an
+        /// empty string is rejected. An absent attribute means "no span id", not a skip (unless a
+        /// `span:` block needs one); only a present but unparseable value is an error.
+        #[serde(
+            default,
+            deserialize_with = "explicit_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "Option<String>")]
+        span_id: Option<Option<String>>,
         /// The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to
-        /// `trace.flags`; `null` disables the lookup, and an empty string is rejected. A
-        /// `traceparent` attribute supplies the flags when this one is absent.
-        #[serde(default = "default_flags_field")]
-        flags: Option<String>,
+        /// `trace.flags` (no lookup under `format: datadog`); `null` disables the lookup, and an
+        /// empty string is rejected. A `traceparent` attribute supplies the flags when this one is
+        /// absent.
+        #[serde(
+            default,
+            deserialize_with = "explicit_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "Option<String>")]
+        flags: Option<Option<String>>,
+        /// `format: datadog` only: the attribute holding a 128-bit trace id's high 64 bits as 1
+        /// to 16 hex characters, the form a Datadog span's `_dd.p.tid` tag takes. Used only when
+        /// the trace id itself carried no high half (a decimal id); a present but unparseable
+        /// value is an error. Unset (the default) means no lookup.
+        #[serde(default)]
+        trace_id_high: Option<String>,
         /// Keep the source attributes after a successful lift instead of removing them (the
         /// default). Removal matters for OTLP-native backends: Loki turns log attributes into
         /// structured metadata under their own names, so a leftover `trace_id` attribute would
@@ -2505,16 +2532,46 @@ pub fn default_prometheus_scrape_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
-fn default_trace_id_field() -> String {
-    "trace.id".to_string()
+/// `trace_context`'s id grammar, which also picks its field-name defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceIdFormat {
+    /// W3C/OpenTelemetry: 32 hex characters for a trace id, 16 for a span id.
+    #[default]
+    Otel,
+    /// Datadog log injection: decimal 64-bit ids, or a 32-hex-character trace id.
+    Datadog,
 }
 
-fn default_span_id_field() -> Option<String> {
-    Some("span.id".to_string())
+impl TraceIdFormat {
+    /// The trace id, span id, and flags attribute names `trace_context` reads, from the configured
+    /// fields: an absent field (`None`) takes this format's default, and a `null` one (`Some(None)`)
+    /// disables that lookup.
+    pub fn resolve_fields(
+        self,
+        trace_id: &Option<String>,
+        span_id: &Option<Option<String>>,
+        flags: &Option<Option<String>>,
+    ) -> (String, Option<String>, Option<String>) {
+        let (trace_default, span_default, flags_default) = match self {
+            TraceIdFormat::Otel => ("trace.id", Some("span.id"), Some("trace.flags")),
+            TraceIdFormat::Datadog => ("dd.trace_id", Some("dd.span_id"), None),
+        };
+        (
+            trace_id.clone().unwrap_or_else(|| trace_default.to_string()),
+            span_id.clone().unwrap_or_else(|| span_default.map(str::to_string)),
+            flags.clone().unwrap_or_else(|| flags_default.map(str::to_string)),
+        )
+    }
 }
 
-fn default_flags_field() -> Option<String> {
-    Some("trace.flags".to_string())
+/// Deserializes a field whose explicit `null` differs from its absence: absent is `None` (through
+/// `#[serde(default)]`), `null` is `Some(None)`.
+fn explicit_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// `trace_context`'s `span:` block: the defaults a minted span falls back on when the event's
@@ -3782,10 +3839,25 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "trace_context", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
-                assert_eq!(trace_id, "trace.id");
-                assert_eq!(span_id, Some("span.id".to_string()));
-                assert_eq!(flags, Some("trace.flags".to_string()));
+            ComponentKind::TraceContext {
+                format,
+                trace_id,
+                span_id,
+                flags,
+                trace_id_high,
+                keep_source,
+                span,
+            } => {
+                assert_eq!(format, TraceIdFormat::Otel);
+                assert_eq!(
+                    format.resolve_fields(&trace_id, &span_id, &flags),
+                    (
+                        "trace.id".to_string(),
+                        Some("span.id".to_string()),
+                        Some("trace.flags".to_string())
+                    )
+                );
+                assert_eq!(trace_id_high, None);
                 assert!(!keep_source);
                 assert_eq!(span, None, "span lifting is opt-in");
             }
@@ -3800,12 +3872,60 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { span_id, flags, .. } => {
-                assert_eq!(span_id, None);
-                assert_eq!(flags, None);
+            ComponentKind::TraceContext { format, trace_id, span_id, flags, .. } => {
+                assert_eq!(span_id, Some(None));
+                assert_eq!(flags, Some(None));
+                assert_eq!(
+                    format.resolve_fields(&trace_id, &span_id, &flags),
+                    ("trace.id".to_string(), None, None)
+                );
             }
             other => panic!("expected TraceContext, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_context_datadog_format_takes_the_dd_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "datadog",
+                "trace_id_high": "_dd.p.tid"}"#,
+        )
+        .unwrap();
+        let ComponentKind::TraceContext { format, trace_id, span_id, flags, trace_id_high, .. } =
+            component.kind
+        else {
+            panic!("expected TraceContext");
+        };
+        assert_eq!(format, TraceIdFormat::Datadog);
+        assert_eq!(
+            format.resolve_fields(&trace_id, &span_id, &flags),
+            ("dd.trace_id".to_string(), Some("dd.span_id".to_string()), None)
+        );
+        assert_eq!(trace_id_high.as_deref(), Some("_dd.p.tid"));
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "datadog",
+                "trace_id": "trace_id", "span_id": null, "flags": "sampled"}"#,
+        )
+        .unwrap();
+        let ComponentKind::TraceContext { format, trace_id, span_id, flags, .. } = component.kind
+        else {
+            panic!("expected TraceContext");
+        };
+        assert_eq!(
+            format.resolve_fields(&trace_id, &span_id, &flags),
+            ("trace_id".to_string(), None, Some("sampled".to_string())),
+            "an explicit name or null beats the format's default"
+        );
+    }
+
+    #[test]
+    fn trace_context_rejects_an_unknown_format() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "zipkin"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("zipkin"), "got: {err}");
     }
 
     #[test]
@@ -3817,10 +3937,10 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
-                assert_eq!(trace_id, "trace_id");
-                assert_eq!(span_id, Some("span_id".to_string()));
-                assert_eq!(flags, Some("trace_flags".to_string()));
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span, .. } => {
+                assert_eq!(trace_id, Some("trace_id".to_string()));
+                assert_eq!(span_id, Some(Some("span_id".to_string())));
+                assert_eq!(flags, Some(Some("trace_flags".to_string())));
                 assert!(keep_source);
                 assert_eq!(
                     span,

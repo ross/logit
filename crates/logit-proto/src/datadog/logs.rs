@@ -12,6 +12,7 @@ use base64::Engine;
 use bytes::Bytes;
 use logit_core::attrs::merged;
 use logit_core::interner::{intern, resolve};
+use logit_core::trace::to_hex;
 use logit_core::{
     format_rfc3339_utc, parse_rfc3339_to_nanos, AttrMap, BodyFormat, Event, EventBatch, LogRecord,
     Resource, Severity, Symbol, Value,
@@ -29,6 +30,10 @@ pub const ATTR_DDSOURCE: &str = "ddsource";
 pub const ATTR_DDTAGS: &str = "ddtags";
 /// `service.name`: the OTel name the encoder's `service` falls back to.
 pub const ATTR_SERVICE_NAME: &str = "service.name";
+/// `trace_id`/`span_id`: the OTel-form hex keys Datadog's log intake detects for trace
+/// correlation, which the encoder writes from `LogRecord.trace`.
+pub const WIRE_TRACE_ID: &str = "trace_id";
+pub const WIRE_SPAN_ID: &str = "span_id";
 
 struct LogKeys {
     status: Symbol,
@@ -41,6 +46,8 @@ struct LogKeys {
     source: Symbol,
     message: Symbol,
     timestamp: Symbol,
+    trace_id: Symbol,
+    span_id: Symbol,
 }
 
 static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
@@ -54,6 +61,8 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
     source: intern(ATTR_SOURCE),
     message: intern("message"),
     timestamp: intern("timestamp"),
+    trace_id: intern(WIRE_TRACE_ID),
+    span_id: intern(WIRE_SPAN_ID),
 });
 
 impl DatadogDecoder {
@@ -253,6 +262,16 @@ impl DatadogEncoder {
                 continue;
             }
             write_value(obj.key(resolve(*key)), value);
+        }
+        // An attribute of either name wins and suppresses both, so a relayed Datadog log goes
+        // back out as it arrived and its ids are never mixed with a `TraceRef`'s.
+        if let Some(trace) = &log.trace {
+            if find(keys.trace_id).is_none() && find(keys.span_id).is_none() {
+                write_str(obj.key(WIRE_TRACE_ID), &to_hex(&trace.trace_id));
+                if let Some(span_id) = &trace.span_id {
+                    write_str(obj.key(WIRE_SPAN_ID), &to_hex(span_id));
+                }
+            }
         }
         obj.finish();
     }
@@ -608,5 +627,60 @@ pub(super) mod tests {
             counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
             1.0
         );
+    }
+
+    fn with_trace(mut batch: EventBatch, trace: logit_core::TraceRef) -> EventBatch {
+        batch.events[0].log.as_mut().unwrap().trace = Some(trace);
+        batch
+    }
+
+    #[test]
+    fn encode_writes_a_trace_ref_as_otel_hex_ids() {
+        let trace = logit_core::TraceRef {
+            trace_id: logit_core::trace::trace_id_bytes(
+                0x64de_8e2b_0000_0000,
+                0x1234_5678_abcd_ef12,
+            ),
+            span_id: Some(987_654_321_u64.to_be_bytes()),
+            flags: 1,
+        };
+        let batch = with_trace(decode(r#"{"message":"m","timestamp":1000,"k":"v"}"#), trace);
+        assert_eq!(
+            encode(&batch),
+            r#"[{"message":"m","timestamp":1000,"k":"v","trace_id":"64de8e2b0000000012345678abcdef12","span_id":"000000003ade68b1"}]"#
+        );
+
+        let no_span = logit_core::TraceRef { span_id: None, ..trace };
+        let batch = with_trace(decode(r#"{"message":"m","timestamp":1000}"#), no_span);
+        assert_eq!(
+            encode(&batch),
+            r#"[{"message":"m","timestamp":1000,"trace_id":"64de8e2b0000000012345678abcdef12"}]"#
+        );
+    }
+
+    #[test]
+    fn a_trace_id_or_span_id_attribute_wins_over_the_trace_ref() {
+        let trace =
+            logit_core::TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 0 };
+        for body in [
+            r#"{"message":"m","timestamp":1000,"trace_id":"1234"}"#,
+            r#"{"message":"m","timestamp":1000,"span_id":"5678"}"#,
+        ] {
+            let batch = with_trace(decode(body), trace);
+            assert_eq!(encode(&batch), format!("[{body}]"), "the attribute alone goes out");
+        }
+    }
+
+    #[test]
+    fn a_decoded_log_with_trace_ids_re_encodes_unchanged() {
+        let body = r#"[{"message":"m","status":"info","timestamp":1000,"dd.trace_id":"1234567890123456789","trace_id":"64de8e2b0000000012345678abcdef12","span_id":"00f067aa0ba902b7"}]"#;
+        let batch = decode(body);
+        assert_eq!(batch.events[0].log.as_ref().unwrap().trace, None, "the decoder sets no ref");
+        let once = encode(&batch);
+        let again = decode(&once);
+        assert_eq!(again, batch, "decode(encode(x)) is x");
+        assert_eq!(encode(&again), once, "and the bytes are stable");
+        let json: Json = serde_json::from_str(&once).unwrap();
+        assert_eq!(json, serde_json::from_str::<Json>(body).unwrap(), "same keys and values");
     }
 }

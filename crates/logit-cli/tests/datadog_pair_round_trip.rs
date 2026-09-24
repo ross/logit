@@ -10,7 +10,8 @@
 
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, Event, EventBatch, HyperLogLog, MetricKind, MetricRecord, Registry, Resource, Value,
+    AttrMap, Event, EventBatch, HyperLogLog, MetricKind, MetricRecord, Registry, Resource,
+    TraceRef, Value,
 };
 use logit_inputs::datadog::DatadogInput;
 use logit_outputs::datadog::{DatadogEndpoints, DatadogOutput};
@@ -171,7 +172,7 @@ fn sketches() -> EventBatch {
 fn logs() -> EventBatch {
     let ms = now_s() * 1000;
     let seed = format!(
-        r#"[{{"message":"GET / 200","status":"info","timestamp":{ms},"hostname":"web-1","service":"nginx","ddsource":"nginx","ddtags":"env:prod"}},{{"message":"boom","status":"error","timestamp":{},"service":"api","http":{{"status_code":500}}}}]"#,
+        r#"[{{"message":"GET / 200","status":"info","timestamp":{ms},"hostname":"web-1","service":"nginx","ddsource":"nginx","ddtags":"env:prod","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}},{{"message":"boom","status":"error","timestamp":{},"service":"api","http":{{"status_code":500}}}}]"#,
         ms + 123
     );
     decoder().decode_logs(seed.as_bytes(), 0).unwrap()
@@ -288,6 +289,25 @@ async fn every_route_relays_its_batch_unchanged() {
         assert_eq!(recv(&mut rx).await, batch, "{name}");
     }
     assert_nothing_delivered(&mut rx).await;
+}
+
+/// A log's `TraceRef` arrives as the `trace_id`/`span_id` hex attributes Datadog correlates on.
+#[tokio::test]
+async fn a_log_trace_ref_arrives_as_hex_id_attributes() {
+    let (addr, mut rx) = listener().await;
+    let registry = Registry::new();
+    let mut batch = logs();
+    batch.events.truncate(1);
+    let event = &mut batch.events[0];
+    event.attributes.remove("trace_id");
+    event.attributes.remove("span_id");
+    event.log.as_mut().unwrap().trace =
+        Some(TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 1 });
+    sink(addr, &registry).send(&batch).await.unwrap();
+    let delivered = recv(&mut rx).await;
+    let attrs = &delivered.events[0].attributes;
+    assert_eq!(attrs.get("trace_id"), Some(&Value::str("ab".repeat(16))));
+    assert_eq!(attrs.get("span_id"), Some(&Value::str("cd".repeat(8))));
 }
 
 /// A `Set` goes out as a gauge of its estimate, the Agent's own `s` semantics: the one series
