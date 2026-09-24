@@ -61,7 +61,7 @@
 //!
 //! - `version` `logit/<version>` and an empty `git_commit`: identifies the stand-in in a
 //!   tracer's debug logs.
-//! - `endpoints`: exactly the routes this listener decodes (`/v0.3`, `/v0.4`, `/v0.5`, and
+//! - `endpoints`: the routes this listener decodes (`/v0.3`, `/v0.4`, `/v0.5`, and
 //!   `/v0.7/traces`, `/v0.6/stats`, `/info`). `/v0.6/stats` is listed so a tracer that computes
 //!   client-side stats keeps sending them; they relay losslessly to a real Agent. The telemetry
 //!   proxy, `/v0.7/config`, `/v0.1/pipeline_stats`, and `/v1.0/traces` are left out so a tracer
@@ -121,15 +121,10 @@
 //! [`Fanout::send_with_deadline`], reaching every downstream consumer or none, under a
 //! [`BUSY_AFTER`] deadline, and a request that misses it is answered `503` with
 //! `Retry-After: 1`, counted `logit.input.requests{class="busy"}` and
-//! `logit.input.batches.dropped{reason="busy"}`.
-//!
-//! **Unlike an Agent, a tracer doesn't retry.** dd-trace tracers write with short timeouts,
-//! commonly 2 s, and drop a payload on any non-`2xx` answer or a timeout. So a `503` here is data
-//! loss, counted by `batches.dropped{reason="busy"}`, not the deferral it is on `datadog_in`. The
-//! 2 s wait is sized to answer before a tracer gives up on its own, which would lose the payload
-//! just the same with nothing counted. The lever against the loss is downstream capacity: give the
-//! sinks behind this listener a `buffer:` (memory or disk) large enough to absorb a stall, so the
-//! channel this listener sends into keeps draining.
+//! `logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`, that `503` is loss here, not
+//! deferral, and `BUSY_AFTER` is shorter (2 s, not 5 s) — see
+//! [ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
+//! decision 11.
 //!
 //! # The Unix socket
 //!

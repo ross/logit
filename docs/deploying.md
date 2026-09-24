@@ -1404,12 +1404,12 @@ that exists and isn't a socket is refused, so a typo can't delete a file. The ne
 permissions if that's too open. `tls:` applies to `bind` only.
 
 **A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
-seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, as `datadog_in` does. A tracer
-isn't an Agent, though: it doesn't retry, and drops the payload on any non-`2xx` answer or on its
-own write timeout, commonly 2 seconds. Waiting longer wouldn't save the payload, so every `503` is
-loss, counted `logit.input.batches.dropped{reason="busy"}`. Prevent it downstream: give the sinks
-this listener feeds a `buffer:` (memory, or `disk:` for a long outage) large enough to absorb a
-stall, so the channel `datadog_trace_in` sends into keeps draining.
+seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, and — unlike `datadog_in`, whose
+own Agent retries — that `503` is loss, counted `logit.input.batches.dropped{reason="busy"}`
+([ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md), decision 11).
+Prevent it downstream: give the sinks this listener feeds a `buffer:` (memory, or `disk:` for a
+long outage) large enough to absorb a stall, so the channel `datadog_trace_in` sends into keeps
+draining.
 
 **What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
 which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and

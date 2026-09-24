@@ -1,5 +1,5 @@
 //! `datadog_trace_in` over a real socket: every trace form a dd-trace tracer sends (v0.4, v0.5,
-//! v0.7) and its client stats (`/v0.6/stats`) deliver exactly the batch the body encodes, with the
+//! v0.7) and its client stats (`/v0.6/stats`) deliver the batch the body encodes, with the
 //! tracer's request headers on the batch resource, over TCP and over the Unix socket.
 //!
 //! Each body is built by `logit_proto::datadog::DatadogEncoder` from a batch that is itself one

@@ -115,6 +115,20 @@ Three facts from the survey drive the shape of the decision:
     never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
     than Datadog's windows (1 h for metrics, 18 h for logs, 10 min for checks) before sending.
 
+11. **`datadog_trace_in` shares decision 5's bounded-wait-then-`503` mechanism, but a `503` there
+    is loss, not deferral, and the bound is shorter.** Delivery is the same
+    `Fanout::send_with_deadline` all-edges-or-nothing wait, under `BUSY_AFTER` at 2 s rather than
+    5 s: a dd-trace tracer writes with a short timeout, commonly 2 s, and drops the payload on any
+    non-`2xx` answer or its own timeout, with no retry (UNVERIFIED against a real tracer until
+    W7). So a `503` here doesn't defer delivery to a retry, the way it does on `datadog_in` — it
+    is the loss, counted `logit.input.batches.dropped{reason="busy"}` rather than assumed
+    recovered. The 2 s bound is sized to answer before the tracer gives up on its own, which would
+    lose the payload the same way with nothing counted. The operator's lever against the loss is
+    downstream capacity, not a retry: a `buffer:` (memory or disk) on the sinks behind this
+    listener, sized to absorb a stall so the channel keeps draining. The
+    `datadog_trace_in -> datadog_trace_out` pair's lossless-relay contract (decision 1) holds only
+    while that channel drains; the counter makes a stall long enough to break it visible.
+
 ## Alternatives considered
 
 - **OTLP as the only trace egress.** Nothing to build, and the documented direct path. Rejected
@@ -174,3 +188,6 @@ Three facts from the survey drive the shape of the decision:
   the perf VM, both sketch-heavy paths, and no measurable cost anywhere else
   ([`docs/design/performance.md`](../design/performance.md) §9). Accepted: bin-for-bin Datadog
   parity needs the Agent's own bin mapping, not a cheaper store that doesn't match it.
+- `datadog_trace_in`'s `503` counts as loss (`logit.input.batches.dropped{reason="busy"}`), not
+  the deferral `datadog_in`'s is (decision 11); the tracer short-timeout, no-retry behavior behind
+  that is UNVERIFIED until W7.
