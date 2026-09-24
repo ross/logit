@@ -391,7 +391,8 @@ impl DdSketch {
     /// Rank-based: the representative value of the bin holding the rank, walking the negative
     /// store from the most negative value, then the zero bin, then the positive store. The rank
     /// is `q * (count - 1)`, rounded to even under the Agent mapping (its `rank()`), truncated
-    /// under the logarithmic one (`sketches-go`). The Agent's own `Sketch.Quantile` instead
+    /// under the logarithmic one (`sketches-go`, whose mirrored walk of the negative store rounds
+    /// a fractional rank up on that side; reproduced as is). The Agent's own `Sketch.Quantile` instead
     /// interpolates upward from `f64(k)` to `f64(k) * γ`, which can miss a single-bin population
     /// by `γ^1.5 - 1`; it isn't what Datadog's backend evaluates for a shipped sketch (that code
     /// is closed), so the bin center, whose `1 - 1/√γ` bound the Agent documents, is used here.
@@ -1003,5 +1004,183 @@ mod tests {
         let total: f64 = sketch.positive_bins().iter().map(|b| b.count).sum();
         assert_eq!(total, 200.0);
         assert_eq!(sketch.count(), 200);
+    }
+
+    /// Randomized checks against the exact answer. A population is a list of `(value, weight)`
+    /// pairs, values log-uniform over 12 decades with some negatives and zeros, so keys span
+    /// thousands of bins and every branch of the rank walk (negative store, zero bin, positive
+    /// store) is exercised.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn value() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                8 => (-4.0f64..8.0).prop_map(|e| 10f64.powf(e)),
+                1 => (-4.0f64..8.0).prop_map(|e| -(10f64.powf(e))),
+                1 => Just(0.0),
+            ]
+        }
+
+        fn population() -> impl Strategy<Value = Vec<(f64, u64)>> {
+            prop::collection::vec((value(), 1u64..=20), 1..=300)
+        }
+
+        /// Both mappings, with a bin limit no population here can reach, so collapse doesn't
+        /// enter the quantile bound (it has its own property below).
+        fn mapping() -> impl Strategy<Value = Mapping> {
+            prop_oneof![
+                Just(Mapping::agent()),
+                (1.01f64..1.2, -3.0f64..3.0).prop_map(|(g, o)| Mapping::logarithmic(g, o, 1 << 16)),
+            ]
+        }
+
+        fn sketch_of(mapping: Mapping, population: &[(f64, u64)]) -> DdSketch {
+            let mut sketch = DdSketch::with_mapping(mapping);
+            for &(v, w) in population {
+                sketch.add_weighted(v, w);
+            }
+            sketch
+        }
+
+        fn sorted_expansion(population: &[(f64, u64)]) -> Vec<f64> {
+            let mut all: Vec<f64> =
+                population.iter().flat_map(|&(v, w)| std::iter::repeat_n(v, w as usize)).collect();
+            all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            all
+        }
+
+        /// The relative error a bin's representative can have against any value in it: `√γ - 1`
+        /// under the Agent mapping (bins centered on `f64(k)` in log space), `(γ - 1) / (γ + 1)`
+        /// under a logarithmic one (`Value` sits at `2γ / (1 + γ)` of the lower bound).
+        fn bound(mapping: &Mapping) -> f64 {
+            match mapping.kind() {
+                MappingKind::Agent => mapping.gamma().sqrt() - 1.0,
+                MappingKind::Logarithmic => (mapping.gamma() - 1.0) / (mapping.gamma() + 1.0),
+            }
+        }
+
+        fn same_bins(a: &DdSketch, b: &DdSketch) -> bool {
+            a.positive_bins() == b.positive_bins()
+                && a.negative_bins() == b.negative_bins()
+                && a.zero_count() == b.zero_count()
+                && a.count() == b.count()
+                && a.min() == b.min()
+                && a.max() == b.max()
+        }
+
+        proptest! {
+            /// Every quantile is within the mapping's bound of the exact quantile of the
+            /// population, under that mapping's own rank rule (round to even for the Agent,
+            /// truncation for `sketches-go`); zero answers exactly, the extremes answer exactly.
+            #[test]
+            fn quantile_is_within_the_mapping_bound_of_the_true_quantile(
+                mapping in mapping(),
+                population in population(),
+            ) {
+                let sketch = sketch_of(mapping, &population);
+                let all = sorted_expansion(&population);
+                let n = all.len() as f64;
+                prop_assert_eq!(sketch.count(), all.len());
+                let negatives = all.iter().filter(|v| **v < 0.0).count() as f64;
+                for q in [0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0] {
+                    let rank = q * (n - 1.0);
+                    let index = match mapping.kind() {
+                        MappingKind::Agent => rank.round_ties_even(),
+                        // `sketches-go` mirrors a rank into the negative store as
+                        // `negatives - 1 - rank` and takes the first bin whose cumulative count
+                        // exceeds it (clamped to its first bin), which selects `ceil(rank)` on that side and `floor(rank)`
+                        // elsewhere; the oracle follows the same rule.
+                        MappingKind::Logarithmic if rank < negatives => {
+                            negatives - 1.0 - (negatives - 1.0 - rank).floor().max(0.0)
+                        }
+                        MappingKind::Logarithmic => rank.floor(),
+                    } as usize;
+                    let truth = all[index];
+                    let estimate = sketch.quantile(q).unwrap();
+                    if q == 0.0 || q == 1.0 || truth == 0.0 {
+                        prop_assert_eq!(estimate, truth, "q = {}", q);
+                    } else {
+                        let error = (estimate - truth).abs() / truth.abs();
+                        prop_assert!(
+                            error <= bound(&mapping) + 1e-12,
+                            "q = {}: estimate {} vs true {} (error {})",
+                            q, estimate, truth, error
+                        );
+                    }
+                }
+            }
+
+            /// Merging two halves equals one sketch fed the whole population, bin for bin, and so
+            /// does feeding it in reverse order. `sum` is compared approximately: it is exact but
+            /// floating-point addition isn't associative.
+            #[test]
+            fn merge_and_insertion_order_are_bin_exact(
+                mapping in mapping(),
+                population in population(),
+                split in 0.0f64..1.0,
+            ) {
+                let whole = sketch_of(mapping, &population);
+                let at = ((population.len() as f64) * split) as usize;
+                let mut merged = sketch_of(mapping, &population[..at]);
+                merged.merge(&sketch_of(mapping, &population[at..]));
+                prop_assert!(same_bins(&merged, &whole));
+                prop_assert!((merged.sum() - whole.sum()).abs() <= 1e-9 * whole.sum().abs().max(1.0));
+
+                let reversed: Vec<_> = population.iter().rev().copied().collect();
+                prop_assert!(same_bins(&sketch_of(mapping, &reversed), &whole));
+            }
+
+            #[test]
+            fn bytes_round_trip_is_the_identity(mapping in mapping(), population in population()) {
+                let sketch = sketch_of(mapping, &population);
+                let decoded = DdSketch::from_bytes(&sketch.to_bytes()).unwrap();
+                prop_assert_eq!(decoded, sketch);
+            }
+
+            /// Under a small bin limit the store stays within it and no observation is lost:
+            /// counts fold into surviving bins, and the exact summary is untouched.
+            #[test]
+            fn collapse_holds_the_limit_and_every_count(
+                limit in 2u32..64,
+                population in population(),
+            ) {
+                let mapping = Mapping::logarithmic(1.02, 0.0, limit);
+                let sketch = sketch_of(mapping, &population);
+                let all = sorted_expansion(&population);
+                prop_assert!(sketch.positive_bins().len() <= limit as usize);
+                prop_assert!(sketch.negative_bins().len() <= limit as usize);
+                let binned: f64 = sketch.positive_bins().iter().chain(sketch.negative_bins()).map(|b| b.count).sum::<f64>() + sketch.zero_count();
+                prop_assert_eq!(binned, all.len() as f64);
+                prop_assert_eq!(sketch.min(), all.first().copied());
+                prop_assert_eq!(sketch.max(), all.last().copied());
+                prop_assert_eq!(sketch.quantile(1.0), all.last().copied());
+            }
+
+            /// Re-binning a logarithmic sketch into an Agent one keeps every observation, the
+            /// exact extremes and sum, and lands each quantile within the two bounds combined.
+            #[test]
+            fn cross_mapping_merge_keeps_counts_within_the_combined_bound(
+                population in population(),
+                gamma in 1.01f64..1.1,
+            ) {
+                let log = Mapping::logarithmic(gamma, 0.0, 1 << 16);
+                let mut agent = sketch_of(Mapping::agent(), &population[..population.len() / 2]);
+                agent.merge(&sketch_of(log, &population[population.len() / 2..]));
+                let all = sorted_expansion(&population);
+                prop_assert_eq!(agent.count(), all.len());
+                prop_assert_eq!(agent.min(), all.first().copied());
+                prop_assert_eq!(agent.max(), all.last().copied());
+                let combined = (1.0 + bound(&Mapping::agent())) * (1.0 + bound(&log)) - 1.0;
+                let index = (0.5 * (all.len() as f64 - 1.0)).round_ties_even() as usize;
+                let truth = all[index];
+                let estimate = agent.quantile(0.5).unwrap();
+                if truth == 0.0 {
+                    prop_assert_eq!(estimate, 0.0);
+                } else {
+                    prop_assert!((estimate - truth).abs() / truth.abs() <= combined + 1e-12);
+                }
+            }
+        }
     }
 }
