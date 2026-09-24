@@ -18,15 +18,13 @@ services:
     environment:
       CARGO_HOME: /home/dev/.cargo
       CARGO_TARGET_DIR: /work/target
-      # Read by examples/statsd-to-influxdb.yaml's `token: !env INFLUXDB_TOKEN`
-      # (docs/adr/env-yaml-tag.md); matches the token influxdb seeds itself with below, and
-      # is overridable from the host shell (`INFLUXDB_TOKEN=... script/server`).
+      # Read by the examples' `token: !env INFLUXDB_TOKEN` (docs/adr/env-yaml-tag.md). Matches
+      # the token influxdb seeds itself with below; override from the host shell.
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
     networks:
-      # `aliases` gives `dev` a second DNS name on the `logit` network, decoupled from the
-      # dev-only service name -- this is the name examples/nginx/nginx.conf's
-      # `access_log syslog:server=logit:5140,...` directive resolves, so it reads cleanly in
-      # config and docs alike regardless of what the actual compose service is called.
+      # The `logit` alias is the name examples/nginx/nginx.conf's `syslog:server=logit:5140`
+      # resolves. Compose applies it only to the `up`-managed container, not to a `compose run`
+      # one; see script/server.
       logit:
         aliases: [logit]
     command: sleep infinity
@@ -59,22 +57,17 @@ services:
     depends_on: [influxdb]
     networks: [logit]
 
-  # The reference nginx example (docs/plans/nginx-integration.md, workstream F;
-  # examples/nginx/). Reaches `dev`'s syslog listener over the compose-internal `logit` network
-  # by its `logit` alias above -- no `ports:` entry needed for UDP 5140, since nginx never talks
-  # to it from the host.
+  # The reference nginx example (examples/nginx/). Reaches `dev`'s syslog listener by its `logit`
+  # alias on the internal network, so UDP 5140 needs no `ports:` entry.
   nginx:
     build:
       context: ./examples/nginx
     ports:
       - "8080:80"
     networks: [logit]
-    # nginx resolves its `syslog:server=logit:5140` target at config-load time (startup), not
-    # lazily on first write -- with no `dev` container up yet to carry the `logit` alias, nginx
-    # fails to start outright ("host not found in syslog server"), confirmed empirically. This is
-    # only a startup-order dependency, not a runtime one (UDP delivery to it afterward is
-    # fire-and-forget either way): `depends_on` just needs `dev`'s container running, not `logit
-    # run` actually listening on 5140 yet.
+    # nginx resolves its syslog host at startup and fails ("host not found in syslog server") if
+    # no container carries the `logit` alias yet. Only startup order matters: `dev` must be
+    # running, not `logit run` listening, since UDP delivery is fire-and-forget.
     depends_on: [dev]
 
 networks:

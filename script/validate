@@ -1,17 +1,11 @@
 #!/bin/bash
 # Usage: script/validate
-# Runs `logit validate` over every shipped config -- demo/logit.yaml, every examples/*.yaml, every
-# perf/scenarios/*.yaml and every tools/shape-survey/configs/*.yaml -- so a component field rename
-# or a new validation rule doesn't silently leave a config broken.
-# Part of script/cibuild. Needs INFLUXDB_TOKEN resolvable (every shipped config's `influxdb_out`
-# uses `!env INFLUXDB_TOKEN`, ADR `env-yaml-tag`), and PROMETHEUS_REMOTE_WRITE_AUTHORIZATION for
-# the one `prometheus_out` example that carries an auth header the same way.
+# Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*.yaml,
+# perf/scenarios/*.yaml, and tools/shape-survey/configs/*.yaml. Not part of script/cibuild;
+# script/test's `every_shipped_config_loads_and_validates` covers the same set.
 #
-# Defaulted here, not left to compose.yaml's `dev` service `environment:` -- common.sh's `run()`
-# execs directly in CI (no `docker compose run`, so that default never applies there), only going
-# through the `dev` service locally. Exporting it here works either way: locally it's what compose
-# interpolates `${INFLUXDB_TOKEN:-logit-dev-token}` from, in CI it's just a plain env var `run`'s
-# direct exec sees.
+# The `!env` variables the configs need (ADR `env-yaml-tag`) are defaulted here, not in
+# compose.yaml's `dev` service: `run()` bypasses compose in CI, so only an export here reaches both.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

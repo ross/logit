@@ -1,29 +1,23 @@
 //! `has_attributes`/`drop_attributes`: filter events by an operator-configured key/value match
-//! against a batch's resource and/or an event's own attributes -- the fan-out-after-`logit_in`
-//! gap `docs/adr/attribute-filtering-components.md` closes. Config is `crate::Set`'s config, field
-//! for field: whatever `set` can stamp is exactly what these can match.
+//! against a batch's resource and/or an event's own attributes. See
+//! `docs/adr/attribute-filtering-components.md`. The config is `set`'s, field for field: whatever
+//! `set` can stamp, these can match.
 //!
 //! **A map is a conjunction.** Every configured pair, within a map and across both `resource:` and
-//! `attributes:`, must match. This is what makes `has_attributes` and `set` inverses -- under an
-//! `any_of` reading a sibling branch sharing just one pair would leak through. There is no `mode:`
-//! field: N sibling `has_attributes`, one pair each, feeding one consumer already expresses "any of
-//! these" in the graph (fan-in is free), so a mode flag would just be a second way to spell
-//! something already composable.
+//! `attributes:`, must match; under an any-of reading, a sibling branch sharing one pair would
+//! leak through. There is no `mode:`: sibling `has_attributes` fanning into one consumer already
+//! express "any of these".
 //!
-//! **`drop_attributes` is the exact complement of `has_attributes` on the same config, taken at the
-//! top level, not per pair**: it drops an event only when *every* configured pair matches; an event
-//! matching some-but-not-all is forwarded. This is structural here, not a convention to remember --
-//! `DropAttributes::process` is `HasAttributes::process` with a single `!`. The alternative reading
-//! ("drop if *any* pair matches") is the complement of "forward iff *none* match", which is a
-//! different filter, not this one's inverse.
+//! **`drop_attributes` is the complement of `has_attributes` on the same config, taken at the top
+//! level, not per pair**: it drops an event only when every configured pair matches, and forwards
+//! one matching some but not all. `DropAttributes::process` is `HasAttributes::process` with a
+//! single `!`.
 //!
-//! **Absent is `false`** -- a configured key the event/resource doesn't carry never matches. This is
-//! what forces the top-level complement above: under a per-pair negation, `drop_attributes {stream:
-//! a}` would drop every event that doesn't carry `stream` at all, a silent black hole for untagged
-//! traffic and the opposite of the else-branch behavior the fan-out topology needs. "Key exists with
-//! any value" is deliberately not expressible -- `exists` was one of the predicate grammar's
-//! functions that `docs/adr/routing-by-condition-is-lua.md` retired, and not shipping it is part of
-//! keeping this a bounded matcher rather than a predicate language.
+//! **Absent is `false`**: a configured key the event/resource doesn't carry never matches. That is
+//! why the complement is top-level: negated per pair, `drop_attributes {stream: a}` would drop
+//! every event without a `stream` key, black-holing untagged traffic. "Key exists with any value"
+//! isn't expressible; `docs/adr/routing-by-condition-is-lua.md` retired `exists` to keep this a
+//! bounded matcher rather than a predicate language.
 
 use crate::value_matches;
 use logit_core::interner::{intern, Symbol};
@@ -31,30 +25,20 @@ use logit_core::{Event, Resource, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// Shared by [`HasAttributes`] and [`DropAttributes`] -- both kinds are this plus a `!` at the one
-/// call site in each `process`.
+/// The match shared by [`HasAttributes`] and [`DropAttributes`].
 struct Matcher {
-    /// Interned once, at construction, from `logit-cli::pipeline::to_set_pairs`'s config
-    /// conversion -- `Set::new`'s hot-path convention exactly.
+    /// Interned once at construction.
     resource_pairs: Vec<(Symbol, Value)>,
     attribute_pairs: Vec<(Symbol, Value)>,
-    /// A one-entry cache of the last resource's match result, keyed by `Arc::ptr_eq` on the input
-    /// -- `Set::map_resource`'s caching idiom, applied to a read instead of a rebuild. The match
-    /// result is constant for a whole batch, since `resource` doesn't change between events in one
-    /// batch.
+    /// The last resource's match result, keyed by `Arc::ptr_eq`; constant within a batch.
     ///
-    /// Can't go stale: `Resource` is immutable behind its `Arc` (every producer -- `Set::
-    /// map_resource`, `logit-script`'s resource proxy, `native::decode` -- builds a fresh
-    /// `Arc::new` rather than mutating one in place), the cache holds an owned `Arc` clone so the
-    /// address it's keyed on can't be recycled by a *different* `Resource` while cached, and a
-    /// false miss (a value-equal but distinct `Arc`) costs a recompute, never a wrong answer.
+    /// Can't go stale: every producer builds a fresh `Arc<Resource>` rather than mutating one,
+    /// the owned clone keeps the address from being recycled while cached, and a false miss (a
+    /// value-equal but distinct `Arc`) only costs a recompute.
     ///
-    /// `native::decode` mints a fresh `Arc<Resource>` per frame, so in the headline
-    /// fan-out-after-`logit_in` topology this cache always misses -- kept anyway, since it helps
-    /// sidecar shapes where a listener reuses one `Arc` per decoder instance, and a miss here costs
-    /// one `ptr_eq` plus one `Arc` clone, allocating nothing (unlike `Set`'s miss, which rebuilds
-    /// an `AttrMap`). No cache-miss telemetry counter for that reason: a miss costs nothing
-    /// measurable, and a counter would advertise a cost that isn't there.
+    /// `native::decode` mints a fresh `Arc<Resource>` per frame, so behind `logit_in` this always
+    /// misses. It still helps a listener that reuses one `Arc` per decoder instance, and a miss
+    /// allocates nothing (one `ptr_eq` plus one `Arc` clone), so there's no miss counter.
     cache: Option<(Arc<Resource>, bool)>,
 }
 
@@ -67,9 +51,10 @@ impl Matcher {
         }
     }
 
-    /// `true` iff every configured pair matches -- resource pairs against `resource.attributes`,
-    /// attribute pairs against `event.attributes`. Resource first, and short-circuits on a miss:
-    /// one cached branch beats a binary search per attribute pair for the common case.
+    /// `true` iff every configured pair matches.
+    ///
+    /// Checks the (cached) resource first and short-circuits on a miss, skipping a lookup per
+    /// attribute pair.
     fn matches(&mut self, resource: &Arc<Resource>, event: &Event) -> bool {
         if !self.resource_pairs.is_empty() {
             let resource_matched = match &self.cache {
@@ -101,23 +86,21 @@ impl Matcher {
 }
 
 /// Forwards an event whose resource/attributes match every configured pair, dropping the rest.
-/// Never mutates a forwarded event -- like `HasSignal`, this only ever decides whether to forward,
-/// never what to forward. See the module doc for the AND rule and absent-is-`false`.
+///
+/// Never mutates a forwarded event. See the module doc for the matching rules.
 pub struct HasAttributes {
     matcher: Matcher,
     telemetry: Telemetry,
 }
 
 impl HasAttributes {
-    /// `resource`/`attributes` are plain `(String, Value)` pairs -- deliberately [`crate::Set::new`]'s
-    /// signature, argument for argument: this matches on exactly what `set` stamps, and
-    /// `logit-cli::pipeline::to_set_pairs` builds both from the same config shape.
+    /// Builds the filter; the signature is [`crate::Set::new`]'s, since it matches what `set`
+    /// stamps.
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
         Self { matcher: Matcher::new(resource, attributes), telemetry: Telemetry::default() }
     }
 
-    /// See [`crate::Keep::with_telemetry`] -- same reasoning, no `Diagnostics` here either:
-    /// matching a fixed set of configured values can't fail.
+    /// Attaches a telemetry handle; matching fixed values can't fail, so no `Diagnostics`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -136,16 +119,17 @@ impl Transform for HasAttributes {
     }
 }
 
-/// Drops an event whose resource/attributes match every configured pair, forwarding the rest -- the
-/// exact complement of [`HasAttributes`] on the same config. See the module doc for why the
-/// complement is taken at the top level, not per pair.
+/// Drops an event whose resource/attributes match every configured pair, forwarding the rest.
+///
+/// The complement of [`HasAttributes`] on the same config, taken at the top level, not per pair.
+/// Unlike `drop_signals`, it drops whole events and never touches a payload.
 pub struct DropAttributes {
     matcher: Matcher,
     telemetry: Telemetry,
 }
 
 impl DropAttributes {
-    /// See [`HasAttributes::new`] -- identical signature and reasoning.
+    /// Builds the filter; see [`HasAttributes::new`].
     pub fn new(resource: Vec<(String, Value)>, attributes: Vec<(String, Value)>) -> Self {
         Self { matcher: Matcher::new(resource, attributes), telemetry: Telemetry::default() }
     }
@@ -164,19 +148,15 @@ impl DropAttributes {
 impl Transform for DropAttributes {
     fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         let matched = self.matcher.matches(resource, event);
-        // The single `!` here is the entire difference between `HasAttributes` and
-        // `DropAttributes` -- which is what makes this the exact boolean complement structurally,
-        // rather than by convention. With several pairs configured, this drops an event only when
-        // *every* pair matches, not when any one does -- same conjunction `Matcher::matches` always
-        // evaluates, just inverted at the very end.
+        // This `!` is the only difference from `HasAttributes`: an event drops only when every
+        // pair matches, not when any one does.
         forward(!matched, &self.telemetry)
     }
 }
 
-/// Shared by both kinds. `keep` is "should this event be forwarded" -- already resolved by the
-/// caller (`HasAttributes` passes its match result through; `DropAttributes` passes its negation).
-/// The `0.0` on the forward path is deliberate, not a no-op: it registers the series so it appears
-/// at zero rather than being absent, mirroring `HasSignal::process`'s own reasoning.
+/// Records the verdict and returns `keep`.
+///
+/// The `0.0` on the forward path registers `events.filtered` so it reads zero rather than absent.
 fn forward(keep: bool, telemetry: &Telemetry) -> bool {
     telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
     keep

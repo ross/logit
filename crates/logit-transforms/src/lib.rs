@@ -1,15 +1,12 @@
-//! Built-in native transform components -- no Lua VM involved, per `docs/design/lua-api.md`'s
-//! "built-in native processors ... meant to sit in front of user Lua" split. Each implements
-//! `logit_pipeline::Transform` (or, for `route`, `logit_pipeline::Router`), letting the node
-//! runtime run it as an ordinary tokio task (no dedicated OS thread, unlike a Lua component --
-//! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
-//! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
-//! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, and
-//! `route` are implemented (`rename`/`filter`/`throttle`/`dedup` were retired rather than landing
-//! -- `docs/adr/routing-by-condition-is-lua.md`; `sample` was retired with them and returned as a
-//! native kind once *consistent* sampling turned out to be something `lua` can't express --
-//! `docs/adr/consistent-sampling-component.md`).
+//! Built-in native transforms: no Lua VM, per `docs/design/lua-api.md`'s "built-in native
+//! processors ... meant to sit in front of user Lua" split. Each implements
+//! `logit_pipeline::Transform` (`route` implements `logit_pipeline::Router`), so the node runtime
+//! runs it as an ordinary tokio task, unlike a Lua component's dedicated OS thread
+//! (`docs/design/pipeline-graph.md`'s "Node kinds and the transform trait question" section).
+//!
+//! Condition-based routing and filtering belong to `lua`, not a native kind
+//! (`docs/adr/routing-by-condition-is-lua.md`). `sample` is the exception, because keyed
+//! consistency is something `lua` can't express (`docs/adr/consistent-sampling-component.md`).
 
 mod aggregate;
 mod attributes;
@@ -53,13 +50,13 @@ pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
 pub use trace_context::{SpanLift, TraceContext};
 
-/// Coerces a `Value` to a finite `f64`: `I64`/`U64`/`F64` directly, or a `Str` that parses
-/// cleanly to a finite `f64` (so it works whether the source JSON quoted the value or not).
-/// `Bool`, `Null`, `Bytes`, `Timestamp`, `Array`, and `Map` never coerce. Deliberately *not* a
-/// general `Value::as_f64` on `logit-core`: a general method that silently parses strings would be
-/// a surprising API for every other caller of `Value` (`docs/adr/kv-metrics-semantics.md`), so
-/// this stays `pub(crate)` here, shared by `kv_metrics` and `scale` -- the two transforms that
-/// read a numeric attribute off an event.
+/// Coerces a `Value` to a finite `f64`.
+///
+/// `I64`/`U64`/`F64` convert directly, and a `Str` that parses to a finite `f64` does too, so a
+/// quoted JSON number, a `logfmt` value, and a `csv` column all work. Every other variant is
+/// `None`. Not a general `Value::as_f64` in `logit-core`: a string-parsing accessor would surprise
+/// every other caller of `Value` (`docs/adr/kv-metrics-semantics.md`). Shared by `kv_metrics` and
+/// `scale`.
 pub(crate) fn numeric(value: &Value) -> Option<f64> {
     let v = match value {
         Value::I64(n) => *n as f64,
@@ -71,33 +68,26 @@ pub(crate) fn numeric(value: &Value) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-/// Whether an event's (or resource's) `Value` matches an operator-configured one. Coercing,
-/// modelled on [`numeric`] and `logit-script`'s `lua_value_matches`, deliberately *not* on
-/// `aggregate`'s `value_key_eq` -- that one is a *keying* equality (variant-exact, `f64` by bit
-/// pattern), correct for hash-map identity and wrong here: config `status: 200` must match a
-/// `Value::Str("200")` off a logfmt line just as it matches a `Value::I64(200)` off JSON, per
-/// ADR `kv-metrics-semantics`' identity commitment.
+/// Whether an event's (or resource's) `Value` matches an operator-configured one.
 ///
-/// **Symmetric** in its arguments -- every arm below is -- so a caller can't get the order wrong.
-/// **Total**: never panics, never allocates, never fails; anything it can't compare is `false`.
+/// Coercing, modelled on [`numeric`] and `logit-script`'s `lua_value_matches`, not on
+/// `aggregate`'s `value_key_eq`: that one is a keying equality (variant-exact, `f64` by bit
+/// pattern), right for hash-map identity and wrong here. Config `status: 200` must match
+/// `Value::Str("200")` off a logfmt line as well as `Value::I64(200)` off JSON
+/// (`docs/adr/kv-metrics-semantics.md`).
 ///
-/// Three rules worth stating plainly, because each is a deliberate asymmetry with a precedent
-/// elsewhere in this module rather than an oversight:
-/// - **String-to-string is never coerced numerically.** `Str("01")` and `Str("1")` do not match --
-///   id-shaped tags are routinely numeric-looking, and treating them as numbers would be a
-///   surprise. Coercion only happens *across* a numeric variant and a string.
-/// - **`Bool` never coerces to anything else, including a string.** A `logfmt` line's
-///   `sampled=true` is `Value::Str("true")` (logfmt always emits `Str`), so it will not match a
-///   configured `sampled: true` -- write `sampled: "true"` instead. Both models this function
-///   follows (`numeric`, `lua_value_matches`) refuse bool coercion, and there is no demand for it.
-/// - **A non-finite configured or actual value matches nothing**, inherited from `numeric`'s
-///   `is_finite` filter -- see `docs/adr/attribute-filtering-components.md`, rule 36's finiteness
-///   check exists precisely because of this.
-///
-/// One divergence from `lua_value_matches` worth flagging so nobody "fixes" it later:
-/// `Timestamp` never compares equal to a bare number here, even though the Lua bridge lets an
-/// integer match one -- filtering on an exact nanosecond value is not a tag-shaped use case, and
-/// `numeric` (which this delegates to for the general numeric case) already excludes `Timestamp`.
+/// Symmetric in its arguments, and total: it never panics or allocates, and anything it can't
+/// compare is `false`. Rules a maintainer might "fix":
+/// - **String-to-string is never coerced numerically.** `Str("01")` and `Str("1")` don't match,
+///   because id-shaped tags are often numeric-looking. Coercion happens only across a numeric
+///   variant and a string.
+/// - **`Bool` never coerces, even to a string.** logfmt's `sampled=true` is `Str("true")`, so
+///   it doesn't match a configured `sampled: true`; the operator writes `sampled: "true"`.
+/// - **A non-finite configured or actual value matches nothing**, via `numeric`'s `is_finite`
+///   filter. Rule 36's finiteness check exists because of this
+///   (`docs/adr/attribute-filtering-components.md`).
+/// - **`Timestamp` never equals a bare number**, unlike in `lua_value_matches`: an exact
+///   nanosecond value isn't a tag-shaped filter, and `numeric` excludes `Timestamp`.
 pub(crate) fn value_matches(configured: &Value, actual: &Value) -> bool {
     match (configured, actual) {
         (Value::Null, Value::Null) => true,
@@ -249,8 +239,7 @@ mod value_matches_tests {
     }
 }
 
-/// Integration coverage across module boundaries -- each transform above is unit-tested in its
-/// own module; this proves they compose the way a real pipeline actually wires them.
+/// Transforms chained as a real pipeline wires them; each module unit-tests its own.
 #[cfg(test)]
 mod chained_pipeline_test {
     use super::*;
@@ -262,18 +251,11 @@ mod chained_pipeline_test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// The workstream's headline test: a `json -> scale -> kv_metrics -> keep -> keep_values ->
-    /// aggregate` chain fed one synthetic nginx-shaped log event produces correctly-tagged
-    /// counter/gauge/distribution metrics and nothing else -- specifically, that the tags
-    /// surviving into `aggregate`'s `SeriesKey` are exactly what `keep` named, that `scale`'s
-    /// unit conversion (seconds -> milliseconds) has already happened by the time `kv_metrics`
-    /// reads `request_time`, and that a junk `host` -- exactly the reference example's motivating
-    /// case
-    /// (`docs/adr/value-allowlist-cardinality-clamp.md`) -- collapses into one `other`-tagged
-    /// series rather than a series of its own. This is what proves `keep`'s documented placement
-    /// ahead of `aggregate` (`crate::keep`'s module doc comment,
-    /// `docs/adr/kv-metrics-semantics.md`) and `keep_values`' placement alongside it actually
-    /// bound series cardinality end to end, not just in isolation.
+    /// `json -> scale -> kv_metrics -> keep -> keep_values -> aggregate` on one nginx-shaped
+    /// event: series tags are what `keep` named, `scale` ran before `kv_metrics` read
+    /// `request_time`, and a junk `host` clamps into one `other` series. Proves `keep` and
+    /// `keep_values` ahead of `aggregate` bound cardinality end to end (`crate::keep`'s module
+    /// doc, `docs/adr/value-allowlist-cardinality-clamp.md`).
     #[test]
     fn json_scale_kv_metrics_keep_keep_values_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
@@ -294,18 +276,14 @@ mod chained_pipeline_test {
             },
         );
 
-        // json: the raw body becomes attributes.
         let mut json = JsonParser::new(false);
         assert!(json.process(&resource, &mut event), "json always forwards");
         assert_eq!(event.attributes.len(), 6, "every top-level JSON key should have landed");
 
-        // scale: request_time converts from seconds to milliseconds before kv_metrics ever
-        // reads it.
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         assert!(scale.process(&resource, &mut event), "scale always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
 
-        // kv_metrics: two counters (one no-field, one field-backed) and a distribution.
         let mut kv = KvMetrics::new(
             vec![
                 MetricSpec { name: "nginx.requests".to_string(), field: None, unit: None },
@@ -325,8 +303,6 @@ mod chained_pipeline_test {
         assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
 
-        // keep: only `status`/`host` are allowed to survive as tags -- client_ip/user_agent (and
-        // the now-redundant body_bytes_sent/request_time) must not reach aggregate.
         let mut keep = Keep::new(vec!["status".to_string(), "host".to_string()]);
         assert!(keep.process(&resource, &mut event), "keep always forwards");
         let mut expected_kept = AttrMap::new();
@@ -337,10 +313,7 @@ mod chained_pipeline_test {
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
         assert_eq!(kept, expected_kept_order, "exactly the two kept attributes should survive");
 
-        // keep_values: `host` is nginx's `$host`, unbounded and attacker-controlled -- clamps
-        // anything outside the two real vhosts to `other` rather than letting it become its own
-        // series (docs/adr/value-allowlist-cardinality-clamp.md). This event's `host` is junk, so
-        // it must clamp, not pass through.
+        // `host` is nginx's `$host`, client-controlled; this event's is outside the allow-list.
         let mut keep_values = KeepValues::new(
             vec![],
             vec![(
@@ -357,8 +330,7 @@ mod chained_pipeline_test {
             "a host outside the allow-list must clamp to 'other'"
         );
 
-        // aggregate: every metric here is mergeable, so it's fully absorbed -- the log half
-        // (still present) is forwarded on its own as the remainder.
+        // Every metric is mergeable, so aggregate absorbs them all and forwards the log half.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
         assert!(event.metrics.is_empty(), "every metric should have been absorbed");
@@ -408,27 +380,20 @@ mod chained_pipeline_test {
         }
     }
 
-    /// The `http_access` workstream's end-to-end chain (`docs/plans/http-access-normalization.md`'s
-    /// W6): `json -> http_access -> trace_context -> kv_metrics -> keep -> aggregate`, with
-    /// `http_access` configured exactly as `demo/logit.yaml`'s `nginx_http` and `keep` holding
-    /// exactly `demo/logit.yaml`'s `trimmed` list. Proves the three claims the demo rests on: the
-    /// normalized semconv attributes (an *integer* `http.response.status_code`, a *config-derived*
-    /// `http.route`, a *classified* `user_agent.class`) are what survive into `aggregate`'s series
-    /// tags; `trace_context` mints its span *named by* `http_access` (`GET /{other}`, never the raw
-    /// path, and never the `span:` block's fallback) with semconv's `Unset` status on a `200`, not
-    /// `Ok`; and the request duration `kv_metrics` reads is already seconds, with no `scale` stage
-    /// anywhere in the chain.
+    /// `json -> http_access -> trace_context -> kv_metrics -> keep -> aggregate`, configured as
+    /// `demo/logit.yaml`'s `nginx_http` and `trimmed`. Proves the three claims the demo rests on:
+    /// the normalized semconv attributes (integer status, config-derived `http.route`, classified
+    /// `user_agent.class`) become the series tags; `trace_context`'s span takes `http_access`'s
+    /// name (`GET /{other}`, not the raw path or the `span:` fallback) and `Unset` status on a
+    /// `200`; and the duration `kv_metrics` reads is already seconds, with no `scale` stage.
     #[test]
     fn json_http_access_trace_context_kv_metrics_keep_aggregate_chain_produces_semconv_series_and_a_named_span(
     ) {
         let resource = Arc::new(Resource::default());
 
-        // `crates/logit-bench/src/fixtures.rs`'s `HTTP_ACCESS_SEMCONV_LINE`, copied verbatim (this
-        // crate can't depend on `logit-bench`): one realistic nginx access line shaped as
-        // `examples/nginx/nginx.conf`'s `access_semconv` log_format -- semconv attribute names,
-        // straight off the wire, a string-encoded status, an `_s` duration already in its target
-        // unit, an upstream leg, a real W3C `traceparent`, and a real Chrome desktop User-Agent.
-        // Values are hand-written, not captured -- no field depends on a running nginx.
+        // A copy of `logit-bench`'s `HTTP_ACCESS_SEMCONV_LINE` (this crate can't depend on it),
+        // shaped as `examples/nginx/nginx.conf`'s `access_semconv` log_format. Hand-written, not
+        // captured.
         let raw = concat!(
             r#"{"http.request.method":"GET","#,
             r#""url.original":"/api/v1/orders?page=2&limit=20","#,
@@ -472,7 +437,7 @@ mod chained_pipeline_test {
             "the producer's status arrives as a string -- http_access is what makes it an integer"
         );
 
-        // http_access, configured as `demo/logit.yaml`'s `nginx_http` (and `haproxy_http`).
+        // As `demo/logit.yaml`'s `nginx_http` (and `haproxy_http`).
         let pattern = |pattern: &str, route: &str| RouteRule::Pattern {
             pattern: pattern.to_string(),
             route: route.to_string(),
@@ -502,9 +467,8 @@ mod chained_pipeline_test {
         assert_eq!(event.attributes.get("user_agent.class"), Some(&Value::str("browser")));
         assert_eq!(event.attributes.get("network.protocol.version"), Some(&Value::str("1.1")));
 
-        // trace_context, as `examples/nginx-to-influxdb.yaml`'s `nginx_trace`: the convention
-        // field names, a server span, and `mint_id` since the line carries only the inbound
-        // `traceparent` (whose span id is this span's *parent*, never its own).
+        // As `examples/nginx-to-influxdb.yaml`'s `nginx_trace`. `mint_id`, because the inbound
+        // `traceparent`'s span id is this span's parent, never its own.
         let mut trace = TraceContext::new(
             "trace.id".to_string(),
             Some("span.id".to_string()),
@@ -538,8 +502,7 @@ mod chained_pipeline_test {
             assert_eq!(event.attributes.get(consumed), None, "{consumed} should be consumed");
         }
 
-        // kv_metrics, as `demo/logit.yaml`'s `nginx_metrics`: the semconv field names, the duration
-        // already in seconds.
+        // As `demo/logit.yaml`'s `nginx_metrics`.
         let spec = |name: &str, field: Option<&str>, unit: Option<&str>| MetricSpec {
             name: name.to_string(),
             field: field.map(str::to_string),
@@ -559,8 +522,7 @@ mod chained_pipeline_test {
         assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 4, "two counters and two distributions");
 
-        // keep, as `demo/logit.yaml`'s `trimmed`. `http.termination_state` is HAProxy-only, so
-        // absent here -- the other seven survive.
+        // As `demo/logit.yaml`'s `trimmed`. `http.termination_state` is HAProxy-only, so absent.
         let trimmed = [
             "server.address",
             "http.request.method",
@@ -588,7 +550,6 @@ mod chained_pipeline_test {
         }
         assert_eq!(event.attributes, expected, "exactly the seven present semconv tags survive");
 
-        // aggregate: every metric is absorbed; the log+span remainder is forwarded on its own.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         assert!(agg.process(&resource, &mut event), "the log+span remainder should be forwarded");
         assert!(event.metrics.is_empty(), "every metric should have been absorbed");
@@ -637,13 +598,9 @@ mod chained_pipeline_test {
         }
     }
 
-    /// A `json -> flatten -> keep -> kv_metrics -> aggregate` chain over a pino-http-shaped
-    /// line (`crates/logit-bench/src/fixtures.rs`'s `pino_http_event` doc comment has the same
-    /// shape as a directly-constructed `Event`): proves `flatten`'s dotted keys
-    /// (`req.method`, `res.statusCode`) are what makes a nested field *addressable* by `keep`
-    /// afterward, exactly the claim `docs/adr/flatten-transform.md` makes against
-    /// `kv-metrics-semantics`' "nested fields are not addressable" -- before `flatten` runs,
-    /// `req`/`res` are `Value::Map`s that `keep`'s literal-name matcher could never select.
+    /// `json -> flatten -> keep -> kv_metrics -> aggregate` over a pino-http line (the shape of
+    /// `logit-bench`'s `pino_http_event`): `flatten`'s dotted keys make a nested field
+    /// addressable by `keep`'s literal-name matcher (`docs/adr/flatten-transform.md`).
     #[test]
     fn json_flatten_keep_kv_metrics_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
@@ -667,7 +624,6 @@ mod chained_pipeline_test {
             },
         );
 
-        // json: the raw body becomes attributes, req/res nested as Value::Map.
         let mut json = JsonParser::new(false);
         assert!(json.process(&resource, &mut event), "json always forwards");
         assert_eq!(event.attributes.len(), 7, "every top-level JSON key should have landed");
@@ -676,8 +632,6 @@ mod chained_pipeline_test {
             "req should still be nested before flatten runs"
         );
 
-        // flatten: attributes: all (the default) expands req/res (and req's own nested headers)
-        // into dotted keys.
         let mut flatten = Flatten::new(Fields::All, Fields::None, Arrays::Index);
         assert!(flatten.process(&resource, &mut event), "flatten always forwards");
         assert_eq!(event.attributes.get("req"), None, "req should be consumed");
@@ -689,14 +643,11 @@ mod chained_pipeline_test {
         );
         assert_eq!(event.attributes.get("res.statusCode"), Some(&Value::U64(200)));
 
-        // keep: only the two dotted paths flatten just created survive -- unaddressable before
-        // flatten ran, ordinary literal attribute names after.
         let mut keep = Keep::new(vec!["req.method".to_string(), "res.statusCode".to_string()]);
         assert!(keep.process(&resource, &mut event), "keep always forwards");
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
         assert_eq!(kept.len(), 2, "exactly the two kept dotted attributes should survive");
 
-        // kv_metrics: one no-field counter.
         let mut kv = KvMetrics::new(
             vec![MetricSpec { name: "http.requests".to_string(), field: None, unit: None }],
             vec![],
@@ -705,7 +656,6 @@ mod chained_pipeline_test {
         assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 1);
 
-        // aggregate: the one metric is mergeable, so it's fully absorbed.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
         assert!(event.metrics.is_empty(), "the metric should have been absorbed");
@@ -728,13 +678,8 @@ mod chained_pipeline_test {
         );
     }
 
-    /// The `logfmt` mirror of
-    /// [`json_scale_kv_metrics_keep_keep_values_aggregate_chain_produces_correctly_tagged_metrics`]
-    /// -- same `json`/`scale`/`kv_metrics`/`keep`/`aggregate` chain (no `keep_values` here; that
-    /// gap is covered by the JSON version above), fed a logfmt-shaped line instead of JSON,
-    /// proving `logfmt`'s always-`Value::Str` output (`request_time="0.012"`, never a number)
-    /// still flows correctly through `scale` -> `Value::F64(12.0)` -> `kv_metrics`'s `numeric`
-    /// coercion, exactly as `crate::numeric`'s own doc comment promises.
+    /// `logfmt -> scale -> kv_metrics -> keep -> aggregate`: `logfmt`'s always-`Str` output
+    /// (`request_time="0.012"`) flows through `scale` to `Value::F64(12.0)` via `numeric`.
     #[test]
     fn logfmt_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
@@ -755,19 +700,15 @@ mod chained_pipeline_test {
             },
         );
 
-        // logfmt: the raw body becomes attributes, always as Value::Str.
         let mut logfmt = Logfmt::new(false);
         assert!(logfmt.process(&resource, &mut event), "logfmt always forwards");
         assert_eq!(event.attributes.len(), 5, "every logfmt field should have landed");
         assert_eq!(event.attributes.get("status"), Some(&Value::str("200")), "never coerced");
 
-        // scale: request_time converts from seconds to milliseconds before kv_metrics ever
-        // reads it -- `numeric` parses logfmt's Value::Str("0.012") just fine.
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         assert!(scale.process(&resource, &mut event), "scale always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
 
-        // kv_metrics: two counters (one no-field, one field-backed) and a distribution.
         let mut kv = KvMetrics::new(
             vec![
                 MetricSpec { name: "nginx.requests".to_string(), field: None, unit: None },
@@ -787,13 +728,11 @@ mod chained_pipeline_test {
         assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
 
-        // keep: only `status` is allowed to survive as a tag.
         let mut keep = Keep::new(vec!["status".to_string()]);
         assert!(keep.process(&resource, &mut event), "keep always forwards");
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
         assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
 
-        // aggregate: every metric here is mergeable, so it's fully absorbed.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
         assert!(event.metrics.is_empty(), "every metric should have been absorbed");
@@ -839,10 +778,8 @@ mod chained_pipeline_test {
         }
     }
 
-    /// The workstream B (Loki-direct) shape from `docs/plans/otlp-logs-and-resource-identity.md`:
-    /// a `json -> kv_metrics -> keep_signals[logs]` chain proves the derived metrics are stripped
-    /// off before a logs-only sink would see the event, while the log body itself survives
-    /// untouched -- `keep_signals` mutates the payload, unlike `has_signal`.
+    /// `json -> kv_metrics -> keep_signals[logs]` strips the derived metrics before a logs-only
+    /// sink and leaves the log body untouched.
     #[test]
     fn json_kv_metrics_keep_signals_chain_strips_derived_metrics_and_keeps_the_log() {
         let resource = Arc::new(Resource::default());
@@ -891,10 +828,8 @@ mod chained_pipeline_test {
         );
     }
 
-    /// Proves `csv`'s all-`Str` output (`docs/adr/csv-positional-columns.md`) feeds
-    /// `kv_metrics`/`scale` correctly through `numeric`'s string branch -- exactly the same
-    /// coercion `json`'s ADR relies on `numeric` for, but starting from a value that was *never*
-    /// anything but a string, unlike JSON's own numeric syntax.
+    /// `csv`'s all-`Str` output feeds `scale`/`kv_metrics` through `numeric`'s string branch
+    /// (`docs/adr/csv-positional-columns.md`).
     #[test]
     fn csv_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
@@ -993,10 +928,8 @@ mod chained_pipeline_test {
         }
     }
 
-    /// The headline claim `docs/adr/attribute-filtering-components.md` exists to make: a `set`
-    /// stage stamping a distinguishing tag, and a `has_attributes`/`drop_attributes` stage
-    /// downstream matching on exactly that tag, are inverses -- `has_attributes` forwards what
-    /// `set` stamped and `drop_attributes` forwards everything else, on the identical config.
+    /// On the same config, `has_attributes` forwards what `set` stamped and `drop_attributes`
+    /// drops it (`docs/adr/attribute-filtering-components.md`).
     #[test]
     fn set_then_has_attributes_round_trips_the_stamped_tag() {
         let resource = Arc::new(Resource::default());

@@ -1,45 +1,31 @@
 //! `has_provenance`/`drop_provenance`: filter events by an operator-configured match against a
-//! batch's `origin`/`previous` (`docs/adr/batch-provenance-on-delivered.md`) -- the `has_signal`/
-//! `has_attributes` shape applied to graph identity instead of payload presence or event data.
-//! See `docs/adr/provenance-filtering-components.md`.
+//! batch's `origin`/`previous` (`docs/adr/batch-provenance-on-delivered.md`). See
+//! `docs/adr/provenance-filtering-components.md`.
 //!
 //! **`origin:`/`previous:` are each a list of alternatives, OR'd within the field; the two fields
-//! AND together when both are configured.** This is `has_signal`'s disjunction-within-one-list
-//! shape (`crate::signals`), applied per field, combined with `has_attributes`'
-//! conjunction-across-fields shape (`crate::attributes`) -- not a new matching primitive, just
-//! those two composed. An empty list means "not checked" for that field, the same "absent
-//! contributes nothing" convention `has_attributes`' empty maps use.
+//! AND together when both are configured.** An empty list means that field isn't checked.
 //!
-//! **`drop_provenance` is the exact complement of `has_provenance` on the same config, taken at
-//! the top level, not per field**: it drops an event only when the *whole* configured match
-//! succeeds; an event matching only `origin:` but not `previous:` (when both are configured) is
-//! forwarded. Structural here, not a convention to remember -- `DropProvenance::process` is
-//! `HasProvenance::process` with a single `!`, exactly `has_attributes`'/`drop_attributes`' own
-//! relationship.
+//! **`drop_provenance` is the complement of `has_provenance` on the same config, taken at the top
+//! level, not per field**: it drops an event only when the whole configured match succeeds, so an
+//! event matching `origin:` but not `previous:` is forwarded. `DropProvenance::process` is
+//! `HasProvenance::process` with a single `!`, as with `has_attributes`/`drop_attributes`.
 //!
-//! **A batch with no provenance at all (`Provenance::default()`) never matches a non-empty
-//! field** -- the same "absent is `false`" rule `has_attributes` has for a missing attribute.
-//! `Fanout` stamps `origin`/`previous` on every real hop
-//! (`docs/adr/batch-provenance-on-delivered.md`), so this only matters for a batch observed
-//! before any `Fanout` ever touched it (a bench or unit test constructing a bare `Provenance`
-//! directly).
+//! **A batch with no provenance (`Provenance::default()`) never matches a non-empty field.**
+//! `Fanout` stamps `origin`/`previous` on every real hop, so this only arises for a batch no
+//! `Fanout` has touched (a bench or unit test).
 
 use logit_core::interner::{intern, Symbol};
 use logit_core::{Event, Provenance, Resource, Telemetry};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// Shared by [`HasProvenance`] and [`DropProvenance`] -- both kinds are this plus a `!` at the one
-/// call site in each `process`.
+/// The match shared by [`HasProvenance`] and [`DropProvenance`].
 struct Matcher {
-    /// Interned once, at construction, from `logit-cli::pipeline::to_symbol_list`'s config
-    /// conversion. Empty means "not checked" for this field.
+    /// Empty means this field isn't checked.
     origin: Vec<Symbol>,
     previous: Vec<Symbol>,
-    /// Cached from `observe_provenance`, which fires once per incoming batch before any of that
-    /// batch's events reach `process` -- constant for the whole batch, exactly `Aggregator::
-    /// observe_batch_context`'s existing pattern for `TraceContext`
-    /// (`crates/logit-transforms/src/aggregate.rs`), applied to `Provenance` instead.
+    /// Cached from `observe_provenance`, which fires once per batch before its events reach
+    /// `process`, as `Aggregator::observe_batch_context` caches `TraceContext`.
     provenance: Provenance,
 }
 
@@ -52,10 +38,9 @@ impl Matcher {
         }
     }
 
-    /// `true` iff every configured field matches: `origin` is one of the listed alternatives (if
-    /// `origin:` is non-empty) *and* `previous` is one of the listed alternatives (if `previous:`
-    /// is non-empty). A `Vec::contains` linear scan, not a `HashSet` -- both lists are a handful
-    /// of component ids at most, and `Symbol` equality is a plain integer compare.
+    /// `true` iff each non-empty list contains the batch's value for its field.
+    ///
+    /// A linear scan, not a `HashSet`: each list is a handful of component ids at most.
     fn matches(&self) -> bool {
         let origin_ok = self.origin.is_empty()
             || self.provenance.origin.is_some_and(|o| self.origin.contains(&o));
@@ -66,24 +51,21 @@ impl Matcher {
 }
 
 /// Forwards an event whose batch's `origin`/`previous` match every configured field, dropping the
-/// rest. Never mutates a forwarded event -- like `HasAttributes`, this only ever decides whether
-/// to forward, never what to forward. See the module doc for the AND-across-fields/OR-within-field
-/// rule and absent-is-`false`.
+/// rest.
+///
+/// Never mutates a forwarded event. See the module doc for the matching rules.
 pub struct HasProvenance {
     matcher: Matcher,
     telemetry: Telemetry,
 }
 
 impl HasProvenance {
-    /// `origin`/`previous` are plain component-id strings, interned once here --
-    /// `logit-cli::pipeline::to_symbol_list` builds both from `ComponentKind::HasProvenance`'s
-    /// identically-shaped config.
+    /// Builds the filter from component-id lists, interned here.
     pub fn new(origin: Vec<String>, previous: Vec<String>) -> Self {
         Self { matcher: Matcher::new(origin, previous), telemetry: Telemetry::default() }
     }
 
-    /// See [`crate::Keep::with_telemetry`] -- same reasoning, no `Diagnostics` here either:
-    /// matching a fixed set of configured values can't fail.
+    /// Attaches a telemetry handle; matching fixed values can't fail, so no `Diagnostics`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -101,15 +83,16 @@ impl Transform for HasProvenance {
 }
 
 /// Drops an event whose batch's `origin`/`previous` match every configured field, forwarding the
-/// rest -- the exact complement of [`HasProvenance`] on the same config. See the module doc for
-/// why the complement is taken at the top level, not per field.
+/// rest.
+///
+/// The complement of [`HasProvenance`] on the same config, taken at the top level, not per field.
 pub struct DropProvenance {
     matcher: Matcher,
     telemetry: Telemetry,
 }
 
 impl DropProvenance {
-    /// See [`HasProvenance::new`] -- identical signature and reasoning.
+    /// Builds the filter; see [`HasProvenance::new`].
     pub fn new(origin: Vec<String>, previous: Vec<String>) -> Self {
         Self { matcher: Matcher::new(origin, previous), telemetry: Telemetry::default() }
     }
@@ -126,19 +109,15 @@ impl Transform for DropProvenance {
     }
 
     fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
-        // The single `!` here is the entire difference between `HasProvenance` and
-        // `DropProvenance` -- which is what makes this the exact boolean complement structurally,
-        // rather than by convention. With both fields configured, this drops an event only when
-        // *both* match, not when either one does -- same conjunction `Matcher::matches` always
-        // evaluates, just inverted at the very end.
+        // This `!` is the only difference from `HasProvenance`: with both fields configured, an
+        // event drops only when both match.
         forward(!self.matcher.matches(), &self.telemetry)
     }
 }
 
-/// Shared by both kinds -- identical to `crate::attributes`' own `forward` helper. `keep` is
-/// "should this event be forwarded," already resolved by the caller. The `0.0` on the forward
-/// path is deliberate, not a no-op: it registers the series so it appears at zero rather than
-/// being absent, mirroring `HasAttributes::process`'s own reasoning.
+/// Records the verdict and returns `keep`.
+///
+/// The `0.0` on the forward path registers `events.filtered` so it reads zero rather than absent.
 fn forward(keep: bool, telemetry: &Telemetry) -> bool {
     telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
     keep
@@ -253,7 +232,6 @@ mod tests {
     #[test]
     fn an_unconfigured_field_is_not_checked() {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
-        // previous: is unconfigured -- any value, or none at all, should be irrelevant.
         has.observe_provenance(provenance(Some("nginx_in"), Some("anything")));
         let mut ev = event();
         assert!(has.process(&default_resource(), &mut ev));
@@ -287,7 +265,7 @@ mod tests {
         assert_eq!(ev.attributes.get("other"), Some(&Value::str("x")));
     }
 
-    // -- DropProvenance: the exact complement ------------------------------------------------------
+    // -- DropProvenance: the exact complement ---------------------------------------------------
 
     #[test]
     fn drop_provenance_is_the_exact_complement_of_has_provenance() {
@@ -356,13 +334,7 @@ mod tests {
 
     // -- end-to-end: a real batch through Fanout/run_transform -----------------------------------
 
-    /// Drives a real two-source graph (`web_in`, `api_in` fan into `filter`, `filter` feeds `out`)
-    /// through `logit_pipeline::run`, proving `observe_provenance` -> cache -> `process` actually
-    /// works against the real `Fanout`/`run_transform` wiring, not just the isolated `Matcher`
-    /// unit tests above. `web_in`'s own component id becomes the batch's `origin`
-    /// (`Fanout::stamp`, `crates/logit-pipeline/src/fanout.rs`) the moment it enters the graph, so
-    /// a `has_provenance` node configured `origin: [web_in]` must forward `web_in`'s batch and
-    /// drop `api_in`'s -- exactly the central-collector fan-in shape this feature exists for.
+    /// Through the real runtime, `origin: [web_in]` forwards `web_in`'s batch and drops `api_in`'s.
     #[tokio::test]
     async fn has_provenance_filters_a_real_fan_in_by_the_sending_nodes_own_id() {
         use async_trait::async_trait;
@@ -393,9 +365,7 @@ mod tests {
             )
         }
 
-        /// Sends its one batch, then idles -- keeps the node alive so `run`'s graph doesn't tear
-        /// down before the assertion side reads from `out`, exactly `logit_pipeline::runtime`'s
-        /// own `OneShotInput` test double.
+        /// Sends its one batch, then idles so the graph stays up until `out` is read.
         struct OneShotInput {
             batch: Option<EventBatch>,
         }
@@ -525,9 +495,7 @@ mod tests {
 
         tokio::spawn(run(g, specs));
 
-        // Both recv attempts happen on the same blocking thread, sequentially, against the same
-        // receiver -- the first proves web_in's batch (and only its tagged event) reaches `out`;
-        // the second, with a short timeout, proves api_in's batch never does.
+        // The second, short recv proves api_in's batch never arrives.
         let (first, second) = tokio::task::spawn_blocking(move || {
             let first = result_rx.recv_timeout(Duration::from_secs(5));
             let second = result_rx.recv_timeout(Duration::from_millis(200));

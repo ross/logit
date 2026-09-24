@@ -1,24 +1,21 @@
 //! The shared UDP listener driver: read/decode decoupling plus datagram-\>batch assembly
-//! (`docs/adr/decoupled-listener-io.md`). `StatsdInput` and `SyslogInput` are both thin
-//! wrappers over [`UdpListener<D>`] -- their `run` loops used to be byte-for-byte identical apart
-//! from the decoder type, which is exactly what this generalizes over.
+//! (`docs/adr/decoupled-listener-io.md`). `statsd_in`, `syslog_in`, `graphite_in`, and
+//! `collectd_in` are thin wrappers over [`UdpListener<D>`], which is generic over the one thing
+//! they differ in: the decoder.
 //!
 //! **Crate placement.** The generic queue (`logit_pipeline::BoundedQueue`) and the batch
 //! accumulator (`logit_pipeline::BatchAccumulator`) are transport-agnostic and live in
-//! `logit-pipeline`, alongside `SinkQueue`. A UDP socket bind, an `SO_RCVBUF` setsockopt, and a
-//! `recv_from` loop are unambiguously protocol-*impl* shaped, per
-//! `docs/design/pipeline-graph.md`'s crate-layout rule ("`logit-inputs`... hold only impls") --
-//! `socket2` is therefore a `logit-inputs` dependency only, never `logit-pipeline`'s.
+//! `logit-pipeline`. The socket bind, `SO_RCVBUF`, and the receive syscall are protocol-impl
+//! code, per `docs/design/pipeline-graph.md`'s crate-layout rule, so `socket2` is a
+//! `logit-inputs` dependency only, never `logit-pipeline`'s.
 //!
-//! **Multicast comes free with the driver.** A `bind:` whose address is a multicast group makes
-//! [`bind_one`] set `SO_REUSEADDR`, bind the unspecified address on that port and join the group,
-//! rather than binding the group address directly -- so `collectd_in` (whose protocol has a
-//! standard group, `239.192.74.66`), `statsd_in` and `syslog_in` all get it without a field of
-//! their own. See that function's doc for why each of the three steps is needed.
+//! **Multicast comes with the driver.** A `bind:` whose address is a multicast group makes
+//! [`bind_one`] set `SO_REUSEADDR`, bind the unspecified address on that port, and join the
+//! group, so every UDP listener (`collectd_in`'s standard group is `239.192.74.66`) gets it
+//! without a field of its own. That function's doc says why each step is needed.
 //!
 //! **Not used by [`crate::internal::InternalInput`].** `internal` has no socket, no datagram, and
-//! no `receive:` block -- its own `Input::run_until_shutdown` override is a single final
-//! `Registry` drain, nothing queue-shaped. Don't generalize this module toward it.
+//! no `receive:` block; don't generalize this module toward it.
 
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
@@ -38,14 +35,13 @@ pub struct Datagram {
 }
 
 impl Queued for Datagram {
-    /// The datagram's own right-sized allocation plus this struct's inline footprint. Not an
-    /// allocator figure -- an admission-control estimate, the same discipline as
-    /// `EventBatch::estimated_heap_bytes` (`docs/design/memory.md` §5).
+    /// The datagram's payload plus this struct's inline footprint: an admission-control
+    /// estimate, not an allocator figure (`docs/design/memory.md` §5).
     fn weight(&self) -> u64 {
         (self.bytes.len() + std::mem::size_of::<Self>()) as u64
     }
-    /// Bytes, not "1" -- so `logit.component.bytes.dropped` reports the size of what was lost,
-    /// the unit an operator sizing `receive.max_bytes` actually reasons in.
+    /// Bytes, not "1", so `logit.component.bytes.dropped` reports the size of what was lost, the
+    /// unit an operator sizing `receive.max_bytes` reasons in.
     fn units(&self) -> u64 {
         self.bytes.len() as u64
     }
@@ -62,8 +58,8 @@ pub static RECEIVE_QUEUE_METRICS: QueueMetrics = QueueMetrics {
 
 pub type ReceiveQueue = BoundedQueue<Datagram>;
 
-/// [`UdpListener`]'s runtime knobs. Workstream F (`docs/adr/decoupled-listener-io.md`) builds
-/// this from a component's `logit_config::ReceiveConfig`; a test can build it directly.
+/// [`UdpListener`]'s runtime knobs, built from a component's `logit_config::ReceiveConfig`
+/// (`docs/adr/decoupled-listener-io.md`) or directly by a test.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UdpListenerConfig {
     pub max_datagrams: usize,
@@ -72,7 +68,7 @@ pub struct UdpListenerConfig {
     /// `SO_RCVBUF`, requested at bind. `None` leaves the kernel default alone.
     pub receive_buffer_bytes: Option<u64>,
     /// Events to accumulate across datagrams before one `Fanout::send`. `1` means one send per
-    /// datagram -- the pre-ADR `decoupled-listener-io` behaviour, exactly (`BatchAccumulator::absorb`'s doc comment).
+    /// datagram (`BatchAccumulator::absorb`).
     pub batch_max_events: usize,
     pub batch_max_bytes: u64,
     /// `Duration::ZERO` disables the flush timer entirely; bounds are then the only trigger.
@@ -80,18 +76,16 @@ pub struct UdpListenerConfig {
     /// How long [`UdpListener::run_until_shutdown`] keeps draining after shutdown fires before
     /// [`logit_pipeline::runtime::run_input`]'s grace backstop cancels it by drop.
     pub shutdown_grace: Duration,
-    /// Datagrams one `recvmmsg(2)` call may return on Linux, and -- the same number -- how many
-    /// [`decode_loop`] takes off the [`ReceiveQueue`] per `pop_many`. See
-    /// `logit_config::ReceiveConfig::read_batch` for the operator-facing account of both halves,
-    /// the slab cost and the widened shutdown loss. Clamped into `1..=MAX_READ_BATCH` by
-    /// [`UdpListenerConfig::read_batch`]; graph rules 18 and 57 reject the out-of-range values
-    /// before a config ever gets here.
+    /// Datagrams one `recvmmsg(2)` call may return on Linux, and how many [`decode_loop`] takes
+    /// off the [`ReceiveQueue`] per `pop_many`. `logit_config::ReceiveConfig::read_batch` has the
+    /// operator-facing account, including the slab cost and the wider shutdown loss. Clamped into
+    /// `1..=MAX_READ_BATCH` by [`UdpListenerConfig::read_batch`]; graph rules 18 and 57 reject
+    /// out-of-range values first.
     pub read_batch: usize,
 }
 
-/// Matches `docs/adr/decoupled-listener-io.md`'s `ReceiveConfig` defaults exactly -- see that
-/// ADR for the numbers' justification against the field's own tuning figures (Telegraf, gostatsd,
-/// DogStatsD, rsyslog, syslog-ng).
+/// Matches `logit_config::ReceiveConfig`'s defaults; `docs/adr/decoupled-listener-io.md`
+/// justifies the numbers.
 impl Default for UdpListenerConfig {
     fn default() -> Self {
         Self {
@@ -109,13 +103,11 @@ impl Default for UdpListenerConfig {
 }
 
 impl UdpListenerConfig {
-    /// `read_batch`, clamped into the range the read and pop paths can actually honour.
+    /// `read_batch`, clamped into the range the read and pop paths can honour.
     ///
-    /// Graph rules 18 and 57 already reject `0` and anything above [`MAX_READ_BATCH`] at
-    /// validation time, so in a real pipeline this clamp never fires; it exists because
-    /// `UdpListenerConfig` is also built directly by tests and by anything embedding the driver,
-    /// and neither `recvmmsg` (`vlen` of 0 reads nothing, forever) nor `pop_many` (whose own
-    /// `debug_assert` catches `max == 0`) has a sensible answer for a zero here.
+    /// Graph rules 18 and 57 reject `0` and anything above [`MAX_READ_BATCH`], so in a real
+    /// pipeline this never fires. It guards a directly-built config: `recvmmsg` with a `vlen` of 0
+    /// reads nothing, forever, and `pop_many` `debug_assert`s `max > 0`.
     fn read_batch(&self) -> usize {
         self.read_batch.clamp(1, MAX_READ_BATCH)
     }
@@ -139,64 +131,54 @@ impl UdpListenerConfig {
 }
 
 /// The largest payload an **IPv4** UDP datagram can carry: 65,535 minus the 8-byte UDP header.
-/// Every UDP listener in this codebase has always sized its receive buffer to exactly this, and
-/// [`BatchReader`] sizes *each* of its `read_batch` slots to it.
+/// [`BatchReader`] sizes each of its `read_batch` slots to it.
 ///
-/// **It is not the largest payload a UDP datagram can carry, and the difference is real.** IPv6's
-/// own payload-length field excludes the 40-byte header, so an IPv6 UDP datagram may carry up to
-/// 65,527 bytes -- 20 more than this. A datagram that big arriving on an IPv6 listener is copied as
-/// far as this bound and the remainder is discarded by the kernel, which is exactly what the
-/// `recv_from` loop this replaced did with its own 65,507-byte buffer. What is new is that
-/// [`BatchReader`] can *see* it happen (`MSG_TRUNC` in the returned `msg_flags`) and counts it as
-/// `logit.input.datagrams.truncated` instead of losing the bytes silently. (Jumbograms --
-/// RFC 2675's payload-length-zero extension, past 65,535 -- are a separate thing again, and nothing
-/// in this codebase or in any mainstream kernel's UDP path supports them.)
+/// **It is not the largest payload a UDP datagram can carry.** IPv6's payload-length field
+/// excludes the 40-byte header, so an IPv6 UDP datagram may carry up to 65,527 bytes, 20 more than
+/// this. The kernel copies such a datagram up to this bound and discards the rest; [`BatchReader`]
+/// sees that happen (`MSG_TRUNC` in the returned `msg_flags`) and counts it as
+/// `logit.input.datagrams.truncated`. Jumbograms (RFC 2675, past 65,535) are a separate thing, and
+/// no mainstream kernel's UDP path supports them.
 const MAX_DATAGRAM_BYTES: usize = 65_507;
 
-/// The largest `receive.read_batch` this driver accepts. Graph rule 57 rejects a larger value at
-/// config-validation time (`logit_config::MAX_READ_BATCH`, the same number -- `logit-inputs`
-/// deliberately does not depend on `logit-config`, the same duplication
-/// [`UdpListenerConfig::default`] already carries against `ReceiveConfig::default`).
+/// The largest `receive.read_batch` this driver accepts. Graph rule 57 rejects a larger value
+/// (`logit_config::MAX_READ_BATCH`, the same number, duplicated because `logit-inputs` doesn't
+/// depend on `logit-config`).
 ///
-/// **The number is `UIO_MAXIOV`'s, but the limit is ours, not the kernel's.** It is tempting to
-/// write that `UIO_MAXIOV` bounds `recvmmsg`'s `vlen`; it does not. `UIO_MAXIOV` bounds
-/// `msg_iovlen` *within one* `msghdr` -- `__copy_msghdr` (`net/socket.c`) returns `-EMSGSIZE`
-/// above it -- and [`build_headers`] sets `msg_iovlen` to 1. There is no `vlen` clamp on the
-/// receive side at all: `do_recvmmsg`'s loop is a plain `while (datagrams < vlen)`, and the only
-/// `UIO_MAXIOV` clamp on a `vlen` anywhere is `__sys_sendmmsg`'s (`if (vlen > UIO_MAXIOV) vlen =
-/// UIO_MAXIOV;`), on the *send* side. What 1024 actually bounds is this crate's own two costs: the
+/// **The number is `UIO_MAXIOV`'s, but the limit is ours, not the kernel's.** `UIO_MAXIOV` does
+/// not bound `recvmmsg`'s `vlen`. It bounds `msg_iovlen` within one `msghdr` (`__copy_msghdr` in
+/// `net/socket.c` returns `-EMSGSIZE` above it), and [`build_headers`] sets `msg_iovlen` to 1. The
+/// receive side has no `vlen` clamp at all: `do_recvmmsg`'s loop is a plain
+/// `while (datagrams < vlen)`, and the only `UIO_MAXIOV` clamp on a `vlen` is `__sys_sendmmsg`'s,
+/// on the send side. What 1024 bounds is this crate's own two costs: the
 /// `vlen * MAX_DATAGRAM_BYTES` slab [`BatchReader::new`] reserves (67 MB of address space at this
-/// ceiling), and how many datagrams a cancelled `push_many` can discard on the shutdown path. Both
-/// are ours to choose; 1024 is a round number comfortably past any measured plateau
-/// (ADR `udp-intake-batching-and-socket-visibility`'s sweep) rather than an ABI boundary.
+/// ceiling), and how many datagrams a cancelled `push_many` can discard on the shutdown path. 1024
+/// is a round number past any measured plateau (ADR `udp-intake-batching-and-socket-visibility`'s
+/// sweep), not an ABI boundary.
 pub const MAX_READ_BATCH: usize = 1024;
 
-/// The three `decode_loop` needs to build and drive a [`BatchAccumulator`] -- split out from
-/// [`UdpListenerConfig`] purely to keep `decode_loop`'s own parameter count down.
+/// What `decode_loop` needs to build and drive a [`BatchAccumulator`]; split out from
+/// [`UdpListenerConfig`] to keep `decode_loop`'s parameter count down.
 #[derive(Debug, Clone, Copy)]
 struct BatchingConfig {
     max_events: usize,
     max_bytes: u64,
     flush_interval: Duration,
-    /// [`UdpListenerConfig::read_batch`], carried through to `decode_loop`'s `pop_many` so one
-    /// setting governs both ends of the [`ReceiveQueue`]. Not a `BatchAccumulator` knob like the
-    /// three above -- it rides along here only to keep `decode_loop`'s parameter count down, which
-    /// is what this struct exists for.
+    /// [`UdpListenerConfig::read_batch`], carried to `decode_loop`'s `pop_many` so one setting
+    /// governs both ends of the [`ReceiveQueue`]. Not a `BatchAccumulator` knob.
     pop_batch: usize,
 }
 
-/// The read/decode split every UDP listener reduces to
-/// (`docs/adr/decoupled-listener-io.md`) -- generic over the decoder because that is the
-/// *only* thing `StatsdInput`/`SyslogInput` ever differed in.
+/// The read/decode split every UDP listener reduces to (`docs/adr/decoupled-listener-io.md`),
+/// generic over the decoder.
 pub struct UdpListener<D: Decoder + Send> {
     bind: String,
     decoder: D,
     config: UdpListenerConfig,
     diag: Diagnostics,
     telemetry: Telemetry,
-    /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`]
-    /// (`docs/plans/operator-surface.md`, workstream B). `None` after a run, so a second run
-    /// rebinds, same as before this field existed.
+    /// Set by [`Input::bind`], taken by [`Input::run_until_shutdown`]. `None` after a run, so a
+    /// second run rebinds.
     socket: Option<tokio::net::UdpSocket>,
 }
 
@@ -212,22 +194,18 @@ impl<D: Decoder + Send> UdpListener<D> {
         }
     }
 
-    /// The address actually bound, once [`Input::bind`] has run -- lets a test learn the
-    /// OS-assigned port without a bind-drop-rebind race.
+    /// The bound address once [`Input::bind`] has run, so a test can learn the OS-assigned port
+    /// without a bind-drop-rebind race.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
-    /// Sets *this listener's own* diagnostics -- the top-level `bad_datagram` diagnostic
-    /// `decode_loop` reports when a whole datagram fails to decode (`udp.rs`'s own
-    /// `diag.warn_throttled("bad_datagram", ...)` call). Does **not** reach `self.decoder`'s own
-    /// diagnostics field, if it has one (`StatsdDecoder`/`SyslogDecoder` each track their own,
-    /// used for the finer-grained `bad_line` diagnostic a malformed line inside an otherwise-valid
-    /// datagram reports) -- `UdpListener` is generic over `D: Decoder`, which has no
-    /// `with_diagnostics` method of its own to call here. `StatsdInput`/`SyslogInput`'s own
-    /// `with_diagnostics` (which know their concrete decoder type) use [`Self::map_decoder`] to
-    /// propagate the same value into the decoder as well -- callers going through this method
-    /// directly on a bare `UdpListener` must do the same if the decoder needs to know it too.
+    /// Sets this listener's own diagnostics, the ones behind `decode_loop`'s `bad_datagram`
+    /// warning.
+    ///
+    /// Does not reach the decoder's diagnostics (a decoder's finer-grained `bad_line`, say):
+    /// [`Decoder`] has no `with_diagnostics` to call. A wrapper that knows its concrete decoder
+    /// must also set them through [`Self::map_decoder`].
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
@@ -238,40 +216,33 @@ impl<D: Decoder + Send> UdpListener<D> {
         self
     }
 
-    /// Applies `f` to the wrapped decoder -- lets a caller that knows the concrete decoder type
-    /// (`StatsdInput`/`SyslogInput`, generic `UdpListener` itself never can) chain the decoder's
-    /// own consuming builder methods, e.g. `with_diagnostics`, through `UdpListener`'s own
-    /// builder-style API.
+    /// Applies `f` to the wrapped decoder, so a wrapper that knows the concrete decoder type can
+    /// chain its consuming builder methods (`with_diagnostics`, say).
     pub fn map_decoder(mut self, f: impl FnOnce(D) -> D) -> Self {
         self.decoder = f(self.decoder);
         self
     }
 
-    /// Overrides the queue/batching/shutdown-grace knobs -- what a `receive:` config block sets
-    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`]
-    /// when never called.
+    /// Overrides the queue/batching/shutdown-grace knobs a `receive:` block sets. Defaults to
+    /// [`UdpListenerConfig::default`].
     pub fn with_config(mut self, config: UdpListenerConfig) -> Self {
         self.config = config;
         self
     }
 
-    /// The currently-configured queue/batching/shutdown-grace knobs -- for test introspection
-    /// (`logit-cli::pipeline`'s `build_spec` wiring tests), mirroring how `NodeSpec::Output`'s
-    /// `SinkQueueConfig`/`WriteLoopConfig` are directly inspectable after `build_spec` runs.
+    /// The configured knobs, for `logit-cli::pipeline`'s `build_spec` wiring tests.
     pub fn config(&self) -> UdpListenerConfig {
         self.config
     }
 
-    /// Test-only: lets `StatsdInput`/`SyslogInput`'s own tests confirm a `with_diagnostics` call
-    /// actually reached the wrapped decoder, not just `UdpListener`'s own `diag` field.
-    /// This listener's own diagnostics -- test-only, the driver-half counterpart of
-    /// [`Self::decoder`]: a wrapper's `with_diagnostics` has to set both, and only an accessor on
-    /// each can prove it did (`crate::syslog`'s own regression test).
+    /// This listener's own diagnostics. With [`Self::decoder`], lets a wrapper's test prove its
+    /// `with_diagnostics` set both halves.
     #[cfg(test)]
     pub(crate) fn diag(&self) -> &Diagnostics {
         &self.diag
     }
 
+    /// The wrapped decoder; see [`Self::diag`].
     #[cfg(test)]
     pub(crate) fn decoder(&self) -> &D {
         &self.decoder
@@ -306,9 +277,8 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
     }
 
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        // Never exercised in production -- `run_input` always calls `run_until_shutdown`. Present
-        // because the trait requires it, mirroring how `logit_pipeline::run` passes
-        // `std::future::pending()` as `run_with_shutdown`'s never-firing signal.
+        // Unused in production: `run_input` always calls `run_until_shutdown`. The trait requires
+        // it. `_tx` outlives the run, so this shutdown signal never fires.
         let (_tx, rx) = watch::channel(false);
         self.run_until_shutdown(sink, rx).await
     }
@@ -343,23 +313,16 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
             self.diag.clone(),
         ));
 
-        // `read` is the only side that can finish on its own initiative -- a fatal socket error,
-        // or `shutdown` firing -- and whichever way it finishes, it always closes `queue` first
-        // (see `read_loop`'s own doc comment; `read_loop_sampled` only wraps it, adding the
-        // kernel-counter sampler and forwarding its result unchanged), which is what lets
-        // `decode`'s `pop_many` discover
-        // "closed and empty" and return on its own. `decode` therefore never needs to be raced
-        // away from early the way `run_output`'s `write`/`drain` dance does: once `read` is done,
-        // simply drive `decode` to completion so it drains whatever `read` already queued and
+        // Only `read` can finish on its own (a fatal socket error, or `shutdown`), and either way
+        // it closes `queue` first (`read_loop`'s doc; `read_loop_sampled` forwards its result
+        // unchanged). That lets `decode`'s `pop_many` see "closed and empty" and return, so once
+        // `read` is done, `decode` is driven to completion: it drains what `read` queued and
         // flushes its accumulator.
         //
-        // The `Option` indirection (rather than unconditionally `decode.await`ing after the
-        // `select!`) exists only to guard the one edge case `select!` itself can't rule out:
-        // `decode` finishing *before* `read` does. Nothing in today's `read_loop`/`decode_loop`
-        // makes that possible (only `read_loop` ever closes `queue`), but if it somehow happened,
-        // polling `decode` again after it already resolved would be exactly the double-poll
-        // hazard `docs/adr/decoupled-listener-io.md` calls out -- so this still awaits `read`
-        // in that branch instead, and never touches `decode` again once it's the side that fired.
+        // The `Option` guards the one case `select!` can't rule out: `decode` finishing first.
+        // Only `read_loop` closes `queue`, so today that can't happen, but polling `decode` again
+        // after it resolved would be the double-poll hazard `docs/adr/decoupled-listener-io.md`
+        // calls out; that branch awaits `read` instead.
         let already_finished = tokio::select! {
             result = &mut read => Some(result),
             () = &mut decode => None,
@@ -375,22 +338,15 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
 }
 
 /// Resolves `bind` and binds a UDP socket to it, applying `receive_buffer_bytes` if given.
-/// Returns the socket and, when `bind` named a multicast group, the group that was joined (for
-/// the `bound` info line -- see [`bind_one`] for what a multicast bind actually does differently).
+/// Returns the socket and, when `bind` named a multicast group, the group joined (for the `bound`
+/// info line; [`bind_one`] says what a multicast bind does differently).
 ///
-/// Two properties this must have, both regressions an earlier version of this function had
-/// relative to the `tokio::net::UdpSocket::bind` it replaced:
-///
-/// - **Resolves asynchronously.** `std::net::ToSocketAddrs::to_socket_addrs` performs a
-///   synchronous (and, for a real hostname rather than a bare IP literal, potentially slow)
-///   `getaddrinfo` call; calling it directly here would block whichever tokio worker thread is
-///   running this listener's startup for as long as resolution takes.
-///   [`tokio::net::lookup_host`] does the same resolution off tokio's own blocking thread pool.
-/// - **Tries every resolved address, not just the first.** A `bind:` value that resolves to more
-///   than one candidate (a hostname yielding both an AAAA and an A record, say) must fall through
-///   to a later candidate if an earlier one can't be bound (its address family disabled, that
-///   specific address unavailable) -- exactly `std`/`tokio`'s own `bind` convention for a
-///   multi-address `ToSocketAddrs` target.
+/// - **Resolves asynchronously.** `std::net::ToSocketAddrs` makes a synchronous `getaddrinfo`
+///   call that would block a tokio worker for as long as a hostname takes to resolve;
+///   [`tokio::net::lookup_host`] runs it on the blocking pool.
+/// - **Tries every resolved address, not just the first.** A hostname with both an AAAA and an A
+///   record must fall through to a later candidate when an earlier one can't bind (its address
+///   family disabled, say), `std`/`tokio`'s own `bind` convention.
 async fn bind_socket(
     bind: &str,
     receive_buffer_bytes: Option<u64>,
@@ -407,10 +363,9 @@ async fn bind_socket(
         .with_context(|| format!("binding to '{bind}'"))
 }
 
-/// Tries every address in `addrs` in turn, returning the first successful bind -- split out from
-/// [`bind_socket`] specifically so this fallback behavior (and its regression, an earlier version
-/// of `bind_socket` tried only the first candidate) is directly unit-testable against a hand-built
-/// address list, without needing a real hostname that resolves to more than one address.
+/// Tries every address in `addrs` in turn, returning the first successful bind. Split out from
+/// [`bind_socket`] so the fallthrough is testable against a hand-built address list, with no
+/// hostname that resolves to several addresses.
 fn bind_first_available(
     addrs: &[std::net::SocketAddr],
     receive_buffer_bytes: Option<u64>,
@@ -439,55 +394,51 @@ struct Bound {
     multicast_group: Option<std::net::IpAddr>,
 }
 
-/// Creates and binds one UDP socket to `addr` -- the per-candidate half of `bind_socket`'s
-/// try-every-resolved-address loop. Synchronous and cheap (socket syscalls only, no I/O wait),
-/// unlike the DNS resolution `bind_socket` itself awaits before ever calling this.
+/// Creates and binds one UDP socket to `addr`, the per-candidate half of `bind_socket`'s loop.
+/// Synchronous: socket syscalls only, no I/O wait.
 ///
-/// **A multicast `addr` is bound differently.** A group address (`224.0.0.0/4`, `ff00::/8` --
-/// collectd's own defaults are `239.192.74.66` and `ff18::efc0:4a42`, and statsd/syslog senders use
-/// groups too) is not an address any interface owns, so receiving on one takes three steps rather
-/// than one: `SO_REUSEADDR`, so several processes on the host can subscribe to the same group and
-/// port; a bind to the *unspecified* address on that port, since the group itself is not bindable
-/// everywhere and binding it would still not subscribe to anything; and an explicit
-/// `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` on the default interface (`INADDR_ANY` / interface index
-/// `0` -- the kernel's own multicast routing decides which interface that is, rather than this
-/// listener guessing at one). A failed join is a hard error, not a warning: a listener that bound
-/// but never joined would sit there looking healthy and receive nothing forever.
+/// **A multicast `addr` is bound differently.** No interface owns a group address (`224.0.0.0/4`,
+/// `ff00::/8`; collectd's defaults are `239.192.74.66` and `ff18::efc0:4a42`), so receiving on one
+/// takes three steps:
 ///
-/// A unicast `addr` binds exactly as it always has.
+/// 1. `SO_REUSEADDR`, so several processes on the host can subscribe to the same group and port.
+/// 2. A bind to the unspecified address on that port: the group isn't bindable everywhere, and
+///    binding it wouldn't subscribe to anything.
+/// 3. `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` on the default interface (`INADDR_ANY`/index `0`), so
+///    the kernel's multicast routing picks the interface rather than this listener guessing.
 ///
-/// **Three things this function deliberately never does, all of them load-bearing elsewhere.**
-/// They are negatives, so nothing in the code says them; they are recorded here because each one
-/// is a single line away and each would break something several files from this one.
+/// A failed join is a hard error: a listener that bound but never joined would look healthy and
+/// receive nothing, forever.
 ///
-/// - **Never `connect(2)`.** `udp_err` (`net/ipv4/udp.c`; `udpv6_err`, `net/ipv6/udp.c`, is
+/// **Three things this function never does.** Each is one line away and would break something
+/// several files from here.
+///
+/// - **Never `connect(2)`.** `udp_err` (`net/ipv4/udp.c`; `udpv6_err` in `net/ipv6/udp.c` is
 ///   identical) gates ICMP error delivery on `if (!inet_test_bit(RECVERR, sk)) { if (!harderr ||
 ///   sk->sk_state != TCP_ESTABLISHED) goto out; }`, and `sk_state` only becomes `TCP_ESTABLISHED`
-///   in `__ip4_datagram_connect` (`net/ipv4/datagram.c`). Unconnected and without `IP_RECVERR`,
-///   therefore, no ICMP unreachable can ever set `sk_err` on this socket -- which is what makes
+///   in `__ip4_datagram_connect` (`net/ipv4/datagram.c`). Unconnected and without `IP_RECVERR`, no
+///   ICMP unreachable can set `sk_err` on this socket. That makes
 ///   `ECONNREFUSED`/`EHOSTUNREACH`/`ENETUNREACH`/`EPROTO`/PMTU `EMSGSIZE` unreachable at
-///   [`BatchReader::read_batch`], and so what makes "every errno but `EAGAIN` is fatal" the right
-///   policy there rather than a hasty one.
-/// - **Never `IP_RECVERR`/`IPV6_RECVERR`.** It is the obvious idea -- it is the *other* way to see
-///   ICMP-reported loss, next to the `SO_MEMINFO` counters this listener does sample -- and it
-///   takes the `else` branch of the gate quoted above, which sets `sk_err` with **no**
-///   `TCP_ESTABLISHED` check. Enabling it would make this listener killable by any host that can
-///   provoke an ICMP unreachable toward it, since the next `recvmmsg` would return that error and
-///   `read_loop` treats a non-`EAGAIN` errno as fatal. Any future change here needs an answer for
-///   that first.
+///   [`BatchReader::read_batch`], which is why "every errno but `EAGAIN` is fatal" is the right
+///   policy there.
+/// - **Never `IP_RECVERR`/`IPV6_RECVERR`.** It's the other way to see ICMP-reported loss, next to
+///   the `SO_MEMINFO` counters this listener samples, but it takes the `else` branch of the gate
+///   above, which sets `sk_err` with no `TCP_ESTABLISHED` check. Any host that can provoke an ICMP
+///   unreachable toward this listener could then kill it: the next `recvmmsg` returns that error,
+///   and `read_loop` treats a non-`EAGAIN` errno as fatal.
 /// - **Never `shutdown(2)`.** `Ready::READ_CLOSED` is in this listener's wait mask (tokio's
-///   `Ready::from_interest` adds it whenever the interest is readable) and `clear_readiness` can
-///   never clear it (`runtime/io/scheduled_io.rs` subtracts it from the clearable mask by name).
-///   If it were ever set while `recvmmsg` kept returning `EAGAIN`, `async_io`'s loop would spin
-///   *inside a single poll* -- and, because its `WouldBlock` arm restores the coop budget, never
-///   yield -- wedging the worker thread: no sampler tick, no shutdown observation, and
-///   `run_input`'s backstop unable to help because it is in the same task. That is open tokio
-///   issue #6971. It is unreachable here only because `EPOLLRDHUP`/`EPOLLHUP` on a UDP socket come
-///   from `sk->sk_shutdown`, which nothing sets without a `shutdown(2)` call on this fd, and
-///   nothing in `logit` makes one on a listener socket.
+///   `Ready::from_interest` adds it for any readable interest), and `clear_readiness` can never
+///   clear it (`runtime/io/scheduled_io.rs` removes it from the clearable mask by name). If it
+///   were set while `recvmmsg` kept returning `EAGAIN`, `async_io`'s loop would spin inside a
+///   single poll and, because its `WouldBlock` arm restores the coop budget, never yield. That
+///   wedges the worker thread: no sampler tick, no shutdown observation, and `run_input`'s
+///   backstop can't help because it's in the same task (open tokio issue #6971). It's unreachable
+///   only because `EPOLLRDHUP`/`EPOLLHUP` on a UDP socket come from `sk->sk_shutdown`, which
+///   nothing sets without a `shutdown(2)` on this fd, and nothing in `logit` makes one.
 ///
-/// Verified against `torvalds/linux` master and tokio tag `tokio-1.53.1`, 2026-09-21; see ADR
-/// `udp-intake-batching-and-socket-visibility`'s amendment of that date.
+/// Verified against `torvalds/linux` master and tokio tag `tokio-1.53.1`; see ADR
+/// `udp-intake-batching-and-socket-visibility`, "Amendment: kernel- and tokio-cited facts behind
+/// the UDP read path".
 fn bind_one(
     addr: std::net::SocketAddr,
     receive_buffer_bytes: Option<u64>,
@@ -528,8 +479,8 @@ fn bind_one(
     Ok(Bound { socket, multicast_group: Some(group) })
 }
 
-/// The granted-`SO_RCVBUF` gauging/warning and the final conversion to a tokio socket, run only
-/// once some candidate address has actually bound successfully.
+/// Gauges the granted `SO_RCVBUF`, warns if the kernel clamped it, and converts to a tokio socket.
+/// Runs only once a candidate address has bound.
 fn finish_bind(
     socket: socket2::Socket,
     receive_buffer_bytes: Option<u64>,
@@ -538,19 +489,17 @@ fn finish_bind(
 ) -> anyhow::Result<tokio::net::UdpSocket> {
     use anyhow::Context;
 
-    // Read once at bind, not per datagram -- SO_RCVBUF doesn't change after bind. The gauge
-    // itself is re-emitted every second by `ReceiveBufferSampler::sample_once` (from
-    // `SO_MEMINFO`'s `SK_MEMINFO_RCVBUF`, the same `sk_rcvbuf` this getsockopt returns), because a
-    // point written once here would survive exactly one `internal` drain window. This emission
-    // still earns its keep: it is the only one a process that fails during startup ever makes.
+    // Read once: SO_RCVBUF doesn't change after bind. `ReceiveBufferSampler::sample_once`
+    // re-emits this gauge every second (from `SO_MEMINFO`'s `SK_MEMINFO_RCVBUF`, the same
+    // `sk_rcvbuf`), because a point written once would survive one `internal` drain window. This
+    // emission is the only one a process that fails during startup makes.
     let granted = socket.recv_buffer_size().unwrap_or(0) as f64;
     telemetry.gauge("logit.input.receive_buffer.bytes", granted, &[]);
     if let Some(requested) = receive_buffer_bytes {
         telemetry.gauge("logit.input.receive_buffer.requested.bytes", requested as f64, &[]);
         // Linux doubles the requested value for its own bookkeeping, so a successful request
-        // routinely reports back roughly 2x what was asked -- a plain `granted < requested` check
-        // would never fire there. Warn only when the kernel's own `net.core.rmem_max` ceiling
-        // actually clamped the request below what was asked.
+        // reports back about 2x what was asked, and `granted < requested` would never fire. Warn
+        // only when `net.core.rmem_max` clamped the request below that doubled value.
         let effective_minimum =
             if cfg!(target_os = "linux") { requested.saturating_mul(2) } else { requested };
         if (granted as u64) < effective_minimum {
@@ -566,37 +515,29 @@ fn finish_bind(
     tokio::net::UdpSocket::from_std(std_socket).context("converting to a tokio UdpSocket")
 }
 
-/// Reads datagrams off `socket` into `queue` as fast as `queue.push` (governed by its own bounds/
-/// overflow policy) allows -- entirely independent of how far behind `decode_loop`'s current
-/// decode is running. Never blocks on downstream backpressure by default (`drop_oldest`, counted --
-/// `docs/adr/decoupled-listener-io.md`'s core argument for why this differs from a sink
-/// queue's `block` default); `overflow: block` is the one configuration under which this
-/// genuinely does stop reading, by explicit operator choice.
+/// Reads datagrams off `socket` into `queue` as fast as the queue's bounds and overflow policy
+/// allow, independent of how far behind `decode_loop` is. The default `drop_oldest` (counted)
+/// never blocks on downstream backpressure (`docs/adr/decoupled-listener-io.md` says why this
+/// differs from a sink queue's `block`); only an operator's `overflow: block` stops reading.
 ///
-/// Races every read *and* every push against `shutdown`, so a graceful shutdown stops this loop
-/// immediately rather than only once the next datagram happens to arrive, or (under `block`) only
-/// once downstream makes room. Cancelling a blocked `push_many` this way drops whatever the reader
-/// was still holding, uncounted -- bounded by `read_batch`, widened from the exactly-one ADR
-/// `service-lifecycle-and-output-retry` accepted for "a datagram in flight when the signal lands"
-/// and named as such in ADR `udp-intake-batching-and-socket-visibility`.
+/// Races every read and every push against `shutdown`, so shutdown stops this loop at once rather
+/// than when the next datagram arrives or (under `block`) downstream makes room. Cancelling a
+/// blocked `push_many` drops what the reader was holding, uncounted: at most `read_batch`
+/// datagrams, the loss ADR `udp-intake-batching-and-socket-visibility` names.
 ///
 /// **Telemetry is per batch, not per datagram.** One [`BatchReader::read_batch`] call is one
 /// `logit.input.reads`, one `logit.input.datagrams` of however many it returned, one
-/// `logit.input.datagram.bytes` of their total, and -- only when it is nonzero, like every other
-/// loss counter here -- one `logit.input.datagrams.truncated`. `datagrams / reads` is the mean fill of the
-/// syscall batch -- a fill pinned at `read_batch` says the knob is the limit, a fill near 1 says
-/// the traffic never batches and the knob is irrelevant. Deliberately three counts per batch
-/// rather than three per datagram: each one takes `ComponentBuffer`'s mutex, which `decode_loop`
-/// contends with from the other side of the same component.
+/// `logit.input.datagram.bytes` of their total, and, only when nonzero, one
+/// `logit.input.datagrams.truncated`. `datagrams / reads` is the mean fill of the syscall batch: a
+/// fill pinned at `read_batch` says the knob is the limit; a fill near 1 says the traffic never
+/// batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
+/// mutex, which `decode_loop` contends for from the other side of the same component.
 ///
-/// Closes `queue` in every exit path -- shutdown, or a fatal socket error -- which is what lets
-/// `decode_loop`'s `pop_many` discover "closed and empty" and return; no separate close-detection
-/// signal is needed on that side.
+/// Closes `queue` on every exit path (shutdown or a fatal socket error), which is how
+/// `decode_loop`'s `pop_many` sees "closed and empty" and returns.
 ///
-/// `read_batch` larger than the queue's own `max_datagrams` is legal and deliberately not rejected
-/// at config time: `push_many` already has a defined answer for a batch that cannot fit at all
-/// (evict or block per policy, per item, exactly as `push` would), so the only thing an extra
-/// validation rule would buy is refusing a configuration that works.
+/// A `read_batch` above the queue's `max_datagrams` is legal: `push_many` evicts or blocks per
+/// policy, per item, as `push` would, so rejecting it would only refuse a working config.
 async fn read_loop(
     socket: &tokio::net::UdpSocket,
     queue: Arc<ReceiveQueue>,
@@ -605,9 +546,8 @@ async fn read_loop(
     read_batch: usize,
 ) -> anyhow::Result<()> {
     let mut reader = BatchReader::new(read_batch);
-    // Reused across every iteration, cleared (not replaced) each time round, for the same reason
-    // `decode_loop`'s `popped` is: `push_many` drains it, so its capacity survives and the steady
-    // state allocates nothing beyond the one right-sized copy per datagram.
+    // Reused and cleared each iteration: `push_many` drains it, so its capacity survives and the
+    // steady state allocates only the one right-sized copy per datagram.
     let mut batch: Vec<Datagram> = Vec::with_capacity(read_batch);
     let result = loop {
         batch.clear();
@@ -635,8 +575,7 @@ async fn read_loop(
     result
 }
 
-/// The syscall [`BatchReader::read_batch`] takes datagrams off the socket with, by name -- for the
-/// one message an operator ever sees it in, the fatal error [`read_loop`] stops on.
+/// The syscall [`BatchReader::read_batch`] makes, named in the fatal error [`read_loop`] stops on.
 #[cfg(target_os = "linux")]
 const READ_SYSCALL: &str = "recvmmsg(2)";
 #[cfg(not(target_os = "linux"))]
@@ -644,37 +583,30 @@ const READ_SYSCALL: &str = "recvfrom(2)";
 
 /// Turns a fatal read error into something an operator can act on.
 ///
-/// Without this the only context added on the way out is `run_input`'s
-/// `.with_context(|| format!("component '{id}'"))` (`logit_pipeline::runtime`), so a sandbox that
-/// blocks the syscall reports `component 'statsd_in': Function not implemented (os error 38)` --
-/// no syscall named, no socket named, nothing to search for. That is the same failure quinn#1947
-/// and bun#42678 both hit (a seccomp profile refusing `recvmmsg`); `logit` at least fails cleanly
-/// rather than spinning, which is the part bun had to fix, but the message was no more useful than
-/// theirs was. `recvmmsg(2)` is unconditional on Linux, so the obvious operator response -- drop
-/// `receive.read_batch` to 1 -- does not help, and the hint says so rather than leaving it to be
-/// discovered. There is deliberately no runtime `recvmmsg` -> `recvmsg` fallback latch
-/// (quinn#2079's pattern); that is an open design decision, not an oversight -- see
+/// Otherwise the only context is `run_input`'s `component '{id}'`, so a sandbox that blocks the
+/// syscall reports `component 'statsd_in': Function not implemented (os error 38)`, with no
+/// syscall or socket named (the failure quinn#1947 and bun#42678 hit from a seccomp profile
+/// refusing `recvmmsg`). `recvmmsg(2)` is unconditional on Linux, so dropping
+/// `receive.read_batch` to 1 doesn't help, and the hint says so. There is no runtime fallback
+/// from `recvmmsg` to `recvmsg` (quinn#2079's pattern); that's an open decision in
 /// `docs/known-gaps.md`.
 ///
-/// The bound address comes from `getsockname(2)` via `local_addr`, not from the configured `bind:`
-/// string: it is the address actually in use (a `:0` port resolved, or whichever candidate won
-/// [`bind_first_available`]'s fallthrough), and it costs one syscall on a path that is about to
-/// terminate the listener anyway.
+/// The address comes from `getsockname(2)`, not the configured `bind:`: it's the one in use (a
+/// `:0` port resolved, or whichever candidate won [`bind_first_available`]).
 fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) -> anyhow::Error {
-    // Matched on `ErrorKind`, not `libc::E*`: `libc` is a Linux-only dependency of this crate and
-    // this function is shared with the `recv_from` twin, so it has to build without it. std's Unix
-    // mapping (`sys/pal/unix/mod.rs`, `decode_error_kind`) is `ENOSYS` -> `Unsupported`,
-    // `EPERM`/`EACCES` -> `PermissionDenied`, `ECONNABORTED` -> `ConnectionAborted`.
+    // Matched on `ErrorKind`, not `libc::E*`: `libc` is a Linux-only dependency and this function
+    // also serves the non-Linux `recv_from` path. std's Unix mapping (`decode_error_kind`) is
+    // `ENOSYS` -> `Unsupported`, `EPERM`/`EACCES` -> `PermissionDenied`, `ECONNABORTED` ->
+    // `ConnectionAborted`.
     let hint = match err.kind() {
         std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied => {
             " -- a seccomp or sandbox profile blocking that syscall is the usual cause; \
              `receive.read_batch: 1` does not avoid it, this listener always makes the same call"
         }
-        // `udp_abort` (`net/ipv4/udp.c`) is the one externally-triggerable fatal on this socket:
-        // it sets `sk_err` and `__udp_disconnect`s, reached from a `SOCK_DESTROY` netlink request.
-        // The socket really is gone -- unhashed, never to receive again -- so failing is correct,
-        // and a retry would read `EAGAIN` (`sock_error`'s `xchg` clears `sk_err`) and leave a
-        // silent zombie listener behind. Naming the cause is all that is left to do.
+        // `udp_abort` (`net/ipv4/udp.c`), reached from a `SOCK_DESTROY` netlink request, is the
+        // one externally-triggerable fatal on this socket: it sets `sk_err` and unhashes the
+        // socket, which never receives again. A retry would read `EAGAIN` (`sock_error`'s `xchg`
+        // clears `sk_err`) and leave a zombie listener, so failing is correct.
         std::io::ErrorKind::ConnectionAborted => {
             " -- the socket was destroyed out from under this listener (an `ss -K`, or another \
              SOCK_DESTROY request naming it); it cannot receive again, so the process exits \
@@ -690,17 +622,14 @@ fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) ->
         .context(format!("{READ_SYSCALL} on the listener socket bound to {addr}{hint}"))
 }
 
-/// Words of `u64` backing one `mmsghdr`, and one `iovec`, in [`BatchReader`]'s storage --
-/// see that type's doc for why the element type is `u64` rather than the C struct itself.
+/// Words of `u64` backing one `mmsghdr`, and one `iovec`, in [`BatchReader`]'s storage (that
+/// type's doc says why the element type is `u64`).
 ///
-/// `div_ceil`, not a plain divide: nothing in the ABI *promises* either size is a multiple of 8
-/// (both are, on every Linux target this builds for), and rounding up can only ever over-allocate.
-/// Note what this does **not** buy, since it is easy to misread as buying it: the stride
-/// [`build_headers`] and [`harvest_headers`] walk is `hdrs.add(i)`, i.e. `size_of::<mmsghdr>()`,
-/// *not* the `HDR_WORDS * 8` bytes reserved per slot, so a size that were not a multiple of the
-/// alignment would misalign slot 1 however much was allocated. That case is impossible for a
-/// language-level reason rather than an ABI one -- Rust guarantees `size_of::<T>()` is a multiple
-/// of `align_of::<T>()` -- and the const block below asserts it anyway.
+/// `div_ceil`, not a plain divide: the ABI doesn't promise either size is a multiple of 8 (both
+/// are, on every Linux target this builds for), and rounding up can only over-allocate. It does
+/// not protect alignment: [`build_headers`] and [`harvest_headers`] stride by `hdrs.add(i)`, that
+/// is `size_of::<mmsghdr>()`, not `HDR_WORDS * 8`. Slot 1 stays aligned because Rust guarantees
+/// `size_of::<T>()` is a multiple of `align_of::<T>()`, and the const block below asserts it.
 #[cfg(target_os = "linux")]
 const HDR_WORDS: usize = std::mem::size_of::<libc::mmsghdr>().div_ceil(8);
 
@@ -709,19 +638,16 @@ const HDR_WORDS: usize = std::mem::size_of::<libc::mmsghdr>().div_ceil(8);
 const IOV_WORDS: usize = std::mem::size_of::<libc::iovec>().div_ceil(8);
 
 /// Every layout fact [`build_headers`], [`recvmmsg_into`] and [`harvest_headers`] rest on, checked
-/// against whatever `libc` says these two structs look like on the target actually being built.
+/// against what `libc` says these two structs look like on the target being built.
 ///
-/// A `const` block, so each of these is a hard compile error rather than a runtime surprise on a
-/// target whose `mmsghdr` is shaped differently than this code assumes -- the same tripwire
-/// discipline `crates/logit-core/tests/type_sizes.rs` applies to `Event`, and the reason
-/// `libc`'s own CI validates these structs against real headers with `ctest`.
+/// A `const` block, so a target whose `mmsghdr` is shaped differently is a compile error, not a
+/// runtime surprise: the same tripwire `crates/logit-core/tests/type_sizes.rs` applies to `Event`.
 #[cfg(target_os = "linux")]
 const _: () = {
-    // **Alignment.** `mmsghdr`/`iovec` are 8-aligned on every target this compiles for, which is
-    // what makes a `u64` buffer valid storage for them. `Vec<u64>` allocates through
-    // `Layout::array::<u64>()`, whose alignment is `align_of::<u64>()`, so `as_mut_ptr()` is
-    // exactly that aligned -- and these two asserts are the whole of the guarantee, since the
-    // point of the `u64` element type is that the compiler cannot check the cast for us.
+    // **Alignment.** `mmsghdr`/`iovec` are at most 8-aligned on every target this compiles for,
+    // which makes a `u64` buffer valid storage for them. `Vec<u64>`'s pointer is
+    // `align_of::<u64>()`-aligned, and the compiler can't check the cast, so these two asserts are
+    // the whole guarantee.
     assert!(std::mem::align_of::<libc::mmsghdr>() <= std::mem::align_of::<u64>());
     assert!(std::mem::align_of::<libc::iovec>() <= std::mem::align_of::<u64>());
     // **Capacity.** The words reserved per slot hold a whole struct, so slot `i` of a
@@ -730,14 +656,13 @@ const _: () = {
     assert!(IOV_WORDS * 8 >= std::mem::size_of::<libc::iovec>());
     // **Stride.** `hdrs.add(i)`/`iovs.add(i)` step by `size_of`, so every slot after the first is
     // aligned only if `size_of` is a multiple of `align_of`. Guaranteed by the language; asserted
-    // because it is the one thing `div_ceil` above does *not* protect against.
+    // because `div_ceil` above doesn't protect against it.
     assert!(
         std::mem::size_of::<libc::mmsghdr>().is_multiple_of(std::mem::align_of::<libc::mmsghdr>())
     );
     assert!(std::mem::size_of::<libc::iovec>().is_multiple_of(std::mem::align_of::<libc::iovec>()));
-    // **Harvest.** The two fields [`harvest_headers`] reads back out of a header the kernel wrote
-    // lie wholly inside that header (and so inside its reserved `HDR_WORDS * 8` bytes), and are
-    // two distinct fields rather than one aliased under two names.
+    // **Harvest.** The two fields [`harvest_headers`] reads back lie wholly inside the header (so
+    // inside its reserved `HDR_WORDS * 8` bytes) and don't alias each other.
     assert!(
         std::mem::offset_of!(libc::mmsghdr, msg_len) + std::mem::size_of::<libc::c_uint>()
             <= std::mem::size_of::<libc::mmsghdr>()
@@ -755,61 +680,47 @@ const _: () = {
 /// The Linux read half: one `recvmmsg(2)` per [`BatchReader::read_batch`] call, up to
 /// `read_batch` datagrams at a time.
 ///
-/// **Why this is a `libc` call and not a `tokio` one.** `tokio::net::UdpSocket` exposes no
-/// vectored multi-message receive; what it does expose is
-/// [`UdpSocket::async_io`](tokio::net::UdpSocket::async_io), which waits for readiness and then
-/// hands control to a closure that makes the syscall itself. That is the seam this uses, and it is
-/// the same shape `crates/logit-inputs/src/tail/watch.rs`'s `inotify` backend already uses for
-/// `read(2)` off an inotify fd: `libc` confined to one Linux-gated module, a `// SAFETY:` comment
-/// per `unsafe` block, and no raw pointer held anywhere a future could carry it across an `.await`.
+/// **Why a `libc` call and not a `tokio` one.** `tokio::net::UdpSocket` has no multi-message
+/// receive, but [`UdpSocket::async_io`](tokio::net::UdpSocket::async_io) waits for readiness and
+/// then hands a closure the syscall. This uses that seam, as `crate::tail::watch` does for
+/// `inotify`: `libc` confined to one Linux-gated module, a `// SAFETY:` comment per `unsafe`
+/// block, and no raw pointer held across an `.await`.
 ///
-/// **The `mmsghdr`/`iovec` arrays are rebuilt inside the closure on every call, and the storage
-/// that backs them is `Vec<u64>`, not `Vec<mmsghdr>`.** Both halves of that matter, for the same
-/// reason: `mmsghdr` contains raw pointers, so a `Vec<mmsghdr>` is `!Send`, and this struct lives
-/// across the `.await` inside `read_batch`. Holding one would make the whole read future `!Send`
-/// -- and `UdpListener::run_until_shutdown` is an `#[async_trait]` method, which requires `Send`
-/// -- leaving `unsafe impl Send` as the only way out, which this codebase does not do and ADR
-/// `udp-intake-batching-and-socket-visibility` explicitly rejects. Plain `u64` words carry no
-/// pointers, so the struct stays ordinarily `Send`; the pointers exist only for the duration of
-/// one synchronous closure call, re-derived from live allocations each time. Rebuilding them is a
-/// short loop of stores and allocates nothing, which is why reuse was never worth the hazard.
+/// **The `mmsghdr`/`iovec` arrays are rebuilt inside the closure on every call, over `Vec<u64>`
+/// storage, not `Vec<mmsghdr>`.** `mmsghdr` holds raw pointers, so a `Vec<mmsghdr>` is `!Send`,
+/// and this struct lives across `read_batch`'s `.await`. That would make the read future `!Send`,
+/// but `UdpListener::run_until_shutdown` is an `#[async_trait]` method that requires `Send`, and
+/// ADR `udp-intake-batching-and-socket-visibility` rejects `unsafe impl Send`. `u64` words carry
+/// no pointers; the pointers exist only for one synchronous closure call, re-derived from live
+/// allocations each time. Rebuilding is a short loop of stores with no allocation.
 /// [`assert_batch_read_future_is_send`] pins the property at compile time.
 ///
-/// **`MSG_TRUNC` is detected and counted, not assumed away.** Each slot is
-/// [`MAX_DATAGRAM_BYTES`], which covers every IPv4 datagram and all but the last 20 bytes of the
-/// largest possible IPv6 one -- so on an IPv6 listener a datagram *can* arrive longer than the
-/// `iovec` it is being written into, and the kernel copies what fits and discards the rest. It
-/// cannot be caught by looking at `msg_len`, which is the *copied* length and so reads exactly
-/// `MAX_DATAGRAM_BYTES` in that case, indistinguishable from a datagram that fit precisely; the
-/// kernel reports it in `msg_hdr.msg_flags` instead, which this reads back out of the same header
-/// it already reads `msg_len` from. Each one is counted as `logit.input.datagrams.truncated` and
-/// the truncated payload is still delivered -- the same bytes the `recv_from` loop this replaced
-/// would have delivered, now with the loss visible rather than silent. Growing the slots to 65,527
-/// was the alternative and is not worth 20 bytes x `read_batch` of address space plus a constant
-/// that stops matching every other 65,507 in this codebase, to avoid a case only a
-/// deliberately-jumbo IPv6 sender produces.
+/// **`MSG_TRUNC` is detected and counted.** Each slot is [`MAX_DATAGRAM_BYTES`], which covers
+/// every IPv4 datagram but not the largest IPv6 one, so on an IPv6 listener the kernel can copy
+/// what fits and discard the rest. `msg_len` can't show it: it's the copied length, so it reads
+/// `MAX_DATAGRAM_BYTES`, the same as a datagram that fit precisely. The kernel reports it in
+/// `msg_hdr.msg_flags` instead. Each one is counted as `logit.input.datagrams.truncated`, and the
+/// truncated payload is still delivered. Growing the slots to 65,527 isn't worth 20 bytes x
+/// `read_batch` of address space and a constant that stops matching every other 65,507 in the
+/// codebase, for a case only a jumbo IPv6 sender produces.
 #[cfg(target_os = "linux")]
 struct BatchReader {
-    /// `vlen` contiguous [`MAX_DATAGRAM_BYTES`] slots, one per `iovec`. Allocated once at
-    /// construction and never resized. Its *virtual* size is `read_batch * 65,507` bytes; only the
-    /// pages a datagram is actually written into are ever faulted in, which is why
-    /// `docs/design/memory.md` records both figures for this row and not just the first.
+    /// `vlen` contiguous [`MAX_DATAGRAM_BYTES`] slots, one per `iovec`, allocated once. Its virtual
+    /// size is `read_batch * 65,507` bytes, but only pages a datagram is written into are faulted
+    /// in, which is why `docs/design/memory.md` records both figures.
     slots: Vec<u8>,
-    /// Backing words for the `vlen` `mmsghdr`s the syscall takes, and for their `vlen` `iovec`s --
-    /// see this struct's own doc for why the element type is `u64` rather than the C structs
-    /// themselves. Sized once; re-pointed at `slots` on every call.
+    /// Backing words for the `vlen` `mmsghdr`s and their `vlen` `iovec`s (this struct's doc says
+    /// why `u64`). Sized once; re-pointed at `slots` on every call.
     hdr_words: Vec<u64>,
     iov_words: Vec<u64>,
-    /// Each returned message's `msg_len`, copied out of the `mmsghdr` array before the closure
-    /// returns -- the header array's contents are meaningless to anything outside the closure, so
-    /// the numbers worth keeping are lifted into plain integer buffers instead.
+    /// Each returned message's `msg_len`, copied out before the closure returns: the header array
+    /// means nothing outside it.
     lens: Vec<u32>,
-    /// Each returned message's `msg_hdr.msg_flags`, lifted out of the same header for the same
-    /// reason. Only [`libc::MSG_TRUNC`] is read from it (see [`BatchReader::truncated`]); the rest
-    /// of the flag set describes conditions this receive path cannot produce.
+    /// Each returned message's `msg_hdr.msg_flags`, copied out the same way. Only
+    /// [`libc::MSG_TRUNC`] is read; the other flags describe conditions this path can't produce.
     flags: Vec<i32>,
-    /// How many datagrams the **last** `read_batch` call had truncated. Reset per call, not
-    /// cumulative: [`read_loop`] reports it once per batch alongside the batch's other counts.
+    /// How many datagrams the last `read_batch` call truncated. Reset per call: [`read_loop`]
+    /// reports it once per batch.
     truncated: u64,
     vlen: usize,
 }
@@ -832,44 +743,39 @@ impl BatchReader {
     /// Waits for the socket to be readable, then takes up to `vlen` datagrams off it in one
     /// `recvmmsg(2)` and appends them to `out`. Returns how many it appended.
     ///
-    /// **One `now_nanos()` per syscall, offset by the datagram's index within the batch** -- the
-    /// named accuracy concession in ADR `udp-intake-batching-and-socket-visibility`. The kernel does
-    /// not report a per-message receive instant through this path (that is `SO_TIMESTAMP`, a
-    /// per-message cmsg mechanism the same ADR rejects), so datagram `i` of a batch is stamped
-    /// `base + i` nanoseconds: ordered and distinct, but with a spacing that is a placeholder rather
-    /// than a measurement. Still strictly better than stamping at decode time, which can skew
+    /// **One `now_nanos()` per syscall, offset by the datagram's index within the batch**, the
+    /// named accuracy concession in ADR `udp-intake-batching-and-socket-visibility`. This path
+    /// gets no per-message receive instant (that's `SO_TIMESTAMP`, which the same ADR rejects), so
+    /// datagram `i` is stamped `base + i` nanoseconds: ordered and distinct, but the spacing is a
+    /// placeholder, not a measurement. Stamping at decode time would be worse: it can skew
     /// arbitrarily far behind arrival under backlog.
     ///
     /// **The `+ i` is not cosmetic.** A downstream keyed on (series, timestamp) treats two points
-    /// that share both as *one* point -- `influxdb_out`'s line protocol overwrites, and its
-    /// `allocate_timestamp` disambiguation is cleared at the top of every `Encoder::encode`, so it
-    /// only ever covers collisions *inside* one output batch. A whole read batch stamped with one
-    /// instant would produce same-timestamp same-series points that straddle an output-batch
-    /// boundary and so reach the sink undisambiguated. One nanosecond per datagram is free (no
-    /// extra clock read), strictly ordered, and orders of magnitude below the batch's own arrival
-    /// uncertainty.
+    /// that share both as one point. `influxdb_out`'s line protocol overwrites, and its
+    /// `allocate_timestamp` disambiguation resets at the top of every `Encoder::encode`, so it only
+    /// covers collisions inside one output batch. A read batch stamped with one instant would
+    /// produce same-timestamp, same-series points that straddle an output-batch boundary and reach
+    /// the sink undisambiguated. One nanosecond per datagram costs no extra clock read, is strictly
+    /// ordered, and is orders of magnitude below the batch's own arrival uncertainty.
     ///
-    /// **One right-sized `Bytes::copy_from_slice` per datagram**, exactly as the `recv_from` loop
-    /// this replaces did: reading straight into a shared buffer and slicing it would save the copy
-    /// but let one retained event pin a 65 KB slot (`docs/design/memory.md`'s "considered and
-    /// rejected", pinned by `datagram_copy_is_one_right_sized_allocation`).
+    /// **One right-sized `Bytes::copy_from_slice` per datagram.** Slicing a shared buffer would
+    /// save the copy but let one retained event pin a 65 KB slot (`docs/design/memory.md`'s
+    /// "considered and rejected", pinned by `datagram_copy_is_one_right_sized_allocation`).
     ///
-    /// **A zero-length datagram is legal UDP and is delivered as one**, the same as `recv_from`
-    /// returning `n == 0` did: an empty `Bytes` goes on `out` and is counted like any other, and
-    /// what to make of it is the decoder's business, not the reader's.
+    /// **A zero-length datagram is legal UDP and is delivered as one**: an empty `Bytes`, counted
+    /// like any other. What it means is the decoder's business.
     ///
-    /// **A truncated datagram is delivered too**, as far as it was copied, and counted -- see
-    /// [`BatchReader::truncated`] and this type's own doc.
+    /// **A truncated datagram is delivered too**, as far as it was copied, and counted (see
+    /// [`BatchReader::truncated`]).
     ///
-    /// **Cancellation loses nothing.** `async_io` suspends in exactly two places
+    /// **Cancellation loses nothing.** `async_io` suspends in two places
     /// (`Registration::async_io`, `tokio/src/runtime/io/registration.rs`, tag `tokio-1.53.1`: the
-    /// `self.readiness(interest).await?` and the `poll_fn(coop::poll_proceed).await` that follows
-    /// it), and **both are strictly before** it calls the closure; once the closure returns
-    /// anything but `WouldBlock`, `async_io` returns in that same poll without suspending again.
-    /// The syscall and everything after it therefore run synchronously in one poll, so a `select!`
-    /// that drops this future either drops it before the syscall or not at all -- the same
-    /// guarantee `recv_from`'s own cancel-safety rests on, and for the same reason, since
-    /// `recv_from` is the same `async_io` call with a different closure.
+    /// `self.readiness(interest).await?` and the `poll_fn(coop::poll_proceed).await` after it), and
+    /// both are before it calls the closure. Once the closure returns anything but `WouldBlock`,
+    /// `async_io` returns in that same poll. The syscall and everything after it run in one poll,
+    /// so a `select!` that drops this future drops it before the syscall or not at all: the same
+    /// guarantee `recv_from`'s cancel-safety rests on, since `recv_from` is the same `async_io`
+    /// call with a different closure.
     async fn read_batch(
         &mut self,
         socket: &tokio::net::UdpSocket,
@@ -879,23 +785,21 @@ impl BatchReader {
 
         let fd = socket.as_raw_fd();
         let vlen = self.vlen;
-        // Captured field by field (Rust 2021 disjoint closure capture) so the closure borrows
-        // three plain-data buffers rather than all of `self`.
+        // Borrowed field by field so the closure captures plain-data buffers, not all of `self`.
         let slots = &mut self.slots;
         let hdr_words = &mut self.hdr_words;
         let iov_words = &mut self.iov_words;
         let lens = &mut self.lens;
         let flags = &mut self.flags;
 
-        // `READABLE | ERROR`, matching what `tokio`'s own `UdpSocket::recv_from` waits on rather
-        // than readability alone: a socket with only a pending error queued is not "readable" to
-        // the poller, and an arm that never wakes is how that turns into a stalled listener.
+        // `READABLE | ERROR`, as tokio's own `UdpSocket::recv_from` waits on: a socket with only a
+        // pending error isn't "readable" to the poller, and an arm that never wakes stalls the
+        // listener.
         let received = socket
             .async_io(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR, || {
-                // Rebuilt on every call of this `FnMut` (`async_io` may call it more than once,
-                // clearing readiness between `WouldBlock`s), so every pointer the kernel is handed
-                // is derived fresh from a live allocation within this same call -- there is no
-                // stale-provenance window across calls, and no raw pointer outlives the closure.
+                // Rebuilt on every call of this `FnMut` (`async_io` may call it more than once), so
+                // every pointer the kernel gets is derived from a live allocation within this call,
+                // and no raw pointer outlives the closure.
                 build_headers(slots, MAX_DATAGRAM_BYTES, iov_words, hdr_words, vlen);
                 loop {
                     // SAFETY: `build_headers` immediately above wrote `vlen` fully-initialized
@@ -911,37 +815,34 @@ impl BatchReader {
                     }
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
-                        // Unreachable on this socket, kept deliberately. `__skb_recv_udp`
-                        // (`net/ipv4/udp.c`) only reaches the sleeping path -- the sole source of
+                        // Unreachable on this socket, kept as insurance. `__skb_recv_udp`
+                        // (`net/ipv4/udp.c`) reaches the sleeping path, the only source of
                         // `sock_intr_errno`'s `EINTR` (`__skb_wait_for_more_packets`,
-                        // `net/core/datagram.c`) -- through `while (timeo && ...)`, and `timeo`
-                        // is zero here twice over: `MSG_DONTWAIT` is passed explicitly, and
-                        // `____sys_recvmsg` (`net/socket.c`) ORs it in anyway for any `O_NONBLOCK`
-                        // fd, which a tokio-registered socket always is. So this arm costs one
-                        // never-taken comparison and buys the same defence `quinn-udp`'s
-                        // `retry_if_interrupted` keeps for the same call -- cheap insurance
-                        // against a future blocking caller, a different socket type, or a kernel
-                        // that stops short-circuiting. Forcing it takes
-                        // `strace -e inject=recvmmsg:error=EINTR`; a signal cannot produce it.
+                        // `net/core/datagram.c`), only through `while (timeo && ...)`, and `timeo`
+                        // is zero here twice over: `MSG_DONTWAIT` is passed, and `____sys_recvmsg`
+                        // (`net/socket.c`) ORs it in for any `O_NONBLOCK` fd, which a
+                        // tokio-registered socket always is. The arm costs one never-taken
+                        // comparison and matches `quinn-udp`'s `retry_if_interrupted`, against a
+                        // future blocking caller, another socket type, or a kernel change. Only
+                        // `strace -e inject=recvmmsg:error=EINTR` can force it; a signal can't.
                         continue;
                     }
-                    // `EAGAIN`/`EWOULDBLOCK` already arrive as `ErrorKind::WouldBlock`, which is
-                    // exactly the signal `async_io` needs to clear readiness and wait again.
-                    // Every other errno is fatal to the listener. That is the right call because
-                    // every errno this socket can actually produce is permanent, not transient:
-                    // the ICMP-derived ones everyone reaches for a retry over
-                    // (`ECONNREFUSED`/`EHOSTUNREACH`/`ENETUNREACH`/`EPROTO`, PMTU `EMSGSIZE`) are
-                    // unreachable here at all -- `udp_err` (`net/ipv4/udp.c`) leaves `sk_err`
-                    // alone unless `IP_RECVERR` is set or the socket is `TCP_ESTABLISHED`, and
-                    // this one is neither (see `bind_one`) -- and `ENOBUFS` never surfaces on the
-                    // receive path, since receive-buffer exhaustion is charged and dropped in
-                    // softirq by `__udp_queue_rcv_skb`. What is left is `EBADF`/`ENOTSOCK`/
-                    // `EINVAL`/`EFAULT` (caller bugs), `EPERM`/`ENOSYS` (seccomp or an LSM), and
-                    // `ECONNABORTED` from `udp_abort` -- an `ss -K`/`SOCK_DESTROY` on this socket,
-                    // which unhashes it for good. Retrying any of them is worse than failing:
-                    // `sock_error`'s `xchg` clears `sk_err`, so a retry after `udp_abort` reads
-                    // `EAGAIN` and the listener sits on a dead socket forever, silently. See
-                    // ADR `udp-intake-batching-and-socket-visibility`'s 2026-09-21 amendment.
+                    // `EAGAIN`/`EWOULDBLOCK` arrive as `ErrorKind::WouldBlock`, the signal
+                    // `async_io` needs to clear readiness and wait again. Every other errno is
+                    // fatal, because every one this socket can produce is permanent:
+                    // - The ICMP-derived ones (`ECONNREFUSED`/`EHOSTUNREACH`/`ENETUNREACH`/
+                    //   `EPROTO`, PMTU `EMSGSIZE`) are unreachable: `udp_err` (`net/ipv4/udp.c`)
+                    //   leaves `sk_err` alone unless `IP_RECVERR` is set or the socket is
+                    //   `TCP_ESTABLISHED`, and this one is neither (see `bind_one`).
+                    // - `ENOBUFS` never surfaces on receive: `__udp_queue_rcv_skb` charges and
+                    //   drops receive-buffer exhaustion in softirq.
+                    // - What's left: `EBADF`/`ENOTSOCK`/`EINVAL`/`EFAULT` (caller bugs),
+                    //   `EPERM`/`ENOSYS` (seccomp or an LSM), and `ECONNABORTED` from `udp_abort`
+                    //   (an `ss -K`/`SOCK_DESTROY`, which unhashes the socket for good).
+                    // Retrying is worse than failing: `sock_error`'s `xchg` clears `sk_err`, so a
+                    // retry after `udp_abort` reads `EAGAIN` and the listener sits on a dead socket
+                    // forever. See ADR `udp-intake-batching-and-socket-visibility`, "Errno
+                    // reachability on *this* socket".
                     return Err(err);
                 }
             })
@@ -950,17 +851,15 @@ impl BatchReader {
         let base = now_nanos();
         self.truncated = 0;
         for i in 0..received {
-            // Dead code, on purpose. `udp_recvmsg` (`net/ipv4/udp.c`, and `udpv6_recvmsg`
-            // identically) computes `err = copied; if (flags & MSG_TRUNC) err = ulen;` -- it
-            // reports the *real* datagram length only when `MSG_TRUNC` is passed as an **input**
-            // flag, which `recvmmsg_into` does not do (it passes `MSG_DONTWAIT` alone). So
-            // `msg_len` is always the copied length, `<= iov_len = MAX_DATAGRAM_BYTES`, and a
-            // longer datagram is signalled through the *output* `msg_flags` instead (below).
-            // Kept as defence in depth so a hostile or broken value could only ever shorten the
-            // slice, never index past the slot; the `debug_assert_eq!` below is what keeps the
-            // claim honest, and it runs in every test build --
-            // `an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives exactly the
-            // truncating case through it.
+            // A dead clamp, kept as defence in depth. `udp_recvmsg` (`net/ipv4/udp.c`;
+            // `udpv6_recvmsg` identically) computes `err = copied; if (flags & MSG_TRUNC) err =
+            // ulen;`: it reports the real datagram length only when `MSG_TRUNC` is an input flag,
+            // and `recvmmsg_into` passes `MSG_DONTWAIT` alone. So `msg_len` is always the copied
+            // length, `<= iov_len = MAX_DATAGRAM_BYTES`; a longer datagram shows in the output
+            // `msg_flags` (below). The clamp means a broken value could only shorten the slice,
+            // never index past the slot. The `debug_assert_eq!` keeps the claim honest in every
+            // test build; `an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives
+            // the truncating case through it.
             let len = (self.lens[i] as usize).min(MAX_DATAGRAM_BYTES);
             debug_assert_eq!(
                 self.lens[i] as usize, len,
@@ -973,9 +872,8 @@ impl BatchReader {
             let start = i * MAX_DATAGRAM_BYTES;
             out.push(Datagram {
                 bytes: Bytes::copy_from_slice(&self.slots[start..start + len]),
-                // `base + i`, saturating only so the arithmetic is total -- `now_nanos()` is ~1.8e18
-                // and `i` is at most 1023, so the addition is nowhere near `i64::MAX` in any year
-                // this code will run in.
+                // Saturating only so the arithmetic is total: `now_nanos()` is ~1.8e18 and `i` is
+                // at most 1023, nowhere near `i64::MAX`.
                 received_at: base.saturating_add(i as i64),
             });
         }
@@ -985,37 +883,35 @@ impl BatchReader {
 
 #[cfg(target_os = "linux")]
 impl BatchReader {
-    /// How many of the datagrams the last [`BatchReader::read_batch`] call returned arrived longer
-    /// than a slot and were copied only as far as one -- an IPv6-only case, see this type's doc.
-    /// Per call, not cumulative.
+    /// How many datagrams the last [`BatchReader::read_batch`] returned were longer than a slot
+    /// and copied only as far as one (IPv6 only; see this type's doc). Per call, not cumulative.
     fn truncated(&self) -> u64 {
         self.truncated
     }
 }
 
 /// Writes `vlen` `iovec`s into `iov_words` and `vlen` `mmsghdr`s into `hdr_words`, header `i`
-/// describing slot `i` of `slots` -- the `[i * slot_bytes, (i + 1) * slot_bytes)` byte range --
-/// through a one-entry `iov`. Every header is fully re-initialized, so a previous call's kernel
-/// writeback is overwritten rather than carried forward.
+/// describing slot `i` of `slots` (bytes `[i * slot_bytes, (i + 1) * slot_bytes)`) through a
+/// one-entry `iov`. Every header is fully re-initialized, overwriting a previous call's kernel
+/// writeback.
 ///
-/// **Why this is its own function.** It is the half of [`BatchReader::read_batch`]'s closure that
-/// is pure: no syscall, no fd, nothing but pointer arithmetic over three caller-owned buffers. That
-/// is what makes it reachable under `miri`, which has no shim for `recvmmsg` and so can never
-/// execute the closure as a whole (`docs/adr/out-of-ci-unsafe-verification.md`). The pointer
-/// provenance, the stride, the slot disjointness and the zero-initialization are the whole of what
-/// `NET-01` is a P0 for, and all of it lives here where a tool can see it. `script/unsafe-check
-/// miri` runs `mod batch_reader_helpers` against it.
+/// **Why this is its own function.** It's the pure half of [`BatchReader::read_batch`]'s closure:
+/// no syscall, no fd, only pointer arithmetic over three caller-owned buffers. That makes it
+/// reachable under `miri`, which has no shim for `recvmmsg`
+/// (`docs/adr/out-of-ci-unsafe-verification.md`). The pointer provenance, stride, slot
+/// disjointness, and zero-initialization (inventory entry `NET-01`) all live here where a tool can
+/// see them; `script/unsafe-check miri` runs `mod batch_reader_helpers` against it.
 ///
 /// **Why `mem::zeroed()` + two field assignments, not a struct literal.** rust-`libc`'s musl
-/// `msghdr` carries private `__pad1`/`__pad2` fields a struct literal cannot set
-/// (rust-lang/libc#2344), and an unzeroed pad is libuv#3419's spurious `EMSGSIZE`. Zeroing also
-/// leaves `msg_name`/`msg_namelen`/`msg_control`/`msg_controllen` NULL/0, which is what tells the
-/// kernel to report neither a source address nor any ancillary data -- and what makes the
-/// `msg_flags`/`msg_controllen` the kernel writes back per call (`____sys_recvmsg`,
-/// `net/socket.c`) inert, since they are overwritten here before anything could read them.
+/// `msghdr` has private `__pad1`/`__pad2` fields a struct literal can't set (rust-lang/libc#2344),
+/// and an unzeroed pad is libuv#3419's spurious `EMSGSIZE`. Zeroing also leaves
+/// `msg_name`/`msg_namelen`/`msg_control`/`msg_controllen` NULL/0, which tells the kernel to report
+/// neither a source address nor ancillary data, and makes the `msg_flags`/`msg_controllen` the
+/// kernel writes back per call (`____sys_recvmsg`, `net/socket.c`) inert: they're overwritten here
+/// before anything reads them.
 ///
-/// Panics rather than trusting its caller: the three length preconditions are the ones that would
-/// otherwise be undefined behaviour, and checking them costs three comparisons per *batch*.
+/// Panics rather than trusting its caller: the three length preconditions would otherwise be
+/// undefined behaviour, and checking them costs three comparisons per batch.
 #[cfg(target_os = "linux")]
 #[inline]
 fn build_headers(
@@ -1068,20 +964,18 @@ fn build_headers(
     }
 }
 
-/// The syscall, and nothing else -- a thin shim between [`build_headers`] and
-/// [`harvest_headers`] so that the two halves either side of it stay pure and therefore
-/// `miri`-runnable. Returns `recvmmsg`'s own return value: `>= 0` is a datagram count, `-1` means
-/// consult `errno`.
+/// The syscall and nothing else, so [`build_headers`] and [`harvest_headers`] on either side stay
+/// pure and `miri`-runnable. Returns `recvmmsg`'s return value: `>= 0` is a datagram count, `-1`
+/// means consult `errno`.
 ///
-/// The timeout argument is NULL ("no timeout"), which is the only value sound to pass from here:
-/// a `timespec` would have to outlive a call this shim cannot see the end of. It is also the value
-/// that side-steps `recvmmsg(2)`'s documented timeout bug (BUGS: the timeout is only checked
-/// *after* a datagram arrives), and `MSG_WAITFORONE` is deliberately not passed -- it is a no-op
-/// alongside `MSG_DONTWAIT`.
+/// The timeout is NULL ("no timeout"), the only value sound to pass from here: a `timespec` would
+/// have to outlive a call this shim can't see the end of. NULL also side-steps `recvmmsg(2)`'s
+/// documented timeout bug (BUGS: the timeout is only checked after a datagram arrives).
+/// `MSG_WAITFORONE` isn't passed; it's a no-op alongside `MSG_DONTWAIT`.
 ///
 /// # Safety
 ///
-/// `hdr_words` must hold at least `vlen` initialized `mmsghdr`s exactly as [`build_headers`]
+/// `hdr_words` must hold at least `vlen` initialized `mmsghdr`s as [`build_headers`]
 /// writes them: each with a valid one-entry `msg_iov` pointing at a live, writable, exclusively
 /// owned buffer of at least `iov_len` bytes, and NULL `msg_name`/`msg_control`. The kernel writes
 /// through those pointers and into each header's `msg_len`/`msg_flags`, so every one of them must
@@ -1099,22 +993,19 @@ unsafe fn recvmmsg_into(fd: std::os::fd::RawFd, hdr_words: &mut [u64], vlen: usi
     }
 }
 
-/// Lifts the `msg_len` and `msg_hdr.msg_flags` the kernel wrote into the first `n` headers of
-/// `hdr_words` out into `lens`/`flags`, and touches nothing beyond `n`.
+/// Copies the `msg_len` and `msg_hdr.msg_flags` the kernel wrote into the first `n` headers of
+/// `hdr_words` out into `lens`/`flags`, touching nothing beyond `n`.
 ///
-/// The header array's contents are meaningless to anything outside [`BatchReader::read_batch`]'s
-/// closure -- they hold raw pointers, which is exactly what the `Vec<u64>` storage exists to keep
-/// out of a `Send` future -- so the two numbers worth keeping are copied into plain integer
-/// buffers here, and the headers are then free to be rebuilt from scratch on the next call.
+/// The headers hold raw pointers, which the `Vec<u64>` storage exists to keep out of a `Send`
+/// future, so they mean nothing outside [`BatchReader::read_batch`]'s closure. The two numbers
+/// worth keeping go into plain integer buffers, and the headers are rebuilt on the next call.
 ///
-/// Pure, for the same reason [`build_headers`] is: under `miri` a test plays the kernel's part by
-/// writing into the same headers through the same pointer type, and this reads back exactly what
-/// was written.
+/// Pure, like [`build_headers`]: under `miri` a test plays the kernel's part by writing into the
+/// same headers through the same pointer type.
 ///
-/// Panics if `n` exceeds any of the three buffers. The kernel cannot return more than the `vlen`
-/// it was given, so this is unreachable; it is an assert rather than a silent `take(n)` because a
-/// count that large would mean the ABI assumption underneath all of this had broken, and that
-/// should be loud.
+/// Panics if `n` exceeds any of the three buffers. The kernel can't return more than the `vlen` it
+/// was given, so this is unreachable; an assert rather than a quiet `take(n)` because a count that
+/// large would mean the ABI assumption underneath had broken.
 #[cfg(target_os = "linux")]
 #[inline]
 fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mut [i32]) {
@@ -1145,14 +1036,11 @@ fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mu
     }
 }
 
-/// Compile-time proof of the property [`BatchReader`]'s doc comment rests on: the future returned
-/// by `read_batch` is `Send`, with no `unsafe impl` anywhere behind it.
+/// Compile-time proof that `read_batch`'s future is `Send` with no `unsafe impl` behind it, the
+/// property [`BatchReader`]'s layout exists for.
 ///
-/// `UdpListener::run_until_shutdown` being an `#[async_trait]` method already forces this
-/// indirectly -- a `!Send` read future would fail to compile there, several layers up, with an
-/// error naming the trait rather than the cause. This says it once, next to the code whose layout
-/// decisions (`Vec<u64>` storage, arrays rebuilt inside the closure) exist for no other reason, so
-/// a change that breaks it fails here first.
+/// `UdpListener::run_until_shutdown`'s `#[async_trait]` already forces this, but a break there
+/// surfaces several layers up with an error naming the trait, not the cause; this fails first.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // a type-checked assertion, never called
 fn assert_batch_read_future_is_send(
@@ -1164,15 +1052,13 @@ fn assert_batch_read_future_is_send(
     assert_send(&reader.read_batch(socket, out));
 }
 
-/// The non-Linux read half: today's one-`recv_from`-per-datagram loop, behind the same interface
-/// its `recvmmsg` counterpart above presents, so [`read_loop`] is one code path rather than two.
+/// The non-Linux read half: one `recv_from` per datagram, behind the same interface as the
+/// `recvmmsg` reader, so [`read_loop`] has one code path.
 ///
-/// `recvmmsg(2)` is a Linux syscall; there is no portable equivalent worth the second
-/// implementation (`sendmmsg`/`recvmmsg` exist on FreeBSD but with a different enough surface to
-/// be its own port, and `logit` ships no such target today). `read_batch` is therefore parsed,
-/// validated and documented everywhere, but only *reads* in batches on Linux -- the decode half's
-/// `pop_many` uses the same value on every target. Mirrors how `logit_pipeline::sockstat`'s
-/// non-Linux twins keep one call site rather than two.
+/// `recvmmsg(2)` has no portable equivalent worth a second implementation (FreeBSD's differs
+/// enough to be its own port, and `logit` ships no such target). `read_batch` is validated
+/// everywhere but only reads in batches on Linux; the decode half's `pop_many` uses it on every
+/// target.
 #[cfg(not(target_os = "linux"))]
 struct BatchReader {
     buf: Vec<u8>,
@@ -1185,13 +1071,12 @@ impl BatchReader {
     }
 
     /// Always `0`: `recv_from` reports only how many bytes it copied, never whether it discarded
-    /// any, so this target has nothing to count. The `logit.input.datagrams.truncated` counter is
-    /// Linux-only for that reason, and is documented as such.
+    /// any, so `logit.input.datagrams.truncated` is Linux-only.
     fn truncated(&self) -> u64 {
         0
     }
 
-    /// One datagram, appended to `out`; always returns `1` on success. Cancel-safe exactly as
+    /// One datagram, appended to `out`; returns `1` on success. Cancel-safe as
     /// `tokio::net::UdpSocket::recv_from` is.
     async fn read_batch(
         &mut self,
@@ -1207,57 +1092,47 @@ impl BatchReader {
     }
 }
 
-/// How often [`read_loop_sampled`] reads the socket's kernel counters. One `getsockopt` a second
-/// per UDP listener -- small enough not to need a config knob, frequent enough that
-/// `logit.input.receive_buffer.utilization` is a usable gauge rather than a coarse average, and
-/// deliberately the same cadence whether or not traffic is arriving (see the wrapper's doc).
+/// How often [`read_loop_sampled`] reads the socket's kernel counters: one `getsockopt` a second
+/// per UDP listener, cheap enough to need no config knob and frequent enough that
+/// `logit.input.receive_buffer.utilization` is a usable gauge. The same cadence whether or not
+/// traffic is arriving.
 const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// [`read_loop`], plus a sampler that reads the kernel's own per-socket counters on a fixed
-/// interval for as long as the read loop is running, and once more after it stops.
+/// [`read_loop`], plus a sampler that reads the kernel's per-socket counters on a fixed interval
+/// while the read loop runs, and once more after it stops.
 ///
-/// **Why the sampler cannot live inside `read_loop`.** The moments worth sampling are exactly the
-/// moments `read_loop` is not going round: under `overflow: block` it parks in `queue.push` until
-/// downstream makes room, and the kernel's receive buffer -- which cannot wait -- is filling and
-/// then dropping the whole time. A sample taken at the top of each read iteration would therefore
-/// go quiet precisely when the numbers start mattering. Pinning `read_loop` as one arm of a
-/// `select!` against a timer solves that without a task, a channel or a `'static` bound: the loop
-/// below re-polls the *same* `read_loop` future each time the timer wins, so a blocked `push`
-/// resumes exactly where it was and nothing is cancelled. (Cancelling and restarting `read_loop`
-/// here would drop a datagram per tick; it is never dropped and re-created.)
+/// **Why the sampler can't live inside `read_loop`.** The moments worth sampling are the ones
+/// `read_loop` isn't going round: under `overflow: block` it parks in `queue.push` while the
+/// kernel's receive buffer fills and then drops. A sample at the top of each read iteration would
+/// go quiet when the numbers matter most. Pinning `read_loop` as one arm of a `select!` against
+/// a timer avoids a task, a channel, and a `'static` bound: [`sample_while`] re-polls the same
+/// `read_loop` future each time the timer wins, so a blocked `push` resumes where it was.
+/// Cancelling and restarting `read_loop` would drop a datagram per tick.
 ///
-/// **The final sample runs on every path [`sample_while`] itself returns on.** Drops in the last
-/// fraction of a second before a fatal socket error or a shutdown are as real as any other, and
-/// with a one-second interval they are the likeliest ones to exist at all -- a listener usually
-/// stops *because* something went wrong. So the sampler runs once more after `read_loop` has
-/// returned, before this function forwards that result. The socket is still open at that point (it
-/// is owned by `run_until_shutdown`, which outlives this future), so the counters are still
-/// readable.
+/// **The final sample runs on every path [`sample_while`] returns on.** Drops in the last fraction
+/// of a second before a fatal socket error or a shutdown are the likeliest to exist, since a
+/// listener usually stops because something went wrong. The socket is still open then (owned by
+/// `run_until_shutdown`, which outlives this future), so the counters are readable.
 ///
-/// It is **not** unconditional, and the difference is worth stating precisely rather than leaving
-/// "guaranteed" to be read as more than it is. There is exactly one path that skips it: a future
-/// that is *dropped* runs nothing, and `run_input`'s grace backstop
-/// (`logit_pipeline::runtime`, the `shutdown_grace_expired` arm of its `select!`) drops this whole
-/// future when the grace expires. Production never reaches it -- `read_loop` races `shutdown` in
-/// both of its own `select!`s, so it returns within microseconds of the signal and the final
-/// sample lands long before the grace could, and `input_runtime_config` supplies
-/// `ReceiveConfig::default()`'s 5 s rather than `InputRuntimeConfig::default()`'s
-/// `Duration::ZERO`. At `Duration::ZERO`, which tests do construct, both arms are ready at once
-/// and `select!`'s random rotation drops this future roughly half the time. See ADR
-/// `udp-intake-batching-and-socket-visibility`'s 2026-09-21 amendment.
+/// It is **not** unconditional. One path skips it: `run_input`'s grace backstop
+/// (`logit_pipeline::runtime`, the `shutdown_grace_expired` arm of its `select!`) drops this
+/// future, and a dropped future runs nothing. Production doesn't reach it: `read_loop` races
+/// `shutdown` in both its `select!`s and returns within microseconds, and `input_runtime_config`
+/// supplies `ReceiveConfig::default()`'s 5 s grace, not `InputRuntimeConfig::default()`'s
+/// `Duration::ZERO`. At `Duration::ZERO`, which tests construct, both arms are ready at once and
+/// `select!`'s random rotation drops this future about half the time. See ADR
+/// `udp-intake-batching-and-socket-visibility`, "The final sample runs on every path
+/// `sample_while` returns on".
 ///
-/// **Once the sampler has disabled itself, no timer is armed at all** and this is exactly
-/// [`read_loop`]. That is the other half of `sockstat`'s "report once and stop asking": a listener
-/// on a non-Linux build (or a kernel without `SO_MEMINFO`) would otherwise wake once a second,
-/// forever, to call a function that returns immediately -- a cost this would have added to every
-/// idle listener on those platforms in exchange for nothing. The final sample still runs in that
-/// state, where it is a no-op.
+/// **Once the sampler has disabled itself, no timer is armed** and this is [`read_loop`] alone:
+/// the other half of `sockstat`'s "report once and stop asking". Otherwise a listener on a
+/// non-Linux build (or a kernel without `SO_MEMINFO`) would wake once a second, forever, for
+/// nothing. The final sample still runs, as a no-op.
 ///
-/// Sampling is synchronous and inline -- one `getsockopt` on an fd this process owns, which is a
-/// bounded read of kernel memory with no I/O wait, so `spawn_blocking` would cost more than the
-/// call it wrapped.
+/// Sampling is synchronous and inline: one `getsockopt` on an owned fd is a bounded read of kernel
+/// memory with no I/O wait, cheaper than a `spawn_blocking` around it.
 ///
-/// The `select!`'s arm ordering is not incidental -- see [`sample_while`], which holds the loop.
+/// The `select!`'s arm ordering matters; see [`sample_while`].
 async fn read_loop_sampled(
     socket: &tokio::net::UdpSocket,
     queue: Arc<ReceiveQueue>,
@@ -1271,62 +1146,56 @@ async fn read_loop_sampled(
     sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
 }
 
-/// [`read_loop_sampled`]'s loop, over an arbitrary `read` future and an arbitrary interval --
-/// split out for exactly the reason [`bind_first_available`] is, to make two paths reachable from
-/// a test that production never reaches on its own: the *disabled* sampler (the non-Linux shape,
-/// unreachable on the Linux this is tested on), and the coop-budget starvation the arm ordering
-/// below exists to prevent, which needs a `read` future that misbehaves in a specific way and an
-/// interval short enough to observe in a test.
+/// [`read_loop_sampled`]'s loop, over an arbitrary `read` future and interval. Split out so a test
+/// can reach two paths production can't on its own: the disabled sampler (the non-Linux shape),
+/// and the coop-budget starvation the arm ordering below prevents, which needs a misbehaving
+/// `read` future and a short interval.
 ///
-/// **The timer arm comes first, and that ordering is load-bearing.** The intuitive order is the
-/// other one -- prefer the work, treat the sample as something to do while idle -- and it is
-/// wrong, for a reason that is invisible until you measure it.
+/// **The timer arm comes first.** The intuitive order is the other one (prefer the work, sample
+/// while idle), and it's wrong for a reason invisible until measured.
 ///
-/// The mechanism, stated against the version this is pinned to -- **`tokio-1.53.1`**, and every
-/// one of the four facts below has to be re-checked on a bump, which is what this paragraph is
-/// for:
+/// The mechanism, pinned to **`tokio-1.53.1`**; re-check all four facts on a bump:
 ///
 /// 1. A task's cooperative-scheduling budget starts at **128** units per poll
 ///    (`task/coop/mod.rs`, `const fn initial() -> Budget { Budget(Some(128)) }`).
-/// 2. A **successful** `async_io` spends one of them (`runtime/io/registration.rs`:
-///    `coop.made_progress()` on the success arm). A `WouldBlock` one spends **zero** -- it drops
+/// 2. A **successful** `async_io` spends one (`runtime/io/registration.rs`:
+///    `coop.made_progress()` on the success arm). A `WouldBlock` one spends **zero**: it drops
 ///    the `RestoreOnPending` guard without calling `made_progress`, and that guard's `Drop` writes
-///    the pre-decrement budget back. So the budget drains exactly under the flood this sampler
-///    exists to report, where every read succeeds and `read_loop` never parks for a real reason:
-///    the only way it returns `Pending` is by running the budget to zero.
+///    the pre-decrement budget back. So the budget drains under the flood this sampler exists to
+///    report, where every read succeeds and `read_loop` never parks for a real reason: its only
+///    way to return `Pending` is running the budget to zero.
 /// 3. `Sleep`'s poll consults coop **before** its deadline (`time/sleep.rs`, `poll_elapsed`:
 ///    `let coop = ready!(crate::task::coop::poll_proceed(cx));` ahead of any use of the deadline
-///    or the timer entry). So a timer arm polled *after* the read arm finds a budget of zero and
-///    returns `Pending` however far past its deadline it is -- and, never having reached the timer
-///    driver, is not even registered to be woken by it. The next wake re-polls in the same order
-///    with the same result, forever.
-/// 4. `select!` itself gates on the budget before polling **any** arm (`macros/select.rs`:
+///    or the timer entry). A timer arm polled after the read arm finds a budget of zero and
+///    returns `Pending` however far past its deadline it is, and, never having reached the timer
+///    driver, isn't registered to be woken by it. The next wake re-polls in the same order with the
+///    same result, forever.
+/// 4. `select!` gates on the budget before polling **any** arm (`macros/select.rs`:
 ///    `ready!(poll_budget_available(cx))` is the first thing its generated `poll_fn` does), so the
 ///    whole `select!` below is subject to (3) as a unit, not just the sleep inside it.
 ///
 /// **A `Pending` caused by the coop budget is not a park, and an arm placed behind one never
-/// runs.** With the timer arm first the budget is intact when `Sleep::poll` runs, it finds the
-/// deadline unmet, and its own `RestoreOnPending` rolls the decrement back before the read arm
-/// burns the budget to zero -- so the sleep is registered with the timer driver on every poll and
-/// the tick lands on time.
+/// runs.** With the timer arm first, the budget is intact when `Sleep::poll` runs; it finds the
+/// deadline unmet, and its `RestoreOnPending` rolls the decrement back before the read arm burns
+/// the budget to zero. The sleep is registered with the timer driver on every poll and the tick
+/// lands on time.
 ///
-/// Two things the earlier wording of this comment got wrong, recorded so they are not
-/// reintroduced: a `WouldBlock` `async_io` does **not** spend a unit (see 2), and
-/// `watch::Receiver::wait_for` -- `read_loop`'s other arm -- has no coop call on its path at all,
-/// so neither is part of why the budget drains. The read side's *successful* `recvmmsg` is.
+/// Not part of why the budget drains: a `WouldBlock` `async_io` (see 2), and
+/// `watch::Receiver::wait_for`, `read_loop`'s other arm, which has no coop call on its path. The
+/// read side's successful `recvmmsg` is.
 ///
-/// Measured on a release build, eight senders flooding one listener for 10 s at roughly 90% kernel
+/// Measured on a release build, eight senders flooding one listener for 10 s at about 90% kernel
 /// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
-/// gauges at all -- 41-47M drops surfaced as a single lump from the final sample after SIGTERM,
-/// which is precisely the "you cannot see it while it is happening" this work set out to fix. With
-/// the timer arm first, 11 of 11 windows carried them, the final sample still landed separately
-/// with a non-zero residual, and throughput did not measurably move (4.7M datagrams read, against
-/// 4.7-5.0M).
+/// gauges; 41-47M drops surfaced as one lump from the final sample after SIGTERM. With the timer
+/// arm first, 11 of 11 windows carried them, the final sample still landed separately with a
+/// non-zero residual, and throughput didn't measurably move (4.7M datagrams read, against
+/// 4.7-5.0M read-arm-first). Measured on the per-datagram `recv_from` reader, before `recvmmsg`;
+/// ADR `udp-intake-batching-and-socket-visibility`, "Sampling cadence", records it.
 ///
-/// The cost of this ordering is one `Sleep::poll` per wake before the read arm is polled -- a
-/// deadline comparison against a timer that is nearly always not yet due. The guaranteed final
-/// sample is unaffected: the read arm still wins the moment `read_loop` actually returns, and a
-/// tick that beats it to the punch only means the remainder is what the final sample reports.
+/// The cost is one `Sleep::poll` per wake before the read arm: a deadline comparison against a
+/// timer that's nearly always not yet due. The final sample is unaffected: the read arm still wins
+/// the moment `read_loop` returns, and a tick that beats it only moves the remainder into the
+/// final sample.
 async fn sample_while<F>(
     mut sampler: ReceiveBufferSampler,
     read: F,
@@ -1351,19 +1220,18 @@ where
     result
 }
 
-/// Reads one UDP socket's kernel-side receive counters into telemetry -- the drop counter and the
-/// receive buffer's fill level, both of which are invisible to `recv_from` itself.
+/// Reads one UDP socket's kernel-side receive counters into telemetry: the drop counter and the
+/// receive buffer's fill level, neither visible to the receive syscall.
 ///
-/// Disables itself for good on the first failed read: `SO_MEMINFO` either exists for a socket or
-/// it never will (an older kernel, a non-Linux build), so retrying it every second would be a
-/// syscall per second forever in exchange for nothing. One diagnostic says so, once: a `warn`
-/// quoting the OS error when a Linux kernel refused the read, `debug` when the build has no such
-/// counters to begin with (non-Linux, or no raw descriptor) -- see `sample_once`.
+/// Disables itself for good on the first failed read: `SO_MEMINFO` exists for a socket or never
+/// will (an older kernel, a non-Linux build), so retrying would be a syscall a second for nothing.
+/// One diagnostic says so: a `warn` quoting the OS error when a Linux kernel refused the read, a
+/// `debug` when the build has no such counters (non-Linux, or no raw descriptor).
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
-    /// descriptors at all, where [`logit_pipeline::sockstat`] reports nothing anyway. Safe to
-    /// hold as a bare fd rather than a borrow: this sampler is created and dropped inside
-    /// [`read_loop_sampled`], whose `socket` argument outlives it.
+    /// descriptors, where [`logit_pipeline::sockstat`] reports nothing anyway. A bare fd rather
+    /// than a borrow is safe: this sampler lives inside [`read_loop_sampled`], whose `socket`
+    /// argument outlives it.
     fd: Option<sockstat::RawFd>,
     drops: sockstat::DropCounter,
     telemetry: Telemetry,
@@ -1384,17 +1252,14 @@ impl ReceiveBufferSampler {
 
     /// One `getsockopt`, and the four metrics it feeds.
     ///
-    /// `logit.input.kernel.drops` is reported only when the delta is nonzero, matching how every
-    /// other loss counter here behaves (`logit.component.datagrams.dropped` does not emit a zero
-    /// either) -- the two gauges alongside it are what tell an operator the sampler is alive.
+    /// `logit.input.kernel.drops` is reported only when the delta is nonzero, like every other
+    /// loss counter here; the gauges alongside it show the sampler is alive.
     ///
-    /// `logit.input.receive_buffer.bytes` is re-emitted on every sample even though the value
-    /// never changes after bind. `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s
-    /// its point map, so a gauge written once at bind time appears in exactly one `internal` drain
-    /// window and then vanishes from the series forever -- which would leave the utilization gauge
-    /// below with no visible denominator a minute into the process's life. `finish_bind` still
-    /// emits it (and still warns about an `rmem_max` clamp) so the value is there before this loop
-    /// ever runs, and for a `logit` that fails during startup.
+    /// `logit.input.receive_buffer.bytes` is re-emitted every sample though it never changes after
+    /// bind: `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s its point map, so a
+    /// gauge written once appears in one `internal` drain window and then vanishes, leaving the
+    /// utilization gauge with no visible denominator. `finish_bind` also emits it, so the value
+    /// exists before this loop runs and for a `logit` that fails during startup.
     fn sample_once(&mut self) {
         if !self.enabled {
             return;
@@ -1404,10 +1269,9 @@ impl ReceiveBufferSampler {
             Ok(info) => info,
             Err(err) => {
                 self.enabled = false;
-                // What the kernel actually said, and the version hint *only* where it applies:
-                // `EBADF` here would mean a stale or reused descriptor -- a bug in logit, and the
-                // one cause an operator most needs to not see dressed up as "upgrade your kernel".
-                // `Unavailable::is_unsupported_option` is what draws that line.
+                // The version hint only where it applies: `EBADF` here would mean a stale or reused
+                // descriptor, a bug in logit that must not read as "upgrade your kernel".
+                // `Unavailable::is_unsupported_option` draws that line.
                 let hint = if err.is_unsupported_option() {
                     " (SO_MEMINFO needs Linux 4.12 or newer)"
                 } else {
@@ -1418,11 +1282,10 @@ impl ReceiveBufferSampler {
                      listener: {err}{hint}; logit.input.kernel.drops, \
                      logit.input.receive_buffer.used.bytes and .utilization will not be reported"
                 );
-                // A build that is simply not Linux (or has no raw descriptors at all) can do
-                // nothing about this, and `internal`'s `logs:` setting captures `warn` into the
-                // pipeline by default -- so one line per listener at every startup would be noise
-                // an operator cannot act on. Everything else is a real failure on a platform that
-                // should have worked, and stays at `warn`.
+                // A non-Linux build (or one with no raw descriptors) can't act on this, and
+                // `internal`'s `logs:` captures `warn` into the pipeline by default, so a `warn`
+                // per listener at every startup would be noise. Anything else is a real failure on
+                // a platform that should have worked.
                 if matches!(
                     err,
                     sockstat::Unavailable::NotLinux | sockstat::Unavailable::NoDescriptor
@@ -1444,11 +1307,10 @@ impl ReceiveBufferSampler {
             f64::from(info.rmem_alloc),
             &[],
         );
-        // Both terms come from this one `SO_MEMINFO` read, deliberately: they are the kernel's own
-        // comparable pair, and mixing either with a number from anywhere else (the operator's
-        // requested `receive_buffer_bytes`, the queued payload bytes) gets the ratio wrong in a
-        // way that still looks plausible. `SockMeminfo::receive_utilization`'s doc has the three
-        // wrong pairings spelt out.
+        // Both terms come from this one `SO_MEMINFO` read: mixing either with a number from
+        // elsewhere (the requested `receive_buffer_bytes`, queued payload bytes) gives a wrong
+        // ratio that still looks plausible. `SockMeminfo::receive_utilization`'s doc lists the
+        // wrong pairings.
         if let Some(utilization) = info.receive_utilization() {
             self.telemetry.gauge("logit.input.receive_buffer.utilization", utilization, &[]);
         }
@@ -1456,36 +1318,29 @@ impl ReceiveBufferSampler {
 }
 
 /// Pops datagrams from `queue`, decodes and accumulates them into batches, and sends each
-/// completed batch through `sink` -- entirely independent of how fast `read_loop` is filling
-/// `queue`. Uses [`ReceiveQueue::pop_many`] (not `peek`/`commit`): a datagram that fails to decode
-/// is diagnosed and dropped, never retried, and `pop_many` is cancellation-safe
-/// (`logit_pipeline::queue::BoundedQueue::pop_many`'s own doc comment) -- this whole future can be
-/// dropped mid-await by `run_input`'s grace backstop.
+/// completed batch through `sink`, independent of how fast `read_loop` fills `queue`. Uses
+/// [`ReceiveQueue::pop_many`], not `peek`/`commit`: a datagram that fails to decode is diagnosed
+/// and dropped, never retried. `pop_many` is cancellation-safe, and this future can be dropped
+/// mid-await by `run_input`'s grace backstop.
 ///
-/// **Why `pop_many` rather than `pop`.** Every `pop` refreshes the queue's three depth/bytes/
-/// utilization gauges, each of which locks the component's telemetry buffer, and `read_loop`
-/// (pushing) contends on that same lock from the other side; taking up to `read_batch`
-/// (`BatchingConfig::pop_batch`, the same value the read half's `recvmmsg` uses -- one knob, both
-/// ends of one queue) datagrams per call collapses that to one set of updates per batch.
-/// `receive.latency` stays
-/// **per datagram** -- it is the number that says whether event timestamps are trustworthy under
-/// load, and a per-batch figure would lose exactly the resolution it exists to report.
+/// **Why `pop_many` rather than `pop`.** Every `pop` refreshes the queue's depth/bytes/utilization
+/// gauges, each locking the component's telemetry buffer, which `read_loop` contends for from the
+/// other side. Taking up to `read_batch` datagrams per call (`BatchingConfig::pop_batch`, the same
+/// knob as the read half) makes that one set of updates per batch. `receive.latency` stays **per
+/// datagram**: it says whether event timestamps are trustworthy under load, and a per-batch figure
+/// would lose the resolution it exists to report.
 ///
-/// One consequence to name, since it widens an already-accepted loss: this future being dropped
-/// mid-batch (the grace backstop) now discards up to `read_batch` popped-but-not-yet-decoded
-/// datagrams instead of the one `pop` held, uncounted, on the shutdown path only -- the decode-side
-/// twin of the `push_many` cancellation the ADR names.
+/// Dropping this future mid-batch (the grace backstop) discards up to `read_batch`
+/// popped-but-undecoded datagrams, uncounted, on the shutdown path only: the decode-side twin of
+/// the `push_many` cancellation ADR `udp-intake-batching-and-socket-visibility` names.
 ///
-/// Owns `sink` (the `Fanout`) -- dropping this future is what closes every downstream inbox, the
-/// shutdown cascade `docs/adr/service-lifecycle-and-output-retry.md` established.
+/// Owns `sink` (the `Fanout`): dropping this future closes every downstream inbox, the shutdown
+/// cascade in `docs/adr/service-lifecycle-and-output-retry.md`.
 ///
 /// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop_many` reports
-/// closed-and-empty (a return of `0`) -- i.e. only after `read_loop` can no longer push anything
-/// new, the same
-/// "flush only once nothing can race it" reasoning `finish_and_flush`
-/// (`logit_pipeline::runtime`) uses on the sink side. Reuses `run_transform`'s deadline-race
-/// pattern for the interval trigger via `BatchAccumulator::next_deadline`, rather than a second
-/// copy of that cadence math.
+/// closed-and-empty (a return of `0`), after `read_loop` can push nothing new: the same "flush only
+/// once nothing can race it" rule as `finish_and_flush` (`logit_pipeline::runtime`). The interval
+/// trigger reuses `run_transform`'s deadline race via `BatchAccumulator::next_deadline`.
 async fn decode_loop<D: Decoder + Send>(
     decoder: &mut D,
     queue: Arc<ReceiveQueue>,
@@ -1495,27 +1350,22 @@ async fn decode_loop<D: Decoder + Send>(
     mut diag: Diagnostics,
 ) {
     let mut accumulator = BatchAccumulator::new(batching.max_events, batching.max_bytes);
-    // Reused across every `decode_into` call, cleared (not replaced) between them, so its
-    // allocated capacity survives from one datagram to the next -- `BatchAccumulator::absorb`'s
-    // own doc comment explains why this is what actually realizes the allocation win, and why
-    // `std::mem::take` anywhere in this loop would silently undo it.
+    // Reused across every `decode_into` call, cleared (not replaced), so its capacity survives;
+    // `BatchAccumulator::absorb`'s doc says why a `std::mem::take` here would undo the win.
     let mut scratch: Vec<Event> = Vec::new();
-    // Reused across every `pop_many` call for the same reason `scratch` is reused across every
-    // `decode_into` call: drained (not replaced) each time round, so its capacity survives and the
-    // steady state allocates nothing.
+    // Drained (not replaced) by each `pop_many`, so its capacity survives and the steady state
+    // allocates nothing.
     let mut popped: Vec<Datagram> = Vec::new();
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
 
     loop {
-        // The interval trigger is checked once per *popped batch* rather than once per datagram
-        // now, which can only ever delay an interval flush by however long it takes to decode and
-        // absorb up to `read_batch` datagrams -- tens of microseconds of pure CPU against a
-        // 100 ms default interval, and bounded by the batch size regardless of how deep the backlog
-        // is. The one unbounded term in that span, an `emit` awaiting a full downstream inbox, is
-        // not new: a single datagram's `emit` could already park here for as long as downstream is
-        // stalled, and a stalled downstream delays the interval flush either way.
+        // Checked once per popped batch, not per datagram, which can delay an interval flush by
+        // the time to decode and absorb up to `read_batch` datagrams: tens of microseconds of CPU
+        // against a 100 ms default, bounded by the batch size however deep the backlog. The one
+        // unbounded term, an `emit` awaiting a full downstream inbox, delays the flush regardless
+        // of batching.
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
@@ -1546,16 +1396,15 @@ async fn decode_loop<D: Decoder + Send>(
 
         if count == 0 {
             // Closed and empty: `read_loop` has stopped for good (shutdown or a fatal socket
-            // error). Flush whatever's left -- nothing more will ever arrive either way.
+            // error), so nothing more can arrive. Flush what's left.
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
             return;
         }
 
-        // Drained, not iterated by reference: each datagram's `Bytes` is handed to `decode_into` by
-        // value, and draining also frees each one as it is consumed rather than at the end of the
-        // batch. In arrival order -- `pop_many` appends in FIFO order and this preserves it.
+        // Drained, not iterated by reference: `decode_into` takes each `Bytes` by value, and each
+        // is freed as it's consumed rather than at the end of the batch. FIFO order is preserved.
         for datagram in popped.drain(..) {
             let latency_nanos = (now_nanos() - datagram.received_at).max(0) as u64;
             telemetry.timing(
@@ -1567,11 +1416,8 @@ async fn decode_loop<D: Decoder + Send>(
             scratch.clear();
             match decoder.decode_into(datagram.bytes, datagram.received_at, &mut scratch) {
                 Ok((resource, scope)) => {
-                    // `scope` is whatever `decoder.decode_into` returned -- `None` for every
-                    // decoder this loop drives today (statsd/syslog datagrams have no OTLP
-                    // instrumentation-scope concept), but threaded through rather than hardcoded so
-                    // a future `Decoder` on this same loop that does carry one isn't silently
-                    // dropped.
+                    // `scope` is `None` from every datagram decoder today, but threaded through
+                    // rather than hardcoded so a decoder that carries one isn't dropped.
                     if let Some((batch, reason)) = accumulator.absorb(resource, scope, &mut scratch)
                     {
                         emit(&sink, &telemetry, batch, reason).await;
@@ -1586,23 +1432,19 @@ async fn decode_loop<D: Decoder + Send>(
     }
 }
 
-/// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
-/// *accumulated* batch, not once per datagram that fed it. Before ADR `decoupled-listener-io`, one datagram was one
-/// `Fanout::send`, so every datagram got its own root; now a `batch_max_events` greater than 1
-/// deliberately correlates however many datagrams the accumulator happened to merge under one
-/// shared root, even though they arrived independently and share no other relationship. This is
-/// not a new hazard class, just a new place `TraceContext`'s own doc comment's already-tracked gap
-/// shows up: a stateful transform's `flush()` has minted one root per flush (covering however many
-/// batches contributed to it) since before this PR, for the identical reason -- no single parent
-/// to attribute a many-to-one emission to. `docs/known-gaps.md`'s internal-spans entry is the one
-/// place this is tracked; not duplicated here.
+/// Counts the flush by `reason` and sends `batch`.
+///
+/// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] per accumulated batch, not
+/// per datagram, so a `batch_max_events` above 1 puts independently-arrived datagrams under one
+/// shared root. It's the same many-to-one gap as a stateful transform's `flush()`, tracked in
+/// `docs/known-gaps.md`'s internal-spans entry.
 async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
     telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
     sink.send(batch).await;
 }
 
-/// `pub(crate)` rather than private: [`crate::tcp`]'s connection loop stamps `received_at` the
-/// same way, and one shared clock reader is better than two copies that could drift apart.
+/// Wall-clock nanoseconds since the Unix epoch, the `received_at` stamp. Shared with
+/// [`crate::tcp`]'s connection loop so the two listeners read one clock.
 pub(crate) fn now_nanos() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64
 }
@@ -1616,17 +1458,13 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
-    /// The `read_batch` the tests below that don't care about the value itself pass to
-    /// [`read_loop`]/[`BatchingConfig`] -- `UdpListenerConfig::default`'s own 64, spelled here so
-    /// a test asserting across batch boundaries (`a_backlog_deeper_than_the_pop_batch_...`) says
-    /// which number it is reasoning about rather than reaching into the config for it.
+    /// The `read_batch` tests pass when the value doesn't matter: `UdpListenerConfig::default`'s
+    /// 64, spelled out so a test asserting across batch boundaries names its number.
     const TEST_POP_BATCH: usize = 64;
 
-    /// A trivial `Decoder`: one datagram -> one event, except the literal bytes `b"BAD"`, which
-    /// are rejected -- enough to exercise decode-error handling without pulling in statsd/syslog
-    /// grammar specifics. Every decoded event's `attributes` carries the raw datagram under
-    /// `"payload"`, and its `timestamp` is exactly the `received_at` it was handed -- both of
-    /// which these tests use to identify which datagram produced which event.
+    /// One datagram -> one event, except the literal bytes `b"BAD"`, which are rejected. Each
+    /// event carries the raw datagram under `"payload"` and its `received_at` as `timestamp`, so a
+    /// test can tell which datagram produced which event.
     struct TestDecoder {
         resource: Arc<Resource>,
     }
@@ -1683,23 +1521,15 @@ mod tests {
         ))
     }
 
-    /// The central property this whole workstream exists for: a stalled downstream `Fanout`
-    /// consumer must never stop the read half from keeping the socket drained -- unlike the
-    /// pre-ADR `decoupled-listener-io` loop, where `recv_from` and `Fanout::send` shared one path.
+    /// A stalled downstream `Fanout` never stops the read half from draining the socket.
     ///
-    /// Proven by direct construction rather than a timing guess: the `Fanout`'s one consumer has
-    /// channel capacity 1 and is never `.recv()`d, so `decode_loop` blocks forever the moment its
-    /// *second* `Fanout::send` is attempted (the first fits in the empty channel) -- deterministic
-    /// regardless of scheduling, since a blocked send means no further `queue.pop()` calls happen
-    /// either. Exactly two datagrams are ever removed from `queue` this way; everything `read_loop`
-    /// pushes afterward either grows the queue or (once at its 4-item bound) evicts under
-    /// `drop_oldest` -- so once every send has landed, draining `queue` directly must find exactly
-    /// 4 items still sitting in it, never 0 (which is what a backpressured reader would leave).
+    /// Deterministic, not timed: the one consumer has capacity 1 and is never read, so
+    /// `decode_loop` blocks on its second send and pops nothing more. Everything `read_loop`
+    /// pushes afterward fills the 4-item queue and then evicts under `drop_oldest`, so the queue
+    /// must end holding 4 items; a backpressured reader would leave 0.
     ///
-    /// `read_loop`/`decode_loop` run as plain (unspawned) futures raced via `select!` against the
-    /// test's own driver, not `tokio::spawn`/`spawn_local` -- both require `'static`, which a
-    /// stack-local `socket`/`&mut decoder` can't satisfy, and `decode_loop` here never returns on
-    /// its own (that's the scenario under test), so it must be raced away from, not awaited.
+    /// The loops are raced as unspawned futures: `spawn` needs `'static`, and `decode_loop` never
+    /// returns here, so it must be raced away from, not awaited.
     #[tokio::test]
     async fn the_reader_keeps_reading_while_the_downstream_fanout_is_never_drained() {
         let socket = bind_ephemeral().await;
@@ -1731,10 +1561,8 @@ mod tests {
                 telemetry,
                 Diagnostics::default(),
             );
-            // Send more datagrams than the queue's own depth (4) -- if the reader ever stopped
-            // reading because of downstream backpressure, some of these sends would pile up in
-            // the OS receive buffer instead of ever reaching `queue`; instead `drop_oldest` just
-            // evicts, and the reader keeps consuming every one.
+            // More datagrams than the queue's depth (4): a backpressured reader would leave some in
+            // the OS receive buffer.
             let driver = async {
                 for i in 0..20u32 {
                     send_datagram(addr, format!("msg-{i}").as_bytes()).await;
@@ -1748,10 +1576,7 @@ mod tests {
             _ = &mut decode_fut => panic!("decode_loop must not exit during this test"),
             () = &mut driver => {}
         }
-        // Neither loop future is polled again after the `select!` above returns -- simply
-        // letting `read_fut`/`decode_fut` fall out of scope at the end of this function is what
-        // stops them, safely, mid-poll -- and it's what makes the queue below inspectable with
-        // nothing else concurrently touching it.
+        // Neither loop is polled again, so nothing else touches the queue below.
 
         let mut drained = 0;
         while tokio::time::timeout(Duration::from_millis(10), queue.pop()).await.is_ok() {
@@ -1764,8 +1589,7 @@ mod tests {
         );
     }
 
-    /// On shutdown, whatever the read half already queued must still be decoded and delivered --
-    /// not silently dropped -- within the grace `run_until_shutdown` is given.
+    /// `run_until_shutdown` shuts down cleanly and promptly within its grace.
     #[tokio::test]
     async fn shutdown_drains_the_queue_and_delivers_every_already_queued_datagram() {
         let mut listener = UdpListener::new(
@@ -1779,13 +1603,8 @@ mod tests {
             },
         );
 
-        // `Input::bind`/`UdpListener::local_addr` (docs/plans/operator-surface.md, workstream B)
-        // now make the OS-assigned port observable before `run` -- see
-        // `bind_then_run_delivers_a_real_datagram` below for the test that actually exercises a
-        // real socket round trip. This test still proves the *shutdown* contract specifically
-        // through `UdpListener::run_until_shutdown` end to end: shut down almost immediately, and
-        // since nothing was sent, this only proves a clean, prompt shutdown with nothing queued.
-        // The queued-backlog case is covered directly against `read_loop`/`decode_loop` below.
+        // Nothing is sent. `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered`
+        // covers the queued-backlog case against `read_loop`/`decode_loop` directly.
         let (fanout, mut rx) = recording_fanout(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -1800,12 +1619,10 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing was ever sent, so nothing should be delivered");
     }
 
-    // -- workstream B: `Input::bind`/`local_addr` (docs/plans/operator-surface.md) --
+    // -- `Input::bind`/`local_addr` --
 
-    /// The primitive `shutdown_drains_the_queue_...` above says was impossible before this
-    /// workstream: bind first, learn the real address via `local_addr`, *then* send a real
-    /// datagram to it and see it delivered -- with `run_until_shutdown` never having called
-    /// `bind()` itself.
+    /// Bind, learn the address via `local_addr`, then a real datagram sent to it is delivered by
+    /// a `run_until_shutdown` that reuses the bound socket.
     #[tokio::test]
     async fn bind_then_run_delivers_a_real_datagram() {
         let mut listener =
@@ -1831,9 +1648,8 @@ mod tests {
         handle.abort();
     }
 
-    /// A second `bind()` call is a no-op, per [`logit_pipeline::Input::bind`]'s idempotency
-    /// contract -- it must not try to rebind (and fail with "address in use") against the socket
-    /// it already holds.
+    /// A second `bind()` is a no-op ([`logit_pipeline::Input::bind`]'s contract), not a rebind
+    /// that fails with "address in use".
     #[tokio::test]
     async fn a_second_bind_is_a_no_op() {
         let mut listener =
@@ -1844,11 +1660,9 @@ mod tests {
         assert_eq!(listener.local_addr(), Some(addr), "the address must not change");
     }
 
-    /// `bind()` surfaces a genuinely unbindable address as an error, same as `run` did before this
-    /// method existed (`bind_socket`'s own error path, unchanged). A privileged low port is the
-    /// usual way to force this, but this test runs as root in CI's containerized environment
-    /// (`docs/adr/containerized-development.md`), where that fails to fail -- occupying a
-    /// specific already-bound ephemeral port instead works regardless of privilege.
+    /// `bind()` reports an unbindable address as an error. Uses an already-held port, not a
+    /// privileged one: the tests run as root in the dev container
+    /// (`docs/adr/containerized-development.md`), where a low port binds fine.
     #[tokio::test]
     async fn bind_reports_an_unbindable_address() {
         let held = bind_ephemeral().await;
@@ -1857,9 +1671,8 @@ mod tests {
         assert!(listener.bind().await.is_err(), "binding an already-held address should fail");
     }
 
-    /// `run_until_shutdown` still binds on its own when the caller never called `bind()` first --
-    /// [`logit_pipeline::Input::bind`]'s documented lazy fallback, and the reason no existing
-    /// direct-`run`/`run_until_shutdown` test in this module needed to change for this workstream.
+    /// `run_until_shutdown` binds on its own when `bind()` wasn't called first
+    /// ([`logit_pipeline::Input::bind`]'s lazy fallback).
     #[tokio::test]
     async fn run_until_shutdown_binds_when_the_caller_did_not() {
         let mut listener =
@@ -1869,17 +1682,14 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
             tokio::spawn(async move { listener.run_until_shutdown(fanout, shutdown_rx).await });
-        // Give the spawned task a chance to reach its own internal `self.bind().await?` -- there
-        // is nothing else to synchronize on here since the listener itself was moved into the
-        // task, but this is only proving the task didn't immediately error out, not timing a
-        // real race.
+        // Only proves the task didn't error out at bind; the listener moved into the task, so
+        // there's nothing else to synchronize on.
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!handle.is_finished(), "run_until_shutdown should have bound and now be listening");
         handle.abort();
     }
 
-    /// The backlog case `shutdown_drains_the_queue_...` above deferred: datagrams already sitting
-    /// in the queue when shutdown fires must still reach the `Fanout`, not be silently dropped.
+    /// Datagrams already queued when shutdown fires still reach the `Fanout`.
     #[tokio::test]
     async fn a_backlog_queued_before_shutdown_is_still_decoded_and_delivered() {
         let socket = bind_ephemeral().await;
@@ -1889,9 +1699,8 @@ mod tests {
         let telemetry = Telemetry::default();
         let mut decoder = TestDecoder::new();
 
-        // Queue three datagrams directly (bypassing the socket, for determinism), then signal
-        // shutdown before either loop starts running -- `shutdown.wait_for` checks the current
-        // value on its very first poll, so this ordering is equivalent to shutting down mid-run.
+        // Queued directly, for determinism. `shutdown.wait_for` checks the current value on its
+        // first poll, so signalling before either loop runs is equivalent to mid-run.
         for i in 0..3u32 {
             queue
                 .push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: i as i64 })
@@ -1899,9 +1708,7 @@ mod tests {
         }
         shutdown_tx.send(true).expect("receiver should still be alive");
 
-        // `tokio::join!`, not `spawn`/`spawn_local`: both loops genuinely terminate here (unlike
-        // the stalled-downstream test above), so waiting for both to finish concurrently is
-        // exactly right, and neither `socket` nor `&mut decoder` need to satisfy `'static`.
+        // `join!`, not `spawn`: both loops terminate here, and nothing need be `'static`.
         let (read_result, ()) = tokio::join!(
             read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, TEST_POP_BATCH),
             decode_loop(
@@ -1928,12 +1735,9 @@ mod tests {
         assert_eq!(payloads, vec!["msg-0", "msg-1", "msg-2"]);
     }
 
-    /// The same drain, over a backlog several times deeper than the pop batch: `decode_loop`
-    /// takes datagrams off the queue a batch at a time now, so "every queued datagram is decoded"
-    /// has to hold across batch boundaries, and arrival order has to survive both the batched pop
-    /// and the iteration over what it popped. Nothing is sorted here, unlike the test above --
-    /// `Fanout`'s channel is FIFO and `batch_max_events: 1` makes one delivery per datagram, so the
-    /// received sequence is the decode order exactly.
+    /// A backlog several pop batches deep is fully decoded, in arrival order, across batch
+    /// boundaries. Unsorted: the channel is FIFO and `batch_max_events: 1` makes one delivery per
+    /// datagram, so the received sequence is the decode order.
     #[tokio::test]
     async fn a_backlog_deeper_than_the_pop_batch_is_fully_decoded_in_arrival_order() {
         const BACKLOG: usize = TEST_POP_BATCH * 3 + 7;
@@ -1982,8 +1786,7 @@ mod tests {
         );
     }
 
-    /// A malformed datagram is diagnosed and skipped -- it must not stop the decode loop from
-    /// processing whatever comes after it.
+    /// A malformed datagram is diagnosed and skipped without stopping the decode loop.
     #[tokio::test]
     async fn a_malformed_datagram_is_skipped_without_stopping_the_decode_loop() {
         let socket = bind_ephemeral().await;
@@ -1994,9 +1797,7 @@ mod tests {
         let telemetry = Telemetry::default();
         let mut decoder = TestDecoder::new();
 
-        // A third concurrent future (alongside `read_loop`/`decode_loop`, joined below) since
-        // this test needs both loops genuinely *running* while the datagrams are sent -- unlike
-        // the backlog test above, where shutdown was already signalled before either loop started.
+        // A third joined future, so both loops are running while the datagrams are sent.
         let driver = async {
             send_datagram(addr, b"good-1").await;
             send_datagram(addr, b"BAD").await;
@@ -2036,9 +1837,7 @@ mod tests {
         );
     }
 
-    /// `SO_RCVBUF` reporting: the granted-buffer gauge fires even when `receive_buffer_bytes` was
-    /// never set -- an operator should always be able to see the kernel default, not just an
-    /// explicit override.
+    /// `bind_socket` succeeds with no `receive_buffer_bytes`.
     #[tokio::test]
     async fn bind_socket_reports_the_granted_receive_buffer_even_when_unset() {
         let telemetry = Telemetry::default();
@@ -2046,18 +1845,12 @@ mod tests {
         let socket = bind_socket("127.0.0.1:0", None, &telemetry, &mut diag)
             .await
             .expect("binding with no explicit receive_buffer_bytes should succeed");
-        // `Telemetry::default()` is the disabled no-op handle, so there's nothing to read the
-        // gauge back out of here -- this test's real assertion is simply that `bind_socket`
-        // completes and yields a usable socket with no explicit `receive_buffer_bytes`, which is
-        // the common (unset) case every other test in this module already relies on implicitly.
+        // `Telemetry::default()` is a no-op handle, so the gauge can't be read back here.
         drop(socket);
     }
 
-    /// The regression `bind_first_available` exists to prevent: a `bind:` target resolving to
-    /// more than one candidate address must fall through to a later one if an earlier one can't
-    /// be bound, not fail outright on the first. Forces a deterministic first-candidate failure
-    /// by occupying a real address with another socket first, rather than relying on a specific
-    /// hostname's DNS records (unavailable/unpredictable in a test environment).
+    /// A `bind:` resolving to several candidates falls through past one that can't bind. The
+    /// first candidate fails because another socket holds it, not through DNS.
     #[tokio::test]
     async fn bind_first_available_falls_through_to_a_later_candidate() {
         let occupied = bind_ephemeral().await;
@@ -2076,27 +1869,22 @@ mod tests {
             "must not have somehow bound the already-occupied address"
         );
         assert_eq!(group, None, "a unicast bind joins no group");
-        drop(occupied); // keep alive until here, so the port stays genuinely occupied throughout
+        drop(occupied); // held until here, so the port stays occupied throughout
     }
 
     /// The multicast path of [`bind_one`]: a group address binds the unspecified address on that
     /// port with `SO_REUSEADDR` and joins the group, and a datagram sent to the group from an
     /// ordinary socket arrives.
     ///
-    /// **Skips rather than fails when the environment has no multicast route** -- a container with
-    /// only a bridged `eth0` and no `224.0.0.0/4` route makes the join itself fail, which says
-    /// nothing about this code. Production deliberately does *not* skip: `bind_one` returns the
-    /// error and startup fails loudly, because a collectd listener that silently joined nothing
-    /// would receive nothing forever.
+    /// **Skips rather than fails when the environment has no multicast route**: a container with
+    /// only a bridged `eth0` and no `224.0.0.0/4` route fails the join itself. Production doesn't
+    /// skip; `bind_one` fails startup, because a listener that joined nothing receives nothing.
     ///
-    /// Port 0 is not usable here (a multicast bind must name the port senders use, and an
-    /// OS-assigned one is not knowable to a sender), so the port comes from binding and dropping an
-    /// ordinary socket first -- a small race with anything else on the host claiming it in between,
-    /// and the reason `SO_REUSEADDR` is set rather than the reason it is.
+    /// Port 0 isn't usable (senders must know the port), so the port comes from binding and
+    /// dropping an ordinary socket first, with a small race against anything else claiming it.
     #[tokio::test]
     async fn a_multicast_bind_joins_the_group_and_receives_a_datagram_sent_to_it() {
-        // collectd's own default IPv4 group (`network` plugin), which is also what
-        // `docs/plans/collectd-binary-relay.md` names.
+        // collectd's default IPv4 group (`network` plugin).
         const GROUP: &str = "239.192.74.66";
         let port = {
             let probe = UdpSocket::bind("0.0.0.0:0").await.expect("should bind an ephemeral port");
@@ -2121,9 +1909,8 @@ mod tests {
             "a multicast listener binds the unspecified address, not the group itself"
         );
 
-        // Bound to the unspecified address, not `127.0.0.1`: the source address a sender binds
-        // picks the interface a multicast datagram leaves by, and one pinned to loopback would
-        // never reach a group joined on the default (routed) interface.
+        // Not `127.0.0.1`: the sender's source address picks the interface a multicast datagram
+        // leaves by, and loopback would never reach a group joined on the default interface.
         let sender = UdpSocket::bind("0.0.0.0:0").await.expect("should bind an ephemeral port");
         if let Err(err) = sender.send_to(b"hello group", addr).await {
             // The same missing route, surfacing at send time instead of join time.
@@ -2140,9 +1927,8 @@ mod tests {
     }
 
     /// Whether `err` is the "this host has no multicast route" family the test above skips on.
-    /// Linux errno numbers (`ENODEV`, `EADDRNOTAVAIL`, `ENETUNREACH`, `EPERM`) -- CI and the dev
-    /// container are both Linux, and a non-Linux host simply gets the stricter behaviour of
-    /// failing the test rather than skipping it.
+    /// Linux errno numbers (`EPERM`, `ENODEV`, `EADDRNOTAVAIL`, `ENETUNREACH`); a non-Linux host
+    /// fails the test rather than skipping it.
     fn is_no_multicast_route(err: &anyhow::Error) -> bool {
         const SKIP_ERRNOS: [i32; 4] = [1, 19, 99, 101];
         err.chain()
@@ -2152,21 +1938,19 @@ mod tests {
 
     // -- per-socket kernel visibility (`ReceiveBufferSampler`, `read_loop_sampled`) --------------
 
-    /// How many datagrams a kernel-overrun test blasts at a deliberately tiny receive buffer. At
-    /// `receive_buffer_bytes: 8 KiB` Linux grants 16 KiB (it doubles the request) and charges each
-    /// of these datagrams several hundred bytes of `skb->truesize`, so a couple of dozen fit and
-    /// the rest have nowhere to go -- a margin of nearly two orders of magnitude, which is what
-    /// keeps the assertion "more than zero" rather than a number that could flake.
+    /// How many datagrams a kernel-overrun test blasts at a tiny receive buffer. At 8 KiB Linux
+    /// grants 16 KiB and charges each datagram several hundred bytes of `skb->truesize`, so a
+    /// couple of dozen fit: a margin of nearly two orders of magnitude, so "more than zero" drops
+    /// can't flake.
     #[cfg(target_os = "linux")]
     const OVERRUN_DATAGRAMS: usize = 2_000;
 
-    /// Deliberately tiny, and deliberately *requested* rather than assumed: Linux doubles it and
-    /// `net.core.rmem_max` may clamp it, and nothing below depends on the exact granted figure.
+    /// Requested, not assumed: Linux doubles it and `net.core.rmem_max` may clamp it, and nothing
+    /// below depends on the granted figure.
     #[cfg(target_os = "linux")]
     const TINY_RECEIVE_BUFFER: u64 = 8 * 1024;
 
-    /// Every `logit.input.kernel.drops` delta in `events`, summed -- the counter is a delta `Sum`
-    /// per drain, so a total is what an operator's backend would show.
+    /// Every `logit.input.kernel.drops` delta in `events`, summed.
     #[cfg(target_os = "linux")]
     fn kernel_drops(events: &[Event]) -> f64 {
         events
@@ -2199,38 +1983,29 @@ mod tests {
     async fn blast(target: std::net::SocketAddr, datagrams: usize) {
         let sender = bind_ephemeral().await;
         for _ in 0..datagrams {
-            // Errors ignored on purpose: a loopback send into a full receive buffer still
-            // *succeeds* (the packet is discarded later, in softirq, and charged to the receiving
-            // socket's `sk_drops`), and any send that did fail simply isn't part of the overrun.
+            // Errors ignored: a loopback send into a full receive buffer still succeeds (the
+            // packet is discarded later, in softirq, and charged to the receiver's `sk_drops`),
+            // and a send that did fail isn't part of the overrun.
             let _ = sender.send_to(b"overrun", target).await;
         }
     }
 
-    /// The gap `docs/known-gaps.md` used to record: a datagram the kernel discards before the read
-    /// loop can return it is now counted and attributable, and the receive buffer's own gauges are
-    /// reported alongside it by a listener that actually ran.
+    /// Datagrams the kernel discards before the read loop returns them are counted, and a
+    /// listener that ran reports the receive buffer's gauges alongside them.
     ///
-    /// **No sleeps, and no dependence on how fast the reader runs.** The overrun happens *before*
-    /// anything reads the socket -- the listener is bound (so the socket, and its tiny buffer,
-    /// exist) but not yet running -- and `shutdown` is already signalled when the run starts. The
-    /// sampler's first read happens at the top of `read_loop_sampled`, before `read_loop` is
-    /// polled even once, so the drop counter is observed at a point in time this test fully
-    /// controls, and it is a *count*: every sample's delta adds to the total this asserts on.
+    /// **No sleeps.** The overrun happens while the listener is bound but not yet running, and
+    /// `shutdown` is already signalled. The sampler's first read comes at the top of
+    /// `read_loop_sampled`, before `read_loop` is polled, and drops are a count, so every sample's
+    /// delta adds to the asserted total.
     ///
-    /// It is also the case `DropCounter`'s first-sample-is-absolute rule exists for: every one of
-    /// these drops happened before the first sample, and a counter that treated that sample as a
-    /// mere baseline would report zero here -- which is the answer `logit` gave before this work.
+    /// This is the case `DropCounter`'s first-sample-is-absolute rule exists for: every drop here
+    /// happened before the first sample, and a baseline-only first sample would report zero.
     ///
-    /// **The *fill* gauges are asserted present here, not nonzero, and that is a consequence of
-    /// the batched read rather than a weakening.** A gauge is last-write-wins per drain, so what
-    /// this test can see is whatever the *final* sample read -- and one `recvmmsg` with
-    /// `vlen = 64` empties a 16 KiB receive buffer (about 21 of these datagrams, at several
-    /// hundred bytes of `skb->truesize` each) in a single syscall, so by the time the read loop
-    /// exits the buffer legitimately reads empty. Before W4 the same run took 21 `recv_from` calls
-    /// and usually lost the race to the already-signalled shutdown arm first.
-    /// `a_full_receive_buffer_is_reported_as_used_bytes_and_a_utilization_ratio` below asserts the
-    /// nonzero fill and the `used / granted` pairing directly against a sampler on a full socket,
-    /// where it is deterministic.
+    /// **The fill gauges are asserted present, not nonzero.** A gauge is last-write-wins per
+    /// drain, so this sees the final sample, and one `recvmmsg` with `vlen = 64` empties a 16 KiB
+    /// buffer (about 21 of these datagrams) in one syscall, so it reads empty by then.
+    /// `a_full_receive_buffer_is_reported_as_used_bytes_and_a_utilization_ratio` asserts the
+    /// nonzero fill deterministically.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_kernels_own_drops_and_receive_buffer_fill_are_reported() {
@@ -2250,8 +2025,8 @@ mod tests {
 
         blast(addr, OVERRUN_DATAGRAMS).await;
 
-        // Already signalled: `read_loop` stops almost immediately, but not before
-        // `read_loop_sampled` has taken its first sample of a socket that is still full.
+        // Already signalled: `read_loop` stops almost at once, after `read_loop_sampled`'s first
+        // sample of a still-full socket.
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         let (fanout, _rx) = recording_fanout(8);
         tokio::time::timeout(
@@ -2277,15 +2052,11 @@ mod tests {
             .expect("the utilization gauge should have been sampled");
         assert!(granted > 0.0, "a live socket always has a receive-buffer ceiling");
         assert!(used >= 0.0, "a fill level is never negative, got {used}");
-        // The pairing the metric's whole meaning depends on: both terms come from the same
-        // `SO_MEMINFO` read, so the ratio is exactly the one the kernel itself tests. No upper
-        // bound of 1.0 on it, deliberately -- the kernel admits a datagram whenever the
-        // *already-charged* total is at or below the ceiling and then charges the whole of its
-        // `truesize` on top, so a saturated queue settles at up to `rcvbuf + truesize` and reads
-        // over 1.0 for as long as it stays there (observed at 1.17 against a real flood).
-        // Asserting `<= 1.0` would be a flake waiting to happen. See
-        // `SockMeminfo::receive_utilization`, which has both kernel generations' spelling of that
-        // same admission rule.
+        // Both terms come from one `SO_MEMINFO` read, so the ratio is the one the kernel tests.
+        // No `<= 1.0` bound: the kernel admits a datagram while the already-charged total is at
+        // or below the ceiling, then charges its whole `truesize` on top, so a saturated queue
+        // reads up to `(rcvbuf + truesize) / rcvbuf` (1.17 observed under a real flood). See
+        // `SockMeminfo::receive_utilization`.
         assert!(
             (utilization - used / granted).abs() < 1e-9,
             "utilization must be `used.bytes / receive_buffer.bytes`, not a ratio against the \
@@ -2293,11 +2064,8 @@ mod tests {
         );
     }
 
-    /// The nonzero half of the pair above, asserted where it is deterministic: a socket whose
-    /// receive buffer is full *right now*, sampled once, with nothing in between that could have
-    /// drained it. This is the reading an operator watching a listener under load actually sees,
-    /// and the one a batched read makes hard to catch from the outside -- one `recvmmsg` empties a
-    /// small buffer, so a test that lets the read loop run at all is racing it.
+    /// A full, unread receive buffer, sampled once, reports nonzero fill and utilization. No read
+    /// loop runs: one `recvmmsg` would empty the buffer first.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_full_receive_buffer_is_reported_as_used_bytes_and_a_utilization_ratio() {
@@ -2332,29 +2100,22 @@ mod tests {
         );
     }
 
-    /// This module's headline claim, checked against the number an operator would check it
-    /// against: **`logit.input.kernel.drops` is the same counter `/proc/net/udp`'s `drops` column
-    /// prints**, to the packet, on the same socket at the same moment.
+    /// **`logit.input.kernel.drops` equals `/proc/net/udp`'s `drops` column**, to the packet, on
+    /// the same socket at the same moment.
     ///
-    /// `logit_pipeline::sockstat`'s module doc asserts this identity ("`SK_MEMINFO_DROPS` is the
-    /// same `sk->sk_drops` that procfs's `drops` column prints, so the two agree by
-    /// construction") and `docs/plans/udp-intake.md` recorded checking it as a manual step. It is
-    /// neither manual nor approximate: both sides read the same field --
-    /// `sk_get_meminfo` (`net/core/sock.c`) does `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)`
-    /// and `udp4_format_sock` (`net/ipv4/udp.c`) prints `atomic_read(&sp->sk_drops)` as its last
-    /// column, both verified at v6.12 -- so this is an equality, not a threshold.
+    /// Both read the same field: `sk_get_meminfo` (`net/core/sock.c`) does
+    /// `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)`, and `udp4_format_sock`
+    /// (`net/ipv4/udp.c`) prints `atomic_read(&sp->sk_drops)` as its last column (both verified at
+    /// v6.12), so this is an equality, not a threshold.
     ///
-    /// It is also the only test in the tree that pins the `SK_MEMINFO_DROPS` *index* against
-    /// something other than itself. A mutant that read `SK_MEMINFO_BACKLOG` (7) or
-    /// `SK_MEMINFO_OPTMEM` (6) instead still reports "some number" and still passes every
-    /// nonzero-drops assertion elsewhere; only an equality against an independently-produced
-    /// figure catches it.
+    /// The only test that pins the `SK_MEMINFO_DROPS` index against something other than itself:
+    /// reading `SK_MEMINFO_BACKLOG` (7) or `SK_MEMINFO_OPTMEM` (6) instead would pass every
+    /// nonzero-drops assertion elsewhere.
     ///
-    /// **Ordering.** The blast finishes before anything is read, and nothing else sends to this
-    /// socket, so `sk_drops` is frozen by the time the comparison runs. The socket is still open
-    /// throughout -- procfs only lists live sockets, and the row is found by the socket's own
-    /// inode (`/proc/self/fd/<fd>` reads back as `socket:[<inode>]`), not by address, which is
-    /// what makes it unambiguous even with another test's loopback socket bound nearby.
+    /// **Ordering.** The blast finishes before anything is read and nothing else sends here, so
+    /// `sk_drops` is frozen. The socket stays open (procfs lists only live sockets), and the row is
+    /// found by inode (`/proc/self/fd/<fd>` reads `socket:[<inode>]`), not address, so another
+    /// test's loopback socket can't be mistaken for it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_kernels_drop_counter_agrees_with_proc_net_udp_to_the_packet() {
@@ -2380,7 +2141,7 @@ mod tests {
         sampler.sample_once();
         assert!(sampler.enabled, "SO_MEMINFO is available on this kernel -- test premise");
 
-        // A third, independent reading: straight off the fd, bypassing the sampler entirely.
+        // A third reading, straight off the fd, bypassing the sampler.
         let direct = logit_pipeline::sockstat::meminfo(
             logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor"),
         )
@@ -2405,19 +2166,19 @@ mod tests {
     }
 
     /// This socket's `drops` column in `/proc/net/udp[6]`, found by inode. `None` if procfs is
-    /// unreadable or the row is not there (neither is something this code could be blamed for).
+    /// unreadable or the row isn't there.
     ///
-    /// The row layout is fixed by `udp4_format_sock`'s `seq_printf` (`net/ipv4/udp.c`, and
-    /// `__ip6_dgram_sock_seq_show` in `net/ipv6/datagram.c` for udp6, which prints the same
-    /// columns with wider addresses): whitespace-separated, `sl` is field 0, `inode` is field 9
-    /// and `drops` is field 12 and last. `tx_queue:rx_queue` and `tr:tm->when` are each one
-    /// colon-joined field, which is what makes the count come out at 13 rather than 15.
+    /// The row layout is fixed by `udp4_format_sock`'s `seq_printf` (`net/ipv4/udp.c`; udp6's
+    /// `__ip6_dgram_sock_seq_show` in `net/ipv6/datagram.c` prints the same columns with wider
+    /// addresses): whitespace-separated, `inode` is field 9 and `drops` is field 12 and last.
+    /// `tx_queue:rx_queue` and `tr:tm->when` are each one colon-joined field, so a row has 13
+    /// fields, not 15.
     #[cfg(target_os = "linux")]
     fn proc_net_udp_drops(socket: &UdpSocket) -> Option<u64> {
         use std::os::fd::AsRawFd;
 
-        // `/proc/self/fd/<fd>` is a symlink that reads back as `socket:[<inode>]` -- the inode
-        // procfs's socket tables key on. Cheaper and safer than an `fstat`, and no `unsafe`.
+        // `/proc/self/fd/<fd>` reads back as `socket:[<inode>]`, the key procfs's socket tables
+        // use; no `fstat`, no `unsafe`.
         let link = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).ok()?;
         let link = link.to_str()?;
         let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
@@ -2437,21 +2198,15 @@ mod tests {
         None
     }
 
-    /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
-    /// last fraction of a second before the reader stops are still reported.
+    /// Drops in the last fraction of a second before the reader stops are still reported.
     ///
-    /// One guarantee holds the test up, and it is not the arm ordering. The future is polled
-    /// exactly once up front -- taking the first sample, of a socket nothing has sent to yet, and
-    /// parking `read_loop` -- and is then not polled *at all* while the overrun happens, because it
-    /// is a plain local future rather than a spawned task. So no interval sample can occur during
-    /// the blast, and every drop below is taken while the only sample that has ever run saw zero.
+    /// The future is polled once up front (the first sample, of a socket nothing has sent to,
+    /// parking `read_loop`) and then not at all during the overrun, since it's a local future, not
+    /// a spawned task. So every drop is taken while the only sample so far saw zero.
     ///
-    /// On the resume after `shutdown` fires, [`sample_while`]'s `select!` is `biased` toward the
-    /// *timer*, for the reason that function's doc gives -- so if the blast happened to outlast
-    /// `KERNEL_SAMPLE_INTERVAL`, a due tick wins that poll, reports what it sees, and the final
-    /// sample reports the remainder. Either way both samples are part of the same total, and the
-    /// assertion is on the total. The final sample's guarantee is that nothing is left behind when
-    /// the loop exits, not that it is the only sample to have run.
+    /// On resume, [`sample_while`]'s `select!` is `biased` toward the timer, so if the blast
+    /// outlasted `KERNEL_SAMPLE_INTERVAL`, a due tick reports some drops and the final sample the
+    /// rest. The assertion is on the total.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_final_sample_reports_drops_that_happened_just_before_shutdown() {
@@ -2463,9 +2218,8 @@ mod tests {
                 .await
                 .expect("binding an ephemeral port should succeed");
         let addr = socket.local_addr().expect("a bound socket has an address");
-        // Depth 1 under `block`, with nothing popping: the reader takes one datagram and then
-        // parks in `queue.push` for good -- the state this whole wrapper exists to keep sampling
-        // through.
+        // Depth 1 under `block`, nothing popping: the reader parks in `queue.push` for good, the
+        // state this wrapper exists to keep sampling through.
         let queue = test_queue(OverflowPolicy::Block, 1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -2479,8 +2233,8 @@ mod tests {
         );
         tokio::pin!(sampled);
 
-        // One poll: `select!` polls every arm on its first pass, so the wrapper's first
-        // `sample_once` has definitely run by the time `yield_now` resolves.
+        // One poll: `select!` polls every arm on its first pass, so the first `sample_once` has
+        // run by the time `yield_now` resolves.
         tokio::select! {
             _ = &mut sampled => panic!("the read loop must not finish before shutdown"),
             () = tokio::task::yield_now() => {}
@@ -2491,8 +2245,7 @@ mod tests {
             "the premise: nothing has been sent yet, so the first sample saw no drops at all"
         );
 
-        // Nothing polls `sampled` between here and the `await` below, so the reader is frozen and
-        // every one of these datagrams arrives at a buffer that is not being drained.
+        // Nothing polls `sampled` until the `await` below, so no one drains the buffer.
         blast(addr, OVERRUN_DATAGRAMS).await;
         shutdown_tx.send(true).expect("receiver should still be alive");
         tokio::time::timeout(Duration::from_secs(5), sampled)
@@ -2507,10 +2260,8 @@ mod tests {
         );
     }
 
-    /// A sampler with nothing to read latches itself off on its very first call -- the state
-    /// [`sample_while`] checks before arming its interval timer, and the reason a listener on a
-    /// platform without these counters goes back to parking instead of waking once a second
-    /// forever.
+    /// A sampler with nothing to read latches itself off on its first call, so [`sample_while`]
+    /// arms no timer.
     #[test]
     fn a_sampler_that_cannot_read_the_counters_disables_itself_on_the_first_sample() {
         let mut sampler = ReceiveBufferSampler {
@@ -2524,21 +2275,17 @@ mod tests {
         assert!(sampler.enabled, "a fresh sampler always tries once");
         sampler.sample_once();
         assert!(!sampler.enabled, "one failed read is enough -- these counters never appear later");
-        sampler.sample_once(); // still a harmless no-op, which is what the final sample relies on
+        sampler.sample_once(); // a no-op, which the final sample relies on
         assert!(!sampler.enabled);
     }
 
-    /// The disabled path end to end: with no timer armed at all, [`sample_while`] is exactly its
-    /// `read` future, and must still forward that future's result and leave the queue closed
-    /// behind it -- the shape every non-Linux build runs, and one no Linux CI run would otherwise
-    /// exercise.
+    /// With the sampler disabled (every non-Linux build's shape), [`sample_while`] still forwards
+    /// the `read` future's result and leaves the queue closed.
     #[tokio::test]
     async fn a_disabled_sampler_still_reads_and_closes_the_queue() {
         let socket = bind_ephemeral().await;
         let queue = test_queue(OverflowPolicy::DropOldest, 10);
-        // Already signalled, so `read_loop` returns on its first poll and this test needs no timer
-        // of its own -- which is also what would hang it if a disabled sampler still armed one and
-        // this assertion depended on the clock. It doesn't; the point is the result and the close.
+        // Already signalled, so `read_loop` returns on its first poll.
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         let sampler = ReceiveBufferSampler {
             fd: None,
@@ -2568,11 +2315,9 @@ mod tests {
         );
     }
 
-    /// A future that never finishes and returns `Pending` **only** by exhausting its task's
-    /// cooperative-scheduling budget, self-waking each time -- the exact shape `read_loop` takes
-    /// under a flood, where there is always another datagram and it never parks for a real reason.
-    /// `tokio::task::consume_budget` spends one unit per call and yields once the whole 128-unit
-    /// budget is gone, which is all it takes to reproduce the condition.
+    /// Never finishes, and returns `Pending` only by exhausting its task's coop budget,
+    /// self-waking each time: `read_loop`'s shape under a flood. `consume_budget` spends one unit
+    /// per call and yields once the 128-unit budget is gone.
     #[cfg(target_os = "linux")]
     async fn burns_its_whole_coop_budget_forever() -> anyhow::Result<()> {
         loop {
@@ -2580,20 +2325,15 @@ mod tests {
         }
     }
 
-    /// The regression the `select!`'s arm ordering in [`sample_while`] exists to prevent: a read
-    /// future that only ever yields on coop-budget exhaustion must not silence the sampler.
+    /// A read future that only yields on coop-budget exhaustion doesn't silence the sampler.
     ///
-    /// **This test fails with the arms swapped back** (read first): the read arm spends all 128
-    /// units, the timer arm is then polled with a budget of zero, `Sleep`'s own
-    /// `coop::poll_proceed` returns `Pending` regardless of how far past its deadline it is, and
-    /// the next wake repeats it forever -- so `ticks` below stays at 0 instead of reaching the
-    /// interval's own cadence.
+    /// **Fails with the arms swapped** (read first): the read arm spends all 128 units, the timer
+    /// arm's `coop::poll_proceed` returns `Pending` however far past its deadline, and `ticks`
+    /// stays at 0.
     ///
-    /// Real time, not a paused clock: the task under test is never idle (it self-wakes
-    /// continuously), so tokio's auto-advance would never engage. The sampler runs on its own
-    /// spawned task for the same reason -- a `tokio::time::timeout` wrapped around this future in
-    /// the test's own task would have its own `Sleep` starved by the very budget exhaustion under
-    /// test, and would never fire.
+    /// Real time, not a paused clock: the task never idles, so auto-advance never engages. The
+    /// sampler gets its own spawned task because a `timeout` around it in the test's task would
+    /// have its `Sleep` starved by the same budget exhaustion.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_sampler_keeps_ticking_while_the_read_future_burns_its_whole_coop_budget() {
@@ -2603,22 +2343,20 @@ mod tests {
 
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
-        // A real socket, so the sampler stays enabled and actually has counters to write.
+        // A real socket, so the sampler stays enabled.
         let socket = bind_ephemeral().await;
         let sampler = ReceiveBufferSampler::new(&socket, telemetry, Diagnostics::default());
         let sampling =
             tokio::spawn(sample_while(sampler, burns_its_whole_coop_budget_forever(), INTERVAL));
 
-        // Let the loop's opening `sample_once` land and throw it away: that one runs before the
-        // `select!` is ever reached, so it happens under either arm ordering and proves nothing.
+        // Discard the opening `sample_once`: it runs before the `select!`, under either ordering.
         tokio::time::sleep(WINDOW).await;
         registry.drain(0);
 
         let mut ticks = 0;
         for _ in 0..WINDOWS {
             tokio::time::sleep(WINDOW).await;
-            // A gauge is last-write-wins per drain, so its presence means "at least one sample ran
-            // in this window" -- which is the question, not how many.
+            // A gauge is last-write-wins per drain: present means at least one sample ran.
             if gauge(&registry.drain(0), "logit.input.receive_buffer.used.bytes").is_some() {
                 ticks += 1;
             }
@@ -2636,55 +2374,44 @@ mod tests {
 
     // -- the pure halves of the `recvmmsg` closure (`miri`'s only way in) ------------------------
 
-    /// `NET-01`'s P0 artifact: everything about [`build_headers`]/[`harvest_headers`] that a
-    /// pointer-provenance checker can see, exercised with no syscall anywhere in reach.
+    /// Everything about [`build_headers`]/[`harvest_headers`] a pointer-provenance checker can
+    /// see, with no syscall in reach (inventory entry `NET-01`).
     ///
-    /// **Why this module exists at all.** `miri` has no shim for `recvmmsg(2)` and none for any
-    /// socket call, so [`BatchReader::read_batch`] as a whole is permanently out of its reach
-    /// (`docs/adr/out-of-ci-unsafe-verification.md`). Splitting the closure into build / syscall /
-    /// harvest puts every one of the pointer decisions -- the `u64`-storage cast, the
+    /// `miri` has no shim for `recvmmsg(2)` or any socket call, so [`BatchReader::read_batch`] as a
+    /// whole is out of its reach (`docs/adr/out-of-ci-unsafe-verification.md`). The build /
+    /// syscall / harvest split puts every pointer decision (the `u64`-storage cast, the
     /// `size_of`-strided `add(i)`, the slot arithmetic, the re-initialization, and the read-back of
-    /// two fields the kernel wrote through a pointer derived from the same borrow -- on the two
-    /// sides `miri` *can* execute. `script/unsafe-check miri` runs exactly this module; the tests
-    /// below are ordinary `cargo test` tests too, so a regression fails in CI even for someone who
-    /// never runs the nightly harness.
+    /// two kernel-written fields) on the sides `miri` can execute. `script/unsafe-check miri` runs
+    /// this module; the tests are ordinary tests too, so a regression fails in CI.
     ///
-    /// **The kernel's part is played by the tests themselves**, writing through a `*mut
-    /// libc::mmsghdr` derived from the same `&mut [u64]` the syscall shim would derive its own
-    /// from -- which is the aliasing question worth asking under Stacked/Tree Borrows, and the one
-    /// production actually relies on.
+    /// **The tests play the kernel**, writing through a `*mut libc::mmsghdr` derived from the same
+    /// `&mut [u64]` the syscall shim derives its pointer from: the aliasing question production
+    /// relies on under Stacked/Tree Borrows.
     #[cfg(target_os = "linux")]
     mod batch_reader_helpers {
         use super::super::{build_headers, harvest_headers, HDR_WORDS, IOV_WORDS};
         use super::MAX_DATAGRAM_BYTES;
 
-        /// Every `vlen` worth checking: both ends of the clamp [`BatchReader::new`] applies
-        /// (`1` and [`MAX_READ_BATCH`]), the default `read_batch` of 64 and the value just below
-        /// it (so an off-by-one in the loop bound shows up as a missing or extra header rather
-        /// than as a boundary case that happens to line up), and `2` as the smallest `vlen` where
-        /// slot disjointness means anything at all.
+        /// Every `vlen` worth checking: both ends of [`BatchReader::new`]'s clamp (`1` and
+        /// [`MAX_READ_BATCH`]), the default 64 and 63 (so an off-by-one in the loop bound shows as
+        /// a missing or extra header), and `2`, the smallest `vlen` where slot disjointness means
+        /// anything.
         const VLENS: [usize; 5] = [1, 2, 63, 64, 1024];
 
-        /// The per-slot size the helper tests use where the *real* one would only make them slow:
-        /// `1024 * MAX_DATAGRAM_BYTES` is a 67 MB zeroed slab, which is nothing to a release
-        /// binary that `mmap`s it once and faults in a few pages, and a great deal to an
-        /// interpreter tracking every byte's initialization state. Nothing in
-        /// [`build_headers`] is sensitive to the *value*: it is a stride and a length, passed as a
-        /// parameter precisely so a test can vary it. `slot_bytes_matching_production` below runs
-        /// the same construction at the real `MAX_DATAGRAM_BYTES`, so the production stride is
-        /// covered too, just not crossed with the largest `vlen` under `miri`.
+        /// A small slot size: `1024 * MAX_DATAGRAM_BYTES` is a 67 MB zeroed slab, cheap for a
+        /// release binary but slow for an interpreter tracking every byte's initialization.
+        /// [`build_headers`] takes the size as a parameter and isn't sensitive to its value;
+        /// `slot_bytes_matching_production` covers the real stride, just not crossed with the
+        /// largest `vlen` under `miri`.
         const SMALL_SLOT: usize = 64;
 
-        /// One header's fields, read back out of the `u64` storage exactly the way the kernel
-        /// would see them -- through a `*mut libc::mmsghdr` derived from `hdr_words`, following
-        /// `msg_iov` into the separate `iovec` array rather than re-deriving that array's pointer
-        /// from `iov_words`.
+        /// One header's fields, read back the way the kernel sees them: through a
+        /// `*mut libc::mmsghdr` derived from `hdr_words`, following `msg_iov` into the `iovec`
+        /// array rather than re-deriving that pointer from `iov_words`.
         ///
-        /// Following the stored pointer, rather than recomputing where it *should* point, is the
-        /// point: it is the one read that fails if the provenance `build_headers` hands the kernel
-        /// has been invalidated by the time the kernel would use it. Which is also why nothing
-        /// here may touch `iov_words` or `slots` again -- a reborrow of either would pop exactly
-        /// the tag under test, in the test rather than in production.
+        /// Following the stored pointer is the point: it's the read that fails if the provenance
+        /// `build_headers` hands the kernel has been invalidated. So nothing here may touch
+        /// `iov_words` or `slots` again; a reborrow would pop the tag under test.
         struct HeaderView {
             iov_base: usize,
             iov_len: usize,
@@ -2698,9 +2425,8 @@ mod tests {
         }
 
         // `msg_iovlen`/`msg_controllen` are `size_t` in rust-`libc`'s `linux-gnu` `msghdr` and
-        // narrower integers in some of its other target definitions -- which is the whole reason
-        // this file never builds an `msghdr` by struct literal. The casts below are that
-        // portability, not redundancy, even where clippy can see through them on *this* target.
+        // narrower on some other targets; the casts are that portability, even where clippy sees
+        // through them on this target.
         #[allow(clippy::unnecessary_cast)]
         fn view(hdr_words: &mut [u64], vlen: usize) -> Vec<HeaderView> {
             let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
@@ -2729,12 +2455,11 @@ mod tests {
                 .collect()
         }
 
-        /// What `recvmmsg(2)` writes back into the first `n` headers, and nothing this code ever
-        /// looks at: `msg_len` and `msg_hdr.msg_flags` are what [`harvest_headers`] reads, and
-        /// `msg_namelen`/`msg_controllen` are written back by `____sys_recvmsg` (`net/socket.c`)
-        /// on every call -- deliberately given nonsense values here so that a
-        /// [`build_headers`] that failed to re-zero a header would be caught by the
-        /// re-initialization test rather than silently agreeing.
+        /// What `recvmmsg(2)` writes back into the first `n` headers: `msg_len` and
+        /// `msg_hdr.msg_flags`, which [`harvest_headers`] reads, and `msg_namelen`/
+        /// `msg_controllen`, which `____sys_recvmsg` (`net/socket.c`) writes on every call. Those
+        /// two get nonsense values, so a [`build_headers`] that failed to re-zero a header fails
+        /// the re-initialization test.
         fn play_kernel(hdr_words: &mut [u64], n: usize, lens: &[u32], flags: &[i32]) {
             let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
             for i in 0..n {
@@ -2751,8 +2476,7 @@ mod tests {
             }
         }
 
-        /// Fresh, correctly-sized backing buffers for one `vlen`, exactly as `BatchReader::new`
-        /// allocates them.
+        /// Fresh backing buffers for one `vlen`, sized as `BatchReader::new` sizes them.
         fn buffers(vlen: usize, slot_bytes: usize) -> (Vec<u8>, Vec<u64>, Vec<u64>) {
             (
                 vec![0u8; vlen * slot_bytes],
@@ -2761,10 +2485,9 @@ mod tests {
             )
         }
 
-        /// Asserts the whole of what a freshly-built header array must look like: a one-entry
-        /// `iov` per header, pointing at that header's own slot and no other, every slot wholly
-        /// inside the slab, every slot exactly `slot_bytes` long, and no address, control buffer
-        /// or returned length carried over from anywhere.
+        /// A freshly-built header array: one `iov` per header, pointing at its own slot, every
+        /// slot inside the slab and `slot_bytes` long, and no address, control buffer, or
+        /// returned length carried over.
         fn assert_freshly_built(views: &[HeaderView], slab: (usize, usize), slot_bytes: usize) {
             let (slab_start, slab_len) = slab;
             let mut seen: Vec<(usize, usize)> = Vec::with_capacity(views.len());
@@ -2820,14 +2543,10 @@ mod tests {
             }
         }
 
-        /// The same construction at the real per-slot size, so the production stride
-        /// (`MAX_DATAGRAM_BYTES`, not [`SMALL_SLOT`]) is covered rather than only the parameter.
+        /// The same construction at the production stride, `MAX_DATAGRAM_BYTES`.
         ///
-        /// `1024` is excluded under `miri` alone, and only for cost: a 67 MB zeroed slab is a
-        /// single `mmap` to a real binary and per-byte bookkeeping to an interpreter. Nothing
-        /// about the arithmetic differs between 64 slots and 1024 of them that
-        /// [`every_header_describes_its_own_slot_and_asks_for_nothing_else`] does not already
-        /// cover at 1024 with a smaller stride.
+        /// `1024` is excluded under `miri` only, for cost; the test above covers 1024 at a
+        /// smaller stride.
         #[test]
         fn slot_bytes_matching_production() {
             #[cfg(miri)]
@@ -2846,10 +2565,8 @@ mod tests {
             }
         }
 
-        /// The property the whole "rebuild the arrays on every call" design rests on: whatever the
-        /// kernel left behind in a header is gone after the next [`build_headers`], so the
-        /// writeback `____sys_recvmsg` performs on `msg_flags`/`msg_controllen` can never be read
-        /// as if it belonged to the *next* call's datagram.
+        /// Whatever the kernel left in a header is gone after the next [`build_headers`], so
+        /// `____sys_recvmsg`'s writeback can't be read as the next call's.
         #[test]
         fn a_rebuild_after_a_kernel_writeback_fully_reinitialises_every_header() {
             for vlen in VLENS {
@@ -2861,8 +2578,7 @@ mod tests {
                 let flags: Vec<i32> = (0..vlen).map(|_| libc::MSG_TRUNC).collect();
                 play_kernel(&mut hdr_words, vlen, &lens, &flags);
 
-                // Exactly what the closure does on its next `FnMut` call: same buffers, same
-                // arguments, no clearing in between.
+                // As the closure's next `FnMut` call does: same buffers, no clearing in between.
                 build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
 
                 let views = view(&mut hdr_words, vlen);
@@ -2870,24 +2586,21 @@ mod tests {
             }
         }
 
-        /// The harvest half: exactly the first `n` entries are written, with exactly the values
-        /// the kernel put in the headers, and nothing past `n` is touched.
+        /// Harvest copies the first `n` headers' values and touches nothing past `n`.
         #[test]
         fn harvest_copies_the_first_n_headers_and_nothing_past_them() {
             const UNTOUCHED_LEN: u32 = 0xA5A5_A5A5;
             const UNTOUCHED_FLAG: i32 = 0x5A5A_5A5A;
 
             for vlen in VLENS {
-                // Every interesting `n` for this `vlen`: none at all, one, one short of the whole
-                // batch, and the whole batch.
+                // None, one, one short of the batch, and the whole batch.
                 for n in [0, 1, vlen.saturating_sub(1), vlen] {
                     let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
                     build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
 
                     let written_lens: Vec<u32> =
                         (0..vlen).map(|i| ((i * 13) % SMALL_SLOT) as u32).collect();
-                    // Alternating, so a harvest that read the wrong header's flags (or the same
-                    // header's twice) cannot pass by accident.
+                    // Alternating, so reading the wrong header's flags can't pass by accident.
                     let written_flags: Vec<i32> =
                         (0..vlen).map(|i| if i % 2 == 0 { libc::MSG_TRUNC } else { 0 }).collect();
                     play_kernel(&mut hdr_words, n, &written_lens, &written_flags);
@@ -2920,17 +2633,14 @@ mod tests {
             }
         }
 
-        /// The full provenance chain, end to end and in production's own order: build the headers,
-        /// then write into each slot *through the `iov_base` pointer the header carries* (which is
-        /// what the kernel does, and the only thing in this file that depends on that pointer
-        /// still being usable after [`build_headers`] has returned), harvest the lengths, and only
-        /// then read the slab back through an ordinary borrow.
+        /// The full provenance chain in production's order: build, write into each slot through
+        /// the header's own `iov_base` (as the kernel does), harvest, then read the slab back
+        /// through an ordinary borrow.
         ///
-        /// Under Stacked/Tree Borrows this is the test that fails if the slab pointer's tag is
-        /// invalidated between construction and use -- which is precisely why nothing between the
-        /// `build_headers` call and the last write touches `slots` or `iov_words` at all. Reading
-        /// `slots` afterwards is a fresh borrow and pops those tags, which is fine: by then the
-        /// "kernel" is done.
+        /// Under Stacked/Tree Borrows this fails if the slab pointer's tag is invalidated between
+        /// construction and use, which is why nothing touches `slots` or `iov_words` before the
+        /// last write. The later fresh borrow of `slots` pops those tags after the "kernel" is
+        /// done.
         #[test]
         fn writing_through_each_headers_own_iov_lands_in_that_headers_own_slot() {
             for vlen in VLENS {
@@ -2975,10 +2685,8 @@ mod tests {
             }
         }
 
-        /// Both helpers refuse a buffer too small for the `vlen`/`n` they are handed, rather than
-        /// writing or reading past it. Unreachable from [`BatchReader::read_batch`], whose buffers
-        /// are sized once from the same `vlen`, and cheap enough (three comparisons per batch, not
-        /// per datagram) to keep as the thing that makes these two functions safe to call at all.
+        /// Both helpers panic on a buffer too small for their `vlen`/`n` rather than overrunning
+        /// it.
         #[test]
         fn a_buffer_too_small_for_the_batch_panics_rather_than_overrunning() {
             fn must_panic(name: &str, case: impl FnOnce()) {
@@ -3018,8 +2726,7 @@ mod tests {
 
     // -- batched reads (`BatchReader`, `read_batch`) --------------------------------------------
 
-    /// Every counter point named `name` in `events`, summed -- counts drain as deltas, so a total
-    /// is what an operator's backend would show and what these tests assert on.
+    /// Every counter point named `name` in `events`, summed.
     fn counter(events: &[Event], name: &str) -> f64 {
         events
             .iter()
@@ -3032,20 +2739,16 @@ mod tests {
             .sum()
     }
 
-    /// Runs one listener over a real loopback socket at the given `read_batch`, sends `payloads`
-    /// in order from a single sender socket, and returns what came out the other end -- the
-    /// datagram bytes, in delivery order, plus the listener's own telemetry.
+    /// Runs one listener over a real loopback socket at `read_batch`, sends `payloads` in order
+    /// from one sender socket, and returns the delivered datagram bytes in delivery order (the
+    /// listener's telemetry lands in `registry`).
     ///
-    /// **No sleeps anywhere, and no unbounded waits.** The driver waits for exactly
-    /// `payloads.len()` deliveries and only then signals shutdown, so the test's synchronization is
-    /// the data itself; each of those waits is wrapped in a `timeout` so a lost datagram is a
-    /// failure with a count in it rather than a hung test process. `batch_max_events:
-    /// 1` makes that one delivery per datagram, and a `Fanout` channel is FIFO, so the received
-    /// sequence *is* the decode order.
+    /// **No sleeps and no unbounded waits.** The driver waits for `payloads.len()` deliveries,
+    /// each under a `timeout`, then signals shutdown. `batch_max_events: 1` makes one delivery per
+    /// datagram and the channel is FIFO, so the received sequence is the decode order.
     ///
-    /// A single sender socket is what makes the ordering assertion meaningful: the kernel
-    /// preserves the order of datagrams sent from one socket to one loopback peer. Two senders
-    /// would have no such guarantee, and a test asserting one would be asserting a coincidence.
+    /// One sender socket makes the ordering assertion meaningful: the kernel preserves the order
+    /// of datagrams from one socket to one loopback peer, but not across senders.
     async fn deliver_burst(
         read_batch: usize,
         payloads: &[Vec<u8>],
@@ -3053,9 +2756,8 @@ mod tests {
     ) -> Vec<Vec<u8>> {
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
-        // A megabyte requested (the kernel doubles it, and `net.core.rmem_max` may clamp it):
-        // enough that a burst sent before anything drains it cannot overrun the socket, which is
-        // the one way this test could lose a datagram for a reason that is not a bug.
+        // A megabyte requested (doubled, maybe clamped by `net.core.rmem_max`), so a burst sent
+        // before anything drains it can't overrun the socket.
         let (socket, _group) =
             bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
@@ -3071,9 +2773,8 @@ mod tests {
             }
             let mut received = Vec::with_capacity(payloads.len());
             for i in 0..payloads.len() {
-                // Bounded, so a datagram lost anywhere (an `SO_RCVBUF` request the container's
-                // `rmem_max` clamped below what this burst needs, most plausibly) fails the test
-                // with a count instead of hanging the process forever waiting for it.
+                // Bounded, so a lost datagram (most plausibly a `rmem_max` clamp) fails with a
+                // count instead of hanging.
                 let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
                     .await
                     .unwrap_or_else(|_| {
@@ -3113,8 +2814,7 @@ mod tests {
         received
     }
 
-    /// [`payload`]'s byte-exact twin -- `String::from_utf8_lossy` would quietly rewrite any byte
-    /// that isn't valid UTF-8, which is exactly what a byte-exactness test must not do.
+    /// [`payload`]'s byte-exact twin: `String::from_utf8_lossy` would rewrite invalid UTF-8.
     fn payload_bytes(event: &Event) -> Vec<u8> {
         match event.attributes.get("payload") {
             Some(logit_core::Value::Str(bytes)) => bytes.to_vec(),
@@ -3126,10 +2826,8 @@ mod tests {
         (0..count).map(|i| format!("msg-{i}").into_bytes()).collect()
     }
 
-    /// The headline property of the batched read: a burst several batches deep arrives complete
-    /// and in the order it was sent. `recvmmsg` fills its `mmsghdr` array in arrival order and
-    /// this loop must preserve that through the batch `Vec`, `push_many`, `pop_many` and the
-    /// decode iteration -- four places an off-by-one or a reversed drain would show up.
+    /// A burst several batches deep arrives complete and in send order, through the batch `Vec`,
+    /// `push_many`, `pop_many`, and the decode iteration.
     #[tokio::test]
     async fn a_two_hundred_datagram_burst_is_delivered_complete_and_in_order() {
         let payloads = numbered_payloads(200);
@@ -3138,9 +2836,7 @@ mod tests {
         assert_eq!(received, payloads, "every datagram, exactly once, in the order it was sent");
     }
 
-    /// `read_batch: 1` is not a second code path -- it is `vlen = 1`, one datagram per syscall,
-    /// which is what ADR `udp-intake-batching-and-socket-visibility` rejected a special case for.
-    /// The proof it owes is this one: identical input, identical event stream, either way.
+    /// `read_batch: 1` (`vlen = 1`, not a second code path) and 64 yield the same event stream.
     #[tokio::test]
     async fn read_batch_one_and_sixty_four_yield_identical_event_streams() {
         let payloads = numbered_payloads(150);
@@ -3151,12 +2847,8 @@ mod tests {
         assert_eq!(sixty_four, one, "the batch size must not be observable in the event stream");
     }
 
-    /// Byte-exactness across the whole legal size range, in one batch: a zero-length datagram (a
-    /// perfectly legal UDP payload, and what `recv_from` used to report as `n == 0`), ordinary
-    /// small ones, and one near the 65,507-byte maximum. The large one is what proves each slot
-    /// really is a whole datagram's worth -- a slab sized per *batch* rather than per *slot* would
-    /// silently truncate here, which is the failure `MSG_TRUNC` would otherwise have to be
-    /// handled for.
+    /// Byte-exact across the legal size range in one batch: zero-length, small, and one at the
+    /// 65,507-byte maximum, which proves each slot holds a whole datagram.
     #[tokio::test]
     async fn datagrams_of_mixed_sizes_including_empty_and_near_maximum_survive_byte_exact() {
         let payloads: Vec<Vec<u8>> = vec![
@@ -3176,10 +2868,8 @@ mod tests {
         assert_eq!(received, payloads, "and so must every byte of it");
     }
 
-    /// `logit.input.reads` is the syscall count and `logit.input.datagrams` the datagram count, so
-    /// `datagrams / reads` is the mean fill an operator reads the `read_batch` knob against. The
-    /// invariant that makes it meaningful at all: a read returns at least one datagram, so reads
-    /// can never exceed datagrams, and both have to add up exactly for a known burst.
+    /// For a known burst, `logit.input.datagrams` and `.datagram.bytes` are exact and
+    /// `logit.input.reads` never exceeds datagrams (a read returns at least one).
     #[tokio::test]
     async fn the_read_counter_never_exceeds_the_datagram_counter_and_both_are_exact() {
         const BURST: usize = 200;
@@ -3202,31 +2892,17 @@ mod tests {
         );
     }
 
-    /// Two datagrams that arrive in one `recvmmsg` must not end up carrying the same
-    /// `received_at`. Anything downstream keyed on (series, timestamp) -- `influxdb_out`'s line
-    /// protocol is the live case -- treats two points sharing both as *one* point, and its own
-    /// same-timestamp disambiguation (`allocate_timestamp`) is reset at the top of every
-    /// `Encoder::encode`, so it cannot help across an output-batch boundary a read batch straddles.
-    /// `base + i` is what keeps them distinct, for the cost of no extra clock read at all.
+    /// Every datagram gets its own, strictly increasing `received_at` (why it matters: the
+    /// "`+ i` is not cosmetic" note on `BatchReader::read_batch`).
     ///
-    /// **What is guaranteed, and what this assertion actually rests on.** *Within* one batch,
-    /// strict increase holds by construction: every datagram is stamped `base + i` from one clock
-    /// read, so the ordering cannot depend on the clock at all. *Across* batches it does not hold
-    /// by construction, because `now_nanos()` is `SystemTime::now()` -- the **wall** clock, which
-    /// is the right choice here (`received_at` is the event's wall-clock timestamp, and a
-    /// monotonic instant could not be one) but which can step backwards. A `clock_settime`
-    /// correction, chrony's `makestep`, or a VM suspend/restore between two batches can move it
-    /// back by far more than the `<= read_batch` nanoseconds of offset the `+ i` adds, and two
-    /// datagrams in consecutive batches could then share a `received_at` -- the very collision the
-    /// offset exists to prevent. Tracked in `docs/known-gaps.md`; not closable from here.
+    /// **What the assertion rests on.** Within one batch, strict increase holds by construction:
+    /// `base + i` from one clock read. Across batches it doesn't: `now_nanos()` is the wall clock
+    /// (`received_at` is a wall-clock timestamp), which can step backwards by more than the `+ i`
+    /// offset between two batches. Tracked in `docs/known-gaps.md`.
     ///
-    /// The assertion below is nonetheless not flaky in any way worth tightening. It would take a
-    /// backwards step landing inside the sub-millisecond window this 200-datagram loopback burst
-    /// occupies, on the machine running the test suite; a forward step cannot break it at all.
-    /// Narrowing the assertion to within-batch windows would cost the cross-batch coverage --
-    /// which is what caught the "one stamp per syscall" shape in the first place -- to insure
-    /// against something that has never been observed here, so the claim is stated honestly rather
-    /// than the test weakened.
+    /// Not a flake worth tightening: it takes a backwards step inside this burst's
+    /// sub-millisecond window, and narrowing to within-batch windows would lose the cross-batch
+    /// coverage that catches a one-stamp-per-syscall regression.
     #[tokio::test]
     async fn every_datagram_in_a_batch_gets_its_own_received_at() {
         const BURST: usize = 200;
@@ -3244,8 +2920,7 @@ mod tests {
             sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("loopback send");
         }
 
-        // Read until the queue holds the whole burst, then stop -- the queue's own depth is the
-        // synchronization, so there is nothing to sleep on.
+        // Pop until the whole burst is out; the data is the synchronization.
         let read = read_loop(&socket, Arc::clone(&queue), telemetry, shutdown_rx, 64);
         tokio::pin!(read);
         let mut stamps: Vec<i64> = Vec::with_capacity(BURST);
@@ -3274,18 +2949,15 @@ mod tests {
         }
     }
 
-    /// The one case a 65,507-byte slot cannot hold: an IPv6 datagram may carry up to 65,527 bytes,
-    /// so the last 20 are copied nowhere. The bytes were lost the same way before this work -- the
-    /// `recv_from` loop had a 65,507-byte buffer too -- what is new is that the loss is *counted*
-    /// rather than silent, from `MSG_TRUNC` in the header the reader already reads `msg_len` from.
+    /// A 65,527-byte IPv6 datagram is delivered truncated to a slot and counted as
+    /// `logit.input.datagrams.truncated`.
     ///
-    /// **Skips rather than fails where IPv6 loopback isn't usable.** A container with no `::1`, or
-    /// one whose loopback MTU won't carry a fragmented 65 KB datagram, says nothing about this code;
-    /// the assertion below is only meaningful once the datagram has actually arrived.
+    /// **Skips rather than fails where IPv6 loopback isn't usable**: a container with no `::1`, or
+    /// whose loopback won't carry a fragmented 65 KB datagram.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_oversized_ipv6_datagram_is_delivered_truncated_and_counted() {
-        /// 20 bytes past what a slot holds -- the largest payload IPv6 permits.
+        /// The largest IPv6 payload, 20 bytes past a slot.
         const IPV6_MAX_PAYLOAD: usize = 65_527;
 
         let registry = logit_core::Registry::new();
@@ -3348,21 +3020,13 @@ mod tests {
         );
     }
 
-    /// The fatal-error path, which before this test nothing covered at all: `read_loop`'s
-    /// `Err` break, its `queue.close()` on the way out, and the message an operator is left with.
+    /// A fatal read error ends `read_loop`, closes the queue, and names the syscall and socket.
     ///
-    /// **A real, deterministic, unprivileged non-`EAGAIN` error, with no fault injection.** That
-    /// is harder than it sounds: every errno an unconnected UDP socket can produce on the receive
-    /// path is either unreachable (`bind_one`'s doc has the kernel citations) or needs privilege
-    /// (`ss -K`, i.e. `SOCK_DESTROY` → `ECONNABORTED`) or `strace -e inject=`. What does work is a
-    /// descriptor that is *readable but is not a socket*: a pipe whose write end has a byte in it
-    /// is immediately `EPOLLIN`, so `async_io` hands control to the closure on the first poll, and
-    /// `recvmmsg(2)` on it returns `ENOTSOCK` -- a genuine kernel error, first call, every time.
-    ///
-    /// This is also why the message must name the syscall rather than lean on `io::Error`'s own
-    /// text. Without [`describe_read_failure`] the whole report is `component 'statsd_in': Socket
-    /// operation on non-socket (os error 88)` -- and for the case that actually happens in the
-    /// field, a sandbox refusing the syscall, `Function not implemented (os error 38)`.
+    /// **A real, deterministic, unprivileged non-`EAGAIN` error, with no fault injection.** Every
+    /// errno an unconnected UDP socket can produce on receive is unreachable (`bind_one`'s doc),
+    /// needs privilege (`ss -K` -> `ECONNABORTED`), or needs `strace -e inject=`. A pipe with a
+    /// byte in it is readable but not a socket: `async_io` runs the closure on the first poll, and
+    /// `recvmmsg(2)` returns `ENOTSOCK` every time.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket() {
@@ -3376,8 +3040,7 @@ mod tests {
         assert_eq!(rc, 0, "pipe2(2) failed: {}", std::io::Error::last_os_error());
         let (read_fd, write_fd) = (fds[0], fds[1]);
 
-        // One byte, so the read end is readable and `async_io` proceeds straight to the closure
-        // instead of parking on a readiness that would never arrive.
+        // One byte, so the read end is readable and `async_io` goes straight to the closure.
         // SAFETY: `write_fd` is a live descriptor from the `pipe2` above; the source is a
         // one-byte buffer this frame owns and the length matches it exactly.
         let written = unsafe { libc::write(write_fd, c"x".as_ptr().cast(), 1) };
@@ -3426,12 +3089,9 @@ mod tests {
         );
     }
 
-    /// The seccomp case, at the seam rather than through a sandbox: `ENOSYS`/`EPERM` is what
-    /// quinn#1947 and bun#42678 both hit, and the default message for it (`Function not
-    /// implemented (os error 38)`) tells an operator nothing at all. Forcing the real syscall to
-    /// return it needs `strace -e inject=recvmmsg:error=ENOSYS:when=1` (`script/unsafe-check
-    /// inject`, which is out of CI by design); what belongs *in* CI is that the mapping from that
-    /// errno to a message worth reading does not quietly disappear.
+    /// `ENOSYS`/`EPERM` (a seccomp profile refusing the syscall) get the syscall, the socket, and
+    /// the `read_batch: 1` hint; other errnos get no guessed cause. Tested at the seam: forcing the
+    /// real syscall needs `script/unsafe-check inject`, which is out of CI.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_sandbox_blocked_syscall_is_named_along_with_why_read_batch_one_would_not_help() {
@@ -3453,7 +3113,7 @@ mod tests {
             );
         }
 
-        // Every other errno gets the syscall and the address and nothing invented on top.
+        // Any other errno gets the syscall and the address only.
         let plain = describe_read_failure(&socket, std::io::Error::from_raw_os_error(libc::EBADF))
             .to_string();
         assert!(plain.contains(READ_SYSCALL) && plain.contains(&addr.to_string()));
@@ -3463,16 +3123,12 @@ mod tests {
         );
     }
 
-    /// Shutdown landing while the read half is parked inside a blocked `push_many` -- the one
-    /// place ADR `udp-intake-batching-and-socket-visibility` widens an accepted loss, from the
-    /// single datagram `push` held to at most `read_batch`. What must still hold is everything
-    /// around it: the loop exits promptly rather than waiting for room that will never come, and
-    /// it closes the queue on the way out so `decode_loop` can finish.
+    /// Shutdown during a blocked `push_many` exits promptly and closes the queue; the rest of the
+    /// batch is the bounded loss ADR `udp-intake-batching-and-socket-visibility` names.
     ///
-    /// Deterministic without a sleep. The queue is `Block` with a bound of 4 and is pre-filled to
-    /// 3, so the read half can accept exactly one datagram of whatever batch it reads and must
-    /// then park; the loop below polls it until `logit.input.reads` proves a batch has actually
-    /// been read (bounded, and asserted afterwards, so a regression fails rather than hangs).
+    /// No sleep: the `Block` queue of 4 is pre-filled to 3, so the read half places one datagram
+    /// and parks. The loop polls until `logit.input.reads` shows a batch was read (bounded, so a
+    /// regression fails rather than hangs).
     #[tokio::test]
     async fn shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue() {
         let registry = logit_core::Registry::new();
@@ -3486,8 +3142,7 @@ mod tests {
             queue.push(Datagram { bytes: Bytes::from(format!("pre-{i}")), received_at: 0 }).await;
         }
 
-        // More than one batch's worth, so the read half is certainly holding a remainder it can
-        // never place once the fourth slot is taken.
+        // More than a batch, so the read half holds a remainder it can't place.
         let sender = bind_ephemeral().await;
         for i in 0..200u32 {
             sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("loopback send");
@@ -3531,17 +3186,13 @@ mod tests {
         );
     }
 
-    /// The whole listener, end to end, in the configuration where a batched read is hardest on the
-    /// queue underneath it: `overflow: block` with a `max_datagrams` *smaller* than `read_batch`,
-    /// so a single `push_many` call cannot fit even against a completely empty queue, and
-    /// `batch_flush_interval: 0s`, so `decode_loop` waits on `pop_many` with no timer to rescue it.
+    /// With `overflow: block`, `max_datagrams` below `read_batch` (one `push_many` can't fit even
+    /// an empty queue), and no flush timer, every datagram is still delivered and the run ends.
     ///
-    /// Every datagram must still be delivered, and the run must finish. A `push_many` that
-    /// notified `not_empty` only after its whole batch landed would deadlock exactly here -- the
-    /// reader parked waiting for room, the decoder parked waiting for an item, and the item that
-    /// would have woken it already sitting in the queue. That combination is legal configuration
-    /// (graph rule 57's own comment says why it is not rejected), so it is pinned end to end
-    /// rather than left to the queue's own unit tests.
+    /// A `push_many` that notified `not_empty` only after its whole batch landed would deadlock
+    /// here: the reader waiting for room, the decoder waiting for an item already in the queue.
+    /// The combination is legal config (graph rule 57's comment says why), so it's pinned end to
+    /// end.
     #[tokio::test]
     async fn a_block_queue_smaller_than_the_read_batch_still_delivers_every_datagram() {
         const BURST: usize = 200;

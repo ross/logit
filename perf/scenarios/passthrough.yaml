@@ -1,15 +1,15 @@
-# Runtime-floor scenario (docs/plans/load-test-harness.md's scenario table): a generate_in with
-# no log body and six plain attributes straight into null_out. No parsing, no encoding -- the only
-# cost measured is scheduling, the fanout channel hop, and the sink's own layer-2 telemetry, so
-# every other scenario's numbers are read relative to this one.
+# Runtime floor: generate_in with no log body and six plain attributes straight into null_out. No
+# parsing, no encoding; the only cost is scheduling, the fanout channel hop, and the sink's own
+# telemetry, so every other scenario's numbers are read relative to this one. Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios".
 #
-# An ordinary logit config, like anything under examples/ -- no `!env`, run the same way an
-# operator would (`logit run perf/scenarios/passthrough.yaml`), or through the harness:
+# An ordinary logit config like anything under examples/: `logit run perf/scenarios/passthrough.yaml`
+# works, as does the harness:
 #
 #   script/perf run --scenario passthrough
 #
-# `{seq%N}` in `path`/`host` gives the event stream some attribute cardinality rather than
-# generating byte-identical events forever, which no real traffic shape looks like.
+# `{seq%N}` in `path`/`host` gives the stream some attribute cardinality rather than byte-identical
+# events forever. fanout.yaml and route.yaml copy this template and count; change them together.
 components:
   gen:
     type: generate_in

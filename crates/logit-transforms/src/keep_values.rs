@@ -1,9 +1,7 @@
 //! `keep_values`: clamps attribute (and/or resource-attribute) values to an operator-configured
-//! allow-list, per field -- `keep`'s value-side sibling, for a tag whose valid set the operator
-//! knows but the producer doesn't enforce. See `docs/adr/value-allowlist-cardinality-clamp.md`.
-//!
-//! Stateless -- like `scale`/`set`, only `process`/`map_resource` are overridden;
-//! `flush_interval`/`flush` keep the `Transform` trait's defaults.
+//! allow-list, per field: `keep`'s value-side sibling, for a tag whose valid set the operator
+//! knows but the producer doesn't enforce. Stateless. See
+//! `docs/adr/value-allowlist-cardinality-clamp.md`.
 
 use crate::value_matches;
 use bytes::Bytes;
@@ -12,21 +10,18 @@ use logit_core::{Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// Mirrors `logit_config::NormalizeStep` -- `logit-transforms` deliberately doesn't depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the same
-/// pattern `MatchMode`/`SignalSet` already follow.
+/// Mirrors `logit_config::NormalizeStep`; `logit-cli` converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Normalize {
     Lower,
 }
 
-/// One field's clamp, interned once at construction ([`KeepValues::new`]) rather than per event --
-/// [`Scale`](crate::Scale)'s `CompiledScale` reasoning applied here too.
+/// One field's clamp, interned once in [`KeepValues::new`].
 struct Clamp {
     field: Symbol,
     normalize: Vec<Normalize>,
-    /// Config order, not sorted -- a linear scan beats a set at the sizes this is configured for
-    /// (a handful of vhosts, tenants, regions), and allocates nothing to build or to search.
+    /// Config order, scanned linearly: at the configured sizes (a handful of vhosts, tenants,
+    /// regions) that beats a set and allocates nothing.
     allow: Vec<Value>,
     other: Option<Value>,
 }
@@ -41,9 +36,10 @@ impl Clamp {
         Self { field: intern(&field), normalize, allow, other }
     }
 
-    /// Applies every configured step in order, returning `None` if none of them actually changed
-    /// the value -- the common case (an already-conforming value), and what keeps that path
-    /// allocation-free: a caller that gets `None` back knows there is nothing new to write back.
+    /// Applies every configured step in order; `None` if none changed the value.
+    ///
+    /// `None` is the common case (an already-conforming value) and keeps it allocation-free:
+    /// there is nothing to write back.
     fn normalize(&self, value: &Value) -> Option<Value> {
         let mut current: Option<Value> = None;
         for step in &self.normalize {
@@ -57,8 +53,7 @@ impl Clamp {
 }
 
 impl Normalize {
-    /// `None` if this step doesn't change `value` -- either because the variant never applies
-    /// (anything but `Str`/`Bytes`) or because it's already in the target form.
+    /// `None` if this step doesn't change `value`: not `Str`/`Bytes`, or already in target form.
     fn apply(self, value: &Value) -> Option<Value> {
         match self {
             Normalize::Lower => lower(value),
@@ -66,11 +61,10 @@ impl Normalize {
     }
 }
 
-/// ASCII-lowercases a `Str`/`Bytes` value bytewise, returning `None` if it has no uppercase ASCII
-/// byte to change (including every non-`Str`/`Bytes` variant). Bytewise, not
-/// `str::to_lowercase`'s Unicode case folding -- see the ADR: it can't change a string's byte
-/// length (so `Str`'s UTF-8 validity is preserved for free) and it's total on non-UTF-8 `Bytes`
-/// with no separate validation step.
+/// ASCII-lowercases a `Str`/`Bytes` value bytewise; `None` if there's no uppercase ASCII byte.
+///
+/// Bytewise rather than `str::to_lowercase`'s Unicode folding: it can't change the byte length,
+/// so `Str` stays valid UTF-8, and it needs no validation on non-UTF-8 `Bytes`.
 fn lower(value: &Value) -> Option<Value> {
     let bytes = match value {
         Value::Str(b) | Value::Bytes(b) => b,
@@ -87,16 +81,14 @@ fn lower(value: &Value) -> Option<Value> {
     })
 }
 
-/// Config for one field, taken by [`KeepValues::new`] -- `(field, normalize steps, allow list,
-/// other)`, `Set::new`'s plain-tuple convention.
+/// Config for one field: `(field, normalize steps, allow list, other)`.
 pub type ClampConfig = (String, Vec<Normalize>, Vec<Value>, Option<Value>);
 
 pub struct KeepValues {
     resource_fields: Vec<Clamp>,
     attribute_fields: Vec<Clamp>,
-    /// A one-entry cache of the last resource this component mapped, keyed by `Arc::ptr_eq` on
-    /// the input -- [`Set`](crate::Set)'s `map_resource` caching idiom, applied to a clamp instead
-    /// of a stamp.
+    /// The last `(input, output)` resource pair, matched by `Arc::ptr_eq` on the input, as in
+    /// [`Set`](crate::Set).
     cache: Option<(Arc<Resource>, Arc<Resource>)>,
     telemetry: Telemetry,
 }
@@ -117,21 +109,19 @@ impl KeepValues {
         }
     }
 
-    /// Attaches a telemetry handle -- see
-    /// [`Keep::with_telemetry`](crate::Keep::with_telemetry) for why there's no `Diagnostics`
-    /// builder alongside it: clamping a value to a fixed allow-list can't fail.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: clamping to a fixed allow-list can't fail.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
 }
 
-/// Resolves one field's clamp against `attrs`, applying it in place. Shared by `process`
-/// (`event.attributes`) and `map_resource` (a rebuilt `Resource`'s attributes).
+/// Applies one field's clamp to `attrs` in place, for both event and resource attributes.
 fn clamp_field(clamp: &Clamp, attrs: &mut logit_core::AttrMap, telemetry: &Telemetry) {
     let field_tag = [("field", logit_core::interner::resolve(clamp.field))];
-    // Borrow ends here, before any mutation below -- `scale.rs`'s "resolve into an owned local
-    // first" shape, needed because `insert_sym`/`remove_sym` need `attrs` mutably.
+    // Resolve into owned locals so the shared borrow ends before `insert_sym`/`remove_sym`.
     let (normalized, matched) = match attrs.get_sym(clamp.field) {
         None => return, // absent: a silent no-op for this field, never a stamp
         Some(actual) => {
@@ -146,8 +136,8 @@ fn clamp_field(clamp: &Clamp, attrs: &mut logit_core::AttrMap, telemetry: &Telem
     }
     if matched {
         telemetry.count("logit.transform.values.allowed", 1.0, &field_tag);
-        // Still write back a normalized-but-allowed value -- the cardinality win `normalize:`
-        // exists for applies whether or not the value happened to already be on the allow-list.
+        // Write back a normalized value even when allowed: that's the cardinality win
+        // `normalize:` exists for.
         if let Some(value) = normalized {
             attrs.insert_sym(clamp.field, value);
         }
@@ -183,9 +173,7 @@ impl Transform for KeepValues {
         for clamp in &self.resource_fields {
             clamp_field(clamp, &mut attrs, &self.telemetry);
         }
-        // `dropped_attributes_count`/`schema_url` aren't configurable through `keep_values` --
-        // carry them over from the input resource explicitly, `Set::map_resource`'s reasoning
-        // exactly.
+        // Carry `dropped_attributes_count`/`schema_url` over, as `Set::map_resource` does.
         let out = Arc::new(Resource {
             attributes: attrs,
             dropped_attributes_count: resource.dropped_attributes_count,

@@ -11,19 +11,16 @@
 //! 1. **`events_to_families(families_to_events(f)) == f`** -- whole-value `PartialEq` on the family
 //!    list, the model mapping's own fixed point. This is what makes
 //!    `prometheus_in -> prometheus_out` a relay rather than a reinterpretation, and it holds
-//!    independently of text syntax, so a future remote-write module inherits it.
+//!    independently of syntax, so remote-write shares it.
 //! 2. **`write(parse(x)) == canonical(x)`** on bytes, in both dialects -- the syntax layer's fixed
-//!    point, stated at the level a scraper actually sees. `canonical(x)` is `x` with exactly the
-//!    normalizations `logit_proto::prometheus`'s module doc permits applied: families sorted by
-//!    name, series by label set, labels by name, floats shortest-round-trip, blank lines and
-//!    non-metadata comments gone, `# TYPE ... untyped`/`unknown` supplied where the input had no
-//!    metadata, a counter's value sample carrying `_total`. Re-running the pass on its own output
-//!    changes nothing, which the third assertion in each test pins.
+//!    point. `canonical(x)` is `x` with the same-dialect entries of `logit_proto::prometheus`'s
+//!    "Permitted normalizations" applied; re-running the pass on its own output changes nothing,
+//!    which the third assertion in each test pins.
 //! 3. **`parse(write(f)) == f`** over a `proptest` generator across the text grammar -- names, label
 //!    sets, every family type, optional timestamps/`_created`/exemplars -- so the corpus above
 //!    doesn't get to pick the easy cases.
 //!
-//! **What the fixtures deliberately leave out**, because including it would make the fixture *not*
+//! **What the fixtures leave out**, because including it would make the fixture *not*
 //! a fixed point by construction rather than by a codec bug (the same discipline
 //! `otlp_fixed_point.rs` applies to a `Summary`'s exemplars):
 //!
@@ -233,9 +230,8 @@ fn the_openmetrics_fixture_is_a_fixed_point_in_every_sense() {
     assert_fixture(OPENMETRICS_FIXTURE, Dialect::OpenMetrics1_0, OPENMETRICS_CANONICAL);
 }
 
-/// A hand-built family list exercising the two model-level extras no exposition body can carry on
-/// its own: an exemplar with both a trace reference *and* filtered attributes, and a series that
-/// carries a timestamp alongside one that doesn't.
+/// Model-level extras no fixture body holds: a trace-ref exemplar with filtered attributes, and
+/// timestamped next to untimestamped series.
 #[test]
 fn a_hand_built_family_list_is_a_model_fixed_point() {
     let mut filtered_attributes = AttrMap::new();
@@ -262,12 +258,8 @@ fn a_hand_built_family_list_is_a_model_fixed_point() {
     assert_model_fixed_point(&[counter]);
 }
 
-/// `Point::Stale` is deliberately absent from the generators below: property 1 is stated under the
-/// *default* encoder, which skips a flagged record outright (neither exposition dialect can express
-/// a stale marker), so a generated `Stale` would fail by construction rather than by a codec bug.
-/// Remote-write can express one, so it gets its own case here with the two switches its transport
-/// turns on -- the same shape `logit_proto::prometheus`'s own unit tests pin per family type, stated
-/// once more at the level this file works at.
+/// `Stale` families round-trip under the remote-write switches; the default encoder skips them,
+/// which is why the proptest generators below never produce a `Point::Stale`.
 #[test]
 fn a_stale_family_is_a_model_fixed_point_with_the_remote_write_switches_on() {
     let families: Vec<MetricFamily> = [
@@ -313,8 +305,7 @@ fn a_stale_family_is_a_model_fixed_point_with_the_remote_write_switches_on() {
     assert_eq!(round_tripped, families);
 }
 
-/// And the default is unchanged: the same families through a plain encoder are skipped, which is
-/// what keeps every other property in this file stated under the settings the exposition path uses.
+/// Under the default encoder, the same `Stale` families are skipped.
 #[test]
 fn a_stale_family_is_skipped_by_the_default_encoder() {
     let families = vec![MetricFamily {

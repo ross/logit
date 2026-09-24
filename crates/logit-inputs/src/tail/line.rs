@@ -1,11 +1,8 @@
-//! Line splitting, and the [`TailDecoder`] trait every tailing decoder implements against.
+//! Line splitting, and the [`TailDecoder`] trait every tailing decoder implements.
 //!
-//! [`TailDecoder`] is the file-tailing analogue of `logit_proto::Decoder`: "one already-split
-//! line in, zero or more events out" rather than "one whole payload in, zero or more events
-//! out". Splitting itself lives here, in [`LineSplitter`], not inside each decoder -- unlike a
-//! UDP datagram (which a `Decoder` always receives whole), a line can straddle two separate
-//! reads of the underlying file, so *something* has to carry a partial line across `push` calls,
-//! and every decoder would otherwise have to reimplement that.
+//! [`TailDecoder`] is `logit_proto::Decoder` at line granularity. Splitting lives in
+//! [`LineSplitter`], shared by every decoder, because a line can straddle two reads of the file
+//! and something has to carry the partial line between them.
 
 use bytes::{Bytes, BytesMut};
 use logit_core::interner::intern;
@@ -14,12 +11,11 @@ use logit_proto::CodecError;
 use std::path::Path;
 use std::sync::Arc;
 
-/// What one tailing decoder implements against: an already-newline-split, `\r`-stripped,
-/// UTF-8-valid line turns into zero or more [`Event`]s appended to `out`. Mirrors
-/// `logit_proto::Decoder::decode_into`'s "append, don't return a fresh `Vec`" shape, at line
-/// rather than whole-payload granularity. `read_at` is when the line was read off the file, not
-/// necessarily this event's own timestamp -- `docker_in`'s decoder uses the line's own embedded
-/// timestamp instead, falling back to `read_at` only when that's unparseable.
+/// Turns one split line into zero or more [`Event`]s appended to `out`.
+///
+/// The line has no `\n`, no trailing `\r`, and is valid UTF-8 (the driver's `ensure_utf8`).
+/// `read_at` is when the line was read, not necessarily the event's timestamp: `docker_in` uses
+/// the envelope's own `time` and falls back to `read_at` only when that's unparseable.
 pub trait TailDecoder: Send {
     fn decode_line(
         &mut self,
@@ -28,58 +24,48 @@ pub trait TailDecoder: Send {
         out: &mut Vec<Event>,
     ) -> Result<Arc<Resource>, CodecError>;
 
-    /// Called once, when the file this decoder is reading is closing (rotated away, removed, or
-    /// the whole component is shutting down) -- an opportunity to emit anything a decoder held
-    /// back across lines (`docker_in`'s reassembled-but-never-newline-terminated final entry;
-    /// `tail_in`'s own unterminated last line is handled one level up, by
-    /// [`LineSplitter::take_partial`], since every `TailDecoder` shares that same behavior).
-    /// Default: nothing held.
+    /// The file is closing (rotated away, removed, or shutdown): emit anything held across lines,
+    /// such as `docker_in`'s unfinished partial-entry reassembly. An unterminated last line is
+    /// [`LineSplitter::take_partial`]'s job, not this. Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
 
-    /// The file this decoder is reading was truncated in place: everything held across lines
-    /// belongs to a generation of the file that no longer exists, and must be dropped -- **not**
-    /// emitted. That's the same policy `Tailer::scan`'s truncation branch already applies to
-    /// [`LineSplitter`]'s own held partial (rebuilt, not drained through `take_partial`): an
-    /// unterminated fragment from content that's gone is worse spliced onto the new generation's
-    /// first line, or emitted as if it were whole, than simply dropped. Distinct from
-    /// [`TailDecoder::close`] for exactly that reason -- `close` *emits* what's held, which is right
-    /// when the file is ending and wrong when it's restarting. Default: nothing held, nothing to do
-    /// (`tail_in`'s [`LineDecoder`] is stateless across lines and relies on this).
+    /// The file was truncated in place: drop, **not** emit, everything held across lines.
+    ///
+    /// Held state belongs to content that no longer exists; emitting it, or splicing it onto the
+    /// new content's first line, is worse than losing it. `Tailer::scan`'s truncation branch
+    /// treats [`LineSplitter`]'s partial the same way (rebuilds it rather than calling
+    /// `take_partial`). That's the difference from [`TailDecoder::close`], which emits. Default:
+    /// nothing held ([`LineDecoder`] is stateless across lines).
     fn reset(&mut self) {}
 
-    /// This decoder's resource, without decoding a line -- needed to seed accounting before
-    /// anything has been read. `tail_in`'s [`LineDecoder`] builds one `Resource` per file and
-    /// never changes it (`docs/adr/decoupled-listener-io.md`'s "never merges across a resource
-    /// change" rule). `docker_in`'s `DockerDecoder` is the one exception: its own
-    /// `DecoderFactory::refresh` may swap this to a freshly-read identity mid-stream
-    /// (`docs/adr/docker-container-identity-and-minimal-watches.md`) -- `BatchAccumulator::
-    /// absorb`'s `Arc::ptr_eq` check is what keeps that from mixing two identities in one batch
-    /// regardless.
+    /// This decoder's resource, readable before any line is decoded.
+    ///
+    /// [`LineDecoder`]'s never changes. `docker_in`'s can: `DecoderFactory::refresh` may swap in
+    /// a freshly read identity mid-stream
+    /// (`docs/adr/docker-container-identity-and-minimal-watches.md`), and
+    /// `BatchAccumulator::absorb`'s `Arc::ptr_eq` check keeps two identities out of one batch.
     fn resource(&self) -> Arc<Resource>;
 }
 
-/// Bytes dropped from one oversized line, and how many complete lines a [`LineSplitter::push`]
-/// call yielded via its callback -- both purely observational; [`LineSplitter`] itself takes no
-/// `Diagnostics`/`Telemetry` (kept dependency-free and directly unit-testable), so the caller
-/// (`crate::tail::driver::Tailer`) reports whatever this carries.
+/// What one [`LineSplitter::push`] observed, for the caller to report: the splitter holds no
+/// `Diagnostics`/`Telemetry` handle.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LineStats {
     pub dropped_lines: u32,
 }
 
-/// Splits a stream of read chunks into complete lines (`\n`-terminated, with a trailing `\r`
-/// stripped), carrying an incomplete line across chunks. A line entirely contained in one
-/// `push` call -- the overwhelming common case -- is handed to the caller as a zero-copy
-/// `Bytes::slice` of that chunk; only a line that actually spans two or more chunks pays a copy
-/// (into `partial`, unavoidable: `Bytes` can't cheaply concatenate two independent
-/// allocations). `docs/design/data-model.md`'s "`bytes::Bytes` everywhere strings and blobs
-/// appear" is what this exists to uphold.
+/// Splits read chunks into `\n`-terminated lines with a trailing `\r` stripped, carrying an
+/// incomplete line across chunks.
+///
+/// A line inside one chunk is a zero-copy `Bytes::slice` of it; only a line spanning chunks is
+/// copied into `partial`, since `Bytes` can't concatenate two allocations. That upholds
+/// `docs/design/data-model.md`'s "Strings and blobs are `bytes::Bytes` everywhere."
 pub struct LineSplitter {
     /// A line seen so far that hasn't reached its `\n` yet. Empty in the common case.
     partial: BytesMut,
     max_line_bytes: usize,
-    /// `true` while skipping the remainder of a line that already exceeded `max_line_bytes` --
-    /// spans however many `push` calls it takes to reach that line's own `\n`.
+    /// Skipping the rest of an oversized line, across as many `push` calls as it takes to reach
+    /// its `\n`. The line is counted dropped once, when detected.
     dropping: bool,
 }
 
@@ -88,11 +74,10 @@ impl LineSplitter {
         Self { partial: BytesMut::new(), max_line_bytes, dropping: false }
     }
 
-    /// Feeds one read chunk, calling `emit` once per complete line found (never including the
-    /// terminating `\n`, and with any trailing `\r` also stripped). Returns how many lines this
-    /// call dropped whole for exceeding `max_line_bytes` -- the caller decides how to report
-    /// that (`Diagnostics::warn_throttled`, a counter), since this type has no telemetry handle
-    /// of its own.
+    /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, no trailing `\r`).
+    ///
+    /// A line over `max_line_bytes` (measured before the `\r` strip) is dropped whole, never
+    /// truncated, and counted in the returned [`LineStats`].
     pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes)) -> LineStats {
         let mut stats = LineStats::default();
         let mut start = 0usize;
@@ -105,10 +90,10 @@ impl LineSplitter {
                 if nl.is_some() {
                     self.dropping = false; // this segment's newline closes the oversized line
                 }
-                // else: still mid-drop, this whole segment is discarded.
+                // No newline: the whole segment is still part of the dropped line.
             } else if self.partial.is_empty() {
                 if let Some(_i) = nl {
-                    // The whole line lives in this one chunk -- the zero-copy path.
+                    // Zero-copy path: the whole line is in this chunk.
                     if seg.len() > self.max_line_bytes {
                         stats.dropped_lines += 1;
                     } else {
@@ -140,10 +125,8 @@ impl LineSplitter {
         stats
     }
 
-    /// The file this splitter was reading is closing: returns whatever incomplete line was held
-    /// (never terminated by a `\n`), if any and if it wasn't itself already dropped for being
-    /// oversized. `tail_in`'s own precedent for "a final line with no trailing newline is still
-    /// real data, not framing to discard."
+    /// The file is closing: returns the held unterminated line, if any. A final line with no
+    /// `\n` is still data. An oversized line already being dropped isn't returned.
     pub fn take_partial(&mut self) -> Option<Bytes> {
         self.dropping = false;
         if self.partial.is_empty() {
@@ -152,10 +135,8 @@ impl LineSplitter {
         Some(strip_cr(self.partial.split().freeze()))
     }
 
-    /// How many bytes of the file this splitter has consumed but not yet turned into a complete
-    /// line -- read (and therefore already counted in the tailer's own offset) but never emitted.
-    /// `Tailer::write_checkpoint` subtracts this so a persisted offset never covers a line nothing
-    /// downstream has seen.
+    /// Bytes read (so already in the tailer's offset) but held as an incomplete line.
+    /// `Tailer::write_checkpoint` subtracts this so a checkpoint never covers an unemitted line.
     pub fn pending_bytes(&self) -> u64 {
         self.partial.len() as u64
     }
@@ -169,15 +150,13 @@ fn strip_cr(b: Bytes) -> Bytes {
     }
 }
 
-/// `tail_in`'s own [`TailDecoder`]: one line becomes one log event, unmodified, with a
-/// `log.file.path` attribute naming the file it came from. `message` stays a zero-copy
-/// [`Value::Str`] slice of whatever [`LineSplitter`] handed in -- this decoder never copies a
-/// line's bytes itself, matching `syslog_in`'s own zero-copy precedent.
+/// `tail_in`'s [`TailDecoder`]: one line becomes one raw log event with a `log.file.path`
+/// attribute. `message` is the [`LineSplitter`] slice itself, never a copy.
 pub struct LineDecoder {
     resource: Arc<Resource>,
     path_key: Symbol,
     path_value: Value,
-    #[allow(dead_code)] // carried for parity with decoders that do use it (diagnostics context)
+    #[allow(dead_code)] // parity with decoders that diagnose; this one never reads it
     diag: Diagnostics,
 }
 
@@ -322,9 +301,7 @@ mod tests {
         );
     }
 
-    /// The zero-copy promise: a fully-contained line's message must be a slice of the exact same
-    /// allocation the read chunk itself owns, not a copy -- `syslog_in`'s own precedent
-    /// (`crates/logit-inputs/src/syslog.rs`'s zero-copy tests).
+    /// A line inside one chunk is a slice of the chunk's allocation, not a copy.
     #[test]
     fn a_fully_contained_lines_message_is_a_zero_copy_slice_of_the_chunk() {
         let mut s = LineSplitter::new(1024);
