@@ -150,7 +150,8 @@ one and stricter than what the intake stored in testing
 
 ### `at_least_once` duplicates everything but series
 
-`datadog_out` isn't duplicate-safe. One batch is up to eight requests, and a retry re-sends the
+`datadog_out` isn't duplicate-safe. One batch goes out over up to eight routes, each as one or
+more requests (one per event, and a route over its size cap is split), and a retry re-sends the
 ones that succeeded. Datadog stores a resent series point once, the last write winning at its
 `(series, timestamp)`, but stores a resent log twice. Every other route is assumed to duplicate
 too. So the default posture is at-most-once, and a `5xx` or a timeout drops the batch.

@@ -1640,7 +1640,8 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 | events | one event |
 | traces | 3,200,000 bytes uncompressed |
 
-**Delivery.** One batch is up to eight requests, sent one after another. The first that fails
+**Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
+event, and a route over its size cap is split), sent one after another. The first that fails
 stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
 and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
 retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded. A trial
