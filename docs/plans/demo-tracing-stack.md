@@ -51,7 +51,7 @@ one `logit` gap that blocks the clean version.
 | Each tier logs `trace_id`/`span_id`/`trace_flags` as **separate JSON fields**, flags **decimal** | `trace_context` takes pre-split hex and decimal-only flags (`crates/logit-transforms/src/trace_context.rs::numeric_flags`) — its own doc comment explains why: a traceparent's 2-hex-digit flags octet would silently parse as the wrong decimal value if accepted directly. `logit` has no `traceparent` parser and this plan doesn't add one — the split happens in HAProxy vars, an nginx `map`, and Python. No `lua` component anywhere. |
 | Stock nginx, not `nginx:*-otel` | nginx only relays and logs the header; a `map` with positional regex captures does the split. Zero extra modules, zero exporter config. |
 | One `syslog_in` listener **per tier** | `set` writes the batch's *resource*, not per-event attributes. Tiers sharing one listener would interleave into one batch and get one wrong `service.name`. |
-| The demo keeps its own copies of every config | ADR `demo-stack-separate-from-dev-stack`. `demo/nginx/nginx.conf` is a new file adapted from `examples/nginx/nginx.conf`, not an edit of it — that file is a three-vhost njs proof artifact for [nginx-integration.md](nginx-integration.md) and stays as it is. |
+| The demo keeps its own copies of every config | ADR `demo-stack-separate-from-dev-stack`. `demo/nginx/nginx.conf` is a new file adapted from `fixtures/nginx/nginx.conf`, not an edit of it — that file is a three-vhost njs proof artifact for [nginx-integration.md](nginx-integration.md) and stays as it is. |
 | Host port 8080 stays the front door | It's what `demo/README.md` and the landing page's links promise. HAProxy takes it; nginx and the app become internal-only. |
 | The app tier keeps `service.name: demo-hello` through workstream A | Four panels in `demo/grafana/dashboards/logit-internal.json` hardcode `{service_name="demo-hello"}` (including a panel title). Renaming in A would blank them for no gain; the rename belongs in B, alongside the dashboard edit and the app rewrite. |
 | The app's own spans go straight to Tempo, not through `logit`'s `otlp_in` | A deliberate choice, made after B first landed the `otlp_in` route: not every telemetry leg needs `logit` in front of it, and this demo shows that honestly instead of routing everything through `logit` to prove it can. Tempo already accepts OTLP/HTTP natively (`demo/tempo/tempo.yaml`), so there's nothing for `logit` to add on this leg specifically. Leaves `otlp_in` genuinely unexercised by this demo — an accepted, named trade-off, not an oversight (see the gaps table above). |
@@ -291,8 +291,8 @@ that unblocks and its own follow-on plan for wiring it into the demo.
 
 ## Verification, across the whole plan
 
-1. `script/validate` — `logit validate` over `demo/logit.yaml` and every `examples/*.yaml`. Must
-   pass after every workstream; `examples/` must be untouched by all three.
+1. `script/validate` — `logit validate` over `demo/logit.yaml` and every `fixtures/*.yaml`. Must
+   pass after every workstream; `fixtures/` must be untouched by all three.
 2. `haproxy -c -f demo/haproxy/haproxy.cfg` before the first `up` — this is where the `bytes()`
    and `regsub()` quoting either works or doesn't.
 3. `script/demo up --build`, then `script/demo logs -f logit`: one `stdio_out` block per tier per

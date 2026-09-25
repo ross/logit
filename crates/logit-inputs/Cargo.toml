@@ -28,6 +28,10 @@ http-body-util.workspace = true
 flate2.workspace = true
 # datadog_in's zstd request decode (docs/adr/datadog-agent-and-intake-relay.md, decision 4).
 ruzstd.workspace = true
+# splunk_hec_in (docs/adr/splunk-hec-relay.md): the `/raw` query string, percent-decoded, and the
+# token a `Basic` `Authorization` header carries as its password.
+form_urlencoded.workspace = true
+base64.workspace = true
 # Listener TLS termination (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
 # `rustls-pki-types` build a `rustls::ServerConfig` from config-supplied PEM, and `tokio-rustls`'s
 # `TlsAcceptor` wraps each accepted `TcpStream` before the serving path sees it.

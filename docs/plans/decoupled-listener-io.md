@@ -333,7 +333,7 @@ omitted-as-`None`, unknown-field rejection); the `human_bytes::option` submodule
 
 **Done:** `script/schema` diff clean (75 lines added, all `ReceiveConfig`-shaped); `script/validate`
 passes every shipped config including the new commented `receive:` block in
-`examples/statsd-to-influxdb.yaml`.
+`fixtures/statsd-to-influxdb.yaml`.
 
 ## G. Telemetry catalog, `known-gaps.md` rewrite, docs
 
@@ -404,7 +404,7 @@ updated to `queue.rs`.
 > receive queue as a second consumer of the byte-aware bounding idea) were updated in the same
 > commit.
 
-**Done:** `examples/internal-telemetry.yaml` is the config the new metrics are exercisable through;
+**Done:** `fixtures/internal-telemetry.yaml` is the config the new metrics are exercisable through;
 [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md) is Accepted.
 
 ---

@@ -1,0 +1,60 @@
+# A synthetic load: `generate_in` renders a fixed number of events from a template, a `json`
+# stage parses their bodies, and `null_out` drops the result. Every perf scenario takes this shape
+# (docs/plans/load-test-harness.md). Run it directly to see the generator's completion line:
+#
+#   logit --log-format json run fixtures/generate-to-null.yaml
+#
+# It ends with `{"message":"generation complete","events":1000,...}` on stderr and exits 0 on its
+# own once `count` is reached; nothing here needs a signal or a timeout.
+components:
+  # No socket and no decoder, so a measurement is of the pipeline rather than of a load-generator
+  # process and a kernel socket buffer.
+  gen:
+    type: generate_in
+
+    # Total events; the last batch is short (`count % batch`) rather than rounded up. Omit for an
+    # unbounded soak run.
+    count: 1000
+
+    # Events per `EventBatch`. Lower it to measure the per-batch runtime cost instead.
+    batch: 100
+
+    # Target events/s. Kept low so the example is polite on a laptop; a real scenario omits it
+    # (generate as fast as backpressure allows) or sets it high. Above roughly a thousand batches
+    # per second the pacing is bursty within a millisecond; the average holds (docs/known-gaps.md).
+    rate: 5000
+
+    # Batch-level resource attributes, built once and shared by every event when all-literal. A
+    # placeholder renders once per batch, and in resource position `seq` is the batch ordinal, so
+    # `host: "h{seq%10}"` gives ten distinct resources cycling one per batch. Per-event
+    # cardinality goes in `event.attributes` below.
+    resource:
+      service.name: synthetic
+
+    event:
+      # The log body. `{{` and `}}` write literal braces; `{seq%50}` is the 0-based event counter
+      # modulo 50, so 50 distinct paths. A placeholder costs a rendering and a copy per event; a
+      # field with none is rendered once at startup.
+      log: '{{"method":"GET","path":"/x/{seq%50}","status":200,"bytes":1024}}'
+
+      # Literal keys, templated values: 10 distinct hosts.
+      attributes:
+        host: "web-{seq%10}"
+
+      # One metric per event: `kind` is sum, gauge, or distribution. A distribution generates raw
+      # samples, never a sketch; summarizing is `aggregate`'s job (docs/adr/lossless-transit.md).
+      metric:
+        name: requests
+        kind: sum
+        value: 1
+
+  # The stage under test. Swapping what sits here is how a scenario changes what it measures.
+  parse:
+    type: json
+    sources: [gen]
+
+  # Drops everything, so the measurement covers what's upstream of a sink with no encoder, socket,
+  # or filesystem in the number. To measure an encoder, swap in a `file_out` to /dev/null.
+  sink:
+    type: null_out
+    sources: [parse]

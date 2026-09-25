@@ -1,0 +1,34 @@
+# The tee a migration away from Splunk runs through (docs/splunk.md's "From Splunk"): HEC clients
+# point at `splunk_hec_in` instead of Splunk, and this config sends what arrives both to Splunk,
+# over `splunk_hec_out`, and to the new backend, here an OpenTelemetry Collector over `otlp_out`.
+# Splunk keeps receiving everything, the clients change only their URL, and undoing it is one URL
+# edit per client. Once the new backend is checked against Splunk, remove the `splunk` sink.
+#
+# `splunk_hec_in -> splunk_hec_out` is a lossless relay (docs/adr/splunk-hec-relay.md), modulo the
+# normalizations in the HEC codec's module doc (crates/logit-proto/src/splunk/mod.rs). Two of them
+# show in Splunk: a `/raw` client's body arrives split into lines and leaves through `/event`, so
+# Splunk's line breaking for that sourcetype doesn't run again; and a metric object with no
+# `metric_type` gains `metric_type=Gauge`.
+#
+# Clients keep the token they send Splunk: this listener checks it and the sink sends it on. When
+# the pipeline stalls, this listener answers `503` and the client retries, and a request that
+# carried several envelopes can then arrive twice. Give the sinks a `buffer:` if a backend may be
+# unreachable for long.
+components:
+  hec:
+    type: splunk_hec_in
+    bind: 127.0.0.1:8088
+    tokens: [!env SPLUNK_HEC_TOKEN]
+
+  splunk:
+    type: splunk_hec_out
+    sources: [hec]
+    endpoint: https://splunk.example.com:8088/services/collector
+    token: !env SPLUNK_HEC_TOKEN
+    # A HEC client's histogram arrives as the exporter's `_bucket`/`_sum`/`_count` series, which
+    # are plain gauges here, so `multi_value: skip` (the default) drops nothing a client sent.
+
+  new_backend:
+    type: otlp_out
+    sources: [hec]
+    endpoint: http://otel-collector:4318

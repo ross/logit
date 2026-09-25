@@ -7,10 +7,11 @@
 //! either route.
 
 use super::events::{non_empty_str, seconds, ATTR_STATSD_TIMESTAMP};
-use super::logs::{new_batch, parse_json, value_text, write_i64, write_str, JsonObject};
+use super::logs::{new_batch, parse_json};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
 use super::{is_service_check, DatadogDecoder, DatadogEncoder};
+use crate::json::{value_text, write_i64, write_str, JsonObject};
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::attrs::merged;
