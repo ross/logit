@@ -216,10 +216,20 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut configs = vec![root.join("demo/logit.yaml")];
         configs.extend(
-            std::fs::read_dir(root.join("examples"))
+            std::fs::read_dir(root.join("fixtures"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
+        // One directory per example, each with a `logit.yaml`; a directory without one fails
+        // `load_with` below.
+        let examples_dir = root.join("examples");
+        configs.extend(
+            std::fs::read_dir(&examples_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", examples_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .map(|dir| dir.join("logit.yaml")),
         );
         // `perf/scenarios/`, `script/shape-survey`'s capture configs, and `script/victoria-interop`'s
         // leg configs run only out of CI, so a field rename must fail here, not on their next run.
@@ -253,7 +263,7 @@ mod tests {
         );
         configs.sort();
 
-        assert!(configs.len() > 1, "expected demo and example configs");
+        assert!(configs.len() > 1, "expected demo and fixture configs");
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),

@@ -143,7 +143,7 @@ allocation row and confuse this diff).
 - `logfmt`/`kv` ship tested (44 new tests across `crates/logit-transforms/src/logfmt.rs`,
   `crates/logit-cli/src/pipeline.rs`, and `crates/logit-pipeline/src/graph.rs`, plus a new
   integration test in `crates/logit-transforms/src/lib.rs`) but, like `otlp_in`, unexercised by
-  `demo/`/`examples/` -- no shipped config needs one yet, and adding an example config for its own
+  `demo/`/`fixtures/` -- no shipped config needs one yet, and adding an example config for its own
   sake isn't this PR's job.
 - A value containing `pair_sep` is not representable in `kv` -- an operator with that shape needs
   `logfmt` (which quotes) instead, or a different `pair_sep` choice. This is a real, documented

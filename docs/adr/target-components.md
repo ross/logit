@@ -24,7 +24,7 @@ equality-only subcase, producing `has_attributes`/`drop_attributes`
 
 Both of those fired on the same topology: one `logit_out` carrying N tagged streams over one
 connection, and a central `logit_in` splitting them back apart
-(`examples/fan-out-edge.yaml`/`examples/fan-out-central.yaml`). That central half today reads:
+(`fixtures/fan-out-edge.yaml`/`fixtures/fan-out-central.yaml`). That central half today reads:
 
 ```
                           /--> host_stream (has_attributes) --> ...
@@ -252,6 +252,6 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
 - **Docs.** `component-graph-configuration` and `routing-by-condition-is-lua` each gain a dated
   amendment, not a rewrite; `pipeline-graph.md`, `lua-api.md`, `internal-telemetry.md`,
   `memory.md`, `known-gaps.md`, `deploying.md` (the `alias` node state) updated;
-  `examples/fan-out-central.yaml` rewritten onto `route` + targets with `fan-out-edge.yaml`
+  `fixtures/fan-out-central.yaml` rewritten onto `route` + targets with `fan-out-edge.yaml`
   untouched -- the same edge config, a central config that no longer clones.
 - **Build-out:** [`docs/plans/target-components.md`](../plans/target-components.md).

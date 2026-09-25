@@ -4,7 +4,7 @@
 # compose.yaml seeds for the dev stack; change `url`/`org`/`bucket` for yours. `token: !env
 # INFLUXDB_TOKEN` reads the token from the environment (docs/adr/env-yaml-tag.md).
 #
-# No `aggregate`, unlike examples/statsd-to-influxdb.yaml: every collectd value list is already
+# No `aggregate`, unlike fixtures/statsd-to-influxdb.yaml: every collectd value list is already
 # one reading per `Interval` with its own timestamp, and a window would re-window it and re-stamp
 # it with the flush time. Add one only when the incoming interval is finer than what you store.
 #

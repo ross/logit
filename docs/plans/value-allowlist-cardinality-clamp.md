@@ -108,13 +108,13 @@ A `build_spec` arm plus `fn to_allow_lists(...)` beside `to_set_pairs`, converti
 `docs/design/pipeline-graph.md` (`ComponentKind` sketch, arity table, rule 54 text),
 `docs/design/internal-telemetry.md` (the three counters), `docs/design/memory.md` (the allocation
 rows), `crates/logit-transforms/src/lib.rs` (module doc + `mod`/`pub use`), `AGENTS.md`
-(current-state paragraph, crate-layout line), `examples/nginx-to-influxdb.yaml` (the demonstrator),
+(current-state paragraph, crate-layout line), `fixtures/nginx-to-influxdb.yaml` (the demonstrator),
 `schema/logit.schema.json` (regenerated).
 
 ### The example (W2)
 
 Inserted between `trimmed` (`keep`) and `windowed` (`aggregate`) in
-`examples/nginx-to-influxdb.yaml`:
+`fixtures/nginx-to-influxdb.yaml`:
 
 ```yaml
   bounded:
@@ -135,7 +135,7 @@ Inserted between `trimmed` (`keep`) and `windowed` (`aggregate`) in
 |---|---|---|---|
 | W0 | **ADR and plan.** | `docs/adr/value-allowlist-cardinality-clamp.md` (new, + row atop `docs/adr/README.md`); `docs/plans/value-allowlist-cardinality-clamp.md` (new, + row atop `docs/plans/README.md`) | — |
 | W1 | **`keep_values` — the component.** | `crates/logit-config/src/lib.rs`; `crates/logit-pipeline/src/graph.rs`; `crates/logit-transforms/src/keep_values.rs` (new); `crates/logit-transforms/src/lib.rs`; `crates/logit-cli/src/pipeline.rs`; `schema/logit.schema.json` | W0 |
-| W2 | **Docs, example, and the allocation pin.** | `examples/nginx-to-influxdb.yaml`; `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `AGENTS.md`; `docs/known-gaps.md` | W1 |
+| W2 | **Docs, example, and the allocation pin.** | `fixtures/nginx-to-influxdb.yaml`; `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `AGENTS.md`; `docs/known-gaps.md` | W1 |
 
 Landing order: **W0 → W1 → W2**, strictly linear. Config, validation, transform and registry are one
 PR because `build_spec`'s match is exhaustive — a variant added without its arm doesn't compile, and
@@ -178,12 +178,12 @@ allowed value pinning 0, and an uppercase value that must be lowered pinning 1, 
 
 - `script/check` during the loop; `script/cibuild` before each PR.
 - `script/schema` after the W1 config change; commit the result.
-- `script/validate` over `demo/`, `examples/`, `perf/scenarios/`.
+- `script/validate` over `demo/`, `fixtures/`, `perf/scenarios/`.
 - Negative config check by hand: both maps empty; empty field name; `allow: []`; `allow: [.nan]`;
   `normalize: [lower]` with `allow: [Static.Local]`; `normalize: [lower, lower]`.
 - `logit graph` on the edited example — `bounded` renders as an ordinary transform node between
   `trimmed` and `windowed`.
-- Manual smoke: `script/server` against `examples/nginx-to-influxdb.yaml` plus the real nginx,
+- Manual smoke: `script/server` against `fixtures/nginx-to-influxdb.yaml` plus the real nginx,
   `curl -H 'Host: static.local'`, `-H 'Host: STATIC.Local'`, `-H 'Host: junk.example'`, `-H
   'Host: proxy.local'`, and no `Host` at all. Expect InfluxDB to show `host=static.local` (both
   casings folded) and a single `host=other` series, no per-junk-value series. **Done 2026-09-16**:

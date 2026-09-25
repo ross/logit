@@ -222,7 +222,7 @@ three are recorded in `docs/known-gaps.md`.
 - `crates/logit-cli/src/pipeline.rs`: `build_spec`'s `StatsdOut` arm, and the sole place a
   `logit_config::StatsdFormat`/`StatsdTransport` value crosses into `logit_outputs::statsd`'s own
   mirror types.
-- `examples/statsd-relay.yaml` (new): a runnable relay config exercising the sink.
+- `fixtures/statsd-relay.yaml` (new): a runnable relay config exercising the sink.
 - `docs/known-gaps.md`: new entries for the v1 metric-kind deferral (and its timer-drop
   consequence for the `statsd_in -> aggregate -> statsd_out` path), no egress timestamp, no
   `unit`, no metric prefix/rename anywhere in the pipeline, and no TLS/DTLS.

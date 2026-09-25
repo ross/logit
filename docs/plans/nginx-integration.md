@@ -313,15 +313,15 @@ external environment involved.
 
 **Files:**
 
-- `examples/nginx/` — a Dockerfile (`FROM nginx:1`) and an nginx.conf representative of the target
+- `fixtures/nginx/` — a Dockerfile (`FROM nginx:1`) and an nginx.conf representative of the target
   properties above: a JSON `log_format` with `escape=json`, `access_log` directed to *both* stdout
   and `syslog:server=logit:5140,tag=nginx_access,nohostname` (two `access_log` directives are legal
   in nginx), and a couple of vhosts — one proxied, one static — so `upstream_response_time` is
   sometimes present and sometimes `-`.
 - `compose.yaml` — add an `nginx` service on the existing `logit` network.
-- `examples/nginx-to-influxdb.yaml` — the reference topology above, `token: !env INFLUXDB_TOKEN`,
-  alongside today's `examples/statsd-to-influxdb.yaml`.
-- `script/server examples/nginx-to-influxdb.yaml`, then drive it with a `curl` loop.
+- `fixtures/nginx-to-influxdb.yaml` — the reference topology above, `token: !env INFLUXDB_TOKEN`,
+  alongside today's `fixtures/statsd-to-influxdb.yaml`.
+- `script/server fixtures/nginx-to-influxdb.yaml`, then drive it with a `curl` loop.
 
 **First task, before anything else in this workstream:** measure whether nginx's syslog messages
 truncate. nginx caps a syslog message at `NGX_SYSLOG_MAX_STR` (1024 bytes total, including the
@@ -337,7 +337,7 @@ checkpoint-aware tailing, so it's the larger fallback, not the first one to reac
 **Test list (manual, this is an integration proof, not unit tests):** `curl` loop produces visible
 `stdio_out` lines carrying both the log body and its derived metrics; Grafana query against the
 InfluxDB bucket the example writes to shows correctly-tagged series; `logit graph
-examples/nginx-to-influxdb.yaml | dot -Tsvg` renders the fan-out after `nginx_metrics` and shows
+fixtures/nginx-to-influxdb.yaml | dot -Tsvg` renders the fan-out after `nginx_metrics` and shows
 `keep` sitting between it and `aggregate`; an oversized request (long query string, long user agent)
 settles the truncation question definitively.
 
@@ -381,7 +381,7 @@ a `logit` instance and see metrics land in Grafana.
   event — A's model change proving itself in one screenful.
 - Grafana query: `nginx.requests` tagged with host/status/method and nothing else. A client-address
   or user-agent tag showing up means `keep` is in the wrong place in the graph.
-- `logit graph examples/nginx-to-influxdb.yaml | dot -Tsvg` — the fan-out after `nginx_metrics`
+- `logit graph fixtures/nginx-to-influxdb.yaml | dot -Tsvg` — the fan-out after `nginx_metrics`
   visible, `keep` sitting between it and `aggregate`.
 - An oversized request settling F's truncation question.
 - SIGTERM mid-window (B) — the partial aggregation window flushes rather than being lost.
