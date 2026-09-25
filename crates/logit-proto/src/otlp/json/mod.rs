@@ -102,15 +102,19 @@ fn bool_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<bool, CodecErro
     }
 }
 
-/// A 64-bit unsigned field: a JSON number or a decimal string.
+/// A 64-bit unsigned field: a JSON number or a decimal string. The string takes no sign: Rust's
+/// `u64::from_str` accepts a leading `+`, but the OTel Collector's unmarshaler parses the string
+/// with Go's `strconv.ParseUint`, which permits no sign prefix.
 fn parse_u64(v: &JsonValue, field: &str) -> Result<u64, CodecError> {
     match v {
         JsonValue::Number(n) => n
             .as_u64()
             .ok_or_else(|| malformed(format!("{field} must be a non-negative integer, got {n}"))),
-        JsonValue::String(s) => s
-            .parse::<u64>()
-            .map_err(|_| malformed(format!("{field} must be a decimal integer string, got {s:?}"))),
+        JsonValue::String(s) => {
+            s.parse::<u64>().ok().filter(|_| !s.starts_with('+')).ok_or_else(|| {
+                malformed(format!("{field} must be a decimal integer string, got {s:?}"))
+            })
+        }
         other => Err(malformed(format!("{field} must be a number or numeric string, got {other}"))),
     }
 }
@@ -359,6 +363,18 @@ mod tests {
             u64_field(as_string.as_object().unwrap(), "timeUnixNano", "time_unix_nano").unwrap(),
             42
         );
+    }
+
+    #[test]
+    fn an_unsigned_64_bit_string_with_a_plus_sign_is_malformed() {
+        let signed = obj(r#"{"timeUnixNano": "+5"}"#);
+        match u64_field(signed.as_object().unwrap(), "timeUnixNano", "time_unix_nano") {
+            Err(CodecError::Malformed(msg)) => assert_eq!(
+                msg, r#"timeUnixNano must be a decimal integer string, got "+5""#,
+                "{msg}"
+            ),
+            other => panic!("expected CodecError::Malformed, got {other:?}"),
+        }
     }
 
     #[test]

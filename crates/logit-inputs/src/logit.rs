@@ -416,14 +416,8 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// Serves one accepted (and, with TLS on, already TLS-handshaken) connection to completion:
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
-/// `logit.proto.errors{reason}`: `handshake` (the handshake failed), `too_large` (a header
-/// declared a payload over `max_frame_bytes`, or a `compressed_len` over
-/// `frame::compressed_bound` of it; answered `Reject{FRAME_TOO_LARGE}`), `truncated` (the body
-/// read hit EOF or an I/O error), `crc`, `codec` (a frame not under the negotiated codec),
-/// `decode_budget` (a batch that decodes past its `native::DecodeBudget`; also answered
-/// `Reject{FRAME_TOO_LARGE}`), `magic` (any other
-/// malformed frame, or an undecodable batch), `ack_write_stalled` and `reject_write_stalled`
-/// (module doc's "Bounded writes"). A close or error mid-header is not counted.
+/// Counts every rejection under `logit.proto.errors{reason}`; `docs/design/internal-telemetry.md`'s
+/// `logit_in` section is the canonical list of reasons. A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,

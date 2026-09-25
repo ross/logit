@@ -1,0 +1,107 @@
+[package]
+name = "logit-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, outside the root one, so libfuzzer-sys and the sanitizer build never enter
+# the stable build or CI (docs/adr/out-of-ci-fuzzing.md). `script/unsafe-check fuzz` drives it.
+[workspace]
+members = [".", "seedgen"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+logit-core = { path = "../crates/logit-core" }
+logit-proto = { path = "../crates/logit-proto" }
+
+# Symbols in a crash's stack trace.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "native_frame"
+path = "fuzz_targets/native_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_batch_v1"
+path = "fuzz_targets/native_batch_v1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_batch_v2"
+path = "fuzz_targets/native_batch_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_control"
+path = "fuzz_targets/native_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sketch_bytes"
+path = "fuzz_targets/sketch_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sketch_merge"
+path = "fuzz_targets/sketch_merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hll_bytes"
+path = "fuzz_targets/hll_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_proto"
+path = "fuzz_targets/otlp_proto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_json"
+path = "fuzz_targets/otlp_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp_grpc"
+path = "fuzz_targets/otlp_grpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prom_decompress"
+path = "fuzz_targets/prom_decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prom_remote_write"
+path = "fuzz_targets/prom_remote_write.rs"
+test = false
+doc = false
+bench = false

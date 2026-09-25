@@ -26,7 +26,7 @@ pub fn write_uvarint(out: &mut BytesMut, mut v: u64) {
 /// The 10th byte carries bit 63 alone, so it must be `0x00` or `0x01`; anything else overflows a
 /// `u64` and is `Malformed` rather than silently truncated. An over-long encoding of a smaller
 /// value (`80 00` for 0) is accepted: no writer emits one, and rejecting it costs a compare per
-/// byte.
+/// byte. Both rules are decided in ADR `untrusted-input-bounds`.
 pub fn read_uvarint(bytes: &mut Bytes) -> Result<u64, CodecError> {
     let mut result: u64 = 0;
     for i in 0..10 {
@@ -72,7 +72,7 @@ pub fn read_ivarint(bytes: &mut Bytes) -> Result<i64, CodecError> {
 
 /// Fails with [`CodecError::Malformed`] naming `what` if a length-carved slice has bytes its
 /// reader didn't consume. Every carve in the native payload ends with this check, so a payload
-/// decodes only if re-encoding it would reproduce it.
+/// decodes only if re-encoding it would reproduce it (ADR `untrusted-input-bounds`).
 #[inline]
 pub(crate) fn ensure_consumed(bytes: &Bytes, what: &str) -> Result<(), CodecError> {
     if bytes.is_empty() {

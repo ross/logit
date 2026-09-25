@@ -42,11 +42,11 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 
 | # | Lead | Entry | Status |
 |---|---|---|---|
-| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → dos/w2 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` in-progress (dos/w3) |
-| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | in-progress (dos/w3); WIRE-03 findings → dos/w2: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is W3's |
+| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → #370 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` done: findings → #369 (decoded `bin_limit` capped, Agent keys range-checked) |
+| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → #369 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 findings → #370: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is CORE-06's |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | in-progress (dos/w6) |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
-| 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 in-progress (dos/w4); measured 2026-09-25: JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; downgraded to P2 pending W4's pinning tests. CORE-17 open |
+| 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 open |
 | 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | open |
 | 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | open |
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
@@ -56,7 +56,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | in-progress (dos/w7) |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
-| 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | in-progress (dos/w4) |
+| 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
@@ -193,18 +193,18 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | unreviewed (lead 11 fixed in #333) |
 | [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | unreviewed |
 | [RT-11](#rt-11--lua-node-hosting-os-thread-two-oneshot-handshake-catch_unwind-handleblock_on) | P0 | Lua node hosting: OS thread, two-oneshot handshake, `catch_unwind`, `Handle::block_on` | `runtime.rs` (`run_lua`, `watch_lua_thread`, `run_lua_loop`) | unreviewed |
-| [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → dos/w2 |
-| [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → dos/w2 |
-| [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → dos/w2 |
+| [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → #370 |
+| [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → #370 |
+| [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → #370 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
 | [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | in-progress (dos/w6) |
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | in-progress (dos/w6) |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | in-progress (dos/w6) |
-| [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P0 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | in-progress (dos/w4) |
-| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | in-progress (dos/w3) |
-| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | in-progress (dos/w3) |
+| [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P2 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | reviewed @dc39d1c (pinned, no change) |
+| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | findings → #369 |
+| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | findings → #369 |
 | [CORE-15](#core-15--scriptworker-vm-lifecycle-the-luajit-sandbox-and-return-value-validation) | P0 | `ScriptWorker`: VM lifecycle, the LuaJIT sandbox, and return-value validation | `crates/logit-script/src/lib.rs` (`sandbox_libs`, `remove_unsandboxed_base_globals`, `ScriptWorker`) | unreviewed |
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | unreviewed |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | unreviewed |
@@ -255,7 +255,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CODEC-12](#codec-12--prometheus-textopenmetrics-decoder--line-grammar-family-assembler-and-cumulative-bucket-reconstruction) | P1 | Prometheus text/OpenMetrics decoder — line grammar, family assembler, and cumulative-bucket reconstruction | `crates/logit-proto/src/prometheus/text.rs` (`parse_with`, `Parser`, `parse_sample`) | unreviewed |
 | [CODEC-13](#codec-13--prometheus-remote-write-decoder--snappy-decompression-bomb-guard-and-the-20-symbol-table-indirection) | P1 | Prometheus remote-write decoder — Snappy decompression-bomb guard and the 2.0 symbol-table indirection | `crates/logit-inputs/src/prometheus.rs` (`snap::raw::decompress_len` gate) | unreviewed |
 | [CODEC-14](#codec-14--influxdb-line-protocol-encoder--collision-avoiding-timestamp-allocator-and-fieldtag-escaping) | P1 | InfluxDB line-protocol encoder — collision-avoiding timestamp allocator and field/tag escaping | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`) | unreviewed |
-| [CODEC-17](#codec-17--otlp-decode--unguarded-u64-as-i64-timestamp-cast-on-every-wire-timestamp-field-logstracesmetrics) | P1 | OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics) | `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`) | in-progress (dos/w4) |
+| [CODEC-17](#codec-17--otlp-decode--unguarded-u64-as-i64-timestamp-cast-on-every-wire-timestamp-field-logstracesmetrics) | P1 | OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics) | `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`) | findings → #366 |
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
 | [CORE-02](#core-02--keycache-hand-rolled-cursor-scan-memo-in-front-of-the-interner) | P1 | `KeyCache`: hand-rolled cursor-scan memo in front of the interner | `crates/logit-core/src/interner.rs` (`KeyCache::get_or_intern`) | unreviewed |
 | [CORE-03](#core-03--attrmap-sorted-inline-smallvec-and-the-resourceevent-merge-join) | P1 | `AttrMap`: sorted inline `SmallVec` and the resource⊕event merge-join | `crates/logit-core/src/attrs.rs` (`AttrMap`, `merged`) | unreviewed |
@@ -3593,7 +3593,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `Truncated` vs `Malformed` classification makes a disk-spool reader silently discard every
   record after the bad one — see the assertion message in `rejects_a_compressed_len_over_the_sanity_cap`); nontrivial-3p-use(lz4_flex) (raw
   *block* API with caller-sized buffers, `decompress_into` + truncate, not the framed API).
-- **Invariants to verify:** *(checked in `dos/w2`: a fresh-context refuter pass over the code
+- **Invariants to verify:** *(checked in #370: a fresh-context refuter pass over the code
   and `lz4_flex` 0.14's source, then the implementer's tests)*
   - ✅ CRC is computed and checked over exactly the bytes on the wire (compressed form), on both
     sides, and always *before* decompression runs. **Holds**: `read_frame_with_header` checks
@@ -5325,9 +5325,25 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Observed concerns (unverified but high-confidence as a real gap in defense-in-depth):** the missing local depth cap is real and directly confirmed by reading `any_value`; whether it is *currently exploitable* hinges entirely on the unverified `serde_json` assumption above. If that assumption ever stops holding (a `serde_json` version/feature change, or a future switch to a streaming/SAX-style JSON parser that builds `AnyValue` incrementally instead of via a full `Value` tree), there would be nothing in this crate's own code to catch it — unlike the native format and graphite/pickle, which both defend themselves locally rather than relying on an upstream crate's internal limit.
 - **Existing coverage:** `crates/logit-proto/src/otlp/json/{mod,logs,metrics,traces}.rs` each have unit tests, but no recursion/depth-specific test was located for this path (unlike the native wire format, which `robustness.rs` explicitly covers for over-depth nesting). `crates/logit-proto/tests/otlp_fixed_point.rs` is round-trip-focused, not adversarial-input-focused. No `robustness.rs` section exists for OTLP at all. Governed by ADR `otlp-json-decoding`.
 - **Suggested verification approach:** (1) first and cheapest: construct a deeply nested (e.g. 10,000–100,000-level) `{"arrayValue":{"values":[{"arrayValue":{"values":[...` JSON payload, well under any configured request-body size cap, and feed it through `otlp_in`'s actual HTTP/JSON path (ideally under a debug build with a deliberately small thread stack to make a real stack overflow reproducible rather than merely plausible) to empirically settle whether `serde_json`'s limit actually protects this code today; (2) if it does not protect it, add an explicit depth counter threaded through `any_value`/`array_field`/`key_values`, mirroring `MAX_PICKLE_DEPTH`'s pattern, with a `CodecError::Malformed` past a small cap (64–128 levels — no real OTLP producer nests attributes anywhere near that deep); (3) either way, add a `robustness.rs`-style depth-cap test for this path so the answer stays pinned regardless of `serde_json`'s own behavior; (4) separately check the protobuf-path `AnyValue` decode in `common.rs` for the same gap, since it's a different code path entirely.
-- **Priority:** P0 (provisional pending the empirical check above) — untrusted network input, fully custom recursive decoding logic, and a directly analogous bug class this exact codebase already fuzzes and caps in two sibling codecs (native `decode_batch`, graphite `pickle`) but has not applied here; downgrade to P2 the moment the `serde_json`-recursion-limit assumption is empirically confirmed to hold and a defense-in-depth cap is judged unnecessary, but until that test is run this should be treated as a live, unverified DoS candidate rather than a stylistic nitpick.
+- **Priority:** ~~P0 (provisional pending the empirical check above) — untrusted network input, fully custom recursive decoding logic, and a directly analogous bug class this exact codebase already fuzzes and caps in two sibling codecs (native `decode_batch`, graphite `pickle`) but has not applied here; downgrade to P2 the moment the `serde_json`-recursion-limit assumption is empirically confirmed to hold and a defense-in-depth cap is judged unnecessary, but until that test is run this should be treated as a live, unverified DoS candidate rather than a stylistic nitpick.~~ **P2.**
 - **Measured 2026-09-25:** JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under
   native's 128; downgraded to P2 pending W4's pinning tests.
+- **Verified 2026-09-25** (`dos/w4`, atop `dos/w0` `dc39d1c`): **pinned, no change.** Both
+  parsers' limits hold, measured by construction. serde_json 1.0.151 rejects past 128 JSON levels
+  ("recursion limit exceeded"), which bounds OTLP/JSON at 41 `AnyValue` levels (`arrayValue` in a
+  resource attribute; 31 for `kvlistValue`, fewer deeper in a message); a 100,000-deep body fails
+  the same way at column 128. prost 0.14.4's `RECURSION_LIMIT` of 100 bounds protobuf at 49
+  levels (`kvlistValue` 33), error "recursion limit reached". Neither `unbounded_depth` nor
+  `no-recursion-limit` is enabled (`cargo tree -e features`). Both bounds sit under native's
+  `MAX_VALUE_DEPTH` (128), so an OTLP-decoded event always re-encodes natively. A local
+  defense-in-depth cap is declined under ADR `deployment-threat-model`; instead
+  `crates/logit-proto/tests/robustness.rs` pins both numbers
+  (`otlp_json_nesting_is_bounded_by_serde_json_at_41_any_value_levels`,
+  `otlp_proto_nesting_is_bounded_by_prost_at_49_any_value_levels`,
+  `otlp_nesting_stays_under_the_native_depth_cap`), so a dependency bump that moves either fails
+  a test. `otlp/common.rs`'s module doc records the rule. The same section's
+  `otlp_json_peak_memory_per_input_byte_is_documented` pins OTLP/JSON's peak heap per input byte
+  (about 19 ordinary, 98 crafted; `docs/known-gaps.md`'s OTLP section).
 
 ### CODEC-17 — OTLP decode — unguarded `u64 as i64` timestamp cast on every wire timestamp field (logs/traces/metrics)
 - **Location:** `crates/logit-proto/src/otlp/logs.rs` (`decode_log_record`'s `time_unix_nano`/`observed_time_unix_nano`, including the `observed_timestamp` field it sets); `crates/logit-proto/src/otlp/traces.rs` (`decode_span`'s `start_time_unix_nano`/`end_time_unix_nano`); `crates/logit-proto/src/otlp/metrics.rs` (`decode_exemplar` and every data-point branch of `decode_metric`: `time_unix_nano`/`start_time_unix_nano`)
@@ -5341,7 +5357,17 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Observed concerns (unverified -> now verified as a real gap):** this is not a hypothetical — it was directly confirmed by reading `decode_log_record` (`if record.time_unix_nano != 0 { record.time_unix_nano as i64 } else { ... }` with no bounds check), and the equivalent pattern repeats verbatim in `traces.rs` and `metrics.rs`. Confidence: high that the cast is unguarded as read; moderate on real-world exploitability/severity, since it requires an attacker or misbehaving sender to emit a timestamp value that is already nonsensical (>287 years in the future) for it to trigger, and the consequence is a wrong timestamp on one event rather than a crash or unbounded resource use. Checked `docs/known-gaps.md` for an existing acknowledgment of this specific gap — found none; the file does document the *general* principle that receipt-time vs. sender-time handling needs care (syslog's, elsewhere), but nothing calling out OTLP's timestamp casts by name.
 - **Existing coverage:** `crates/logit-proto/src/otlp/logs.rs`, `traces.rs`, and `metrics.rs` each have a `mod tests`; these unit tests exist but (based on the test names visible via grep — `unwrap()`-heavy round-trip assertions) appear focused on the normal-range/round-trip cases, not adversarial out-of-range timestamps; no test constructing a `time_unix_nano` >= `i64::MAX` was found. `crates/logit-proto/tests/otlp_fixed_point.rs` likely covers round-trip fixed points for realistic values only (not independently re-read for this specific edge case). No `robustness.rs` coverage for OTLP at all (that file's own module doc doesn't name it). Governed by ADR `otlp-json-decoding`, `docs/design/data-model.md`; `docs/known-gaps.md`'s timestamp-precedence entries address a related-but-distinct concern (receipt vs. sender time) and do not cover this.
 - **Suggested verification approach:** a unit test per file (logs/traces/metrics) constructing a wire message with `time_unix_nano = u64::MAX` (and `i64::MAX + 1` exactly, the boundary) and asserting the decoded `Event`'s timestamp is *not* silently negative — then decide and implement the actual desired behavior (reject the record, clamp to `i64::MAX`, or omit the field with a diagnostic, mirroring syslog's `OutOfRange` handling) and apply it uniformly across all enumerated call sites, ideally through one shared helper (`fn wire_time_to_nanos(u64) -> Option<i64>` or similar) rather than three independently-repeated bare casts.
-- **Priority:** P1 — genuine, verified, previously-unflagged silent-data-corruption bug reachable from fully untrusted network input (OTLP/HTTP and OTLP/gRPC both accept arbitrary `fixed64` timestamps), inconsistent with the project's own established, more careful handling of the identical failure mode elsewhere (syslog); not P0 only because the trigger condition (a timestamp implying a date past 2262) is unusual enough that it's far more likely to surface from a buggy sender's garbage value than a deliberate attack, and the consequence is corrupted metadata on affected records rather than a crash or resource exhaustion.
+- **Priority:** ~~P1 — genuine, verified, previously-unflagged silent-data-corruption bug reachable from fully untrusted network input (OTLP/HTTP and OTLP/gRPC both accept arbitrary `fixed64` timestamps), inconsistent with the project's own established, more careful handling of the identical failure mode elsewhere (syslog); not P0 only because the trigger condition (a timestamp implying a date past 2262) is unusual enough that it's far more likely to surface from a buggy sender's garbage value than a deliberate attack, and the consequence is corrupted metadata on affected records rather than a crash or resource exhaustion.~~ **fixed in #366; stays P1 as the record of what it was.**
+- **Verified 2026-09-25** (`dos/w4`, atop `dos/w0` `dc39d1c`): **fixed: all 17 decode sites
+  saturate.** Against the old code, a wire value of `i64::MAX + 1` decoded as `i64::MIN` and
+  `u64::MAX` as `-1`, on both protobuf and JSON. One helper, `otlp/common.rs`'s `wire_nanos`, now
+  maps a value past `i64::MAX` to `i64::MAX` at every site: `decode_log_record` (3),
+  `decode_span_event` and `decode_span` (3), and `decode_exemplar` plus both time fields of all
+  five `decode_metric` kinds (11). The encoder's `.max(0)` clamps are untouched, so a saturated
+  value relays as 2262-04-11T23:47:16.854775807Z, a permitted normalization under ADR
+  `lossless-transit`. `crates/logit-proto/tests/robustness.rs`'s
+  `every_otlp_wire_timestamp_past_i64_max_saturates` (both encodings, both boundary values, every
+  field) and `a_saturated_timestamp_relays_as_i64_max` fail on the old code and pass on the new.
 
 ---
 
@@ -5463,7 +5489,21 @@ the telemetry buffers are `std::collections::HashMap`.
   re-binned into the receiver's. Every location, invariant, and concern above describes the removed wrapper.
   Nobody has re-reviewed the replacement. Start from `sketch.rs`'s `merge`, `from_bytes`, and
   `malformed_bytes_are_rejected_not_panicked_on`, and check the decode-side bounds (bin counts, key ranges,
-  weights) as well as merge. The re-review is `dos/w3`.
+  weights) as well as merge. The re-review is #369.
+- **Verified 2026-09-25** (#369): ~~the wrapper and its `.expect()`~~ are gone,
+  and the hand-rolled `sketch::DdSketch`'s `merge` can't panic: a fresh-context refuter drove
+  degenerate mappings, non-finite counts, and hostile summaries through it, and the new
+  `crates/logit-core/tests/robustness.rs` runs truncations, seeded bit flips, and hostile counts
+  through `from_bytes` and every operation `aggregate` runs after it. **fixed: two decode bounds.**
+  A decoded `bin_limit` was unbounded (`u32::MAX` meant no collapse, so a cross-mapping merge of
+  two such sketches took 62 s at 320k bins); `Mapping::MAX_BIN_LIMIT` (4096) now caps it
+  (`a_decoded_bin_limit_past_the_cap_is_malformed`,
+  `a_cross_mapping_merge_of_two_capped_sketches_is_bounded`). An Agent-mapped blob accepted any
+  `i32` key, and `datadog_out` negates a negative-store key (`i32::MIN` panicked in debug); keys
+  outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
+  `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
+  large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
+  `docs/known-gaps.md`.
 
 ---
 
@@ -5485,6 +5525,18 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `hyperloglog_*` tests and `hll_slice_len_matches_upstream_constant`) — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner).
 - **Suggested verification approach:** **run the HLL tests under Miri and ASan specifically** (this is the one place in the area where UB is the documented failure mode); fuzz `from_bytes` with arbitrary bytes; proptest merge as a set-union law; add a guard test that pins serde's `with_capacity`-from-`size_hint` behaviour if one can be written.
 - **Priority:** **P0** — untrusted bytes feeding a codec whose stated purpose is preventing UB in a dependency, with version-pinned constants mirrored by hand.
+- **Verified 2026-09-25** (#369): the size hint is the rounded capacity, a
+  `None` tag is rejected, and canonicalization clears only bits upstream discards. **fixed:** a
+  zero-register count past `M` (4096) panicked upstream's `estimate` in debug and read 0 in release,
+  and now fails decode; a blob with trailing bytes decoded `Ok` and now fails. ~~Only the first has
+  a guard test~~: serde's preallocation is now pinned by
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, and the
+  circular `hll_slice_len_matches_upstream_constant` is replaced by
+  `hll_slice_len_matches_what_upstream_serializes`, which measures a blob upstream wrote. A merge-law
+  proptest checks union on `estimate`. Miri runs the HLL tests only under
+  `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`, where a regressed hint still fails
+  with the `Layout` error (ADR `out-of-ci-unsafe-verification`'s "Sketch and HyperLogLog targets"
+  amendment).
 
 ---
 

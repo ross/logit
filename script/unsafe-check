@@ -4,20 +4,33 @@
 #        script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]
 #        script/unsafe-check inject-all
 #        script/unsafe-check all
+#        script/unsafe-check fuzz <target> [-- <libfuzzer args>]
+#        script/unsafe-check fuzz-all [seconds]
+#        script/unsafe-check fuzz-tmin <target> <crash file>
+#        script/unsafe-check fuzz-seed
 #        script/unsafe-check shell
 #        script/unsafe-check --help
 #
 # Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
 # tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-# helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
-# force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
+# helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+# debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+# `all` runs `miri` then `careful`.
+#
+# The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
+# cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
+# runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
+# `fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
+#   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
 #   UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose
 #                                    default seccomp profile blocks ptrace
 #   MIRIFLAGS                        defaults to -Zmiri-disable-isolation
+#   FUZZ_SECONDS                     `fuzz`'s -max_total_time, default 600
 #
-# Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md).
+# Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md,
+# docs/adr/out-of-ci-fuzzing.md).
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -25,23 +38,62 @@ source "${SCRIPT_PATH}/common.sh"
 
 IMAGE=logit-unsafe-check:local
 
-# One "<package>|<libtest filter>" per line; `miri` with no arguments runs each in order. Miri
-# can't execute these syscalls, so each entry is a pure helper split out of the code around one
-# (the ADR's "What each tool verifies, and its limits"). Add an entry when a new one lands.
+# One "<package>|<libtest args>|<extra MIRIFLAGS>" per line; `miri` with no arguments runs each
+# in order, with the extra flags appended to MIRIFLAGS. The libtest args are word-split, so an
+# entry can add `--skip`. Miri can't execute the three syscalls, so each of their entries is a
+# pure helper split out of the code around one (the ADR's "What each tool verifies, and its
+# limits"). Add an entry when a new one lands.
 #
 #   parse_events            the `inotify_event` parser in tail/watch.rs
 #   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec` construction and post-call harvest
 #   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
 #                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
+#   hyperloglog, hll_       metric.rs's `HyperLogLog` codec; Stacked Borrows off, permissive provenance
+#   sketch::tests           sketch.rs's `DdSketch`; deterministic floats
+#
+# Why those flags, and why `--skip properties`: the ADR's "Sketch and HyperLogLog targets" amendment.
 MIRI_TARGETS=(
-    "logit-inputs|parse_events"
-    "logit-inputs|batch_reader_helpers"
-    "logit-pipeline|sockstat::tests::reply_parsing"
+    "logit-inputs|parse_events|"
+    "logit-inputs|batch_reader_helpers|"
+    "logit-pipeline|sockstat::tests::reply_parsing|"
+    "logit-core|hyperloglog --skip properties|-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance"
+    "logit-core|hll_ --skip properties|-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance"
+    "logit-core|sketch::tests --skip properties|-Zmiri-deterministic-floats"
 )
 
 # Every checkout binds at the same `/work`, so cargo fingerprints match across branches and two
 # worktrees sharing one target volume can run each other's stale test binaries.
 TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
+
+# One "<target>|<max_len>|<malloc_limit_mb>|<extra args>" per line, one per
+# `fuzz/fuzz_targets/<target>.rs`; `fuzz-all` runs each in order. `malloc_limit_mb` fails a run on
+# any single allocation past it, which is how a decoder sizing an allocation from a declared
+# length shows up. Each sits above the largest allocation a valid input may make: `native_frame`'s
+# 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`. `extra args` go to `fuzz`
+# only, never to `fuzz-tmin`.
+#
+# The two `native_batch_*` targets run in fork mode: the process-wide interner never evicts, so a
+# long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
+# the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
+# child fatal, as it is outside fork mode.
+FUZZ_TARGETS=(
+    "native_frame|262144|65|"
+    "native_batch_v1|65536|16|-fork=1 -ignore_ooms=0"
+    "native_batch_v2|65536|16|-fork=1 -ignore_ooms=0"
+    "native_control|4096|4|"
+    "sketch_bytes|65536|16|"
+    "sketch_merge|65536|64|"
+    "hll_bytes|65536|16|"
+    "otlp_proto|65536|64|"
+    "otlp_json|65536|64|"
+    "otlp_grpc|65536|16|"
+    "prom_decompress|65536|16|"
+    "prom_remote_write|65536|64|"
+)
+
+# The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume
+# rather than invalidating the other one on every switch.
+FUZZ_TARGET_VOLUME="${UNSAFE_CHECK_FUZZ_TARGET_VOLUME:-logit_fuzz_target}"
 
 # One "<label>|<strace inject spec>|<cargo test args>" per line; `inject-all` runs each in order.
 # Unlike MIRI_TARGETS, not all are expected to pass: two force a fatal error, and they succeed
@@ -67,13 +119,15 @@ build_image() {
 
 # A plain `docker run`, not a compose service, which could cross-mount another checkout. Its own
 # volumes, never the dev container's `logit_cargo_home`/`logit_target_cache`: nightly artifacts
-# must not mix into the stable toolchain's cache.
+# must not mix into the stable toolchain's cache. The first argument is the target volume.
 run_in_image() {
+    local target_volume="${1}"
+    shift
     ${DOCKER} run --rm \
         -u 1000:1000 -w /work \
         -v "${ROOT}:/work:z" \
         -v logit_unsafe_check_cargo_home:/home/dev/.cargo \
-        -v "${TARGET_VOLUME}:/work/target" \
+        -v "${target_volume}:/work/target" \
         -e CARGO_HOME=/home/dev/.cargo \
         -e CARGO_TARGET_DIR=/work/target \
         -e MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}" \
@@ -103,24 +157,28 @@ run_privileged_in_image() {
 cmd_miri() {
     build_image
     if [ "$#" -gt 0 ]; then
-        run_in_image cargo miri test "$@"
+        run_in_image "${TARGET_VOLUME}" cargo miri test "$@"
         return
     fi
+    local base_flags="${MIRIFLAGS:--Zmiri-disable-isolation}"
     for target in "${MIRI_TARGETS[@]}"; do
         local package="${target%%|*}"
-        local filter="${target#*|}"
-        echo "## miri: -p ${package} -- ${filter} ################################"
-        run_in_image cargo miri test -p "${package}" --lib -- "${filter}"
+        local rest="${target#*|}"
+        local filter="${rest%%|*}"
+        local flags="${rest#*|}"
+        echo "## miri: -p ${package} -- ${filter} (MIRIFLAGS: ${base_flags} ${flags}) ##########"
+        # shellcheck disable=SC2086 # `filter` is a word-split libtest argument list
+        MIRIFLAGS="${base_flags} ${flags}" run_in_image "${TARGET_VOLUME}" cargo miri test -p "${package}" --lib -- ${filter}
     done
 }
 
 cmd_careful() {
     build_image
     if [ "$#" -gt 0 ]; then
-        run_in_image cargo careful test "$@"
+        run_in_image "${TARGET_VOLUME}" cargo careful test "$@"
         return
     fi
-    run_in_image cargo careful test -p logit-pipeline -p logit-inputs
+    run_in_image "${TARGET_VOLUME}" cargo careful test -p logit-pipeline -p logit-inputs
 }
 
 # Builds one test binary, then runs it under strace with the fault injected. `<cargo test args>`
@@ -167,7 +225,7 @@ cmd_inject() {
     # relative to /work. `tail -1` assumes one target (`--lib`, `--bin <name>`, or
     # `--test <name>`); selecting more than one isn't supported.
     local build_output
-    build_output="$(run_in_image cargo test --no-run "${cargo_args[@]}" 2>&1)"
+    build_output="$(run_in_image "${TARGET_VOLUME}" cargo test --no-run "${cargo_args[@]}" 2>&1)"
     local binary
     binary="$(printf '%s\n' "${build_output}" |
         grep -E '^\s*Executable ' | tail -1 | sed -E 's/.*\(([^()]+)\)[[:space:]]*$/\1/')"
@@ -202,9 +260,131 @@ cmd_all() {
     cmd_careful
 }
 
+fuzz_target_entry() {
+    local wanted="${1}"
+    for entry in "${FUZZ_TARGETS[@]}"; do
+        if [ "${entry%%|*}" = "${wanted}" ]; then
+            echo "${entry}"
+            return
+        fi
+    done
+    return 1
+}
+
+# Prints the libFuzzer limits FUZZ_TARGETS gives `target`, or exits with the target list.
+fuzz_limits() {
+    local target="${1}"
+    local usage="${2}"
+    local entry
+    if [ -z "${target}" ] || ! entry="$(fuzz_target_entry "${target}")"; then
+        echo "usage: ${usage}" >&2
+        echo "targets: $(printf '%s ' "${FUZZ_TARGETS[@]%%|*}")" >&2
+        exit 1
+    fi
+    local rest="${entry#*|}"
+    local max_len="${rest%%|*}"
+    rest="${rest#*|}"
+    echo "-max_len=${max_len} -malloc_limit_mb=${rest%%|*} -rss_limit_mb=4096 -timeout=10"
+}
+
+# Prints the extra libFuzzer arguments FUZZ_TARGETS gives `target`, often none.
+fuzz_extra_args() {
+    local entry
+    entry="$(fuzz_target_entry "${1}")"
+    echo "${entry##*|}"
+}
+
+# libFuzzer writes new inputs only to the first corpus directory, so fuzz/corpus/<target> grows
+# and fuzz/seeds/<target> stays as committed. Caller arguments come last, so they win.
+cmd_fuzz() {
+    local target="${1:-}"
+    local limits
+    limits="$(fuzz_limits "${target}" "script/unsafe-check fuzz <target> [-- <libfuzzer args>]")"
+    shift
+    if [ "${1:-}" = "--" ]; then
+        shift
+    fi
+
+    build_image
+    mkdir -p "${ROOT}/fuzz/corpus/${target}"
+    local extra
+    extra="$(fuzz_extra_args "${target}")"
+    # shellcheck disable=SC2086 # `limits` and `extra` are word-split argument lists
+    run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz run "${target}" \
+        "fuzz/corpus/${target}" "fuzz/seeds/${target}" -- \
+        ${limits} ${extra} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
+}
+
+# An `oom-*` file gets the target's limits, since without `-malloc_limit_mb` an allocation-limit
+# crash doesn't reproduce. Any other crash gets none: under the malloc limit, a mutated candidate
+# that trips it counts as the crash and libFuzzer "minimizes" to an empty file that doesn't
+# reproduce. cargo-fuzz writes the result beside the crash file as `minimized-from-<hash>`.
+cmd_fuzz_tmin() {
+    local target="${1:-}"
+    local crash="${2:-}"
+    local limits
+    limits="$(fuzz_limits "${target}" "script/unsafe-check fuzz-tmin <target> <crash file>")"
+    if [ -z "${crash}" ]; then
+        echo "usage: script/unsafe-check fuzz-tmin <target> <crash file>" >&2
+        exit 1
+    fi
+    case "$(basename -- "${crash}")" in
+    oom-*) ;;
+    *) limits="" ;;
+    esac
+    build_image
+    # shellcheck disable=SC2086 # `limits` is a word-split argument list
+    run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz tmin "${target}" "${crash}" \
+        ${limits:+-- ${limits}}
+}
+
+# Runs every target past a failure, which `set -e` would otherwise stop at. Each run's output
+# lands in perf/results/fuzz/<timestamp>/<target>.log, and the summary quotes libFuzzer's last
+# stats line per target.
+cmd_fuzz_all() {
+    local seconds="${1:-120}"
+    local out_dir
+    out_dir="perf/results/fuzz/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "${ROOT}/${out_dir}"
+    local summary=()
+    local failed=0
+    for entry in "${FUZZ_TARGETS[@]}"; do
+        local target="${entry%%|*}"
+        local log="${ROOT}/${out_dir}/${target}.log"
+        echo
+        echo "===== fuzz: ${target} for ${seconds}s ====================================="
+        local status=0
+        cmd_fuzz "${target}" -- -max_total_time="${seconds}" 2>&1 | tee "${log}" || status=$?
+        local stats
+        stats="$(grep -E '^#[0-9]+' "${log}" | tail -1 || true)"
+        if [ "${status}" -eq 0 ]; then
+            summary+=("ok     ${target}: ${stats}")
+        else
+            local artifact
+            artifact="$(grep -oE 'fuzz/artifacts/[^ ]+' "${log}" | tail -1 || true)"
+            failed=1
+            summary+=("FAILED ${target} (exit ${status}): ${stats}")
+            if [ -n "${artifact}" ]; then
+                summary+=("       minimize: script/unsafe-check fuzz-tmin ${target} ${artifact}")
+            fi
+        fi
+    done
+    echo
+    echo "===== fuzz-all summary: ${seconds}s per target, logs in ${out_dir} ====="
+    printf '%s\n' "${summary[@]}"
+    return "${failed}"
+}
+
+# A plain binary with no sanitizer, so it needs nothing the stable dev image lacks either.
+cmd_fuzz_seed() {
+    build_image
+    run_in_image "${FUZZ_TARGET_VOLUME}" \
+        cargo run --manifest-path fuzz/seedgen/Cargo.toml --release
+}
+
 cmd_shell() {
     build_image
-    run_in_image bash
+    run_in_image "${TARGET_VOLUME}" bash
 }
 
 usage() {
@@ -214,20 +394,33 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
        script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]
        script/unsafe-check inject-all
        script/unsafe-check all
+       script/unsafe-check fuzz <target> [-- <libfuzzer args>]
+       script/unsafe-check fuzz-all [seconds]
+       script/unsafe-check fuzz-tmin <target> <crash file>
+       script/unsafe-check fuzz-seed
        script/unsafe-check shell
        script/unsafe-check --help
 
 Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
 tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
-force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
+helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+`all` runs `miri` then `careful`.
+
+The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
+cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
+runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
+`fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
+  UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
   UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose
                                    default seccomp profile blocks ptrace
   MIRIFLAGS                        defaults to -Zmiri-disable-isolation
+  FUZZ_SECONDS                     `fuzz`'s -max_total_time, default 600
 
-Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md).
+Not part of script/cibuild: needs nightly and ptrace (docs/adr/out-of-ci-unsafe-verification.md,
+docs/adr/out-of-ci-fuzzing.md).
 EOF
 }
 
@@ -249,6 +442,21 @@ inject-all)
     ;;
 all)
     cmd_all
+    ;;
+fuzz)
+    shift
+    cmd_fuzz "$@"
+    ;;
+fuzz-all)
+    shift
+    cmd_fuzz_all "$@"
+    ;;
+fuzz-tmin)
+    shift
+    cmd_fuzz_tmin "$@"
+    ;;
+fuzz-seed)
+    cmd_fuzz_seed
     ;;
 shell)
     cmd_shell

@@ -7,7 +7,8 @@
 //!
 //! A payload is consumed whole: bytes after a scalar's value, an array's last item, or a map's
 //! last entry are `Malformed`, so decoding and re-encoding a valid payload reproduces it byte for
-//! byte.
+//! byte. The rule, and the decode budget arrays and maps are charged against, are decided in ADR
+//! `untrusted-input-bounds`.
 //!
 //! [`read_attr_map`] inserts each entry into `AttrMap`'s sorted storage as it reads it, which is
 //! quadratic for a large map whose keys arrive in descending symbol order. That is a documented
