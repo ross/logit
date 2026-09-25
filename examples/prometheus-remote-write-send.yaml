@@ -1,8 +1,11 @@
-# Pushes metrics into a remote-write receiver (Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a
-# Prometheus started with `--web.enable-remote-write-receiver`): `prometheus_out` with `endpoint:`
-# is the remote-write sender (docs/adr/prometheus-remote-write.md). Pushing is how a `logit`
-# behind a NAT or in a short-lived container gets its series out. Change `endpoint` to your
-# receiver and set `PROMETHEUS_REMOTE_WRITE_AUTHORIZATION` in the environment.
+# Pushes metrics into a remote-write receiver (Mimir, Thanos, Grafana Cloud, or a Prometheus
+# started with `--web.enable-remote-write-receiver`): `prometheus_out` with `endpoint:` is the
+# remote-write sender (docs/adr/prometheus-remote-write.md). Pushing is how a `logit` behind a NAT
+# or in a short-lived container gets its series out. Change `endpoint` to your receiver and set
+# `PROMETHEUS_REMOTE_WRITE_AUTHORIZATION` in the environment.
+#
+# VictoriaMetrics takes remote-write too, but only `version: 1`: it answers a 2.0 request `204` and
+# stores nothing. examples/victoriametrics-remote-write.yaml is the config for it.
 #
 # `statsd_in -> aggregate -> prometheus_out`, so this runs against the dev stack's statsd port with
 # nothing external on the ingress side. The `aggregate` is not optional: Prometheus counters are
@@ -32,6 +35,8 @@ components:
     # negotiation and no fallback: pick what your receiver speaks. Only 2 carries a counter's start
     # time.
     version: 1
+    # compression: snappy        # the default; `zstd` is the VictoriaMetrics remote write
+    #                             # protocol, version 1 only, and Prometheus and Mimir reject it
     # Extra headers on every request: `X-Scope-OrgID` for a multi-tenant Mimir, `Authorization`
     # for anything token-guarded. `!env` substitutes the whole value, so the variable holds the
     # `Bearer ` prefix too (docs/adr/env-yaml-tag.md). A header the protocol owns (content-type,

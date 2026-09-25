@@ -635,7 +635,8 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
             if file.should_rotate(now, bytes.len()) {
                 let outcome = file.rotate(&mut self.diagnostics).await?;
                 // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means the
-                // active-file rename failed and nothing on disk changed, so it isn't a rotation.
+                // active file's rename or truncate failed and nothing on disk changed, so it
+                // isn't a rotation.
                 if outcome == RotateOutcome::Rotated {
                     self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
                 }

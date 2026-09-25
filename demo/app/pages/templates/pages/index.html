@@ -90,9 +90,8 @@ uncritically:</p>
   <li>Grafana's anonymous access is admin-level, not read-only
   (<code>GF_AUTH_ANONYMOUS_ORG_ROLE: Admin</code>, <code>demo/compose.yaml</code>).</li>
   <li>A hardcoded Django <code>SECRET_KEY</code> (<code>demo/app/demoproj/settings.py</code>) and
-  a hardcoded InfluxDB admin token, <code>INFLUXDB_TOKEN</code>
-  (<code>demo/compose.yaml</code>). Comments where each one lives call it out too; this list is
-  the one place they're collected.</li>
+  a hardcoded Postgres password, <code>POSTGRES_PASSWORD</code> (<code>demo/compose.yaml</code>).
+  VictoriaMetrics, Loki, and Tempo run with no authentication at all.</li>
   <li><code>ALLOWED_HOSTS = ["*"]</code> (same <code>settings.py</code>), because there's no single
   real hostname to pin for a stack that answers on <code>localhost</code> at whatever port you
   gave it.</li>

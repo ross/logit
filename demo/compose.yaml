@@ -12,8 +12,9 @@
 #   - Each tier's logs reach `logit`: haproxy, app, and worker over syslog; nginx and redis via
 #     `logit` tailing their Docker json-file logs off the host; postgres via a shared log volume.
 #     demo/logit.yaml is the pipeline, and its header comment is the map of it.
-#   - `logit` writes metrics to `influxdb`, logs to `loki`, and spans to `tempo`. `app` and `worker`
-#     also send their own OTel spans straight to `tempo`, bypassing `logit`.
+#   - `logit` writes metrics to `victoriametrics` (Prometheus remote-write), logs to `loki`, and
+#     spans to `tempo`. `app` and `worker` also send their own OTel spans straight to `tempo`,
+#     bypassing `logit`.
 #   - `grafana` (:3000) reads all three backends.
 #   - `graph-dot`, `graph-svg`, and `arch-svg` render the landing page's two diagrams once at
 #     startup, and `app-migrate` creates `app`'s schema. All four exit when done; `Exited (0)` in
@@ -33,25 +34,27 @@ x-postgres-env: &postgres-env
   POSTGRES_PASSWORD: demo-postgres-password
 
 services:
-  influxdb:
-    image: docker.io/library/influxdb:2
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: logit
-      DOCKER_INFLUXDB_INIT_PASSWORD: logit-demo-password
-      DOCKER_INFLUXDB_INIT_ORG: logit
-      DOCKER_INFLUXDB_INIT_BUCKET: metrics
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: logit-demo-token
+  # Metrics backend. `logit`'s `victoria_out` (`prometheus_out`) remote-writes into
+  # `/api/v1/write`, and Grafana queries it as a Prometheus datasource. Single-node, no auth, no
+  # bootstrap step. The image tag is the one `script/victoria-interop` verifies
+  # (tools/victoria-interop/compose.yaml). `:8428` is published for the built-in UI at `/vmui`.
+  victoriametrics:
+    image: docker.io/victoriametrics/victoria-metrics:v1.152.0
+    command:
+      - -storageDataPath=/victoria-metrics-data
+      # A demo holds minutes of data, not the default month. `1d` is the minimum VictoriaMetrics
+      # accepts.
+      - -retentionPeriod=1d
     healthcheck:
-      test: ["CMD-SHELL", "influx ping || exit 1"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8428/health"]
       interval: 5s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      start_period: 5s
     ports:
-      - "8086:8086"
+      - "8428:8428"
     volumes:
-      - influxdb_data:/var/lib/influxdb2
+      - victoriametrics_data:/victoria-metrics-data
     networks: [demo]
 
   # `demo/app`'s database (`docs/plans/demo-richer-traces.md`), and the source `logit`'s `tail_in`
@@ -118,7 +121,7 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
     depends_on:
-      influxdb:
+      victoriametrics:
         condition: service_healthy
     ports:
       - "3000:3000"
@@ -182,10 +185,10 @@ services:
     image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
-      # influxdb_out/otlp_out both retry transient failures (ADR
+      # prometheus_out/otlp_out both retry transient failures (ADR
       # `service-lifecycle-and-output-retry`), but there's no reason to spend the demo's first
-      # several seconds visibly doing that against a cold InfluxDB/Loki.
-      influxdb:
+      # several seconds visibly doing that against a cold VictoriaMetrics/Loki.
+      victoriametrics:
         condition: service_healthy
       loki:
         condition: service_healthy
@@ -230,8 +233,6 @@ services:
     # Disables SELinux confinement for this one container rather than relabeling the bind mount
     # above (`:z` would do that, and is exactly what must NOT happen to the daemon's own state).
     security_opt: ["label=disable"]
-    environment:
-      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
     # `logit ready` (`docs/deploying.md`'s "Probes and exit codes", ADR `admin-readiness-endpoint`)
     # against demo/logit.yaml's own `admin: { bind: 0.0.0.0:9600 }`. It's the same probe
     # `Dockerfile`'s `HEALTHCHECK` runs, declared explicitly here so the `depends_on:
@@ -271,14 +272,11 @@ services:
     # one-shot write.
     user: "0:0"
     # Overrides ENTRYPOINT ["logit"] with a shell, purely to redirect stdout to a file. Why
-    # `|| true`: `logit graph` resolves `!env` exactly like `validate`/`run` (needs INFLUXDB_TOKEN)
-    # and exits 1 with nothing on stdout if that fails. But on a config that loads yet fails
-    # *semantic* validation, it prints complete, valid DOT to stdout before exiting 1, so gating
-    # this step on exit code alone would throw away good output.
+    # `|| true`: `logit graph` exits 1 with nothing on stdout on a config that fails to load. But
+    # on a config that loads yet fails *semantic* validation, it prints complete, valid DOT to
+    # stdout before exiting 1, so gating this step on exit code alone would throw away good output.
     entrypoint: ["/bin/sh", "-c"]
     command: ["logit graph /config.yaml > /graph/logit.dot || true"]
-    environment:
-      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
     volumes:
       - ./logit.yaml:/config.yaml:ro
       - graph_data:/graph
@@ -523,7 +521,7 @@ networks:
   demo: {}
 
 volumes:
-  influxdb_data: {}
+  victoriametrics_data: {}
   grafana_data: {}
   loki_data: {}
   tempo_data: {}

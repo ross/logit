@@ -25,6 +25,11 @@ serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 
+[features]
+# Arms the fault-injection seam (`src/fault.rs`) outside this crate's own tests. Only ever a
+# dev-dependency feature: `script/lint` fails if `logit-cli`'s normal dependency graph enables it.
+fault-injection = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads: Linux-only socket
 # options, so a Linux-only dependency.
@@ -35,3 +40,4 @@ libc.workspace = true
 # `cargo test -p <crate>` builds that package's feature set alone, so a sibling's override
 # doesn't carry over, though a `--workspace` build's feature unification hides that.
 tokio = { workspace = true, features = ["test-util"] }
+proptest.workspace = true

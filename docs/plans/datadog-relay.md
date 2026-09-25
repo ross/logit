@@ -265,7 +265,7 @@ The HTTP server driver behind `otlp_in`/`prometheus_in` (`crates/logit-inputs/sr
 `crate::http` in `logit-outputs` (`build_client`, `is_retryable_http_status`,
 `classify_reqwest_error`); `write_loop`'s bounded retry with `Fault` classification;
 `TlsClientConfig`/`TlsServerConfig`; the `TcpListener` driver for the Unix stream transport;
-graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 62+).
+graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 63+).
 
 ### 4. Sketch compatibility (W1)
 
