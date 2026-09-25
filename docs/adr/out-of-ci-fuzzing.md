@@ -85,7 +85,8 @@ targets cover:
 - `fuzz <target> [-- <libFuzzer args>]` runs one target.
 - `fuzz-all [seconds]` runs every target for the given time (default 120 seconds each), keeps
   going past a failing target, and prints a per-target summary with a `fuzz-tmin` line for each
-  crash. Each target's output lands in `perf/results/fuzz/<timestamp>/<target>.log`.
+  crash. Each target's output lands in `perf/results/fuzz/<timestamp>/<target>.log`. It exits 1
+  if any target failed.
 - `fuzz-tmin <target> <crash file>` runs `cargo fuzz tmin`. An `oom-*` file gets the target's
   limits, because an allocation-limit crash reproduces only under `-malloc_limit_mb`. Any other
   crash gets none, because under the limit libFuzzer can minimize a panic down to an empty file
@@ -209,7 +210,8 @@ line gives no corpus size, and its exec/s is the executions divided by the secon
 | `prom_decompress` | 121 | 911,925 | 7,536 | 754 / 205 KB | clean |
 | `prom_remote_write` | 121 | 1,739,336 | 14,374 | 1,544 / 1,126 KB | clean |
 
-One finding for the workstream that owns the decoder, and one harness change:
+One finding for the workstream that owns the decoder, and one harness change, from the campaign
+itself:
 
 - **`hll_bytes`: `HyperLogLog::estimate` overflows on a decoded estimator.**
   `cardinality-estimator` 1.0.3's `hyperloglog.rs` computes `M - zeros` from the estimator's
@@ -217,8 +219,8 @@ One finding for the workstream that owns the decoder, and one harness change:
   (4096). Under the fuzz build's debug assertions that panics with "attempt to subtract with
   overflow". A release build wraps and returns a meaningless estimate. The 3,097-byte reproducer
   doesn't minimize further, because the HLL representation's register array fills most of it. It
-  is committed as `fuzz/seeds/hll_bytes/regress-9a8fd57a`, so `hll_bytes` fails at startup until
-  the decoder rejects it (CORE-06).
+  is committed as `fuzz/seeds/hll_bytes/regress-9a8fd57a`. The decoder fix is in `dos/w3` (#369);
+  until it lands, `hll_bytes` fails at startup on this seed (CORE-06).
 - **`native_batch_v1`/`v2`: an `oom` that no single input reproduces.** The failing allocation is
   16 MiB (`malloc(16777240)`), from `lasso`'s arena growing a bucket under
   `logit_core::interner::intern`, called from `Dict::read`. The process-wide interner never
@@ -227,3 +229,19 @@ One finding for the workstream that owns the decoder, and one harness change:
   This is the native dictionary's cross-frame interner growth (WIRE-02), a documented non-goal
   under ADR `deployment-threat-model`, not a decoder bug. The two targets now run in fork mode
   (see "The driver"), and the rerun in the table is clean.
+
+Review of this harness found two more, each with its reproducer committed as a `regress-*` seed:
+
+- **`native_control`: a decoded `Reject` didn't re-encode within its own cap.** `Reject`'s decode
+  checked the message's wire bytes against the 1,024-byte cap, then converted them with lossy
+  UTF-8, which turns each invalid byte into a 3-byte U+FFFD. 342 bytes of `0xFF` decoded to a
+  1,026-byte message that a second decode refused, and the target's round-trip oracle fired.
+  Decode now truncates the converted message to the cap on a char boundary. The input is
+  `fuzz/seeds/native_control/regress-reject-lossy`.
+- **`sketch_bytes`: two finite bin counts can fold to `+inf`.** A version-1 Agent sketch with two
+  positive-store bins at the same key, each with a count of `f64::MAX`, decodes. The bins fold
+  into one infinite count after the non-finite filter has run, so `to_bytes` is not a fixed
+  point and the oracle fires. It is committed as
+  `fuzz/seeds/sketch_bytes/regress-bins-fold-to-inf`. The fix to the decoder's bin
+  normalization is in `dos/w3` (#369); until it lands, `sketch_bytes` fails at startup on this
+  seed (CORE-05).

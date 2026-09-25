@@ -6,10 +6,9 @@
 //! and a 4-byte big-endian `Message-Length` (gRPC over HTTP/2, "Length-Prefixed-Message").
 //! [`unframe`] reads one such message off the front of a body. Bytes after it are ignored.
 //!
-//! **The inflation bound.** [`inflate_bounded`] reads at most `max + 1` decompressed bytes, so
-//! an input inflating to `max + 1` is rejected as [`InflateError::TooLarge`] rather than cut to
-//! fit. The extra byte is the tripwire: reading only `max` bytes would make an oversized body
-//! indistinguishable from one of `max` bytes.
+//! **The inflation bound.** [`inflate_bounded`] reads at most `max + 1` decompressed bytes and
+//! rejects the `+1`th as [`InflateError::TooLarge`]; ADR
+//! `otlp-compression-and-decompression-bounds` has the why.
 
 use bytes::Bytes;
 use std::io::Read;
