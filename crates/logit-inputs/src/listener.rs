@@ -32,6 +32,12 @@ impl LiveConnections {
         LiveConnection(self.clone())
     }
 
+    /// The current count, for a test that holds the handle rather than a `Registry`.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> i64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Publishes from the read-modify-write's return value, never a separate `load`:
     /// `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving a change and a load
     /// would leave the stale value published until the next transition.

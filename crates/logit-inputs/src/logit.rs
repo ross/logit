@@ -93,7 +93,6 @@ use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
 use logit_proto::CodecError;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -234,7 +233,7 @@ impl Input for LogitInput {
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let max_frame_bytes = self.max_frame_bytes;
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
@@ -348,7 +347,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     shutdown: watch::Receiver<bool>,
-    live_connections: Arc<AtomicI64>,
+    live_connections: crate::listener::LiveConnections,
 ) -> anyhow::Result<()> {
     let Some(_permit) = permit else {
         let reject = control::Reject {
@@ -358,13 +357,9 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         return write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
     };
 
-    // Published from the read-modify-write's own return value, not a separate `load`:
-    // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add and a load
-    // could leave a stale value published until the next transition.
-    let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-    telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-    let result = serve_connection(
+    // Counted out on drop, so a panic in the connection brings the gauge back down too.
+    let _live = live_connections.enter();
+    serve_connection(
         stream,
         sink,
         telemetry.clone(),
@@ -373,12 +368,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         idle_timeout,
         shutdown,
     )
-    .await;
-
-    let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-    telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-    result
+    .await
 }
 
 /// What the handshake negotiated for one connection.
@@ -2128,7 +2118,7 @@ mod tests {
 
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let permit = limit.clone().try_acquire_owned().unwrap();
-        let live = Arc::new(AtomicI64::new(0));
+        let live = crate::listener::LiveConnections::new(telemetry.clone());
         let (sink, mut rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(reject_or_serve(
@@ -2173,7 +2163,7 @@ mod tests {
             "the task ended {stalled_for:?} after its last forward, past the {BOUND:?} bound"
         );
         assert_eq!(limit.available_permits(), 1, "the permit came back");
-        assert_eq!(live.load(Ordering::Relaxed), 0, "the live-connection count came back to 0");
+        assert_eq!(live.count(), 0, "the live-connection count came back to 0");
 
         let events = registry.drain(0);
         assert_eq!(
