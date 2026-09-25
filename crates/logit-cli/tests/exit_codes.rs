@@ -69,7 +69,7 @@ fn a_port_already_in_use_exits_1() {
 ///
 /// The sink is `stdio_out` to `/dev/null`, not `null_out`: a sink that opens, writes, and flushes
 /// a file on close is evidence the cascade flushed downstream, and one whose `send` does nothing
-/// isn't. `examples/generate-to-null.yaml` has the canonical `generate_in -> null_out` shape.
+/// isn't. `fixtures/generate-to-null.yaml` has the canonical `generate_in -> null_out` shape.
 #[test]
 fn a_finite_generate_in_config_exits_0() {
     let config = TempConfig::write(

@@ -491,7 +491,7 @@ components:
 
 **Files:** `crates/logit-config/src/lib.rs`, `crates/logit-cli/src/pipeline.rs`,
 `crates/logit-pipeline/src/graph.rs`, `schema/logit.schema.json` (via `script/schema`),
-`examples/nginx-to-influxdb.yaml` or `examples/statsd-to-influxdb.yaml` (a commented `buffer:`
+`fixtures/nginx-to-influxdb.yaml` or `fixtures/statsd-to-influxdb.yaml` (a commented `buffer:`
 block on the InfluxDB sink), `docs/deploying.md`.
 
 **Test list:** defaults round-trip through serde with an empty `buffer: {}`; each `overflow`/
@@ -535,7 +535,7 @@ component) vs `logit.output.*` (sink-specific) split — these are all `logit.co
 > `logit.component.retries`, not `send.retries` as first sketched here.
 
 All tag values `&'static str`, well under `MAX_KEYS_PER_COMPONENT` (1024) per sink. Exercisable
-via `examples/internal-telemetry.yaml`. `logit.component.errors` keeps its existing meaning
+via `fixtures/internal-telemetry.yaml`. `logit.component.errors` keeps its existing meaning
 (incremented once per permanently-dropped batch, not once per retry attempt).
 
 Then rewrite `docs/known-gaps.md`: delete the **Output buffering** entry entirely, and delete the
@@ -557,7 +557,7 @@ in-flight batches per link is the real shape). Also fold the new metrics into
 asserting the `reason` tag, a retry test asserting `send.attempts{outcome="retryable"}`, a
 shutdown-grace-expiry test asserting `reason="shutdown"`).
 
-**Done when:** `examples/internal-telemetry.yaml` run against a config with a small `max_batches`
+**Done when:** `fixtures/internal-telemetry.yaml` run against a config with a small `max_batches`
 shows `buffer.utilization` climbing and `batches.dropped` incrementing under sustained load.
 
 ---

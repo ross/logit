@@ -189,8 +189,8 @@ async fn logit_output_to_logit_input_round_trips_a_lz4_compressed_batch() {
 
 /// A batch decoded from a real statsd line, not hand-built `Event`s, crosses a real
 /// `logit_out -> logit_in` hop with its timestamp and resource attribute intact. This is the
-/// codec/transport path of `examples/forwarder-edge.yaml` feeding
-/// `examples/forwarder-central.yaml`, in-process rather than across two `logit run` processes.
+/// codec/transport path of `fixtures/forwarder-edge.yaml` feeding
+/// `fixtures/forwarder-central.yaml`, in-process rather than across two `logit run` processes.
 #[tokio::test]
 async fn a_statsd_decoded_batch_forwards_through_logit_out_and_logit_in_with_its_timestamp_intact()
 {

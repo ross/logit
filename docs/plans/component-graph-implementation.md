@@ -115,7 +115,7 @@ In `logit-pipeline`. Per-kind node loops (design doc's "Runtime model"):
 
 ## 7. Rewrite the example and docs that describe running code
 
-- `examples/statsd-to-influxdb.yaml` → the component shape (statsd_in → aggregate → lua → 
+- `fixtures/statsd-to-influxdb.yaml` → the component shape (statsd_in → aggregate → lua → 
   influxdb_out, matching today's actual pipeline). Verify `script/server` still runs it end to end
   against the compose stack — this is the only environment-dependent verification step in the whole
   plan.
@@ -134,5 +134,5 @@ In `logit-pipeline`. Per-kind node loops (design doc's "Runtime model"):
 - Stage 3's `graph.rs` tests are the load-bearing regression suite for the whole rework; they should
   be written and passing before stage 4 exists to consume them.
 - End-to-end: `script/server` against the rewritten example config (stage 7), confirming statsd →
-  aggregate → Lua → InfluxDB still works, and `logit graph examples/statsd-to-influxdb.yaml` prints
+  aggregate → Lua → InfluxDB still works, and `logit graph fixtures/statsd-to-influxdb.yaml` prints
   a sensible four-node DOT chain.
