@@ -6,7 +6,8 @@
 //! behind a 5-byte prefix (compressed flag, big-endian `u32` length), and the outcome rides in
 //! `grpc-status`/`grpc-message` trailers on an HTTP `200`. A rejection maps to `12`
 //! (`UNIMPLEMENTED`: a non-`POST`, an unknown method, an unsupported `grpc-encoding`), `3`
-//! (`INVALID_ARGUMENT`: a malformed frame, gzip, or payload), `8` (`RESOURCE_EXHAUSTED`: over
+//! (`INVALID_ARGUMENT`: a malformed frame, gzip, or payload, or bytes after the one message a
+//! unary body carries), `8` (`RESOURCE_EXHAUSTED`: over
 //! [`MAX_REQUEST_BYTES`]), or `4` (`DEADLINE_EXCEEDED`: a stalled body).
 //!
 //! **One accept loop, one task per connection.** [`Input::run`] spawns a task per accepted
@@ -117,7 +118,8 @@
 //!
 //! **Gzip, and nothing else.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's compressed flag
 //! with `grpc-encoding: gzip` are decoded via [`inflate`]; any other declared encoding is
-//! rejected (`415`/`grpc-status: 12`). `inflate` bounds the *decompressed* size to
+//! rejected (`415`/`grpc-status: 12`). Both headers are matched case-insensitively, since
+//! content-coding names are (RFC 9110 §8.4.1). `inflate` bounds the *decompressed* size to
 //! [`MAX_REQUEST_BYTES`], the cap already on the compressed body, so a compression bomb is
 //! rejected rather than inflated (`docs/adr/otlp-compression-and-decompression-bounds.md`).
 //!
@@ -525,11 +527,10 @@ async fn handle_http(
     };
     // Matched on value, not presence: an explicit `identity` declares no compression and must not
     // be a `415`.
-    let gzip_encoded = match req.headers().get("content-encoding") {
-        None => false,
-        Some(enc) if enc.as_bytes() == b"identity" => false,
-        Some(enc) if enc.as_bytes() == b"gzip" => true,
-        Some(_) => {
+    let gzip_encoded = match crate::http::Encoding::from_headers(req.headers()) {
+        Ok(crate::http::Encoding::Identity) => false,
+        Ok(crate::http::Encoding::Gzip) => true,
+        Ok(_) | Err(_) => {
             return Ok(text_response(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported Content-Encoding -- this input speaks 'identity' and 'gzip' only",
@@ -651,7 +652,9 @@ async fn handle_grpc(
     // The frame's compressed flag (`grpc_unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
-        if enc.as_bytes() != b"identity" && enc.as_bytes() != b"gzip" {
+        // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is.
+        let enc = enc.to_str().unwrap_or("").trim();
+        if !enc.eq_ignore_ascii_case("identity") && !enc.eq_ignore_ascii_case("gzip") {
             return Ok(grpc_response(
                 12,
                 "unsupported grpc-encoding -- this input speaks 'identity' and 'gzip' only",
@@ -676,6 +679,19 @@ async fn handle_grpc(
     let Some((compressed, payload)) = grpc_unframe(&framed) else {
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
     };
+    // `Export` is unary, so its body is one message. Bytes after it are a sender's encoder bug,
+    // answered rather than dropped unread.
+    let leftover = framed.len() - 5 - payload.len();
+    if leftover != 0 {
+        return Ok(grpc_response(
+            3,
+            &format!(
+                "the request body carries {leftover} bytes after its gRPC message; a unary call \
+                 takes one message"
+            ),
+            None,
+        ));
+    }
     let payload = if compressed {
         match inflate(payload) {
             Ok(inflated) => inflated,

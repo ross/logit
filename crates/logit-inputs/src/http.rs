@@ -358,8 +358,8 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    /// Matched case-insensitively, since HTTP content codings are. `Err` carries what was sent,
-    /// for the `415` message.
+    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1). `Err`
+    /// carries what was sent, for the `415` message.
     pub(crate) fn from_headers(headers: &http::HeaderMap) -> Result<Self, String> {
         let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
             return Ok(Self::Identity);
