@@ -10,8 +10,10 @@ Accepted
 
 ## Context
 
-Every decoder an unauthenticated peer can reach is covered today by a stable-toolchain mutation
-suite: `crates/logit-proto/tests/robustness.rs` truncates, flips bits, inflates declared lengths,
+Every decoder that reads a peer's or the disk spool's bytes is covered today by a
+stable-toolchain mutation suite
+([ADR `deployment-threat-model`](deployment-threat-model.md) says why that input is accidental,
+not hostile): `crates/logit-proto/tests/robustness.rs` truncates, flips bits, inflates declared lengths,
 and nests past the depth cap, from a fixed seed. That suite finds what its author thought to
 mutate. A coverage-guided fuzzer finds the rest, and `docs/known-gaps.md` has deferred one twice:
 first because `cargo-fuzz` needs nightly and `Dockerfile.dev` is stable-only
@@ -98,6 +100,14 @@ allocation past the limit is a crash. The limit is set slightly above
 the largest allocation a valid input of `max_len` bytes can need. For the native frame that is 65
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
+A fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
+and never by `fuzz-tmin`. The two native batch targets use it to run in fork mode (`-fork=1
+-ignore_ooms=0`). The process-wide interner never evicts, so a long-lived fuzz process
+accumulates every dictionary string it decodes until the arena outgrows the malloc limit, and
+fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal. Fork
+mode was checked in the image: it stops at `-max_total_time`, merges new inputs into
+`fuzz/corpus/<target>`, and writes a child's crash to `fuzz/artifacts/<target>/`.
+
 ### The image
 
 `tools/unsafe-check/Dockerfile` installs a pinned `cargo-fuzz` with `cargo install --locked` next
@@ -180,13 +190,15 @@ then `fuzz-all 120`, on the dev box, one target at a time, against `dos/w1`. Ima
 
 The executions per second and corpus size come from libFuzzer's last stats line. A failing target
 stopped at its first crash, so its line is the last one before the crash, and its time is how long
-the crash took to find.
+the crash took to find. The two native batch rows are a rerun in fork mode, after the first run
+of each stopped at about 40 seconds on the interner growth described below. Fork mode's stats
+line gives no corpus size, and its exec/s is the executions divided by the seconds.
 
 | Target | Seconds | Executions | exec/s | Corpus (inputs/size) | Result |
 |---|---|---|---|---|---|
 | `native_frame` | 121 | 1,346,503 | 11,128 | 263 / 577 KB | clean |
-| `native_batch_v1` | ~40 | 2,286,271 | 57,156 | 693 / 121 KB | `oom`: interner arena growth |
-| `native_batch_v2` | ~39 | 1,976,749 | 50,685 | 637 / 132 KB | `oom`: interner arena growth |
+| `native_batch_v1` | 121 | 6,642,834 | 54,900 | 606 / n/a | clean (fork mode) |
+| `native_batch_v2` | 122 | 2,423,419 | 19,864 | 510 / n/a | clean (fork mode) |
 | `native_control` | 121 | 6,495,351 | 53,680 | 309 / 47 KB | clean |
 | `sketch_bytes` | 121 | 4,502,624 | 37,211 | 520 / 929 KB | clean |
 | `sketch_merge` | 121 | 3,231,840 | 26,709 | 591 / 1,754 KB | clean |
@@ -197,7 +209,7 @@ the crash took to find.
 | `prom_decompress` | 121 | 911,925 | 7,536 | 754 / 205 KB | clean |
 | `prom_remote_write` | 121 | 1,739,336 | 14,374 | 1,544 / 1,126 KB | clean |
 
-Two findings, handed to the workstreams that own the decoders:
+One finding for the workstream that owns the decoder, and one harness change:
 
 - **`hll_bytes`: `HyperLogLog::estimate` overflows on a decoded estimator.**
   `cardinality-estimator` 1.0.3's `hyperloglog.rs` computes `M - zeros` from the estimator's
@@ -212,6 +224,6 @@ Two findings, handed to the workstreams that own the decoders:
   `logit_core::interner::intern`, called from `Dict::read`. The process-wide interner never
   evicts, so after about two million decoded dictionaries it outgrows the target's 16 MiB malloc
   limit. Rerunning the saved input alone doesn't crash, so `fuzz-tmin` has nothing to minimize.
-  This is the native dictionary's cross-frame interner growth (WIRE-02), and it ends every
-  `native_batch_*` run at about 40 seconds until the decoder bounds it or the target's limit
-  changes.
+  This is the native dictionary's cross-frame interner growth (WIRE-02), a documented non-goal
+  under ADR `deployment-threat-model`, not a decoder bug. The two targets now run in fork mode
+  (see "The driver"), and the rerun in the table is clean.
