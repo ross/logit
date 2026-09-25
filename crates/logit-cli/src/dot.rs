@@ -15,7 +15,11 @@ use logit_pipeline::graph::{self, role, Role};
 pub fn render(config: &Config) -> String {
     let mut out =
         String::from("digraph logit {\n  rankdir=LR;\n  node [fontname=\"monospace\"];\n\n");
-    for (id, component) in &config.components {
+    // `components` is a `HashMap`; sorting by id keeps the output, and an SVG committed from it,
+    // stable across runs of an unchanged config.
+    let mut components: Vec<_> = config.components.iter().collect();
+    components.sort_unstable_by_key(|(id, _)| id.as_str());
+    for (id, component) in &components {
         let (shape, style) = match role(&component.kind) {
             Role::Listener => ("box", "filled,rounded"),
             Role::Transform => ("ellipse", "filled"),
@@ -27,7 +31,7 @@ pub fn render(config: &Config) -> String {
         out.push_str(&format!("  {id:?} [shape={shape}, style=\"{style}\", label={id:?}];\n"));
     }
     out.push('\n');
-    for (id, component) in &config.components {
+    for (id, component) in &components {
         for source in &component.sources {
             out.push_str(&format!("  {source:?} -> {id:?};\n"));
         }
@@ -124,6 +128,30 @@ mod tests {
             targets: targets.into_iter().map(String::from).collect(),
             kind,
         }
+    }
+
+    /// Output doesn't depend on the order components went into the `HashMap`.
+    #[test]
+    fn output_is_the_same_whatever_the_insertion_order() {
+        let ids = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+        let render_in = |order: Vec<&str>| {
+            let mut components = HashMap::new();
+            for id in order {
+                components.insert(
+                    id.to_string(),
+                    component(vec!["alpha", "bravo"], vec![], ComponentKind::Target {}),
+                );
+            }
+            render(&Config { components, ..Default::default() })
+        };
+        let forward = render_in(ids.to_vec());
+        assert_eq!(forward, render_in(ids.iter().rev().copied().collect()));
+        for _ in 0..8 {
+            assert_eq!(forward, render_in(ids.to_vec()));
+        }
+        let alpha = forward.find("\"alpha\" [").expect("alpha node");
+        let hotel = forward.find("\"hotel\" [").expect("hotel node");
+        assert!(alpha < hotel, "nodes sorted by id, got: {forward}");
     }
 
     /// A target renders as a dashed node.
