@@ -1,4 +1,17 @@
-target
-.git
-tmp
-schema/*.json
+# Default-deny build context: `*` excludes everything, and the `!` lines let back in only what a
+# build from the repo root needs. Dockerfile's `COPY . .` feeds `cargo build --release -p
+# logit-cli`, and Dockerfile.dev copies nothing (the tree is bind-mounted at run time). Hidden
+# directories (.git, .claude), target/, and tmp/ never reach the daemon.
+#
+# Only a build whose context is the repo root reads this file. The Dockerfiles under demo/,
+# examples/, tools/, and crates/logit-perf build from their own directory.
+#
+# A build-time input outside crates/ (a new workspace member, a .cargo/config.toml, an
+# include_str! of a file elsewhere) needs its own `!` line, or the release build fails with a
+# missing-file error. CI doesn't build the release image, so that failure only shows up in
+# script/image and the harnesses that build it.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates
