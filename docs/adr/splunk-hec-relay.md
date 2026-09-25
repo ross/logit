@@ -257,3 +257,39 @@ module doc describes the behavior; this list is the record of the choices.
   whose every object the codec skips sends nothing and still answers `200`, with an `ackID` when
   it named a channel.
 - **Decision 16:** no channel is required on any route, `/raw` and `/ack` included.
+
+## Amendment: what the sink settled (2026-09-25)
+
+Building `splunk_hec_out` (W3) fixed the details below. `crates/logit-outputs/src/splunk.rs`'s
+module doc describes the behavior; this list is the record of the choices.
+
+- **Decision 2, config:** `max_body_bytes` is a byte-count string (default `"2MiB"`), like
+  `splunk_hec_in`'s `max_request_bytes`, and caps a body before compression. There is no
+  `headers:` field: nothing in the survey needs one, and `datadog_out`'s reserved-name rules
+  would come with it. `ack_timeout`'s 30s default is applied when the component is built, so an
+  explicit `ack_timeout` without `ack: true` is rule 70's error rather than a silent no-op.
+- **Decision 2, bodies:** objects are packed greedily in batch order and concatenated with no
+  separator. An object over the cap alone is dropped and counted by the records it carries, and
+  packing carries on past it rather than closing the body. The first failing body aborts the
+  rest of the batch, `datadog_out`'s rule.
+- **Decision 17, the channel:** one random v4 GUID per sink instance, drawn when it is built, so
+  a restart starts a new channel. It goes on `/ack` polls too, which a `useACK` token requires.
+- **Decision 18, code 6:** a `400` whose body is code 6 with no `invalid-event-number`, or one
+  that names no object of the body, is permanent, as is a code 6 on the resend. A code 6 naming
+  the body's last object needs no resend. The records ahead of the named object count as
+  delivered (`logit.output.records`), under the same unverified assumption the resend makes.
+- **Decision 5, acknowledgment:** the deadline runs from when the batch's last body was
+  accepted, and a last poll runs at the deadline before the batch fails as ambiguous. Every poll
+  failure other than code 14 (a transport error, another non-2xx, a body that isn't an ack reply)
+  is retried on the same schedule, since a poll that fails says nothing about indexing. A code 14
+  poll counts every id still pending as delivered. Polls aren't compressed: an ack request is a
+  few bytes per body. `logit.output.acks` counts per `/event` request (one id each).
+- **Telemetry:** `logit.output.requests`, `request.duration`, and `request.bytes` carry
+  `route` (`event` or `ack`), so a poll is visible beside the requests it confirms.
+  `logit.output.requests.rejected{code}` counts every non-retryable `/event` answer, a code 6
+  that leads to a resend included; `code` is the body's HEC code when Splunk documents it (the
+  codes in `HecStatus::ALL`), else `other`, so a proxy's error page can't grow the tag set. A
+  `401` or `403` has its own diagnostic key, `token_rejected`.
+- **Decision 3, reuse:** `datadog_out`'s bounded, secret-scrubbing error-body read moves into
+  `logit-outputs`' `crate::http` (`error_read_bytes`, `redacted_snippet`), shared by both sinks.
+  The HTTP client is built on `Output::bind`, or by the first `send` when nothing called it.
