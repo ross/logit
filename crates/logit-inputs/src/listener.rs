@@ -97,15 +97,15 @@ impl AcceptErrorClass {
 ///
 /// | Class | errno | Portable `ErrorKind` |
 /// |---|---|---|
-/// | `Connection` | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETDOWN`, `ENETUNREACH` | `ConnectionAborted`, `ConnectionReset`, `Interrupted`, `HostUnreachable`, `NetworkDown`, `NetworkUnreachable`, `PermissionDenied` |
+/// | `Connection` | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | `ConnectionAborted`, `ConnectionReset`, `Interrupted`, `HostUnreachable`, `NetworkDown`, `NetworkUnreachable`, `PermissionDenied` |
 /// | `Resource` | `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` | `OutOfMemory` |
 /// | `Fatal` | `EBADF`, `EINVAL`, `ENOTSOCK`, `EFAULT` | `InvalidInput`, and tokio's runtime-shutdown error |
 /// | `Other` | anything else | anything else |
 ///
 /// The `Connection` row follows `man 2 accept`: Linux passes a new socket's pending network errors
-/// (`ENETDOWN`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`)
-/// through `accept`, and a server should treat them like `EAGAIN` and retry. `EPERM`
-/// is a firewall rule refusing that one connection.
+/// (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`,
+/// `ENETUNREACH`) through `accept`, and a server should treat them like `EAGAIN` and retry.
+/// `EPERM` is a firewall rule refusing that one connection.
 ///
 /// tokio retries only `WouldBlock` inside `accept` and returns everything else, so every class
 /// here reaches the caller. The errno column applies on Linux only, where `libc` is a dependency;
@@ -140,6 +140,7 @@ pub(crate) fn classify_accept_error(err: &io::Error) -> AcceptErrorClass {
             | libc::EHOSTUNREACH
             | libc::EOPNOTSUPP
             | libc::ENETDOWN
+            | libc::ENOPROTOOPT
             | libc::ENETUNREACH => return AcceptErrorClass::Connection,
             libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => {
                 return AcceptErrorClass::Resource;
@@ -258,6 +259,7 @@ mod tests {
             (libc::EHOSTUNREACH, Connection),
             (libc::EOPNOTSUPP, Connection),
             (libc::ENETDOWN, Connection),
+            (libc::ENOPROTOOPT, Connection),
             (libc::ENETUNREACH, Connection),
             (libc::EMFILE, Resource),
             (libc::ENFILE, Resource),

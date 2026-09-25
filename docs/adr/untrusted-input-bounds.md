@@ -135,7 +135,7 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 
   | Class | errno | Action |
   |---|---|---|
-  | Connection | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETDOWN`, `ENETUNREACH` | Retry at once: the failure belongs to one connection. |
+  | Connection | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | Retry at once: the failure belongs to one connection. |
   | Resource | `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` | Back off 100 ms, then continue. |
   | Fatal | `EBADF`, `EINVAL`, `ENOTSOCK`, `EFAULT`, and tokio's runtime-shutdown error | Return the error: the listening socket itself is unusable. |
   | Other | anything else | Back off 100 ms, then continue. |
