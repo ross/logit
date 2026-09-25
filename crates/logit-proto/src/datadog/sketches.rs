@@ -28,6 +28,14 @@ use std::sync::Arc;
 /// The largest count one `n` entry carries; the Agent's bins are `uint16`.
 pub const MAX_BIN_COUNT: u32 = 65535;
 
+/// The most `k`/`n` entries one encoded `Dogsketch` may carry. A bin's count splits into
+/// `ceil(count / MAX_BIN_COUNT)` entries, so without a cap a few KiB of sketch whose counts near
+/// `u32::MAX` (a sample-rate typo extrapolated through `aggregate`) expands to gigabytes. `2^20`
+/// is 128 entries per bin for a full Agent-mapped sketch (two stores of
+/// `Mapping::AGENT_BIN_LIMIT` bins plus the zero bin), a per-bin count of about 8.4 million, and
+/// 8 MiB of `k` and `n` in memory.
+pub const MAX_DOGSKETCH_ENTRIES: u64 = 1 << 20;
+
 impl DatadogDecoder {
     /// `/api/beta/sketches`: one `Event` per `Dogsketch`, its `MetricRecord` a
     /// `Distribution` under [`Mapping::agent`], bin-for-bin.
@@ -187,10 +195,7 @@ impl DatadogEncoder {
                     self.out_skipped(("reason", "no_recorded_value"));
                     continue;
                 }
-                let Some(dog) = self.dogsketch(sketch, event.timestamp) else {
-                    self.out_skipped(("reason", "empty_sketch"));
-                    continue;
-                };
+                let Some(dog) = self.dogsketch(sketch, event.timestamp) else { continue };
                 let c = carriers
                     .get_or_insert_with(|| self.carriers(&batch.resource, event, Route::Sketches));
                 sketches.push(Sketch {
@@ -209,9 +214,9 @@ impl DatadogEncoder {
         })
     }
 
-    /// One sketch as a `Dogsketch`, re-binned first when it isn't under the Agent mapping; `None`
-    /// for an empty one.
-    fn dogsketch(&self, sketch: &DdSketch, timestamp: i64) -> Option<Dogsketch> {
+    /// One sketch as a `Dogsketch`, re-binned first when it isn't under the Agent mapping. `None`,
+    /// counted, for an empty sketch or one past [`MAX_DOGSKETCH_ENTRIES`].
+    fn dogsketch(&mut self, sketch: &DdSketch, timestamp: i64) -> Option<Dogsketch> {
         let rebinned;
         let sketch = if *sketch.mapping() == Mapping::agent() {
             sketch
@@ -220,13 +225,31 @@ impl DatadogEncoder {
             rebinned = rebin_to_agent(sketch);
             &rebinned
         };
+        let entries: u64 = sketch
+            .negative_bins()
+            .iter()
+            .chain(sketch.positive_bins())
+            .map(|bin| bin.count)
+            .chain(std::iter::once(sketch.zero_count()))
+            .map(|count| u64::from(wire_count(count).div_ceil(MAX_BIN_COUNT)))
+            .sum();
+        if entries > MAX_DOGSKETCH_ENTRIES {
+            self.out_skipped(("reason", "oversized_sketch"));
+            self.diagnostics.warn_throttled(
+                "oversized_sketch",
+                format!(
+                    "datadog: a sketch of {entries} k/n entries dropped (the cap is \
+                     {MAX_DOGSKETCH_ENTRIES})"
+                ),
+            );
+            return None;
+        }
         let mut k = Vec::new();
         let mut n = Vec::new();
         let mut fractional = false;
         let mut push = |key: i32, count: f64| {
-            let rounded = count.round();
-            fractional |= rounded != count;
-            let mut left = if rounded >= f64::from(u32::MAX) { u32::MAX } else { rounded as u32 };
+            fractional |= count.round() != count;
+            let mut left = wire_count(count);
             while left > 0 {
                 let chunk = left.min(MAX_BIN_COUNT);
                 k.push(key);
@@ -250,6 +273,7 @@ impl DatadogEncoder {
         // `i64::MAX`; saturate rather than wrap to a negative `cnt` the next hop rejects.
         let cnt = i64::try_from(sketch.count()).unwrap_or(i64::MAX);
         if k.is_empty() && cnt == 0 {
+            self.out_skipped(("reason", "empty_sketch"));
             return None;
         }
         let sum = sketch.sum();
@@ -263,6 +287,16 @@ impl DatadogEncoder {
             k,
             n,
         })
+    }
+}
+
+/// A bin count as the total its `n` entries carry: rounded, saturating at `u32::MAX`.
+fn wire_count(count: f64) -> u32 {
+    let rounded = count.round();
+    if rounded >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        rounded as u32
     }
 }
 
@@ -421,6 +455,55 @@ mod tests {
         assert_eq!(dog.n, vec![1, 3, 2, 1, 65535, 4465]);
         assert_eq!((dog.cnt, dog.ts), (70007, TS_S));
         assert_eq!(dog.avg, 10.0 / 70007.0);
+    }
+
+    fn batch_of(sketch: DdSketch) -> EventBatch {
+        let record = MetricRecord::new(intern("lat"), MetricKind::Distribution(sketch));
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![Event::metric(seconds_to_nanos(TS_S), AttrMap::new(), record)],
+        }
+    }
+
+    /// A sketch of `bins` positive bins, each counting `per_bin`.
+    fn heavy(bins: i32, per_bin: f64) -> DdSketch {
+        DdSketch::from_parts(
+            Mapping::agent(),
+            (1..=bins).map(|key| Bin { key, count: per_bin }).collect(),
+            vec![],
+            0.0,
+            Some(SketchStats { count: f64::from(bins) * per_bin, min: 1.0, max: 1.0, sum: 1.0 }),
+        )
+    }
+
+    /// Each bin splits into `ceil(count / MAX_BIN_COUNT)` entries, so 256 bins of 4e9 (a
+    /// sample-rate typo extrapolated through `aggregate`) would be 15.6 million entries from a
+    /// few KiB of sketch. Past `MAX_DOGSKETCH_ENTRIES` the sketch is dropped and counted.
+    #[test]
+    fn a_sketch_past_the_entry_cap_is_dropped_and_counted() {
+        let (_, mut e, registry) = with_registry();
+        let entries = e
+            .encode_sketches(&batch_of(heavy(256, 4.0e9)))
+            .map(|body| SketchPayload::decode(body).unwrap().sketches[0].dogsketches[0].k.len());
+        assert_eq!(entries, None);
+        assert!(reasons(&registry).contains(&"oversized_sketch".to_string()));
+    }
+
+    /// The cap is inclusive: 16 bins of `65535 * 65536` are 16 * 65536 = 2^20 entries.
+    #[test]
+    fn a_sketch_at_the_entry_cap_is_sent() {
+        let (_, mut e, registry) = with_registry();
+        let at_cap = 65535.0 * 65536.0;
+        let body = e.encode_sketches(&batch_of(heavy(16, at_cap))).expect("sent");
+        let dog = &SketchPayload::decode(body).unwrap().sketches[0].dogsketches[0];
+        assert_eq!(dog.k.len(), 1 << 20);
+        assert!(reasons(&registry).is_empty());
+
+        let mut over = heavy(16, at_cap);
+        over.merge(&heavy(1, 1.0));
+        assert!(e.encode_sketches(&batch_of(over)).is_none());
+        assert!(reasons(&registry).contains(&"oversized_sketch".to_string()));
     }
 
     #[test]
