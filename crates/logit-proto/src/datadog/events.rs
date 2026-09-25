@@ -9,15 +9,14 @@
 //! DogStatsD event and a Datadog-API event are indistinguishable in the model, so either one
 //! re-encodes on either route.
 
-use super::logs::{
-    json_to_value, new_batch, parse_json, value_text, write_i64, write_str, write_value, JsonObject,
-};
+use super::logs::{new_batch, parse_json};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received, seconds_f64_to_nanos, seconds_to_nanos};
 use super::{
     is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
     ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, RESOURCE_ATTR_AGENT_HOSTNAME,
 };
+use crate::json::{json_to_value, value_text, write_i64, write_str, write_value, JsonObject};
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::attrs::merged;

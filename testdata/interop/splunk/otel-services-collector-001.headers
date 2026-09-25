@@ -1,0 +1,12 @@
+method: POST
+path: /services/collector
+host: capture:8088
+user-agent: OpenTelemetry Collector Contrib/0.161.0
+content-length: 283
+authorization: Splunk 00000000-0000-0000-0000-000000000000
+connection: keep-alive
+content-encoding: gzip
+content-type: application/json
+__splunk_app_name: OpenTelemetry Collector Contrib
+__splunk_app_version: 0.161.0
+accept-encoding: gzip

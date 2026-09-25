@@ -990,8 +990,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "flate2",
+ "form_urlencoded",
  "http",
  "http-body-util",
  "hyper",

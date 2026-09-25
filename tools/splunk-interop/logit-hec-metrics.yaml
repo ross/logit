@@ -1,0 +1,91 @@
+# Leg `hec-metrics` of `script/splunk-interop`: every metric kind through `splunk_hec_out`
+# `multi_value: expand` into the `metrics` index.
+#
+# Two `lua` stages mint one event per tick each with `Event.new`:
+#
+#   mint_raw  a gauge, a cumulative and a delta sum, raw samples, raw set members, a histogram,
+#             a summary, and an exponential histogram, straight to the sink
+#   mint_agg  raw samples and set members that `aggregate` turns into a `Distribution` and a
+#             `Set`, the two kinds `Event.new` can't build
+#
+# Every name starts `splunk_interop.`, so the harness's `mstats` and `mcatalog` queries find only
+# this leg's series.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+    resource:
+      service.name: splunk-interop-metrics
+
+  mint_raw:
+    type: lua
+    sources: [tick]
+    script: |
+      local n = 0
+
+      function process(event)
+        n = n + 1
+        return Event.new{
+          timestamp = event.timestamp,
+          attributes = {leg = "hec-metrics"},
+          metrics = {
+            {name = "splunk_interop.gauge", kind = "gauge", value = 42.5},
+            {name = "splunk_interop.sum_cumulative", kind = "sum", value = n,
+             temporality = "cumulative", monotonic = true},
+            {name = "splunk_interop.sum_delta", kind = "sum", value = 1, temporality = "delta"},
+            {name = "splunk_interop.samples", kind = "samples", values = {1, 2, 3, 10}},
+            {name = "splunk_interop.set_members", kind = "set_members",
+             members = {"alice", "bob", "carol"}},
+            {name = "splunk_interop.histogram", kind = "histogram", temporality = "cumulative",
+             sum = 55, buckets = {{bound = 0.1, count = 1}, {bound = 1, count = 3},
+                                  {bound = 10, count = 5}, {bound = math.huge, count = 1}}},
+            {name = "splunk_interop.summary", kind = "summary", count = 10, sum = 20,
+             quantiles = {{quantile = 0.5, value = 1.5}, {quantile = 0.99, value = 9}}},
+            {name = "splunk_interop.exphist", kind = "exponential_histogram", scale = 0,
+             zero_count = 1, count = 4, zero_threshold = 0, sum = 7,
+             positive = {offset = 0, counts = {1, 2}}, negative = {offset = 0, counts = {}},
+             temporality = "cumulative"},
+          },
+        }
+      end
+
+  mint_agg:
+    type: lua
+    sources: [tick]
+    script: |
+      function process(event)
+        return Event.new{
+          timestamp = event.timestamp,
+          attributes = {leg = "hec-metrics"},
+          metrics = {
+            {name = "splunk_interop.distribution", kind = "samples",
+             values = {1, 2, 3, 4, 5, 6, 7, 8, 9, 100}},
+            {name = "splunk_interop.set", kind = "set_members", members = {"x", "y", "z"}},
+          },
+        }
+      end
+
+  window:
+    type: aggregate
+    sources: [mint_agg]
+    interval: 5s
+
+  envelope:
+    type: set
+    sources: [mint_raw, window]
+    resource:
+      com.splunk.index: metrics
+      com.splunk.sourcetype: logit:metrics
+      com.splunk.source: splunk-interop
+      host.name: splunk-interop-logit
+
+  splunk:
+    type: splunk_hec_out
+    sources: [envelope]
+    endpoint: http://splunk:8088/services/collector
+    token: 11111111-1111-1111-1111-111111111111
+    multi_value: expand

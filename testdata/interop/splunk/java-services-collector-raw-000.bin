@@ -1,0 +1,1 @@
+INFO splunk-java-fixture {"action":"start","component":"splunk-java fixture","port":8080}

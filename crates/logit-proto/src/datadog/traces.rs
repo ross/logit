@@ -9,7 +9,6 @@
 //! `HashMap`s, whose iteration order is random per instance, so encoding through them would make
 //! two encodes of one batch differ byte for byte. The encoders sort every map by key instead.
 
-use super::logs::value_text;
 use super::{
     merged_get, DatadogDecoder, DatadogEncoder, ATTR_RESOURCE_NAME, ATTR_SERVICE_NAME,
     ATTR_SPAN_KIND, ATTR_SPAN_TYPE, RESOURCE_ATTR_AGENT_ENV, RESOURCE_ATTR_AGENT_HOSTNAME,
@@ -18,6 +17,7 @@ use super::{
     RESOURCE_ATTR_TRACER_LANGUAGE_NAME, RESOURCE_ATTR_TRACER_RUNTIME_ID,
     RESOURCE_ATTR_TRACER_VERSION,
 };
+use crate::json::value_text;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::trace::{parse_trace_id_high, trace_id_bytes, trace_id_halves};

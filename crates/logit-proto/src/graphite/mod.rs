@@ -262,14 +262,4 @@ pub enum Tags {
     Drop,
 }
 
-/// What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot carry.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum MultiValue {
-    /// Drop the record, counted `logit.output.metrics.skipped{metric_kind=…}`. The default, since
-    /// a sub-path naming convention is one the receiver knows nothing about.
-    #[default]
-    Skip,
-    /// Expand into the dotted sub-paths this module doc's table lists, counted
-    /// `logit.output.metrics.degraded{metric_kind=…}` once per record.
-    Expand,
-}
+pub use crate::MultiValue;

@@ -1,0 +1,48 @@
+# Stands in for Splunk's HTTP Event Collector (HEC): any HEC client sends this listener what it
+# would send Splunk, and `stdio_out` prints what arrives. `splunk_hec_in`
+# (docs/adr/splunk-hec-relay.md) answers with Splunk's own `{"text","code"}` bodies, so a client
+# needs no change beyond its URL. The envelope's `host`, `source`, `sourcetype`, and `index`
+# arrive as the resource attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and
+# `com.splunk.index`. docs/splunk.md covers the topologies this fits into.
+#
+# Point a client at it with the token it already sends Splunk. Docker's `splunk` log driver, in
+# any `splunk-format` (the driver checks the URL with an `OPTIONS` request before it starts a
+# container, which this listener answers):
+#
+#   docker run --log-driver splunk \
+#     --log-opt splunk-url=http://<this-host>:8088 \
+#     --log-opt splunk-token=<token> \
+#     --log-opt splunk-format=json ...
+#
+# The OpenTelemetry Collector's `splunk_hec` exporter (logs, metrics, and traces; its span events
+# arrive here as spans):
+#
+#   exporters:
+#     splunk_hec:
+#       endpoint: http://<this-host>:8088/services/collector
+#       token: <token>
+#
+# Splunk's Java logging library, as a Logback appender:
+#
+#   <appender name="hec" class="com.splunk.logging.HttpEventCollectorLogbackAppender">
+#     <url>http://<this-host>:8088</url>
+#     <token>TOKEN</token>
+#   </appender>
+#
+# A client configured with an `https://` URL needs `tls:` below.
+components:
+  hec:
+    type: splunk_hec_in
+    # Loopback: with `tokens` set this listener checks each request's token, but that is a shared
+    # secret, not transport security. Bind wider, and add `tls:`, only when you mean to.
+    bind: 127.0.0.1:8088
+    # The tokens clients send. Empty accepts any token; `!env` keeps the token out of this file.
+    tokens: [!env SPLUNK_HEC_TOKEN]
+    # tls:                        # presence turns server TLS on for this listener
+    #   cert_file: server.pem     # resolved against this config file's directory
+    #   key_file: server.key
+    # max_request_bytes: 5MiB     # the default; one request, as sent and after gzip
+
+  stdout:
+    type: stdio_out
+    sources: [hec]

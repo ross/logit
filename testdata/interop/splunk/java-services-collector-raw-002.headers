@@ -1,0 +1,9 @@
+method: POST
+path: /services/collector/raw?channel=00000000-0000-0000-0000-00000000000a&host=splunk-java-fixture&index=main&sourcetype=java%3Araw&source=java%3Alogback
+authorization: Splunk 00000000-0000-0000-0000-000000000000
+content-type: plain/text; charset=utf-8
+content-length: 61
+host: capture:8088
+connection: Keep-Alive
+accept-encoding: gzip
+user-agent: okhttp/4.12.0

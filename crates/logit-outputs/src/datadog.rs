@@ -124,9 +124,8 @@
 //! | `User-Agent` | `logit/<version>` |
 //!
 //! The key never appears in a diagnostic or an error: a rejection body is read past the quoted
-//! snippet size by the key's own length ([`error_read_bytes`]) so an echoed key is read whole and
-//! replaced with `<redacted>` before the snippet is cut, and a trailing remnant of the key split
-//! by the read limit itself is stripped after ([`strip_key_remnant`]).
+//! snippet size by the key's own length ([`error_read_bytes`]) and scrubbed of it by
+//! [`redacted_snippet`].
 //!
 //! ## Faults, retries, and duplicate safety
 //!
@@ -170,8 +169,8 @@
 //! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
 
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, ERROR_BODY_SNIPPET_BYTES,
+    build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
+    split_encode, status_class, Caps, Encoded,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -425,36 +424,6 @@ fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-}
-
-/// How many bytes to read from a rejection body before cutting it to [`ERROR_BODY_SNIPPET_BYTES`]:
-/// enough past the snippet size that a key echoed within the kept snippet is read whole, rather
-/// than cut mid-key by the read limit itself, so [`DatadogOutput::redact`]'s whole-key match can
-/// still catch it before the cut.
-fn error_read_bytes(key: &str) -> usize {
-    ERROR_BODY_SNIPPET_BYTES + key.len()
-}
-
-/// After `snippet` is cut to size, strips a trailing run of 4 or more bytes that is itself a
-/// prefix of `key`. That run is what's left of a key split by [`error_read_bytes`]'s own read
-/// limit, which [`DatadogOutput::redact`]'s whole-key match can't catch because the read never
-/// captured the whole key.
-fn strip_key_remnant(snippet: String, key: &str) -> String {
-    let (content, ellipsis) = match snippet.strip_suffix("...") {
-        Some(rest) => (rest, "..."),
-        None => (snippet.as_str(), ""),
-    };
-    let max_run = content.len().min(key.len());
-    for len in (4..=max_run).rev() {
-        let cut = content.len() - len;
-        if !content.is_char_boundary(cut) {
-            continue;
-        }
-        if key.as_bytes().starts_with(&content.as_bytes()[cut..]) {
-            return format!("{}{ellipsis}", &content[..cut]);
-        }
-    }
-    snippet
 }
 
 /// The Datadog intake client (module doc).
@@ -754,14 +723,6 @@ impl DatadogOutput {
         headers
     }
 
-    /// `text` with the API key replaced, for anything quoted from a response.
-    fn redact(&self, text: &str) -> String {
-        match self.api_key.to_str() {
-            Ok(key) if !key.is_empty() => text.replace(key, "<redacted>"),
-            _ => text.to_string(),
-        }
-    }
-
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
     async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
@@ -801,14 +762,11 @@ impl DatadogOutput {
             self.telemetry.count(RECORDS, entries as f64, &tags);
             return Ok(());
         }
-        // Bounded, and scrubbed of the key before it reaches a diagnostic or the error: the read
-        // goes past the snippet size so a key that starts inside the kept snippet is read whole
-        // and redacted before the cut, and a trailing remnant of the key split by the read limit
-        // itself is stripped after.
+        // Bounded, and scrubbed of the key before it reaches a diagnostic or the error
+        // ([`redacted_snippet`]).
         let key = self.api_key.to_str().unwrap_or_default();
         let body = read_body_prefix(response, error_read_bytes(key)).await;
-        let snippet =
-            strip_key_remnant(body_snippet(&self.redact(&body), ERROR_BODY_SNIPPET_BYTES), key);
+        let snippet = redacted_snippet(&body, key);
         let fault = match status.as_u16() {
             408 | 429 | 500..=599 => Fault::Ambiguous,
             403 => {
@@ -1420,8 +1378,8 @@ mod tests {
     }
 
     /// A key can be split by the read limit itself, not only by the snippet cut, leaving a
-    /// fragment `redact`'s whole-key match can't catch. `strip_key_remnant` bounds what such a
-    /// fragment can leak to fewer than 4 bytes.
+    /// fragment `redacted_snippet`'s whole-key match can't catch. Its remnant strip bounds what
+    /// such a fragment can leak to fewer than 4 bytes.
     #[tokio::test]
     async fn a_key_split_by_the_read_limit_leaks_no_more_than_a_few_bytes() {
         let start = error_read_bytes(KEY) - 3;

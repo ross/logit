@@ -96,14 +96,14 @@ DOT format. [examples/](examples) has complete starting configs, each with a ren
 
 | Role | Types |
 |---|---|
-| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `collectd_in`, `graphite_in`, `tail_in`, `docker_in`, `logit_in`, `internal` (`logit`'s own telemetry), `generate_in` |
+| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `splunk_hec_in` (Splunk's HTTP Event Collector), `collectd_in`, `graphite_in`, `tail_in`, `docker_in`, `logit_in`, `internal` (`logit`'s own telemetry), `generate_in` |
 | Parsers | `json`, `csv`, `logfmt`, `kv`, `regex`, `http_access` |
 | Reshaping | `set`, `remove`, `keep`, `keep_values`, `flatten`, `scale`, `kv_metrics`, `trace_context` |
 | Filtering and sampling | `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `sample` |
 | Aggregation and routing | `aggregate`, `route`, `target` |
 | Scripting | `lua`, `lua_file` |
 | Observation | `shape` |
-| Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
+| Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `splunk_hec_out` (Splunk's HTTP Event Collector), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
 
 `logit_in` and `logit_out` speak `logit`'s own wire protocol, for forwarding between `logit` nodes.
 VictoriaMetrics, VictoriaLogs, and VictoriaTraces need no component of their own; see
@@ -117,6 +117,8 @@ The editor-ready JSON Schema for the config is [schema/logit.schema.json](schema
 - [docs/deploying.md](docs/deploying.md): running `logit` in production.
 - [docs/datadog.md](docs/datadog.md): sending to Datadog, and standing in for a Datadog Agent or
   Datadog's intake.
+- [docs/splunk.md](docs/splunk.md): sending to Splunk over HEC, and standing in for Splunk's HTTP
+  Event Collector.
 - [docs/http-access-logs.md](docs/http-access-logs.md): the access-log schema for nginx, HAProxy,
   and other web servers.
 - [docs/design/](docs/design): the event model, Lua API, pipeline graph, wire protocol, internal

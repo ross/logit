@@ -1,0 +1,126 @@
+#!/bin/bash
+# Usage: script/splunk-interop
+#
+# Runs every leg of tools/splunk-interop/ against a real Splunk Enterprise container, then probes
+# that Splunk directly for what docs/plans/splunk-relay.md left unverified, and prints one pass,
+# gap, or fail row per leg and one row per probe. See tools/splunk-interop/README.md for what it
+# runs and what it writes.
+#
+# Not part of script/cibuild: it runs third-party images on the host's docker daemon, and no test
+# depends on it. Splunk takes several GB of RAM and a few minutes to start.
+#
+#   SPLUNK_INTEROP_WINDOW=60      seconds the legs run before Splunk is queried
+#   SPLUNK_INTEROP_SKIP_IMAGE=1   reuse the existing logit:splunk-interop image
+#   SPLUNK_INTEROP_OUT=<dir>      where run directories go (default perf/results/splunk-interop)
+
+set -euo pipefail
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+TOOLS_DIR="${ROOT}/tools/splunk-interop"
+# Everything this run creates is under this compose project, and compose.yaml names its network
+# `splunk-interop-net`, so cleanup can't touch anything else on a shared daemon.
+PROJECT="splunk-interop"
+NETWORK="splunk-interop-net"
+IMAGE="logit:splunk-interop"
+PYTHON_IMAGE="python:3.12-slim"
+WINDOW="${SPLUNK_INTEROP_WINDOW:-60}"
+
+RUN_DIR="${SPLUNK_INTEROP_OUT:-${ROOT}/perf/results/splunk-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${RUN_DIR}/logs"
+# The image's unprivileged `logit` user and the capture containers have unrelated uids;
+# world-writable lets their files land here.
+chmod 777 "${RUN_DIR}"
+
+# `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
+# `sudo docker` by default.
+ENV_FILE="${RUN_DIR}/compose.env"
+{
+    echo "SPLUNK_INTEROP_OUT=${RUN_DIR}"
+    echo "SPLUNK_INTEROP_IMAGE=${IMAGE}"
+} >"${ENV_FILE}"
+
+si_compose() {
+    ${DOCKER} compose --progress quiet -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" \
+        --env-file "${ENV_FILE}" "$@"
+}
+
+STARTED=0
+
+# Captures every service's log into the run directory, then removes the project's containers,
+# volumes, and network. Runs on every exit, including a failed start.
+cleanup() {
+    if [ "${STARTED}" -eq 1 ]; then
+        collect_logs || true
+        si_compose down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+collect_logs() {
+    local service
+    for service in $(si_compose config --services); do
+        si_compose logs --no-color --no-log-prefix "${service}" >"${RUN_DIR}/logs/${service}.log" 2>&1 || true
+    done
+}
+
+# A project already up is someone else's run (or a crashed one of ours): stop rather than tear down
+# a stack this invocation didn't start.
+if [ -n "$(si_compose ps -a -q 2>/dev/null)" ]; then
+    echo "splunk-interop: compose project '${PROJECT}' already has containers on this daemon." >&2
+    echo "  Not this run's to stop. If it is yours, run:" >&2
+    echo "  ${DOCKER} compose -p ${PROJECT} -f ${TOOLS_DIR}/compose.yaml down -v" >&2
+    exit 1
+fi
+
+if [ -n "${SPLUNK_INTEROP_SKIP_IMAGE:-}" ]; then
+    ${DOCKER} image inspect "${IMAGE}" >/dev/null 2>&1 || {
+        echo "splunk-interop: SPLUNK_INTEROP_SKIP_IMAGE is set but ${IMAGE} does not exist" >&2
+        exit 1
+    }
+else
+    echo "splunk-interop: building ${IMAGE} from the current tree"
+    ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null
+fi
+
+for config in "${TOOLS_DIR}"/logit-*.yaml; do
+    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+        echo "splunk-interop: ${config} failed 'logit validate'" >&2
+        exit 1
+    }
+done
+
+trap cleanup EXIT
+STARTED=1
+echo "splunk-interop: starting the stack (run directory ${RUN_DIR}); Splunk takes a few minutes"
+# `--wait` holds until Splunk's and every `logit` service's health check passes; `splunk-init`,
+# a one-shot, has finished by then, since every `logit` service waits on it. `replay` exits once
+# it has posted, so it starts after the wait.
+legs=()
+for config in "${TOOLS_DIR}"/logit-*.yaml; do
+    legs+=("$(basename "${config}" .yaml)")
+done
+si_compose up -d --wait --wait-timeout 900 splunk rawcap "${legs[@]}" >/dev/null
+si_compose up -d replay >/dev/null
+
+{
+    echo "splunk-interop provenance"
+    echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
+    echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    si_compose images 2>/dev/null
+} >"${RUN_DIR}/provenance.txt"
+
+echo "splunk-interop: generating traffic for ${WINDOW}s"
+sleep "${WINDOW}"
+
+collect_logs
+echo "splunk-interop: querying Splunk"
+status=0
+${DOCKER} run --rm --network "${NETWORK}" \
+    -v "${TOOLS_DIR}:/tools:ro,z" \
+    -v "${RUN_DIR}:/out:z" \
+    "${PYTHON_IMAGE}" python3 /tools/check.py || status=$?
+
+echo "splunk-interop: results in ${RUN_DIR}/results.md, service logs in ${RUN_DIR}/logs/"
+exit "${status}"

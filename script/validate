@@ -2,7 +2,8 @@
 # Usage: script/validate
 # Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/logit.yaml,
 # fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml, and tools/victoria-interop/logit-*.yaml
-# (that directory's other YAML is compose and vmagent config). Not part of script/cibuild;
+# and tools/splunk-interop/logit-*.yaml (those directories' other YAML is compose and vmagent
+# config). Not part of script/cibuild;
 # script/test's `every_shipped_config_loads_and_validates` covers the same set.
 #
 # The `!env` variables the configs need (ADR `env-yaml-tag`) are defaulted here, not in
@@ -20,6 +21,12 @@ export PROMETHEUS_REMOTE_WRITE_AUTHORIZATION="${PROMETHEUS_REMOTE_WRITE_AUTHORIZ
 # `DD-API-KEY`), fixtures/datadog-direct.yaml's `api_key`, and examples/canonical/logit.yaml's
 # `api_key` and `dd-api-key` header.
 export DD_API_KEY="${DD_API_KEY:-logit-dev-key}"
+# fixtures/splunk-observability.yaml's `headers:` map (the `X-SF-Token` an org sends to
+# Observability Cloud).
+export SPLUNK_OBSERVABILITY_TOKEN="${SPLUNK_OBSERVABILITY_TOKEN:-logit-dev-token}"
+# The HEC token fixtures/splunk-hec-*.yaml send (`splunk_hec_out`'s `token`) and accept
+# (`splunk_hec_in`'s `tokens:`).
+export SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-logit-dev-token}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"
@@ -30,7 +37,8 @@ cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
 for config in demo/logit.yaml examples/*/logit.yaml fixtures/*.yaml perf/scenarios/*.yaml \
-    tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml; do
+    tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml \
+    tools/splunk-interop/logit-*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done
