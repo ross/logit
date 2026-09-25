@@ -1,0 +1,63 @@
+# Relays OTLP into all three Victoria products: metrics to VictoriaMetrics, logs to VictoriaLogs,
+# and traces to VictoriaTraces, each over OTLP/HTTP (docs/adr/victoriametrics-interop.md). Point
+# your OpenTelemetry SDKs or Collector at `otlp_in`, and change each `endpoint` to your product.
+#
+# One `otlp_out` posts every signal it carries to one host, and a product answers a signal it
+# doesn't ingest with a permanent `404` that drops the whole batch. So each product gets its own
+# `otlp_out` behind a `keep_signals` that passes only its signal.
+#
+# What to know per product (docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and
+# VictoriaTraces" section):
+#
+# - VictoriaMetrics keeps no temporality and stores a delta `Sum` as raw per-interval points. If
+#   your SDKs export delta temporality, put an `aggregate` with `temporality: cumulative` between
+#   `only_metrics` and `victoria_metrics`.
+# - VictoriaLogs maps the OTLP log body to `_msg` with no `VL-Msg-Field` header; `VL-Stream-Fields`
+#   names the fields that identify a log stream.
+# - VictoriaTraces also takes OTLP/gRPC, but its gRPC listener closes each connection after about
+#   5 seconds without a `GOAWAY`, and a batch in flight at that moment is dropped. Use HTTP.
+# - VictoriaMetrics and VictoriaLogs label every record whose OTLP scope is empty with
+#   `scope.name="unknown"` and `scope.version="unknown"`. Batches from `otlp_in` keep the scope
+#   the SDK sent. For a scope-less source, start VictoriaMetrics with
+#   `-opentelemetry.promoteScopeMetadata=false`, or write `scope.name` and `scope.version` in a
+#   `lua` stage (docs/design/lua-api.md's "Reading and writing `scope`").
+components:
+  otel:
+    type: otlp_in
+    # No authentication on this listener: bind loopback or pod-local, or front it with something
+    # that authenticates.
+    bind: 127.0.0.1:4318
+    protocol: http
+
+  only_metrics:
+    type: keep_signals
+    sources: [otel]
+    signals: [metrics]
+
+  only_logs:
+    type: keep_signals
+    sources: [otel]
+    signals: [logs]
+
+  only_traces:
+    type: keep_signals
+    sources: [otel]
+    signals: [traces]
+
+  victoria_metrics:
+    type: otlp_out
+    sources: [only_metrics]
+    # The OTLP base path; `otlp_out` appends `/v1/metrics`.
+    endpoint: http://127.0.0.1:8428/opentelemetry
+
+  victoria_logs:
+    type: otlp_out
+    sources: [only_logs]
+    endpoint: http://127.0.0.1:9428/insert/opentelemetry
+    headers:
+      VL-Stream-Fields: service.name
+
+  victoria_traces:
+    type: otlp_out
+    sources: [only_traces]
+    endpoint: http://127.0.0.1:10428/insert/opentelemetry

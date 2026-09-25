@@ -3,7 +3,7 @@
 A self-contained stack for trying `logit`: no Rust toolchain, no `script/*`, and no knowledge of the
 rest of this repo. Real traffic crosses a three-hop request path (haproxy → nginx → app) tied
 together by a W3C trace context, and `logit` carries the resulting logs, metrics, and traces into
-Loki, InfluxDB, and Tempo, with a pre-built Grafana dashboard over all three.
+Loki, VictoriaMetrics, and Tempo, with a pre-built Grafana dashboard over all three.
 [docs/plans/demo-stack.md](../docs/plans/demo-stack.md) explains why the demo exists, and
 [docs/plans/demo-tracing-stack.md](../docs/plans/demo-tracing-stack.md) covers its tracing design
 and what's still to come.
@@ -54,7 +54,7 @@ They're one-shot renderers that have finished, not crashed (see
 |---|---|---|
 | Front door (haproxy) | http://localhost:8080 | Start here. Mints the request's W3C `traceparent`, then proxies to `nginx`. |
 | Grafana | http://localhost:3000 | Anonymous admin access. Open the "logit" folder for the pre-built dashboard. |
-| InfluxDB | http://localhost:8086 | `logit`/`logit-demo-password`. Bucket `metrics`, org `logit`. |
+| VictoriaMetrics | http://localhost:8428/vmui | No login. Receives `logit`'s metrics over Prometheus remote-write; `vmui` runs PromQL/MetricsQL queries directly. |
 | Loki | internal only, query it through Grafana | Provisioned as a Grafana datasource; receives `logit`'s own logs directly via `otlp_out`. |
 | Tempo | :4317/:4318 (OTLP ingest only), query it through Grafana | Provisioned as a Grafana datasource; receives `logit`'s own internal spans over OTLP/gRPC. |
 
@@ -70,8 +70,8 @@ host:
 ## What's actually flowing
 
 The shipped Grafana dashboard shows all of the following side by side over the same pipeline: the
-`logit.*` InfluxDB panels, a Loki logs panel, and two Tempo traces panels (one scoped to `logit`'s
-own internal spans, one to this demo's own request traces).
+`web.*` and `logit.*` VictoriaMetrics panels, a Loki logs panel, and two Tempo traces panels (one
+scoped to `logit`'s own internal spans, one to this demo's own request traces).
 
 ### Request path
 
@@ -149,13 +149,22 @@ continues on to the metrics leg.
 
 `http_access` has already put both tiers' durations in seconds (`http.request.duration_s`), so
 neither chain has a `scale` step. Each tier's own `kv_metrics` (`nginx_metrics`/`haproxy_metrics`)
-fans into a shared `keep` → `aggregate` → `influxdb_out` tail, and InfluxDB tells the tiers apart
-by the `service.name` tag each tier's `set` stamped.
+fans into a shared `keep` → `aggregate` → `prometheus_out` tail. `victoria_out` sends Prometheus
+remote-write 1.0, zstd-compressed, to VictoriaMetrics. VictoriaMetrics tells the tiers apart by the
+`service_name` label, which is the `service.name` each tier's `set` stamped.
+
+Two things differ from the metric names in `logit.yaml`, and the dashboard's PromQL uses the
+Prometheus spelling:
+
+- Dots become underscores, and a counter gains `_total`: `web.requests` is `web_requests_total`.
+- The `aggregate` runs with `temporality: cumulative`, because `prometheus_out` skips a delta
+  counter. A distribution such as `web.request_time` becomes a summary:
+  `web_request_time{quantile="0.5"}` through `{quantile="0.99"}`, one per 10-second window.
 
 ### `logit`'s own telemetry
 
 `logit` also observes its own pipeline via `internal` (`../docs/design/internal-telemetry.md`).
-It writes into the same InfluxDB bucket *and*, as real spans, over OTLP/gRPC into Tempo: one span
+It writes into the same VictoriaMetrics *and*, as real spans, over OTLP/gRPC into Tempo: one span
 per node-visit at `span_sample_rate: 1.0`, so nothing is thinned out
 (`../docs/adr/internal-span-emission-and-deterministic-sampling.md`,
 `../docs/adr/hand-rolled-grpc-over-hyper.md`). These share the same `tempo_out` as haproxy's and
@@ -331,7 +340,7 @@ expectations.
 
 ```sh
 docker compose down        # stop, keep data
-docker compose down -v     # stop, wipe all volumes (InfluxDB/Grafana/Loki/Tempo/graph/logit state)
+docker compose down -v     # stop, wipe all volumes (VictoriaMetrics/Grafana/Loki/Tempo/graph/logit state)
 ```
 
 `docker compose down -v` also wipes `nginx_in`'s checkpoint in the `logit_state` volume, along with

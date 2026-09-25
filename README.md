@@ -15,8 +15,8 @@ Vector, the OpenTelemetry Collector, Fluent Bit, and Telegraf, see
 ## Try the demo
 
 The demo runs `logit` against a small web stack and sends its logs, metrics, and traces to Loki,
-InfluxDB, and Tempo, with Grafana dashboards already provisioned. It needs only Docker with the
-Compose plugin.
+VictoriaMetrics, and Tempo, with Grafana dashboards already provisioned. It needs only Docker with
+the Compose plugin.
 
 ```sh
 cd demo
@@ -105,6 +105,9 @@ DOT format. [examples/](examples) has a runnable config for most components.
 | Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `datadog_out` (Datadog's intake API), `datadog_trace_out` (a Datadog Agent's APM API), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
 
 `logit_in` and `logit_out` speak `logit`'s own wire protocol, for forwarding between `logit` nodes.
+VictoriaMetrics, VictoriaLogs, and VictoriaTraces need no component of their own; see
+[docs/deploying.md](docs/deploying.md#victoriametrics-victorialogs-and-victoriatraces) for which
+standard one reaches each.
 The editor-ready JSON Schema for the config is [schema/logit.schema.json](schema/logit.schema.json).
 
 ## Documentation

@@ -28,7 +28,7 @@
 //!
 //! There are no per-sink host, service, source, or tag fields (ADR decision 10): the encoders read
 //! them from each event's attributes and the batch resource, so an upstream `set` stamps them.
-//! Graph rule 65 validates the block.
+//! Graph rule 66 validates the block.
 //!
 //! ## Routes
 //!
@@ -114,7 +114,7 @@
 //! ## The wire
 //!
 //! Headers are the operator's `headers:` with these `insert`ed over them, so a protocol-owned name
-//! always wins (rule 65 also rejects one at config time):
+//! always wins (rule 66 also rejects one at config time):
 //!
 //! | Header | Value |
 //! |---|---|
@@ -197,7 +197,7 @@ pub const DEFAULT_SITE: &str = "datadoghq.com";
 /// The default `timeout:` for one request, the 10s `otlp_out` and `prometheus_out` use.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The `User-Agent` on every request. Reserved in config (rule 65).
+/// The `User-Agent` on every request. Reserved in config (rule 66).
 const USER_AGENT: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 
 const REQUESTS: &str = "logit.output.requests";
@@ -530,7 +530,7 @@ impl DatadogOutput {
     }
 
     /// The extra headers on every request (`headers:`). Fails on a name or value that isn't legal
-    /// HTTP, and on two names that collide once case is normalized; rule 65 rejects the
+    /// HTTP, and on two names that collide once case is normalized; rule 66 rejects the
     /// protocol's own names.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());

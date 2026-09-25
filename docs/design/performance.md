@@ -510,6 +510,77 @@ What's left open is narrow: how much `DiskQueue::open`'s bounded active-segment 
 present, contributes to a *cleared* spool's remaining spread. On this evidence, not much.
 `perf/scenarios/buffered.yaml`'s comment and `docs/known-gaps.md`'s entry carry the same account.
 
+### Segment rolls: `buffered-small-segments` (2026-09-24)
+
+**A roll's durable cursor persist cost 16–27% of `buffered-small-segments`'s throughput while it
+ran on the sink task. `dur/w8` moves it to a worker thread and recovers all of it.** `dur/w1` made
+every spool cursor persist durable (write, fsync, rename, directory fsync:
+[ADR `durable-checkpoint-writes-and-fault-injection`](../adr/durable-checkpoint-writes-and-fault-injection.md)),
+and `roll_read_cursor` ran it inline, then unlinked the segment the cursor left, on every segment
+roll. `main`'s roll was a plain write and rename. At `buffered`'s 64 MiB default a run rolls about
+once; `perf/scenarios/buffered-small-segments.yaml` is `buffered` with 1 MiB segments, so it rolls
+about 70 times per 1.2M-event run.
+
+**The regression.** `origin/main` (`16dd735`) against `origin/dur/w7` (`f2f4094`),
+`script/perf run --profile release`, three passes interleaved by binary on the VM. Pass 1 is
+`--repeat 3`; passes 2 and 3 are `--repeat 5`. Each cell is the pass's median.
+
+| Scenario | Pass | `main` events/s | `dur/w7` events/s | Δ events/s | `main` CPU µs/event | `dur/w7` CPU µs/event |
+|---|---|---:|---:|---:|---:|---:|
+| `buffered` | 1 | 791,362 | 770,616 | −2.6% | 1.693 | 1.727 |
+| `buffered` | 2 | 875,213 | 851,602 | −2.7% | 1.692 | 1.730 |
+| `buffered` | 3 | 880,437 | 848,812 | −3.6% | 1.692 | 1.729 |
+| `buffered-small-segments` | 1 | 687,849 | 578,911 | −15.8% | 1.716 | 1.753 |
+| `buffered-small-segments` | 2 | 671,681 | 492,597 | −26.7% | 1.719 | 1.757 |
+| `buffered-small-segments` | 3 | 659,760 | 480,663 | −27.1% | 1.715 | 1.756 |
+
+- **`buffered`'s events/s delta is inside noise.** `main`'s own median moved 11% between passes 1
+  and 2.
+- **`buffered-small-segments` regressed on every pass,** and `compare` flagged each one.
+  `script/perf attribute` put the whole delta in `gen`'s time blocked in `send` (+0.63 s): wall
+  time waiting on the disk, not CPU. Each roll's persist took 5–10 ms on the VM's Azure Premium disk.
+- **CPU µs/event rose about 2% on both scenarios** (1.69 against 1.73 on `buffered`, under 1%
+  spread across 13 repeats each). That cost doesn't depend on rolls; see "Where `dur/w7`'s CPU
+  cost came from" below.
+
+**The fix.** `dur/w8` keeps every persist durable but runs it, and the unlinks after it, on a
+per-spool worker thread, so `commit` never waits on the disk (the ADR's "Amendment: the spool
+persists its cursor on a worker thread"). Measured on the VM with `script/perf run --repeat 5`,
+binaries in the order `main`, `dur/w7`, `dur/w8`, `main`, so the two `main` runs bracket the others
+as a control. `dur/w8` is `dc5afce`. Each cell is a median.
+
+| Scenario | Binary | events/s | CPU µs/event | Peak RSS |
+|---|---|---:|---:|---:|
+| `buffered` | `main` (first) | 763,329 | 1.692 | 77.4 MiB |
+| `buffered` | `dur/w7` | 718,362 | 1.728 | 70.2 MiB |
+| `buffered` | `dur/w8` | 857,264 | 1.701 | 77.1 MiB |
+| `buffered` | `main` (second) | 877,124 | 1.691 | 75.4 MiB |
+| `buffered-small-segments` | `main` (first) | 653,446 | 1.717 | 75.3 MiB |
+| `buffered-small-segments` | `dur/w7` | 496,624 | 1.754 | 73.0 MiB |
+| `buffered-small-segments` | `dur/w8` | 649,326 | 1.726 | 79.4 MiB |
+| `buffered-small-segments` | `main` (second) | 659,922 | 1.717 | 75.2 MiB |
+
+`compare` at a 5% threshold flagged no regression:
+
+- **`buffered-small-segments` is back at `main`.** `dur/w7` to `dur/w8` is +30.7% events/s and
+  −1.6% CPU µs/event. Against the two `main` runs, `dur/w8` is −0.6% and −1.6% events/s, +0.5% and
+  +0.6% CPU µs/event, and +5.5% peak RSS.
+- **On `buffered`, read the CPU µs/event column, not events/s.** The two `main` runs alone differ
+  by +14.9% events/s, so every events/s delta here is inside that control's swing. CPU µs/event is
+  steady within each binary: `dur/w8` is +0.5% and +0.6% over the two `main` runs.
+
+**Where `dur/w7`'s CPU cost came from.** `dur/w7` cost +2.4% CPU µs/event on `buffered` against
+`main`. A bisect across the stack on the VM (`script/perf run` per `dur/*` tip, then per commit
+inside the tip that moved) puts all of it in `dur/w5`:
+
+- About two-thirds comes with `d9807391`, which makes `push` call `roll_read_cursor` on every push
+  under every overflow policy, not only `drop_oldest`.
+- About +0.009 µs/event comes with `43974694`, the shutdown sweep's in-hand slot for the batch a
+  dropped `drain_inbox` was pushing. `passthrough`, which has no disk spool, pays it too: +0.003
+  µs/event, about 0.9%.
+
+`dur/w8` recovers most of it: its `buffered` CPU µs/event is +0.5% over `main`'s.
+
 ## 4. Before/after: the regression workflow
 
 ```sh

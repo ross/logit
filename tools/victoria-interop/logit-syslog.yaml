@@ -1,0 +1,22 @@
+# Leg 8 of `script/victoria-interop`: `syslog_out` RFC 5424 over TCP into VictoriaLogs's
+# `-syslog.listenAddr.tcp`. `syslog_out` octet-counts every message on TCP, so a record whose
+# `_msg` is the message with no leading length prefix shows VictoriaLogs detected the framing.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      log: "victoria-interop syslog line {seq}"
+
+  victoria_logs:
+    type: syslog_out
+    sources: [tick]
+    endpoint: victoria-logs:514
+    transport: tcp
+    format: rfc5424
+    hostname: vi-syslog-host
+    app_name: vi-syslog

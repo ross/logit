@@ -1,0 +1,36 @@
+# Leg 7 of `script/victoria-interop`: `otlp_out` over gRPC into VictoriaTraces's
+# `-otlpGRPCListenAddr` (off by default; compose.yaml turns it on at `:4317` with
+# `-otlpGRPC.tls=false`). A `lua` stage mints one span per tick with `Event.new`.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+    resource:
+      service.name: victoria-interop-otlp-grpc
+
+  mint:
+    type: lua
+    sources: [tick]
+    script: |
+      function process(event)
+        local ts = event.timestamp
+        -- Ids from the tick's own nanosecond timestamp: unique per run and per tick, and plain
+        -- decimal digits are valid hex.
+        return Event.new{
+          timestamp = ts,
+          attributes = {leg = "otlp-grpc"},
+          span = {trace_id = "2" .. string.rep("0", 31 - #ts) .. ts,
+                  span_id = string.sub(ts, -16), name = "vi-otlp-grpc-span",
+                  kind = "client", end_timestamp = ts},
+        }
+      end
+
+  victoria_traces:
+    type: otlp_out
+    sources: [mint]
+    endpoint: http://victoria-traces:4317
+    protocol: grpc
