@@ -515,6 +515,10 @@ async fn handle_http(
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
+    #[cfg(test)]
+    if req.headers().contains_key(tests::PANIC_HEADER) {
+        panic!("a test asked this handler to panic");
+    }
     if req.method() != Method::POST {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     }
@@ -892,6 +896,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
+    /// A request carrying this header panics in `handle_http`, so a test can unwind a connection
+    /// task the way a handler bug would.
+    pub(super) const PANIC_HEADER: &str = "x-logit-test-panic";
+
     async fn bound_input(transport: OtlpTransport) -> (String, OtlpInput) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1242,6 +1250,32 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
     }
 
+    /// Content-coding names are case-insensitive (RFC 9110 §8.4.1), so `GZIP`, `Gzip`, and
+    /// `IDENTITY` are the codings `gzip` and `identity`, not a `415`.
+    #[tokio::test]
+    async fn a_capitalised_content_encoding_is_accepted() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for encoding in ["GZIP", "Gzip", "IDENTITY", "Identity"] {
+            let body = if encoding.eq_ignore_ascii_case("gzip") {
+                gzip(&one_span_payload())
+            } else {
+                one_span_payload()
+            };
+            let headers = format!(
+                "Content-Type: application/x-protobuf\r\nContent-Encoding: {encoding}\r\n\
+                 Connection: close\r\n"
+            );
+            let response = post_raw(&addr, "/v1/traces", &headers, &body).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{encoding}: got {response}");
+            let received = recv_batch(&mut rx).await;
+            assert!(received.events[0].span.is_some(), "{encoding}: the span is delivered");
+        }
+    }
+
     fn one_span_payload() -> Vec<u8> {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {
@@ -1542,6 +1576,86 @@ mod tests {
         let collected = res.into_body().collect().await.unwrap();
         let trailers = collected.trailers().expect("should carry trailers");
         assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "3");
+    }
+
+    /// One gRPC message frame: `[compressed:u8][len:u32 BE][payload]`.
+    fn grpc_message(compressed: bool, payload: &[u8]) -> Vec<u8> {
+        let mut framed = vec![u8::from(compressed)];
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(payload);
+        framed
+    }
+
+    /// Sends one unary `Export` to `addr` over a fresh h2c connection and returns its trailers.
+    async fn grpc_export(addr: &str, body: Vec<u8>, grpc_encoding: Option<&str>) -> HeaderMap {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Traces.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers");
+        if let Some(encoding) = grpc_encoding {
+            req = req.header("grpc-encoding", encoding);
+        }
+        let res = sender.send_request(req.body(Full::new(Bytes::from(body))).unwrap()).await;
+        let collected = res.unwrap().into_body().collect().await.unwrap();
+        collected.trailers().expect("should carry trailers").clone()
+    }
+
+    /// `grpc-encoding` names a content coding, and those are case-insensitive (RFC 9110 §8.4.1),
+    /// so `GZIP` and `Identity` are decoded, not answered `UNIMPLEMENTED`.
+    #[tokio::test]
+    async fn a_capitalised_grpc_encoding_is_accepted() {
+        let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for (encoding, body) in [
+            ("GZIP", grpc_message(true, &gzip(&one_span_payload()))),
+            ("Gzip", grpc_message(true, &gzip(&one_span_payload()))),
+            ("IDENTITY", grpc_message(false, &one_span_payload())),
+            ("Identity", grpc_message(false, &one_span_payload())),
+        ] {
+            let trailers = grpc_export(&addr, body, Some(encoding)).await;
+            assert_eq!(trailers.get("grpc-status").unwrap(), "0", "{encoding}: {trailers:?}");
+            let received = recv_batch(&mut rx).await;
+            assert!(received.events[0].span.is_some(), "{encoding}: the span is delivered");
+        }
+    }
+
+    /// `Export` is a unary method, so its request body is one message. A second frame after the
+    /// first is an encoder bug on the sender, answered `INVALID_ARGUMENT` naming the leftover
+    /// bytes, and neither message is delivered.
+    #[tokio::test]
+    async fn a_second_grpc_frame_in_one_body_is_invalid_argument() {
+        let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let first = grpc_message(false, &one_span_payload());
+        let second = grpc_message(false, &one_span_payload());
+        let leftover = second.len();
+        let mut body = first;
+        body.extend_from_slice(&second);
+
+        let trailers = grpc_export(&addr, body, None).await;
+        assert_eq!(trailers.get("grpc-status").unwrap(), "3", "{trailers:?}");
+        let message = trailers.get("grpc-message").expect("a message").to_str().unwrap();
+        assert!(
+            message.contains(&format!("{leftover} bytes")),
+            "the message names the leftover bytes: {message}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+            "no batch is delivered from a rejected body"
+        );
     }
 
     // ---- TLS: server termination against a real `tokio-rustls` client. ----
@@ -2045,6 +2159,70 @@ mod tests {
         drop(open);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
+    }
+
+    /// A handler that panics unwinds the h1 connection task, whose permit comes back on the
+    /// unwind; the gauge has to come back with it, or it reads one live connection forever.
+    #[tokio::test]
+    async fn a_panicking_handler_still_returns_the_connections_gauge_to_zero() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry).with_max_connections(1);
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = format!(
+            "Content-Type: application/x-protobuf\r\n{PANIC_HEADER}: 1\r\nConnection: close\r\n"
+        );
+        let response = post_raw(&addr, "/v1/metrics", &headers, &metric_body()).await;
+        assert_eq!(response, "", "a panicking handler writes no response");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
+
+        // The permit came back too: under `with_max_connections(1)` this is served only if so.
+        let response = post_raw(
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &metric_body(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+    }
+
+    /// A client that gives up while its request waits on a full consumer (an exporter's own
+    /// timeout under backpressure) cancels the handler. With two consumers, the first must not
+    /// keep a batch the second never got: the client retries, and the first would see it twice.
+    #[tokio::test]
+    async fn a_client_that_closes_while_its_batch_waits_leaves_no_consumer_with_it() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (tx_a, mut rx_a) = mpsc::channel(16);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let sink = Fanout::new(vec![tx_a, tx_b]);
+        // Fills b's one slot, so the request's send waits on b; a's copy is drained here.
+        sink.send(metric_batch()).await;
+        recv_batch(&mut rx_a).await;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_request(&mut client, &addr, "/v1/traces", &one_span_payload()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let filler = recv_batch(&mut rx_b).await;
+        assert!(filler.events[0].span.is_none(), "b's first batch is the metric filler");
+        let a = tokio::time::timeout(Duration::from_millis(300), rx_a.recv()).await;
+        let b = tokio::time::timeout(Duration::from_millis(300), rx_b.recv()).await;
+        assert_eq!(
+            (a.is_ok(), b.is_ok()),
+            (false, false),
+            "a cancelled request's batch reaches every consumer or none (a, b)"
+        );
     }
 
     fn metric_batch() -> logit_core::EventBatch {
