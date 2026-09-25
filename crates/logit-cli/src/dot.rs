@@ -7,7 +7,8 @@
 //! resolve first, even on a field this never reads (`docs/adr/env-yaml-tag.md`).
 //!
 //! Conventions: a listener is a rounded box, a transform an ellipse, a sink a bold box, and a
-//! target a dashed box. A `sources` edge is solid; a router -> target edge is dashed. Listeners
+//! target a dashed box. A `sources` edge is solid, and labelled `[else]` when its source directs
+//! events into targets; a router -> target edge is dashed. Listeners
 //! share the leftmost rank and sinks the rightmost, so a graph reads inputs -> processing ->
 //! backends whatever the depth of each path.
 
@@ -45,7 +46,17 @@ pub fn render(config: &Config) -> String {
     out.push('\n');
     for (id, component) in &components {
         for source in &component.sources {
-            out.push_str(&format!("  {source:?} -> {id:?};\n"));
+            // A targeting node's ordinary edges carry what no target took, so label them to
+            // tell them apart from the dashed target edges (`docs/adr/target-components.md`).
+            let targeting = config
+                .components
+                .get(source)
+                .is_some_and(|producer| !graph::target_edges(producer).is_empty());
+            if targeting {
+                out.push_str(&format!("  {source:?} -> {id:?} [label=\"[else]\"];\n"));
+            } else {
+                out.push_str(&format!("  {source:?} -> {id:?};\n"));
+            }
         }
         // Router -> target edges are declared on the producer, not the consumer
         // (`docs/adr/target-components.md`), so they're dashed and labelled with the route key.
@@ -227,5 +238,35 @@ mod tests {
         );
         assert!(dot.contains("\"enrich\" -> \"app_stream\" [style=dashed];"), "got: {dot}");
         assert!(!dot.contains("\"enrich\" -> \"app_stream\" [style=dashed, label"), "got: {dot}");
+    }
+
+    /// A targeting node's ordinary consumer edge is labelled `[else]`; other edges are bare.
+    #[test]
+    fn targeting_nodes_label_their_ordinary_edges_else() {
+        let mut components = HashMap::new();
+        components.insert(
+            "split".to_string(),
+            component(
+                vec!["in"],
+                vec![],
+                ComponentKind::Route {
+                    by: logit_config::RouteBy::Attribute("stream".to_string()),
+                    routes: [("app".to_string(), "app_stream".to_string())].into_iter().collect(),
+                },
+            ),
+        );
+        components
+            .insert("app_stream".to_string(), component(vec![], vec![], ComponentKind::Target {}));
+        components.insert(
+            "rest".to_string(),
+            component(
+                vec!["split"],
+                vec![],
+                ComponentKind::Lua { script: String::new(), interval: None },
+            ),
+        );
+        let dot = render(&Config { components, ..Default::default() });
+        assert!(dot.contains("\"split\" -> \"rest\" [label=\"[else]\"];"), "got: {dot}");
+        assert!(dot.contains("\"in\" -> \"split\";"), "got: {dot}");
     }
 }
