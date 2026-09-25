@@ -716,14 +716,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   concurrent connections and, per connection, concurrent streams (hyper's default of 200, pinned),
   so its worst case is
   `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 1024 × 200 × 2 ×
-  4 MiB = 1.6 TiB for `otlp_in`, which is why this is a follow-up and not a fix.
-  The stream cap bounds one factor of that product, not the product. A budget over the
-  bytes held in request bodies across a listener (a semaphore acquired per body chunk) would bound
-  the product directly. Recorded as a follow-up, not built: it changes how every HTTP listener
-  reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
-  considered"), and the concurrent large requests it guards against are a non-goal under
-  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
-  concurrent large requests.
+  4 MiB = 1.6 TiB for `otlp_in`, which is why this is a follow-up and not a fix. The stream cap
+  bounds one factor of that product, not the product. A budget over the bytes held in request
+  bodies across a listener (a semaphore acquired per body chunk) would bound the product directly.
+  Recorded as a follow-up, not built: it changes how every HTTP listener reads a body
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives considered"), and
+  the concurrent large requests it guards against are a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit trigger:** a public
+  listener, or an operator seeing memory pressure from concurrent large requests.
 - **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
   handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
   the grace after it closes the connection; it ends when the send completes or the client goes
