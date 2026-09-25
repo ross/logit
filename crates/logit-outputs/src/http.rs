@@ -100,6 +100,46 @@ pub(crate) fn body_snippet(body: &str, max: usize) -> String {
     format!("{}...", &trimmed[..end])
 }
 
+/// How many bytes to read from a rejection body before cutting it to [`ERROR_BODY_SNIPPET_BYTES`]:
+/// enough past the snippet size that a secret echoed within the kept snippet is read whole,
+/// rather than cut mid-secret by the read limit itself, so [`redacted_snippet`]'s whole-secret
+/// match can still catch it before the cut.
+pub(crate) fn error_read_bytes(secret: &str) -> usize {
+    ERROR_BODY_SNIPPET_BYTES + secret.len()
+}
+
+/// A rejection body read with [`error_read_bytes`], as a snippet safe to quote: `secret` replaced
+/// with `<redacted>`, cut to [`ERROR_BODY_SNIPPET_BYTES`], and any trailing remnant of a secret the
+/// read limit split stripped ([`strip_secret_remnant`]). `datadog_out`'s API key and
+/// `splunk_hec_out`'s token are the secrets.
+pub(crate) fn redacted_snippet(body: &str, secret: &str) -> String {
+    let redacted =
+        if secret.is_empty() { body.to_string() } else { body.replace(secret, "<redacted>") };
+    strip_secret_remnant(body_snippet(&redacted, ERROR_BODY_SNIPPET_BYTES), secret)
+}
+
+/// After `snippet` is cut to size, strips a trailing run of 4 or more bytes that is itself a
+/// prefix of `secret`. That run is what's left of a secret split by [`error_read_bytes`]'s own
+/// read limit, which [`redacted_snippet`]'s whole-secret match can't catch because the read never
+/// captured the whole secret.
+fn strip_secret_remnant(snippet: String, secret: &str) -> String {
+    let (content, ellipsis) = match snippet.strip_suffix("...") {
+        Some(rest) => (rest, "..."),
+        None => (snippet.as_str(), ""),
+    };
+    let max_run = content.len().min(secret.len());
+    for len in (4..=max_run).rev() {
+        let cut = content.len() - len;
+        if !content.is_char_boundary(cut) {
+            continue;
+        }
+        if secret.as_bytes().starts_with(&content.as_bytes()[cut..]) {
+            return format!("{}{ellipsis}", &content[..cut]);
+        }
+    }
+    snippet
+}
+
 /// A coarse HTTP response-status bucket: the `class` tag on `logit.output.requests`.
 ///
 /// Six values and no more. A `429` stays a `4xx`; [`is_retryable_http_status`] is what reads it

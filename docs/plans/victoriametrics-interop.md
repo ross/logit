@@ -13,7 +13,7 @@ VictoriaLogs, and VictoriaTraces ingest standard wires that `prometheus_out`, `i
 `/federate` and remote-write, which `prometheus_in` already receives. None of it is verified
 against the real software, and the repo's three mentions of VictoriaMetrics (in
 `docs/deploying.md`, `docs/adr/prometheus-remote-write.md`, and
-`examples/prometheus-remote-write-send.yaml`) list it beside Mimir and Thanos as a remote-write
+`fixtures/prometheus-remote-write-send.yaml`) list it beside Mimir and Thanos as a remote-write
 receiver, with one of them implying it takes remote-write 2.0. It doesn't.
 
 The one VictoriaMetrics wire `logit` can't speak is the "VictoriaMetrics remote write
@@ -412,7 +412,7 @@ Each becomes a `docs/known-gaps.md` row or `docs/deploying.md` guidance in W3, u
   skipped; a zstd `prometheus_out -> prometheus_in` round trip is a fixed point; W1's legs 1
   and 10 re-run, with the zstd sender accepted by VictoriaMetrics and vmagent staying on zstd
   against `prometheus_in`, counted `logit.input.writes{class="ok",encoding="zstd"}`.
-- W3: the shipped-config test and `script/validate` cover `examples/victoriametrics-*.yaml`;
+- W3: the shipped-config test and `script/validate` cover `fixtures/victoriametrics-*.yaml`;
   each `docs/known-gaps.md` row links to the "Findings" row it comes from;
   `docs/deploying.md`'s "Choosing `version: 1` or `2`" no longer lists VictoriaMetrics as a
   2.0 receiver.

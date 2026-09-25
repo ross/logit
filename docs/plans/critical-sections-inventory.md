@@ -4418,8 +4418,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
     same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.** **fixed**:
-    `crate::listener::LiveConnections` hands out a drop guard at all six gauge sites; an h1 handler
-    panic left the gauge at `1.0` before and `0.0` after
+    `crate::listener::LiveConnections` hands out a drop guard at all seven gauge sites
+    (`splunk_hec_in`'s included); an h1 handler panic left the gauge at `1.0` before and `0.0` after
     (`a_panicking_handler_still_returns_the_connections_gauge_to_zero`, seen to fail first).
 - **Existing coverage:** the idle/stall tests in `crates/logit-inputs/src/otlp.rs`'s test module,
   and the equivalents in `crates/logit-inputs/src/prometheus.rs`. ADR `idle-connection-timeout`,
@@ -4711,7 +4711,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     this is the most consequential finding in the Prometheus half.** **Corrected, then pinned.**
     hyper 1.11.1's h2 server default is 200 streams, not RFC 7540's unlimited. The receiver now
     builds through `crate::http::auto_builder`, which sets the 200 explicitly, and
-    `MAX_CONCURRENT_CONNECTIONS`' doc states the 1024 × 200 × 2 × 4 MiB = 1.6 TiB product.
+    `MAX_CONCURRENT_CONNECTIONS`' doc states the 1024 × 200 × 2 × 4 MiB = 1.6 TiB product. Every
+    `auto` listener builds there: `otlp_in`'s HTTP transport, this receiver, `datadog_in`,
+    `datadog_trace_in`, and `splunk_hec_in`, each pinned by
+    `the_h2_settings_frame_advertises_the_pinned_stream_cap`.
   - **The accept loop terminates the input on any `accept()` error** (the `?` on
     `accept_queue.accept` in `PrometheusReceiver::run`), where `prometheus_out`'s own loop backs
     off and continues (`crates/logit-outputs/src/prometheus.rs`'s `serve`). This is the

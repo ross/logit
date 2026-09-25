@@ -1,0 +1,9 @@
+method: POST
+path: /services/collector/event/1.0
+authorization: Splunk 00000000-0000-0000-0000-000000000000
+content-type: application/json; profile="urn:splunk:event:1.0"; charset=utf-8
+content-length: 302
+host: capture:8088
+connection: Keep-Alive
+accept-encoding: gzip
+user-agent: okhttp/4.12.0

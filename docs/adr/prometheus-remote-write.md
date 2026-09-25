@@ -112,7 +112,7 @@ client TLS for outbound scrapes, server TLS for the inbound receiver — and a b
 `bind_tls:` would be a coin flip for a reader. Every TLS key on the kind is prefixed by the mode it
 serves: `scrape_tls` (client), `bind_tls` (server). `prometheus_out` takes the symmetric name for
 the sender's client TLS, `endpoint_tls`. This is a breaking config rename with no compatibility
-shim and no alias, because `logit` is pre-release and carries none anywhere else; no `examples/*.yaml`
+shim and no alias, because `logit` is pre-release and carries none anywhere else; no `fixtures/*.yaml`
 uses `prometheus_in`'s `tls:` today. The exposition `bind:`'s no-TLS/no-auth posture and its
 known-gaps row are untouched — the receiver getting TLS does not retroactively give the exposition
 server any.
@@ -324,7 +324,7 @@ stops accepting. [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s "
 recommend it on wherever consistent traffic is expected" applies squarely here: a remote-write
 listener is the definition of consistent traffic, so `docs/deploying.md`'s remote-write section
 recommends setting it and
-[`examples/prometheus-remote-write-receive.yaml`](../../examples/prometheus-remote-write-receive.yaml)
+[`fixtures/prometheus-remote-write-receive.yaml`](../../fixtures/prometheus-remote-write-receive.yaml)
 ships with a real value rather than a commented-out one. Making the stall bound unconditional —
 independent of the idle field — would be the more thorough answer and is deliberately *not* done
 here: it would mean a second timeout constant on a listener whose timeouts an operator already

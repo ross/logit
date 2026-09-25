@@ -117,7 +117,7 @@ mechanisms — the fast path, and the strong-count property `try_unwrap` depends
 The first version of this ADR and its implementation put `Arc::new` on every send,
 unconditionally, including a single-consumer edge — which previously moved the batch for free.
 Review caught this: it regressed every shipped listener's first hop and all three single-consumer
-edges of the v0.1 reference config (`examples/statsd-to-influxdb.yaml`, a pure linear chain) by
+edges of the v0.1 reference config (`fixtures/statsd-to-influxdb.yaml`, a pure linear chain) by
 roughly one allocation per event per hop, for zero benefit. The `Delivered::Owned` fast path above
 is the fix, and `fanout_send_one_consumer_costs_nothing` (`crates/logit-bench/tests/allocations.rs`)
 measures it at **zero** additional allocations — a genuine, unconditional restoration of what the
@@ -141,7 +141,7 @@ consumer but the last, unconditionally) — this design does not reduce it. What
 5` against the old code's `(N - 1) × 5`: one allocation worse, at every fan-out width, in the best
 (fully sequential) case. Under genuine concurrency — two branches' `unwrap_batch` calls actually
 overlapping on different cores of the multi-thread runtime, which the review confirmed happens in
-practice against `examples/nginx-to-influxdb.yaml`'s `tap`/`trimmed` fan-out — more than one branch
+practice against `fixtures/nginx-to-influxdb.yaml`'s `tap`/`trimmed` fan-out — more than one branch
 can fail to unwrap and clone, which is *worse* than the deterministic case above, never better.
 
 **The originally-hoped saving — "every read-only branch pays one atomic, not a clone" — needed the

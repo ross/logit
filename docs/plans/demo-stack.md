@@ -36,12 +36,12 @@ updated: 2026-09-24
 >   environment, the `INFLUXDB_TOKEN` passed to every service that loads `demo/logit.yaml`, and the
 >   token in the Grafana datasource are gone.
 >
-> The dev stack (root `compose.yaml`, `script/server`) and `examples/*-to-influxdb.yaml` keep
+> The dev stack (root `compose.yaml`, `script/server`) and `fixtures/*-to-influxdb.yaml` keep
 > InfluxDB, and `influxdb_out` is unchanged. The narrative below still says InfluxDB where it
 > describes the stack as first built.
 
-`logit`'s examples are developer scratch material — `examples/statsd-to-influxdb.yaml`,
-`examples/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
+`logit`'s examples are developer scratch material — `fixtures/statsd-to-influxdb.yaml`,
+`fixtures/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
 pointed at the *dev* stack (`compose.yaml`, `script/server`), whose entrypoint execs `cargo run`
 inside a bind-mounted contributor container. None of that is something to hand a stranger.
 
@@ -68,7 +68,7 @@ now write real data to their backends — see the notice at the top of this file
 |---|---|
 | Where the demo lives | A new, self-contained `demo/` directory with its own `compose.yaml`. Root `compose.yaml` (the contributor dev stack) is untouched — see [ADR `demo-stack-separate-from-dev-stack`](../adr/demo-stack-separate-from-dev-stack.md). |
 | What runs `logit` | The production image (`Dockerfile`), built by compose — no published image exists yet ([docs/deploying.md](../deploying.md)). |
-| Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
+| Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `fixtures/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
 | Metrics backend | VictoriaMetrics, written by `prometheus_out` over remote-write 1.0 with zstd and queried with PromQL. Replaced InfluxDB 2.x and its Flux dashboard on 2026-09-24 (see the update note at the top of this file). |
 | Log backend | Loki, up and provisioned. **Now live** — `syslog_out` (`docs/adr/syslog-output.md`) relays `access_json`'s events through `alloy` into Loki. |
@@ -84,7 +84,7 @@ now write real data to their backends — see the notice at the top of this file
 | ~~No `syslog_out`~~ | **Closed** — implemented, UDP and TCP, RFC 3164/5424 ([ADR `syslog-output`](../adr/syslog-output.md)), and wired live into `demo/logit.yaml`'s `log_out`. |
 | ~~`otlp_out` rejected at validation~~ | **Closed** — was: declared in `logit-config`, but `graph::is_implemented` rejected it, no OTLP code, no wire protocol chosen (ADR `native-wire-format-with-otlp-bridge` left gRPC-vs-HTTP open). [docs/plans/otlp-end-to-end.md](otlp-end-to-end.md) shipped both transports, both directions ([ADR `committed-pregenerated-otlp-protobuf`](../adr/committed-pregenerated-otlp-protobuf.md), [ADR `hand-rolled-grpc-over-hyper`](../adr/hand-rolled-grpc-over-hyper.md)), and it's wired live into `demo/logit.yaml`'s `trace_out`. |
 | ~~No span producer~~ | **Closed** — real internal span emission, sampled deterministically on `trace_id` ([ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)). `stdio_out` already rendered spans; `otlp_out` (above) is what exports one over the wire. |
-| `examples/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
+| `fixtures/` doubles as both dev fixtures and the onboarding story | Someone trying `logit` for the first time hits `script/server`'s dev-container dependency before seeing anything work. |
 | No config-drift guard | A component field rename can silently break every shipped example; nothing runs `logit validate` over them. |
 
 ## Reference topology
@@ -115,7 +115,7 @@ access_json --> log_out (syslog_out) --> alloy (loki.source.syslog) --> Loki -->
 
 ## Workstream dependency graph
 
-A (stack) → B (pipeline config) → C (hello-world app + graph render), D (Grafana provisioning) → E (reset `examples/`) → F (guard + docs)
+A (stack) → B (pipeline config) → C (hello-world app + graph render), D (Grafana provisioning) → E (reset `fixtures/`) → F (guard + docs)
 
 ## A. The demo stack
 
@@ -234,31 +234,31 @@ Loki returns real data (`log_out` is live), and Tempo returns clean, error-free 
 Grafana Explore — provisioned and reachable is the bar there, not populated (see workstream C:
 spans are real now, but nothing exports them over the wire yet, pending `otlp_out`).
 
-## E. Reset `examples/`
+## E. Reset `fixtures/`
 
-**Goal:** `demo/` becomes the front door; `examples/` stops trying to double as one.
+**Goal:** `demo/` becomes the front door; `fixtures/` stops trying to double as one.
 
 **Disposition of each file:**
 
 | File | Disposition |
 |---|---|
-| `examples/statsd-to-influxdb.yaml` | Keep — `script/server`'s default config, the v0.1 slice. |
-| `examples/internal-telemetry.yaml` | Keep — the canonical `internal → aggregate → sink` shape ADR `internal-telemetry-as-pipeline-events` references. |
-| `examples/syslog-with-telemetry.yaml` | Removed — superseded by `demo/logit.yaml`, which does strictly more. |
-| `examples/nginx-to-influxdb.yaml`, `examples/nginx/**` | Keep, marked as a dev-stack fixture, not a starting point — root `compose.yaml`'s `nginx` service and `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` provenance both depend on it staying real and runnable. |
+| `fixtures/statsd-to-influxdb.yaml` | Keep — `script/server`'s default config, the v0.1 slice. |
+| `fixtures/internal-telemetry.yaml` | Keep — the canonical `internal → aggregate → sink` shape ADR `internal-telemetry-as-pipeline-events` references. |
+| `fixtures/syslog-with-telemetry.yaml` | Removed — superseded by `demo/logit.yaml`, which does strictly more. |
+| `fixtures/nginx-to-influxdb.yaml`, `fixtures/nginx/**` | Keep, marked as a dev-stack fixture, not a starting point — root `compose.yaml`'s `nginx` service and `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` provenance both depend on it staying real and runnable. |
 
 **Files:** `README.md` (a "Try it" section pointing at `demo/`; the status paragraph re-pointed),
 `AGENTS.md` ("Current state"), `docs/deploying.md` (a pointer at the top), header comments on
-`examples/nginx-to-influxdb.yaml`.
+`fixtures/nginx-to-influxdb.yaml`.
 
-**Deliberately not doing:** deleting `examples/nginx/`. That would mean editing root
+**Deliberately not doing:** deleting `fixtures/nginx/`. That would mean editing root
 `compose.yaml` and `script/server` too (out of scope — the dev stack stays as it is) and would
 strand `fixtures.rs`'s claim that its benchmark workload is "the repo's own reference example, not
-a synthetic shape." If `examples/nginx/` should go too, it's a clean follow-up once the demo's
+a synthetic shape." If `fixtures/nginx/` should go too, it's a clean follow-up once the demo's
 `hello` app has proven out the same line shape: `fixtures.rs` needs only its comments rewritten to
 be self-contained, no re-measurement, no allocation-count churn.
 
-**Done when:** nothing in the repo points at `examples/syslog-with-telemetry.yaml`, and every
+**Done when:** nothing in the repo points at `fixtures/syslog-with-telemetry.yaml`, and every
 remaining doc cross-reference resolves.
 
 ## F. Guard against rot, and document
@@ -268,7 +268,7 @@ not silently in someone's demo.
 
 **Files:**
 
-- `script/validate` — `logit validate` over `demo/logit.yaml` and every `examples/*.yaml`; wired
+- `script/validate` — `logit validate` over `demo/logit.yaml` and every `fixtures/*.yaml`; wired
   into `script/cibuild` (and therefore CI) right after `script/test`.
 - `script/demo` — thin wrapper (`${DOCKER} compose -f demo/compose.yaml "$@"`, default `up
   --build`), for `$DOCKER`/podman/sudo parity with every other `script/*` entrypoint (ADR `scripts-to-rule-them-all`).

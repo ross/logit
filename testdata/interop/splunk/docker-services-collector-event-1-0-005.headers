@@ -1,0 +1,8 @@
+method: POST
+path: /services/collector/event/1.0
+host: capture:8088
+user-agent: Go-http-client/1.1
+content-length: 168
+authorization: Splunk 00000000-0000-0000-0000-000000000000
+content-encoding: gzip
+accept-encoding: gzip

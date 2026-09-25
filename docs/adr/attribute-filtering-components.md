@@ -241,7 +241,7 @@ component.
   `Arc` and costs one allocation), a miss here costs nothing measurable: it only re-evaluates
   `get_sym` against the `Arc` already in hand. `docs/design/internal-telemetry.md` records no
   cache-miss counter for that reason -- one would advertise a cost that isn't actually there.
-- `examples/fan-out-edge.yaml`/`examples/fan-out-central.yaml` are the worked example this ADR
+- `fixtures/fan-out-edge.yaml`/`fixtures/fan-out-central.yaml` are the worked example this ADR
   exists to make possible: N `set`-tagged branches into one `logit_out`, split back into N branches
   by `has_attributes` after `logit_in`, with the untagged else-branch expressed as a chained
   `drop_attributes`.
