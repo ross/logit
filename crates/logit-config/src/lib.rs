@@ -999,10 +999,18 @@ pub enum ComponentKind {
         #[serde(default, with = "human_bytes::option")]
         #[schemars(with = "Option<String>")]
         max_frame_bytes: Option<u64>,
-        /// How long one connection has, per pre-`Hello` phase, before this listener closes it
-        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the `Hello`
-        /// read itself. Each phase gets its own budget, so a TLS connection that sends no `Hello`
-        /// costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// Bounds each pre-`Hello` phase of a connection and each write this listener makes to
+        /// the peer. Defaults to `5s`; `0s` is rejected.
+        ///
+        /// The pre-`Hello` phases are the TLS accept when `tls:` is set, then the `Hello` read.
+        /// Each gets its own budget, so a TLS connection that sends no `Hello` costs up to twice
+        /// this value before this listener closes it and frees its connection-cap slot.
+        ///
+        /// The writes are every reply this listener sends: `HelloAck`, each frame's `Ack`, and
+        /// every `Reject`, including the one it sends on shutdown or an idle close. A write that
+        /// can't finish within this value means the peer has stopped reading: the connection
+        /// closes and frees its slot. So raising this for slow TLS handshakes also lengthens how
+        /// long a peer that stops reading holds its slot.
         ///
         /// Not an idle timeout. Once a connection is handshaken, the gap before its next data
         /// frame is bounded by `idle_timeout` if set, and unbounded otherwise.
