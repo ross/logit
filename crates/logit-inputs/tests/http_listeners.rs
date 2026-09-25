@@ -1,5 +1,6 @@
-//! Black-box checks on the four `hyper`-based listeners (`otlp_in`, `prometheus_in`'s
-//! remote-write receiver, `datadog_in`, `datadog_trace_in`), driven over real sockets.
+//! Black-box checks on the five `hyper`-based listeners (`otlp_in`, `prometheus_in`'s
+//! remote-write receiver, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`), driven over real
+//! sockets.
 //!
 //! This file installs a counting global allocator, so it is its own test binary: the heap
 //! measurement below would see every other test's allocations if it shared a process with them.
@@ -8,6 +9,7 @@ use logit_inputs::datadog::DatadogInput;
 use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport};
 use logit_inputs::prometheus::PrometheusReceiver;
+use logit_inputs::splunk::SplunkHecInput;
 use logit_inputs::Input;
 use logit_pipeline::Fanout;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -125,6 +127,11 @@ async fn the_h2_settings_frame_advertises_the_pinned_stream_cap() {
     let mut input = DatadogTraceInput::new().with_bind("127.0.0.1:0");
     input.bind().await.unwrap();
     listeners.push(("datadog_trace_in (tcp, h2c)", input.local_addr().unwrap().to_string()));
+    run(input).await;
+
+    let mut input = SplunkHecInput::new("127.0.0.1:0");
+    input.bind().await.unwrap();
+    listeners.push(("splunk_hec_in (h2c)", input.local_addr().unwrap().to_string()));
     run(input).await;
 
     for (who, addr) in listeners {

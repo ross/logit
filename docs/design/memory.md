@@ -29,7 +29,7 @@ change one of their numbers, change the matching table here in the same commit.
 ## 0. What these measurements can and can't tell you
 
 **Read this before acting on anything below.** Most allocation numbers here come from one event
-shape: the `examples/nginx-to-influxdb.yaml` reference pipeline, whose events carry a log body
+shape: the `fixtures/nginx-to-influxdb.yaml` reference pipeline, whose events carry a log body
 *and* several derived metrics, with ~10 attributes. It's a real config that exercises five
 components end to end, but it is **one point in a space `logit` is meant to cover**:
 
@@ -207,7 +207,7 @@ number."
 ## 2. Where the allocations are
 
 Pinned by `crates/logit-bench/tests/allocations.rs`. Unless a row names another fixture, it
-measures the reference pipeline (`examples/nginx-to-influxdb.yaml`,
+measures the reference pipeline (`fixtures/nginx-to-influxdb.yaml`,
 `syslog_in → json → kv_metrics → keep → aggregate → influxdb_out`) with one real nginx access-log
 line.
 
@@ -1167,7 +1167,7 @@ allocating 180 times per event":
 
 ```
 script/console
-heaptrack cargo run --release -p logit-cli -- run examples/nginx-to-influxdb.yaml
+heaptrack cargo run --release -p logit-cli -- run fixtures/nginx-to-influxdb.yaml
 heaptrack_print heaptrack.*.zst | head -50
 ```
 
@@ -1252,7 +1252,7 @@ The pattern for a new shape, in order of preference:
 
 Synthetic doesn't mean guessed. A literal should carry **provenance**: which software and config
 produced this shape, and when it was last checked against the real thing. `NGINX_SYSLOG_LINE` was
-derived from the `access_json_syslog` format `examples/nginx/nginx.conf` used before it became
+derived from the `access_json_syslog` format `fixtures/nginx/nginx.conf` used before it became
 `access_semconv` (the fixture keeps the older shape so the pins stay comparable) and confirmed
 against a live nginx run (the emitted `syslog.facility=23`/`severity=6` match its `<190>` priority exactly).
 Exploring real software is the right way to *inform* a fixture; the fixture is what gets committed.

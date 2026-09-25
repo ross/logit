@@ -55,7 +55,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done** (#333); the rest of RT-03 is unreviewed |
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
-| 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all eight input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
+| 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
@@ -4122,7 +4122,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     off 100 ms (racing shutdown) on a resource or unrecognized one, and ends the listener only on a
     fatal one, counting `logit.input.accept.errors{reason}` each time. `script/unsafe-check`'s
     `logit-accept-emfile` scenario injects `EMFILE` into this loop's first `accept4` and the relay
-    test still passes.
+    test still passes. The same helper serves all nine input accept loops: `crate::tcp`'s TCP and
+    Unix sockets, this one, `otlp_in`, `prometheus_in`'s bind mode, `datadog_in`,
+    `datadog_trace_in`'s TCP and Unix sockets, and `splunk_hec_in`.
 - **Existing coverage:** in-file tests
   `bind_makes_the_port_live_before_run_and_local_addr_reports_it`, `a_second_bind_is_a_no_op`,
   and `binding_a_port_already_held_is_an_error` (bind/idempotent bind/port-in-use),
@@ -4422,8 +4424,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
     same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.** **fixed**:
-    `crate::listener::LiveConnections` hands out a drop guard at all six gauge sites; an h1 handler
-    panic left the gauge at `1.0` before and `0.0` after
+    `crate::listener::LiveConnections` hands out a drop guard at all seven gauge sites
+    (`splunk_hec_in`'s included); an h1 handler panic left the gauge at `1.0` before and `0.0` after
     (`a_panicking_handler_still_returns_the_connections_gauge_to_zero`, seen to fail first).
 - **Existing coverage:** the idle/stall tests in `crates/logit-inputs/src/otlp.rs`'s test module,
   and the equivalents in `crates/logit-inputs/src/prometheus.rs`. ADR `idle-connection-timeout`,
@@ -4715,7 +4717,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     this is the most consequential finding in the Prometheus half.** **Corrected, then pinned.**
     hyper 1.11.1's h2 server default is 200 streams, not RFC 7540's unlimited. The receiver now
     builds through `crate::http::auto_builder`, which sets the 200 explicitly, and
-    `MAX_CONCURRENT_CONNECTIONS`' doc states the 1024 × 200 × 2 × 4 MiB = 1.6 TiB product.
+    `MAX_CONCURRENT_CONNECTIONS`' doc states the 1024 × 200 × 2 × 4 MiB = 1.6 TiB product. Every
+    `auto` listener builds there: `otlp_in`'s HTTP transport, this receiver, `datadog_in`,
+    `datadog_trace_in`, and `splunk_hec_in`, each pinned by
+    `the_h2_settings_frame_advertises_the_pinned_stream_cap`.
   - **The accept loop terminates the input on any `accept()` error** (the `?` on
     `accept_queue.accept` in `PrometheusReceiver::run`), where `prometheus_out`'s own loop backs
     off and continues (`crates/logit-outputs/src/prometheus.rs`'s `serve`). This is the

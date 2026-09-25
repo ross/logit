@@ -1,12 +1,13 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
-//! `prometheus_in`'s remote-write receiver, `datadog_in`, and `datadog_trace_in`): the connection
-//! builders that pin hyper's HTTP/2 settings ([`auto_builder`], [`h2_builder`]), the idle-timeout
-//! tracker ([`Activity`], [`InFlight`]), the connection driver that acts on it
-//! ([`drive_with_idle`]), and the bounded request-body read ([`collect_with_stall_bound`], which
-//! holds one buffer per body however many reads it arrives in). All four listeners build and
-//! read through these. The two Datadog listeners also share their request helpers here:
-//! `Content-Encoding` and `Content-Type` parsing, bounded decompression, Datadog's JSON response
-//! shapes, and the deadline-bounded delivery.
+//! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`, and
+//! `splunk_hec_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
+//! [`h2_builder`]), the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
+//! that acts on it ([`drive_with_idle`]), and the bounded request-body read
+//! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
+//! in). All five listeners build and read through these. The two Datadog listeners and
+//! `splunk_hec_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
+//! parsing, bounded decompression, the JSON response shapes, the constant-time key check, and the
+//! deadline-bounded delivery.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -50,7 +51,7 @@ const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
 /// The HTTP/1.1-and-h2c builder every `auto` listener serves through, with the h2 settings
 /// above set explicitly. `otlp_in`'s HTTP transport, `prometheus_in`'s receiver, `datadog_in`,
-/// and `datadog_trace_in` build here.
+/// `datadog_trace_in`, and `splunk_hec_in` build here.
 pub(crate) fn auto_builder() -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -350,11 +351,11 @@ pub(crate) fn is_length_limit(err: &(dyn std::error::Error + Send + Sync + 'stat
 }
 
 // -------------------------------------------------------------------------------------------------
-// Request helpers shared by `datadog_in` and `datadog_trace_in`
+// Request helpers shared by `datadog_in`, `datadog_trace_in`, and `splunk_hec_in`
 // -------------------------------------------------------------------------------------------------
 
 /// A request's declared `Content-Encoding`. Each listener decides which of these it accepts:
-/// `datadog_in` all four, `datadog_trace_in` identity and gzip.
+/// `datadog_in` all four, `datadog_trace_in` and `splunk_hec_in` identity and gzip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Encoding {
     Identity,
@@ -559,4 +560,40 @@ pub(crate) async fn deliver_with_deadline(
         }
     }
     Ok(())
+}
+
+/// Whether `sent` equals one of `keys`: `datadog_in`'s `api_keys` and `splunk_hec_in`'s `tokens`.
+/// Every key is compared, and each comparison runs over the whole key, so the time taken doesn't
+/// reveal which key matched or how much of a guess did.
+pub(crate) fn matches_any_key(keys: &[Box<[u8]>], sent: &[u8]) -> bool {
+    keys.iter().fold(false, |matched, key| matched | constant_time_eq(key, sent))
+}
+
+/// Byte equality whose time depends on the two lengths only, never on where the bytes differ.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_compares_whole_keys() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn matches_any_key_finds_any_entry_and_nothing_else() {
+        let keys: Vec<Box<[u8]>> = vec![Box::from(&b"one"[..]), Box::from(&b"two"[..])];
+        assert!(matches_any_key(&keys, b"one"));
+        assert!(matches_any_key(&keys, b"two"));
+        assert!(!matches_any_key(&keys, b"three"));
+        assert!(!matches_any_key(&[], b"one"));
+    }
 }

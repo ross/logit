@@ -490,6 +490,64 @@
           }
         },
         {
+          "description": "A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at, such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry Collector's `splunk_hec` exporter, or Vector. Serves `/services/collector/event` (and `/services/collector`) with concatenated or array JSON bodies, `/services/collector/raw` with one log per line and `host`, `source`, `sourcetype`, and `index` from the query string, `/services/collector/ack`, and `/services/collector/health`, answering Splunk's own `{\"text\",\"code\"}` bodies. Decompresses gzip; any other `Content-Encoding` gets `415`. A request that names a channel gets an `ackId`, and `/ack` reports every id delivered. The envelope's `host`, `source`, `sourcetype`, and `index` become the resource attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When the pipeline can't take a request's data within 5s, the request gets `503` code 9 with `Retry-After: 1`, and the client retries it; a request carrying several envelopes can then deliver some of its events twice.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "description": "The `host:port` to listen on. Splunk's HEC port is `8088`.",
+              "type": "string"
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long one connection may sit with no request in flight before this listener closes it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s` is rejected. HEC clients keep their connections open between batches, so set it well above a client's flush interval if you set it at all. It also bounds a request body that stalls mid-upload, answered `408`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_request_bytes": {
+              "description": "Caps one request body, both as sent and after gzip decompression; a larger one gets `413`. A byte-count string. Defaults to `\"5MiB\"`, the OpenTelemetry Collector exporter's largest event, above its 2 MiB default request. `0` is rejected.",
+              "default": "5242880",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted. Splunk serves HEC over HTTPS by default, so a client pointed at `https://` needs this.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tokens": {
+              "description": "The HEC tokens this listener accepts, from each request's `Authorization: Splunk <token>` header (or `Basic`, with the token as the password). A request with no token gets `401`, and one with a token not listed gets `403`. Empty, the default, accepts any request, whatever token it carries. Take each entry from the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing a token into the file. A token is never kept on an event. A token sent in the query string (`?token=`) is always refused, `400`. An empty entry, or one with leading or trailing whitespace, is rejected.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "splunk_hec_in"
+              ]
+            }
+          }
+        },
+        {
           "description": "Tails one or more files as a log source, one line per event; rotation-, truncation-, and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty list or entry is rejected.",
           "type": "object",
           "required": [
@@ -1895,6 +1953,86 @@
                 {
                   "$ref": "#/definitions/DatadogTraceVersion"
                 }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed field. A resent batch is indexed twice, so a failure Splunk may have partly applied (a `5xx`, a timeout) drops the batch unless `buffer.delivery` is `at_least_once`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "token",
+            "type"
+          ],
+          "properties": {
+            "ack": {
+              "description": "Waits for Splunk to confirm each request was indexed before a batch counts as delivered, polling `/services/collector/ack`. Needs a token with indexer acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't acknowledge, each request counts as delivered on its `200`, and `logit` logs a warning. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
+            "ack_timeout": {
+              "description": "How long to wait for every request of a batch to be acknowledged. Past it the batch fails, and is dropped unless `buffer.delivery` is `at_least_once`, which resends it (and Splunk may index it twice). Only with `ack: true`. Defaults to `30s`; `0s` is rejected.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "compression": {
+              "description": "How request bodies are compressed: `gzip` (the default) or `none`.",
+              "default": "gzip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SplunkCompression"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "The collector's base URL, ending in `/services/collector`: `https://splunk.example.com:8088/services/collector`, or `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. This sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is rejected.",
+              "type": "string"
+            },
+            "max_body_bytes": {
+              "description": "Caps one request body before compression; a batch larger than this goes out as several requests, and one event larger than this alone is dropped, counted. A byte-count string. Defaults to `\"2MiB\"`, the OpenTelemetry exporter's default. `0` is rejected.",
+              "default": "2097152",
+              "type": "string"
+            },
+            "multi_value": {
+              "description": "What to do with a metric kind that carries more than one number (a histogram, a summary, a sketch, raw samples, a set), since a Splunk metric is one number per name. `skip` (the default) drops the record, counted; `expand` writes the series the OpenTelemetry exporter writes for a histogram or summary (`_sum`, `_count`, `_bucket` with `le`, or a quantile with `qt`), and a count, sum, minimum, maximum, or percentile series for the others, counted as degraded. An exponential histogram is dropped under both.",
+              "default": "skip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SplunkMultiValue"
+                }
+              ]
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no verification. A non-default block with an `http://` endpoint is rejected.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "token": {
+              "description": "The HEC token, sent as `Authorization: Splunk <token>` and never logged. Take it from the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing it into the file. An empty token, or one with leading or trailing whitespace, is rejected.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "splunk_hec_out"
               ]
             }
           }
@@ -3619,6 +3757,33 @@
         }
       },
       "additionalProperties": false
+    },
+    "SplunkCompression": {
+      "description": "How `splunk_hec_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "gzip, what the OpenTelemetry exporter sends.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "Every body uncompressed.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "SplunkMultiValue": {
+      "description": "What `splunk_hec_out` does with a metric kind that carries more than one number: drop it, counted (`skip`, the default), or write one series per number (`expand`).",
+      "type": "string",
+      "enum": [
+        "skip",
+        "expand"
+      ]
     },
     "StatsdFormat": {
       "description": "Which statsd dialect `statsd_out` emits. `dogstatsd` (the default) includes the tag segment.",
