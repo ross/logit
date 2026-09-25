@@ -822,7 +822,7 @@ pub fn distribution_event() -> Event {
 
 /// A gauge event with a *spilled* 12-attribute map (past `AttrMap`'s 8 inline slots, un-`keep`ed),
 /// so `aggregate_flush_retained_gauges` (`tests/allocations.rs`) pins a retained series'
-/// `key.attributes.clone()` as a heap allocation, not the memcpy `aggregate_flush_100_series`'
+/// `key.attributes.clone()` as a heap allocation, not the memcpy `aggregate_flush_4_series`'
 /// `keep`-trimmed fixture gets.
 pub fn wide_gauge_event(name: &str, value: f64) -> Event {
     let mut attributes = AttrMap::new();

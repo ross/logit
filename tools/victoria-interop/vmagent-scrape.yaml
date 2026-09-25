@@ -1,0 +1,11 @@
+# vmagent's scrape config for `script/victoria-interop` (legs 3 and 10): scrape
+# `logit-expose.yaml`'s exposition endpoint. vmagent remote-writes what it scrapes to both
+# `-remoteWrite.url`s compose.yaml gives it: VictoriaMetrics (leg 3) and `logit`'s remote-write
+# receiver (leg 10).
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: logit-expose
+    static_configs:
+      - targets: ["logit-expose:9464"]

@@ -2,7 +2,7 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-statsd/DogStatsD clients, a Datadog Agent, and a dd-trace tracer. The fixtures check `logit`'s decoders against what those producers put on
+vmagent, statsd/DogStatsD clients, a Datadog Agent, and a dd-trace tracer. The fixtures check `logit`'s decoders against what those producers put on
 the wire:
 
 - `crates/logit-inputs/src/syslog.rs`
@@ -47,11 +47,13 @@ testdata/interop/
                           `write_graphite` plugin) and real carbon pickle frames (a stdlib Python
                           producer), one file per accepted connection
   prometheus/README.md -- provenance table for prometheus/*.bin
-  prometheus/*.bin     -- Snappy-compressed protobuf remote-write request bodies, exactly as a real
-                          Prometheus POSTed them, one file per request
+  prometheus/*.bin     -- compressed protobuf remote-write request bodies, exactly as a real
+                          Prometheus (Snappy) or a real vmagent (zstd, its default wire, and Snappy)
+                          POSTed them, one file per request
   prometheus/*.headers -- one sidecar per body, holding that request's method, path and request
                           headers -- which is what carries the `Content-Type` and
-                          `X-Prometheus-Remote-Write-Version` the wire version is read from
+                          `X-Prometheus-Remote-Write-Version` the wire version is read from, and
+                          the `Content-Encoding` that says which decompressor the body needs
   statsd/README.md     -- provenance table for statsd/*.raw
   statsd/*.raw         -- raw captured UDP datagrams from two real statsd clients (Datadog's
                           `datadog` package and the plain-statsd `statsd` package), each in a
@@ -115,7 +117,7 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **Datadog:** under 40 KB for the whole corpus. A zstd request body is small; a trace body isn't,
   since one Flask request is about ten spans, so trace captures serve few requests.
 - **Whole directory:** well under 100 KB total. As of 2026-09-24, the fixtures, excluding READMEs,
-  total about 73 KB.
+  total about 74 KB.
 
 If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
 at record time instead of committing everything the producer emits. `script/record-fixtures`'s

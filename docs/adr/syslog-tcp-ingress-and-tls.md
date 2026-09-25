@@ -13,9 +13,10 @@ Accepted
 `syslog_out` (the egress side, [ADR `syslog-output`](syslog-output.md)) has spoken TCP since it was
 built, but never TLS -- `docs/known-gaps.md`'s "`syslog_out` has no TLS" entry already names the fix
 as "config-plumbing against `TlsClientConfig`/`TlsServerConfig`... not a design decision to redo."
-`syslog_in` (`crates/logit-inputs/src/syslog.rs`) has no TCP at all: its own module doc, and
-`ComponentKind::SyslogIn { bind: String }`'s doc comment (`crates/logit-config/src/lib.rs`), both
-say UDP-only, and `docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry records why that was a
+When this was written, `syslog_in` (`crates/logit-inputs/src/syslog.rs`) had no TCP at all: its
+own module doc, and `ComponentKind::SyslogIn { bind: String }`'s doc comment
+(`crates/logit-config/src/lib.rs`), both said UDP-only, and `docs/known-gaps.md`'s "`syslog_in` is
+UDP-only" entry recorded why that was a
 deliberate, not-yet gap -- the driving integration, nginx's `syslog:` writer, is UDP-only, so a TCP
 accept loop would have bought that integration nothing. [ADR `syslog-output`](syslog-output.md)'s
 "asymmetry is deliberate" note is the same call from the egress side.
@@ -53,7 +54,7 @@ Everything this decision needs already exists in-tree and is reused, not re-deci
 
 `SyslogIn` gains `#[serde(default)] transport: SyslogTransport` (the same enum `syslog_out` already
 publishes -- see "Config surface" below) and `#[serde(default)] tls: Option<TlsServerConfig>`.
-`SyslogIn`'s doc comment, which currently asserts UDP-only is deliberate, and
+`SyslogIn`'s doc comment, which at the time asserted UDP-only is deliberate, and
 `docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry, and [ADR `syslog-output`](syslog-output.md)'s
 "that asymmetry is deliberate" note, are all superseded by this decision, not merely narrowed.
 

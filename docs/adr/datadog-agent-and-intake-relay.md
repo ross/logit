@@ -136,7 +136,7 @@ Three facts from the survey drive the shape of the decision:
     `bind`/`endpoint` field.** There's no separate `path:` field. One `statsd_in` listens on one
     socket, so an Agent's UDP port plus its socket is two components, as a TCP and a UDP listener
     already are; and a client names the socket the same way, one address under a scheme
-    (`DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`). Rule 64 requires an absolute path and
+    (`DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`). Rule 65 requires an absolute path and
     rejects `tls:` under either Unix transport. The rest of the decision:
     - **`unix_stream` frames each packet as a 4-byte little-endian length, then one datagram's
       worth of newline-separated lines**: what the Agent's `pkg/dogstatsd/listeners/uds_stream.go`

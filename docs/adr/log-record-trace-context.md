@@ -143,7 +143,7 @@ application's logs never got a `TraceRef`
 - An optional `trace_id_high` names an attribute holding the high 64 bits in `_dd.p.tid`'s form. It
   applies only when the parsed trace id's high half is zero, so a 32-hex id's own high half always
   wins. It's parsed whenever present, like `flags`: a bad value is `invalid` even when a 128-bit id
-  leaves it unused. It's consumed with the other ids unless `keep_source`. Graph rule 67 rejects it
+  leaves it unused. It's consumed with the other ids unless `keep_source`. Graph rule 68 rejects it
   under `format: otel`, where every trace id already has its high half.
 - `traceparent` is still honored, and `span.parent_id` stays 16 hex under either format: both are
   W3C names, not Datadog ones.
