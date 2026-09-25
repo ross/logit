@@ -100,8 +100,10 @@ so a v1 record spooled before an upgrade still replays after it.
 The frame caps bound what arrives, not what it decodes into. An element at its smallest wire
 encoding can become a much larger in-memory struct: one empty event is 1 wire byte and an 864-byte
 `Event`. So every payload decodes against a per-frame budget (`native::DecodeBudget`,
-`crates/logit-proto/src/native/budget.rs`), and a payload that would exceed it is `Malformed`
-before the elements are built:
+`crates/logit-proto/src/native/budget.rs`), and a payload that would exceed it fails with
+`CodecError::BudgetExceeded` before the elements are built. `logit_in` counts that under
+`logit.proto.errors{reason="decode_budget"}` and diagnoses it under its own `decode_budget` key.
+The budget per reader:
 
 - `logit_in` gives each frame 4 × its effective `max_frame_bytes` (at most 64 MiB, so at most a
   256 MiB budget).
@@ -150,7 +152,7 @@ nginx access logs 6.1, spans 8.0, sshd logs 7.8, pino-http logs 18.7, statsd 19.
 16.6, graphite 32.0, Prometheus gauges 32.5, and a bare `Sum` metric 38.8. So a frame is refused
 once its payload passes `4 / ratio` of the frame cap it arrived under: about 10% of it for a
 metric batch, and about 65% for an nginx one. At the 64 MiB default that is a payload of roughly
-6.5 MiB, or about 240,000 small metric events.
+6.5 MiB, or about 250,000 small metric events (about 120,000 nginx access-log events).
 
 ## Encoding: decided — hand-rolled
 

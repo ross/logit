@@ -3630,8 +3630,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - ~~`resync` is `O(n)` per call over the remaining buffer and a caller that resyncs
     repeatedly past spurious magics is `O(n²)`~~ **Holds for `resync` itself**: one linear
     `windows` scan per call. The quadratic cost in the spool walk is `parse_record` copying the
-    rest of the segment for each record, not `resync`; it's fixed separately in the
-    `fix/spool-walk-copy` PR (DISK-02/DISK-13).
+    rest of the segment for each record, not `resync`; it's fixed separately in #367
+    (DISK-02/DISK-13).
 - **Existing coverage:** in-file unit tests in `frame.rs` (round trips, bad magic, unknown
   version, corrupt CRC, both truncation classes, both sanity caps, short-decompress, zstd,
   resync); `crates/logit-proto/tests/robustness.rs` (`read_frame_survives_every_single_byte_truncation`,

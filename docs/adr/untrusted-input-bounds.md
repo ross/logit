@@ -69,10 +69,14 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 ### Decoders
 
 - **A per-frame decode budget.** Decoding a frame may allocate at most 4 × the listener's
-  effective `max_frame_bytes` of estimated heap, charged per element as it is decoded. The reason
-  is a misconfigured sender's giant batch, not a bomb. The per-element charges are the measured
-  wire-to-heap expansion ratios, recorded next to the caps in
-  [`docs/design/wire-protocol.md`](../design/wire-protocol.md).
+  effective `max_frame_bytes` of estimated heap, charged per list, up front, from the declared
+  count, after the count is checked against the bytes left. The reason is a misconfigured
+  sender's giant batch, not a bomb. Ordinary batches cost 6 to 39 bytes of heap per wire byte,
+  so at the default 64 MiB cap the budget refuses a frame of more than roughly 250,000 small
+  metric events (about 120,000 nginx access-log events). The per-element charges and the measured wire-to-heap expansion ratios are recorded
+  next to the caps in [`docs/design/wire-protocol.md`](../design/wire-protocol.md). A refusal is
+  its own error, `CodecError::BudgetExceeded`, counted by `logit_in` as
+  `logit.proto.errors{reason="decode_budget"}`.
 - **OTLP nesting keeps its parsers' limits.** OTLP nesting is bounded by serde_json's recursion
   limit (128 JSON levels, about 41 `AnyValue` levels) and prost's (100 messages, about 49 levels),
   both under native's 128. Tests pin both limits so a dependency bump can't remove them silently.

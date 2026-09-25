@@ -334,6 +334,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   with tens of thousands of keys in the worst order pays it. A non-goal under
   [ADR `deployment-threat-model`](adr/deployment-threat-model.md): the fix (collect, then sort
   once) changes the ordinary decode path for a shape only crafted input produces.
+- **The native decode budget bounds only what arrives over `logit_in`.** The `buffer.disk:` spool
+  decodes its records with no budget (`parse_record` in `crates/logit-pipeline/src/disk_queue.rs`),
+  because each spooled batch was already that size in memory when `DiskQueue::push` wrote it, and
+  a budget refusal there would discard the batch as corrupt. `NativeDecoder` (the `Decoder` seam)
+  uses the 256 MiB default. See [`docs/design/wire-protocol.md`](design/wire-protocol.md)'s
+  "Decode amplification".
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
