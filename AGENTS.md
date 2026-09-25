@@ -460,6 +460,7 @@ the operator-facing account of all of this.
   since neither the host nor `Dockerfile.dev` has graphviz:
 
   ```sh
+  sudo docker build -q -t logit-graph-renderer demo/graph-renderer
   set -o pipefail
   sudo COMPOSE_PROJECT_NAME=logit docker compose run --rm -T -e DD_API_KEY=unused dev \
       cargo run --quiet -p logit-cli -- graph examples/canonical/logit.yaml \
