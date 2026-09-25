@@ -1205,16 +1205,34 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         // listener has no such gauges (this module's "A Unix stream socket runs on the same
         // loop"); `UnixListener::accept` is cancellation-safe on its own.
         let mut accept_queue = AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
+        let mut accept_diag = self.diag.clone();
         loop {
             let accepted = match &listener {
                 BoundListener::Tcp(listener) => tokio::select! {
-                    accepted = accept_queue.accept(listener) => Accepted::Tcp(accepted?.0),
+                    accepted = accept_queue.accept(listener) => accepted.map(|(s, _)| Accepted::Tcp(s)),
                     _ = shutdown.wait_for(|&due| due) => return Ok(()),
                 },
                 BoundListener::Unix(listener) => tokio::select! {
-                    accepted = listener.accept() => Accepted::Unix(accepted?.0),
+                    accepted = listener.accept() => accepted.map(|(s, _)| Accepted::Unix(s)),
                     _ = shutdown.wait_for(|&due| due) => return Ok(()),
                 },
+            };
+            let accepted = match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // `biased`, absorb first: the error is counted before shutdown can win, and a
+                    // stopping listener doesn't wait out the backoff.
+                    tokio::select! {
+                        biased;
+                        absorbed = crate::listener::absorb_accept_error(
+                            err,
+                            &self.telemetry,
+                            &mut accept_diag,
+                        ) => absorbed?,
+                        _ = shutdown.wait_for(|&due| due) => return Ok(()),
+                    }
+                    continue;
+                }
             };
 
             // `try_acquire_owned`, not `acquire_owned`: at capacity the connection is closed

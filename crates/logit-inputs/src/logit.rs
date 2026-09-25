@@ -242,10 +242,29 @@ impl Input for LogitInput {
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
 
+        let mut accept_diag = self.diag.clone();
+
         loop {
-            let (stream, _peer) = tokio::select! {
-                accepted = accept_queue.accept(&listener) => accepted?,
+            let accepted = tokio::select! {
+                accepted = accept_queue.accept(&listener) => accepted,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
+            };
+            let (stream, _peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // `biased`, absorb first: the error is counted before shutdown can win, and a
+                    // stopping listener doesn't wait out the backoff.
+                    tokio::select! {
+                        biased;
+                        absorbed = crate::listener::absorb_accept_error(
+                            err,
+                            &self.telemetry,
+                            &mut accept_diag,
+                        ) => absorbed?,
+                        _ = shutdown.wait_for(|&due| due) => return Ok(()),
+                    }
+                    continue;
+                }
             };
 
             // `None` means past the cap. `reject_or_serve` writes the reject, after the TLS wrap

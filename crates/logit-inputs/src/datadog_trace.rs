@@ -498,8 +498,16 @@ async fn accept_tcp(
 ) -> anyhow::Result<()> {
     let mut accept_queue =
         crate::tcp::AcceptQueueSampler::new(accept.telemetry.clone(), accept.diag.clone());
+    let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, peer) = accept_queue.accept(&listener).await?;
+        let (stream, peer) = match accept_queue.accept(&listener).await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
+                    .await?;
+                continue;
+            }
+        };
         let Some(permit) = accept.permit() else {
             drop(stream);
             continue;
@@ -559,8 +567,16 @@ async fn accept_unix(
     path: Arc<Path>,
     accept: Arc<AcceptContext>,
 ) -> anyhow::Result<()> {
+    let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
+                    .await?;
+                continue;
+            }
+        };
         let Some(permit) = accept.permit() else {
             drop(stream);
             continue;

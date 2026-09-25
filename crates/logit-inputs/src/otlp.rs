@@ -336,8 +336,16 @@ impl Input for OtlpInput {
         // sampled before each accept and once a second while waiting for one.
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
+        let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, _peer) = accept_queue.accept(&listener).await?;
+            let (stream, _peer) = match accept_queue.accept(&listener).await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
+                        .await?;
+                    continue;
+                }
+            };
 
             // Non-blocking, and before any TLS accept (this module's "Connection limit").
             let Ok(permit) = connection_limit.clone().try_acquire_owned() else {

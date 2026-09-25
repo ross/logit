@@ -300,8 +300,16 @@ impl Input for DatadogInput {
         let idle_timeout = self.idle_timeout;
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
+        let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, peer) = accept_queue.accept(&listener).await?;
+            let (stream, peer) = match accept_queue.accept(&listener).await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
+                        .await?;
+                    continue;
+                }
+            };
 
             let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
                 self.telemetry.count(
