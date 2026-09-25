@@ -71,8 +71,10 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # `fuzz/fuzz_targets/<target>.rs`; `fuzz-all` runs each in order. `malloc_limit_mb` fails a run on
 # any single allocation past it, which is how a decoder sizing an allocation from a declared
 # length shows up. Each sits above the largest allocation a valid input may make: `native_frame`'s
-# 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`. `extra args` go to `fuzz`
-# only, never to `fuzz-tmin`.
+# 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`, and the `native_batch_*`
+# targets' 64 admits `decode_batch_body`'s events `Vec` regrowing by doubling past its initial
+# 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `extra args` go to
+# `fuzz` only, never to `fuzz-tmin`.
 #
 # The two `native_batch_*` targets run in fork mode: the process-wide interner never evicts, so a
 # long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
@@ -80,8 +82,8 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # child fatal, as it is outside fork mode.
 FUZZ_TARGETS=(
     "native_frame|262144|65|"
-    "native_batch_v1|65536|16|-fork=1 -ignore_ooms=0"
-    "native_batch_v2|65536|16|-fork=1 -ignore_ooms=0"
+    "native_batch_v1|65536|64|-fork=1 -ignore_ooms=0"
+    "native_batch_v2|65536|64|-fork=1 -ignore_ooms=0"
     "native_control|4096|4|"
     "sketch_bytes|65536|16|"
     "sketch_merge|65536|64|"

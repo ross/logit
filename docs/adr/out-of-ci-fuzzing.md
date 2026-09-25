@@ -288,3 +288,7 @@ Two things the campaign turned up about the harness, not the decoders:
   10,315-second `slow-unit-*` in `prom_remote_write`. Each artifact runs in 1 ms on its own. The
   four targets were rerun from their seeds, and the table has the rerun. Wrap a long campaign
   in `systemd-inhibit --what=sleep:idle`.
+
+After the campaign, both `native_batch_*` targets' `malloc_limit_mb` rose from 16 to 64, because
+a valid batch of more than 16,384 empty events regrows `decode_batch_body`'s events `Vec` past
+16 MiB (about 56 MiB at `max_len`), and none of the campaign's inputs reached that count.
