@@ -2207,6 +2207,54 @@ mod tests {
         drop(unread);
     }
 
+    /// Every `Reject{GOING_AWAY}` goes out before the frame it answers reaches `send_relayed`,
+    /// so a frame answered with one is never forwarded, and a `logit_out` may resend it at any
+    /// delivery posture. A whole frame buffered as shutdown fires races the header read against
+    /// the shutdown arm; this runs the race until both outcomes have occurred.
+    #[tokio::test]
+    async fn a_frame_answered_with_going_away_is_never_forwarded() {
+        let (mut acked, mut going_away) = (0, 0);
+        for _ in 0..400 {
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let (sink, mut rx) = fanout_into_channel(16);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(serve_connection(
+                server,
+                sink,
+                Telemetry::default(),
+                frame::MAX_SANE_UNCOMPRESSED_LEN,
+                HANDSHAKE_TIMEOUT,
+                None,
+                shutdown_rx,
+            ));
+            write_msg(&mut client, &hello_v1()).await;
+            let _ = read_control_response_over(&mut client).await;
+            tokio::task::yield_now().await; // the task parks in its `select!`
+            client.write_all(&sample_frame()).await.unwrap(); // fits the buffer: no yield
+            shutdown_tx.send(true).unwrap();
+            match read_control_response_over(&mut client).await {
+                control::ControlMessage::Ack(_) => {
+                    acked += 1;
+                    assert!(rx.try_recv().is_ok(), "an acked frame was forwarded first");
+                }
+                control::ControlMessage::Reject(reject) => {
+                    assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+                    going_away += 1;
+                    task.await.unwrap().unwrap();
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "a frame answered with GOING_AWAY must never be forwarded"
+                    );
+                }
+                other => panic!("expected Ack or Reject, got {other:?}"),
+            }
+        }
+        assert!(
+            going_away > 0 && acked > 0,
+            "both arms ran: {acked} acked, {going_away} going away"
+        );
+    }
+
     /// An xorshift-generated printable-ASCII string: lz4 finds almost no 4-byte match in it, so
     /// its lz4 frame is larger than its payload.
     fn incompressible_text(len: usize) -> String {
@@ -2321,6 +2369,131 @@ mod tests {
             Some(1.0)
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A header partly read when shutdown fires is discarded with the connection: the client
+    /// gets `GOING_AWAY`, the rest of its frame is never read, and nothing is forwarded.
+    #[tokio::test]
+    async fn a_partial_header_at_shutdown_is_discarded_and_the_connection_closes() {
+        let (addr, mut input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+        let frame = sample_frame();
+        client.write_all(&frame[..10]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // the listener reads those 10 bytes
+
+        shutdown_tx.send(true).unwrap();
+        match read_control_response(&mut client).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY)
+            }
+            other => panic!("expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
+        let _ = client.write_all(&frame[10..]).await; // may fail: the listener has closed
+        let mut buf = [0u8; 1];
+        let after = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject");
+        assert!(matches!(after, Ok(0) | Err(_)), "expected a close, got {after:?}");
+
+        handle.await.unwrap().unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            closed.expect("the fanout closes within 2s").is_none(),
+            "the partial frame was never forwarded"
+        );
+    }
+
+    /// Something that isn't `logit` on this port (an HTTP request, a syslog line) fails the
+    /// header's magic check. That check comes before the length bound and the body allocation, so
+    /// the connection closes at once, counted as a handshake error, and allocates nothing sized
+    /// from the stray bytes.
+    #[tokio::test]
+    async fn a_stray_http_or_syslog_client_is_reset_before_any_allocation() {
+        const STRAYS: [(&str, &[u8]); 2] = [
+            ("http", b"GET /metrics HTTP/1.1\r\nHost: logit\r\n\r\n"),
+            ("syslog", b"<13>1 2026-09-25T00:00:00Z host app - - - hello world\n"),
+        ];
+
+        for (name, bytes) in STRAYS {
+            let mut header = [0u8; frame::HEADER_LEN];
+            header.copy_from_slice(&bytes[..frame::HEADER_LEN]);
+            let (_client, mut server) = tokio::io::duplex(64);
+            peak_alloc::reset();
+            let result =
+                read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None).await;
+            let peak = peak_alloc::peak();
+            match result {
+                Err(FrameReadError::Malformed(err)) => {
+                    assert!(format!("{err:#}").contains("magic"), "{name}: {err:#}")
+                }
+                Err(other) => panic!("{name}: expected Malformed, got {:#}", other.into_inner()),
+                Ok(_) => panic!("{name}: stray bytes parsed as a frame"),
+            }
+            assert!(peak < 1024, "{name}: {peak} bytes allocated for a rejected header");
+        }
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: a close comes from the magic check, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+        for (name, bytes) in STRAYS {
+            let mut stray = connect(&addr).await;
+            stray.write_all(bytes).await.unwrap();
+            let mut buf = [0u8; 64];
+            let read = tokio::time::timeout(Duration::from_secs(2), stray.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: expected a close within 2s"));
+            assert!(matches!(read, Ok(0) | Err(_)), "{name}: expected a close, got {read:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "handshake")),
+            Some(2.0)
+        );
+    }
+
+    /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected
+    /// connection still open, and the first one closed, a third handshakes.
+    #[tokio::test]
+    async fn a_past_the_cap_connection_holds_no_permit() {
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut first = connect(&addr).await;
+        client_hello(&mut first, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut first).await;
+
+        let mut rejected = connect(&addr).await;
+        match read_control_response(&mut rejected).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_INTERNAL)
+            }
+            other => panic!("expected Reject{{INTERNAL}}, got {other:?}"),
+        }
+
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await; // the first task ends
+        let mut third = connect(&addr).await;
+        client_hello(&mut third, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        match read_control_response(&mut third).await {
+            control::ControlMessage::HelloAck(_) => {}
+            other => {
+                panic!("expected HelloAck with the rejected connection still open, got {other:?}")
+            }
+        }
+        drop(rejected);
     }
 
     /// A frame's body is held once while it's read: one buffer of `HEADER_LEN + compressed_len`,
