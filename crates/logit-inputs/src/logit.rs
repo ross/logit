@@ -26,7 +26,8 @@
 //! *`GOING_AWAY` and forwarding exclude each other.* Every `Reject` this listener writes (the
 //! past-the-cap one, the handshake's, the loop-top and `select!` shutdown arms, and an idle close)
 //! goes out before the frame it answers reaches `send_relayed`; after
-//! `send_relayed` the only write is that frame's `Ack`.
+//! `send_relayed` the only write is that frame's `Ack`. So a `logit_out` that gets `GOING_AWAY`
+//! in place of an `Ack` knows the batch never landed, and resends it at any delivery posture.
 //!
 //! **Bounded writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`, including
 //! `GOING_AWAY`) finishes within `handshake_timeout` or is abandoned ([`write_control`]). A peer
@@ -749,9 +750,9 @@ impl HeaderReadError {
 /// last `Ack`. Once the first byte arrives the header is progress, so each later read gets
 /// [`IdleBounds::stall`], the per-`read` rule [`read_frame_body`] applies to a body. One absolute
 /// deadline around the whole header would discard a header that started shortly before it, and send
-/// `Reject{GOING_AWAY}` to a peer already writing a frame: for `logit_out`, the
-/// `Fault::Ambiguous` batch its pooled-connection probe exists to avoid. The first-byte deadline
-/// firing loses nothing, since no byte has been read.
+/// `Reject{GOING_AWAY}` to a peer already writing a frame, costing `logit_out` a reconnect and a
+/// resend of a batch that was on its way. The first-byte deadline firing loses nothing, since no
+/// byte has been read.
 async fn read_header<S: AsyncRead + Unpin>(
     stream: &mut S,
     bounds: Option<IdleBounds>,
