@@ -189,10 +189,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **A decoded sketch's or HyperLogLog's summary fields are taken as written**
   (`crates/logit-core/src/sketch.rs`'s module doc, `HyperLogLog::from_bytes`). `from_bytes`
   bounds what a blob can allocate or make later operations cost, and rejects a zero-register
-  count past the register count, but trusts the rest of a peer's summary under
-  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model (accidental data
-  from private peers; a check is added only where it is free and would catch an accident). None of
-  these panics:
+  count past the register count, but trusts the rest of a peer's summary: a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md) (accidental data from private
+  peers), and [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md) adds a check only
+  where it is free and would catch an accident. None of these panics:
   - A `DdSketch` with `min > max` answers non-monotonic quantiles.
   - A `DdSketch` with an infinite or `NaN` `min` or `max` hands it to `quantile`'s clamp, so a
     decoded sketch can answer `±∞`.
@@ -685,8 +685,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
   `datadog_trace_in`) and up to `max_frame_bytes × idle_timeout` per frame on `logit_in`. With
   enough connections, such a peer can hold the connection cap. A documented cost of the per-frame
-  design, not a bug: a total body deadline was declined because a slow link sending a large
-  legitimate body looks the same ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
+  design, not a bug, and a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): a total body deadline was
+  declined because a slow link sending a large legitimate body looks the same
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
   [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment).
   **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum
   transfer rate, or a per-peer connection cap is worth the false positives.
@@ -711,7 +713,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   bytes held in request bodies across a listener (a semaphore acquired per body chunk) would bound
   the product directly. Recorded as a follow-up, not built: it changes how every HTTP listener
   reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
-  considered"). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
+  considered"), and the concurrent large requests it guards against are a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
   concurrent large requests.
 - **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
   handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
@@ -1139,8 +1142,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `logit.output.metrics.skipped{reason="oversized_sketch"}` with diag `oversized_sketch`, rather
   than splitting each bin's count into `uint16` entries without bound; it takes per-bin counts of
   millions (a statsd sample-rate typo extrapolated through `aggregate`) across many bins, and
-  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model treats that as an
-  accident to bound, not data to scale down.
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md) treats that as an accident to
+  bound, not data to scale down ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)
+  has the rule).
 
 ## syslog
 

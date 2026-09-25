@@ -24,11 +24,12 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-25, `main` @ `489a200`):** 14 of 135 entries done (7 P0, 7 P1): 13 with
-  findings and one reviewed clean. The two finished clusters are the `libc` surface (#280–#283)
-  and durability (#322–#337). The remote-reachable crash/DoS cluster is in progress on the
-  `dos/w0`–`dos/w8` stack, with CORE-05's stale entry re-reviewed there; the rest of the list is
-  `unreviewed`. The index's **Status** column is the source of truth.
+- **Progress (2026-09-25, at the remote-reachable crash/DoS stack tip, `d04a494`):** 27 of 135
+  entries done (16 P0, 10 P1, 1 P2): 25 with findings and two reviewed clean. The three finished
+  clusters are the `libc` surface (#280–#283), durability (#322–#337), and remote-reachable
+  crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
+  re-reviewed CORE-05's stale entry. The rest of the list is `unreviewed`. The index's
+  **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three
@@ -65,9 +66,11 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 
 Repo-wide gaps that cut across entries:
 
-- **No `cargo-fuzz` target exists anywhere in the workspace.** `logit-proto/tests/robustness.rs`
-  mutates native/control/graphite/collectd only — statsd, syslog, both Prometheus paths, OTLP/JSON,
-  the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and tail checkpoints have none.
+- ~~**No `cargo-fuzz` target exists anywhere in the workspace.**~~ **Partly fixed (#371):**
+  `fuzz/` holds twelve cargo-fuzz targets over the native, sketch, HyperLogLog, OTLP, and
+  Prometheus remote-write decoders, run out of CI (ADR `out-of-ci-fuzzing`). statsd, syslog, the
+  Prometheus text parser, the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and
+  tail checkpoints still have none (cluster 9).
 - **Cancellation is the least-tested axis.** The runtime drops `send`/`push` futures mid-flight by
   design; no test drops one inside `write_all`, the UDP datagram loop, or a parked `store.push`.
 - **Dependency bumps are re-verification triggers**: `logit-inputs/src/http.rs`'s idle/graceful
@@ -75,15 +78,16 @@ Repo-wide gaps that cut across entries:
   `BoundedQueue::close` leans on a tokio `notify_waiters` internal; `logit_out`'s `Clean` vs
   `Ambiguous` fault split rests on an unverified `tokio-rustls` write-semantics assumption; the HLL
   codec's soundness rests on serde's `with_capacity(size_hint)` behaviour.
-- **Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
-  listeners — leaks on panic.
+- ~~**Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
+  listeners — leaks on panic.~~ **fixed (#374):** every stream input's live-connections gauge is
+  a drop guard, and a test panics a connection task and reads the gauge back to zero.
 - No TLS certificate reload exists anywhere, and it is not recorded in `docs/known-gaps.md`.
 
 ## Suggested session clusters
 
 Entries that share a mechanism and should be verified together, in suggested order:
 
-1. **Remote-reachable crash/DoS (in progress, dos/w0–w8)** — CORE-05, CORE-06, WIRE-01..03, WIRE-06, WIRE-10/11/15,
+1. **Remote-reachable crash/DoS (done, #361, #366, #369–#372, #374, #377)** — CORE-05, CORE-06, WIRE-01..03, WIRE-06, WIRE-10/11/15,
    CODEC-16, CODEC-17. Mostly fuzz targets + size/depth caps; highest severity, most mechanical.
 2. **Durability (done, #322–#337)** — DISK-01..06, DISK-09, DISK-13, TAIL-05, DISK-10. One crash-injection harness
    serves all of it; settle the fsync policy (tmp file + directory) once for spool *and* checkpoints.
@@ -926,11 +930,11 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     (the `Ok(Err(err))` and `Err(_elapsed)` arms) and a panicking `serve_connection` (the
     `_permit` binding handles the unwind, assuming `panic = unwind`). **Holds**: the permit and
     the `LiveConnection` guard are both owned by the spawned task, and tokio drops a panicked
-    task's future; no profile sets `panic = "abort"` (dos/w6).
+    task's future; no profile sets `panic = "abort"` (#374).
   - The live-connections gauge converges to 0 after every connection ends; the `fetch_add`/
     `fetch_sub` are balanced across all exit paths. **Holds**: the pair is now
     `crate::listener::LiveConnections`' drop guard, pinned by
-    `a_panicking_connection_task_still_returns_the_gauge_to_zero` (dos/w6).
+    `a_panicking_connection_task_still_returns_the_gauge_to_zero` (#374).
   - Shutdown: the accept loop's `return Ok(())` in the accept `select!`'s shutdown arm does not orphan in-flight connection tasks
     in a way that loses their accumulated batches — each has its own `conn_shutdown` receiver and
     flushes on it, but nothing joins them.
@@ -4103,7 +4107,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - ~~Gauge decrement is not a drop guard (`reject_or_serve`'s `live_connections.fetch_sub`), so a panic in `serve_connection` leaks the gauge
     upward and the `logit.input.connections` reading drifts permanently. **High confidence in the
     code shape; `otlp_in` has the identical pattern in `crates/logit-inputs/src/otlp.rs`'s `Input::run` (`live_connections.fetch_add`/`fetch_sub`).**~~
-    **fixed** (dos/w6): `reject_or_serve` counts a connection through
+    **fixed** (#374): `reject_or_serve` counts a connection through
     `crate::listener::LiveConnections`' drop guard, after the permit check.
   - Nothing bounds the *number* of past-the-cap TLS handshakes in flight (acknowledged in the
     module doc of `crates/logit-inputs/src/logit.rs` and in the ADR), so the cap bounds served connections but not resource
@@ -5410,8 +5414,8 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Suggested verification approach:** (1) first and cheapest: construct a deeply nested (e.g. 10,000–100,000-level) `{"arrayValue":{"values":[{"arrayValue":{"values":[...` JSON payload, well under any configured request-body size cap, and feed it through `otlp_in`'s actual HTTP/JSON path (ideally under a debug build with a deliberately small thread stack to make a real stack overflow reproducible rather than merely plausible) to empirically settle whether `serde_json`'s limit actually protects this code today; (2) if it does not protect it, add an explicit depth counter threaded through `any_value`/`array_field`/`key_values`, mirroring `MAX_PICKLE_DEPTH`'s pattern, with a `CodecError::Malformed` past a small cap (64–128 levels — no real OTLP producer nests attributes anywhere near that deep); (3) either way, add a `robustness.rs`-style depth-cap test for this path so the answer stays pinned regardless of `serde_json`'s own behavior; (4) separately check the protobuf-path `AnyValue` decode in `common.rs` for the same gap, since it's a different code path entirely.
 - **Priority:** ~~P0 (provisional pending the empirical check above) — untrusted network input, fully custom recursive decoding logic, and a directly analogous bug class this exact codebase already fuzzes and caps in two sibling codecs (native `decode_batch`, graphite `pickle`) but has not applied here; downgrade to P2 the moment the `serde_json`-recursion-limit assumption is empirically confirmed to hold and a defense-in-depth cap is judged unnecessary, but until that test is run this should be treated as a live, unverified DoS candidate rather than a stylistic nitpick.~~ **P2.**
 - **Measured 2026-09-25:** JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under
-  native's 128; downgraded to P2 pending W4's pinning tests.
-- **Verified 2026-09-25** (`dos/w4`, atop `dos/w0` `dc39d1c`): **pinned, no change.** Both
+  native's 128; downgraded to P2 pending the pinning tests in #366.
+- **Verified 2026-09-25** (#366, at `dc39d1c`): **pinned, no change.** Both
   parsers' limits hold, measured by construction. serde_json 1.0.151 rejects past 128 JSON levels
   ("recursion limit exceeded"), which bounds OTLP/JSON at 41 `AnyValue` levels (`arrayValue` in a
   resource attribute; 31 for `kvlistValue`, fewer deeper in a message); a 100,000-deep body fails
@@ -5441,7 +5445,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **Existing coverage:** `crates/logit-proto/src/otlp/logs.rs`, `traces.rs`, and `metrics.rs` each have a `mod tests`; these unit tests exist but (based on the test names visible via grep — `unwrap()`-heavy round-trip assertions) appear focused on the normal-range/round-trip cases, not adversarial out-of-range timestamps; no test constructing a `time_unix_nano` >= `i64::MAX` was found. `crates/logit-proto/tests/otlp_fixed_point.rs` likely covers round-trip fixed points for realistic values only (not independently re-read for this specific edge case). No `robustness.rs` coverage for OTLP at all (that file's own module doc doesn't name it). Governed by ADR `otlp-json-decoding`, `docs/design/data-model.md`; `docs/known-gaps.md`'s timestamp-precedence entries address a related-but-distinct concern (receipt vs. sender time) and do not cover this.
 - **Suggested verification approach:** a unit test per file (logs/traces/metrics) constructing a wire message with `time_unix_nano = u64::MAX` (and `i64::MAX + 1` exactly, the boundary) and asserting the decoded `Event`'s timestamp is *not* silently negative — then decide and implement the actual desired behavior (reject the record, clamp to `i64::MAX`, or omit the field with a diagnostic, mirroring syslog's `OutOfRange` handling) and apply it uniformly across all enumerated call sites, ideally through one shared helper (`fn wire_time_to_nanos(u64) -> Option<i64>` or similar) rather than three independently-repeated bare casts.
 - **Priority:** ~~P1 — genuine, verified, previously-unflagged silent-data-corruption bug reachable from fully untrusted network input (OTLP/HTTP and OTLP/gRPC both accept arbitrary `fixed64` timestamps), inconsistent with the project's own established, more careful handling of the identical failure mode elsewhere (syslog); not P0 only because the trigger condition (a timestamp implying a date past 2262) is unusual enough that it's far more likely to surface from a buggy sender's garbage value than a deliberate attack, and the consequence is corrupted metadata on affected records rather than a crash or resource exhaustion.~~ **fixed in #366; stays P1 as the record of what it was.**
-- **Verified 2026-09-25** (`dos/w4`, atop `dos/w0` `dc39d1c`): **fixed: all 17 decode sites
+- **Verified 2026-09-25** (#366, at `dc39d1c`): **fixed: all 17 decode sites
   saturate.** Against the old code, a wire value of `i64::MAX + 1` decoded as `i64::MIN` and
   `u64::MAX` as `-1`, on both protobuf and JSON. One helper, `otlp/common.rs`'s `wire_nanos`, now
   maps a value past `i64::MAX` to `i64::MAX` at every site: `decode_log_record` (3),
