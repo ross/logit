@@ -71,7 +71,8 @@ fn write_scalar_field(
 ///
 /// `visit` must consume all of a field's payload: bytes left after it returns are `Malformed`,
 /// so a reader that parses a prefix (a varint, one `Value`, a list) rejects what follows it. A
-/// visitor skips a tag it doesn't know by clearing the payload.
+/// visitor skips a tag it doesn't know by clearing the payload. The rule is decided in ADR
+/// `untrusted-input-bounds`.
 fn for_each_field(
     body: &mut Bytes,
     mut visit: impl FnMut(u8, &mut Bytes) -> Result<(), CodecError>,
@@ -412,6 +413,7 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
 
 /// Charges `budget` each list element's in-memory size up front, and rejects a body with bytes
 /// after its last field. `Distribution` and `Set` hand the whole body to their blob decoders.
+/// Both rules, and the budget's 4x multiplier, are decided in ADR `untrusted-input-bounds`.
 fn read_metric_kind(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<MetricKind, CodecError> {
     let kind_tag = read_u8(bytes)?;
     let len = read_uvarint(bytes)? as usize;

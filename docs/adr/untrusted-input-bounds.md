@@ -71,10 +71,9 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 - **A per-frame decode budget.** Decoding a frame may allocate at most 4 × the listener's
   effective `max_frame_bytes` of estimated heap, charged per list, up front, from the declared
   count, after the count is checked against the bytes left. The reason is a misconfigured
-  sender's giant batch, not a bomb. Ordinary batches cost 6 to 39 bytes of heap per wire byte,
-  so at the default 64 MiB cap the budget refuses a frame of more than roughly 250,000 small
-  metric events (about 120,000 nginx access-log events). The per-element charges and the measured wire-to-heap expansion ratios are recorded
-  next to the caps in [`docs/design/wire-protocol.md`](../design/wire-protocol.md). A refusal is
+  sender's giant batch, not a bomb. The per-element charges, the measured wire-to-heap expansion
+  ratios, and what an ordinary batch costs against the budget are recorded next to the caps in
+  [`docs/design/wire-protocol.md`](../design/wire-protocol.md)'s "Decode amplification". A refusal is
   its own error, `CodecError::BudgetExceeded`, counted by `logit_in` as
   `logit.proto.errors{reason="decode_budget"}`.
 - **OTLP nesting keeps its parsers' limits.** OTLP nesting is bounded by serde_json's recursion
@@ -196,7 +195,12 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
 - A peer that sends any of the following now gets a rejection where it used to get silent
   acceptance: a non-canonical varint, trailing bytes in a native field or metric body, a frame
   whose decode exceeds the per-frame budget, or a unary gRPC body with a second frame. No
-  conforming sender produces any of these, so each rejection points at a sender bug.
+  conforming sender produces any of these except the budget one, so each other rejection points
+  at a sender bug. A budget refusal can hit a stock `logit_out`, which learns only
+  `max_frame_bytes` from `HelloAck` and can't know the budget, so a batch between roughly 10% and
+  100% of the cap can be refused. The refusal is deterministic, and `logit_in` answers it with
+  `REJECT_FRAME_TOO_LARGE` (#372), so the sender drops the batch as permanent and diagnoses it
+  rather than retrying. The operator's fix is the sender's batching.
 - An OTLP sender that spells its encoding `Gzip` or `GZIP` now interoperates with `otlp_in`.
 - An OTLP timestamp past 2262-04-11 relays as 2262-04-11T23:47:16.854775807Z.
 - `docs/design/wire-protocol.md` gains each native decoder's measured expansion ratio, and

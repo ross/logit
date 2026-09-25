@@ -339,7 +339,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   because each spooled batch was already that size in memory when `DiskQueue::push` wrote it, and
   a budget refusal there would discard the batch as corrupt. `NativeDecoder` (the `Decoder` seam)
   uses the 256 MiB default. See [`docs/design/wire-protocol.md`](design/wire-protocol.md)'s
-  "Decode amplification".
+  "Decode amplification". A sender learns only `max_frame_bytes` from `HelloAck`, not the budget,
+  so a stock `logit_out` batch between roughly 10% and 100% of the cap can be refused; the
+  refusal is deterministic, `logit_in` answers it with `REJECT_FRAME_TOO_LARGE` (#372) so the
+  sender drops the batch as permanent and diagnoses it rather than retrying, and the operator's
+  fix is the sender's batching.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
