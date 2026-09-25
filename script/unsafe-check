@@ -55,24 +55,30 @@ MIRI_TARGETS=(
 # worktrees sharing one target volume can run each other's stale test binaries.
 TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 
-# One "<target>|<max_len>|<malloc_limit_mb>" per line, one per `fuzz/fuzz_targets/<target>.rs`;
-# `fuzz-all` runs each in order. `malloc_limit_mb` fails a run on any single allocation past it,
-# which is how a decoder sizing an allocation from a declared length shows up. Each sits above the
-# largest allocation a valid input may make: `native_frame`'s 65 admits a 64 MiB lz4 frame, which
-# allocates its `uncompressed_len`.
+# One "<target>|<max_len>|<malloc_limit_mb>|<extra args>" per line, one per
+# `fuzz/fuzz_targets/<target>.rs`; `fuzz-all` runs each in order. `malloc_limit_mb` fails a run on
+# any single allocation past it, which is how a decoder sizing an allocation from a declared
+# length shows up. Each sits above the largest allocation a valid input may make: `native_frame`'s
+# 65 admits a 64 MiB lz4 frame, which allocates its `uncompressed_len`. `extra args` go to `fuzz`
+# only, never to `fuzz-tmin`.
+#
+# The two `native_batch_*` targets run in fork mode: the process-wide interner never evicts, so a
+# long-lived fuzz process accumulates every dictionary string it decodes until the arena outgrows
+# the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a
+# child fatal, as it is outside fork mode.
 FUZZ_TARGETS=(
-    "native_frame|262144|65"
-    "native_batch_v1|65536|16"
-    "native_batch_v2|65536|16"
-    "native_control|4096|4"
-    "sketch_bytes|65536|16"
-    "sketch_merge|65536|64"
-    "hll_bytes|65536|16"
-    "otlp_proto|65536|64"
-    "otlp_json|65536|64"
-    "otlp_grpc|65536|16"
-    "prom_decompress|65536|16"
-    "prom_remote_write|65536|64"
+    "native_frame|262144|65|"
+    "native_batch_v1|65536|16|-fork=1 -ignore_ooms=0"
+    "native_batch_v2|65536|16|-fork=1 -ignore_ooms=0"
+    "native_control|4096|4|"
+    "sketch_bytes|65536|16|"
+    "sketch_merge|65536|64|"
+    "hll_bytes|65536|16|"
+    "otlp_proto|65536|64|"
+    "otlp_json|65536|64|"
+    "otlp_grpc|65536|16|"
+    "prom_decompress|65536|16|"
+    "prom_remote_write|65536|64|"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume
@@ -262,7 +268,16 @@ fuzz_limits() {
         exit 1
     fi
     local rest="${entry#*|}"
-    echo "-max_len=${rest%%|*} -malloc_limit_mb=${rest#*|} -rss_limit_mb=4096 -timeout=10"
+    local max_len="${rest%%|*}"
+    rest="${rest#*|}"
+    echo "-max_len=${max_len} -malloc_limit_mb=${rest%%|*} -rss_limit_mb=4096 -timeout=10"
+}
+
+# Prints the extra libFuzzer arguments FUZZ_TARGETS gives `target`, often none.
+fuzz_extra_args() {
+    local entry
+    entry="$(fuzz_target_entry "${1}")"
+    echo "${entry##*|}"
 }
 
 # libFuzzer writes new inputs only to the first corpus directory, so fuzz/corpus/<target> grows
@@ -278,10 +293,12 @@ cmd_fuzz() {
 
     build_image
     mkdir -p "${ROOT}/fuzz/corpus/${target}"
-    # shellcheck disable=SC2086 # `limits` is a word-split argument list
+    local extra
+    extra="$(fuzz_extra_args "${target}")"
+    # shellcheck disable=SC2086 # `limits` and `extra` are word-split argument lists
     run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz run "${target}" \
         "fuzz/corpus/${target}" "fuzz/seeds/${target}" -- \
-        ${limits} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
+        ${limits} ${extra} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
 }
 
 # An `oom-*` file gets the target's limits, since without `-malloc_limit_mb` an allocation-limit
