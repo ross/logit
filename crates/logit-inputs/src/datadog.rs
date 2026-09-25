@@ -64,7 +64,7 @@
 //!    `api_keys` every request passes, and the validate routes answer `200` to any key.
 //! 4. **`Content-Encoding`.** `identity` (or none), `gzip`, `deflate` (zlib-wrapped: what the
 //!    Agent's `zlib` compressor kind sends under that name), or `zstd` (the Agent's default), else
-//!    `415`. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
+//!    `415`. A header that is present but empty, or not ASCII, is a `415` too, not identity. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
 //!    [`MAX_TRACES_DECOMPRESSED_BYTES`] for traces, by `otlp_in`'s pattern: read through
 //!    `Read::take(cap + 1)`, and `413` when that last byte arrives. A stream that doesn't decode is a
 //!    `400`. zstd has its own bounds ([`crate::zstd`]).

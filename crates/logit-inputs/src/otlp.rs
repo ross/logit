@@ -1275,6 +1275,26 @@ mod tests {
         }
     }
 
+    /// A `Content-Encoding` header that is present but empty, or carries a non-ASCII byte, names
+    /// no coding this input can trust, so it is a `415` like any unknown one, never identity.
+    /// Only an absent header means identity.
+    #[tokio::test]
+    async fn an_empty_or_non_ascii_content_encoding_is_415() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for encoding in ["", "gzip\u{e9}", "\u{e9}zstd"] {
+            let headers = format!(
+                "Content-Type: application/x-protobuf\r\nContent-Encoding: {encoding}\r\n\
+                 Connection: close\r\n"
+            );
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_payload()).await;
+            assert!(response.starts_with("HTTP/1.1 415"), "{encoding:?}: got {response}");
+        }
+    }
+
     fn one_span_payload() -> Vec<u8> {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {

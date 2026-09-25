@@ -121,7 +121,8 @@
 //! 2. **Size.** A `Content-Length` over [`MAX_REQUEST_BYTES`] (25 MiB, the Agent's
 //!    `max_request_bytes`) is a `413` before any byte is read, and the body is read through
 //!    [`Limited`] at the same cap. No API key is checked: tracers send none.
-//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`. Tracers don't compress,
+//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`, including a header that
+//!    is present but empty or not ASCII. Tracers don't compress,
 //!    and the Agent accepts gzip. The decompressed size is capped at the same 25 MiB.
 //! 4. **Decode.** `CodecError::Malformed` is a `400`.
 //! 5. **Delivery**, bounded (below), then the route's `200`. A body that decodes to no events is

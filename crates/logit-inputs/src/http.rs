@@ -364,14 +364,21 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1). `Err`
-    /// carries what was sent, for the `415` message.
+    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1); ADR
+    /// `untrusted-input-bounds` makes that uniform across the HTTP listeners. Only an absent header
+    /// means identity: a present one that is empty or not ASCII names no coding, so it is an `Err`
+    /// like an unknown name. `Err` carries what was sent, for the `415` message.
     pub(crate) fn from_headers(headers: &http::HeaderMap) -> Result<Self, String> {
         let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
             return Ok(Self::Identity);
         };
-        let value = value.to_str().unwrap_or("").trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+        let Ok(value) = value.to_str() else {
+            return Err(String::from_utf8_lossy(value.as_bytes()).into_owned());
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            Err(String::new())
+        } else if value.eq_ignore_ascii_case("identity") {
             Ok(Self::Identity)
         } else if value.eq_ignore_ascii_case("gzip") {
             Ok(Self::Gzip)
