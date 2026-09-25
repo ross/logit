@@ -258,6 +258,7 @@ mod tests {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
                 "DD_API_KEY" => Some("logit-test-key".to_string()),
+                "SPLUNK_OBSERVABILITY_TOKEN" => Some("logit-test-token".to_string()),
                 // The whole header value, `Bearer ` included: `!env` substitutes a field, it
                 // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {

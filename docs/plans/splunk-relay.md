@@ -53,8 +53,8 @@ stack.
 | Signal | Platform, direct over HEC | Platform, through SC4S or the Splunk OTel Collector | Observability Cloud | HEC stand-in (receive from HEC clients) |
 |---|---|---|---|---|
 | Logs | `syslog_out` to a network input (a shape Splunk now steers away from) → `splunk_hec_out` `/services/collector/event` (W3) | `syslog_out` to SC4S; `otlp_out` to the Collector's OTLP receiver, which re-emits HEC | none (no log store) | none → `splunk_hec_in` `/event` and `/raw` (W2) |
-| Metrics | none → `splunk_hec_out` multi-metric events (W3) | `otlp_out` to the Collector | `otlp_out` OTLP/HTTP `/v2/datapoint/otlp` (unverified) → verified, with an example (W4) | none → `splunk_hec_in` (W2) |
-| Traces | none (no trace store) → `splunk_hec_out` spans as JSON events, the OTel exporter's shape (W3) | `otlp_out` to the Collector | `otlp_out` OTLP/HTTP `/v2/trace/otlp` or OTLP/gRPC (unverified) → verified (W4) | none → `splunk_hec_in` decodes the OTel span-event shape back to a `SpanRecord` (W2) |
+| Metrics | none → `splunk_hec_out` multi-metric events (W3) | `otlp_out` to the Collector | `otlp_out` OTLP/HTTP `/v2/datapoint/otlp` (unverified) → example config, unverified (W4) | none → `splunk_hec_in` (W2) |
+| Traces | none (no trace store) → `splunk_hec_out` spans as JSON events, the OTel exporter's shape (W3) | `otlp_out` to the Collector | `otlp_out` OTLP/HTTP `/v2/trace/otlp` or OTLP/gRPC (unverified) → example config, unverified (W4) | none → `splunk_hec_in` decodes the OTel span-event shape back to a `SpanRecord` (W2) |
 
 ## What Splunk accepts and emits
 
@@ -348,14 +348,14 @@ and ADR) precedes both because the pair test needs both halves of the codec.
 | W1 | ADR `splunk-hec-relay`; `logit_proto::splunk`: envelope, `/event` JSON (logs, metric events, the OTel span shape), `/raw` lines, the `{"text","code"}` response bodies; encoder with `MultiValue`; fixed-point suite; `lossless-transit` amendment; ADR index row | M | W0 |
 | W2 | `splunk_hec_in`: listener, routes, `tokens:`, gzip, graph rules, schema | M | W1 |
 | W3 | `splunk_hec_out`: HEC client, body splitting, error classification, `ack:`, graph rules, schema | M | W1 |
-| W4 | `otlp_out` to Observability Cloud verified against a trial org (traces over HTTP and gRPC, metrics over HTTP with an explicit-bucket histogram); `examples/splunk-observability.yaml` | S | W3 |
+| W4 | `examples/splunk-observability.yaml`: `otlp_out` to Observability Cloud (traces over OTLP/HTTP, metrics over OTLP/HTTP), marked unverified — no trial org (Ross, 2026-09-25); verification is a follow-up | S | W3 |
 | W5 | Recorded fixtures via `script/record-fixtures` (a Splunk Enterprise container with a `useACK` token as the HEC target; producers: the OTel Collector `splunk_hec` exporter with logs, all metric kinds, and traces; Docker's `splunk` driver in each `splunk-format`; SC4S; a Java appender); the pair fixed-point test over the corpus; `splunk_hec_out` end-to-end into that container, including ack and a 400 code 6 split; UNVERIFIED items resolved in this plan | M | W2, W3 |
-| W6 | `docs/splunk.md` (operator best practices from this plan); `deploying.md`; `known-gaps.md` (S2S, REST export, raw `tcpout`, the cross-protocol rows); `AGENTS.md` tables; `telemetry-landscape.md` cells; examples `splunk-hec-send.yaml`, `splunk-hec-receive.yaml`, `splunk-hec-relay.yaml`; `SPLUNK_HEC_TOKEN` and `SPLUNK_OBSERVABILITY_TOKEN` in `every_shipped_config_loads_and_validates`'s `!env` map | S | W5 |
+| W6 | `docs/splunk.md` (operator best practices from this plan); `deploying.md`; `known-gaps.md` (S2S, REST export, raw `tcpout`, the cross-protocol rows); `AGENTS.md` tables; `telemetry-landscape.md` cells; examples `splunk-hec-send.yaml`, `splunk-hec-receive.yaml`, `splunk-hec-relay.yaml`; `SPLUNK_HEC_TOKEN` in `every_shipped_config_loads_and_validates`'s `!env` map (`SPLUNK_OBSERVABILITY_TOKEN` landed with W4) | S | W5 |
 
 Landing order: W0 → W1 → W2 → W3 → W4 → W5 → W6, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
-**Status (2026-09-25):** W1, W2 on their branches; W3–W6 not started.
+**Status (2026-09-25):** W1–W4 on their branches; W5/W6 not started.
 
 ## Verification
 
@@ -370,7 +370,9 @@ parent's branch and is brought up to date with `git merge origin/main`, never a 
 - W3: a Splunk Enterprise container shows logs with indexed `fields`, metrics queryable by
   `mstats` including an expanded histogram through `histperc`, and span events; a `useACK`
   token round-trips an id; a `400` code 6 batch is split and the rest delivered.
-- W4: the Observability Cloud trial org shows traces and metrics sent by `otlp_out`.
+- W4: `script/validate` and `every_shipped_config_loads_and_validates` accept
+  `examples/splunk-observability.yaml`. No trial org run: the leg stays unverified until a
+  follow-up confirms it against a real Observability Cloud org.
 - W5: the pair test holds over the recorded corpus; every UNVERIFIED item in this plan is
   resolved and the text updated.
 - W0 (this PR) is documentation only: every relative link resolves and `docs/plans/README.md`
