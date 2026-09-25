@@ -226,7 +226,8 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
   temporarily down destination never trips this; only a failure `logit` can identify as a
   configuration problem does.
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
-  Anything still queued at that deadline is dropped and counted.
+  Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
+  counted (a disk-backed sink spools it instead).
 
 ### Sink buffer sizing: `max_bytes` × number of sinks
 
@@ -259,7 +260,7 @@ buffering:
   destination; under `block`, it is also back-pressuring intake.
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
   (a `drop_*` policy dropped something), `send_failed` (retry gave up on a batch), or `shutdown`
-  (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate is data
+  (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 
@@ -287,13 +288,41 @@ real `write` per batch (a `logit_proto::native` encode plus one file append) tha
 queue never pays. Validation rejects a non-default `buffer.max_batches`/`buffer.max_bytes`
 alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it.
 
+**Under `overflow: drop_oldest`, keep `segment_bytes` well under `max_bytes`,** as the defaults
+(64MiB and 1GiB) do. The spool frees space only by deleting a whole consumed segment, so one push
+against a full spool can evict every record in the oldest segment, each counted
+`batches.dropped{reason="overflow_oldest"}`, before any space comes back. With `segment_bytes`
+close to `max_bytes`, the oldest segment is also the one being written, and that one push evicts
+every queued record. Any `segment_bytes` is safe under every policy: a push that finds the spool
+full with nothing left to deliver rotates the consumed segment away and deletes it instead of
+waiting or dropping.
+
 **Put the spool directory on a volume that survives the container.** An ephemeral container
 filesystem defeats the point, as it would for any durable state (`tail_in`'s checkpoint file in
 `crates/logit-inputs/src/tail/checkpoint.rs`, a database's data directory).
 
-**Durability level:** `logit` calls `fdatasync` on segment rotation, on the cursor file, and at
-shutdown, not per push. A process crash (including `SIGKILL`) loses nothing already written; a
-power loss can lose the most recent, not-yet-synced tail of the active segment.
+**Durability level:** `logit` `fsync`s every read-cursor write (and the spool directory after
+it), and each segment when it rotates away and at shutdown, not per push. A process crash
+(including `SIGKILL`) loses nothing already written; a power loss can lose the most recent,
+not-yet-synced tail of the active segment.
+
+**The spool survives a restart, not an outage longer than `retry_budget`.** A batch the sink
+gives up on is removed from the spool and counted `batches.dropped{reason="send_failed"}`,
+exactly as an in-memory queue drops it, and a restart doesn't bring it back. The sink gives up
+when a failure isn't retryable under its delivery posture (a configuration error, or a timeout or
+5xx under `at_most_once`; see the
+[retry table](adr/buffered-sink-delivery.md#delivery-posture-is-a-per-sink-policy-chosen-in-three-layers)),
+or when a retryable failure is still failing once `retry_budget` runs out. To ride out a longer
+destination outage, raise `retry_budget` as well as `disk.max_bytes`. That only helps for failures
+the posture retries: an `at_most_once` sink drops a batch on its first ambiguous failure, with no
+budget spent
+([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md#amendment-a-dropped-batch-is-committed-off-the-spool-2026-09-24)).
+
+**`file_out` never fsyncs**, with or without a `buffer.disk:` block: a power loss can lose its most
+recent writes or an in-progress rotation, by design
+([ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24)).
+Its `rotate.max_files` can't exceed 1000 (999 rotated files plus the active one), because every
+rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
@@ -308,6 +337,13 @@ disk-backed sink never emits `reason="shutdown"`, because it drops nothing at sh
 - `logit.component.buffer.disk.truncated` (count): a torn tail found and truncated at open. Nonzero
   means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
   alert on it alone.
+- `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
+  of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
+  durability level above no longer holds. A failed `cursor` write means more replay after a
+  restart; a failed `fsync` means a power loss can lose more. A failed `truncate` also drops the
+  batch whose push attempted it (`batches.dropped{reason="disk_full"|"disk_io_error"}`): the spool
+  couldn't cut away the bytes a failed or cancelled write left, and appends nothing until a later
+  push succeeds at it.
 
 ## Listener intake
 
@@ -840,7 +876,7 @@ components:
   resynchronize at. This framing hasn't yet been checked against a real Agent or client
   ([`known-gaps.md`](known-gaps.md)).
 - **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
-  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 64),
+  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 65),
   which a client's `unix:///` URL couldn't name.
 
 ### `collectd_out`: relaying back onto the wire
@@ -1006,7 +1042,7 @@ components:
   [`known-gaps.md`](known-gaps.md)). A write that fails having accepted zero bytes is retried once
   on a fresh connection, as on plaintext TCP.
 - **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
-  `endpoint:` (rule 64).
+  `endpoint:` (rule 65).
 
 ## Tailing files and Docker logs
 
@@ -1041,6 +1077,15 @@ one, a newly selected container) always starts at its beginning, since it has no
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
 file it names.
 
+**A checkpoint that exists but can't be used replays every file from its beginning.** If
+`checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
+while `<checkpoint_path>.tmp` sits beside it (a crash before the first checkpoint landed), every
+file present at the first scan starts at offset 0, even under `read_from: end`. A previous run read
+those files, so skipping to their end would lose whatever they gained while `logit` was down.
+Expect a burst of duplicates; `logit.input.checkpoint.errors{op="load"}` and a `checkpoint_error`
+diagnostic say why. Only a missing checkpoint with no `.tmp` beside it is a first run that
+`read_from` decides.
+
 **Set `checkpoint_path` for `docker_in`.** It is optional and unset by default, in which case every
 restart re-applies `read_from` as if every file were newly discovered. A long-running container's
 log easily holds more than a restart reading from `end` would silently skip. **Put the checkpoint
@@ -1052,6 +1097,12 @@ close and at shutdown, never per line. A crash between two writes can therefore 
 `checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
+directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
+one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
+tick. Give each `tail_in`/`docker_in` its own `checkpoint_path`: validation rejects two components
+that name the same one, or one that names another's `<checkpoint_path>.tmp`.
 
 ### `watch: auto | inotify | poll`
 
@@ -1681,6 +1732,9 @@ components:
   `path:`. `path:` belongs to the other mode, and setting it here violates rule 56.
 - **TLS is selected by the scheme**, and `endpoint_tls:` tunes it: a private CA, a client
   certificate, or the deliberately awkward `insecure_skip_verify`, which logs a startup warning.
+- **`compression:` is `snappy` (the default) or `zstd`.** `zstd` is the VictoriaMetrics remote
+  write protocol, which Prometheus and Mimir reject; see
+  [Sending with `compression: zstd`](#sending-with-compression-zstd).
 - **Five headers are reserved:** the four protocol headers (`Content-Type`, `Content-Encoding`,
   `X-Prometheus-Remote-Write-Version`, `User-Agent`) plus `Content-Length`. Rule 56 rejects them in
   `headers:` at config time instead of letting the sink silently override them.
@@ -1689,17 +1743,25 @@ components:
 receiver speaks, as you pick an exposition dialect. The choice depends on the destination:
 
 - **`version: 1`** (`prometheus.WriteRequest`) is the default, and every remote-write receiver
-  deployed today accepts it. Use it unless you know the receiver speaks 2.0. Its one real cost: 1.0
-  has no field for a counter's start time, so `Series::created` (an OpenMetrics `_created` series,
-  an OTLP `start_time_unix_nano`) is dropped on the way out.
+  deployed today accepts it. Use it unless you know the receiver speaks 2.0, and always for
+  VictoriaMetrics (below). Its one real cost: 1.0 has no field for a counter's start time, so
+  `Series::created` (an OpenMetrics `_created` series, an OTLP `start_time_unix_nano`) is dropped on
+  the way out.
 - **`version: 2`** (`io.prometheus.write.v2.Request`) is worth setting when the receiver is a recent
-  Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a Prometheus 3.x started with
+  Mimir, Thanos, Grafana Cloud, or a Prometheus 3.x started with
   `--web.enable-remote-write-receiver`. It interns every label and metadata string in a request-wide
   symbol table (smaller bodies for the same series), carries `Metadata` inline on each series instead
   of in separate requests, carries the created timestamp per sample, and answers with
   `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
   stored. A receiver that doesn't speak 2.0 answers `415`, which this sink classifies as permanent:
   the misconfiguration is reported immediately instead of retried.
+
+**Use `version: 1` for VictoriaMetrics: it discards 2.0 without an error.** VictoriaMetrics doesn't
+accept remote-write 2.0 and doesn't refuse it either. It answers a 2.0 request `204` with an empty
+body, stores nothing, logs nothing, and leaves its `vm_http_request_errors_total` at zero. The
+sender can't detect this: a `204` is success under both specs, and `prometheus_out` doesn't read the
+2.0 `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` response headers, so its counters report every batch
+delivered. Only a query against VictoriaMetrics shows the loss (`docs/known-gaps.md` has the row).
 
 Native histograms are skipped and counted on both wires regardless of version
 (`docs/known-gaps.md`), so this choice doesn't affect them.
@@ -1717,6 +1779,99 @@ Native histograms are skipped and counted on both wires regardless of version
 - A sender feeding one series from two upstream branches can draw out-of-order `400`s from a
   receiver with no out-of-order window. That is the topology, not the sink; `docs/known-gaps.md` has
   the row.
+
+## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
+
+There's no VictoriaMetrics-specific component. All three products ingest standard wires that
+existing components speak, and each row below was checked against VictoriaMetrics and vmagent
+v1.152.0, VictoriaLogs v1.52.0, and VictoriaTraces v0.11.1 by `script/victoria-interop`
+([`tools/victoria-interop/README.md`](../tools/victoria-interop/README.md)).
+[ADR `victoriametrics-interop`](adr/victoriametrics-interop.md) records why, and
+[`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings" section
+has what each check showed. The default ports are VictoriaMetrics `:8428`, VictoriaLogs `:9428`,
+and VictoriaTraces `:10428`.
+
+| Surface | Component | Configuration | What to know |
+|---|---|---|---|
+| VictoriaMetrics `/api/v1/write` | `prometheus_out` | `endpoint: http://HOST:8428/api/v1/write`, `version: 1`, optionally `compression: zstd` | `version: 2` is stored nowhere, with a `204` (see "Choosing `version: 1` or `2`" above) |
+| vmagent scraping `logit` | `prometheus_out` | `bind:` | vmagent adds `job` and `instance` |
+| VictoriaMetrics `/api/v2/write` (InfluxDB line protocol) | `influxdb_out` | `url: http://HOST:8428`; `org`, `bucket`, and `token` are required but any value works | A field arrives as `<measurement>_<field>`. `org` and `bucket` become no label |
+| VictoriaMetrics `-graphiteListenAddr` | `graphite_out` | `protocol: plaintext`, `tags: carbon` (the default) | The listener is off until VictoriaMetrics starts with the flag. There's no pickle listener |
+| VictoriaMetrics `/opentelemetry/v1/metrics` | `otlp_out` | `endpoint: http://HOST:8428/opentelemetry` | HTTP only; VictoriaMetrics has no OTLP/gRPC listener |
+| VictoriaLogs `/insert/opentelemetry/v1/logs` | `otlp_out` | `endpoint: http://HOST:9428/insert/opentelemetry`, `headers: {VL-Stream-Fields: service.name}` | The OTLP body becomes `_msg` without a `VL-Msg-Field` header. HTTP only |
+| VictoriaLogs `-syslog.listenAddr.tcp` | `syslog_out` | `transport: tcp` (or TLS) | VictoriaLogs detects `syslog_out`'s octet counting and the RFC 5424 format |
+| VictoriaTraces `/insert/opentelemetry/v1/traces` | `otlp_out` | `endpoint: http://HOST:10428/insert/opentelemetry` | The recommended trace leg |
+| VictoriaTraces `-otlpGRPCListenAddr` | `otlp_out` | `protocol: grpc`, `endpoint: http://HOST:4317` | Off by default. A plaintext listener also needs `-otlpGRPC.tls=false`, because TLS is on by default and then requires a certificate. Drops batches; see below |
+| VictoriaMetrics `/federate` | `prometheus_in` | `scrape_targets: ["http://HOST:8428/federate?match%5B%5D=SELECTOR"]` | Percent-encode `match[]`. Every series comes back an untyped `Gauge`, because `/federate` emits no `# TYPE` |
+| vmagent `-remoteWrite.url` | `prometheus_in` | `bind:` | No configuration on either side; see below |
+
+Runnable configs:
+[`examples/victoriametrics-remote-write.yaml`](../examples/victoriametrics-remote-write.yaml),
+[`examples/victoriametrics-otlp.yaml`](../examples/victoriametrics-otlp.yaml), and
+[`examples/victoriametrics-vmagent-receive.yaml`](../examples/victoriametrics-vmagent-receive.yaml).
+
+**Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
+it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
+permanent fault that drops the whole batch, including the signals it did store. Split the flow with
+`keep_signals` (or `has_signal`) so each sink sees only its product's signal.
+
+**Put `aggregate` with `temporality: cumulative` ahead of metrics bound for VictoriaMetrics.**
+VictoriaMetrics keeps no temporality. A delta `Sum` sent over OTLP is stored as its raw
+per-interval points, so `rate()` and `increase()` over it are wrong, and `prometheus_out` skips a
+delta `Sum` outright. The `aggregate` keeps a running total, as it does ahead of any Prometheus
+receiver ([Counter temporality](#counter-temporality-delta-vs-cumulative)).
+
+**An empty OTLP scope costs two labels per series.** VictoriaMetrics and VictoriaLogs add
+`scope.name="unknown"` and `scope.version="unknown"` to a record whose OTLP scope is empty, which is
+every batch that didn't arrive through `otlp_in` with a scope of its own. To drop the labels on
+VictoriaMetrics, start it with `-opentelemetry.promoteScopeMetadata=false`. To give them a
+meaningful value on either product, write `scope.name` and `scope.version` in a `lua` stage
+([`lua-api.md`](design/lua-api.md)'s "Reading and writing `scope`").
+
+**Send traces to VictoriaTraces over HTTP, not gRPC.** VictoriaTraces's gRPC listener closes every
+connection about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`. A request in flight
+at that moment fails as ambiguous, because the server may have processed it, and `otlp_out` is
+at-most-once by default, so it drops that batch. `buffer: { delivery: at_least_once }` retries it
+instead, at the cost of a duplicate span whenever VictoriaTraces had stored the first attempt. The
+HTTP endpoint has neither problem (`docs/known-gaps.md`'s OTLP section has the row).
+
+### Sending with `compression: zstd`
+
+`prometheus_out`'s `compression: zstd` sends the VictoriaMetrics remote write protocol: the same
+remote-write 1.0 request, compressed with zstd instead of Snappy. VictoriaMetrics, vmagent, and
+`logit`'s own `prometheus_in` accept it; Prometheus and Mimir don't. VictoriaMetrics accepts Snappy
+too, so the default is never wrong there. Choose `zstd` when you want the wire vmagent sends, for
+example for a `logit` hop that stands in for vmagent in front of VictoriaMetrics.
+
+- **There's no fallback.** Unlike vmagent, `prometheus_out` doesn't downgrade to Snappy. A `415` or
+  `400` under `zstd` is a permanent fault that drops the batch, and the `remote_write_rejected`
+  diagnostic names `compression: snappy` as the remedy.
+- **`zstd` needs `version: 1`.** Remote-write 2.0 mandates Snappy, so `version: 2` with
+  `compression: zstd` is a config error.
+- **Expect about libzstd level 1's ratio.** `logit` compresses with `ruzstd`, a pure-Rust
+  implementation whose encoder goes no higher than that. The goal is VictoriaMetrics's default
+  wire, not the bandwidth a higher zstd level would save.
+
+### Receiving from vmagent
+
+Point vmagent's `-remoteWrite.url` at a `prometheus_in` `bind:`, path included:
+
+```text
+-remoteWrite.url=http://logit:9201/api/v1/write
+```
+
+Neither side needs any other setting. vmagent sends zstd first, `prometheus_in` accepts it, and
+vmagent stays on zstd. A `logit` receiver without zstd support answers `415`, which makes vmagent
+log "Downgrading protocol from VictoriaMetrics to Prometheus remote write" and send Snappy from then
+on. `logit.input.writes` carries an `encoding` tag on every request that named a supported one, so
+you can see which wire a sender is on. `logit` decodes zstd with `ruzstd`, which runs 1.4 to 3.5
+times slower than libzstd. If that CPU matters more than bandwidth, start vmagent with
+`-remoteWrite.forcePromProto` to send Snappy.
+
+The receiver advice in
+[Prometheus remote-write](#prometheus-remote-write-receiving-sending-and-picking-a-version)
+applies unchanged: bind loopback or pod-local, front it with something that authenticates, and set
+`idle_timeout:`.
 
 ## TLS
 

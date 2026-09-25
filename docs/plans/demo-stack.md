@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-03
+updated: 2026-09-24
 ---
 
 # Enabling plan: a user-facing demo stack
@@ -21,6 +21,24 @@ updated: 2026-09-03
 > it's just no longer what the demo's log leg uses (workstream C there records that trade-off).
 > Everything below describing Alloy is historical: accurate for what the stack looked like when
 > this plan landed, not for its current shape.
+>
+> **Update, 2026-09-24: the metrics backend is VictoriaMetrics, not InfluxDB.** `demo/logit.yaml`'s
+> `influx_out` (`influxdb_out`) became `victoria_out`, a `prometheus_out` sending remote-write 1.0
+> with zstd to a single-node VictoriaMetrics, and the Grafana dashboard's metric panels moved from
+> Flux to PromQL. Why:
+>
+> - The dashboard's queries were Flux, which InfluxData put in maintenance mode and dropped from
+>   InfluxDB 3. PromQL (and VictoriaMetrics' MetricsQL superset) is the query language a reader is
+>   most likely to use elsewhere.
+> - The demo now exercises `prometheus_out`'s remote-write sender, the relay pair with the most
+>   verified coverage, zstd included (`script/victoria-interop`).
+> - VictoriaMetrics is one small binary with no bootstrap step. The `DOCKER_INFLUXDB_INIT_*`
+>   environment, the `INFLUXDB_TOKEN` passed to every service that loads `demo/logit.yaml`, and the
+>   token in the Grafana datasource are gone.
+>
+> The dev stack (root `compose.yaml`, `script/server`) and `examples/*-to-influxdb.yaml` keep
+> InfluxDB, and `influxdb_out` is unchanged. The narrative below still says InfluxDB where it
+> describes the stack as first built.
 
 `logit`'s examples are developer scratch material — `examples/statsd-to-influxdb.yaml`,
 `examples/nginx-to-influxdb.yaml`, each landed alongside the feature it exercises, all of them
@@ -52,6 +70,7 @@ now write real data to their backends — see the notice at the top of this file
 | What runs `logit` | The production image (`Dockerfile`), built by compose — no published image exists yet ([docs/deploying.md](../deploying.md)). |
 | Data source | A hello-world Python app (stdlib only) that's also the demo's landing page — real visits plus a background synthetic loop. No nginx in the demo — `examples/nginx/` stays a dev-stack fixture. |
 | Log line shape | The same RFC 3164 + JSON-body shape `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` already measures. |
+| Metrics backend | VictoriaMetrics, written by `prometheus_out` over remote-write 1.0 with zstd and queried with PromQL. Replaced InfluxDB 2.x and its Flux dashboard on 2026-09-24 (see the update note at the top of this file). |
 | Log backend | Loki, up and provisioned. **Now live** — `syslog_out` (`docs/adr/syslog-output.md`) relays `access_json`'s events through `alloy` into Loki. |
 | Trace backend | Tempo, up and provisioned. **Now live** — spans are real ([ADR `internal-span-emission-and-deterministic-sampling`](../adr/internal-span-emission-and-deterministic-sampling.md)) and `otlp_out` ([docs/plans/otlp-end-to-end.md](otlp-end-to-end.md)) exports them over OTLP/gRPC via `demo/logit.yaml`'s `trace_out`. |
 | syslog → Loki shim | Grafana Alloy (`loki.source.syslog`, confirmed to accept UDP and both RFC 3164/5424). **Now fed** by `log_out`. Loki has no syslog receiver of its own; promtail is EOL. |
