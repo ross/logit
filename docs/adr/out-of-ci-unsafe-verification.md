@@ -186,8 +186,8 @@ rather than duplicated here — this ADR is the decision record, not the run log
 ## Amendment: the image also hosts `cargo-fuzz` (2026-09-25)
 
 [ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md) installs a pinned `cargo-fuzz` in
-`tools/unsafe-check/Dockerfile` and adds `fuzz`, `fuzz-all`, and `fuzz-seed` to
-`script/unsafe-check`. That supersedes the "`cargo-fuzz` over these same call sites" deferral under
+`tools/unsafe-check/Dockerfile`, adds `llvm` for ASan's symbolizer, and adds `fuzz`, `fuzz-all`,
+`fuzz-tmin`, and `fuzz-seed` to `script/unsafe-check`. That supersedes the "`cargo-fuzz` over these same call sites" deferral under
 "Alternatives considered": the fuzz targets now exist, over the native, sketch, OTLP, and
 Prometheus decoders rather than this ADR's `libc` surface. The nightly pin, the plain `docker run`,
 and the separate cargo-home volume are unchanged. Fuzz builds get their own target volume,
