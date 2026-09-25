@@ -45,13 +45,13 @@
 //! 1. **Route and method**, as the table above. `/health` answers here, before authentication.
 //! 2. **Size.** A `Content-Length` over `max_request_bytes` is a `413` before any byte is read, and
 //!    the body is read through [`Limited`] at the same cap in case the header lied or was absent.
-//! 3. **Authentication.** A `token` query parameter is `400` code 16: query-string authorization
-//!    is off, as on a Splunk token by default. With `tokens` configured, the `Authorization` header
-//!    must be `Splunk <token>`, or `Basic` with the token as the password (any user name); a
-//!    missing header or empty token is `401` code 2, another scheme or an undecodable `Basic`
-//!    value `401` code 3, and a token not in the list `403` code 4. The comparison takes the same
-//!    time for every token of one length, and no token is ever logged, counted, or kept on an
-//!    event. With no `tokens` every request passes.
+//! 3. **Authentication.** A `token` query parameter is `400` code 16. With `tokens` configured,
+//!    the `Authorization` header must be `Splunk <token>`, or `Basic` with the token as the
+//!    password, else `401` or `403` with Splunk's code. The comparison takes the same time for
+//!    every token of one length, and no token is ever logged, counted, or kept on an event. The
+//!    per-outcome codes, the error bodies, and when an `ackID` is issued are recorded in
+//!    [ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md)'s amendment "what the
+//!    listener settled"; [`authenticate`] and [`respond`] implement them.
 //! 4. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`: `deflate` and `zstd`
 //!    included, which Splunk doesn't accept either.
 //! 5. **Body.** A body that stops arriving mid-upload gets `408` and the connection closes, when

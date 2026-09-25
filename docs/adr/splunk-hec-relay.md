@@ -231,3 +231,29 @@ Four facts from the survey drive the shape of the decision:
 - `splunk_hec_in`'s bounded-wait `503` can follow a partial delivery of a multi-resource request,
   so a client's retry duplicates the batches already delivered: the Datadog listener's trade-off,
   documented in W2's module doc.
+
+## Amendment: what the listener settled (2026-09-25)
+
+Building `splunk_hec_in` (W2) fixed the details below. `crates/logit-inputs/src/splunk.rs`'s
+module doc describes the behavior; this list is the record of the choices.
+
+- **Decision 2, config:** the TLS field is `tls:`, the single-mode listener shape `datadog_in`
+  and `otlp_in` use; `bind_tls:` is for a two-mode kind such as `prometheus_in`.
+  `max_request_bytes` is a byte-count string (default `"5MiB"`), like every other byte field,
+  and one cap covers both the body as sent and its gzip-decompressed form.
+- **Decision 2, authentication:** a `token` query parameter is always `400` code 16, even with
+  no `tokens` configured. A missing `Authorization` header, an empty one, or `Splunk` with no
+  token is `401` code 2; another scheme, or a `Basic` value that doesn't decode to
+  `user:password`, is `401` code 3; a token not listed is `403` code 4. Scheme names match in any
+  case. An empty `tokens` passes any request, whatever it carries.
+- **Decision 2, errors:** code 5 answers an empty body on any `POST` route and a `/raw` body with
+  no non-empty line. A malformed `/ack` body is `400` code 6 with no `invalid-event-number`. A
+  gzip body that doesn't decompress is `400` code 6, counted `malformed_encoding`. The HTTP-level
+  errors carry the status as `code` with these texts: `404` "Not Found", `405` "Method Not
+  Allowed", `408` "Request Timeout", `413` "Request Entity Too Large", `415` "Unsupported Media
+  Type". The rejection reasons beyond `datadog_in`'s are `query_token` and `no_data`.
+- **Decision 5, acknowledgment:** an `ackID` is drawn only on a `200`, never on a `503` or a
+  rejection, and a channel header or `?channel=` with an empty value names no channel. A body
+  whose every object the codec skips sends nothing and still answers `200`, with an `ackID` when
+  it named a channel.
+- **Decision 16:** no channel is required on any route, `/raw` and `/ack` included.

@@ -247,7 +247,7 @@ amendment to `lossless-transit.md` lands with the ADR.
 
 ### 2. Kinds and config (W2, W3)
 
-- `splunk_hec_in` (W2): `bind:`, `bind_tls:`, an optional `tokens:` allowlist (empty = accept
+- `splunk_hec_in` (W2): `bind:`, `tls:`, an optional `tokens:` allowlist (empty = accept
   any, the shape the Datadog and New Relic plans give `api_keys:`), `max_request_bytes`
   (default 5 MiB, the OTel exporter's `max_event_size`, plus the 2 MiB default body), and the
   `TcpListener`-style `handshake_timeout` and `idle_timeout`. Routes:
@@ -355,7 +355,7 @@ and ADR) precedes both because the pair test needs both halves of the codec.
 Landing order: W0 → W1 → W2 → W3 → W4 → W5 → W6, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
-**Status (2026-09-25):** W1 on `splunk/w1`; W2–W6 not started.
+**Status (2026-09-25):** W1, W2 on their branches; W3–W6 not started.
 
 ## Verification
 
