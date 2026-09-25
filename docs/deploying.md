@@ -183,7 +183,7 @@ process, not a component.
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
@@ -1749,6 +1749,140 @@ The sink isn't duplicate-safe (an Agent dedupes nothing), so the default is at-m
 `logit.output.records{route}` for what the Agent accepted, and
 `logit.output.spans.degraded{reason="no_wire_form"}` for what `v0.4` couldn't carry.
 `docs/design/internal-telemetry.md`'s `datadog_trace_out` section has every counter.
+
+## `splunk_hec_in`: standing in for Splunk's HEC
+
+To choose between this and the other Splunk topologies, and for the rules that lose data when
+missed, see [`docs/splunk.md`](splunk.md). This section and the next are the reference.
+
+`splunk_hec_in` answers a HEC client the way Splunk's HTTP Event Collector does, so Docker's
+`splunk` log driver, Splunk's logging libraries, the OpenTelemetry Collector's `splunk_hec`
+exporter, SC4S, and other HEC clients send it what they'd send Splunk with nothing changed but
+their URL. [`examples/splunk-hec-receive.yaml`](../examples/splunk-hec-receive.yaml) has a runnable
+config and the client-side settings; [`examples/splunk-hec-relay.yaml`](../examples/splunk-hec-relay.yaml)
+relays what arrives on to Splunk. See [ADR `splunk-hec-relay`](adr/splunk-hec-relay.md) for the
+design.
+
+```yaml
+components:
+  hec:
+    type: splunk_hec_in
+    bind: 127.0.0.1:8088
+    tokens: [!env SPLUNK_HEC_TOKEN]   # empty or absent accepts any token
+    # max_request_bytes: 5MiB         # the default; as sent and after gzip
+    # idle_timeout: 120s              # off by default
+```
+
+**Routes.** `/services/collector`, `/services/collector/event`, and `/event/1.0` take JSON
+objects, concatenated or in an array, each carrying its own envelope; the body decodes into one
+batch per distinct envelope. `/services/collector/raw` and `/raw/1.0` take one log per line, with
+`host`, `source`, `sourcetype`, and `index` from the query string. `/services/collector/health`
+answers `{"text":"HEC is healthy","code":17}` without authentication, and `OPTIONS` on any route
+answers `200` as Splunk does, which Docker's driver requires before it starts a container. Any
+other path gets `404`, and a known path with the wrong method `405`. Every answer is Splunk's own
+`{"text","code"}` body, so a client's error handling reads it as it reads Splunk's.
+
+**What arrives.** The envelope's `host`, `source`, `sourcetype`, and `index` become the resource
+attributes `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`;
+`fields` become event attributes. An `event` object in the OTel exporter's span shape decodes to
+a span, `"event":"metric"` (or no `event`, with a measurement in `fields`) to metrics, and
+anything else to a log. An object with no `event` and no measurement, or a blank `event`, is
+skipped and counted, and the rest of the body is delivered: Splunk would reject the whole request.
+`crates/logit-proto/src/splunk/mod.rs`'s module doc has every mapping.
+
+**Authentication.** With `tokens` set, a request needs `Authorization: Splunk <token>` (or
+`Basic` with the token as the password) naming one of them: none gets `401`, an unlisted one
+`403`, counted `logit.input.requests.rejected{reason="auth"}`. A token in the query string is
+always `400` code 16. A token is never logged or kept on an event. With `tokens` empty, every
+request is accepted. Add `tls:` before binding beyond loopback, since otherwise the token crosses
+the network in the clear, and because a client configured with an `https://` URL expects it.
+
+**Compression.** Identity or `gzip`; any other `Content-Encoding`, `deflate` included, gets `415`,
+as Splunk answers.
+
+**Channels and acknowledgment.** No channel is required on any route. A request that names one
+(`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, and `/ack` answers every
+id asked about `true`, because a `200` already means the data reached the pipeline. Neither the
+channel nor the id enters an event.
+
+**A full pipeline gets `503`.** When the pipeline doesn't take a request's batches within 5
+seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
+`logit.input.requests{class="busy"}`, and the batches not yet delivered
+`logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9. A body with several
+envelopes can have delivered some of its batches before the deadline, and the retry delivers
+those again.
+
+**What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
+answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token
+mismatch, `encoding` for a client sending something other than gzip, `oversize` for a body over
+`max_request_bytes`. `docs/design/internal-telemetry.md`'s `splunk_hec_in` section has every
+counter.
+
+## `splunk_hec_out`: sending to Splunk over HEC
+
+[`docs/splunk.md`](splunk.md) compares sending directly with sending through SC4S or the Splunk
+OTel Collector.
+
+`splunk_hec_out` posts logs, metrics, and spans to Splunk's HTTP Event Collector as
+`/services/collector/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter
+writes. [`examples/splunk-hec-send.yaml`](../examples/splunk-hec-send.yaml) tails a log file into
+it.
+
+```yaml
+components:
+  splunk:
+    type: splunk_hec_out
+    sources: [envelope]
+    endpoint: https://splunk.example.com:8088/services/collector
+    token: !env SPLUNK_HEC_TOKEN
+    # compression: gzip     # the default; none sends bodies uncompressed
+    # multi_value: skip     # the default; expand writes histograms and sketches as series
+    # ack: false            # the default; true polls /services/collector/ack
+    # max_body_bytes: 2MiB  # the default; one request, before compression
+```
+
+**The endpoint.** The base URL, ending in `/services/collector`; the sink appends `/event` and
+`/ack`, so a URL ending in a route is a `logit validate` error. On Splunk Cloud it's
+`https://http-inputs-<stack>.splunkcloud.com/services/collector`. `tls:` tunes an `https://`
+endpoint, such as a `ca_file` for Splunk Enterprise's default self-signed certificate.
+
+**Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
+them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
+`host.name` from the batch resource, so stamp them upstream with `set`, as the example does. Every
+other attribute goes out in `fields`, as an indexed field, a nested one flattened to dotted keys.
+
+**Metrics.** A gauge or a sum goes out as one `metric_name:<name>` field with a `metric_type`
+dimension (`Gauge` or `Sum`). A kind with more than one number is dropped under `multi_value:
+skip`, counted `logit.output.metrics.skipped{metric_kind}`, or written as a series set under
+`expand`, counted `logit.output.metrics.degraded{metric_kind}`. A metric name outside
+`[A-Za-z0-9_.:]` is sanitized, counted `logit.output.metrics.normalized`.
+
+**Spans** go out as JSON events in the exporter's span shape, `time` the start. The Platform has
+no trace store: they're searchable events, not a trace view.
+
+**Requests.** A batch is cut into bodies of at most `max_body_bytes` before compression, sent in
+order. An object larger than the cap alone is dropped, counted
+`logit.output.records.dropped{reason="oversize"}`. Every request carries one per-sink
+`X-Splunk-Request-Channel`, which a `useACK` token requires and any other token ignores.
+
+**Delivery.** `408`, `429`, `5xx`, and timeouts are retryable; `401` and `403` are permanent, with
+a `token_rejected` warning; any other `4xx`, `413` included, is permanent and counted
+`logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the object
+Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of that body
+once. The first failing request stops the rest of the batch, and the sink isn't duplicate-safe,
+since Splunk indexes a resent event twice. So the default posture is at-most-once, and a `5xx`
+drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
+
+**Acknowledgment.** With `ack: true`, the sink polls `/services/collector/ack` after the last body
+of a batch is accepted, until Splunk confirms every request or `ack_timeout` (30s by default)
+passes, which fails the batch as ambiguous. It needs a token with indexer acknowledgment on;
+Splunk Cloud offers none. Against a token without it, each request counts as delivered on its
+`200`, counted `logit.output.acks{result="unsupported"}` with an `ack_unsupported` warning.
+
+**What to watch.** `logit.output.requests{route, class}` (`route` is `event` or `ack`),
+`logit.output.records` for what Splunk accepted, `logit.output.records.dropped{reason}`, and
+`logit.output.acks{result}` under `ack: true`. `docs/design/internal-telemetry.md`'s
+`splunk_hec_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version
 
