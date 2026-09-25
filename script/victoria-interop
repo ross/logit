@@ -1,0 +1,120 @@
+#!/bin/bash
+# Usage: script/victoria-interop
+#
+# Runs every leg of docs/plans/victoriametrics-interop.md's "W1's legs" against real
+# VictoriaMetrics, VictoriaLogs, VictoriaTraces, and vmagent, and prints one pass, gap, or fail row
+# per leg. See tools/victoria-interop/README.md for what it runs and what it writes.
+#
+# Not part of script/cibuild: it runs third-party images on the host's docker daemon, and no test
+# depends on it.
+#
+#   VICTORIA_INTEROP_WINDOW=45      seconds the stack runs before the backends are queried
+#   VICTORIA_INTEROP_SKIP_IMAGE=1   reuse the existing logit:victoria-interop image
+#   VICTORIA_INTEROP_OUT=<dir>      where run directories go (default perf/results/victoria-interop)
+
+set -euo pipefail
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+TOOLS_DIR="${ROOT}/tools/victoria-interop"
+# Everything this run creates is under this compose project, and compose.yaml names its network
+# `victoria-interop-net`, so cleanup can't touch anything else on a shared daemon.
+PROJECT="victoria-interop"
+NETWORK="victoria-interop-net"
+IMAGE="logit:victoria-interop"
+PYTHON_IMAGE="python:3.12-slim"
+WINDOW="${VICTORIA_INTEROP_WINDOW:-45}"
+
+RUN_DIR="${VICTORIA_INTEROP_OUT:-${ROOT}/perf/results/victoria-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${RUN_DIR}/logs"
+# The image's unprivileged `logit` user has an unrelated uid; world-writable lets its `stdio_out`
+# file targets land here.
+chmod 777 "${RUN_DIR}"
+
+# `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
+# `sudo docker` by default.
+ENV_FILE="${RUN_DIR}/compose.env"
+{
+    echo "VICTORIA_INTEROP_OUT=${RUN_DIR}"
+    echo "VICTORIA_INTEROP_IMAGE=${IMAGE}"
+} >"${ENV_FILE}"
+
+vi_compose() {
+    ${DOCKER} compose --progress quiet -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" \
+        --env-file "${ENV_FILE}" "$@"
+}
+
+STARTED=0
+
+# Captures every service's log into the run directory, then removes the project's containers,
+# volumes, and network. Runs on every exit, including a failed start.
+cleanup() {
+    if [ "${STARTED}" -eq 1 ]; then
+        collect_logs || true
+        vi_compose down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+collect_logs() {
+    local service
+    for service in $(vi_compose config --services); do
+        vi_compose logs --no-color --no-log-prefix "${service}" >"${RUN_DIR}/logs/${service}.log" 2>&1 || true
+    done
+}
+
+# A project already up is someone else's run (or a crashed one of ours): stop rather than tear down
+# a stack this invocation didn't start.
+if [ -n "$(vi_compose ps -q 2>/dev/null)" ]; then
+    echo "victoria-interop: compose project '${PROJECT}' already has containers on this daemon." >&2
+    echo "  Not this run's to stop. If it is yours, run:" >&2
+    echo "  ${DOCKER} compose -p ${PROJECT} -f ${TOOLS_DIR}/compose.yaml down -v" >&2
+    exit 1
+fi
+
+if [ -n "${VICTORIA_INTEROP_SKIP_IMAGE:-}" ]; then
+    ${DOCKER} image inspect "${IMAGE}" >/dev/null 2>&1 || {
+        echo "victoria-interop: VICTORIA_INTEROP_SKIP_IMAGE is set but ${IMAGE} does not exist" >&2
+        exit 1
+    }
+else
+    echo "victoria-interop: building ${IMAGE} from the current tree"
+    ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null
+fi
+
+for config in "${TOOLS_DIR}"/logit-*.yaml; do
+    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+        echo "victoria-interop: ${config} failed 'logit validate'" >&2
+        exit 1
+    }
+done
+
+trap cleanup EXIT
+STARTED=1
+echo "victoria-interop: starting the stack (run directory ${RUN_DIR})"
+# `--wait` holds until every `logit` service's HEALTHCHECK (`logit ready`) passes and the rest are
+# running.
+vi_compose up -d --wait --wait-timeout 120 >/dev/null
+
+{
+    echo "victoria-interop provenance"
+    echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
+    echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+    vi_compose images 2>/dev/null
+} >"${RUN_DIR}/provenance.txt"
+
+echo "victoria-interop: generating traffic for ${WINDOW}s"
+sleep "${WINDOW}"
+
+collect_logs
+echo "victoria-interop: querying the backends"
+status=0
+${DOCKER} run --rm --network "${NETWORK}" \
+    -v "${TOOLS_DIR}:/tools:ro,z" \
+    -v "${RUN_DIR}:/out:z" \
+    -v "${ROOT}/testdata/interop/prometheus:/fixtures:ro,z" \
+    "${PYTHON_IMAGE}" python3 /tools/check.py || status=$?
+
+echo "victoria-interop: results in ${RUN_DIR}/results.md, service logs in ${RUN_DIR}/logs/"
+exit "${status}"

@@ -9,7 +9,7 @@
 #    line per request to its own file; one `tail_in` per file follows it, and each leg gets the
 #    two-tap pattern (tools/shape-survey/README.md, "The config pattern"):
 #
-#      <app>_in --+--> tap_input  (shape: the raw line, 2 attributes, a long body)
+#      <app>_in --+--> tap_input  (shape: the raw line, 1 attribute, a long body)
 #                 |
 #                 +--> <app>_json (json) --> tap_<app> (shape: the line's fields as attributes,
 #                                                       its nested objects as nested maps)

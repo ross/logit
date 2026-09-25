@@ -76,8 +76,8 @@
 //!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
 //!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
 //! 29. A `file_out` whose `rotate:` sets neither `max_bytes` nor `interval` (use `stdio_out` for an
-//!     unrotated file), or a `rotate.max_bytes`/`max_files` of `0`
-//!     (`docs/adr/rotating-file-output.md`).
+//!     unrotated file), a `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above
+//!     `logit_config::MAX_ROTATE_FILES` (`docs/adr/rotating-file-output.md`).
 //! 30. A `kv` with an empty `pair_sep`/`kv_sep`, `pair_sep == kv_sep`, or a `kv_sep` containing
 //!     `pair_sep`: since `pair_sep` splits first, each is a certain no-op or garbage
 //!     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule: its one field is a `bool`.
@@ -153,9 +153,10 @@
 //!     the other mode, a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
 //!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
-//!     other mode, or a sender fault in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a
-//!     reserved or colliding header, or a bad `endpoint_tls`
-//!     (`docs/adr/prometheus-remote-write.md`).
+//!     other mode, `version: 2` with `compression: zstd` (2.0 mandates Snappy), or a sender fault
+//!     in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or
+//!     a bad `endpoint_tls` (`docs/adr/prometheus-remote-write.md`,
+//!     `docs/adr/victoriametrics-interop.md`).
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
 //!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
@@ -171,7 +172,10 @@
 //! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
 //!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
 //!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
-//! 62. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has leading or
+//! 62. Two `tail_in`/`docker_in` components sharing a literal `checkpoint_path`, or one whose
+//!     `checkpoint_path` is another's `<checkpoint_path>.tmp`: each would overwrite, or truncate
+//!     and rename away, the other's offsets (`docs/adr/file-tailing-and-docker-json-logs.md`).
+//! 63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has leading or
 //!     trailing whitespace: it could never match a request's `DD-API-KEY`. Its zero
 //!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
@@ -1233,7 +1237,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 29: `file_out`'s `rotate:`. With neither trigger it never rotates, which is what
     // `stdio_out` is for, so the message points there. `max_bytes: 0`/`max_files: 0` are impossible
-    // bounds.
+    // bounds, and `max_files` above `MAX_ROTATE_FILES` makes every rotation a syscall storm.
     for (id, component) in &components {
         if let ComponentKind::FileOut { path, rotate, .. } = &component.kind {
             if rotate.max_bytes.is_none() && rotate.interval.is_none() {
@@ -1253,6 +1257,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'rotate.max_files' must be at least 1 -- 0 would delete \
                      the file it just rotated"
+                );
+            }
+            if rotate.max_files > logit_config::MAX_ROTATE_FILES {
+                anyhow::bail!(
+                    "component '{id}': 'rotate.max_files' must be at most {} -- every rotation \
+                     renames each retained file",
+                    logit_config::MAX_ROTATE_FILES
                 );
             }
         }
@@ -2199,6 +2210,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_series,
             endpoint,
             version,
+            compression,
             timeout,
             headers,
             endpoint_tls,
@@ -2225,6 +2237,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'version' selects the remote-write protocol version \
                          and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
                          serves an exposition, which has no wire version to pick"
+                    );
+                }
+                if *compression != logit_config::RemoteWriteCompression::default() {
+                    anyhow::bail!(
+                        "component '{id}': 'compression' selects how a remote-write request body \
+                         is compressed and only means anything with 'endpoint' -- a \
+                         prometheus_out with 'bind' serves an exposition, which sends no request \
+                         bodies"
                     );
                 }
                 if *timeout != logit_config::default_prometheus_endpoint_timeout() {
@@ -2285,6 +2305,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'timeout: 0s' would fail every remote-write request \
                          immediately -- use a positive duration"
+                    );
+                }
+                if *version == logit_config::RemoteWriteVersion::V2
+                    && *compression == logit_config::RemoteWriteCompression::Zstd
+                {
+                    anyhow::bail!(
+                        "component '{id}': 'compression: zstd' needs 'version: 1' -- remote-write \
+                         2.0 mandates Snappy, and zstd is the VictoriaMetrics variant of 1.0; use \
+                         'compression: snappy' with 'version: 2'"
                     );
                 }
                 // Rule 40's header checks, against this sink's own reserved list.
@@ -2635,7 +2664,52 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 62: `datadog_in` (`docs/adr/datadog-agent-and-intake-relay.md`). An empty `bind` names
+    // Rule 62: a tail listener's `checkpoint_path`
+    // (`docs/adr/file-tailing-and-docker-json-logs.md`). Two listeners sharing one would overwrite
+    // each other's offsets on every write, and each would resume from whichever wrote last. One
+    // whose path is another's tmp path (`crate::atomic_write::tmp_path`) would have its checkpoint
+    // truncated and renamed away by every write of the other, then load as missing and skip to
+    // `read_from`. Literal paths only, like rule 35's `disk.path`. Sorted as `(path, id)` so
+    // entries sharing a path are adjacent.
+    let mut checkpoint_paths: Vec<(&str, &str)> = components
+        .iter()
+        .filter_map(|(id, component)| match &component.kind {
+            ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => {
+                tail.checkpoint_path.as_deref().map(|path| (path, id.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    checkpoint_paths.sort_unstable();
+    for pair in checkpoint_paths.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            anyhow::bail!(
+                "components '{}' and '{}' both set 'checkpoint_path' to '{}' -- two tailing \
+                 listeners sharing one checkpoint would overwrite each other's offsets",
+                pair[0].1,
+                pair[1].1,
+                pair[0].0
+            );
+        }
+    }
+    for &(path, id) in &checkpoint_paths {
+        let tmp = crate::atomic_write::tmp_path(std::path::Path::new(path));
+        let tmp = tmp.to_string_lossy();
+        let clash = checkpoint_paths
+            .binary_search_by(|&(other, _)| other.cmp(tmp.as_ref()))
+            .ok()
+            .map(|at| checkpoint_paths[at]);
+        if let Some((other_path, other_id)) = clash {
+            anyhow::bail!(
+                "component '{other_id}' sets 'checkpoint_path' to '{other_path}', which is the tmp \
+                 file component '{id}' writes beside its own 'checkpoint_path' '{path}' -- every \
+                 checkpoint write of '{id}' would truncate and rename away the checkpoint of \
+                 '{other_id}'"
+            );
+        }
+    }
+
+    // Rule 63: `datadog_in` (`docs/adr/datadog-agent-and-intake-relay.md`). An empty `bind` names
     // no socket. An empty `api_keys` entry could never match, since an Agent always sends a key;
     // nor could one with leading or trailing whitespace, which HTTP strips from a header value, a
     // typo `!env` makes easy with a key file's trailing newline. An empty list is the "accept any
@@ -4893,7 +4967,7 @@ mod tests {
         assert!(err.contains("must be finite"), "got: {err}");
     }
 
-    /// A `datadog_in` with every optional field at its default, the shape rule 62 reads.
+    /// A `datadog_in` with every optional field at its default, the shape rule 63 reads.
     fn datadog_in(bind: &str, api_keys: Vec<&str>) -> ComponentKind {
         ComponentKind::DatadogIn {
             bind: bind.to_string(),
@@ -4919,7 +4993,7 @@ mod tests {
         }
     }
 
-    /// Rule 62: an empty `bind` names no socket.
+    /// Rule 63: an empty `bind` names no socket.
     #[test]
     fn a_datadog_in_with_an_empty_bind_is_rejected() {
         let err = datadog_in_err(datadog_in("", vec![]));
@@ -4927,7 +5001,7 @@ mod tests {
         assert!(err.contains("'bind' must not be empty"), "got: {err}");
     }
 
-    /// Rule 62: an empty key could never match; the message names the accept-any spelling.
+    /// Rule 63: an empty key could never match; the message names the accept-any spelling.
     #[test]
     fn a_datadog_in_with_an_empty_api_key_is_rejected() {
         let err = datadog_in_err(datadog_in("0.0.0.0:8080", vec!["good-key", ""]));
@@ -4935,7 +5009,7 @@ mod tests {
         assert!(err.contains("omit 'api_keys'"), "got: {err}");
     }
 
-    /// Rule 62: HTTP strips a header value's surrounding whitespace, so this key never matches.
+    /// Rule 63: HTTP strips a header value's surrounding whitespace, so this key never matches.
     #[test]
     fn a_datadog_in_api_key_with_surrounding_whitespace_is_rejected() {
         let err = datadog_in_err(datadog_in("0.0.0.0:8080", vec!["key\n"]));
@@ -6723,6 +6797,41 @@ mod tests {
     }
 
     #[test]
+    fn file_out_with_max_files_over_the_ceiling_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: logit_config::MAX_ROTATE_FILES + 1,
+                }),
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'rotate.max_files' must be at most 1000"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_max_files_at_the_ceiling_is_accepted() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: logit_config::MAX_ROTATE_FILES,
+                }),
+            ),
+        ]))
+        .expect("max_files at the ceiling should validate fine");
+    }
+
+    #[test]
     fn file_out_with_compression_set_under_the_default_human_format_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
@@ -7418,6 +7527,86 @@ mod tests {
             ("out2", vec!["in"], sink(), disk_buffer("two")),
         ]))
         .expect("distinct disk paths should validate fine");
+    }
+
+    fn tail_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {
+        ComponentKind::TailIn {
+            paths: vec!["/var/log/app.log".to_string()],
+            tail: logit_config::TailOptions {
+                checkpoint_path: Some(checkpoint_path.to_string()),
+                ..logit_config::TailOptions::default()
+            },
+        }
+    }
+
+    fn docker_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {
+        ComponentKind::DockerIn {
+            root: "/var/lib/docker/containers".to_string(),
+            containers: vec!["nginx".to_string()],
+            discover: false,
+            labels: Vec::new(),
+            tail: logit_config::TailOptions {
+                checkpoint_path: Some(checkpoint_path.to_string()),
+                ..logit_config::TailOptions::default()
+            },
+        }
+    }
+
+    /// Rule 62: two tailing listeners writing one checkpoint would overwrite each other's
+    /// offsets every interval, and each would resume from whichever wrote last.
+    #[test]
+    fn two_tailing_listeners_sharing_a_checkpoint_path_are_rejected() {
+        let err = expect_err(cfg(vec![
+            ("logs", vec![], tail_in_checkpointing_to("state/tail.json")),
+            ("containers", vec![], docker_in_checkpointing_to("state/tail.json")),
+            ("out", vec!["logs", "containers"], sink()),
+        ]));
+        assert!(err.contains("'containers'") && err.contains("'logs'"), "got: {err}");
+        assert!(err.contains("both set 'checkpoint_path' to 'state/tail.json'"), "got: {err}");
+
+        let err = expect_err(cfg(vec![
+            ("a", vec![], tail_in_checkpointing_to("tail.json")),
+            ("b", vec![], tail_in_checkpointing_to("tail.json")),
+            ("out", vec!["a", "b"], sink()),
+        ]));
+        assert!(err.contains("both set 'checkpoint_path' to 'tail.json'"), "got: {err}");
+    }
+
+    /// Rule 62: `a.json`'s every write creates (truncating) `a.json.tmp` and renames it away, so a
+    /// second listener checkpointing to `a.json.tmp` would find its checkpoint gone at restart,
+    /// load it as missing, and skip to `read_from`.
+    #[test]
+    fn a_checkpoint_path_equal_to_another_components_tmp_path_is_rejected() {
+        for (first, second) in [("a", "b"), ("b", "a")] {
+            let err = expect_err(cfg(vec![
+                (first, vec![], tail_in_checkpointing_to("state/a.json")),
+                (second, vec![], docker_in_checkpointing_to("state/a.json.tmp")),
+                ("out", vec!["a", "b"], sink()),
+            ]));
+            assert!(
+                err.contains(&format!("component '{second}'"))
+                    && err.contains(&format!("component '{first}'")),
+                "got: {err}"
+            );
+            assert!(
+                err.contains("'state/a.json.tmp'") && err.contains("'state/a.json'"),
+                "got: {err}"
+            );
+            assert!(err.contains("tmp file"), "got: {err}");
+        }
+    }
+
+    /// Rule 62 compares literal paths only; distinct ones, and listeners with no checkpoint, pass.
+    #[test]
+    fn tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine() {
+        resolve(cfg(vec![
+            ("a", vec![], tail_in_checkpointing_to("state/a.json")),
+            ("b", vec![], tail_in_checkpointing_to("state/a.yaml")),
+            ("c", vec![], tail_in(vec!["/var/log/c.log"])),
+            ("d", vec![], tail_in(vec!["/var/log/d.log"])),
+            ("out", vec!["a", "b", "c", "d"], sink()),
+        ]))
+        .expect("distinct checkpoint paths, or none, should validate fine");
     }
 
     #[test]
@@ -8653,6 +8842,7 @@ mod tests {
             max_series,
             endpoint: None,
             version: logit_config::RemoteWriteVersion::default(),
+            compression: logit_config::RemoteWriteCompression::default(),
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -8668,6 +8858,7 @@ mod tests {
             max_series: logit_config::default_prometheus_max_series(),
             endpoint: Some(endpoint.to_string()),
             version: logit_config::RemoteWriteVersion::default(),
+            compression: logit_config::RemoteWriteCompression::default(),
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -8789,6 +8980,12 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("'version'"), "got: {err}");
 
         let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }));
+        assert!(err.contains("'out'") && err.contains("'compression'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
             let ComponentKind::PrometheusOut { timeout, .. } = kind else { unreachable!() };
             *timeout = Duration::from_secs(30);
         }));
@@ -8819,6 +9016,45 @@ mod tests {
             *version = logit_config::RemoteWriteVersion::default();
         }))
         .expect("defaults are legal in either mode");
+        resolve(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Snappy;
+        }))
+        .expect("an explicit default compression is legal under bind");
+    }
+
+    /// Remote-write 2.0 mandates Snappy, so `zstd` pairs only with `version: 1`.
+    #[test]
+    fn zstd_compression_with_version_2_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { version, compression, .. } = kind else {
+                unreachable!()
+            };
+            *version = logit_config::RemoteWriteVersion::V2;
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }));
+        assert!(
+            err.contains("'out'") && err.contains("'compression: zstd' needs 'version: 1'"),
+            "got: {err}"
+        );
+    }
+
+    /// `zstd` with `version: 1` and `snappy` with `version: 2` are both legal senders.
+    #[test]
+    fn zstd_with_version_1_and_snappy_with_version_2_both_resolve() {
+        resolve(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }))
+        .expect("zstd with version: 1 is the VictoriaMetrics wire");
+        resolve(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { version, compression, .. } = kind else {
+                unreachable!()
+            };
+            *version = logit_config::RemoteWriteVersion::V2;
+            *compression = logit_config::RemoteWriteCompression::Snappy;
+        }))
+        .expect("snappy with version: 2 is the 2.0 wire");
     }
 
     /// Rule 41's checks are registry-mode only: a sender-mode component never reaches them, and

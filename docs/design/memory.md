@@ -262,7 +262,7 @@ line.
 | `shape` measure 1 wide-JSON event (32 attrs) | **3** | 1 `MetricList` spill + 1 each for `logit.shape.key_bytes`/`.value_bytes`, which carry 32 values apiece and so run past `SAMPLES_INLINE`'s 19. Inherent -- a per-attribute measurement of a 32-attribute event *is* 32 numbers -- and the reason `shape` belongs on a tap branch rather than in the flow |
 | `flatten` an already-flat event | **0** | the phase-1 scan selects nothing -- no scratch buffer touched, no `Symbol` interned, no `Value` moved ([ADR `flatten-transform`](../adr/flatten-transform.md)) |
 | `flatten` pino-http shape (8 attrs, 2 nested `req`/`res`), warm `KeyCache` | **1** | six flat attributes survive untouched plus the eight leaves `req`/`res` expand into -- 14 total, spilling `AttrMap`'s 8-slot inline capacity once. One allocation, not one per inserted entry: `SmallVec`'s first over-capacity push grows straight to 16 slots, which the rest of this event's inserts fit inside |
-| `flatten` pino-http shape, cold `KeyCache` (first event of its shape in the process) | **12** | the warm case's spill plus one interner-and-cache-entry cost per distinct path this shape mints (`req.method`, `req.headers.host`, ...) -- exactly the cost `docs/design/data-shapes.md`'s pino-http finding says this shape pays "again" on every event, until its own component's `KeyCache` has seen every path once |
+| `flatten` pino-http shape, cold `KeyCache` (first event of its shape in the process) | **12** | the warm case's spill, one `Box<str>` copy per distinct path this shape mints (eight: `req.method`, `req.headers.host`, ...) as each `KeyCache` miss stores its key, and the first growth of the component's scratch buffers (`pending`, `path`, the cache's `Vec`); the interner itself allocates nothing for these keys. This is the cost `docs/design/data-shapes.md`'s pino-http finding says this shape pays "again" on every event, until its own component's `KeyCache` has seen every path once |
 | `sample` `key: trace_id` on a span event | **0** | the 16 id bytes hex-encoded into a stack array, one XXH64 over them ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)); the key name was interned at construction and the decision tally is plain integers emitted once per batch |
 | `sample` `key: {attribute: status}` on an `I64` value | **0** | the decimal text is formatted straight into the streaming hasher through `fmt::Write` (`logit_core::sampling`'s `KeyHasher`) -- no intermediate `String`, the reason numeric canonicalization costs nothing |
 | `sample` with no key (random draw) | **0** | a per-instance counter mixed with the seed through the same hash -- no RNG, nothing to allocate |
@@ -403,7 +403,7 @@ reader keeps reading under backpressure, shutdown drains a backlog) is tested in
 [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md)'s
 flush-side linking pairs each `Event` that `Transform::flush` emits with a bounded, best-effort
 `Vec<SpanLink>` naming its sources (`crates/logit-transforms/src/aggregate.rs`'s
-`ContributingContexts`). It took `aggregate_flush_100_series` from 2 to 6 allocations: one
+`ContributingContexts`). It took `aggregate_flush_4_series` from 2 to 6 allocations: one
 `Vec<SpanLink>` for each of the fixture's 4 series. The fixture never calls
 `observe_batch_context`, so each series holds one context (the default, all-zero one), but a
 non-empty `Vec` allocates whatever its length, so one per series is the floor, not a worst case.
@@ -418,7 +418,7 @@ exported.
 
 `series_retention > 0` (`docs/adr/aggregation-window-semantics.md`'s amendment) adds its own
 allocation cost, paid only by retained series. The default (`series_retention: 0`) path is
-untouched: `aggregate_flush_100_series` still measures **6**. `aggregate_flush_retained_gauges`
+untouched: `aggregate_flush_4_series` still measures **6**. `aggregate_flush_retained_gauges`
 isolates the retained path: 100 distinct gauge series, deliberately not trimmed by `keep` (12
 attributes each, past `AttrMap`'s 8-slot inline capacity), retained across a second flush, cost
 **209** allocations. Two costs stack, both inherent to retention:
@@ -426,7 +426,7 @@ attributes each, past `AttrMap`'s 8-slot inline capacity), retained across a sec
 - **`key.attributes.clone()`, once per retained series.** The tumbling path moves `key.attributes`
   into the emitted event and drops the key. A retained series needs its key again next window, so
   the attributes are cloned instead, and a spilled map's clone allocates: ~100 of the 209, one per
-  series. `aggregate_flush_100_series` never takes this branch, because its gauge retention is off.
+  series. `aggregate_flush_4_series` never takes this branch, because its gauge retention is off.
 - **Each group's `series` `HashMap` rebuilds its table on every flush that retains anything.**
   `flush` takes the whole map via `mem::take` and re-inserts survivors into the empty replacement,
   so the far more common tumbling path can move `key.attributes` for free instead of cloning every

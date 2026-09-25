@@ -1,8 +1,8 @@
 # Recorded interop fixtures
 
 This directory holds real wire traffic, captured once from real third-party producers and
-committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus, and
-statsd/DogStatsD clients. The fixtures check `logit`'s decoders against what those producers put on
+committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
+vmagent, and statsd/DogStatsD clients. The fixtures check `logit`'s decoders against what those producers put on
 the wire:
 
 - `crates/logit-inputs/src/syslog.rs`
@@ -45,11 +45,13 @@ testdata/interop/
                           `write_graphite` plugin) and real carbon pickle frames (a stdlib Python
                           producer), one file per accepted connection
   prometheus/README.md -- provenance table for prometheus/*.bin
-  prometheus/*.bin     -- Snappy-compressed protobuf remote-write request bodies, exactly as a real
-                          Prometheus POSTed them, one file per request
+  prometheus/*.bin     -- compressed protobuf remote-write request bodies, exactly as a real
+                          Prometheus (Snappy) or a real vmagent (zstd, its default wire, and Snappy)
+                          POSTed them, one file per request
   prometheus/*.headers -- one sidecar per body, holding that request's method, path and request
                           headers -- which is what carries the `Content-Type` and
-                          `X-Prometheus-Remote-Write-Version` the wire version is read from
+                          `X-Prometheus-Remote-Write-Version` the wire version is read from, and
+                          the `Content-Encoding` that says which decompressor the body needs
   statsd/README.md     -- provenance table for statsd/*.raw
   statsd/*.raw         -- raw captured UDP datagrams from two real statsd clients (Datadog's
                           `datadog` package and the plain-statsd `statsd` package), each in a
@@ -100,8 +102,8 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **OTLP:** low single-digit KB per fixture.
 - **statsd:** ~12 KB for the whole corpus. It needs 56 small datagrams, because its subject is the
   *distribution* of datagram sizes rather than one message shape.
-- **Whole directory:** well under 100 KB total. As of 2026-09-23, the fixtures, excluding READMEs,
-  total about 34 KB.
+- **Whole directory:** well under 100 KB total. As of 2026-09-24, the fixtures, excluding READMEs,
+  total about 37 KB.
 
 If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
 at record time instead of committing everything the producer emits. `script/record-fixtures`'s

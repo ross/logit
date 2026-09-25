@@ -2774,10 +2774,10 @@ mod tests {
         );
     }
 
-    /// `@`, `,`, and a space, which the name rule would substitute, survive in a member.
+    /// `@`, `#`, `,`, and a space, which the name rule would substitute, survive in a member.
     #[test]
     fn members_with_at_hash_comma_or_a_space_round_trip_byte_for_byte() {
-        for line in ["users:a@b|s", "users:a,b|s", "users:a b|s"] {
+        for line in ["users:a@b|s", "users:a#b|s", "users:a,b|s", "users:a b|s"] {
             let original = decode_one(line);
             let (msgs, stats) = encode(original.clone());
             assert_eq!(msgs, vec![line], "expected {line:?} to round-trip byte for byte");

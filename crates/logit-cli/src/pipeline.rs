@@ -906,6 +906,7 @@ fn build_spec(
             max_series,
             endpoint,
             version,
+            compression,
             timeout,
             headers,
             endpoint_tls,
@@ -926,6 +927,7 @@ fn build_spec(
                 }
                 (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
                     .with_version(to_remote_write_version(*version))
+                    .with_compression(to_remote_write_encoding(*compression))
                     .with_timeout(*timeout)
                     .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                     .with_telemetry(telemetry.clone())
@@ -1332,6 +1334,17 @@ fn to_remote_write_version(
     match version {
         logit_config::RemoteWriteVersion::V1 => Version::V1,
         logit_config::RemoteWriteVersion::V2 => Version::V2,
+    }
+}
+
+/// Config's `compression: snappy | zstd` into the codec's own `compression::Encoding`.
+fn to_remote_write_encoding(
+    compression: logit_config::RemoteWriteCompression,
+) -> logit_proto::prometheus::compression::Encoding {
+    use logit_proto::prometheus::compression::Encoding;
+    match compression {
+        logit_config::RemoteWriteCompression::Snappy => Encoding::Snappy,
+        logit_config::RemoteWriteCompression::Zstd => Encoding::Zstd,
     }
 }
 
@@ -1854,6 +1867,7 @@ mod tests {
                 max_series: 100_000,
                 endpoint: None,
                 version: logit_config::RemoteWriteVersion::default(),
+                compression: logit_config::RemoteWriteCompression::default(),
                 timeout: logit_config::default_prometheus_endpoint_timeout(),
                 headers: HashMap::new(),
                 endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -1868,8 +1882,11 @@ mod tests {
     /// `endpoint:` builds the remote-write sender; nothing is dialed, it connects per request.
     #[test]
     fn build_spec_builds_a_prometheus_remote_write_sink() {
-        for version in [logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteVersion::V2]
-        {
+        for (version, compression) in [
+            (logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteCompression::Snappy),
+            (logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteCompression::Zstd),
+            (logit_config::RemoteWriteVersion::V2, logit_config::RemoteWriteCompression::Snappy),
+        ] {
             let component = ResolvedComponent {
                 buffer: logit_config::BufferConfig::default(),
                 receive: logit_config::ReceiveConfig::default(),
@@ -1883,6 +1900,7 @@ mod tests {
                     max_series: logit_config::default_prometheus_max_series(),
                     endpoint: Some("http://mimir:8080/api/v1/push".to_string()),
                     version,
+                    compression,
                     timeout: Duration::from_secs(30),
                     headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
                     endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -1893,7 +1911,7 @@ mod tests {
                     build_spec("out", &component, Path::new(""), None).unwrap().0,
                     NodeSpec::Output(_, _, _)
                 ),
-                "version {version:?}"
+                "version {version:?}, compression {compression:?}"
             );
         }
     }

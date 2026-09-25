@@ -447,7 +447,7 @@
               "type": "string"
             },
             "checkpoint_path": {
-              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory.",
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
               "default": null,
               "type": [
                 "string",
@@ -507,7 +507,7 @@
               "type": "string"
             },
             "checkpoint_path": {
-              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory.",
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
               "default": null,
               "type": [
                 "string",
@@ -2252,6 +2252,15 @@
                 "null"
               ]
             },
+            "compression": {
+              "description": "How each remote-write request body is compressed. `snappy`, the default, is the Snappy block format both remote-write specs mandate, and every receiver accepts it. `zstd` is the VictoriaMetrics remote write protocol: the same 1.0 request compressed with zstd instead, which VictoriaMetrics, vmagent, and `logit`'s own `prometheus_in` accept and Prometheus and Mimir reject. There is no negotiation and no fallback: a receiver that rejects `zstd` fails every batch, so pick what the receiver accepts. `zstd` needs `version: 1`. Sender mode only.",
+              "default": "snappy",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/RemoteWriteCompression"
+                }
+              ]
+            },
             "endpoint": {
               "description": "An absolute `http://`/`https://` remote-write URL, path included (typically `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that isn't up yet is not a config error.",
               "default": null,
@@ -2990,6 +2999,25 @@
       },
       "additionalProperties": false
     },
+    "RemoteWriteCompression": {
+      "description": "How `prometheus_out`'s `endpoint:` sender compresses a request body. Defaults to `snappy`.",
+      "oneOf": [
+        {
+          "description": "Snappy block compression, what both remote-write specs mandate.",
+          "type": "string",
+          "enum": [
+            "snappy"
+          ]
+        },
+        {
+          "description": "zstd, the VictoriaMetrics remote write protocol. Remote-write 1.0 only.",
+          "type": "string",
+          "enum": [
+            "zstd"
+          ]
+        }
+      ]
+    },
     "RotateConfig": {
       "description": "`file_out`'s rotation policy. At least one of `max_bytes`/`interval` must be set; a config that would never rotate is rejected (use `stdio_out` for an unrotated file). `max_files` counts every file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads as a disk budget.",
       "type": "object",
@@ -3015,7 +3043,7 @@
           ]
         },
         "max_files": {
-          "description": "Files to keep, active plus rotated. Defaults to `5`; `0` is rejected.",
+          "description": "Files to keep, active plus rotated. Defaults to `5`. Must be between `1` and `1000` (`MAX_ROTATE_FILES`): 1000 keeps 999 rotated files, about 2.7 years of daily files or 41 days of hourly ones.",
           "default": 5,
           "type": "integer",
           "format": "uint32",

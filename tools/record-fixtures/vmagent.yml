@@ -1,0 +1,19 @@
+# vmagent scrape config for script/record-fixtures's `vmagent` producer: scrape the static
+# prometheus-metadata-target.prom (served by `python3 -m http.server` as the `metatarget`
+# container) and let vmagent remote-write it to the raw_capture.py listener. The same four
+# families the `prometheus` producer's captures carry, so the two corpora can be compared family
+# for family.
+#
+# vmagent takes its remote-write URL, and the zstd-or-Snappy choice, on the command line
+# (`record_vmagent`), not here.
+global:
+  scrape_interval: 5s
+  # One fixed label on every series, as prometheus.yml's `external_labels`, so a test can assert on
+  # it instead of on a container id.
+  external_labels:
+    monitor: logit-fixture
+
+scrape_configs:
+  - job_name: vmagent
+    static_configs:
+      - targets: ["metatarget:9100"]
