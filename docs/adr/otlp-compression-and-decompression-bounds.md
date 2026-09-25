@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-25
 ---
 
 # `otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size
@@ -96,3 +96,10 @@ assuming the header and the frame always agree.
   (`crc32fast`/`miniz_oxide`/`adler2`, all MIT-compatible) without a `deny.toml` change.
 - gRPC TLS remains unaddressed — a separate, larger workstream (a `tokio-rustls` layer in the
   hand-rolled client) that this ADR deliberately does not attempt.
+
+## Amendment: `inflate` and the server's `grpc_unframe` move to `logit-proto` (2026-09-25)
+
+Both helpers move from `crates/logit-inputs/src/otlp.rs` to `logit_proto::otlp::grpc`, as
+`inflate_bounded` and `unframe`, so the fuzz harness can reach them
+([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)). The bound, the `InflateError` variants, and
+their status mapping are unchanged. `flate2` becomes a normal dependency of `logit-proto`.

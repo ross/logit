@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-25
 ---
 
 # Hand-rolled unary gRPC over `hyper`, not `tonic`
@@ -86,3 +86,24 @@ gRPC response needs exactly one.
 - No new transitive dependency version enters the graph (`h2`, pulled in by enabling `hyper`'s
   `http2` feature, resolves to the same version `reqwest` already pins) — confirmed via
   `script/audit`, not assumed. `deny.toml` needed no edit.
+
+## Amendment: an explicit stream cap, one message per unary body, and a shared framing module (2026-09-25)
+
+[ADR `untrusted-input-bounds`](untrusted-input-bounds.md) changes four things about the server
+half:
+
+- **Stream cap.** `otlp_in` builds both transports through a shared builder that sets
+  `max_concurrent_streams` to 32 and pins `max_pending_accept_reset_streams` (20) and
+  `max_header_list_size` (16 KiB) explicitly. Before this, the server ran on hyper 1.11.1's
+  default of 200 concurrent streams per connection, which the per-listener worst case didn't
+  account for.
+- **One message per unary body.** A unary request body that carries a second gRPC frame after the
+  first is answered `INVALID_ARGUMENT` (`grpc-status: 3`). It used to be decoded as its first
+  frame alone.
+- **Case-insensitive encodings.** `grpc-encoding` and `content-encoding` are matched without
+  regard to case, so `Gzip` is accepted.
+- **Framing moves to `logit-proto`.** The server's `grpc_unframe` and the bounded gzip `inflate`
+  move from `crates/logit-inputs/src/otlp.rs` to `logit_proto::otlp::grpc` (`unframe`,
+  `inflate_bounded`, `InflateError`), so the fuzz harness
+  ([ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md)) can reach them without building
+  `logit-inputs`. The client half's framing in `otlp_out` is unchanged.

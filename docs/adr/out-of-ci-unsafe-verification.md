@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-09-25
 ---
 
 # Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change
@@ -182,3 +182,16 @@ rather than duplicated here — this ADR is the decision record, not the run log
   reviewed value to bump, the same way `docs/adr/committed-pregenerated-otlp-protobuf.md` treats
   regenerating the OTLP bindings — not something to float to `nightly` for convenience, which would
   make "miri passed" stop meaning the same thing run to run.
+
+## Amendment: the image also hosts `cargo-fuzz` (2026-09-25)
+
+[ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md) installs a pinned `cargo-fuzz` in
+`tools/unsafe-check/Dockerfile` and adds `fuzz`, `fuzz-all`, and `fuzz-seed` to
+`script/unsafe-check`. That supersedes the "`cargo-fuzz` over these same call sites" deferral under
+"Alternatives considered": the fuzz targets now exist, over the native, sketch, OTLP, and
+Prometheus decoders rather than this ADR's `libc` surface. The nightly pin, the plain `docker run`,
+and the separate cargo-home volume are unchanged. Fuzz builds get their own target volume,
+`logit_fuzz_target`, because sanitizer `RUSTFLAGS` would invalidate every miri and careful
+artifact in `logit_unsafe_check_target`. `MIRI_TARGETS` also gains the `HyperLogLog` fuzz
+regressions, because AddressSanitizer can't see the wrong-`Layout` deallocation that codec guards
+against and Miri can.

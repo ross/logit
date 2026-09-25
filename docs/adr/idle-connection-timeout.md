@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-25
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -284,3 +284,19 @@ comment.
   doing its job rather than something to investigate.
 - No new crate dependency: `Notify`, `poll_fn`, `ReadBuf`, `Instant::checked_add`/`far_future`, and
   `BodyExt::frame` are all already in the dependency tree the workstreams above build on.
+
+## Amendment: the wait-out loop and the per-frame stall bound are the contract (2026-09-25)
+
+A review of the remote-reachable listeners against
+[ADR `untrusted-input-bounds`](untrusted-input-bounds.md) confirmed two properties of this ADR and
+kept both:
+
+- `drive_with_idle`'s wait for an in-flight request has no ceiling. A request blocked in
+  `Fanout::send` is backpressure, which question 1 of this ADR's Context rules out treating as
+  idleness, and the request's body read is bounded by the stall timeout on its own.
+- The body stall bound is per frame (per `read` on `logit_in`), not a total deadline. A peer that
+  sends one byte per frame slightly under the bound holds a connection permit for up to
+  `MAX_REQUEST_BYTES` times the bound on an HTTP listener, and `max_frame_bytes` times the bound on
+  `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
+  looks the same. The cost is recorded under "TLS and connection lifecycle" in
+  [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle).
