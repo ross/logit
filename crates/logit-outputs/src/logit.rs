@@ -23,7 +23,8 @@
 //!   is forwarded (its module doc's "Shutdown"), so the batch never landed and is resent at any
 //!   delivery posture. Any other transient code there is `Ambiguous`.
 //! - A `HelloAck` naming a codec never offered: `Ambiguous`.
-//! - A batch over the sanity cap or the peer's `max_frame_bytes`: `Permanent`, nothing written.
+//! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
+//!   `frame::compressed_bound` of that: `Permanent`, nothing written.
 //! - A first write that sends nothing: `Clean`. Any failure once a byte of the frame left, an ack
 //!   timeout, or a mismatched `Ack.seq`: `Ambiguous`, and the connection is dropped.
 //!
@@ -364,6 +365,22 @@ impl Output for LogitOutput {
 
         let framed = frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
             .context(Fault::Permanent)?;
+        // The peer bounds `compressed_len` by `frame::compressed_bound`, lz4's worst case over
+        // the payload bound; checked here so this side never sends a frame the peer refuses.
+        let compressed_len = framed.len() - frame::HEADER_LEN;
+        if compressed_len as u64 > frame::compressed_bound(bound) as u64 {
+            self.stream = Some(conn);
+            self.diag.warn_throttled(
+                "frame_too_large",
+                format!(
+                    "batch compresses to {compressed_len} bytes, over this connection's {}-byte \
+                     compressed bound",
+                    frame::compressed_bound(bound)
+                ),
+            );
+            return Err(anyhow::anyhow!("compressed batch too large for this connection"))
+                .context(Fault::Permanent);
+        }
 
         // One `write` first to learn whether anything left (`Clean` if not), `write_all` only for
         // the remainder: never resend once a byte of this frame reached the peer.

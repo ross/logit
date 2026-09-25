@@ -24,8 +24,8 @@
 //! forwarded.
 //!
 //! *`GOING_AWAY` and forwarding exclude each other.* Every `Reject` this listener writes (the
-//! past-the-cap one, the handshake's, the loop-top and `select!` shutdown arms, and an idle close)
-//! goes out before the frame it answers reaches `send_relayed`; after
+//! past-the-cap one, the handshake's, the loop-top and `select!` shutdown arms, an idle close, and
+//! `FRAME_TOO_LARGE`) goes out before the frame it answers reaches `send_relayed`; after
 //! `send_relayed` the only write is that frame's `Ack`. So a `logit_out` that gets `GOING_AWAY`
 //! in place of an `Ack` knows the batch never landed, and resends it at any delivery posture.
 //!
@@ -417,11 +417,12 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
 /// `logit.proto.errors{reason}`: `handshake` (the handshake failed), `too_large` (a header
-/// declared more than `max_frame_bytes`), `truncated` (the body read hit EOF or an I/O error),
-/// `crc`, `codec` (a frame not under the negotiated codec), `decode_budget` (a batch that decodes
-/// past its `native::DecodeBudget`), `magic` (any other malformed frame, or an undecodable batch),
-/// `ack_write_stalled` and `reject_write_stalled` (module doc's "Bounded writes"). A close or
-/// error mid-header is not counted.
+/// declared a payload over `max_frame_bytes`, or a `compressed_len` over
+/// `frame::compressed_bound` of it; answered `Reject{FRAME_TOO_LARGE}`), `truncated` (the body
+/// read hit EOF or an I/O error), `crc`, `codec` (a frame not under the negotiated codec),
+/// `decode_budget` (a batch that decodes past its `native::DecodeBudget`), `magic` (any other
+/// malformed frame, or an undecodable batch), `ack_write_stalled` and `reject_write_stalled`
+/// (module doc's "Bounded writes"). A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -489,8 +490,15 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 Err(FrameReadError::Stalled(idle)) => {
                     return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
                 }
+                // Answered before the close, so the peer sees a permanent refusal rather than an
+                // EOF it can't tell from a crash. Nothing of the body has been read.
                 Err(FrameReadError::TooLarge(err)) => {
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", "too_large")]);
+                    let reject = control::Reject {
+                        code: control::REJECT_FRAME_TOO_LARGE,
+                        message: err.to_string(),
+                    };
+                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
                     return Err(err);
                 }
                 Err(FrameReadError::Truncated(err)) => {
@@ -821,8 +829,10 @@ impl FrameReadError {
     }
 }
 
-/// Parses `header_buf` and checks both declared lengths against `max_frame_bytes` (capped at
-/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`]) *before* reading the body, then hands the whole frame to
+/// Parses `header_buf` and checks its declared lengths before reading the body:
+/// `uncompressed_len` against `max_frame_bytes` (capped at [`frame::MAX_SANE_UNCOMPRESSED_LEN`]),
+/// and `compressed_len` against [`frame::compressed_bound`] of that, since an incompressible
+/// payload at the cap grows under lz4. Then hands the whole frame to
 /// [`frame::read_frame_with_header`] for its CRC, decompression, and length checks.
 ///
 /// `stall` bounds each `read` of the body, not the body in total (module doc's "Idle timeout").
@@ -839,9 +849,11 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     })?;
 
     let bound = max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
-    if header.uncompressed_len > bound || header.compressed_len > bound {
+    let compressed_bound = frame::compressed_bound(bound);
+    if header.uncompressed_len > bound || header.compressed_len > compressed_bound {
         return Err(FrameReadError::TooLarge(anyhow::anyhow!(
-            "frame declares {}/{} (uncompressed/compressed) bytes, over the {bound}-byte bound",
+            "frame declares {}/{} (uncompressed/compressed) bytes, over the \
+             {bound}/{compressed_bound}-byte bound",
             header.uncompressed_len,
             header.compressed_len
         )));
@@ -1401,10 +1413,19 @@ mod tests {
                 .unwrap();
         client.write_all(&framed[..frame::HEADER_LEN]).await.unwrap();
 
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("should answer within 2s, not hang waiting for a body")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE)
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
-            .expect("should observe a close within 2s, not hang waiting for a body")
+            .expect("should observe a close within 2s")
             .unwrap();
         assert_eq!(n, 0);
     }
@@ -2183,4 +2204,119 @@ mod tests {
         drop(unread);
     }
 
+    /// An xorshift-generated printable-ASCII string: lz4 finds almost no 4-byte match in it, so
+    /// its lz4 frame is larger than its payload.
+    fn incompressible_text(len: usize) -> String {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b'!' + (x % 94) as u8)
+            })
+            .collect()
+    }
+
+    /// A one-event batch whose native v1 encoding is at most `target` bytes, within a few bytes
+    /// of it, and whose message is [`incompressible_text`].
+    fn incompressible_batch_encoding_to(target: usize) -> EventBatch {
+        let batch_with = |len: usize| {
+            let mut batch = sample_batch();
+            batch.events[0].log.as_mut().unwrap().message = Value::str(incompressible_text(len));
+            batch
+        };
+        let mut len = target;
+        loop {
+            let encoded = native::encode_batch(&batch_with(len)).len();
+            if encoded <= target {
+                return batch_with(len);
+            }
+            len -= encoded - target;
+        }
+    }
+
+    /// A payload a few bytes under `max_frame_bytes` that lz4 expands past it still relays: the
+    /// compressed length is bounded by lz4's worst case over the cap, not by the cap itself.
+    #[tokio::test]
+    async fn an_incompressible_batch_just_under_the_cap_relays_under_lz4() {
+        const CAP: u32 = 64 * 1024;
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_frame_bytes(CAP);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+            .await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.compression, Compression::Lz4 as u8)
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        let batch = incompressible_batch_encoding_to(CAP as usize - 8);
+        let framed = NativeEncoder::new(Compression::Lz4).encode(&batch).unwrap();
+        let compressed_len = framed.len() - frame::HEADER_LEN;
+        assert!(
+            compressed_len > CAP as usize,
+            "precondition: the lz4 frame ({compressed_len} bytes) is larger than the cap"
+        );
+        client.write_all(&framed).await.unwrap();
+
+        assert_eq!(read_ack(&mut client).await.seq, 1, "the frame is acked, not rejected");
+        let relayed = recv_batch(&mut rx).await;
+        assert_eq!(relayed.events.len(), 1);
+    }
+
+    /// A header declaring a `compressed_len` one past lz4's worst case over `max_frame_bytes`
+    /// is answered `Reject{FRAME_TOO_LARGE}` on the header alone, counted, and closed.
+    #[tokio::test]
+    async fn a_frame_over_the_compressed_bound_is_answered_frame_too_large() {
+        const CAP: u32 = 64;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_frame_bytes(CAP).with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+            .await;
+        let _ = read_control_response(&mut client).await;
+
+        // A real lz4 frame's header, its `compressed_len` (bytes 16..20) raised to one past
+        // `CAP + CAP / 255 + 16`, sent with no body.
+        let mut header = BytesMut::from(
+            &frame::write_frame(native::CODEC_NATIVE_V1, Compression::Lz4, &[0u8; CAP as usize])
+                .unwrap()[..frame::HEADER_LEN],
+        );
+        let over = CAP + CAP / 255 + 16 + 1;
+        header[16..20].copy_from_slice(&over.to_le_bytes());
+        client.write_all(&header).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("the listener answers within 2s, not after waiting for a body")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE, "{}", reject.message)
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject")
+            .unwrap();
+        assert_eq!(n, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "too_large")),
+            Some(1.0)
+        );
+        assert!(rx.try_recv().is_err());
+    }
 }

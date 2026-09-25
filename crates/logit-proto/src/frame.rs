@@ -28,11 +28,18 @@ pub const FLAG_CONTROL: u16 = 1 << 0;
 /// socket.
 pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
-/// The largest `compressed_len` a reader accepts: [`MAX_SANE_UNCOMPRESSED_LEN`] plus lz4's
-/// documented worst-case expansion, since an incompressible payload at the uncompressed cap
-/// compresses to slightly more bytes than the cap.
-const MAX_SANE_COMPRESSED_LEN: u32 =
-    MAX_SANE_UNCOMPRESSED_LEN + MAX_SANE_UNCOMPRESSED_LEN / 255 + 16;
+/// The largest `compressed_len` a reader accepts: [`compressed_bound`] of
+/// [`MAX_SANE_UNCOMPRESSED_LEN`].
+const MAX_SANE_COMPRESSED_LEN: u32 = compressed_bound(MAX_SANE_UNCOMPRESSED_LEN);
+
+/// The largest `compressed_len` a frame whose payload is at most `uncompressed_bound` bytes can
+/// carry: lz4's documented worst-case expansion (`n + n / 255 + 16`), since an incompressible
+/// payload compresses to slightly more bytes than it started with. A reader that bounds a frame's
+/// payload checks `compressed_len` against this, not against the payload bound itself, and a
+/// writer checks its compressed frame against the same number.
+pub const fn compressed_bound(uncompressed_bound: u32) -> u32 {
+    uncompressed_bound.saturating_add(uncompressed_bound / 255).saturating_add(16)
+}
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
@@ -461,5 +468,27 @@ mod tests {
              `DiskQueue::read_record_at`'s `walk_segment`, silently discarding every record after \
              it instead of resyncing"
         );
+    }
+
+    /// An incompressible payload's lz4 frame is larger than the payload and still within
+    /// `compressed_bound` of the payload's length, the bound `logit_in` checks `compressed_len`
+    /// against.
+    #[test]
+    fn an_incompressible_lz4_payload_fits_its_compressed_bound() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let payload: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let framed = write_frame(1, Compression::Lz4, &payload).unwrap();
+        let compressed_len = (framed.len() - HEADER_LEN) as u32;
+        assert!(compressed_len > payload.len() as u32, "lz4 expands random bytes");
+        assert!(compressed_len <= compressed_bound(payload.len() as u32));
+        assert_eq!(compressed_bound(MAX_SANE_UNCOMPRESSED_LEN), MAX_SANE_COMPRESSED_LEN);
+        assert_eq!(compressed_bound(u32::MAX), u32::MAX, "saturates rather than wrapping");
     }
 }
