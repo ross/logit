@@ -1290,14 +1290,22 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
   same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
-  node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
-  `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the existing 4 GiB figure. Measured
-  2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
-  98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
-  the 98× shape needs crafted input, a non-goal under
-  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:**
-  profile it before OTLP/JSON sees production volume.
+  node, where `prost::Message::decode` builds the target structs directly. Measured 2026-09-25 as
+  peak live heap bytes per input byte, debug build:
+  - Ordinary OTLP/JSON structure (`testdata/interop/otlp/logs.json`, a real SDK export): about 19.
+    The same batch as protobuf: about 17.
+  - Crafted input, a body of tiny `{"":0}` objects under a key OTLP doesn't define, which
+    serde_json builds in full and the decoder then ignores: about 98, at both 1 MiB and 4 MiB. At
+    4 MiB that is about 400 MiB for one request.
+
+  `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
+  asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
+  a test before this entry drifts. The bound still holds: `MAX_CONCURRENT_CONNECTIONS`'s doc
+  comment (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
+  finite multiple of the existing 4 GiB figure. No cap and no streaming parser are added: the
+  98× shape needs crafted input, a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:** if
+  an OTLP listener ever faces an untrusted network.
 - **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
   close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
   about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
