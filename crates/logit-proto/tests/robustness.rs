@@ -4,7 +4,8 @@
 //! in both protocols, and `prometheus::compression::decompress_bounded`, which inflates every
 //! remote-write body `prometheus_in` receives. Pickle is the highest-risk parser in the repo: a format built for arbitrary
 //! object construction, read from a socket. A network-facing decoder must pass this suite
-//! (`docs/plans/native-transport.md`).
+//! (`docs/plans/native-transport.md`). The OTLP section pins OTLP's timestamp
+//! saturation.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -23,8 +24,13 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
 use logit_proto::native::varint::write_uvarint;
 use logit_proto::native::{self, NativeDecoder};
+use logit_proto::otlp::generated::opentelemetry::proto::common::v1 as otlp_common;
+use logit_proto::otlp::generated::opentelemetry::proto::logs::v1 as otlp_logs;
+use logit_proto::otlp::generated::opentelemetry::proto::metrics::v1 as otlp_metrics;
+use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
+use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
-use logit_proto::{Decoder, Encoder};
+use logit_proto::{Decoder, Encoder, Signal, SignalDecoder, SignalEncoder};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
@@ -815,4 +821,254 @@ fn zstd_memory_is_bounded_by_the_cap_not_by_what_an_undeclared_frame_inflates_to
     );
     let bound = 4 * REMOTE_WRITE_CAP as i64;
     assert!(peak < bound, "peak live bytes {peak} over {bound} for a {}-byte bomb", bomb.len());
+}
+
+// -- otlp -------------------------------------------------------------------------------------
+
+const OTLP_TRACE_ID: [u8; 16] = [1; 16];
+const OTLP_SPAN_ID: [u8; 8] = [2; 8];
+
+/// One past the largest wire timestamp the model's `i64` nanoseconds can hold, and the largest a
+/// `fixed64` can carry.
+const OTLP_TIMESTAMPS_PAST_I64_MAX: [u64; 2] = [i64::MAX as u64 + 1, u64::MAX];
+
+fn otlp_int_leaf() -> otlp_common::AnyValue {
+    otlp_common::AnyValue { value: Some(otlp_common::any_value::Value::IntValue(1)) }
+}
+
+/// Every model timestamp an OTLP decode sets, labelled by the field it came from.
+fn otlp_timestamps(batches: &[EventBatch]) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        for event in &batch.events {
+            if let Some(log) = &event.log {
+                out.push(("log timestamp".to_string(), event.timestamp));
+                out.push(("log observed_timestamp".to_string(), log.observed_timestamp));
+            }
+            if let Some(span) = &event.span {
+                out.push(("span start".to_string(), event.timestamp));
+                out.push(("span end".to_string(), span.end_timestamp));
+                for e in &span.events {
+                    out.push(("span event".to_string(), e.timestamp));
+                }
+            }
+            for m in &event.metrics {
+                let name = logit_core::interner::resolve(m.name);
+                out.push((format!("{name} timestamp"), event.timestamp));
+                out.push((format!("{name} start_timestamp"), m.start_timestamp));
+                for x in &m.exemplars {
+                    out.push((format!("{name} exemplar"), x.timestamp));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Asserts `batches` carry `fields` timestamps and every one is `i64::MAX`.
+fn assert_every_timestamp_saturated(case: &str, batches: &[EventBatch], fields: usize) {
+    let stamps = otlp_timestamps(batches);
+    assert_eq!(stamps.len(), fields, "{case}: {stamps:?}");
+    for (field, ts) in &stamps {
+        assert_eq!(*ts, i64::MAX, "{case}: {field}");
+    }
+}
+
+fn otlp_pb_logs_at(time: u64, observed: u64) -> Bytes {
+    let data = otlp_logs::LogsData {
+        resource_logs: vec![otlp_logs::ResourceLogs {
+            scope_logs: vec![otlp_logs::ScopeLogs {
+                log_records: vec![otlp_logs::LogRecord {
+                    time_unix_nano: time,
+                    observed_time_unix_nano: observed,
+                    body: Some(otlp_int_leaf()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// A span starting and ending at `t`, with one span event at `t`.
+fn otlp_pb_traces_at(t: u64) -> Bytes {
+    let data = otlp_trace::TracesData {
+        resource_spans: vec![otlp_trace::ResourceSpans {
+            scope_spans: vec![otlp_trace::ScopeSpans {
+                spans: vec![otlp_trace::Span {
+                    trace_id: OTLP_TRACE_ID.to_vec(),
+                    span_id: OTLP_SPAN_ID.to_vec(),
+                    name: "s".into(),
+                    start_time_unix_nano: t,
+                    end_time_unix_nano: t,
+                    events: vec![otlp_trace::span::Event {
+                        time_unix_nano: t,
+                        name: "e".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// One metric of each of OTLP's five kinds with every time field at `t`, plus an exemplar at `t`
+/// on each kind that has an `exemplars` field (all but `Summary`): 14 model timestamps.
+fn otlp_pb_metrics_at(t: u64) -> Bytes {
+    use otlp_metrics::metric::Data;
+    let exemplar = || otlp_metrics::Exemplar {
+        time_unix_nano: t,
+        value: Some(otlp_metrics::exemplar::Value::AsDouble(1.0)),
+        ..Default::default()
+    };
+    let number_point = || otlp_metrics::NumberDataPoint {
+        start_time_unix_nano: t,
+        time_unix_nano: t,
+        exemplars: vec![exemplar()],
+        value: Some(otlp_metrics::number_data_point::Value::AsDouble(1.0)),
+        ..Default::default()
+    };
+    let metric = |name: &str, data| otlp_metrics::Metric {
+        name: name.into(),
+        data: Some(data),
+        ..Default::default()
+    };
+    let metrics = vec![
+        metric(
+            "sum",
+            Data::Sum(otlp_metrics::Sum {
+                data_points: vec![number_point()],
+                aggregation_temporality: 1,
+                is_monotonic: true,
+            }),
+        ),
+        metric("gauge", Data::Gauge(otlp_metrics::Gauge { data_points: vec![number_point()] })),
+        metric(
+            "histogram",
+            Data::Histogram(otlp_metrics::Histogram {
+                data_points: vec![otlp_metrics::HistogramDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    bucket_counts: vec![1],
+                    exemplars: vec![exemplar()],
+                    ..Default::default()
+                }],
+                aggregation_temporality: 1,
+            }),
+        ),
+        metric(
+            "summary",
+            Data::Summary(otlp_metrics::Summary {
+                data_points: vec![otlp_metrics::SummaryDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    ..Default::default()
+                }],
+            }),
+        ),
+        metric(
+            "exponential_histogram",
+            Data::ExponentialHistogram(otlp_metrics::ExponentialHistogram {
+                data_points: vec![otlp_metrics::ExponentialHistogramDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    exemplars: vec![exemplar()],
+                    ..Default::default()
+                }],
+                aggregation_temporality: 1,
+            }),
+        ),
+    ];
+    let data = otlp_metrics::MetricsData {
+        resource_metrics: vec![otlp_metrics::ResourceMetrics {
+            scope_metrics: vec![otlp_metrics::ScopeMetrics { metrics, ..Default::default() }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// Every protobuf case at `t`, with the number of model timestamps each decodes to. A `time` of
+/// 0 takes `decode_log_record`'s fallback to `observed_time_unix_nano`.
+fn otlp_pb_cases_at(t: u64) -> [(&'static str, Signal, Bytes, usize); 4] {
+    [
+        ("logs, time and observed", Signal::Logs, otlp_pb_logs_at(t, t), 2),
+        ("logs, time 0 falls back to observed", Signal::Logs, otlp_pb_logs_at(0, t), 2),
+        ("traces", Signal::Traces, otlp_pb_traces_at(t), 3),
+        ("metrics, all five kinds", Signal::Metrics, otlp_pb_metrics_at(t), 14),
+    ]
+}
+
+#[test]
+fn every_otlp_wire_timestamp_past_i64_max_saturates() {
+    for t in OTLP_TIMESTAMPS_PAST_I64_MAX {
+        for (case, signal, body, fields) in otlp_pb_cases_at(t) {
+            let batches = OtlpDecoder::new().decode_signal(signal, body).unwrap();
+            assert_every_timestamp_saturated(&format!("protobuf {case} at {t}"), &batches, fields);
+        }
+
+        // proto3 JSON writes a 64-bit integer as a decimal string.
+        let t = format!("\"{t}\"");
+        let json_cases = [
+            (
+                "logs",
+                Signal::Logs,
+                format!(
+                    r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"timeUnixNano":{t},"observedTimeUnixNano":{t},"body":{{"stringValue":"x"}}}}]}}]}}]}}"#
+                ),
+                2,
+            ),
+            (
+                "traces",
+                Signal::Traces,
+                format!(
+                    r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"traceId":"01010101010101010101010101010101","spanId":"0202020202020202","name":"s","startTimeUnixNano":{t},"endTimeUnixNano":{t},"events":[{{"timeUnixNano":{t},"name":"e"}}]}}]}}]}}]}}"#
+                ),
+                3,
+            ),
+            (
+                "metrics",
+                Signal::Metrics,
+                format!(
+                    r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{{"name":"g","gauge":{{"dataPoints":[{{"startTimeUnixNano":{t},"timeUnixNano":{t},"asDouble":1.0,"exemplars":[{{"timeUnixNano":{t},"asDouble":1.0}}]}}]}}}}]}}]}}]}}"#
+                ),
+                3,
+            ),
+        ];
+        for (case, signal, body, fields) in json_cases {
+            let batches = OtlpDecoder::new().decode_signal_json(signal, Bytes::from(body)).unwrap();
+            assert_every_timestamp_saturated(&format!("JSON {case} at {t}"), &batches, fields);
+        }
+    }
+}
+
+/// A saturated timestamp is a fixed point: the encoder's `.max(0)` clamp passes `i64::MAX`
+/// through to the wire, and it decodes as `i64::MAX` again.
+#[test]
+fn a_saturated_timestamp_relays_as_i64_max() {
+    for (case, signal, body, fields) in otlp_pb_cases_at(u64::MAX) {
+        let first = OtlpDecoder::new().decode_signal(signal, body).unwrap();
+        let mut relayed = Vec::new();
+        for batch in &first {
+            for (signal, bytes) in OtlpEncoder::new().encode_signals(batch).unwrap() {
+                if signal == Signal::Logs {
+                    let wire: otlp_logs::LogsData = prost::Message::decode(bytes.clone()).unwrap();
+                    let record = &wire.resource_logs[0].scope_logs[0].log_records[0];
+                    assert_eq!(record.time_unix_nano, i64::MAX as u64, "{case}");
+                    assert_eq!(record.observed_time_unix_nano, i64::MAX as u64, "{case}");
+                }
+                relayed.extend(OtlpDecoder::new().decode_signal(signal, bytes).unwrap());
+            }
+        }
+        assert_every_timestamp_saturated(&format!("relayed {case}"), &relayed, fields);
+    }
 }

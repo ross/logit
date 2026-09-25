@@ -23,6 +23,14 @@ use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Resource, Scope, Value};
 
+/// Converts a wire timestamp to the model's. OTLP's `*_unix_nano` fields are `fixed64`, and the
+/// model's timestamps are `i64` nanoseconds, so a wire value past `i64::MAX` (a date past
+/// 2262-04-11) saturates to `i64::MAX` instead of wrapping negative. ADR `lossless-transit`'s
+/// "Permitted normalizations" list names the saturation.
+pub(crate) fn wire_nanos(nanos: u64) -> i64 {
+    i64::try_from(nanos).unwrap_or(i64::MAX)
+}
+
 /// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the lossy cases.
 pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {
     use pb::any_value::Value as Any;

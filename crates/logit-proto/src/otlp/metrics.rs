@@ -131,7 +131,7 @@ fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
     let trace = TraceRef::from_bytes(&e.trace_id, &e.span_id, 0);
     let mut filtered_attributes = AttrMap::new();
     common::key_values_into_attrs(e.filtered_attributes, &mut filtered_attributes);
-    Exemplar { timestamp: e.time_unix_nano as i64, value, trace, filtered_attributes }
+    Exemplar { timestamp: common::wire_nanos(e.time_unix_nano), value, trace, filtered_attributes }
 }
 
 fn encode_exemplars(exemplars: &[Exemplar]) -> Vec<pb::Exemplar> {
@@ -393,12 +393,17 @@ pub(crate) fn decode_metric(
                 .into_iter()
                 .map(|dp| {
                     let mut attrs = base_attrs.clone();
-                    let ts = dp.time_unix_nano as i64;
+                    let ts = common::wire_nanos(dp.time_unix_nano);
                     let value = number_value(dp.value);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);
                     let kind = MetricKind::Sum(Sum { value, temporality, monotonic });
                     let exemplars = decode_exemplars(dp.exemplars);
-                    let rec = record(kind, dp.start_time_unix_nano as i64, dp.flags, exemplars);
+                    let rec = record(
+                        kind,
+                        common::wire_nanos(dp.start_time_unix_nano),
+                        dp.flags,
+                        exemplars,
+                    );
                     Event::metric(ts, attrs, rec)
                 })
                 .collect()
@@ -408,13 +413,13 @@ pub(crate) fn decode_metric(
             .into_iter()
             .map(|dp| {
                 let mut attrs = base_attrs.clone();
-                let ts = dp.time_unix_nano as i64;
+                let ts = common::wire_nanos(dp.time_unix_nano);
                 let value = number_value(dp.value);
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
                 let exemplars = decode_exemplars(dp.exemplars);
                 let rec = record(
                     MetricKind::Gauge(value),
-                    dp.start_time_unix_nano as i64,
+                    common::wire_nanos(dp.start_time_unix_nano),
                     dp.flags,
                     exemplars,
                 );
@@ -427,13 +432,13 @@ pub(crate) fn decode_metric(
                 .into_iter()
                 .map(|dp| {
                     let mut attrs = base_attrs.clone();
-                    let ts = dp.time_unix_nano as i64;
+                    let ts = common::wire_nanos(dp.time_unix_nano);
                     let mut buckets = Vec::with_capacity(dp.bucket_counts.len());
                     for (i, count) in dp.bucket_counts.iter().enumerate() {
                         let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
                         buckets.push((bound, *count));
                     }
-                    let start_timestamp = dp.start_time_unix_nano as i64;
+                    let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                     let flags = dp.flags;
                     let exemplars = decode_exemplars(dp.exemplars);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);
@@ -453,9 +458,9 @@ pub(crate) fn decode_metric(
             .into_iter()
             .map(|dp| {
                 let mut attrs = base_attrs.clone();
-                let ts = dp.time_unix_nano as i64;
+                let ts = common::wire_nanos(dp.time_unix_nano);
                 let quantiles = dp.quantile_values.iter().map(|q| (q.quantile, q.value)).collect();
-                let start_timestamp = dp.start_time_unix_nano as i64;
+                let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                 let flags = dp.flags;
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
                 let kind = MetricKind::Summary(Summary { quantiles, count: dp.count, sum: dp.sum });
@@ -470,8 +475,8 @@ pub(crate) fn decode_metric(
                 .into_iter()
                 .map(|dp| {
                     let mut attrs = base_attrs.clone();
-                    let ts = dp.time_unix_nano as i64;
-                    let start_timestamp = dp.start_time_unix_nano as i64;
+                    let ts = common::wire_nanos(dp.time_unix_nano);
+                    let start_timestamp = common::wire_nanos(dp.start_time_unix_nano);
                     let flags = dp.flags;
                     let exemplars = decode_exemplars(dp.exemplars);
                     common::key_values_into_attrs(dp.attributes, &mut attrs);

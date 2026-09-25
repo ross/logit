@@ -30,8 +30,9 @@ pub mod logs;
 pub mod metrics;
 pub mod traces;
 
-#[allow(dead_code)] // prost emits types the codec never names (the `*Flags` enums, for one).
-pub(crate) mod generated;
+/// The committed `prost` types. Public so a test outside the crate can build a wire message the
+/// encoder never emits, such as a timestamp past `i64::MAX`.
+pub mod generated;
 
 use crate::{CodecError, Signal, SignalDecoder, SignalEncoder};
 use bytes::Bytes;
