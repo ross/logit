@@ -614,7 +614,7 @@ metric: a handshake failure surfaces as `connection_error`.
 `logit.input.accept.errors{reason}` and the `accept_error` key are not the driver's alone. Every
 connection-oriented listener records them from one shared helper, on each of its accept loops:
 this driver's TCP and Unix sockets, `logit_in`, `otlp_in`, `prometheus_in`'s bind mode,
-`datadog_in`, and `datadog_trace_in`'s TCP and Unix sockets.
+`datadog_in`, `datadog_trace_in`'s TCP and Unix sockets, and `splunk_hec_in`.
 
 There's no stream counterpart of `logit.input.reads`: a stream listener's reads aren't
 message-aligned, so a read count over a frame count wouldn't be a fill ratio of anything.
