@@ -1,0 +1,200 @@
+# A green-field starting point: every producer sends to logit, and logit decides where each
+# signal goes. Changing a backend later is an edit to this file, not to every application.
+#
+#   DogStatsD clients -> dogstatsd_in  :8125/udp
+#   syslog senders    -> syslog_in     :5140/udp  (nginx access logs take their own branch)
+#   OTel SDKs         -> otlp_grpc_in  :4317, otlp_http_in :4318
+#
+# Three gates (metrics, logs, traces) collect one signal each from every input, and each backend
+# reads the gates it wants:
+#
+#   metrics -> Datadog (per-window deltas) and VictoriaMetrics (running totals)
+#   logs    -> Datadog and Loki
+#   traces  -> Datadog and Tempo
+#
+# Check it with `logit validate logit.yaml` (DD_API_KEY must be set) and draw it with
+# `logit graph logit.yaml | dot -Tsvg > graph.svg`.
+
+# /readyz and /healthz for a container or Kubernetes probe. No TLS and no auth: keep this port
+# off public networks.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  # --- Inputs --------------------------------------------------------------------------------
+
+  # statsd and DogStatsD on one port: DogStatsD tags, events, and service checks need no setting.
+  dogstatsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  # UDP by default. For senders that support it, `transport: tcp` is reliable, and a `tls:` block
+  # encrypts it.
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+
+  # One otlp_in speaks one protocol, so gRPC and HTTP each get a listener on their usual port.
+  otlp_grpc_in:
+    type: otlp_in
+    bind: 0.0.0.0:4317
+    protocol: grpc
+
+  otlp_http_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
+
+  # --- nginx access logs ---------------------------------------------------------------------
+
+  # nginx's `access_log syslog:server=<logit>:5140` tags its lines `nginx`; those go through the
+  # branch below, and every other syslog line goes to the `logs` gate unchanged. nginx must log
+  # the `access_semconv` JSON format from docs/http-access-logs.md.
+  by_app:
+    type: route
+    sources: [syslog_in]
+    by: {attribute: syslog.tag}
+    routes:
+      nginx: nginx_lines
+
+  nginx_lines:
+    type: target
+
+  # Every backend sees these lines, their metrics, and their spans under one service name.
+  nginx_identity:
+    type: set
+    sources: [nginx_lines]
+    resource:
+      service.name: nginx
+
+  # `replace` keeps a line carrying a non-UTF-8 byte (a Latin-1 User-Agent, say) instead of
+  # failing its parse.
+  nginx_json:
+    type: json
+    sources: [nginx_identity]
+    invalid_utf8: replace
+
+  # Maps each request path to a bounded `http.route`: built-in sets for probes and static assets,
+  # your own patterns, and one `/{other}` bucket for everything else, so a scanner can't create
+  # new metric series.
+  nginx_http:
+    type: http_access
+    sources: [nginx_json]
+    routes:
+      - builtin: probes
+      - builtin: assets
+      - match: '^/api/users/[0-9]+$'
+        route: /api/users/{id}
+    route_other: /{other}
+
+  # Turns each access line into a server span, joining the caller's trace when the request
+  # carried a `traceparent`.
+  nginx_trace:
+    type: trace_context
+    sources: [nginx_http]
+    span:
+      kind: server
+      name: http.request
+      mint_id: true
+
+  # Request metrics from the same line. A line missing a field skips that metric only.
+  nginx_metrics:
+    type: kv_metrics
+    sources: [nginx_trace]
+    counters:
+      - name: http.server.requests
+    distributions:
+      - name: http.server.request.duration
+        field: http.request.duration_s
+        unit: s
+      - name: http.server.response.body.size
+        field: http.response.body.size
+        unit: By
+
+  # Metric tags: only these low-cardinality attributes. `service.name` is on the resource, which
+  # `keep` leaves alone.
+  nginx_series:
+    type: keep
+    sources: [nginx_metrics]
+    fields:
+      - http.request.method
+      - http.response.status_code
+      - http.route
+
+  # --- Signal gates --------------------------------------------------------------------------
+
+  metrics:
+    type: keep_signals
+    sources: [dogstatsd_in, nginx_series, otlp_grpc_in, otlp_http_in]
+    signals: [metrics]
+
+  # `by_app` passes on only the syslog lines it didn't route to nginx. DogStatsD events arrive as
+  # logs.
+  logs:
+    type: keep_signals
+    sources: [by_app, dogstatsd_in, nginx_metrics, otlp_grpc_in, otlp_http_in]
+    signals: [logs]
+
+  traces:
+    type: keep_signals
+    sources: [nginx_metrics, otlp_grpc_in, otlp_http_in]
+    signals: [traces]
+
+  # --- Windows -------------------------------------------------------------------------------
+
+  # Datadog takes each window's increment and skips a running total, and has no histogram form,
+  # so an OTel SDK's histograms reach VictoriaMetrics only.
+  delta_10s:
+    type: aggregate
+    sources: [metrics]
+    interval: 10s
+
+  # Prometheus remote write takes running totals and skips a per-window increment. A counter an
+  # OTel SDK already sends as a running total passes through both windows unchanged, so it
+  # reaches VictoriaMetrics only; set OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta on
+  # the SDK to send it to Datadog too.
+  cumulative_10s:
+    type: aggregate
+    sources: [metrics]
+    interval: 10s
+    temporality: cumulative
+
+  # --- Backends ------------------------------------------------------------------------------
+
+  # Datadog reads `host.name` from each event's resource; on a per-host logit, stamp it with a
+  # `set` ahead of the gates.
+  datadog_out:
+    type: datadog_out
+    sources: [logs, delta_10s]
+    api_key: !env DD_API_KEY
+    # site: datadoghq.eu     # default datadoghq.com; use your organization's site
+
+  # `datadog_out` sends only spans a Datadog Agent has processed, so OTel spans go to Datadog's
+  # OTLP intake instead. Use the same site as `datadog_out`: https://otlp.<site>.
+  datadog_traces_out:
+    type: otlp_out
+    sources: [traces]
+    protocol: http
+    endpoint: https://otlp.datadoghq.com
+    headers:
+      dd-api-key: !env DD_API_KEY
+
+  # VictoriaMetrics' remote write: Prometheus remote write 1.0, compressed with zstd.
+  victoria_out:
+    type: prometheus_out
+    sources: [cumulative_10s]
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+
+  tempo_out:
+    type: otlp_out
+    sources: [traces]
+    protocol: grpc
+    endpoint: tempo:4317
+
+  loki_out:
+    type: otlp_out
+    sources: [logs]
+    protocol: http
+    endpoint: http://loki:3100/otlp
