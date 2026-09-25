@@ -1,0 +1,26 @@
+# Leg 4 of `script/victoria-interop`: `influxdb_out` into VictoriaMetrics's `/api/v2/write`.
+# `org` and `bucket` carry distinctive values so the harness can see which of them, if any,
+# VictoriaMetrics turns into labels. VictoriaMetrics ignores the token.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: influx
+      metric:
+        name: vi_influx_gauge
+        kind: gauge
+        value: 3
+
+  victoria_metrics:
+    type: influxdb_out
+    sources: [gauge_gen]
+    url: http://victoria-metrics:8428
+    org: vi-org
+    bucket: vi-bucket
+    token: unused-by-victoriametrics

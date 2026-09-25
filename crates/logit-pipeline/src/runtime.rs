@@ -487,8 +487,11 @@ async fn run_output(
     );
 
     // `drain_inbox` borrows `inbox` rather than owning it, so dropping an abandoned `drain`
-    // leaves its unread batches in the channel for the sweep below to count.
-    let mut drain = Box::pin(drain_inbox(&mut inbox, Arc::clone(&store), telemetry.clone()));
+    // leaves its unread batches in the channel for the sweep below to count. The batch it was
+    // pushing when dropped is left in `in_hand`, for the same sweep.
+    let in_hand = InHand::default();
+    let mut drain =
+        Box::pin(drain_inbox(&mut inbox, Arc::clone(&store), telemetry.clone(), &in_hand));
     let mut write = Box::pin(write_loop(
         id.clone(),
         output.as_mut(),
@@ -531,19 +534,30 @@ async fn run_output(
     // since nothing left running would notify it. Once closed, `DiskQueue::push` accepts
     // over-bound instead of blocking, so the sweep still drops nothing (`SinkStore::finish`'s
     // "a disk-backed sink drops nothing at shutdown") and may briefly exceed `disk.max_bytes`, by
-    // at most the channel's capacity, reclaimed on the next `open`. The `Memory` path never
+    // at most the channel's capacity plus the one batch `in_hand` held, reclaimed on the next
+    // `open`. The `Memory` path never
     // pushes in the sweep, and `SinkStore::finish`'s memory drain uses `commit()`, which
     // ignores `closed`.
     store.close();
 
-    // An abandoned `drain` may leave batches in `inbox` that never reached `store`, so
-    // `finish_and_flush` can't see them. A `Disk` store persists them (it drops nothing at
+    // An abandoned `drain` may leave batches that never reached `store`, so `finish_and_flush`
+    // can't see them: the one its dropped `store.push` held (`in_hand`, first, since it arrived
+    // first), then any still in `inbox`. A `Disk` store persists them (it drops nothing at
     // shutdown); a `Memory` store counts and diagnoses them as dropped. `try_recv` never waits.
     let mut abandoned_batches: u64 = 0;
     let mut abandoned_events: u64 = 0;
-    while let Ok(delivered) = inbox.try_recv() {
-        let ctx = delivered.batch_context();
-        let batch = unwrap_batch_arc(delivered);
+    let mut parked = in_hand.lock().unwrap_or_else(|p| p.into_inner()).take();
+    loop {
+        let (batch, ctx) = match parked.take() {
+            Some(item) => item,
+            None => match inbox.try_recv() {
+                Ok(delivered) => {
+                    let ctx = delivered.batch_context();
+                    (unwrap_batch_arc(delivered), ctx)
+                }
+                Err(_) => break,
+            },
+        };
         abandoned_batches += 1;
         abandoned_events += batch.events.len() as u64;
         if matches!(store.as_ref(), SinkStore::Disk(_)) {
@@ -553,9 +567,8 @@ async fn run_output(
     if abandoned_batches > 0 {
         if matches!(store.as_ref(), SinkStore::Disk(_)) {
             diag.warn(format_args!(
-                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this \
-                 sink's inbox when it stopped -- appended to its disk spool instead of being \
-                 dropped"
+                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) not yet in this \
+                 sink's disk spool when it stopped -- appended to it instead of being dropped"
             ));
         } else {
             shutdown_dropped_batches
@@ -571,8 +584,8 @@ async fn run_output(
                 &[("reason", "shutdown")],
             );
             diag.warn(format_args!(
-                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) still in this \
-                 sink's inbox, never handed to its delivery queue, when this sink stopped"
+                "{abandoned_batches} batch(es) ({abandoned_events} event(s)) never handed to \
+                 this sink's delivery queue when it stopped"
             ));
         }
     }
@@ -590,13 +603,18 @@ async fn run_output(
 /// (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`).
 ///
 /// Borrows `inbox` so that dropping this future (when `write_loop` gives up first) leaves unread
-/// batches in the channel for `run_output`'s abandoned-inbox sweep to count.
+/// batches in the channel for `run_output`'s abandoned-inbox sweep. The batch being pushed sits
+/// in `in_hand` until its `store.push` returns, so dropping this future mid-push (parked on a
+/// full `overflow: block` store, say) leaves it there for the same sweep, instead of losing it
+/// uncounted. A push that returned has either queued the batch or counted it dropped, and
+/// `in_hand` is cleared in the same poll, so the sweep never handles a batch twice.
 ///
 /// `pub` only so `logit-bench`'s allocation tests can drive this hop directly.
 pub async fn drain_inbox(
     inbox: &mut mpsc::Receiver<Delivered>,
     store: Arc<SinkStore>,
     telemetry: Telemetry,
+    in_hand: &InHand,
 ) {
     while let Some(delivered) = inbox.recv().await {
         // Read before `unwrap_batch_arc` consumes `delivered`. The store carries it with the
@@ -606,10 +624,16 @@ pub async fn drain_inbox(
         let batch = unwrap_batch_arc(delivered);
         telemetry.count("logit.component.batches.received", 1.0, &[]);
         telemetry.count("logit.component.events.received", batch.events.len() as f64, &[]);
+        *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = Some((Arc::clone(&batch), ctx));
         store.push((batch, ctx)).await;
+        *in_hand.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
     store.close();
 }
+
+/// The batch [`drain_inbox`] is pushing into its store, if a push is in progress. `run_output`
+/// owns it and sweeps it at shutdown.
+pub type InHand = std::sync::Mutex<Option<(Arc<EventBatch>, BatchContext)>>;
 
 /// Converts a `Delivered` into the store's `Arc<EventBatch>`: one `Arc::new` for
 /// `Delivered::Owned`, a move for `Delivered::Shared`.
@@ -4491,8 +4515,8 @@ mod tests {
     /// A batch left unread in the inbox when `write_loop` gives up is counted as dropped.
     ///
     /// Batch 1 fills the one-slot queue and is reserved by the failing retry loop; batch 2 is
-    /// received by `drain_inbox` and stuck in `push`, lost with the abandoned future (a known,
-    /// uncounted residual gap); batch 3 stays in the channel for the sweep to count.
+    /// received by `drain_inbox` and parked in `push`, left in `in_hand` when the future is
+    /// abandoned; batch 3 stays in the channel. The sweep counts batches 2 and 3.
     #[tokio::test(start_paused = true)]
     async fn a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost(
     ) {
@@ -4593,12 +4617,9 @@ mod tests {
             .sum();
 
         assert_eq!(
-            dropped_for_shutdown, 2.0,
-            "batch 1 (left reserved in the queue) and batch 3 (left in the inbox, never drained \
-             into the queue at all) must both be counted as dropped -- before this fix, batch 3 \
-             would vanish uncounted, leaving this at 1.0 instead of 2.0. (Batch 2, stuck inside \
-             an abandoned in-flight `queue.push()`, is a separate, narrower residual gap this fix \
-             does not close, and is deliberately not counted here either.)"
+            dropped_for_shutdown, 3.0,
+            "batch 1 (left reserved in the queue), batch 2 (parked in the abandoned push), and \
+             batch 3 (left in the inbox) must each be counted as dropped, never lost uncounted"
         );
     }
 
@@ -4729,7 +4750,7 @@ mod tests {
              must survive, not be counted dropped"
         );
 
-        // Batches 1 and 3 survive, in order. Batch 2 was lost in the abandoned `push`.
+        // Every batch survives, in order: batch 2, parked in the abandoned `push`, too.
         let reopened = crate::disk_queue::DiskQueue::open(
             crate::disk_queue::DiskQueueConfig {
                 dir: dir.clone(),
@@ -4743,15 +4764,329 @@ mod tests {
             Diagnostics::new("test"),
         )
         .unwrap();
-        let (first, _) = reopened.peek().await.expect("batch 1 should still be present");
-        assert_eq!(counter_value_of(&first), 1.0);
-        reopened.commit().unwrap();
-        let (third, _) = reopened.peek().await.expect("batch 3 should still be present");
-        assert_eq!(counter_value_of(&third), 3.0);
-        reopened.commit().unwrap();
         reopened.close();
-        assert!(reopened.peek().await.is_none());
+        let mut spooled = Vec::new();
+        while let Some((batch, _)) = reopened.peek().await {
+            spooled.push(counter_value_of(&batch));
+            reopened.commit().unwrap();
+        }
+        assert_eq!(spooled, vec![1.0, 2.0, 3.0]);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Every `run_output` exit path accounts for every batch (DISK-09)
+    // -----------------------------------------------------------------------------------------
+
+    /// Sleeps `delay` per send, then fails with `fail` if set, else succeeds and counts it.
+    struct PacedOutput {
+        delay: Duration,
+        fail: Option<Fault>,
+        delivered: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for PacedOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            match self.fail {
+                Some(fault) => Err(anyhow::anyhow!("simulated {fault:?} failure")).context(fault),
+                None => {
+                    self.delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        }
+
+        fn duplicate_safe(&self) -> bool {
+            true
+        }
+    }
+
+    fn counter_batch(value: f64) -> Delivered {
+        Delivered::Owned(
+            EventBatch {
+                resource: Arc::new(Resource::default()),
+                scope: None,
+                events: vec![counter_event("hits", value)],
+            },
+            TraceContext::new_root().into(),
+        )
+    }
+
+    /// The on-disk length of one [`counter_batch`] record.
+    fn one_counter_record_len() -> u64 {
+        let Delivered::Owned(batch, _) = counter_batch(0.0) else { unreachable!() };
+        crate::disk_queue::test_support::encoded_record_len(
+            &batch,
+            logit_core::Provenance::default(),
+        )
+    }
+
+    fn disk_store_config(
+        dir: &std::path::Path,
+        max_bytes: u64,
+    ) -> crate::disk_queue::DiskQueueConfig {
+        crate::disk_queue::DiskQueueConfig {
+            dir: dir.to_path_buf(),
+            max_bytes,
+            segment_bytes: 2 * one_counter_record_len(),
+            overflow: OverflowPolicy::Block,
+            compression: logit_proto::frame::Compression::None,
+            checkpoint_interval: Duration::from_secs(3600),
+        }
+    }
+
+    /// Reopens the spool at `dir` and drains it, returning each batch's counter value in order.
+    async fn reopen_and_drain(dir: &std::path::Path) -> Vec<f64> {
+        let reopened = crate::disk_queue::DiskQueue::open(
+            disk_store_config(dir, u64::MAX),
+            Telemetry::default(),
+            Diagnostics::new("test"),
+        )
+        .unwrap();
+        reopened.close();
+        let mut spooled = Vec::new();
+        while let Some((batch, _)) = reopened.peek().await {
+            spooled.push(counter_value_of(&batch));
+            reopened.commit().unwrap();
+        }
+        spooled
+    }
+
+    /// Sums `logit.component.batches.dropped` for component `out` under `reason`.
+    fn batches_dropped(events: &[logit_core::Event], reason: &str) -> f64 {
+        events
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
+            .filter_map(|m| match &m.kind {
+                MetricKind::Sum(s) => Some(s.value),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn slow_retry_write_config(total_budget: Duration, grace: Duration) -> WriteLoopConfig {
+        WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget,
+                base_delay: Duration::from_millis(10),
+                max_delay: Duration::from_millis(10),
+            },
+            shutdown_grace: grace,
+            delivery_override: None,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExitPath {
+        /// The inbox closes while a slow sink is still delivering: `drain_inbox` finishes first.
+        DrainFirst,
+        /// The sink fails forever; shutdown grace expires with the store full and a push parked.
+        GraceExpiry,
+        /// The sink fails permanently for `PERMANENT_FAILURE_WINDOW`: `write_loop` returns `Err`
+        /// with the store full and a push parked.
+        PermanentError,
+        /// The inbox closes and the sink delivers everything: `write_loop` sees closed and empty.
+        ClosedAndEmpty,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled()
+    {
+        const SENT: u64 = 6;
+        for path in [
+            ExitPath::DrainFirst,
+            ExitPath::GraceExpiry,
+            ExitPath::PermanentError,
+            ExitPath::ClosedAndEmpty,
+        ] {
+            for disk in [false, true] {
+                let at = format!("{path:?}, disk={disk}");
+                let dir = crate::disk_queue::test_support::scratch_dir("exit-path-reconcile");
+                // Two batches fill the store on the paths that leave some undelivered, so the
+                // rest wait in `drain_inbox`'s parked push and in the inbox.
+                let small = matches!(path, ExitPath::GraceExpiry | ExitPath::PermanentError);
+                let store_config = match (disk, small) {
+                    (true, true) => {
+                        SinkStoreConfig::Disk(disk_store_config(&dir, 2 * one_counter_record_len()))
+                    }
+                    (true, false) => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+                    (false, true) => SinkStoreConfig::Memory(SinkQueueConfig {
+                        max_batches: 2,
+                        max_bytes: u64::MAX,
+                        overflow: OverflowPolicy::Block,
+                    }),
+                    (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                };
+                let delivered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let (delay, fail) = match path {
+                    ExitPath::DrainFirst => (Duration::from_millis(10), None),
+                    ExitPath::GraceExpiry => (Duration::from_millis(10), Some(Fault::Clean)),
+                    ExitPath::PermanentError => (Duration::from_secs(20), Some(Fault::Permanent)),
+                    ExitPath::ClosedAndEmpty => (Duration::ZERO, None),
+                };
+                let output = PacedOutput { delay, fail, delivered: Arc::clone(&delivered) };
+                let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let registry = Registry::new();
+                let run = tokio::spawn(run_output(
+                    "out".to_string(),
+                    Box::new(output),
+                    inbox_rx,
+                    registry.telemetry_for("out", "influxdb_out", "sink"),
+                    store_config,
+                    slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
+                    shutdown_rx,
+                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ));
+
+                for value in 1..=SENT {
+                    inbox_tx.send(counter_batch(value as f64)).await.unwrap();
+                }
+                // Lets `drain_inbox` fill the store and park on its next push.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                // `PermanentError` keeps the inbox open, as a live listener would: only the
+                // permanent streak ends it.
+                let held_open = match path {
+                    ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
+                        drop(inbox_tx);
+                        None
+                    }
+                    ExitPath::GraceExpiry => {
+                        shutdown_tx.send(true).unwrap();
+                        drop(inbox_tx);
+                        None
+                    }
+                    ExitPath::PermanentError => Some(inbox_tx),
+                };
+
+                let result = tokio::time::timeout(Duration::from_secs(600), run)
+                    .await
+                    .unwrap_or_else(|_| panic!("{at}: run_output stopped responding"))
+                    .expect("the task must not panic");
+                assert_eq!(
+                    result.is_err(),
+                    matches!(path, ExitPath::PermanentError),
+                    "{at}: exit result {result:?}"
+                );
+                drop(held_open);
+                drop(shutdown_tx);
+
+                let events = registry.drain(0);
+                let delivered = delivered.load(std::sync::atomic::Ordering::SeqCst) as f64;
+                let send_failed = batches_dropped(&events, "send_failed");
+                let shutdown = batches_dropped(&events, "shutdown");
+                let spooled = if disk { reopen_and_drain(&dir).await.len() as f64 } else { 0.0 };
+                assert_eq!(
+                    SENT as f64,
+                    delivered + send_failed + shutdown + spooled,
+                    "{at}: received == delivered ({delivered}) + send_failed ({send_failed}) + \
+                     shutdown ({shutdown}) + spooled ({spooled})"
+                );
+                if disk {
+                    assert_eq!(shutdown, 0.0, "{at}: a disk-backed sink drops nothing at shutdown");
+                }
+                match path {
+                    ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
+                        assert_eq!(delivered, SENT as f64, "{at}")
+                    }
+                    ExitPath::GraceExpiry => assert_eq!(delivered, 0.0, "{at}"),
+                    ExitPath::PermanentError => {
+                        assert!(send_failed >= 4.0 && send_failed < SENT as f64, "{at}")
+                    }
+                }
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    /// Batch 1 fills a one-record `Block` spool and is reserved by a failing sink; batch 2 is
+    /// parked in `drain_inbox`'s push when shutdown grace expires and `drain_inbox` is dropped.
+    /// The inbox is empty, so the sweep has only the parked batch, and must spool it.
+    #[tokio::test]
+    async fn a_batch_parked_in_a_blocked_push_when_the_drain_is_abandoned_is_spooled_by_the_sweep()
+    {
+        let dir = crate::disk_queue::test_support::scratch_dir("parked-push-spooled");
+        let output = PacedOutput {
+            delay: Duration::from_millis(10),
+            fail: Some(Fault::Clean),
+            delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Registry::new();
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            SinkStoreConfig::Disk(disk_store_config(&dir, one_counter_record_len())),
+            slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
+            shutdown_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+
+        inbox_tx.send(counter_batch(1.0)).await.unwrap();
+        inbox_tx.send(counter_batch(2.0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // batch 2 parks in the push
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output must not stop responding")
+            .expect("the task must not panic")
+            .expect("shutdown-grace expiry ends run_output with Ok");
+        drop(inbox_tx);
+
+        assert_eq!(batches_dropped(&registry.drain(0), "shutdown"), 0.0);
+        assert_eq!(reopen_and_drain(&dir).await, vec![1.0, 2.0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Decision 7 of `docs/adr/durable-checkpoint-writes-and-fault-injection.md`: a batch the
+    /// sink drops once its retry budget runs out is committed off a disk spool, counted
+    /// `send_failed`, and never replayed after a restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_disk_sink_commits_a_batch_dropped_after_its_retry_budget_so_it_never_replays() {
+        let dir = crate::disk_queue::test_support::scratch_dir("dropped-is-committed");
+        let output = PacedOutput {
+            delay: Duration::from_millis(10),
+            fail: Some(Fault::Clean),
+            delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry = Registry::new();
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+            slow_retry_write_config(Duration::from_secs(1), Duration::from_secs(5)),
+            shutdown_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ));
+        inbox_tx.send(counter_batch(1.0)).await.unwrap();
+        inbox_tx.send(counter_batch(2.0)).await.unwrap();
+        drop(inbox_tx); // the store closes, and ends empty once both are dropped
+
+        tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("run_output must not stop responding")
+            .expect("the task must not panic")
+            .expect("budget-exhausted drops don't fail the sink");
+
+        assert_eq!(batches_dropped(&registry.drain(0), "send_failed"), 2.0);
+        assert!(
+            reopen_and_drain(&dir).await.is_empty(),
+            "a batch dropped after its retry budget is committed, so a restart doesn't replay it"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4966,8 +5301,7 @@ mod tests {
         assert!(err.to_string().contains("bad"), "the returned error should be bad's, got: {err}");
     }
 
-    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`. A `delay`
-    /// past the retry budget times that attempt out as `Fault::Ambiguous` instead.
+    /// Always fails `Fault::Permanent`; the second `send` first sleeps for `delay`.
     struct DelayedSecondFailureOutput {
         delay: Duration,
         calls: Arc<std::sync::atomic::AtomicU32>,
@@ -4984,9 +5318,8 @@ mod tests {
         }
     }
 
-    /// The join loop returns `bad1`'s failure, which trips the window at 60 s. `bad2`'s 61 s
-    /// delay exceeds the default 60 s retry budget, so its second batch drops as `Ambiguous`,
-    /// resetting its streak: `bad2` never fails, and the `!contains("bad2")` check holds trivially.
+    /// Both sinks fail permanently: `bad1`'s failure window trips at 60 s and `bad2`'s at 61 s.
+    /// The join loop returns `bad1`'s error, and `bad2`'s later one doesn't overwrite it.
     #[tokio::test(start_paused = true)]
     async fn run_with_telemetry_returns_the_first_failure_not_a_later_cascading_one() {
         let mut components = Map::new();
@@ -5048,9 +5381,14 @@ mod tests {
         let (bad1_tx, bad1_rx) = mpsc::unbounded_channel();
         let (bad2_tx, bad2_rx) = mpsc::unbounded_channel();
 
-        // So one sink's failure-triggered shutdown doesn't cut the other's delay short.
-        let generous_grace = WriteLoopConfig {
-            retry: RetryConfig::default(),
+        // The budget outlasts `bad2`'s 61 s send, which would otherwise time out as `Ambiguous`
+        // and reset its failure streak. The grace keeps one sink's failure-triggered shutdown
+        // from cutting the other's delay short.
+        let generous = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                ..RetryConfig::default()
+            },
             shutdown_grace: Duration::from_secs(3600),
             delivery_override: None,
         };
@@ -5068,7 +5406,7 @@ mod tests {
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous_grace,
+                generous,
             ),
         );
         specs.insert(
@@ -5083,7 +5421,7 @@ mod tests {
                     calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 }),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                generous_grace,
+                generous,
             ),
         );
 

@@ -37,7 +37,10 @@
 //!
 //! Nothing else diverges: `# HELP`, `# UNIT`, every family type, label sets, exemplars with their
 //! trace/span references, buckets, and quantiles all cross both wire versions. Asserting on the
-//! whole body turns a regression in any of them into a readable diff.
+//! whole body turns a regression in any of them into a readable diff. The 1.0 sweep runs a second
+//! time under `compression: zstd` against the same expected files: compression is a
+//! sink-configured transport choice, so a zstd relay is the same fixed point
+//! ([ADR `victoriametrics-interop`](../../../docs/adr/victoriametrics-interop.md)).
 //!
 //! The rest of the file covers a `statsd_in -> aggregate(cumulative) -> prometheus_out(endpoint)`
 //! pipeline, a stale marker, an exemplar, the metadata cache typing a samples-only 1.0 request
@@ -56,6 +59,7 @@ use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::prometheus::{ExposeOutput, RemoteWriteOutput};
 use logit_pipeline::{Fanout, Input, Output};
+use logit_proto::prometheus::compression::Encoding;
 use logit_proto::prometheus::generated::prometheus as pb1;
 use logit_proto::prometheus::remote_write::Version;
 use logit_proto::prometheus::text::{self, Dialect};
@@ -288,10 +292,16 @@ const CASES: [(&str, &str, &str); 10] = [
     ("dialect_om_types_to_text", "om", "text"),
 ];
 
-/// One case: scrape `name`'s `.{in_ext}.in` body, relay it over remote-write `version`, request the
-/// exposition back in `out_ext`'s dialect, and assert the result equals `name`'s
-/// `.{out_ext}.expected` under [`canonicalize`].
-async fn assert_fixture_round_trips(name: &str, in_ext: &str, out_ext: &str, version: Version) {
+/// One case: scrape `name`'s `.{in_ext}.in` body, relay it over remote-write `version` compressed
+/// with `encoding`, request the exposition back in `out_ext`'s dialect, and assert the result
+/// equals `name`'s `.{out_ext}.expected` under [`canonicalize`].
+async fn assert_fixture_round_trips(
+    name: &str,
+    in_ext: &str,
+    out_ext: &str,
+    version: Version,
+    encoding: Encoding,
+) {
     let target_addr = canned_server(
         Bytes::from(read_fixture(name, &format!("{in_ext}.in"))),
         content_type_of(in_ext),
@@ -300,7 +310,7 @@ async fn assert_fixture_round_trips(name: &str, in_ext: &str, out_ext: &str, ver
     let scraped = scrape_once(target_addr).await;
 
     let (receiver_addr, mut rx) = start_receiver(16, None).await;
-    let mut sender = remote_write_sender(receiver_addr, version);
+    let mut sender = remote_write_sender(receiver_addr, version).with_compression(encoding);
     sender.send(&scraped).await.expect("the receiver should accept the write");
     let received = collect_batches(&mut rx, 1).await;
 
@@ -317,20 +327,31 @@ async fn assert_fixture_round_trips(name: &str, in_ext: &str, out_ext: &str, ver
         dialect_of(out_ext),
         version,
     );
-    assert_eq!(actual, expected, "{name}: {in_ext} -> remote-write {version:?} -> {out_ext}");
+    assert_eq!(
+        actual, expected,
+        "{name}: {in_ext} -> remote-write {version:?} ({encoding:?}) -> {out_ext}"
+    );
 }
 
 #[tokio::test]
 async fn every_fixture_round_trips_over_remote_write_1_0() {
     for (name, in_ext, out_ext) in CASES {
-        assert_fixture_round_trips(name, in_ext, out_ext, Version::V1).await;
+        assert_fixture_round_trips(name, in_ext, out_ext, Version::V1, Encoding::Snappy).await;
+    }
+}
+
+/// The VictoriaMetrics remote write protocol: 1.0 under zstd, the same fixed point as Snappy.
+#[tokio::test]
+async fn every_fixture_round_trips_over_remote_write_1_0_under_zstd() {
+    for (name, in_ext, out_ext) in CASES {
+        assert_fixture_round_trips(name, in_ext, out_ext, Version::V1, Encoding::Zstd).await;
     }
 }
 
 #[tokio::test]
 async fn every_fixture_round_trips_over_remote_write_2_0() {
     for (name, in_ext, out_ext) in CASES {
-        assert_fixture_round_trips(name, in_ext, out_ext, Version::V2).await;
+        assert_fixture_round_trips(name, in_ext, out_ext, Version::V2, Encoding::Snappy).await;
     }
 }
 
@@ -392,14 +413,9 @@ async fn an_exemplar_with_a_trace_reference_survives_the_wire() {
 /// `hits_total 2`.
 #[tokio::test]
 async fn statsd_through_cumulative_aggregate_writes_a_cumulative_counter_over_the_wire() {
-    // Reserves an ephemeral port by bind-drop-rebind, as `prometheus_round_trip.rs`'s statsd case
-    // does. `StatsdInput::local_addr` after `bind()` would avoid the race.
-    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let mut input = StatsdInput::new(addr.to_string());
+    let mut input = StatsdInput::new("127.0.0.1:0");
     input.bind().await.expect("binding statsd_in");
+    let addr = input.local_addr().expect("bind() should leave a real address behind");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {

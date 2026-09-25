@@ -39,11 +39,11 @@ digraph architecture {
   // from any other sink, but at the architecture level that distinction is the point. `redis` is
   // a broker rather than held data like the other four, but it's grouped here rather than given
   // a sixth shape for one node.
-  loki     [shape=cylinder, style=filled];
-  tempo    [shape=cylinder, style=filled];
-  influxdb [shape=cylinder, style=filled];
-  postgres [shape=cylinder, style=filled];
-  redis    [shape=cylinder, style=filled];
+  loki            [shape=cylinder, style=filled];
+  tempo           [shape=cylinder, style=filled];
+  victoriametrics [shape=cylinder, style=filled];
+  postgres        [shape=cylinder, style=filled];
+  redis           [shape=cylinder, style=filled];
 
   // -- Web: the request path, plus the re-entrant hop `/work` adds -------------------------
   // (docs/plans/demo-richer-traces.md): app calling back into nginx's /inner is a second,
@@ -112,11 +112,11 @@ digraph architecture {
   worker  -> tempo   [label="tracing"];
 
   // -- Metrics -------------------------------------------------------------------------------
-  logit -> influxdb [label="metrics"];
+  logit -> victoriametrics [label="metrics"];
 
   // -- Query: Grafana reading back what everything else wrote, dashed to set it apart from
   // the push/write traffic above -------------------------------------------------------------
-  grafana -> loki     [label="query", style=dashed];
-  grafana -> tempo    [label="query", style=dashed];
-  grafana -> influxdb [label="query", style=dashed];
+  grafana -> loki            [label="query", style=dashed];
+  grafana -> tempo           [label="query", style=dashed];
+  grafana -> victoriametrics [label="query", style=dashed];
 }

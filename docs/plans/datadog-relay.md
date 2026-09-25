@@ -276,7 +276,7 @@ The HTTP server driver behind `otlp_in`/`prometheus_in` (`crates/logit-inputs/sr
 `crate::http` in `logit-outputs` (`build_client`, `is_retryable_http_status`,
 `classify_reqwest_error`); `write_loop`'s bounded retry with `Fault` classification;
 `TlsClientConfig`/`TlsServerConfig`; the `TcpListener` driver for the Unix stream transport;
-graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 62+).
+graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 63+).
 
 ### 4. Sketch compatibility (W1, settled)
 
@@ -359,7 +359,7 @@ and an optional `trace_id_high` attribute in `_dd.p.tid`'s form, applied only wh
 half is zero. 16 hex isn't a Datadog form, so a 16-digit id is decimal under `datadog` and hex
 under the default `otel`, never guessed from the value
 ([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s Datadog amendment; graph
-rule 67). The parsers live in `logit_core::trace`, shared with the traces codec.
+rule 68). The parsers live in `logit_core::trace`, shared with the traces codec.
 
 ### 10. `statsd` additions (W4b)
 
@@ -368,7 +368,7 @@ rule 67). The parsers live in `logit_core::trace`, shared with the traces codec.
 Under either, the existing address field (`bind:`, `endpoint:`) holds the socket's absolute path,
 as a client's `DD_DOGSTATSD_URL=unix:///…` does, so no new field and no "at least one of" rule is
 needed; an operator who wants UDP and the socket at once runs two `statsd_in` components. Graph
-rule 64 requires an absolute path and rejects `tls:` under either. The listener's socket file is
+rule 65 requires an absolute path and rejects `tls:` under either. The listener's socket file is
 mode `0722`, the Agent's own, through path handling shared with `datadog_trace_in`
 (`crates/logit-inputs/src/unix.rs`). `unix` runs on the UDP driver (receive queue, `recvmmsg`,
 `SO_MEMINFO` sampler); `unix_stream` runs on the TCP driver with each packet (one datagram's worth
@@ -455,14 +455,14 @@ the OTel-direct topology is `otlp_out`.
 | W1 | **Landed** (`dd/w1`). Hand-rolled `DdSketch` with the Agent and logarithmic mappings, bins exposed, `sketches-ddsketch` removed, tripwires and wire doc updated; ADR `datadog-agent-and-intake-relay`; `lossless-transit` amendment; ADR index row. | M | W0 |
 | W2a | **Landed** (`dd/w2a`). Vendored `agent-payload` metrics proto as a third protogen family; `logit_proto::datadog` codecs for series v1/v2 (JSON and protobuf), distribution points, sketches, logs, events (Agent envelope and public v1), and service checks; two fixed-point suites. | L | W1 |
 | W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
-| W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
-| W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
-| W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
-| W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
-| W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 66; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
+| W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 63; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
+| W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 64; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
+| W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 65; schema; the example's socket component. | S | W0 |
+| W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 66; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
+| W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 67; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
 | W7a | **Landed** (`dd/w7a`). Recorded fixtures from a real Agent 7.83, dd-trace-py 4.15, and the `datadog` DogStatsD client over both Unix sockets (`script/record-fixtures datadog`, `testdata/interop/datadog/`), replayed through every decoder and both pairs; fixed what the captures contradicted: `/info`'s field types, `statsd_in`'s service-check `m:`, `datadog_trace_in`'s socket mode and stats headers, `datadog_in`'s probe routes and the logs `{}` check. | M | W5, W6 |
 | W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W7a, W8a |
-| W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 67; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
+| W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 68; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
 | W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7b |
 
 Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7a → W7b → W8b, linear; W4b

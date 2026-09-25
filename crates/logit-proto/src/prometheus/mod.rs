@@ -146,6 +146,8 @@ pub mod generated;
 
 mod assemble;
 
+pub mod compression;
+
 pub mod remote_write;
 
 pub mod text;

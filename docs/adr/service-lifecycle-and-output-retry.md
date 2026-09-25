@@ -49,7 +49,7 @@ race, dropping `input.run`'s future drops the `Fanout` inside it, which drops th
 into every one of that listener's downstream inboxes. Those inboxes then observe every sender gone
 and close, precisely the way they already do today when a listener finishes on its own
 (`FiniteInput` in `runtime.rs`'s own tests proves that cascade). The existing close-time flush
-(`run_transform`/`run_lua`, `runtime.rs:175-185` and `:268-273`) needs no change at all.
+(`run_transform`/`run_lua` in `runtime.rs`) needs no change at all.
 
 **No `Input` trait change, and no cooperation required from any listener implementation** — this is
 the decision this ADR is actually making, over the alternative of widening `Input::run` with a
