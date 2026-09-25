@@ -1125,10 +1125,10 @@ mod tests {
         let (fanout, mut rx) = recording_fanout(8);
         let tailer =
             Tailer::new(vec![PathPattern::new(&path)], LineFactory, fast_config(ReadFrom::End));
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        // Bound first: the initial scan must open the file at its end before the append, or the
+        // append could be skipped.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        // Let the initial scan open the file before appending, or the append could be skipped.
-        tokio::time::sleep(Duration::from_millis(45)).await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -1165,9 +1165,10 @@ mod tests {
             LineFactory,
             fast_config(ReadFrom::End),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        // Bound first: a file already present at the initial scan would be skipped by
+        // `read_from: end`.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(dir.join("app.log"), b"first\nsecond\n").unwrap();
 
         let events = expect_events(&mut rx, 2).await;
@@ -1325,14 +1326,10 @@ mod tests {
         assert_eq!(gauge_value(&registry, "logit.input.files.open"), Some(1.0));
 
         std::fs::remove_file(&path).unwrap();
-        // Give a couple of poll cycles time to notice the removal and reap the file.
-        tokio::time::sleep(Duration::from_millis(90)).await;
-
-        assert_eq!(
-            gauge_value(&registry, "logit.input.files.open"),
-            Some(0.0),
-            "files.open should drop to 0 once the removed file is reaped"
-        );
+        wait_until("files.open to drop to 0 once the removed file is reaped", || {
+            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+        })
+        .await;
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
@@ -1364,12 +1361,11 @@ mod tests {
         );
 
         std::fs::remove_file(&path).unwrap();
-        tokio::time::sleep(Duration::from_millis(90)).await;
-        assert_eq!(
-            gauge_value(&registry, "logit.input.watch.watches"),
-            Some(1.0),
-            "back down to just the watched directory once the removed file is reaped"
-        );
+        wait_until(
+            "watches to fall back to just the watched directory once the removed file is reaped",
+            || gauge_value(&registry, "logit.input.watch.watches") == Some(1.0),
+        )
+        .await;
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
@@ -1386,17 +1382,22 @@ mod tests {
 
         let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let factory = SelectiveFactory { deselected: deselected.clone() };
+        let registry = Registry::new();
         let (fanout, mut rx) = recording_fanout(8);
         let tailer =
-            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning));
+            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
+                .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         deselected.store(true, std::sync::atomic::Ordering::SeqCst);
-        // A couple of poll ticks' worth of time for the next scan to notice and reap.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Written before the reap, the append would be read and fail the negative assertion.
+        wait_until("the next scan to notice the de-selection and reap the file", || {
+            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+        })
+        .await;
 
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -1423,16 +1424,21 @@ mod tests {
 
         let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let factory = SelectiveFactory { deselected: deselected.clone() };
+        let registry = Registry::new();
         let (fanout, mut rx) = recording_fanout(8);
         let tailer =
-            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning));
+            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
+                .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         deselected.store(true, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(60)).await; // time to reap
+        wait_until("the next scan to notice the de-selection and reap the file", || {
+            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+        })
+        .await;
 
         // Written while de-selected: deferred, not lost.
         {
@@ -1473,12 +1479,11 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["line one"]);
 
-        // At least one checkpoint tick after the read dirtied the store.
-        tokio::time::sleep(Duration::from_millis(70)).await;
-        assert!(
-            checkpoint_path.exists(),
-            "an interval tick should have written the dirty checkpoint"
-        );
+        // "line one\n" is 9 bytes; an offset of 0 would be a tick that landed before the read.
+        wait_until("an interval tick after the read to write the dirty checkpoint", || {
+            checkpointed_offset(&checkpoint_path) == Some(9)
+        })
+        .await;
 
         shutdown(shutdown_tx, handle).await;
 
@@ -1546,19 +1551,30 @@ mod tests {
         config.checkpoint_path = Some(checkpoint_path.clone());
         config.checkpoint_interval = Duration::from_millis(20);
 
+        let registry = Registry::new();
         let (fanout, mut rx) = recording_fanout(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
             LineFactory,
             config,
-        );
+        )
+        .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
         let _ = expect_events(&mut rx, 2).await;
-        tokio::time::sleep(Duration::from_millis(50)).await; // let a checkpoint tick fire
+        wait_until("a checkpoint tick to record both files", || {
+            std::fs::read_to_string(&checkpoint_path)
+                .is_ok_and(|text| text.contains("a.log") && text.contains("b.log"))
+        })
+        .await;
 
         std::fs::remove_file(&b_path).unwrap();
-        tokio::time::sleep(Duration::from_millis(70)).await; // reap, then another tick
+        // Reaping doesn't dirty the store, so no interval tick prunes `b.log`: the forced write at
+        // shutdown does, and only if the reap came first.
+        wait_until("the removed file to be reaped", || {
+            gauge_value(&registry, "logit.input.files.open") == Some(1.0)
+        })
+        .await;
 
         shutdown(shutdown_tx, handle).await;
 
@@ -1584,12 +1600,20 @@ mod tests {
         config.checkpoint_interval = Duration::from_secs(60);
         config.checkpoint_path = Some(checkpoint_path.clone());
 
+        let registry = Registry::new();
         let (fanout, mut rx) = recording_fanout(8);
-        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Time for the initial scan and read; both intervals are 60s away.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Shutdown before the read would leave nothing to flush and make the negative assertion
+        // vacuous. `counter_total` drains, so the total accumulates across polls.
+        let mut lines = 0.0;
+        wait_until("the initial scan and read to take all three lines", || {
+            lines += counter_total(&registry, "logit.input.lines");
+            lines >= 3.0
+        })
+        .await;
         assert!(
             rx.try_recv().is_err(),
             "nothing should have flushed yet -- both intervals are 60s away"
@@ -1627,6 +1651,12 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The offset the on-disk checkpoint records for its first file, once one is written.
+    fn checkpointed_offset(path: &Path) -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()?["files"][0]["offset"].as_u64()
     }
 
     /// Decision 4 of `docs/adr/durable-checkpoint-writes-and-fault-injection.md`: a checkpoint
@@ -1707,9 +1737,9 @@ mod tests {
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
             .with_diagnostics(diag.clone())
             .with_telemetry(telemetry);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
-        // Let the initial scan open the file before appending, or the append could be skipped.
-        tokio::time::sleep(Duration::from_millis(45)).await;
+        // Bound first: the initial scan must open the file at its end before the append, or the
+        // append could be skipped.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -1941,10 +1971,9 @@ mod tests {
         config.watch = WatchMode::Inotify;
         config.poll_interval = Duration::from_secs(30);
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        // Bound first: the initial scan must arm the directory watch before the write.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        // Let the initial scan start watching `dir` first.
-        tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
         let events =
@@ -1969,9 +1998,10 @@ mod tests {
         config.watch = WatchMode::Poll;
         config.poll_interval = Duration::from_millis(300);
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        // Bound first: a file already present at the initial scan would be skipped by
+        // `read_from: end`.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
         // Nothing before the 300ms tick.
@@ -2057,7 +2087,13 @@ mod tests {
 
         // `ftruncate(2)`: same inode, length 0, one `IN_MODIFY`.
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // `counter_total` drains, so the total accumulates across polls.
+        let mut truncated = 0.0;
+        wait_until("the truncation's own wake to be handled before the replacement", || {
+            truncated += counter_total(&registry, "logit.input.files.truncated");
+            truncated >= 1.0
+        })
+        .await;
         append(&path, b"a-much-longer-replacement-line\n");
 
         let second =
@@ -2070,7 +2106,8 @@ mod tests {
             vec!["a-much-longer-replacement-line"],
             "the truncation's own wake should have rewound the file to 0"
         );
-        assert_eq!(counter_total(&registry, "logit.input.files.truncated"), 1.0);
+        truncated += counter_total(&registry, "logit.input.files.truncated");
+        assert_eq!(truncated, 1.0);
 
         shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
@@ -2146,10 +2183,9 @@ mod tests {
         config.batching.max_events = 1;
         // A glob, so the removal is what drives the file into `FileState::Draining`.
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
-
-        // Don't consume `rx` yet.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Bound first: the initial scan must open the file before it's removed, or the glob never
+        // finds it. `rx` stays unconsumed.
+        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
         std::fs::remove_file(&path).unwrap();
         // A poll tick marks the file `Draining` while it is still mostly unread.
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -2344,14 +2380,17 @@ mod tests {
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
         let _ = expect_events(&mut rx, 3).await;
-        tokio::time::sleep(Duration::from_millis(70)).await; // let a checkpoint tick land
+        // A tick can land before the first read and write offset 0, so wait for a nonzero one.
+        wait_until("a checkpoint written after the read", || {
+            checkpointed_offset(&checkpoint_path).is_some_and(|offset| offset > 0)
+        })
+        .await;
 
         // Read while running: shutdown emits the partial and legitimately advances the offset.
-        let text = std::fs::read_to_string(&checkpoint_path).unwrap();
-        // `serde_json::to_vec_pretty` puts a space after the colon.
-        assert!(
-            text.contains(&format!(r#""offset": {COMPLETE_PREFIX_LEN}"#)),
-            "the checkpoint must not cover the unterminated trailing line: {text}"
+        assert_eq!(
+            checkpointed_offset(&checkpoint_path),
+            Some(COMPLETE_PREFIX_LEN as u64),
+            "the checkpoint must not cover the unterminated trailing line"
         );
 
         shutdown(shutdown_tx, handle).await;
