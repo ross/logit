@@ -7,7 +7,9 @@
 //! resolve first, even on a field this never reads (`docs/adr/env-yaml-tag.md`).
 //!
 //! Conventions: a listener is a rounded box, a transform an ellipse, a sink a bold box, and a
-//! target a dashed box. A `sources` edge is solid; a router -> target edge is dashed.
+//! target a dashed box. A `sources` edge is solid; a router -> target edge is dashed. Listeners
+//! share the leftmost rank and sinks the rightmost, so a graph reads inputs -> processing ->
+//! backends whatever the depth of each path.
 
 use logit_config::Config;
 use logit_pipeline::graph::{self, role, Role};
@@ -29,6 +31,16 @@ pub fn render(config: &Config) -> String {
             Role::Target => ("box", "filled,dashed"),
         };
         out.push_str(&format!("  {id:?} [shape={shape}, style=\"{style}\", label={id:?}];\n"));
+    }
+    for (rank, wanted) in [("source", Role::Listener), ("sink", Role::Sink)] {
+        let ids: Vec<_> = components
+            .iter()
+            .filter(|(_, component)| role(&component.kind) == wanted)
+            .map(|(id, _)| format!("{id:?};"))
+            .collect();
+        if !ids.is_empty() {
+            out.push_str(&format!("  {{ rank={rank}; {} }}\n", ids.join(" ")));
+        }
     }
     out.push('\n');
     for (id, component) in &components {
@@ -95,6 +107,8 @@ mod tests {
         assert!(dot.contains("\"in\""), "got: {dot}");
         assert!(dot.contains("\"out\""), "got: {dot}");
         assert!(dot.contains("\"in\" -> \"out\";"), "got: {dot}");
+        assert!(dot.contains("{ rank=source; \"in\"; }"), "got: {dot}");
+        assert!(dot.contains("{ rank=sink; \"out\"; }"), "got: {dot}");
     }
 
     /// A dangling source reference still renders as an edge, making a typo'd source visible.
