@@ -220,15 +220,21 @@ pub(crate) enum BodyReadError {
 ///
 /// The bound is per *frame*, never a total: a large body that keeps arriving in pieces is making
 /// progress, however long it takes in aggregate (the distinction `logit_in`'s per-`read` body
-/// bound also draws). With `stall: None` this behaves as `limited.collect().await`, including
-/// which errors reach [`body_read_error_message`].
+/// bound also draws). With `stall: None` no frame is timed, and the same errors reach
+/// [`body_read_error_message`].
+///
+/// **One buffer, not one per frame.** A body of one frame is returned as that frame, with no
+/// copy. From the second frame on, every frame is copied into one growing [`BytesMut`] and
+/// dropped. Keeping the frames instead would keep hyper's read buffers: on h1 a frame is a slice
+/// of the connection's read buffer, and hyper allocates a fresh buffer behind it while the frame
+/// is alive, so a body arriving in small segments (a slow WAN client, one MSS per read) held
+/// several times its own size until it ended. Trailers are dropped: nothing here reads them.
 pub(crate) async fn collect_with_stall_bound(
     mut body: Limited<Incoming>,
     stall: Option<std::time::Duration>,
 ) -> Result<Bytes, BodyReadError> {
-    // Frames are accumulated rather than concatenated as they arrive so the common single-frame
-    // body is handed on without a copy, as `Collected::to_bytes` does.
-    let mut frames: Vec<Bytes> = Vec::new();
+    let mut first: Option<Bytes> = None;
+    let mut joined: Option<BytesMut> = None;
     loop {
         let next = match stall {
             Some(stall) => match tokio::time::timeout(stall, body.frame()).await {
@@ -239,22 +245,22 @@ pub(crate) async fn collect_with_stall_bound(
         };
         let Some(frame) = next else { break };
         let frame = frame.map_err(BodyReadError::Failed)?;
-        // Trailers on a request body are legal and carry nothing this input reads; dropping them
-        // is what `Collected::to_bytes` does too.
-        if let Ok(data) = frame.into_data() {
-            frames.push(data);
+        let Ok(data) = frame.into_data() else { continue };
+        if let Some(joined) = joined.as_mut() {
+            joined.extend_from_slice(&data);
+        } else if let Some(held) = first.take() {
+            let mut buf = BytesMut::with_capacity(held.len() + data.len());
+            buf.extend_from_slice(&held);
+            buf.extend_from_slice(&data);
+            joined = Some(buf);
+        } else {
+            first = Some(data);
         }
     }
-    Ok(match frames.len() {
-        0 => Bytes::new(),
-        1 => frames.pop().expect("length checked just above"),
-        _ => {
-            let mut joined = BytesMut::with_capacity(frames.iter().map(Bytes::len).sum());
-            for frame in frames {
-                joined.extend_from_slice(&frame);
-            }
-            joined.freeze()
-        }
+    Ok(match (joined, first) {
+        (Some(joined), _) => joined.freeze(),
+        (None, Some(first)) => first,
+        (None, None) => Bytes::new(),
     })
 }
 
