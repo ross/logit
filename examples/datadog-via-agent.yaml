@@ -1,0 +1,52 @@
+# Sends OpenTelemetry-origin data and DogStatsD to Datadog through a local Datadog Agent: OTLP
+# traces and metrics to the Agent's OTLP receiver (`otlp_out` to `agent:4318`), and DogStatsD to
+# its DogStatsD port (`statsd_out` to `agent:8125`, `format: dogstatsd`). The Agent adds its host
+# and container tags, computes APM trace metrics, and applies its own sampling and retries before
+# anything reaches Datadog. docs/datadog.md compares this topology with sending directly.
+#
+# The Agent's OTLP receiver is off until it's given an endpoint. In the Agent's datadog.yaml:
+#
+#   otlp_config:
+#     receiver:
+#       protocols:
+#         http:
+#           endpoint: 0.0.0.0:4318
+#     # logs:
+#     #   enabled: true      # off by default; turn on to send OTLP logs as well
+#
+# or `DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT=0.0.0.0:4318` in its environment.
+#
+# The Agent names an OTel span from the `service.name`, `operation.name`, `resource.name`, and
+# `span.type` attributes when they're present, and from semantic conventions when they aren't. It
+# converts cumulative monotonic sums to deltas (`sums.cumulative_monotonic_mode: to_delta`, its
+# default), so an OTel SDK's cumulative counters need no `aggregate` here.
+#
+# This config binds :4318 and :8125 on its own host. If the Agent runs on the same host, move
+# `logit`'s listeners or the Agent's to other ports.
+components:
+  otel_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+
+  # The Agent's OTLP logs pipeline is off by default, so logs stop here. Remove this stage once
+  # `logs.enabled: true` is set above.
+  otel_no_logs:
+    type: drop_signals
+    sources: [otel_in]
+    signals: [logs]
+
+  agent_otlp:
+    type: otlp_out
+    sources: [otel_no_logs]
+    endpoint: http://agent:4318
+
+  dogstatsd:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  agent_dogstatsd:
+    type: statsd_out
+    sources: [dogstatsd]
+    endpoint: agent:8125
+    # Keeps tags, `|c:`, `|e:`, `|card:`, `|T`, events, and service checks on the wire.
+    format: dogstatsd

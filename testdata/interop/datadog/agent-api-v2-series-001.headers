@@ -1,0 +1,9 @@
+method: POST
+path: /api/v2/series
+content-type: application/x-protobuf
+content-encoding: zstd
+dd-api-key: logit-record
+dd-agent-version: 1.5.2
+user-agent: agent-data-plane/1.5.2
+host: capture:8080
+content-length: 169

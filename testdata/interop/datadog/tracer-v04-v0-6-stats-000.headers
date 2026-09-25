@@ -1,0 +1,12 @@
+method: POST
+path: /v0.6/stats
+user-agent: Tracer/11.0.0
+datadog-entity-id: in-751952
+datadog-external-env: it-false,cn-record-fixtures,pu-00000000-0000-4000-8000-000000000001
+datadog-meta-lang: python
+datadog-meta-lang-version: 3.12.14
+datadog-meta-lang-interpreter: CPython
+datadog-meta-tracer-version: 4.15.2
+content-type: application/msgpack
+host: capture:8126
+content-length: 825

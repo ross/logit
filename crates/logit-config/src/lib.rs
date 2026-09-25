@@ -496,6 +496,69 @@ impl OtlpPaths {
     }
 }
 
+/// `datadog_out`'s per-intake base URLs (`endpoints:` in config). Each is an absolute
+/// `http://` or `https://` URL with a host and an optional path prefix, and replaces the host
+/// `site` derives for its intake; an omitted one keeps the derived `https://` host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DatadogEndpoints {
+    /// Replaces `https://api.<site>`: series, distribution points, sketches, service checks,
+    /// and events.
+    #[serde(default)]
+    pub api: Option<String>,
+    /// Replaces `https://http-intake.logs.<site>`: logs.
+    #[serde(default)]
+    pub logs: Option<String>,
+    /// Replaces `https://trace.agent.<site>`: APM traces and stats.
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
+/// How `datadog_out` compresses its request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DatadogCompression {
+    /// gzip on every route but distribution points, which get zlib-wrapped deflate, and events,
+    /// which go uncompressed.
+    #[default]
+    Gzip,
+    /// Every body uncompressed.
+    None,
+}
+
+/// Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum DatadogTraceVersion {
+    /// `/v0.4/traces`: what most tracers send and every Agent accepts.
+    #[default]
+    #[serde(rename = "v0.4")]
+    V04,
+    /// `/v0.7/traces`: carries the trace chunk and tracer payload fields v0.4 has no room for.
+    #[serde(rename = "v0.7")]
+    V07,
+}
+
+/// How `datadog_trace_out` compresses its request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DatadogTraceCompression {
+    /// Every body uncompressed, as tracers send.
+    #[default]
+    None,
+    /// gzip, which the Agent accepts.
+    Gzip,
+}
+
+/// `datadog_out`'s default `site:`, Datadog's US1 site.
+pub fn default_datadog_site() -> String {
+    "datadoghq.com".to_string()
+}
+
+/// `datadog_out`'s default per-request `timeout:`.
+pub fn default_datadog_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 /// `internal`'s `span_sample_rate` default, taken from `logit-core` so the two crates can't
 /// drift. The one place `logit-config` depends on `logit-core`.
 fn default_span_sample_rate() -> f64 {
@@ -508,7 +571,21 @@ fn default_span_sample_rate() -> f64 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
-    /// statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.
+    /// statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.
+    ///
+    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path under
+    /// `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory
+    /// must exist; a stale socket file left by an earlier run is replaced, and anything else at the
+    /// path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running
+    /// as any user can send; restrict access with the directory's permissions. To listen on UDP and
+    /// a socket at once, configure two `statsd_in` components.
+    ///
+    /// `transport: unix` behaves as UDP does: the whole `receive:` block applies. Under
+    /// `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of
+    /// newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and
+    /// `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its
+    /// connection, counted as `logit.input.frames.dropped{reason="oversize"}`: a length-framed
+    /// stream has no point to resynchronize at.
     ///
     /// Under `transport: tcp` a message is one LF-delimited line; there is no `framing:` field
     /// and no octet-counted alternative, because a statsd line may begin with a digit. A line
@@ -516,12 +593,12 @@ pub enum ComponentKind {
     /// the connection stays open and the next line still decodes.
     ///
     /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
-    /// listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected.
+    /// listener. It applies to `transport: tcp` only and is rejected under any other transport.
     /// Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or
     /// stunnel-shaped relay hop.
     ///
-    /// A TCP listener has no receive queue (the connection's own flow control is the
-    /// backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// A TCP or `unix_stream` listener has no receive queue (the connection's own flow control is
+    /// the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
     /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
     /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
     /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
@@ -537,7 +614,8 @@ pub enum ComponentKind {
         /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
         /// the connection's first byte. Each phase gets its own budget, so a silent TLS
         /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
-        /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
+        /// `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or
+        /// `unix` is rejected.
         ///
         /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
         /// next line is bounded by `idle_timeout` if set, and unbounded otherwise.
@@ -547,7 +625,8 @@ pub enum ComponentKind {
         /// How long one connection may stay quiet before this listener closes it and frees its
         /// connection-cap slot. Off unless set: with no value, a connection that sent one line
         /// and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to
-        /// disable. `transport: tcp` only: any value under `transport: udp` is rejected.
+        /// disable. `transport: tcp` or `unix_stream` only: any value under `transport: udp` or
+        /// `unix` is rejected.
         ///
         /// Recommended wherever steady traffic is expected: a connection quiet for longer than
         /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
@@ -784,6 +863,85 @@ pub enum ComponentKind {
         /// gracefully, given `handshake_timeout` to do it, so a response already in flight still
         /// goes out. The close is counted `logit.input.connections.closed{reason="idle"}`, never
         /// diagnosed as a `connection_error`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+    },
+    /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
+    /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
+    /// Serves series (v1 and v2), distribution points, sketches, service checks, events, logs, APM
+    /// traces, and APM stats over HTTP, decompressing gzip, deflate, and zstd. Host and inventory
+    /// metadata are acknowledged and discarded. A request on a known path with the wrong method
+    /// gets `405`; a request on any other path gets `404`, so an Agent reports a route this
+    /// listener doesn't speak rather than having it silently dropped. When the pipeline can't take
+    /// a request's data within 5s, the request gets `503` with `Retry-After: 1`, and the Agent
+    /// retries it.
+    DatadogIn {
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// The API keys this listener accepts, compared with each request's `DD-API-KEY` header.
+        /// A request with none of them gets `403`. Empty, the default, accepts any request,
+        /// whatever key it carries. Take each entry from the environment (`!env DD_API_KEY`)
+        /// rather than writing a key into the file. An empty entry is rejected.
+        #[serde(default)]
+        api_keys: Vec<String>,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
+        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
+        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. An Agent keeps its intake connections open between flushes, so set it
+        /// well above the Agent's flush interval (15s for metrics) if you set it at all. It also
+        /// bounds a request body that stalls mid-upload, answered `408`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+    },
+    /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
+    /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
+    /// (msgpack), `/v0.6/stats`, and `/info`, over TCP (`bind`), a Unix stream socket (`socket`),
+    /// or both at once; at least one is required. Every span is kept: the reply sets every
+    /// service's sampling rate to 1.0. Profiling, debugger, and `evp_proxy` uploads are answered
+    /// `200` and discarded; telemetry, Remote Configuration, and the other trace forms get `404`.
+    /// A request the pipeline can't take within 2s gets `503`, which a tracer retries a few times
+    /// and then drops. Spans pass through unprocessed (no obfuscation, normalization, or stats), so
+    /// send them to a real Agent (`datadog_trace_out`) or `otlp_out`, never straight to
+    /// `datadog_out`.
+    DatadogTraceIn {
+        /// The `host:port` to listen on. The Agent's default is `localhost:8126`. A tracer finds
+        /// it through `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or
+        /// `DD_TRACE_AGENT_URL=http://host:8126`.
+        #[serde(default)]
+        bind: Option<String>,
+        /// An absolute path for a Unix stream socket, the Agent's `receiver_socket`
+        /// (`/var/run/datadog/apm.socket` by default). A tracer finds it through
+        /// `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a
+        /// stale socket file at the path is replaced, and the new one is made writable by every
+        /// user (mode `0722`, the Agent's own) so unprivileged tracers can connect.
+        #[serde(default)]
+        socket: Option<String>,
+        /// Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires
+        /// `bind`: the Unix socket is always plaintext.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise
+        /// the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. A tracer flushes every second or so over a kept-alive connection, so set
+        /// it well above that if you set it at all. It also bounds a request body that stalls
+        /// mid-upload, answered `408`.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
@@ -1040,26 +1198,53 @@ pub enum ComponentKind {
     /// the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`,
     /// `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`,
     /// `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`,
-    /// `span_id`, and `flags` rename the three id sources. A successful lift overwrites any trace
-    /// reference the log already had. An event with no log, or with missing or unparseable
-    /// attributes, passes through untouched; it is never an error.
+    /// `span_id`, and `flags` rename the three id sources. `format: datadog` reads the ids a
+    /// Datadog tracer injects into its logs (`dd.trace_id`, `dd.span_id`) instead. A successful
+    /// lift overwrites any trace reference the log already had. An event with no log, or with
+    /// missing or unparseable attributes, passes through untouched; it is never an error.
     TraceContext {
-        /// The attribute holding a 32-character hex trace id. Defaults to `trace.id`; an empty
-        /// string is rejected. A `traceparent` attribute supplies the trace id when this one is
-        /// absent.
-        #[serde(default = "default_trace_id_field")]
-        trace_id: String,
-        /// The attribute holding this line's own 16-character hex span id. Defaults to `span.id`;
-        /// `null` disables the lookup, and an empty string is rejected. An absent attribute means
-        /// "no span id", not a skip (unless a `span:` block needs one); only a present but
-        /// unparseable value is an error.
-        #[serde(default = "default_span_id_field")]
-        span_id: Option<String>,
+        /// The id grammar, and the attribute names the three id fields default to. `otel` (the
+        /// default): a 32-character hex trace id and a 16-character hex span id, read from
+        /// `trace.id`/`span.id`/`trace.flags`. `datadog`: what a Datadog tracer injects into a
+        /// log, read from `dd.trace_id`/`dd.span_id` with no flags field: a trace id that is a
+        /// decimal 64-bit number or 32 hex characters, and a span id that is a decimal 64-bit
+        /// number. A 16-digit value is hex under `otel` and decimal under `datadog`; the format
+        /// decides, never the value.
+        #[serde(default)]
+        format: TraceIdFormat,
+        /// The attribute holding the trace id, in `format`'s grammar. Defaults to `trace.id`
+        /// (`dd.trace_id` under `format: datadog`); an empty string is rejected. A `traceparent`
+        /// attribute supplies the trace id when this one is absent.
+        #[serde(default)]
+        trace_id: Option<String>,
+        /// The attribute holding this line's own span id, in `format`'s grammar. Defaults to
+        /// `span.id` (`dd.span_id` under `format: datadog`); `null` disables the lookup, and an
+        /// empty string is rejected. An absent attribute means "no span id", not a skip (unless a
+        /// `span:` block needs one); only a present but unparseable value is an error.
+        #[serde(
+            default,
+            deserialize_with = "explicit_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "Option<String>")]
+        span_id: Option<Option<String>>,
         /// The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to
-        /// `trace.flags`; `null` disables the lookup, and an empty string is rejected. A
-        /// `traceparent` attribute supplies the flags when this one is absent.
-        #[serde(default = "default_flags_field")]
-        flags: Option<String>,
+        /// `trace.flags` (no lookup under `format: datadog`); `null` disables the lookup, and an
+        /// empty string is rejected. A `traceparent` attribute supplies the flags when this one is
+        /// absent.
+        #[serde(
+            default,
+            deserialize_with = "explicit_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "Option<String>")]
+        flags: Option<Option<String>>,
+        /// `format: datadog` only: the attribute holding a 128-bit trace id's high 64 bits as 1
+        /// to 16 hex characters, the form a Datadog span's `_dd.p.tid` tag takes. Used only when
+        /// the trace id itself carried no high half (a decimal id); a present but unparseable
+        /// value is an error. Unset (the default) means no lookup.
+        #[serde(default)]
+        trace_id_high: Option<String>,
         /// Keep the source attributes after a successful lift instead of removing them (the
         /// default). Removal matters for OTLP-native backends: Loki turns log attributes into
         /// structured metadata under their own names, so a leftover `trace_id` attribute would
@@ -1406,6 +1591,93 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
+    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to
+    /// Datadog's intake API, one request per route a batch needs. Host, service, source, and tags
+    /// come from each event's attributes and resource, so stamp them upstream with `set`. Points
+    /// older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service
+    /// checks) are dropped and counted before sending. Traces go out only once a Datadog Agent
+    /// has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
+    DatadogOut {
+        /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
+        /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
+        /// empty key, or one with leading or trailing whitespace, is rejected.
+        api_key: String,
+        /// The Datadog site your organization is on: `datadoghq.com` (the default),
+        /// `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`,
+        /// `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`,
+        /// `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no
+        /// scheme and no `/`.
+        #[serde(default = "default_datadog_site")]
+        site: String,
+        /// Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to
+        /// point this sink at another `logit`'s `datadog_in`.
+        #[serde(default)]
+        endpoints: DatadogEndpoints,
+        /// How request bodies are compressed. `gzip`, the default, gzips every route except
+        /// distribution points, which are zlib-deflated, and events, which Datadog accepts only
+        /// uncompressed; `none` sends every body uncompressed.
+        #[serde(default)]
+        compression: DatadogCompression,
+        /// Timeout for one request. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_datadog_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every request, a proxy's authorization header, say. A value is a
+        /// plain string, so `!env` works on it. A name this sink sets itself (`dd-api-key`,
+        /// `content-type`, `content-encoding`, `content-length`, `host`, `user-agent`) or an
+        /// HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same
+        /// header once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Tunes TLS for every `https://` request: a private CA, a client certificate, or no
+        /// verification. A non-default block is rejected when every intake is a plain `http://`
+        /// `endpoints` override.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
+    /// Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or
+    /// its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a
+    /// tracer's spans can pass through `logit` on their way to a real Agent, which still does all
+    /// trace processing. Spans and stats are sent as they arrive; nothing is sampled, normalized,
+    /// or derived, so a span that didn't come from a Datadog tracer arrives with empty service,
+    /// resource, and type fields: send OpenTelemetry spans with `otlp_out` instead. Set `endpoint`
+    /// or `socket`, not both.
+    DatadogTraceOut {
+        /// The Agent's trace API as an absolute `http://` or `https://` URL:
+        /// `http://127.0.0.1:8126` for an Agent on the same host.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// The absolute path of the Agent's trace Unix socket (its `receiver_socket`,
+        /// `/var/run/datadog/apm.socket` by default), instead of `endpoint`.
+        #[serde(default)]
+        socket: Option<String>,
+        /// The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers
+        /// send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or
+        /// a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7`
+        /// carries all of them.
+        #[serde(default)]
+        version: DatadogTraceVersion,
+        /// How request bodies are compressed: `none` (the default, what tracers send) or `gzip`,
+        /// worth it only when the Agent is across a slow link.
+        #[serde(default)]
+        compression: DatadogTraceCompression,
+        /// Timeout for one request. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_datadog_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every request. A value is a plain string, so `!env` works on it.
+        /// A name this sink sets itself (`content-type`, `content-encoding`, `content-length`,
+        /// `host`, `user-agent`, and every `datadog-*` and `x-datadog-*` header) or an HTTP/2
+        /// pseudo-header starting with `:` is rejected, as are two keys naming the same header
+        /// once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no
+        /// verification. A non-default block is rejected with an `http://` endpoint or a
+        /// `socket`.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
     /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
     /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
     LogitOut {
@@ -1512,10 +1784,17 @@ pub enum ComponentKind {
         #[serde(default)]
         structured_data: Option<SyslogStructuredData>,
     },
-    /// statsd / DogStatsD egress over UDP or TCP, the mirror of `statsd_in` and a real relay:
-    /// names, values, and tags round-trip through the decoder on the other end.
+    /// statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a
+    /// real relay: names, values, and tags round-trip through the decoder on the other end.
+    ///
+    /// Under `transport: unix` each packet is one datagram sent to the socket; under
+    /// `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian
+    /// integer, on a connection opened on the first send and reopened after an error, as under
+    /// TCP.
     StatsdOut {
-        /// `host:port`. Resolved at connect/bind time, never at config-load time.
+        /// `host:port` under `udp`/`tcp`, resolved at connect/send time, never at config-load
+        /// time. The socket file's absolute path under `unix`/`unix_stream` (the Datadog Agent's
+        /// datagram socket is `/var/run/datadog/dsd.socket`).
         endpoint: String,
         #[serde(default)]
         transport: StatsdTransport,
@@ -1529,26 +1808,31 @@ pub enum ComponentKind {
         /// `aggregate`, so this is an opt-in relay behavior.
         #[serde(default)]
         relative_gauges: bool,
-        /// Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined
-        /// per send), not a single line's length. A byte-count string. Defaults to `"1432"`, the
-        /// statsd and DogStatsD client default: a 1500-byte MTU minus IPv4/UDP headers minus
+        /// Bounds one packet's worth of packed lines (several statsd lines newline-joined per
+        /// send), not a single line's length: a UDP or Unix datagram, or one length-prefixed
+        /// `unix_stream` packet. A byte-count string. Defaults to `"1432"`, the statsd and
+        /// DogStatsD client default over UDP: a 1500-byte MTU minus IPv4/UDP headers minus
         /// headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently
-        /// fragment or fail `EMSGSIZE`. `0` is rejected. Ignored for `transport: tcp`.
+        /// fragment or fail `EMSGSIZE`. DogStatsD clients default to `"8192"` over a Unix socket,
+        /// the Agent's receive buffer size, which is the most a Datadog Agent reads per packet.
+        /// `0` is rejected. Ignored for `transport: tcp`.
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) may take before `send` reports a failure. Also bounds the TLS
-        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice
-        /// this value. Defaults to `5s`.
+        /// How long a connect attempt (including a reconnect after a dropped connection) may take
+        /// before `send` reports a failure, under `tcp` and `unix_stream`. Also bounds the TLS
+        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this
+        /// value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a
+        /// Unix socket pushes back on the sender where UDP would drop). Ignored for `udp`.
+        /// Defaults to `5s`.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
         /// Turns on TLS for this connection when present, and makes it required: a bare
         /// `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS
-        /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under `transport: udp`
-        /// is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or
-        /// stunnel-shaped relay hop.
+        /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under any other
+        /// transport is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit`
+        /// or stunnel-shaped relay hop.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
     },
@@ -2272,16 +2556,46 @@ pub fn default_prometheus_scrape_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
-fn default_trace_id_field() -> String {
-    "trace.id".to_string()
+/// `trace_context`'s id grammar, which also picks its field-name defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceIdFormat {
+    /// W3C/OpenTelemetry: 32 hex characters for a trace id, 16 for a span id.
+    #[default]
+    Otel,
+    /// Datadog log injection: decimal 64-bit ids, or a 32-hex-character trace id.
+    Datadog,
 }
 
-fn default_span_id_field() -> Option<String> {
-    Some("span.id".to_string())
+impl TraceIdFormat {
+    /// The trace id, span id, and flags attribute names `trace_context` reads, from the configured
+    /// fields: an absent field (`None`) takes this format's default, and a `null` one (`Some(None)`)
+    /// disables that lookup.
+    pub fn resolve_fields(
+        self,
+        trace_id: &Option<String>,
+        span_id: &Option<Option<String>>,
+        flags: &Option<Option<String>>,
+    ) -> (String, Option<String>, Option<String>) {
+        let (trace_default, span_default, flags_default) = match self {
+            TraceIdFormat::Otel => ("trace.id", Some("span.id"), Some("trace.flags")),
+            TraceIdFormat::Datadog => ("dd.trace_id", Some("dd.span_id"), None),
+        };
+        (
+            trace_id.clone().unwrap_or_else(|| trace_default.to_string()),
+            span_id.clone().unwrap_or_else(|| span_default.map(str::to_string)),
+            flags.clone().unwrap_or_else(|| flags_default.map(str::to_string)),
+        )
+    }
 }
 
-fn default_flags_field() -> Option<String> {
-    Some("trace.flags".to_string())
+/// Deserializes a field whose explicit `null` differs from its absence: absent is `None` (through
+/// `#[serde(default)]`), `null` is `Some(None)`.
+fn explicit_null<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// `trace_context`'s `span:` block: the defaults a minted span falls back on when the event's
@@ -2378,6 +2692,10 @@ pub struct SyslogStructuredData {
 /// `statsd_in`'s and `statsd_out`'s transport. `udp` (the default) matches classic statsd and
 /// DogStatsD clients; `tcp` is the reliable, framed transport, and what `tls:` needs underneath
 /// it. A TCP message is one LF-delimited line in both directions.
+///
+/// `unix` and `unix_stream` are the Datadog Agent's two DogStatsD Unix sockets. Under either,
+/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, not a
+/// `host:port`, and `tls:` is rejected.
 // Its own enum rather than a shared one: schemars publishes a type's name into the schema's
 // `$defs`, so sharing would document this transport by pointing at a syslog-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2386,6 +2704,15 @@ pub enum StatsdTransport {
     #[default]
     Udp,
     Tcp,
+    /// A Unix datagram socket, the Agent's `dogstatsd_socket` (default
+    /// `/var/run/datadog/dsd.socket`), which a client reaches with
+    /// `DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`. One datagram carries one or more
+    /// newline-separated lines, as over UDP, and the whole `receive:` block applies.
+    Unix,
+    /// A Unix stream socket, the Agent's `dogstatsd_stream_socket`. Each packet (one datagram's
+    /// worth of newline-separated lines) is preceded by its length as a 4-byte little-endian
+    /// integer, what `datadog-go`'s stream writer sends, reached with `unixstream://<path>`.
+    UnixStream,
 }
 
 /// Which statsd dialect `statsd_out` emits. `dogstatsd` (the default) includes the tag segment.
@@ -3544,10 +3871,25 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "trace_context", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
-                assert_eq!(trace_id, "trace.id");
-                assert_eq!(span_id, Some("span.id".to_string()));
-                assert_eq!(flags, Some("trace.flags".to_string()));
+            ComponentKind::TraceContext {
+                format,
+                trace_id,
+                span_id,
+                flags,
+                trace_id_high,
+                keep_source,
+                span,
+            } => {
+                assert_eq!(format, TraceIdFormat::Otel);
+                assert_eq!(
+                    format.resolve_fields(&trace_id, &span_id, &flags),
+                    (
+                        "trace.id".to_string(),
+                        Some("span.id".to_string()),
+                        Some("trace.flags".to_string())
+                    )
+                );
+                assert_eq!(trace_id_high, None);
                 assert!(!keep_source);
                 assert_eq!(span, None, "span lifting is opt-in");
             }
@@ -3562,12 +3904,60 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { span_id, flags, .. } => {
-                assert_eq!(span_id, None);
-                assert_eq!(flags, None);
+            ComponentKind::TraceContext { format, trace_id, span_id, flags, .. } => {
+                assert_eq!(span_id, Some(None));
+                assert_eq!(flags, Some(None));
+                assert_eq!(
+                    format.resolve_fields(&trace_id, &span_id, &flags),
+                    ("trace.id".to_string(), None, None)
+                );
             }
             other => panic!("expected TraceContext, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trace_context_datadog_format_takes_the_dd_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "datadog",
+                "trace_id_high": "_dd.p.tid"}"#,
+        )
+        .unwrap();
+        let ComponentKind::TraceContext { format, trace_id, span_id, flags, trace_id_high, .. } =
+            component.kind
+        else {
+            panic!("expected TraceContext");
+        };
+        assert_eq!(format, TraceIdFormat::Datadog);
+        assert_eq!(
+            format.resolve_fields(&trace_id, &span_id, &flags),
+            ("dd.trace_id".to_string(), Some("dd.span_id".to_string()), None)
+        );
+        assert_eq!(trace_id_high.as_deref(), Some("_dd.p.tid"));
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "datadog",
+                "trace_id": "trace_id", "span_id": null, "flags": "sampled"}"#,
+        )
+        .unwrap();
+        let ComponentKind::TraceContext { format, trace_id, span_id, flags, .. } = component.kind
+        else {
+            panic!("expected TraceContext");
+        };
+        assert_eq!(
+            format.resolve_fields(&trace_id, &span_id, &flags),
+            ("trace_id".to_string(), None, Some("sampled".to_string())),
+            "an explicit name or null beats the format's default"
+        );
+    }
+
+    #[test]
+    fn trace_context_rejects_an_unknown_format() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "trace_context", "sources": ["in"], "format": "zipkin"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("zipkin"), "got: {err}");
     }
 
     #[test]
@@ -3579,10 +3969,10 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span } => {
-                assert_eq!(trace_id, "trace_id");
-                assert_eq!(span_id, Some("span_id".to_string()));
-                assert_eq!(flags, Some("trace_flags".to_string()));
+            ComponentKind::TraceContext { trace_id, span_id, flags, keep_source, span, .. } => {
+                assert_eq!(trace_id, Some("trace_id".to_string()));
+                assert_eq!(span_id, Some(Some("span_id".to_string())));
+                assert_eq!(flags, Some(Some("trace_flags".to_string())));
                 assert!(keep_source);
                 assert_eq!(
                     span,
@@ -4435,6 +4825,128 @@ mod tests {
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn datadog_out_needs_only_an_api_key() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "datadog_out", "api_key": "k"}"#).unwrap();
+        match component.kind {
+            ComponentKind::DatadogOut {
+                api_key,
+                site,
+                endpoints,
+                compression,
+                timeout,
+                headers,
+                tls,
+            } => {
+                assert_eq!(api_key, "k");
+                assert_eq!(site, "datadoghq.com");
+                assert_eq!(endpoints, DatadogEndpoints::default());
+                assert_eq!(compression, DatadogCompression::Gzip);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert!(tls.is_empty());
+            }
+            other => panic!("expected DatadogOut, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_out", "api_key": "k", "site": "datadoghq.eu",
+                "endpoints": {"logs": "http://127.0.0.1:8080"}, "compression": "none"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogOut { site, endpoints, compression, .. } => {
+                assert_eq!(site, "datadoghq.eu");
+                assert_eq!(endpoints.logs.as_deref(), Some("http://127.0.0.1:8080"));
+                assert_eq!(endpoints.api, None);
+                assert_eq!(compression, DatadogCompression::None);
+            }
+            other => panic!("expected DatadogOut, got {other:?}"),
+        }
+        // A misspelled intake name is an error, not a silently ignored override.
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "datadog_out", "api_key": "k", "endpoints": {"log": "http://x"}}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn datadog_trace_out_defaults_to_v04_uncompressed() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_out", "endpoint": "http://127.0.0.1:8126"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceOut {
+                endpoint,
+                socket,
+                version,
+                compression,
+                timeout,
+                headers,
+                tls,
+            } => {
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:8126"));
+                assert_eq!(socket, None);
+                assert_eq!(version, DatadogTraceVersion::V04);
+                assert_eq!(compression, DatadogTraceCompression::None);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert!(tls.is_empty());
+            }
+            other => panic!("expected DatadogTraceOut, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_out", "socket": "/var/run/datadog/apm.socket",
+                "version": "v0.7", "compression": "gzip"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceOut { socket, version, compression, .. } => {
+                assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
+                assert_eq!(version, DatadogTraceVersion::V07);
+                assert_eq!(compression, DatadogTraceCompression::Gzip);
+            }
+            other => panic!("expected DatadogTraceOut, got {other:?}"),
+        }
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "datadog_trace_out", "endpoint": "http://x", "version": "v0.5"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn datadog_trace_in_takes_a_bind_a_socket_or_both() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:8126",
+                "socket": "/var/run/datadog/apm.socket"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceIn {
+                bind,
+                socket,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+            } => {
+                assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
+                assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None);
+            }
+            other => panic!("expected DatadogTraceIn, got {other:?}"),
+        }
+        let component: Component =
+            serde_json::from_str(r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket"}"#)
+                .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::DatadogTraceIn { bind: None, socket: Some(_), .. }
+        ));
     }
 
     #[test]
@@ -5856,6 +6368,41 @@ mod tests {
                 assert_eq!(tls, None);
             }
             other => panic!("expected StatsdIn, got {other:?}"),
+        }
+    }
+
+    /// The two Unix-socket transports deserialize from their snake_case names on both statsd
+    /// kinds, with the socket path in the existing address field.
+    #[test]
+    fn statsd_unix_and_unix_stream_transports_deserialize_on_both_kinds() {
+        for (name, expected) in
+            [("unix", StatsdTransport::Unix), ("unix_stream", StatsdTransport::UnixStream)]
+        {
+            let input: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_in", "bind": "/var/run/datadog/dsd.socket",
+                    "transport": "{name}"}}"#
+            ))
+            .unwrap();
+            match input.kind {
+                ComponentKind::StatsdIn { bind, transport, .. } => {
+                    assert_eq!(bind, "/var/run/datadog/dsd.socket");
+                    assert_eq!(transport, expected);
+                }
+                other => panic!("expected StatsdIn, got {other:?}"),
+            }
+
+            let output: Component = serde_json::from_str(&format!(
+                r#"{{"type": "statsd_out", "endpoint": "/var/run/datadog/dsd.socket",
+                    "transport": "{name}"}}"#
+            ))
+            .unwrap();
+            match output.kind {
+                ComponentKind::StatsdOut { endpoint, transport, .. } => {
+                    assert_eq!(endpoint, "/var/run/datadog/dsd.socket");
+                    assert_eq!(transport, expected);
+                }
+                other => panic!("expected StatsdOut, got {other:?}"),
+            }
         }
     }
 }

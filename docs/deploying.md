@@ -833,6 +833,52 @@ components:
   `logit.input.frames.dropped{reason="oversize"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.component.diagnostics{key="bad_line"}`, not a framing error.
 
+### `statsd_in`: DogStatsD over a Unix socket
+
+A Datadog Agent also listens for DogStatsD on a Unix datagram socket (`dogstatsd_socket`, by
+default `/var/run/datadog/dsd.socket`), which is how Kubernetes clients usually reach it. To stand
+in for that socket, set `transport: unix` and put the socket's absolute path in `bind:`. Clients
+then use `DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`:
+
+```yaml
+components:
+  dogstatsd:
+    type: statsd_in
+    bind: 127.0.0.1:8125           # UDP, as before
+  dsd_socket:
+    type: statsd_in
+    transport: unix                # unix (datagram) | unix_stream
+    bind: /var/run/datadog/dsd.socket
+```
+
+- **One `statsd_in` per transport.** A component listens on one socket, so to accept UDP and the
+  Unix socket at once, configure two components, as above, and list both as sources downstream.
+  [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml) carries the
+  socket component, commented out.
+- **Create the directory first.** `logit` never creates the socket's directory, because its owner
+  and mode are the access control. At startup a stale socket file from an earlier run is replaced;
+  anything else at the path (a regular file, say) fails startup rather than being deleted. The
+  socket file isn't removed on shutdown.
+- **The socket file is mode `0722`**, the Agent's own mode for this socket: a client needs only
+  write permission to send, so any user's process can send to it. Restrict senders with the
+  directory's permissions.
+- **`transport: unix` behaves like UDP.** One datagram carries one or more newline-separated lines,
+  and the whole `receive:` block applies. The kernel counters differ: a full Unix datagram queue
+  makes the *client's* send block or fail with `EAGAIN` rather than dropping in the kernel, so
+  `logit.input.kernel.drops` stays at zero and any loss shows up in the client's own telemetry
+  (`datadog-go` counts dropped packets). `logit.input.receive_buffer.*` is still reported.
+- **`transport: unix_stream` is the Agent's `dogstatsd_stream_socket`.** Each packet (one
+  datagram's worth of lines) follows its length as a 4-byte little-endian integer; clients use
+  `DD_DOGSTATSD_URL=unixstream:///path`. It runs on the TCP stream driver, so `handshake_timeout:`,
+  `idle_timeout:`, and the batch-assembly half of `receive:` apply, and the queue fields are
+  rejected. A packet declaring more than 64 KiB closes its connection
+  (`logit.input.frames.dropped{reason="oversize"}`), since a length-framed stream has no point to
+  resynchronize at. A recorded `datadog` Python client's stream decodes this way, and a real
+  Agent 7.83 accepted `statsd_out`'s.
+- **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
+  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 65),
+  which a client's `unix:///` URL couldn't name.
+
 ### `collectd_out`: relaying back onto the wire
 
 Use `collectd_out` when the destination is another collectd (or anything else speaking its
@@ -960,8 +1006,42 @@ components:
 - **What to watch.** `logit.output.requests{class="ok"|"error"}` (one per attempt) and, on TCP,
   `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
-  way, since both take the same connect path. `logit.output.datagrams` exists only under
-  `transport: udp`.
+  way, since both take the same connect path. `logit.output.datagrams` exists only under the
+  datagram transports, `udp` and `unix`.
+
+### `statsd_out`: sending to a DogStatsD Unix socket
+
+To hand metrics to a local Datadog Agent over its Unix socket, set `transport: unix` (the
+`dogstatsd_socket`) or `unix_stream` (the `dogstatsd_stream_socket`) and put the socket's absolute
+path in `endpoint:`:
+
+```yaml
+components:
+  to_agent:
+    type: statsd_out
+    sources: [enrich]
+    transport: unix
+    endpoint: /var/run/datadog/dsd.socket
+    max_packet_bytes: 8192          # DogStatsD clients' default over a Unix socket
+```
+
+- **Raise `max_packet_bytes:` to `8192`.** The `1432` default is sized for a UDP path MTU; DogStatsD
+  clients pack up to 8192 bytes into a Unix-socket packet, which is also the Agent's default read
+  buffer. Lines are packed into packets as into UDP datagrams, on both Unix transports.
+- **A full Agent queue makes a `unix` send wait, not drop.** Unlike UDP, a Unix datagram socket
+  pushes back on the sender. Each datagram's wait is bounded by `connect_timeout:` (default `5s`);
+  past it the send fails and the batch is retried or dropped under the sink's usual rules.
+- **`unix` connects its socket to the path and follows a restarted Agent.** A connected sender
+  waits for room without spinning. When the Agent restarts and rebinds the path, the next send is
+  refused on the old connection. If that's a batch's first datagram, `statsd_out` reconnects and
+  sends it again at once, so a restart between batches loses nothing; later in a batch, the batch
+  fails under the sink's usual rules and the next send reconnects. Each reconnect counts
+  `logit.output.reconnects`.
+- **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
+  4-byte little-endian integer, which a real Agent 7.83 accepted. A write that fails having
+  accepted zero bytes is retried once on a fresh connection, as on plaintext TCP.
+- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
+  `endpoint:` (rule 65).
 
 ## Tailing files and Docker logs
 
@@ -1305,6 +1385,370 @@ CORS support (`handle_http` returns 404 for an `OPTIONS` preflight and sets no
 directly from a page on a different origin, can't reach it at all. Put a reverse proxy in front that
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
 (`docs/known-gaps.md`).
+
+## `datadog_in`: standing in for Datadog's intake
+
+To choose between this and the other Datadog topologies, and for the rules that lose data when
+missed, see [`docs/datadog.md`](datadog.md). This section and the next three are the reference.
+
+`datadog_in` answers a Datadog Agent the way Datadog's intake does, so an Agent sends it series,
+sketches, service checks, events, logs, APM traces, and APM stats with nothing changed but its URLs.
+Point the Agent's `dd_url`, `logs_config.logs_dd_url`, and `apm_config.apm_dd_url` at it to replace
+Datadog, or add it under `additional_endpoints` (and the `logs_config`/`apm_config` equivalents) to
+receive a copy while Datadog keeps receiving everything.
+[`examples/datadog-intake-standin.yaml`](../examples/datadog-intake-standin.yaml) has a runnable
+config and the Agent-side settings for both. See
+[ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md) for the design.
+
+```yaml
+components:
+  datadog:
+    type: datadog_in
+    bind: 127.0.0.1:8080
+    api_keys: [!env DD_API_KEY]   # empty or absent accepts any key
+    idle_timeout: 120s            # off by default
+```
+
+**Routes.** Each of these decodes into events:
+
+| Route | What an Agent sends there |
+|---|---|
+| `/api/v2/series` (protobuf or JSON), `/api/v1/series` | metric series |
+| `/api/v1/distribution_points` | raw distribution values |
+| `/api/beta/sketches`, `/api/v1/sketches` | distribution sketches |
+| `/api/v1/check_run`, `/api/v2/service_checks` | service checks |
+| `/api/v2/events`, `/api/v1/events`, `/intake/` | events |
+| `/api/v2/logs`, `/v1/input` | logs |
+| `/api/v0.2/traces` | APM traces (`AgentPayload`) |
+| `/api/v0.2/stats` | APM stats, relayed rather than recomputed |
+
+The Agent's probes, `/api/v1/validate`, `/api/v2/validate`, and `GET /_health`, answer `200` for a
+valid key. Host and inventory metadata
+(`/api/v2/host_metadata`, `/api/v1/metadata`, host metadata on `/intake/`) and the process and
+orchestrator collectors (`/api/v1/collector`, `/api/v1/container`, `/api/v2/orch`) are answered
+`202` and discarded, counted `logit.input.requests.acknowledged{route}`. **Any other path gets
+`404`**, deliberately: an Agent feature this listener doesn't speak then shows up as errors in the
+Agent's own status and logs, instead of as data acknowledged and silently lost. A known path with
+the wrong method gets `405`.
+
+**Authentication.** With `api_keys` set, a request whose `DD-API-KEY` header matches none of them
+gets `403`, counted `logit.input.requests.rejected{reason="auth"}`. The probes also accept the key
+as an `api_key` query parameter, because that's the only place the Agent's own key check sends it.
+A key is never logged. Take the
+keys from the environment with `!env`, as the example does. `api_keys` is a shared secret, not
+transport security: add `tls:` before binding beyond loopback, since otherwise the key crosses the
+network in the clear. With `api_keys` empty, every request is accepted and `/api/v1/validate`
+answers `200` to any key, so an Agent can't tell a wrong key from a right one.
+
+**Compression.** The Agent compresses with zstd by default, and `datadog_in` decodes zstd, gzip, and
+deflate (the zlib-wrapped form the Agent sends under that name), so nothing needs changing on the
+Agent. Any other `Content-Encoding` gets `415`.
+
+**Size caps.** These are fixed, sized to what an Agent sends, not configuration:
+
+- A compressed body over 5 MiB gets `413`, on every route.
+- A body that decompresses past 5,242,880 bytes gets `413`, except on `/api/v0.2/traces`, whose cap
+  is 16 MiB. The first is the Agent's own serializer limit for series and sketches, and the trace
+  agent caps its payloads at 3.2 MB, so a conforming Agent stays under both.
+- A zstd frame that declares a window above `max(the route's decompressed cap, 8 MiB)` gets `413`
+  before anything is decompressed, because the decoder would reserve that window up front. The 8
+  MiB floor exists because a Go `klauspost/compress` streaming writer -- what the Agent's forwarder
+  uses -- declares an 8 MiB window regardless of how little it actually writes, so the 5 MiB
+  metrics/logs cap still accepts a legitimately small body sent under that window. The floor
+  doesn't raise how much decoded data a route accepts: the decompressed output is still capped at
+  the route's own limit.
+
+**A full pipeline gets `503`, not a blocked connection.** When the pipeline doesn't accept a
+request's batches within 5 seconds, `datadog_in` answers `503` with `Retry-After: 1` rather than
+holding the connection open, which is what `otlp_in` and `prometheus_in` do. The Agent's forwarder
+retries a `503` with backoff and holds the payload in its retry queue meanwhile, so nothing is lost
+until that queue fills. A blocked connection would instead cost the Agent 20 seconds before its own
+timeout, and then the same retry.
+
+- **A `503` means no consumer holds the batch that timed out.** Each batch goes to every consumer
+  downstream of `datadog_in` or to none, however many there are, so the Agent's retry is its only
+  copy.
+- **Delivery is at-least-once.** A traces or stats request carries one batch per tracer or client
+  payload, and a `503` partway through means the retry delivers the batches already delivered
+  before the deadline again. Datadog's own intake has the same shape: a resent series point
+  overwrites, a resent log or span duplicates.
+- **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
+  with its Agents, and the Agents' retry queues are absorbing the difference.
+  `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
+  deferred to the Agent, not lost. It and `logit.component.batches.sent` are disjoint: a batch
+  counts under one or the other, never both.
+
+**What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
+they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
+`unknown_route` means an Agent is using a route this listener doesn't speak, and `auth` a key
+mismatch. `docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its
+`datadog` codec section the per-item drops inside a request that decoded.
+
+## `datadog_trace_in`: standing in for the Agent's APM API
+
+[`docs/datadog.md`](datadog.md) covers when to stand in for an Agent, and where its spans must go
+next.
+
+`datadog_trace_in` answers a dd-trace tracer the way a local Datadog Agent's APM receiver does, so
+an application sends it traces and client-computed stats with nothing changed but where it points:
+`DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or `DD_TRACE_AGENT_URL` (`http://HOST:8126` or
+`unix:///PATH`). [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml)
+pairs it with a DogStatsD `statsd_in` on `:8125`, the Agent's other application-side listener.
+
+```yaml
+components:
+  apm:
+    type: datadog_trace_in
+    bind: 127.0.0.1:8126                  # and/or:
+    socket: /var/run/datadog/apm.socket   # the directory must exist
+```
+
+**Send its output to a real Agent or an OTLP backend, never straight to `datadog_out`.** Spans
+arrive exactly as the tracer wrote them: nothing here obfuscates SQL or URLs, normalizes names,
+marks top-level spans, applies sampling, or computes APM stats, all of which an Agent does before
+Datadog sees a span. Route them to `datadog_trace_out` in front of a real Agent, or to `otlp_out`.
+`datadog_out` skips a span no Agent has processed.
+
+**Routes.** `/v0.3/traces`, `/v0.4/traces`, `/v0.5/traces`, and `/v0.7/traces` (msgpack, `POST` or
+`PUT`) decode into span events, and `/v0.6/stats` into APM stats events. A JSON v0.3/v0.4 body gets
+`415`: only msgpack is decoded, which is what every current tracer sends. Every trace reply sets
+every service's sampling rate to 1.0, so the tracer keeps everything. Two groups of routes are
+answered without relaying anything:
+
+- **`404`, as an Agent with the feature turned off answers:** `/v0.1/traces`, `/v0.2/traces`,
+  `/v1.0/traces`, `/v0.1/pipeline_stats`, `/telemetry/proxy/`, and `/v0.7/config`. A tracer
+  doesn't enable these, because `/info` doesn't list them.
+- **`200` and discarded:** `evp_proxy`, profiling, debugger, symbol-database, DogStatsD-proxy,
+  tracer-flare, and OpenLineage uploads. Several tracers send these whatever `/info` says, and
+  answering stops them logging an error per upload. Each is counted
+  `logit.input.requests.acknowledged{route}`.
+
+Any other path gets `404`.
+
+**`/info` shapes what the tracer sends.** A tracer reads it at startup. This listener's document
+lists only the routes above, so the tracer doesn't turn on telemetry forwarding, Remote
+Configuration, or the v1.0 trace form. It sets `client_drop_p0s: false`, so the tracer sends every
+trace rather than dropping priority-0 ones, which would leave them out of the relay. It lists
+`/v0.6/stats`, so a tracer that computes stats keeps sending them. The module doc in
+`crates/logit-inputs/src/datadog_trace.rs` gives the reason for every field.
+
+**Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
+`-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
+headers land on the batch resource as `datadog.tracer.*`, which `datadog_trace_out` writes back as
+headers. For `/v0.7/traces`, the payload's own fields win over a header.
+
+**The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
+The directory must already exist. A stale socket file from an earlier run is replaced, but a path
+that exists and isn't a socket is refused, so a typo can't delete a file. The new socket is mode
+`0722`, the mode the Agent gives its own `apm.socket`: connecting needs only write permission, so
+a tracer running as any user can connect. Restrict access with the directory's permissions if
+that's too open. `tls:` applies to `bind` only.
+
+**A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
+seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
+`logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
+minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
+window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
+decision 11 is loss.
+Prevent it downstream: give the sinks this listener feeds a `buffer:` (memory, or `disk:` for a
+long outage) large enough to absorb a stall, so the channel `datadog_trace_in` sends into keeps
+draining.
+
+**What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
+which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
+`logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
+doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
+
+## `datadog_out`: sending straight to Datadog
+
+[`docs/datadog.md`](datadog.md) compares sending directly with sending through a local Agent.
+
+`datadog_out` posts each batch to Datadog's intake API with no Datadog Agent in the path: series
+and sketches, raw distribution values, service checks, events, logs, and Agent-processed APM traces
+and stats, each to its own route. [`examples/datadog-direct.yaml`](../examples/datadog-direct.yaml)
+runs DogStatsD through `aggregate` into it.
+
+```yaml
+components:
+  datadog:
+    type: datadog_out
+    sources: [host]
+    api_key: !env DD_API_KEY
+    site: datadoghq.eu     # default datadoghq.com
+```
+
+**Hosts.** Requests go to three hosts on your organization's site: `https://api.<site>` (series,
+distribution points, sketches, service checks, events), `https://http-intake.logs.<site>` (logs),
+and `https://trace.agent.<site>` (traces and stats). Set `site` to the one your organization uses:
+`datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`,
+`ap2.datadoghq.com`, `uk1.datadoghq.com`, `ddog-gov.com`, or `us2.ddog-gov.com`. A key from one
+site gets `403` on another.
+
+**The key.** `api_key` is sent as `DD-API-KEY` on every request. Take it from the environment with
+`!env DD_API_KEY`. A key with leading or trailing whitespace is rejected at startup, because a key
+file read with a trailing newline would otherwise reach Datadog as a different key. The key is never
+logged: a `403` is reported as a throttled `api_key_rejected` warning that names the URL, and any
+response text quoted in a log line or error has the key replaced with `<redacted>`.
+
+**Host, service, and tags come from the data.** There's no `host:` or `tags:` field on the sink.
+Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
+and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`.
+
+**Compression.** `compression: gzip`, the default, gzips every body except two. Distribution
+points go zlib-deflated, which is what Datadog documents for that route. Events go uncompressed,
+because Datadog's events route answers any compressed body `400 Invalid JSON structure`.
+`compression: none` sends every body uncompressed.
+
+**Stale data is dropped before sending.** Datadog documents a window for each kind of data and
+discards data outside it, so `datadog_out` drops it and counts
+`logit.output.records.dropped{reason="stale"}`, measured from the moment of sending:
+
+| Data | Dropped when |
+|---|---|
+| metrics (series, distribution points, sketches) | older than 1 hour, or more than 10 minutes in the future |
+| logs, events | older than 18 hours |
+| service checks | older than 10 minutes |
+| traces, stats | never |
+
+**A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
+batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
+past 18 hours are dropped as stale, not sent. The metrics window is Datadog's documented one, and
+stricter than the intake; the
+[Datadog plan's "Timestamp windows" section](plans/datadog-relay.md#11-timestamp-windows-w5) has
+what a trial org stored. Watch `records.dropped{reason="stale"}` after a replay to see how much.
+
+**Traces must have been through an Agent.** Datadog's trace intake expects spans an Agent has
+normalized, obfuscated, and marked, with the Agent's APM stats sent beside them. `datadog_out`
+sends a trace chunk only when its root span carries the Agent's `_top_level` mark. A chunk without
+it is counted `records.dropped{reason="needs_agent_processing"}`, and a span with no Datadog
+attributes at all (an OTel span) `reason="not_datadog_origin"`. So:
+
+- **Don't feed `datadog_trace_in` straight into `datadog_out`.** Its spans are raw tracer output
+  and would all be dropped. Send them to `datadog_trace_out` in front of a real Agent instead.
+- **Send OTel spans to Datadog with `otlp_out`**, not `datadog_out`.
+- **Relaying an Agent's traffic works:** what `datadog_in` receives on `/api/v0.2/traces` and
+  `/api/v0.2/stats` came from an Agent and goes out unchanged.
+
+**Size limits.** Each route's events are cut into requests under Datadog's documented limits. An
+event too large to send alone is dropped and counted `records.dropped{reason="oversize"}`.
+
+| Route | Per request |
+|---|---|
+| series | 10,000 points, 5,242,880 bytes uncompressed, 512,000 bytes compressed |
+| distribution points, sketches | the series limits (Datadog documents none) |
+| logs | 1,000 logs, 5,000,000 bytes uncompressed |
+| events | one event |
+| traces | 3,200,000 bytes uncompressed |
+
+**Delivery.** One batch goes out over up to eight routes, each as one or more requests (one per
+event, and a route over its size cap is split), sent one after another. The first that fails
+stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
+and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
+retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded. A trial
+org stored a resent series point once, the last write winning at its `(series, timestamp)`, and an
+identical log twice. Assume every other route (distribution points, sketches, events, checks,
+traces, stats) stores a resend again: none was measured. So the default is at-most-once and a
+`5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to retry instead and accept those
+duplicates.
+
+**Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
+is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
+
+```yaml
+    endpoints:
+      api: http://collector:8080
+      logs: http://collector:8080
+      traces: http://collector:8080
+```
+
+**What to watch.** `logit.output.requests{route, class}` shows each route's answers,
+`logit.output.records{route}` what Datadog accepted, and `logit.output.records.dropped{route,
+reason}` everything held back. `docs/design/internal-telemetry.md`'s `datadog_out` section has every
+counter.
+
+### Correlating dd-trace logs: `trace_context` with `format: datadog`
+
+A Datadog tracer with log injection on writes the active trace and span into every log line as
+`dd.trace_id` and `dd.span_id`: decimal 64-bit numbers, or the trace id as 32 hex characters when
+the tracer generates 128-bit ids. `trace_context`'s default `otel` format reads only W3C hex ids,
+so those lines pass through uncorrelated. `format: datadog` reads them:
+
+```yaml
+  dd_trace:
+    type: trace_context
+    sources: [dd_flat]
+    format: datadog      # reads dd.trace_id / dd.span_id, decimal or 128-bit hex
+```
+
+- **A 16-digit id is decimal under `datadog` and hex under `otel`.** The format decides; nothing
+  is guessed from the value. A 16-hex `dd.span_id` is `skipped{reason="invalid"}`.
+- **A decimal trace id fills the low 64 bits**; the high half stays zero. When the log carries the
+  high half separately, in `_dd.p.tid`'s 1-16 hex form, name that attribute in `trace_id_high:`.
+- **Both kinds of sink send the lifted ids.** `datadog_out` writes a log's trace reference as
+  `trace_id`/`span_id` in hex, which Datadog's log intake correlates on, unless the log already
+  has an attribute of either name. An OTLP sink sends them as OTLP's native `trace_id`/`span_id`.
+- **Some libraries nest the ids** under a `dd` object (`"dd":{"trace_id":"..."}`); a `flatten`
+  with `attributes: [dd]` ahead of `trace_context` turns that into the dotted names.
+
+[`examples/datadog-logs-correlation.yaml`](../examples/datadog-logs-correlation.yaml) runs
+`tail_in` → `json` → `flatten` → `trace_context` into both `datadog_out` and `otlp_out`.
+
+## `datadog_trace_out`: sending to an Agent's APM API
+
+[`docs/datadog.md`](datadog.md) covers the tracer-to-Agent relay topology this sink completes.
+
+`datadog_trace_out` sends APM traces and tracer-computed stats to a real Datadog Agent's trace API,
+as a dd-trace tracer does. It's the sending half of `datadog_trace_in`: a tracer's spans pass
+through `logit` on their way to the Agent, which still does all the trace processing Datadog
+expects. [`examples/datadog-agent-relay.yaml`](../examples/datadog-agent-relay.yaml) relays a
+tracer's traces and its DogStatsD to an Agent this way.
+
+```yaml
+components:
+  agent_apm:
+    type: datadog_trace_out
+    sources: [apm]
+    endpoint: http://agent:8126             # or:
+    # socket: /var/run/datadog/apm.socket   # the Agent's receiver_socket
+```
+
+**`endpoint` or `socket`, exactly one.** `endpoint` is the Agent's trace API as an `http://` or
+`https://` URL; `tls:` tunes an `https://` one. `socket` is the absolute path of the Agent's Unix
+socket (`receiver_socket`, `/var/run/datadog/apm.socket` by default), always plaintext.
+
+**Pick `version` by where the spans came from.** `v0.4`, the default, is what most tracers send and
+every Agent accepts. It has no room for a trace chunk's fields (its sampling priority, origin, and
+tags) or for a tracer payload's hostname, environment, runtime ID, app version, and tags. Those
+are dropped and counted `logit.output.spans.degraded{reason="no_wire_form"}`. A tracer that sent
+v0.4 never had them, so v0.4 relays its spans with nothing lost. If your tracers send `/v0.7/traces`,
+set `version: v0.7`, which carries all of them. The tracer's language, versions, container ID, and
+the rest of its request headers go out as the same headers under either version.
+
+**It relays; it doesn't process.** Spans go to the Agent as they arrived, and the Agent does the
+obfuscation, normalization, sampling, and stats computation. The Agent's reply carries sampling
+rates for a tracer to apply; this sink samples nothing and ignores them. It derives no Datadog
+fields either, so an OpenTelemetry span without `service.name`, `resource.name`, and `span.type`
+reaches the Agent with those fields empty. Send OTel spans with `otlp_out` instead.
+
+**Compression and headers.** `compression: none`, the default, sends bodies as tracers do; `gzip`
+is worth it only across a slow link. `headers:` adds headers to every request; a name the sink sets
+itself (`content-type`, `user-agent`, and every `datadog-*` or `x-datadog-*` header) is rejected.
+
+**Size limits.** A request holds at most 1,000 traces (or stats groups) and 25 MiB on the wire, the
+Agent's `max_request_bytes`. A trace too large to send alone is dropped and counted
+`logit.output.records.dropped{reason="oversize"}`.
+
+**Delivery.** Traces go first, then stats. The first request that fails stops the rest, and the
+batch is retried or dropped as one. `408`, `429`, `5xx`, and timeouts are retryable; a refused
+connection or a missing socket file is retried as a clean failure; any other `4xx` isn't retried.
+The sink isn't duplicate-safe (an Agent dedupes nothing), so the default is at-most-once; `buffer:
+{delivery: at_least_once}` retries and accepts duplicates. A `buffer:` here is also what keeps
+`datadog_trace_in` from answering tracers `503` while the Agent is unreachable.
+
+**What to watch.** `logit.output.requests{route, class}` (`route` is `traces` or `stats`),
+`logit.output.records{route}` for what the Agent accepted, and
+`logit.output.spans.degraded{reason="no_wire_form"}` for what `v0.4` couldn't carry.
+`docs/design/internal-telemetry.md`'s `datadog_trace_out` section has every counter.
 
 ## Prometheus remote-write: receiving, sending, and picking a version
 

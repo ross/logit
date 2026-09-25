@@ -14,6 +14,8 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod collectd;
+pub mod datadog;
+pub mod datadog_trace;
 pub mod docker;
 pub mod generate;
 pub mod graphite;
@@ -28,5 +30,7 @@ pub mod tail;
 pub mod tcp;
 mod tls;
 pub mod udp;
+mod unix;
+mod zstd;
 
 pub use logit_pipeline::Input;

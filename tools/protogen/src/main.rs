@@ -1,10 +1,10 @@
-//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus}/generated/`, run by
+//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus,datadog}/generated/`, run by
 //! `script/protogen` (see `docs/adr/committed-pregenerated-otlp-protobuf.md`). Messages only, no
 //! service stubs: the hand-rolled transports send and receive these bytes directly.
 //!
 //! Each proto family is generated from its own vendored sources (pinned in
-//! `crates/logit-proto/proto/README.md`) into its own `generated/` directory. Both regenerate on
-//! every run, so a diff should show changes only under the family whose sources moved.
+//! `crates/logit-proto/proto/README.md`) into its own `generated/` directory. All three regenerate
+//! on every run, so a diff should show changes only under the family whose sources moved.
 
 use std::collections::HashSet;
 use std::fs;
@@ -24,10 +24,27 @@ struct Family {
     files: &'static [(&'static str, &'static str)],
     dest: &'static str,
     rename: fn(&str) -> &str,
+    // `(parent generated file, child module name, child generated file)`: after the parent file
+    // is written, append `#[path = "<child, renamed>"] pub mod <name>;` to it as an extra
+    // top-level item -- see the Datadog family's entry for why a *generation-side* fixup, rather
+    // than another hand-written nesting level in `generated/mod.rs`, is what a genuine
+    // parent-package/child-package pair (as opposed to sibling packages, which OTLP's five are)
+    // needs.
+    nest: &'static [(&'static str, &'static str, &'static str)],
 }
 
 fn identity(name: &str) -> &str {
     name
+}
+
+// sketches-go's ddsketch.proto declares `package test;` (upstream's own placeholder package
+// name, never renamed there) -- rewritten to the name the rest of this repo actually uses.
+// Every other Datadog output file keeps prost-build's package-derived name as-is.
+fn rename_datadog(name: &str) -> &str {
+    match name {
+        "test.rs" => "ddsketch.rs",
+        other => other,
+    }
 }
 
 // Renamed short: opentelemetry.proto.common.v1.rs -> common.v1.rs -- generated/mod.rs nests each
@@ -65,6 +82,7 @@ const FAMILIES: &[Family] = &[
         ],
         dest: "crates/logit-proto/src/otlp/generated",
         rename: strip_otlp_prefix,
+        nest: &[],
     },
     Family {
         // `remote.proto`'s `import "types.proto"` and the nested v2 file resolve against the
@@ -87,6 +105,83 @@ const FAMILIES: &[Family] = &[
         ],
         dest: "crates/logit-proto/src/prometheus/generated",
         rename: identity,
+        nest: &[],
+    },
+    Family {
+        // `agent_payload.proto`'s (the agent-payload one, package `datadog.agentpayload`) `import
+        // "github.com/gogo/protobuf/gogoproto/gogo.proto"` resolves against the `datadog/include`
+        // root, which holds a relative symlink to the one vendored `gogoproto/gogo.proto` at that
+        // Go-style import path (rather than a second copy) -- see
+        // `crates/logit-proto/proto/README.md`'s Datadog section. `/usr/include` is still needed
+        // for `gogo.proto`'s own `import "google/protobuf/descriptor.proto"`, same as the
+        // Prometheus family above.
+        //
+        // The datadog-agent trace/stats files (package `datadog.trace`, plus `datadog.trace.idx`
+        // for the `idx/` pair vendored only to satisfy `agent_payload.proto`'s -- the trace one's,
+        // not the agent-payload one's -- import) resolve their `import "datadog/trace/..."` lines
+        // against the `datadog-agent/pkg/proto` root, matching upstream's own include layout.
+        // sketches-go's `ddsketch.proto` has no imports of its own but still needs its root on the
+        // include path -- protoc requires every input file to sit under some declared include
+        // directory.
+        //
+        // `agent_payload.proto` (the trace one)'s `idxTracerPayloads` field is typed
+        // `idx.TracerPayload` -- a genuine *child* package (`datadog.trace.idx` sits directly
+        // under `datadog.trace`), not a sibling like OTLP's five. prost-build emits that
+        // cross-package reference as the bare, unqualified `idx::TracerPayload` (checked against
+        // the actual generated output, not assumed) -- which only resolves if `idx` is declared as
+        // a real child item inside whatever module holds `datadog.trace.rs`'s own top-level items.
+        // A `#[path] mod trace;` file-module's content is fixed to exactly its file; nothing
+        // outside it (`generated/mod.rs` included) can add a sibling `pub mod idx` inside that
+        // scope. So `nest` below appends `idx`'s own `#[path] pub mod idx;` declaration straight
+        // into the written `datadog.trace.rs`, as an ordinary extra item (item order doesn't
+        // matter) -- both files stay genuine, independent file modules, each free to keep the
+        // shared `HEADER`'s inner attributes at its own true start (see `generated/mod.rs`'s own
+        // comment on why `mod trace { include!(..); pub mod idx { include!(..); } }` can't be used
+        // instead: those inner attributes wouldn't be at the true start of a file module anymore).
+        includes: &[
+            "crates/logit-proto/proto/datadog/agent-payload/proto",
+            "crates/logit-proto/proto/datadog/include",
+            "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto",
+            "crates/logit-proto/proto/datadog/sketches-go",
+            "/usr/include",
+        ],
+        files: &[
+            (
+                "crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto",
+                "datadog.agentpayload.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/span.proto",
+                "datadog.trace.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/tracer_payload.proto",
+                "datadog.trace.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/agent_payload.proto",
+                "datadog.trace.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/stats.proto",
+                "datadog.trace.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/idx/span.proto",
+                "datadog.trace.idx.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/datadog-agent/pkg/proto/datadog/trace/idx/tracer_payload.proto",
+                "datadog.trace.idx.rs",
+            ),
+            (
+                "crates/logit-proto/proto/datadog/sketches-go/ddsketch/pb/ddsketch.proto",
+                "test.rs",
+            ),
+        ],
+        dest: "crates/logit-proto/src/datadog/generated",
+        rename: rename_datadog,
+        nest: &[("datadog.trace.rs", "idx", "datadog.trace.idx.rs")],
     },
 ];
 
@@ -113,7 +208,16 @@ fn main() {
             let body = fs::read_to_string(out_dir.join(generated))
                 .unwrap_or_else(|e| panic!("read generated {generated}: {e}"));
             let short = (family.rename)(generated);
-            fs::write(Path::new(family.dest).join(short), format!("{HEADER}{body}"))
+            let mut out = format!("{HEADER}{body}");
+            for (parent, child_mod, child_generated) in family.nest {
+                if *parent == *generated {
+                    let child_short = (family.rename)(child_generated);
+                    out.push_str(&format!(
+                        "\n#[rustfmt::skip]\n#[path = \"{child_short}\"]\npub mod {child_mod};\n"
+                    ));
+                }
+            }
+            fs::write(Path::new(family.dest).join(short), out)
                 .unwrap_or_else(|e| panic!("write {short}: {e}"));
             println!("wrote {}/{short}", family.dest);
         }

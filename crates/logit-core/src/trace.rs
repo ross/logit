@@ -64,6 +64,58 @@ pub fn parse_span_id(s: &str) -> Option<[u8; 8]> {
     parse_hex::<8>(s).filter(|id| *id != [0; 8])
 }
 
+/// Parses a Datadog trace id as a log carries it (`dd.trace_id`): a decimal uint64, which fills the
+/// low 64 bits with the high half zero, or 32 hex characters (a 128-bit id, what newer tracers
+/// inject). `None` if neither, or all-zero.
+///
+/// Never 16 hex characters: a 16-digit string is decimal here, where [`parse_trace_id`]'s callers
+/// read hex. The attribute's format decides the grammar; nothing guesses from the value.
+pub fn parse_trace_id_datadog(s: &str) -> Option<[u8; 16]> {
+    if s.len() == 32 {
+        return parse_trace_id(s);
+    }
+    parse_decimal_u64(s).filter(|&low| low != 0).map(|low| trace_id_bytes(0, low))
+}
+
+/// Parses a Datadog span id as a log carries it (`dd.span_id`): a decimal uint64. `None` if not
+/// one, or zero.
+pub fn parse_span_id_datadog(s: &str) -> Option<[u8; 8]> {
+    parse_decimal_u64(s).filter(|&id| id != 0).map(u64::to_be_bytes)
+}
+
+/// `_dd.p.tid`'s value as a 128-bit trace id's high 64 bits, by Go's `strconv.ParseUint(v, 16,
+/// 64)` (what the Agent's `Get128BitTraceID` calls): 1 to 16 hex digits, either case, no prefix.
+pub fn parse_trace_id_high(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(s, 16).ok()
+}
+
+/// A 128-bit id from its halves, big-endian.
+pub fn trace_id_bytes(high: u64, low: u64) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&high.to_be_bytes());
+    id[8..].copy_from_slice(&low.to_be_bytes());
+    id
+}
+
+/// A 128-bit id's `(high, low)` halves.
+pub fn trace_id_halves(id: &[u8; 16]) -> (u64, u64) {
+    let high = u64::from_be_bytes(id[..8].try_into().expect("8 bytes"));
+    let low = u64::from_be_bytes(id[8..].try_into().expect("8 bytes"));
+    (high, low)
+}
+
+/// 1 to 20 ASCII digits that fit a `u64`, by Go's `strconv.ParseUint(v, 10, 64)`: leading zeros
+/// allowed, no sign, no whitespace. `u64::from_str` alone would accept a leading `+`.
+fn parse_decimal_u64(s: &str) -> Option<u64> {
+    if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Parses a W3C Trace Context `traceparent` header value
 /// (<https://www.w3.org/TR/trace-context/>): `00-<32 hex trace-id>-<16 hex parent-id>-<2 hex
 /// flags>`, 55 ASCII characters, case-insensitive. Returns `(trace_id, parent_id, flags)`.
@@ -263,6 +315,99 @@ mod tests {
         assert_ne!(a, there);
         let short: [u8; 8] = random_id_bytes();
         assert_ne!(short, [0; 8]);
+    }
+
+    // Datadog's documented forms: a decimal uint64 `dd.trace_id` (older tracers), a 128-bit hex
+    // one (newer tracers), and `_dd.p.tid` carrying that hex's high half.
+    const DD_DECIMAL: &str = "1234567890123456789";
+    const DD_HEX_128: &str = "64de8e2b0000000012345678abcdef12";
+    const DD_TID: &str = "64de8e2b00000000";
+
+    #[test]
+    fn datadog_trace_id_parses_a_decimal_uint64_into_the_low_half() {
+        let id = parse_trace_id_datadog(DD_DECIMAL).unwrap();
+        assert_eq!(trace_id_halves(&id), (0, 1_234_567_890_123_456_789));
+        assert_eq!(to_hex(&id), "0000000000000000112210f47de98115");
+        let max = parse_trace_id_datadog(&u64::MAX.to_string()).unwrap();
+        assert_eq!(trace_id_halves(&max), (0, u64::MAX), "20 digits, the u64 ceiling");
+        let padded = parse_trace_id_datadog("0000000000000000042").unwrap();
+        assert_eq!(trace_id_halves(&padded), (0, 42), "leading zeros, as Go's ParseUint allows");
+    }
+
+    #[test]
+    fn datadog_trace_id_parses_128_bit_hex() {
+        let id = parse_trace_id_datadog(DD_HEX_128).unwrap();
+        assert_eq!(trace_id_halves(&id), (0x64de_8e2b_0000_0000, 0x1234_5678_abcd_ef12));
+        assert_eq!(Some(id), parse_trace_id(DD_HEX_128));
+        assert_eq!(
+            trace_id_bytes(parse_trace_id_high(DD_TID).unwrap(), 0x1234_5678_abcd_ef12),
+            id,
+            "_dd.p.tid supplies the same high half"
+        );
+    }
+
+    #[test]
+    fn datadog_trace_id_reads_16_digits_as_decimal_never_hex() {
+        let id = parse_trace_id_datadog("1234567890123456").unwrap();
+        assert_eq!(trace_id_halves(&id), (0, 1_234_567_890_123_456));
+        assert_eq!(parse_trace_id_datadog(&"ab".repeat(8)), None, "16 hex is not a Datadog form");
+    }
+
+    #[test]
+    fn datadog_trace_id_rejects_overflow_signs_zero_and_junk() {
+        let zero_hex = "00".repeat(16);
+        let non_hex = "zz".repeat(16);
+        for bad in [
+            "18446744073709551616",
+            "123456789012345678901",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "0",
+            "00000000000000000000",
+            "",
+            "0x1234",
+            "12a",
+            &zero_hex,
+            &non_hex,
+        ] {
+            assert_eq!(parse_trace_id_datadog(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn datadog_span_id_is_decimal_only() {
+        assert_eq!(
+            parse_span_id_datadog(DD_DECIMAL),
+            Some(1_234_567_890_123_456_789_u64.to_be_bytes())
+        );
+        assert_eq!(
+            parse_span_id_datadog("1234567890123456"),
+            Some(1_234_567_890_123_456_u64.to_be_bytes()),
+            "16 digits are decimal"
+        );
+        for bad in ["0", "", "+5", "18446744073709551616", "abcdef0123456789", "ab"] {
+            assert_eq!(parse_span_id_datadog(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn trace_id_high_follows_go_parse_uint_base_16() {
+        assert_eq!(parse_trace_id_high(DD_TID), Some(0x64de_8e2b_0000_0000));
+        assert_eq!(parse_trace_id_high("ABC"), Some(0xabc));
+        assert_eq!(parse_trace_id_high("0"), Some(0));
+        assert_eq!(parse_trace_id_high(""), None);
+        assert_eq!(parse_trace_id_high("0x12"), None);
+        assert_eq!(parse_trace_id_high("+12"), None);
+        assert_eq!(parse_trace_id_high("11112222333344445"), None, "17 digits");
+    }
+
+    #[test]
+    fn trace_id_halves_inverts_trace_id_bytes() {
+        let id = trace_id_bytes(0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10);
+        assert_eq!(id, core::array::from_fn(|i| i as u8 + 1));
+        assert_eq!(trace_id_halves(&id), (0x0102_0304_0506_0708, 0x090a_0b0c_0d0e_0f10));
     }
 
     #[test]

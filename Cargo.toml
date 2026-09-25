@@ -72,7 +72,6 @@ socket2 = "0.6.5"
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_norway = "0.9"
-sketches-ddsketch = "0.4"
 # `logit-core::metric::HyperLogLog` (docs/plans/lossless-transit.md's W2) -- a real, mergeable
 # cardinality estimator for `MetricKind::Set`, replacing the stub. Apache-2.0, in `deny.toml`'s
 # allowlist. Its `CardinalityEstimator` has no `as_bytes`/`to_bytes` of its own -- only a
@@ -84,12 +83,14 @@ cardinality-estimator = { version = "1.0.3", features = ["with_serde"] }
 # Prometheus remote-write mandates Snappy **block** compression (not framed) for the request body
 # (docs/plans/prometheus-remote-write.md). BSD-3-Clause, allowed in `deny.toml`.
 snap = "1"
-# Prometheus remote-write's zstd variant, the VictoriaMetrics remote write protocol, both
-# directions (docs/adr/victoriametrics-interop.md). Pure Rust, MIT, no C toolchain. Its encoder
-# reaches about libzstd level 1 and its decoder is slower than libzstd; the goal is interop with
-# vmagent and VictoriaMetrics, not libzstd's ratio. Not the native frame's compression (see the
-# `lz4_flex` note above).
-ruzstd = "0.9"
+# zstd, two uses: Prometheus remote-write's zstd variant, the VictoriaMetrics remote write
+# protocol, both directions (docs/adr/victoriametrics-interop.md); and datadog_in's request decode
+# (docs/adr/datadog-agent-and-intake-relay.md, decision 4), since a Datadog Agent compresses with
+# zstd by default. Pure Rust, MIT, no C toolchain, unlike the `zstd` crate (see the `lz4_flex`
+# note above). Its encoder reaches about libzstd level 1 and its decoder is slower than libzstd;
+# the goal is interop with vmagent, VictoriaMetrics, and the Agent, not libzstd's ratio. Not the
+# native frame's compression. `hash` lets the decoder verify a frame's content checksum.
+ruzstd = { version = "0.9", features = ["hash"] }
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR `containerized-development`) intact, since rustls has no system OpenSSL to link against.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -103,6 +104,11 @@ hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 # -- a `hyper_util::client::legacy::Client` replaces the hand-rolled per-request TcpStream connect,
 # which is what gives the gRPC transport both TLS and connection pooling in one move.
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http2"] }
+# datadog_trace_out's Unix-socket connector for that client (docs/adr/datadog-agent-and-intake-relay.md,
+# decision 13): `hyper-util`'s client takes any `tower_service::Service<Uri>` as its connector.
+# Already present transitively (via `hyper-util` and `reqwest`) at this exact version -- a direct
+# dependency adds no new crate version to the graph.
+tower-service = "0.3.3"
 http = "1"
 http-body-util = "0.1"
 # otlp_out's optional gzip request compression and otlp_in's matching decode

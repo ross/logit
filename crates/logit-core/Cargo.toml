@@ -10,7 +10,6 @@ description = "Internal event model: Event, Value, Resource, metric kinds, attri
 bytes.workspace = true
 smallvec.workspace = true
 lasso = { version = "0.7", features = ["multi-threaded"] }
-sketches-ddsketch.workspace = true
 # `HyperLogLog`'s underlying cardinality estimator (docs/plans/lossless-transit.md's W2).
 cardinality-estimator.workspace = true
 # Drives `cardinality-estimator`'s tuple-shaped `Serialize`/`Deserialize` impl through the
@@ -28,6 +27,9 @@ tracing-subscriber.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
+# `sketch.rs`'s property tests: every quantile within the mapping's bound of the true quantile
+# of a random population, merge equals one sketch fed both halves, bytes round-trip.
+proptest.workspace = true
 # `tests/type_sizes.rs` asserts `size_of::<bytes::Bytes>()` directly -- it's the term that sets
 # `Value`'s size, so the assertion is more legible naming it than hiding it behind `Value`.
 # An integration test can't reach a crate's ordinary dependencies, hence the restatement here.

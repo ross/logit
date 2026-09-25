@@ -69,3 +69,7 @@ reqwest.workspace = true
 # Snappy-block-compresses them. Both already transitive at these versions via `logit-proto`.
 prost.workspace = true
 snap.workspace = true
+# `tests/datadog_in_round_trip.rs` posts every route gzip-, deflate-, and zstd-compressed, as a
+# Datadog Agent does. Both already transitive at these versions via `logit-inputs`.
+flate2.workspace = true
+ruzstd.workspace = true

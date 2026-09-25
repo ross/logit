@@ -8,9 +8,11 @@
 
 pub mod buffer;
 pub mod collectd;
+pub mod datadog;
 pub mod frame;
 pub mod graphite;
 pub mod msgbuf;
+pub mod msgpack;
 pub mod native;
 pub mod otlp;
 pub mod prometheus;

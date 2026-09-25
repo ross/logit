@@ -656,6 +656,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`crates/logit-proto/src/graphite/`, [ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)),
     whose module doc is likewise the authority. It is the narrowest wire model: a carbon datapoint
     is one untyped number at one whole second.
+  - The `encode (Datadog)` rows are the Datadog codec (`crates/logit-proto/src/datadog/`,
+    [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)), whose module
+    doc's encode tables are the authority. They cover what leaves `datadog_out` and
+    `datadog_trace_out` from another protocol's data; a Datadog-origin batch relays losslessly.
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
@@ -698,6 +702,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   | encode (Graphite) | **Resource** attributes are rendered as carbon tags, indistinguishable from event ones | none (documented) | The `influxdb_out`/`statsd_out` rule: one wire tag set, and dropping the resource half would lose `service.name`/`host.name`. Invisible within the pair (a bare `graphite_in` resource is empty, so `graphite_in -> graphite_out` stays a fixed point), but cross-protocol `otlp_in -> graphite_out -> graphite_in` returns every resource attribute as an *event* attribute. Carbon has no second tag scope. |
   | encode (Graphite) | A path component longer than **255 bytes** → written unchanged, and rejected by whisper | none (documented) | Carbon has no path length bound, and the codec deliberately does **not** truncate: a truncated path is a *different, silently wrong* series, while an over-long one fails visibly at storage. 255 bytes is a filesystem limit (whisper stores `a.b.c` as `a/b/c.wsp`), binding only whisper-backed Graphites, not `go-carbon` with a ClickHouse backend, which is why the codec shouldn't enforce it. `/` and `\` *are* substituted with `_`, since they'd create nested directories. Put a length check in an operator-side `lua` stage if needed. |
   | encode (Prometheus) | A `MetricRecord` flagged `NO_RECORDED_VALUE` → **skipped** | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The rule for every sink with no no-value wire form (the `sinks with no no-value wire form / `aggregate`` row above): exposition has no "no value here" marker, so emitting the default payload fabricates a reading. Prometheus staleness is scrape-level (a series stops appearing), which a relay can't synthesize from one flagged point. |
+  | encode (Datadog) | OTel-only span fields (`status: Ok`, span `flags`, `SpanExt`'s status message, `trace_state`, and dropped counts, and a link's or span event's dropped-attribute count) → dropped | `logit.output.spans.degraded{reason="no_wire_form"}`, one per field | A Datadog span has no field for any of them. `kind` survives as `meta["span.kind"]`, and a span with no `service.name`/`resource.name`/`span.type` goes out with those fields empty (the "`datadog_trace_out` derives no Datadog fields from an OTel span" entry). |
+  | encode (Datadog) | A span attribute that is an `Array`, `Map`, or `Null` → a `meta` string of its JSON text; an integer an `f64` can't hold exactly → `metrics` as the nearest `f64` | `logit.output.spans.degraded{reason="json_text"\|"int_as_f64"}` | `meta` is string-to-string and `metrics` string-to-`f64`: the only typed homes a span attribute has. |
+  | encode (Datadog) | `Histogram`, `ExponentialHistogram`, `Summary`, `GaugeDelta`, `SetMembers`, and a cumulative or non-monotonic `Sum` → **skipped** | `logit.output.metrics.skipped{metric_kind}` | A series is `count`, `rate`, `gauge`, or unspecified; a delta monotonic `Sum` is the only sum a `count` can carry. The "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
+  | encode (Datadog) | `Set` → a `gauge` of `estimate()`; a `Distribution` under a logarithmic mapping → re-binned into `Mapping::agent`; a `Samples` with `sample_rate < 1` → each value repeated `weight()` times | `logit.output.metrics.degraded{reason="set_estimate"\|"rebinned"\|"sample_rate_expanded"}` | A set gauge is the Agent's own `s`. A metrics sketch carries no mapping, so the receiver assumes the Agent's. Distribution points have no rate field. |
 
   **Still open, too narrow for a row:** `BodyFormat` has no OTLP field and round-trips through a
   reserved attribute (`logit.body_format`), lossless but attribute-shaped (`otlp/logs.rs`'s module
@@ -791,8 +799,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   hard cardinality cap (the TTL bounds only the retained set's tail, not its peak).
 
   **Sample-rate extrapolation.** `DdSketch::add_weighted(value, count)`
-  (`crates/logit-core/src/metric.rs`) delegates to `sketches_ddsketch::DDSketch::add_with_count`,
-  an O(1) native weighted add. A repeated-`add` loop and a binary-doubling `merge` were rejected;
+  (`crates/logit-core/src/sketch.rs`) adds `count` to one bin, an O(1) weighted add. A repeated-`add` loop and a binary-doubling `merge` were rejected;
   `merge` specifically because it is O(log count) allocations on `statsd_decode_one_line`'s
   exact-equality allocation path, which this project doesn't relax. `100|ms|@0.1` extrapolates into
   10 weighted samples, as a `c` (counter) already extrapolates via `value / sample_rate`. Weight is
@@ -863,6 +870,184 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `statsd_tag_values_share_the_datagram_allocation` (formerly
   `statsd_tag_values_are_copied_not_sliced`, inverted as its doc comment said it would be) asserts
   the zero-copy property structurally. See [memory.md](design/memory.md).
+
+## Datadog
+
+- **`datadog_in` doesn't speak every route an Agent can send to.** Each of these gets `404`,
+  counted `logit.input.requests.rejected{reason="unknown_route"}`, so an Agent reports it rather
+  than losing data silently:
+  - The v3 columnar series routes (`/api/intake/metrics/v3/series` and its siblings). An Agent sends
+    v3 only to Datadog's own URLs (`use_v3_api.series.enabled: datadog_only`), so a redirected Agent
+    sends v2, which is served: a recorded Agent 7.83 with `dd_url` at another host sent every series
+    request to `/api/v2/series` (`testdata/interop/datadog/README.md`), and Agent 7.83.3 with
+    `dd_url` at a `datadog_in` sent only v2 protobuf series.
+  - The legacy TCP logs intake (port 10516, `<api-key> <json>\n` or length-prefixed protobuf). That
+    isn't HTTP, so it can't share this listener. Set `logs_config.force_use_http: true` on the Agent.
+  - An API key in the query string (`?api_key=`) or the path (`/v1/input/<key>`) on a data route.
+    Only the `DD-API-KEY` header authenticates a data route, which is what a current Agent sends
+    on every one. The validate and `/_health` probes also read `?api_key=`, because an Agent's own
+    key check sends its key that way and no other (`testdata/interop/datadog/README.md`).
+  - **Consequence:** an Agent configured for any of these shows errors against `datadog_in`.
+  - **Revisit trigger:** a later Agent's recorded traffic, re-recorded with
+    `script/record-fixtures datadog-agent`, shows one of them. A 7.83 Agent's doesn't.
+- **`datadog_in` with no `api_keys` accepts any key, the validate routes included.** An Agent
+  pointed at it can't detect a mistyped key, because validation always answers `200`.
+  - **Consequence:** a key typo surfaces only when the same Agent also talks to Datadog.
+  - **Workaround:** set `api_keys`, which makes `/api/v1/validate` and `/api/v2/validate` check
+    the key.
+- **`datadog_trace_in` doesn't decode JSON trace bodies.** A `/v0.3/traces` or `/v0.4/traces`
+  request with `Content-Type: application/json` gets `415`, counted
+  `logit.input.requests.rejected{reason="json_traces"}`. The Agent accepts that form; the codec
+  implements only msgpack.
+  - **Consequence:** a tracer or client that sends JSON traces loses them. No current dd-trace
+    library sends JSON by default.
+  - **Revisit trigger:** a user shows a JSON sender. The recorded dd-trace-py 4.15 sends msgpack
+    on both of its forms (`testdata/interop/datadog/README.md`).
+- **`datadog_trace_in` doesn't speak the v1.0 string-table trace form (`idx`).** `/v1.0/traces`
+  gets `404`, and `/info` doesn't list it, so a tracer that reads `/info` falls back to v0.4 or
+  v0.5.
+  - **Consequence:** none for a tracer that honors `/info`; a tracer hard-configured for v1.0 loses
+    its traces.
+  - **Revisit trigger:** a tracer that sends v1.0 whatever `/info` says. dd-trace-py 4.15 reads
+    `/info` and sends v0.5.
+- **`datadog_trace_in` does none of the Agent's processing.** Spans relay as the tracer wrote them:
+  no obfuscation, normalization, `_top_level` marking, sampling, or stats computation
+  ([plan §14](plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
+  - **Consequence:** its output must reach Datadog through a real Agent (`datadog_trace_out`) or go
+    to an OTLP backend. Fed straight to `datadog_out`, its spans are skipped as not yet processed.
+  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers.
+- ~~**The mode of `datadog_trace_in`'s Unix socket is `0666`, and the Agent's is UNVERIFIED.**~~
+  **Closed.** A recorded Agent 7.83 makes its APM socket `0722`, as it does its DogStatsD sockets,
+  and `datadog_trace_in` now does too (`testdata/interop/datadog/README.md`).
+- ~~**`statsd_in`/`statsd_out`'s `transport: unix_stream` framing is UNVERIFIED.**~~ **Closed.** The
+  `datadog` Python client writes a 4-byte little-endian length and one packet of `LF`-terminated
+  lines, which `statsd_in` decodes, and a real Agent 7.83 accepted `statsd_out`'s stream in a
+  one-off relay (`testdata/interop/datadog/README.md`).
+- ~~**The order `statsd_out` writes `|c:`, `|e:`, `|card:`, and `|T` in is UNVERIFIED.**~~
+  **Closed.** A metric line's order is the `datadog` Python client's. That client writes a service
+  check's `c:` and `card:` after `m:`, which the Agent reads, so `statsd_in` now ends `m:` at the
+  next `|` (`testdata/interop/datadog/README.md`).
+- **A libdatadog tracer sends `datadog_trace_in` no client stats.** dd-trace-py 4.x computes them
+  only when `/info` says `client_drop_p0s: true`, and `datadog_trace_in` says `false` so that the
+  tracer drops no span before the relay sees it (`testdata/interop/datadog/README.md`).
+  - **Consequence:** none in Datadog, where a downstream Agent computes the stats from the relayed
+    spans. A pipeline that reads the stats themselves from `datadog_trace_in` gets only an older
+    tracer's.
+  - **Revisit trigger:** a pipeline that needs a tracer's own stats more than its priority-0
+    spans, which `client_drop_p0s: true` would let the tracer drop before the relay sees them.
+- **`datadog_out`'s size limits for distribution points and logs are tighter than the
+  intake's.** Only the series limit is the intake's own: a 512,180 B gzip series body drew `413`
+  ("limit=512 kB"). Distribution points reuse the series limits, and logs keep the documented
+  5,000,000 B, but a trial org accepted a 1,052,533 B gzip distribution-points body (150,000
+  values, all counted) and a 5,252,247 B logs body (all 21 logs stored). Sketches also reuse the
+  series limits, unmeasured: no oversized sketch body was sent. Service checks and stats are sent
+  uncapped.
+  - **Consequence:** extra requests, never a `413`, on these routes.
+  - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
+    a sink's request rate.
+- **`datadog_out` isn't duplicate-safe, because Datadog stores a resent log twice.** A batch is
+  several requests, and a retry re-sends the ones that succeeded. A trial org was sent two
+  resends: a series point resent at the same `(series, timestamp)` was stored once, the last write
+  winning (a count sent twice read 5, not 10; a gauge sent as 7 then 9 read 9), and an identical
+  log posted twice was stored as two logs. Every other route (distribution points, sketches,
+  events, checks, traces, stats) is assumed to store a resend again until measured.
+  - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
+    `buffer: {delivery: at_least_once}` retries it and accepts duplicates on every route but
+    series: duplicate logs, and assumed inflated distribution, sketch, event, check, trace, and
+    stats counts.
+  - **Revisit trigger:** a measurement showing another route dedupes a resend, or a design that
+    sends one batch as one request.
+- **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The series
+  window is the documented one, and stricter than the intake:
+  [the plan's "Timestamp windows" section](plans/datadog-relay.md#11-timestamp-windows-w5) has
+  what a trial org stored.
+  - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
+    the intake may still have stored, counted `records.dropped{reason="stale"}`.
+  - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
+- **`datadog_out` treats a `202` as full success, and the intake drops parts of a `202`ed
+  request.** The series route answers `202` with an `errors` array naming what it dropped: a point
+  more than 10 minutes ahead ("contains 1 data points too far in the future"), or a whole series
+  carrying more than 100 tags ("too many tags in series ...: limit=100"). The sink doesn't read
+  the body of a `2xx`, so neither is counted.
+  - **Consequence:** a series over 100 tags reaches no dashboard, and nothing in `logit`'s
+    telemetry says so.
+  - **Workaround:** keep series under 100 tags with `keep` upstream.
+- **`datadog_out` sends a Datadog event's and a service check's host as a tag.** Their encoders
+  read the host from `statsd.event.host` and `statsd.service_check.host` only, so a `host.name`
+  that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog shows the
+  event or check with no host.
+  - **Consequence:** events and checks sent directly, not through an Agent, have no host in
+    Datadog unless the DogStatsD client set `h:`.
+  - **Workaround:** `set` `statsd.event.host` and `statsd.service_check.host` as attributes.
+- ~~**`datadog_trace_out`'s Unix-socket client is UNVERIFIED against a real Agent.**~~ **Closed.**
+  A one-off relay sent a real tracer's spans through `datadog_trace_out`'s `socket:` to a real
+  Agent 7.83, which forwarded every one (`testdata/interop/datadog/README.md`), and the trial-org
+  run's Agent 7.83.3 took traces and `/v0.6/stats` through it.
+- **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
+  A chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped flag, tags) and the
+  tracer payload fields no request header carries (`datadog.tracer.runtime_id`, `.env`,
+  `.hostname`, `.app_version`, `.tags`, `.container_debug`) have no v0.4 field. Each is counted
+  `logit.output.spans.degraded{reason="no_wire_form"}`.
+  - **Consequence:** only a v0.7-origin batch loses anything, and the Agent derives a chunk's
+    priority and origin from the root span again on its side.
+  - **Workaround:** `version: v0.7`, which carries all of them.
+- **`datadog_trace_out` derives no Datadog fields from an OTel span.** A span without
+  `service.name`, `resource.name`, or `span.type` reaches the Agent with `service`, `resource`, or
+  `type` empty, and no stats are computed for it.
+  - **Consequence:** OTel-origin spans through this sink show up in Datadog poorly named.
+  - **Workaround:** send OTel spans with `otlp_out`, to the Agent's OTLP receiver or to Datadog.
+  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers
+    ([plan §14](plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
+- **`datadog_out` sends no Agent-style `h`/`ms` aggregates, and no explicit-bucket
+  `Histogram`.** An Agent turns a DogStatsD `h` or `ms` into `.avg`, `.count`, `.median`,
+  `.95percentile`, and `.max` series. `aggregate` in front of `datadog_out` sends a sketch
+  instead, which Datadog computes quantiles from, and `datadog_out` skips a `Histogram`,
+  `ExponentialHistogram`, `Summary`, `GaugeDelta`, `SetMembers`, and a cumulative or non-monotonic
+  `Sum`, counted `logit.output.metrics.skipped{metric_kind}`.
+  - **Consequence:** dashboards built on an Agent's `.95percentile`-style series find no data
+    when the same metrics arrive through `aggregate` and `datadog_out`; query the distribution
+    instead. An OTLP explicit-bucket histogram reaches Datadog only through `otlp_out`.
+  - **Revisit trigger:** an operator who needs the Agent's five series, or a `Histogram` as
+    Datadog's `.bucket` counters ([plan §2](plans/datadog-relay.md#2-kinds-and-config-w3w6)).
+- **No plain-lines listener for an application that writes JSON lines to an Agent's TCP `logs`
+  port.** An Agent's `logs` integration can listen on TCP or UDP for raw, JSON, or syslog lines,
+  one per `\n`. `logit` has no listener that takes such a line as a plain line: `syslog_in`
+  parses each one as a syslog message. The reverse direction is unverified: an Agent's TCP `logs`
+  listener takes `syslog_out`'s syslog-formatted lines, but whether it parses a JSON body into
+  attributes wasn't tested.
+  - **Consequence:** such an application can't point at `logit` in place of the Agent, and logs
+    into an Agent go through `otlp_out` with the Agent's OTLP logs turned on.
+  - **Revisit trigger:** a user with such an application. The plan's sketch is a `lines_in` on
+    the `TcpListener` driver ([plan §7](plans/datadog-relay.md#7-documented-recipes-not-code-w8b)).
+- **Some Datadog behavior wasn't exercised by the recorded corpus or the trial-org run.** Each of
+  these is implemented from the Agent's source or Datadog's docs and covered by the codec's own
+  tests, but no real sender or Datadog org has checked it:
+  - whether the intake accepts an APM stats sketch whose gamma isn't 1.0202. A relayed stats
+    sketch keeps its own gamma, and dd-trace-py 4.15 computes on 1.015625; nothing in `logit`
+    sends one to Datadog yet ([plan §4](plans/datadog-relay.md#4-sketch-compatibility-w1-settled));
+  - service checks sent by `datadog_out`, which got `202` but which Datadog has no API to query;
+  - the Agent's dual-shipping (`additional_endpoints`) and TLS settings against `datadog_in`;
+  - v0.7 traces and a `PUT` from a real tracer, and any tracer other than dd-trace-py;
+  - the nested `dd` log fields that dd-trace-js and dd-trace-rb write, which `flatten` expands.
+  - **Consequence:** a failure here shows up in a deployment first, as `datadog_out` request
+    errors or a listener's `rejected` counters.
+  - **Revisit trigger:** re-record with `script/record-fixtures datadog` against another tracer,
+    or repeat the plan's W7b run for the item in question.
+- ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
+  unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
+  (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the
+  feature's cost is unmeasurable in practice and it stays on workspace-wide.
+- **The hand-rolled `DdSketch` store costs about 4% CPU on a sketch-heavy stage.** `aggregate`
+  sketches every series, and `kv_metrics` sketches a `Samples` metric at the sink on `json-parse`'s
+  path; both pay for it: `aggregate` measures 0.339 vs 0.325 µs/event and `json-parse` 0.934 vs
+  0.895 µs/event, `dd/w1` against `main` (`docs/design/performance.md` §9).
+  - **Consequence:** accepted for bin-for-bin Datadog parity — a cheaper store that didn't match
+    the Agent's own bin mapping would relay a sketch that reads differently at Datadog's end ([ADR
+    `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)).
+  - **Revisit trigger:** the Agent's own mitigation is a fixed-size key buffer
+    (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
+    pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
+    believing it helps.
 
 ## syslog
 
