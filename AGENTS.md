@@ -546,6 +546,24 @@ runs, so a clean local run means a clean CI run.
 Use `script/check` for the ordinary edit/verify loop. Cargo downloads and compiled artifacts use
 shared project-wide Docker volumes across worktrees; do not remove them as part of routine cleanup.
 
+**The shared `logit_target_cache` volume can serve one worktree a crate compiled from another.**
+Every worktree mounts at `/work` inside the dev container, so cargo's fingerprints can't tell two
+checkouts of the same crate apart, and a test run in one worktree can link a `logit-proto` or
+`logit-core` built from a sibling branch. The symptom is a failure no change on the branch
+explains: an allocation pin off by one on a docs-only branch, an interop test rejecting a fixture
+the branch never touched. Before treating such a failure as real, rerun with a private target
+dir, `CARGO_TARGET_DIR=/work/perf/results/<slug>/target` (gitignored), through a plain
+`docker run` of the dev image with the worktree bound at `/work`; if that run passes, the shared
+cache was stale. CI builds from a clean cache and doesn't have the problem.
+
+**Before opening a PR, sweep for the two things review catches most often**: grep every comment
+line the branch added for the words the comment rule bans (`exactly`, `actually`, `genuinely`,
+`deliberately`, `simply`, `just`, `on purpose`, `load-bearing`), and ask whether the branch made
+a decision a maintainer would look for in an ADR (a wire form, a transport, a mode, a loss
+semantic) and recorded it only in a module doc. Both rules are in
+[Conventions to hold to](#conventions-to-hold-to); they are the two a reviewer flags on most
+PRs that skip this pass.
+
 **To bring a branch with an open PR up to date with `main`, `git merge origin/main` — don't
 rebase.** A rebase rewrites the branch's commits, which means a force-push to update the PR; that's
 disruptive for an open PR (review-comment associations, anyone else with the branch checked out)
