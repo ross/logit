@@ -221,8 +221,8 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // `perf/scenarios/` and `script/shape-survey`'s capture configs run only out of CI, so a
-        // field rename must fail here, not on their next run.
+        // `perf/scenarios/`, `script/shape-survey`'s capture configs, and `script/victoria-interop`'s
+        // leg configs run only out of CI, so a field rename must fail here, not on their next run.
         let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
             std::fs::read_dir(&perf_scenarios_dir)
@@ -236,6 +236,20 @@ mod tests {
                 .unwrap_or_else(|err| panic!("reading {}: {err}", shape_survey_dir.display()))
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
+        // `script/victoria-interop`'s per-leg configs; the directory's other YAML is compose and
+        // vmagent config, so only `logit-*.yaml`.
+        let victoria_interop_dir = root.join("tools/victoria-interop");
+        configs.extend(
+            std::fs::read_dir(&victoria_interop_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", victoria_interop_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml"))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("logit-"))
+                }),
         );
         configs.sort();
 

@@ -24,7 +24,7 @@ use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
-use logit_pipeline::runtime::{drain_inbox, route_batch};
+use logit_pipeline::runtime::{drain_inbox, route_batch, InHand};
 use logit_pipeline::{
     process_batch, send_batch, unwrap_batch, BatchContext, Delivered, Fanout, RouterScratch,
     SinkQueue, SinkQueueConfig, SinkStore, Transform,
@@ -1370,8 +1370,11 @@ fn aggregate_absorb_without_keep() {
 /// context, and `into_links()` collects it into its own `Vec`. A non-empty `Vec` always
 /// allocates, so one per series is the floor, and more contributors (up to the cap) don't add to
 /// it.
+///
+/// The 100 nginx events collapse into 4 series because `keep` bounds the tag set to one series
+/// per metric name.
 #[test]
-fn aggregate_flush_100_series() {
+fn aggregate_flush_4_series() {
     let resource = fixtures::resource();
     let mut keep = fixtures::keep();
     let mut agg = fixtures::aggregator();
@@ -1683,7 +1686,8 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
 /// The sink-side hop after `Fanout::send` (`docs/adr/buffered-sink-delivery.md`): `drain_inbox`,
 /// driven directly, on a single-consumer `Delivered::Owned` batch. One allocation, the `Arc::new`
 /// that hands the batch to its `SinkQueue`. The single-consumer edge before it is free
-/// ([`fanout_send_one_consumer_costs_nothing`]).
+/// ([`fanout_send_one_consumer_costs_nothing`]). Recording the batch in `in_hand` for the
+/// shutdown sweep, an `Arc::clone` behind an uncontended mutex, allocates nothing.
 #[test]
 fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1710,13 +1714,14 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     let batch = fixtures::nginx_batch(1);
     let store_for_measure = Arc::clone(&store);
     let telemetry_for_measure = telemetry.clone();
+    let in_hand = InHand::default();
     let ((), stats) = measure(|| {
         rt.block_on(async move {
             tx.send(Delivered::Owned(batch, BatchContext::default()))
                 .await
                 .expect("send should succeed");
             drop(tx); // closes the inbox, so `drain_inbox` returns after this one batch
-            drain_inbox(&mut rx, store_for_measure, telemetry_for_measure).await;
+            drain_inbox(&mut rx, store_for_measure, telemetry_for_measure, &in_hand).await;
         })
     });
 

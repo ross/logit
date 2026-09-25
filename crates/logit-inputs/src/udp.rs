@@ -1589,9 +1589,11 @@ mod tests {
         );
     }
 
-    /// `run_until_shutdown` shuts down cleanly and promptly within its grace.
+    /// `run_until_shutdown` with nothing ever sent shuts down cleanly within its grace and
+    /// delivers nothing. `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered` covers
+    /// the queued-backlog case against `read_loop`/`decode_loop` directly.
     #[tokio::test]
-    async fn shutdown_drains_the_queue_and_delivers_every_already_queued_datagram() {
+    async fn shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing() {
         let mut listener = UdpListener::new(
             "127.0.0.1:0",
             TestDecoder::new(),
@@ -1603,8 +1605,6 @@ mod tests {
             },
         );
 
-        // Nothing is sent. `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered`
-        // covers the queued-backlog case against `read_loop`/`decode_loop` directly.
         let (fanout, mut rx) = recording_fanout(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -1837,16 +1837,27 @@ mod tests {
         );
     }
 
-    /// `bind_socket` succeeds with no `receive_buffer_bytes`.
+    /// With no `receive_buffer_bytes`, `bind_socket` still gauges the kernel's default grant, and
+    /// reports no requested size.
     #[tokio::test]
     async fn bind_socket_reports_the_granted_receive_buffer_even_when_unset() {
-        let telemetry = Telemetry::default();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         let mut diag = Diagnostics::default();
         let socket = bind_socket("127.0.0.1:0", None, &telemetry, &mut diag)
             .await
             .expect("binding with no explicit receive_buffer_bytes should succeed");
-        // `Telemetry::default()` is a no-op handle, so the gauge can't be read back here.
         drop(socket);
+
+        let events = registry.drain(0);
+        let granted = gauge(&events, "logit.input.receive_buffer.bytes")
+            .expect("the granted receive buffer should be gauged even when none was requested");
+        assert!(granted > 0.0, "the kernel always grants a nonzero default, got {granted}");
+        assert_eq!(
+            gauge(&events, "logit.input.receive_buffer.requested.bytes"),
+            None,
+            "nothing was requested, so no requested size should be reported"
+        );
     }
 
     /// A `bind:` resolving to several candidates falls through past one that can't bind. The
@@ -1966,7 +1977,6 @@ mod tests {
 
     /// The single value of gauge `name` in `events`, or `None` if it was never recorded. A gauge
     /// is last-write-wins per drain, so there is at most one point per name here.
-    #[cfg(target_os = "linux")]
     fn gauge(events: &[Event], name: &str) -> Option<f64> {
         events
             .iter()
