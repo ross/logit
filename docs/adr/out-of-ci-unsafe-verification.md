@@ -224,8 +224,11 @@ MIRIFLAGS>"`, because the `logit-core` sketch targets can't run under the defaul
 ADR [`untrusted-input-bounds`](untrusted-input-bounds.md) makes every input accept loop classify an
 `accept()` error instead of propagating it. `script/unsafe-check`'s `INJECT_SCENARIOS` gains four
 `accept4` scenarios that force the classifier's branches on a real listener, because no in-process
-test can make `accept4` return `EBADF` on a working socket. They were run on the dev box with
-`--cap-add SYS_PTRACE` alone:
+test can make `accept4` return `EBADF` on a working socket. The code they exercise
+(`classify_accept_error` and `absorb_accept_error` in `crates/logit-inputs/src/listener.rs`) is
+safe Rust, a departure from this ADR's raw-`libc` surface in the same way the `cargo-fuzz`
+amendment's decoder targets are one: the image hosts them because it already has the tool that
+reaches them. They were run on the dev box with `--cap-add SYS_PTRACE` alone:
 
 | Scenario | Spec | Test | Observed |
 |---|---|---|---|

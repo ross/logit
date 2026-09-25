@@ -11,9 +11,11 @@
 #        script/unsafe-check shell
 #        script/unsafe-check --help
 #
-# Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
-# tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-# helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+# Verifies, with nightly-only tools in a throwaway image, the three raw-`libc` `unsafe` call sites
+# (udp.rs `recvmmsg`, sockstat.rs `getsockopt`, tail/watch.rs inotify), the safe-Rust accept loops
+# (the `accept4` inject scenarios), and the decoders of untrusted bytes (the fuzz targets); see
+# docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md. `miri` runs the
+# pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
 # debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
 # `all` runs `miri` then `careful`.
 #
@@ -96,9 +98,11 @@ FUZZ_TARGETS=(
 FUZZ_TARGET_VOLUME="${UNSAFE_CHECK_FUZZ_TARGET_VOLUME:-logit_fuzz_target}"
 
 # One "<label>|<strace inject spec>|<cargo test args>" per line; `inject-all` runs each in order.
-# Unlike MIRI_TARGETS, not all are expected to pass: two force a fatal error, and they succeed
-# when the failure has the expected shape. ADR `udp-intake-batching-and-socket-visibility`'s
-# amendment records the results.
+# Unlike MIRI_TARGETS, not all are expected to pass: three force a fatal error, and they succeed
+# when the failure has the expected shape. Each scenario's results are recorded in the ADR that
+# owns its code path: the `udp-*` ones in ADR `udp-intake-batching-and-socket-visibility`'s
+# "kernel- and tokio-cited facts" amendment, the `*-accept-*` ones in ADR
+# `out-of-ci-unsafe-verification`'s "accept-error inject scenarios" amendment.
 INJECT_SCENARIOS=(
     # The EINTR retry arm in `BatchReader::read_batch`, which a signal can't reach on a
     # non-blocking socket. EXPECT: the test passes, every datagram delivered.
@@ -249,7 +253,7 @@ cmd_inject() {
         "${binary}" ${filter:+"${filter}"} --test-threads=1
 }
 
-# Runs past a non-zero exit, which `set -e` would otherwise stop at: two scenarios are expected to
+# Runs past a non-zero exit, which `set -e` would otherwise stop at: three scenarios are expected to
 # fail, and the operator reads the shape of each failure off the output.
 cmd_inject_all() {
     build_image
@@ -412,9 +416,11 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
        script/unsafe-check shell
        script/unsafe-check --help
 
-Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
-tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+Verifies, with nightly-only tools in a throwaway image, the three raw-`libc` `unsafe` call sites
+(udp.rs `recvmmsg`, sockstat.rs `getsockopt`, tail/watch.rs inotify), the safe-Rust accept loops
+(the `accept4` inject scenarios), and the decoders of untrusted bytes (the fuzz targets); see
+docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md. `miri` runs the
+pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
 debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
 `all` runs `miri` then `careful`.
 
