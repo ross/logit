@@ -17,6 +17,14 @@
 //! and are never copied into `Event::attributes`; a sink that wants resource → scope → point
 //! precedence merges them at render time, as `crates/logit-outputs/src/influxdb.rs`'s
 //! `render_tag_suffix` does.
+//!
+//! **`AnyValue` nesting has no local depth cap.** Neither [`any_value_to_value`] nor the OTLP/JSON
+//! walk (`json`'s `any_value`) counts depth. Each parser's own limit bounds them: serde_json
+//! rejects past 128 JSON levels (at most 41 `AnyValue` levels), and prost past 100 nested
+//! messages (at most 49). Both stay under native's `MAX_VALUE_DEPTH` (128).
+//! `crates/logit-proto/tests/robustness.rs`'s `otlp_*_nesting_*` tests pin both numbers, so a
+//! dependency bump that moves one fails a test rather than a process (ADR
+//! `deployment-threat-model`).
 
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
