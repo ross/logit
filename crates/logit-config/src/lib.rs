@@ -1788,8 +1788,10 @@ pub enum ComponentKind {
         /// warning. Off by default.
         #[serde(default)]
         ack: bool,
-        /// How long to wait for every request of a batch to be acknowledged before retrying the
-        /// batch. Only with `ack: true`. Defaults to `30s`; `0s` is rejected.
+        /// How long to wait for every request of a batch to be acknowledged. Past it the batch
+        /// fails, and is dropped unless `buffer.delivery` is `at_least_once`, which resends it
+        /// (and Splunk may index it twice). Only with `ack: true`. Defaults to `30s`; `0s` is
+        /// rejected.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         ack_timeout: Option<Duration>,

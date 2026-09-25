@@ -68,11 +68,12 @@ Four facts from the survey drive the shape of the decision:
 
 5. **Acknowledgment is opt-in on the sink.** `ack: true` reads each response's `ackID` and polls
    `/services/collector/ack` until every id is `true` or `ack_timeout` (default 30 s) elapses, at
-   which point the batch is a `Fault::Ambiguous` for `write_loop` to retry. Off by default:
-   Splunk Cloud doesn't support it, and a token without `useACK` returns no id. The listener
-   answers `/ack` with every asked id `true`, because its `200` already means delivered to the
-   pipeline, and a full pipeline answers `503` code 9, which every HEC client retries. Channel and
-   ack id never enter the event.
+   which point the batch fails as `Fault::Ambiguous`: `write_loop` drops it under the default
+   at-most-once posture and retries it under `buffer: { delivery: at_least_once }`. Off by
+   default: Splunk Cloud doesn't support it, and a token without `useACK` returns no id. The
+   listener answers `/ack` with every asked id `true`, because its `200` already means delivered
+   to the pipeline, and a full pipeline answers `503` code 9, which every HEC client retries.
+   Channel and ack id never enter the event.
 
 6. **The OpenTelemetry exporter's attribute vocabulary, not a `splunk.*` namespace.** The
    envelope's `host`, `source`, `sourcetype`, and `index` are the resource attributes `host.name`,
