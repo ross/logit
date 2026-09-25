@@ -1065,6 +1065,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
     pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
     believing it helps.
+- **`datadog_out` reports a connect failure `Clean` after an earlier request of the same batch
+  succeeded.** One `send` is up to eight routes' requests, and `crate::http`'s
+  `classify_reqwest_error` makes any connect failure `Fault::Clean`. `write_loop` retries `Clean`
+  under every delivery posture, and the retry re-sends the requests that already succeeded.
+  - **Consequence:** under the default at-most-once posture, a connect failure on route 2 after
+    route 1 was accepted resends route 1, and Datadog stores a resent log (and any route not
+    measured) twice.
+  - **Fix:** `splunk_hec_out`'s rule: once a request of the `send` is accepted, a later
+    transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
+    `after_delivery`).
 
 ## syslog
 

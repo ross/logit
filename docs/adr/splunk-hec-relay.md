@@ -275,9 +275,15 @@ module doc describes the behavior; this list is the record of the choices.
 - **Decision 17, the channel:** one random v4 GUID per sink instance, drawn when it is built, so
   a restart starts a new channel. It goes on `/ack` polls too, which a `useACK` token requires.
 - **Decision 18, code 6:** a `400` whose body is code 6 with no `invalid-event-number`, or one
-  that names no object of the body, is permanent, as is a code 6 on the resend. A code 6 naming
-  the body's last object needs no resend. The records ahead of the named object count as
-  delivered (`logit.output.records`), under the same unverified assumption the resend makes.
+  that names no object of the body, is permanent with a `request_rejected` diagnostic, as is a
+  code 6 on the resend. A code 6 naming the body's last object needs no resend. The records
+  ahead of the named object count as delivered (`logit.output.records`), under the same
+  unverified assumption the resend makes.
+- **Decision 2, faults across requests:** a connect failure is `Fault::Clean` only until a
+  `/event` request of the `send` is accepted (a 2xx, or a code 6 that counts objects ahead of the
+  named one as delivered); after that every transport failure is `Fault::Ambiguous`. `write_loop`
+  retries `Clean` under every posture, so a `Clean` there would index the accepted bodies twice.
+  `logit_out`'s "`Clean` at the handshake, `Ambiguous` after a data frame left" is the precedent.
 - **Decision 5, acknowledgment:** the deadline runs from when the batch's last body was
   accepted, and a last poll runs at the deadline before the batch fails as ambiguous. Every poll
   failure other than code 14 (a transport error, another non-2xx, a body that isn't an ack reply)

@@ -63,8 +63,14 @@
 //! | 408, 429, any 5xx | [`Fault::Ambiguous`] |
 //! | 401, 403 | [`Fault::Permanent`], with a throttled `token_rejected` diagnostic |
 //! | any other 3xx or 4xx (a code 6 with no or an out-of-range number included) | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
-//! | connect failure | [`Fault::Clean`] |
+//! | connect failure, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
+//! | connect failure after one was (a 2xx, or a code 6 whose objects ahead count as delivered) | [`Fault::Ambiguous`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//!
+//! A connect failure is `Clean` only while nothing of the batch has reached Splunk:
+//! `write_loop` retries `Clean` under every posture, and a retry re-sends the bodies already
+//! indexed, so once one was accepted every later transport failure is `Ambiguous` instead
+//! ([`after_delivery`]).
 //!
 //! Every non-2xx other than 408, 429, and 5xx is counted `logit.output.requests.rejected{code}`,
 //! `code` being the body's HEC code when Splunk documents it ([`code_tag`]), else `other`.
@@ -200,6 +206,17 @@ enum AckPoll {
 fn after_invalid_event(objects: usize, n: u64) -> Option<(usize, Range<usize>)> {
     let n = usize::try_from(n).ok().filter(|&n| n < objects)?;
     Some((n, n + 1..objects))
+}
+
+/// A failure of a later request in a `send` that already had a body accepted: a `Clean` fault
+/// becomes [`Fault::Ambiguous`], since `write_loop` retries `Clean` under every posture and the
+/// retry would index the accepted bodies twice (module doc's "Faults" table).
+fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Error {
+    if sent_any && logit_pipeline::classify(&err) == Fault::Clean {
+        err.context(Fault::Ambiguous)
+    } else {
+        err
+    }
 }
 
 /// The `code` tag on `logit.output.requests.rejected`: the reply's HEC code when it is one
@@ -524,27 +541,35 @@ impl SplunkHecOutput {
         );
     }
 
-    /// One body, and its code-6 resend (module doc's "Faults" table).
+    /// One body, and its code-6 resend (module doc's "Faults" table). `sent_any` says whether an
+    /// earlier request of this `send` was accepted, and is set once one of these is.
     async fn send_body(
         &mut self,
         objects: &[Object<'_>],
         ack_ids: &mut Vec<u64>,
+        sent_any: &mut bool,
     ) -> anyhow::Result<()> {
-        let n = match self.post_event(objects).await? {
+        let reply = self.post_event(objects).await.map_err(|err| after_delivery(err, *sent_any))?;
+        let n = match reply {
             EventReply::Accepted { ack_id } => {
+                *sent_any = true;
                 self.keep_ack_id(ack_id, ack_ids);
                 return Ok(());
             }
             EventReply::InvalidEvent { n } => n,
         };
         let Some((bad, rest)) = after_invalid_event(objects.len(), n) else {
-            return Err(anyhow::anyhow!(
-                "splunk_hec_out: Splunk rejected a request of {} objects as invalid (code 6) at \
-                 object {n}, which isn't one of them",
+            let message = format!(
+                "Splunk rejected a request of {} objects as invalid (code 6) at object {n}, \
+                 which isn't one of them",
                 objects.len()
-            ))
-            .map_err(|err| err.context(Fault::Permanent));
+            );
+            self.diag.warn_throttled("request_rejected", &message);
+            return Err(anyhow::anyhow!("splunk_hec_out: {message}"))
+                .map_err(|err| err.context(Fault::Permanent));
         };
+        // The objects ahead of `bad` count as indexed (`after_invalid_event`'s assumption).
+        *sent_any |= bad > 0;
         let ahead: usize = objects[..bad].iter().map(|(_, records)| records).sum();
         self.telemetry.count(RECORDS, ahead as f64, &[]);
         let dropped = objects[bad].1;
@@ -560,8 +585,11 @@ impl SplunkHecOutput {
         if rest.is_empty() {
             return Ok(());
         }
-        match self.post_event(&objects[rest]).await? {
+        let reply =
+            self.post_event(&objects[rest]).await.map_err(|err| after_delivery(err, *sent_any))?;
+        match reply {
             EventReply::Accepted { ack_id } => {
+                *sent_any = true;
                 self.keep_ack_id(ack_id, ack_ids);
                 Ok(())
             }
@@ -658,9 +686,9 @@ impl SplunkHecOutput {
                 ),
             );
         }
-        let mut ack_ids = Vec::new();
+        let (mut ack_ids, mut sent_any) = (Vec::new(), false);
         for body in pack(sendable.iter().map(|(bytes, _)| bytes.len()), self.max_body_bytes) {
-            self.send_body(&sendable[body], &mut ack_ids).await?;
+            self.send_body(&sendable[body], &mut ack_ids, &mut sent_any).await?;
         }
         if !ack_ids.is_empty() {
             self.await_acks(ack_ids).await?;
@@ -1129,6 +1157,92 @@ mod tests {
         drop(listener);
         let err = sink(addr).send(&logs(1)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    /// A collector that answers one request with `status` and `body`, closes the connection,
+    /// and stops listening, so the next request's connect is refused.
+    async fn answers_once(status: u16, body: String) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body_start = loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..body_start]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map(|v| v.trim().parse().unwrap())
+                .unwrap();
+            while buf.len() < body_start + length {
+                let n = stream.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            seen.lock().unwrap().push(buf[body_start..].to_vec());
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        (addr, bodies)
+    }
+
+    /// Once a body was accepted, a connect failure on the next is ambiguous, not clean: a
+    /// `Clean` retry would index the first body twice.
+    #[tokio::test]
+    async fn a_connect_failure_after_an_accepted_body_is_ambiguous() {
+        let (addr, bodies) = answers_once(200, r#"{"text":"Success","code":0}"#.into()).await;
+        let mut out = sink(addr).with_max_body_bytes(300);
+        let err = out.send(&logs(10)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(bodies.lock().unwrap().len(), 1, "one body accepted, then refused");
+    }
+
+    /// The same after a code 6 whose objects ahead count as indexed: the resend's connect
+    /// failure is ambiguous. With nothing ahead of the named object, it stays clean.
+    #[tokio::test]
+    async fn a_connect_failure_on_a_code_6_resend_is_ambiguous_once_objects_counted() {
+        for (n, fault) in [(1, Fault::Ambiguous), (0, Fault::Clean)] {
+            let body = String::from_utf8(encode_status_body(6, Some(n))).unwrap();
+            let (addr, _bodies) = answers_once(400, body).await;
+            let err = sink(addr).send(&logs(3)).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), fault, "n={n}: {err:#}");
+        }
+    }
+
+    /// A code 6 naming no object of the body is permanent, with a `request_rejected` diagnostic.
+    #[tokio::test]
+    async fn a_code_6_out_of_range_is_diagnosed() {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let body = String::from_utf8(encode_status_body(6, Some(5))).unwrap();
+        let (addr, _log) = collector(move |_, _| (400, body.clone())).await;
+        let captured = CapturedLogs::default();
+        let guard = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+        let mut out = sink(addr).with_diagnostics(Diagnostics::new("splunk"));
+        let err = out.send(&logs(2)).await.unwrap_err();
+        drop(guard);
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        let logged = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        assert!(logged.contains("at object 5, which isn't one of them"), "{logged}");
+        assert_eq!(out.diag.occurrences("request_rejected"), 1);
     }
 
     // ---- acknowledgment ----------------------------------------------------------------------
