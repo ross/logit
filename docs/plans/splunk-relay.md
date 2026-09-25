@@ -400,8 +400,10 @@ Per signal:
 
 - **Logs** relay both ways with the exporter's `otel.log.severity.*`, `otel.log.name`, and
   `trace_id`/`span_id` decoded into `LogRecord`'s typed fields and written back from them (§6); an
-  object with no `event` or a blank one is skipped and counted where Splunk would reject the
-  request (ADR decision 16).
+  object with no `event` or a blank one is skipped and counted, and every valid object in the body
+  delivered. Splunk 10.4.3 skips an object with `fields` and no `event` too, but answers one with
+  neither code 12 and a blank `event` code 13, indexing only the objects before it (ADR decision
+  16 and its W5 amendment).
 - **Metrics**: gauges and sums relay in both metric forms, `metric_type` carrying `Sum` versus
   `Gauge`, and SC4S's `event`-less objects with numeric-string measurements decode as metrics.
   Another protocol's multi-number kinds leave through `multi_value: skip | expand` (§4), with

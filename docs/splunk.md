@@ -145,7 +145,8 @@ route.
 before compression). An event larger than that alone is dropped, counted
 `logit.output.records.dropped{reason="oversize"}`. Keep `max_body_bytes` under the receiver's
 `limits.conf [http_input] max_content_length`: Splunk Enterprise 10.4.3 allows 838,860,800 bytes,
-older releases 1,000,000, and a body over it gets `413`, which isn't retried.
+older releases 1,000,000. Splunk documents `413` for a body over it (the run didn't send
+one), and `splunk_hec_out` doesn't retry a `413`.
 
 `splunk_hec_in` caps a request at `max_request_bytes` (5 MiB by default), both as sent and after
 gzip decompression, and answers `413` past it. Raise it if a client sends larger bodies.
@@ -230,8 +231,8 @@ decodes and gets a `2xx` from `splunk_hec_in`, including the Docker driver's `OP
 - a `useACK` token acknowledged every request `splunk_hec_out` sent with `ack: true`;
 - the recorded corpus, replayed into `splunk_hec_in` and relayed by `splunk_hec_out`, arrived in
   Splunk from every producer;
-- probes settled what Splunk does with gzip, oversized and per-object-invalid bodies,
-  `metric_type`, 1,000 dimensions, `OPTIONS`, and acknowledgment.
+- probes settled what Splunk does with gzip and per-object-invalid bodies, read its
+  `max_content_length` from `limits.conf` over REST, and settled `metric_type`, 1,000 dimensions, `OPTIONS`, and acknowledgment.
 
 Not verified: the Observability Cloud leg (`examples/splunk-observability.yaml`), since no trial
 org was run; Splunk Cloud; Vector's HEC sinks and an Edge Processor as clients; and any Splunk

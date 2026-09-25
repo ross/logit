@@ -154,7 +154,8 @@ Four facts from the survey drive the shape of the decision:
 16. **Lenient where Splunk rejects a whole request.** `/raw` needs no channel (Splunk requires one
     only with `useACK`, and `splunk_hec_in` has no ack state). An object with no `event` or a
     blank one is skipped and counted, and the rest of the body delivered, where Splunk answers
-    code 12 or 13 and indexes nothing. On the way out, a log whose message is `null` or `""` is
+    code 12 or 13 and indexes nothing (see the W5 amendment for what Splunk 10.4.3 does). On the
+    way out, a log whose message is `null` or `""` is
     never sent, counted, because Splunk would reject the whole request for it.
 
 17. **The sink sends a channel header on every request; `ack` only switches polling on.** A
