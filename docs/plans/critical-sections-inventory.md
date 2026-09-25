@@ -45,7 +45,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → dos/w2 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` in-progress (dos/w3) |
 | 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | in-progress (dos/w3); WIRE-03 findings → dos/w2: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is W3's |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | in-progress (dos/w6) |
-| 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → dos/w5): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
+| 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 in-progress (dos/w4); measured 2026-09-25: JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; downgraded to P2 pending W4's pinning tests. CORE-17 open |
 | 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | open |
 | 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | open |
@@ -197,7 +197,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → dos/w2 |
 | [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → dos/w2 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
-| [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → dos/w5 |
+| [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
 | [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | in-progress (dos/w6) |
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | in-progress (dos/w6) |
@@ -4013,7 +4013,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   a targeted review of the `select!`/`borrow()` cancellation reasoning in `serve_connection`.
 - **Priority:** P0 — network-reachable listener, custom read loop, and the allocation and
   unbounded-write paths are DoS-shaped on the main data path.
-- **Verified 2026-09-25** (`dos/w5`, atop `dos/w0` `dc39d1ca`; findings → dos/w5): a
+- **Verified 2026-09-25** (#372): a
   fresh-context refuter reproduced four bugs, each now fixed with a test seen to fail first.
   - **B1, unbounded control writes: fixed.** A peer that sends frames but never reads its `Ack`s
     filled the send buffer after ~60k frames; the `Ack` write then blocked forever, holding the
@@ -4031,7 +4031,9 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `a_frame_answered_with_going_away_is_never_forwarded` (receiver, 400 races) and
     `a_going_away_in_place_of_an_ack_is_a_clean_fault_and_the_batch_is_resent` (sender).
   - **B3, the body held twice: fixed.** Peak heap for a frame was 2 × `compressed_len`; the body
-    is read into its final buffer now (`a_frame_body_is_held_once_at_peak`).
+    is read into its final buffer now. `crates/logit-inputs/tests/robustness.rs`'s
+    `a_frame_body_is_held_once_at_peak` drives a real `LogitInput` over a socket with one 8 MiB
+    `Value::Str` body and asserts the listener's peak stays under 1.125 × the body.
   - **B4, lz4 frames near the cap: fixed.** `logit_in` bounded `compressed_len` by the payload
     bound and closed without a `Reject`, so an incompressible batch a few bytes under the cap was
     dropped as `Fault::Ambiguous`. Both ends now use `frame::compressed_bound`, and an over-bound
@@ -4041,7 +4043,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - **Holds:** a header partly read at shutdown is discarded with its connection and never
     forwarded (`a_partial_header_at_shutdown_is_discarded_and_the_connection_closes`); a stray HTTP
     or syslog client fails the magic check before the length bound or any allocation, counted
-    `reason="handshake"` (`a_stray_http_or_syslog_client_is_reset_before_any_allocation`); a
+    `reason="handshake"` (`a_stray_http_or_syslog_client_is_reset_before_any_allocation`, and
+    `tests/robustness.rs`'s `a_stray_client_allocates_nothing_sized_from_its_bytes`); a
     past-the-cap connection holds no permit (`a_past_the_cap_connection_holds_no_permit`). The
     `Fault::Ambiguous` outcome for an ack lost after forwarding (a full inbox parks `send_relayed`
     past the sender's ack timeout) is the posture contract, not a bug. The gauge drop guard lands
