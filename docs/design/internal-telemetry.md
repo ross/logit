@@ -950,8 +950,9 @@ left out of the resource).
 [ADR `splunk-hec-relay`](../adr/splunk-hec-relay.md).
 
 **The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
-tracker: `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
-`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+tracker: `logit.input.connections` (gauge, published by the same drop guard),
+`logit.input.connections.rejected{reason="limit"}`, `logit.input.connections.closed{reason="idle"}`,
+and the accept-queue gauges.
 
 | Name | Kind | Meaning |
 |---|---|---|

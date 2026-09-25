@@ -51,7 +51,7 @@ const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
 /// The HTTP/1.1-and-h2c builder every `auto` listener serves through, with the h2 settings
 /// above set explicitly. `otlp_in`'s HTTP transport, `prometheus_in`'s receiver, `datadog_in`,
-/// and `datadog_trace_in` build here.
+/// `datadog_trace_in`, and `splunk_hec_in` build here.
 pub(crate) fn auto_builder() -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
