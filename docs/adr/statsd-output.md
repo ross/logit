@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-14
+updated: 2026-09-24
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -424,7 +424,8 @@ rendering) handles a service check with no special-casing. `statsd.service_check
 `MetricRecord`'s own name has nowhere to carry the raw wire spelling, rule (b) again),
 `statsd.service_check.status` (always, `Value::U64`), `statsd.service_check.message` (`m:`, only
 if present, verbatim including any `|` it contains — `m:` is always the *last* field on the wire,
-so it can consume the rest of the line), `statsd.service_check.host` (`h:`, only if present),
+so it can consume the rest of the line; superseded: `m:` now ends at the next `|`, see the
+2026-09-24 amendment), `statsd.service_check.host` (`h:`, only if present),
 `statsd.timestamp`/`statsd.container_id`/`#tags` round out the carrier set.
 
 **`event_name` stays `None`, deliberately.** An event title is free text an operator or their
@@ -440,7 +441,8 @@ lost by leaving `event_name` unset.
 `statsd_out` re-emits both shapes in one fixed field order regardless of the order their fields
 arrived in on the wire — `_e{tlen,xlen}:title|text|d:|h:|p:|t:|k:|s:|#tags|c:` for an event,
 `_sc|name|status|d:|h:|#tags|c:|m:` for a service check (`m:` last, unconditionally, since it
-consumes the rest of the line on decode) — the same "tags in `AttrMap` order, not wire order"
+consumes the rest of the line on decode; the order stands, the reason is superseded by the
+2026-09-24 amendment) — the same "tags in `AttrMap` order, not wire order"
 normalization this ADR's previous amendment already permits by name for an ordinary metric line's
 segments, applied to these two grammars' own named fields instead of a generic `|` segment order.
 `d:<secs>` (never `|T<secs>`) renders from the `statsd.timestamp` carrier's own `U64` value on
@@ -461,7 +463,8 @@ decode-side mirror); event host/aggregation-key/source-type and service-check na
 control bytes substituted (each sits in a `|letter:value` field a real decode splits on the *next*
 `|`, the same reason a tag value's own colon-preserving rule doesn't apply here — none of these
 fields has a tag value's colon-splitting ambiguity); service-check message — control bytes
-(including a real newline) substituted, `|` left alone, since `m:` is always the line's last field.
+(including a real newline) substituted, `|` left alone, since `m:` is always the line's last field
+(superseded: `|` is now substituted too, see the 2026-09-24 amendment).
 Event priority/alert-type are never sanitized at all: either the value exactly matches its fixed
 allowed set (`normal`/`low`; `info`/`success`/`warning`/`error`) and is written verbatim, or it
 doesn't and the one field is omitted — there is no substituted spelling of an out-of-set priority
@@ -503,7 +506,7 @@ ordinary lines, right after the `_sc` line — only the first metric is claimed 
 `event_d_field_sets_the_timestamp_and_the_carrier`, `event_container_id_becomes_an_attribute`,
 `service_check_d_field_sets_the_timestamp_and_the_carrier`,
 `service_check_container_id_becomes_an_attribute`,
-`service_check_message_containing_pipe_decodes_verbatim`,
+`service_check_message_ends_at_the_next_pipe`,
 `service_check_out_of_range_or_non_numeric_status_is_rejected`,
 `service_check_empty_name_is_rejected`,
 `an_underscore_prefixed_metric_name_still_decodes_as_a_metric` (only `_e{`/`_sc|` are
@@ -525,7 +528,7 @@ real payload), and
 `event_carriers_never_appear_as_tags`, `event_carriers_set_on_the_resource_are_honored`,
 `an_oversize_event_line_is_dropped_via_the_existing_oversize_path`,
 `a_service_check_renders_the_canonical_line`,
-`a_service_check_message_containing_a_pipe_is_kept_since_m_is_last`,
+`a_service_check_message_s_pipe_is_substituted`,
 `service_check_status_attribute_wins_over_the_gauge_value`,
 `service_check_status_falls_back_to_the_rounded_gauge_value`,
 `an_out_of_range_service_check_status_is_dropped_and_counted`,
@@ -721,3 +724,27 @@ handshake as two *separate* phases, so a TLS connect can take up to twice the co
 This closes `docs/known-gaps.md`'s "`statsd_out` has no TLS/DTLS" entry, whose other half
 (`statsd_in`'s ingress side adopting the shared TCP listener driver) closed alongside it. DTLS
 itself stays out of scope on both halves.
+
+## Amendment: a service check's `m:` ends at the next `|` (2026-09-24)
+
+The DogStatsD events amendment above read `m:` to the end of the line, on the assumption that `m:`
+is always a service check's last field. A real client breaks that assumption. The `datadog` Python
+client 0.54 writes `c:` and `card:` after `m:`: it sent
+`_sc|record.can_connect|1|...|m:slow upstream|c:in-...|card:low`
+(`testdata/interop/datadog/dogstatsd-unix-008.raw`). A Datadog Agent 7.83 reported that check's
+message as `slow upstream` (`testdata/interop/datadog/agent-api-v1-check-run-*.bin`), so the Agent
+ends `m:` at the next `|`, as it does every other field. Read to the end of the line, `statsd_in`
+turned those two segments into message text and lost the container id and cardinality.
+
+Both directions change:
+
+- **Decode:** `statsd_in` ends `m:` at the next `|`. The segments after it parse as they would
+  anywhere else on the line (`service_check_message_ends_at_the_next_pipe`).
+- **Encode:** `statsd_out` substitutes `_` for a `|` in `statsd.service_check.message`, as it
+  already did for a service check's name and host, because no receiver can read a `|` there
+  (`a_service_check_message_s_pipe_is_substituted`). `m:` stays last in the canonical field order.
+
+A message containing `|` no longer relays byte-for-byte; the substitution joins this ADR's
+permitted normalizations. `docs/design/data-model.md`'s `statsd.service_check.message` row carries
+the rule, and [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s W7a
+amendment records the same finding from the Datadog side.

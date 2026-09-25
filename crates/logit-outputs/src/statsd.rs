@@ -1,4 +1,4 @@
-//! statsd / DogStatsD egress over UDP or TCP, the mirror of `logit_inputs::statsd`. Names, values,
+//! statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `logit_inputs::statsd`. Names, values,
 //! and tags round-trip through the real `StatsdDecoder`, which this module's tests pin.
 //!
 //! A pure [`StatsdEncoder`] (no socket; every grammar, sanitization, and packing test runs against
@@ -15,7 +15,7 @@
 //!
 //! ## Grammar and round-trip contract
 //!
-//! `<name>:<value>|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>]`
+//! `<name>:<value>|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|e:<external-data>][|card:<cardinality>][|T<unix-seconds>]`
 //! is the grammar `logit_inputs::statsd` parses. When `@` and `|T` appear is under "Sample rate:
 //! never for a counter, real for `Samples`" and "`\|c:<container-id>` and `\|T<timestamp>`" below.
 //! Every sanitization rule exists because `StatsdDecoder::parse_line` would otherwise misparse the
@@ -32,8 +32,9 @@
 //! multi-value line (`name:v1:v2|ms`) becomes one `name:v|ms` line per value, and a timer's `h`/`d`
 //! wire type collapses to `ms` (counted `EncodeStats::type_normalized_dialect`). These are the
 //! "sink-configured dialect change" and "splitting a multi-value line" normalizations
-//! `docs/adr/lossless-transit.md` permits by name. `|c:<container-id>`/`|T<timestamp>` have no
-//! plain-statsd equivalent and are dropped, not normalized.
+//! `docs/adr/lossless-transit.md` permits by name. `|c:<container-id>`, `|e:<external-data>`,
+//! `|card:<cardinality>` and `|T<timestamp>` have no plain-statsd equivalent and are dropped, not
+//! normalized.
 //!
 //! ## Sanitization
 //!
@@ -156,10 +157,31 @@
 //! octet-counting: statsd has no such convention and no receiver auto-detects one, unlike syslog's
 //! `go-syslog`.
 //!
+//! The two Unix transports carry **packets**, packed as UDP datagrams are (newline-joined, no
+//! trailing newline, at most `max_packet_bytes`):
+//!
+//! - `transport: unix` sends each packet as one datagram on a socket connected to the path in
+//!   `endpoint`, connected lazily on the first send. A receiver whose queue stays full makes the
+//!   send wait, not drop (unlike UDP, `AF_UNIX` pushes back on the sender), so each datagram's
+//!   wait is bounded by `connect_timeout` and a timeout fails the send like any other socket
+//!   error. The socket must be connected: Linux parks a sender on a full receiver, and wakes it
+//!   when the receiver drains, only when it's connected. An unconnected sender is reported
+//!   writable again right after each `EAGAIN`, so behind other clients' datagrams it retries in a
+//!   busy loop. A connected socket follows the receiver's socket, not the path, so a
+//!   timeout, `ECONNREFUSED`, or `ENOTCONN` drops it and the next send connects to whatever is
+//!   at the path then; the first datagram of a batch gets one immediate reconnect-and-retry, so
+//!   a receiver restart costs no batch (ADR `datadog-agent-and-intake-relay`, decision 12).
+//! - `transport: unix_stream` writes each packet after its length as a 4-byte little-endian
+//!   integer (the Agent's `dogstatsd_stream_socket` framing, as a real client writes it:
+//!   `testdata/interop/datadog/dogstatsd-unix-stream-000.raw`) on
+//!   one connection, with everything [`StatsdOutput::send_tcp`] says about TCP's plaintext arm:
+//!   the lazy connect, the probe of a reused connection, the one reconnect after a zero-byte
+//!   failure, and the flush before a batch is called delivered.
+//!
 //! ## TLS
 //!
 //! `transport: tcp` optionally runs over TLS ([`StatsdOutput::with_tls`]) in `syslog_out`'s
-//! arrangement (`docs/adr/statsd-output.md`'s "Amendment: TLS" section). A `tls:` block's presence
+//! arrangement; a Unix socket never does (graph rule 65) (`docs/adr/statsd-output.md`'s "Amendment: TLS" section). A `tls:` block's presence
 //! turns TLS on and makes it *required*: `endpoint` is a bare `host:port` with no scheme to carry
 //! the signal, so there is no plaintext fallback. No statsd client in the wild speaks TLS, so this
 //! is for a `logit`-to-`logit` (or stunnel-shaped) relay hop. DTLS is out of scope, so `tls:` under
@@ -191,15 +213,25 @@
 //! the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp` after
 //! decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides on the
 //! series key like any other attribute. A `statsd.timestamp` that isn't a `Value::U64` (reachable
-//! from a cross-protocol relay or Lua, never from `statsd_in`) isn't emitted. Both segments follow
-//! the tag segment on every line emitted for the event (`append_dialect_extras`). Under
-//! `Format::Statsd` neither has anywhere to go, so both are dropped and counted
-//! (`EncodeStats::dropped_dialect_fields`).
+//! from a cross-protocol relay or Lua, never from `statsd_in`) isn't emitted.
 //!
-//! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`) are
-//! protocol-namespaced carriers, not tags: `build_tag_suffix` filters the prefix out of the
-//! `|#k:v,...` segment, as `syslog_out` never re-emits its own `syslog.*` attributes as SD-ELEMENT
-//! fields. The same merged resource⊕event walk captures all three carriers into [`EncodeCtx`], so a
+//! `statsd.external_data` and `statsd.cardinality` (DogStatsD v1.5's `|e:` and v1.6's `|card:`)
+//! round-trip the same way as `|c:`: a `Value::Str` carrier. Cardinality is sanitized like a tag
+//! value; external data keeps its own `,` separators ([`is_forbidden_in_external_data`]).
+//!
+//! On a metric line the segments follow the tag segment, in the order `|c:`, `|e:`, `|card:`, `|T`
+//! (`append_dialect_extras`), the order the `datadog` Python client writes them in
+//! (`testdata/interop/datadog/dogstatsd-unix-00*.raw`). On an event or service-check line `c:`,
+//! `e:`, `card:` follow the tags and precede `m:` (`append_origin_fields`); that client writes a
+//! service check's `c:` and `card:` after `m:` instead, and the Agent and the decoder accept any
+//! order. Under `Format::Statsd` none has
+//! anywhere to go, so each is dropped and counted (`EncodeStats::dropped_dialect_fields`).
+//!
+//! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`, and the
+//! rest) are protocol-namespaced carriers, not tags: `build_tag_suffix` filters the prefix out of
+//! the `|#k:v,...` segment, as `syslog_out` never re-emits its own `syslog.*` attributes as
+//! SD-ELEMENT fields. The same merged resource⊕event walk captures every carrier into
+//! [`EncodeCtx`], so a
 //! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored like
 //! an event-level one. `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never
 //! `event.attributes`, which keeps the filter and the read symmetric.
@@ -228,7 +260,8 @@
 //! event's timestamp is a named field of its own grammar), `|h:<host>`, `|p:<priority>`
 //! (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/`warning`/`error` only),
 //! `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment (via
-//! [`build_tag_suffix`]/[`append_tags`], as for a metric line), then `|c:<container id>`. `title`
+//! [`build_tag_suffix`]/[`append_tags`], as for a metric line), then `|c:<container id>`,
+//! `|e:<external data>`, `|card:<cardinality>`. `title`
 //! is `statsd.event.title`; `text` is the log `message`, which must be a `Value::Str` (anything
 //! else drops the event, counted `EncodeStats::dropped_unencodable_value`), with every real `\n`
 //! escaped to the two bytes `\n` (`statsd_in`'s `unescape_event_text` is the mirror). `tlen`/`xlen`
@@ -239,8 +272,8 @@
 //! protocol's own egress, and an absent carrier means an absent wire field.
 //!
 //! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`,
-//! the `|#...` tag segment, `|c:<container id>`, and always last `|m:<message>`, since `m:`
-//! consumes the rest of the line on decode. The event's **first** metric is the check and must be a
+//! the `|#...` tag segment, `|c:<container id>`, `|e:<external data>`, `|card:<cardinality>`, and
+//! last `|m:<message>`, the reference order. The event's **first** metric is the check and must be a
 //! `Gauge`; otherwise the whole event is dropped and counted
 //! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g`
 //! line, since the point is the check, not a gauge that shares its value. `name` is the
@@ -266,8 +299,9 @@
 //!   out-of-set value has no sanitized form that means the same thing. The line is still emitted,
 //!   so this is its own counter rather than `dropped_unencodable_value`, which reports a message
 //!   drop.
-//! - Service-check message: control bytes (a real newline included) -> `_`, with no escape; `|`
-//!   is left alone since `m:` is last ([`is_forbidden_in_service_check_message`]).
+//! - Service-check message: `|` and control bytes (a real newline included) -> `_`, with no
+//!   escape ([`is_forbidden_in_service_check_message`]). The Agent ends `m:` at the next `|`
+//!   wherever it sits, as `statsd_in` does.
 //!
 //! **`Format::Statsd` has no wire form for either shape** (no `_e`/`_sc` sigil), so the whole
 //! event is dropped and counted (`EncodeStats::dropped_dialect_events`) before anything else about
@@ -299,7 +333,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{lookup_host, TcpStream, UdpSocket};
+use tokio::net::{lookup_host, TcpStream, UdpSocket, UnixDatagram, UnixStream};
 use tokio_rustls::TlsConnector;
 
 /// Re-exported for symmetry with `crate::syslog`'s and `crate::logit`'s paths; every TLS-dialing
@@ -362,7 +396,8 @@ pub struct EncodeStats {
     /// A timer's `h`/`d` wire type (`statsd.type`) collapsed to `ms` under `Format::Statsd`.
     /// Counted once per `Samples` record, not per split line.
     pub type_normalized_dialect: usize,
-    /// `statsd.container_id`/`statsd.timestamp` dropped under `Format::Statsd`
+    /// `statsd.container_id`/`statsd.external_data`/`statsd.cardinality`/`statsd.timestamp`
+    /// dropped under `Format::Statsd`
     /// (`append_dialect_extras`). Counted once per field per emitted line, so a negative-gauge pair
     /// or a multi-member `SetMembers` record counts once per physical line.
     pub dropped_dialect_fields: usize,
@@ -495,6 +530,8 @@ impl FramedEncoder for StatsdEncoder {
                     tag_suffix: &self.tag_suffix,
                     statsd_type: carriers.statsd_type,
                     container_id: carriers.container_id,
+                    external_data: carriers.external_data,
+                    cardinality: carriers.cardinality,
                     timestamp_secs: carriers.timestamp_secs,
                     max_packet_bytes: self.max_packet_bytes,
                     stats: &mut stats,
@@ -538,6 +575,8 @@ impl FramedEncoder for StatsdEncoder {
                 tag_suffix: &self.tag_suffix,
                 statsd_type: carriers.statsd_type,
                 container_id: carriers.container_id,
+                external_data: carriers.external_data,
+                cardinality: carriers.cardinality,
                 timestamp_secs: carriers.timestamp_secs,
                 max_packet_bytes: self.max_packet_bytes,
                 stats: &mut stats,
@@ -607,8 +646,8 @@ fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
 }
 
 /// The per-event context [`render_metric`] and its helpers need but don't own, as one borrow
-/// instead of a long parameter list. `statsd_type`/`container_id`/`timestamp_secs` come from
-/// [`build_tag_suffix`]'s merged resource⊕event walk; [`append_dialect_extras`]/
+/// instead of a long parameter list. `statsd_type`/`container_id`/`external_data`/`cardinality`/
+/// `timestamp_secs` come from [`build_tag_suffix`]'s merged resource⊕event walk; [`append_dialect_extras`]/
 /// [`statsd_wire_type`] read them here, never from `event.attributes`, so a resource-only carrier
 /// is honored.
 struct EncodeCtx<'a> {
@@ -616,6 +655,8 @@ struct EncodeCtx<'a> {
     tag_suffix: &'a str,
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
+    external_data: Option<&'a str>,
+    cardinality: Option<&'a str>,
     timestamp_secs: Option<u64>,
     max_packet_bytes: usize,
     stats: &'a mut EncodeStats,
@@ -631,6 +672,8 @@ struct EncodeCtx<'a> {
 struct Carriers<'a> {
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
+    external_data: Option<&'a str>,
+    cardinality: Option<&'a str>,
     timestamp_secs: Option<u64>,
     /// `statsd.event.title`, present only if valid UTF-8. [`is_dogstatsd_event`] detects an event
     /// by the raw attribute, so this can be `None` on a detected event.
@@ -677,6 +720,12 @@ fn build_tag_suffix<'a>(
                 }
                 ("statsd.container_id", Value::Str(s)) => {
                     carriers.container_id = std::str::from_utf8(s).ok();
+                }
+                ("statsd.external_data", Value::Str(s)) => {
+                    carriers.external_data = std::str::from_utf8(s).ok();
+                }
+                ("statsd.cardinality", Value::Str(s)) => {
+                    carriers.cardinality = std::str::from_utf8(s).ok();
                 }
                 ("statsd.timestamp", Value::U64(secs)) => {
                     carriers.timestamp_secs = Some(*secs);
@@ -797,40 +846,51 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
     }
 }
 
-/// Appends `|c:<container-id>`/`|T<timestamp>` under [`Format::DogStatsd`], or counts each
-/// present field into `EncodeStats::dropped_dialect_fields` under [`Format::Statsd`]. Called after
-/// [`append_tags`] on every physical metric line, both lines of a negative-gauge pair included,
-/// since each is its own statsd line on the wire. `|T` is the carrier's wire seconds, never
-/// `event.timestamp` (module doc's "`|c:<container-id>` and `|T<timestamp>`").
+/// Appends `|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>`, then
+/// `|T<timestamp>` under [`Format::DogStatsd`], or counts each present field into
+/// `EncodeStats::dropped_dialect_fields` under [`Format::Statsd`]. Called after [`append_tags`] on
+/// every physical metric line, both lines of a negative-gauge pair included, since each is its own
+/// statsd line on the wire. `|T` is the carrier's wire seconds, never `event.timestamp` (module
+/// doc's "`|c:<container-id>` and `|T<timestamp>`").
 fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
     match ctx.format {
         Format::DogStatsd => {
-            if let Some(id) = ctx.container_id {
-                line.push_str("|c:");
-                sanitize_into(line, id, is_forbidden_in_tag_value_only);
-            }
+            append_origin_fields(line, ctx);
             if let Some(secs) = ctx.timestamp_secs {
                 let _ = write!(line, "|T{secs}");
             }
         }
         Format::Statsd => {
-            if ctx.container_id.is_some() {
-                ctx.stats.dropped_dialect_fields += 1;
-            }
-            if ctx.timestamp_secs.is_some() {
-                ctx.stats.dropped_dialect_fields += 1;
-            }
+            let present = [
+                ctx.container_id.is_some(),
+                ctx.external_data.is_some(),
+                ctx.cardinality.is_some(),
+                ctx.timestamp_secs.is_some(),
+            ];
+            ctx.stats.dropped_dialect_fields += present.iter().filter(|&&p| p).count();
         }
     }
 }
 
-/// [`append_dialect_extras`] for an event/service-check line: `|c:<container-id>` only, **never**
-/// `|T`, since the timestamp already went out as `d:<secs>`. No dialect accounting:
-/// [`StatsdEncoder::encode_into`] drops both shapes under `Format::Statsd` before rendering.
-fn append_container_id(line: &mut String, ctx: &EncodeCtx) {
+/// Appends `|c:<container-id>|e:<external-data>|card:<cardinality>`, each only when its carrier is
+/// present. The container id and cardinality are sanitized like a tag value, the external data by
+/// [`is_forbidden_in_external_data`]. The metric-line tail before `|T`, and the whole tail of an
+/// event or service-check line before `|m:`. **Never `|T`** on those two shapes, since their
+/// timestamp already went out as `d:<secs>`. No dialect accounting: [`append_dialect_extras`]
+/// does that for a metric line, and [`StatsdEncoder::encode_into`] drops both other shapes under
+/// `Format::Statsd` before rendering.
+fn append_origin_fields(line: &mut String, ctx: &EncodeCtx) {
     if let Some(id) = ctx.container_id {
         line.push_str("|c:");
         sanitize_into(line, id, is_forbidden_in_tag_value_only);
+    }
+    if let Some(data) = ctx.external_data {
+        line.push_str("|e:");
+        sanitize_into(line, data, is_forbidden_in_external_data);
+    }
+    if let Some(cardinality) = ctx.cardinality {
+        line.push_str("|card:");
+        sanitize_into(line, cardinality, is_forbidden_in_tag_value_only);
     }
 }
 
@@ -934,7 +994,7 @@ fn render_event(
         sanitize_into(line, source, is_forbidden_in_extended_field);
     }
     append_tags(line, ctx.tag_suffix);
-    append_container_id(line, ctx);
+    append_origin_fields(line, ctx);
 
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
 }
@@ -1003,7 +1063,7 @@ fn render_service_check(
         sanitize_into(line, host, is_forbidden_in_extended_field);
     }
     append_tags(line, ctx.tag_suffix);
-    append_container_id(line, ctx);
+    append_origin_fields(line, ctx);
     if let Some(message) = carriers.service_check_message {
         line.push_str("|m:");
         sanitize_into(line, message, is_forbidden_in_service_check_message);
@@ -1451,16 +1511,24 @@ fn is_forbidden_in_extended_field(c: char) -> bool {
     c == '|' || c.is_control()
 }
 
-/// Forbidden in a service check's `m:` message: control bytes only. A newline is substituted, not
-/// escaped, since the decoder has no unescape for this field. `|` is allowed: `m:` is always
-/// rendered and parsed last, so a `|` can't start another field.
-fn is_forbidden_in_service_check_message(c: char) -> bool {
-    c.is_control()
+/// A DogStatsD `|e:<external-data>` value: `|`, control characters, and whitespace -> `_`. Not the
+/// tag-value rule, which substitutes `,`: external data is itself a comma-separated list
+/// (`it-<bool>,cn-<container name>,pu-<pod uid>`), and the decoder ends the field only at the next
+/// `|` or line end. Whitespace goes because a metric line's trailing whitespace is trimmed at decode.
+fn is_forbidden_in_external_data(c: char) -> bool {
+    c == '|' || c.is_control() || c.is_whitespace()
 }
 
-/// The live half of a `statsd_out` sink, as `syslog::Conn`: `Udp` binds eagerly (a bad local bind
-/// is a config error); `Tcp` connects lazily inside `send`, so a receiver that isn't up yet can't
-/// block startup.
+/// Forbidden in a service check's `m:` message: `|` and control bytes. A newline is substituted,
+/// not escaped, since the decoder has no unescape for this field. `|` ends the field at the Agent
+/// and at `statsd_in`, wherever `m:` sits on the line.
+fn is_forbidden_in_service_check_message(c: char) -> bool {
+    c == '|' || c.is_control()
+}
+
+/// The live half of a `statsd_out` sink, as `syslog::Conn`: the UDP arm binds eagerly (a bad
+/// local socket is a config error); the Unix datagram and stream arms connect lazily inside
+/// `send`, so a receiver that isn't up yet can't block startup.
 enum Conn {
     Udp(UdpSocket),
     /// `Box<dyn AsyncStream>` covers plaintext and TLS without making [`StatsdOutput`] generic,
@@ -1470,10 +1538,23 @@ enum Conn {
         stream: Option<Box<dyn AsyncStream>>,
         connect_timeout: Duration,
     },
+    /// Connected to the path in `endpoint` on first use, and `None` again after a send that shows
+    /// the receiver gone or stuck, so the next send reconnects; each send is bounded by
+    /// `send_timeout` (module doc's "Packing and framing").
+    UnixDatagram {
+        socket: Option<UnixDatagram>,
+        send_timeout: Duration,
+    },
+    /// Always plaintext (graph rule 65); boxed like `Tcp` so both share
+    /// [`StatsdOutput::send_tcp`].
+    UnixStream {
+        stream: Option<Box<dyn AsyncStream>>,
+        connect_timeout: Duration,
+    },
 }
 
-/// `logit_pipeline::Output` for `statsd_out`, built via [`StatsdOutput::udp`] or
-/// [`StatsdOutput::tcp`].
+/// `logit_pipeline::Output` for `statsd_out`, built via [`StatsdOutput::udp`],
+/// [`StatsdOutput::tcp`], [`StatsdOutput::unix_datagram`] or [`StatsdOutput::unix_stream`].
 pub struct StatsdOutput {
     endpoint: String,
     conn: Conn,
@@ -1507,6 +1588,17 @@ impl StatsdOutput {
         Self::new(endpoint, Conn::Tcp { stream: None, connect_timeout })
     }
 
+    /// Never connects here; see [`Conn`]. `send_timeout` bounds each send's wait on a full
+    /// receiver.
+    pub fn unix_datagram(path: impl Into<String>, send_timeout: Duration) -> Self {
+        Self::new(path, Conn::UnixDatagram { socket: None, send_timeout })
+    }
+
+    /// Never connects here; see [`Conn`].
+    pub fn unix_stream(path: impl Into<String>, connect_timeout: Duration) -> Self {
+        Self::new(path, Conn::UnixStream { stream: None, connect_timeout })
+    }
+
     fn new(endpoint: impl Into<String>, conn: Conn) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -1523,13 +1615,14 @@ impl StatsdOutput {
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
 
-    /// The encoder's per-line cap for this transport: `max_packet_bytes` on UDP, uncapped on TCP.
-    /// Applied by the builders, so `send` never mutates the encoder.
+    /// The encoder's per-line cap for this transport: `max_packet_bytes` wherever lines are packed
+    /// into packets (UDP and both Unix transports), uncapped on TCP. Applied by the builders, so
+    /// `send` never mutates the encoder.
     fn encoder_cap(&self) -> usize {
-        if matches!(self.conn, Conn::Udp(_)) {
-            self.max_packet_bytes
-        } else {
+        if matches!(self.conn, Conn::Tcp { .. }) {
             usize::MAX
+        } else {
+            self.max_packet_bytes
         }
     }
 
@@ -1539,7 +1632,8 @@ impl StatsdOutput {
         self
     }
 
-    /// Bounds one UDP **datagram** (several packed lines), and so one line; no effect on TCP.
+    /// Bounds one **packet** (several packed lines: a UDP or Unix datagram, or one length-prefixed
+    /// `unix_stream` packet), and so one line; no effect on TCP.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         let cap = self.encoder_cap();
@@ -1556,9 +1650,9 @@ impl StatsdOutput {
     /// [`TlsClientSettings::is_empty`], which `otlp_out` can use only because `https://` already
     /// selected TLS. TLS is then *required*; there is no plaintext fallback.
     ///
-    /// Errors on UDP (DTLS is out of scope). `logit-pipeline::graph::resolve`'s rule 52 already
-    /// rejects that config; this check stops a caller that skips graph validation from getting an
-    /// unencrypted socket.
+    /// Errors on UDP (DTLS is out of scope) and on a Unix socket. `logit-pipeline::graph::resolve`'s
+    /// rules 52 and 65 already reject those configs; this check stops a caller that skips graph
+    /// validation from getting an unencrypted socket.
     ///
     /// Paths in `settings` resolve against `base_dir` (the config file's directory) and load here,
     /// since `graph::resolve` never touches the filesystem.
@@ -1567,11 +1661,15 @@ impl StatsdOutput {
         settings: &TlsClientSettings,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
-        if matches!(self.conn, Conn::Udp(_)) {
-            anyhow::bail!(
+        match self.conn {
+            Conn::Tcp { .. } => {}
+            Conn::Udp(_) => anyhow::bail!(
                 "statsd_out: tls: requires transport: tcp -- DTLS (statsd over TLS over UDP) is \
                  out of scope"
-            );
+            ),
+            Conn::UnixDatagram { .. } | Conn::UnixStream { .. } => anyhow::bail!(
+                "statsd_out: tls: requires transport: tcp -- a Unix socket is always plaintext"
+            ),
         }
         if settings.insecure_skip_verify {
             self.diag.warn(
@@ -1690,11 +1788,41 @@ impl Output for StatsdOutput {
                 )
                 .await
             }
+            Conn::UnixDatagram { socket, send_timeout } => {
+                let mut dest = DatagramDest::Unix(UnixDest {
+                    socket,
+                    path: Path::new(&self.endpoint),
+                    send_timeout: *send_timeout,
+                    telemetry: &self.telemetry,
+                    has_connected_once: &mut self.has_connected_once,
+                });
+                Self::send_datagrams(
+                    &mut dest,
+                    &self.lines,
+                    self.max_packet_bytes,
+                    &mut self.packet_buf,
+                    &mut self.diag,
+                    &self.telemetry,
+                )
+                .await
+            }
             Conn::Tcp { stream, connect_timeout } => {
                 let mut dial = TcpDial {
                     endpoint: &self.endpoint,
                     connect_timeout: *connect_timeout,
                     tls: self.tls.as_ref(),
+                    kind: StreamKind::Tcp,
+                    telemetry: &self.telemetry,
+                    has_connected_once: &mut self.has_connected_once,
+                };
+                Self::send_tcp(stream, &mut dial, &self.lines, &mut self.packet_buf).await
+            }
+            Conn::UnixStream { stream, connect_timeout } => {
+                let mut dial = TcpDial {
+                    endpoint: &self.endpoint,
+                    connect_timeout: *connect_timeout,
+                    tls: None,
+                    kind: StreamKind::Unix { max_packet_bytes: self.max_packet_bytes },
                     telemetry: &self.telemetry,
                     has_connected_once: &mut self.has_connected_once,
                 };
@@ -1706,7 +1834,7 @@ impl Output for StatsdOutput {
         match &result {
             Ok((messages, datagrams)) => {
                 self.telemetry.count("logit.output.messages", *messages as f64, &[]);
-                if matches!(self.conn, Conn::Udp(_)) {
+                if matches!(self.conn, Conn::Udp(_) | Conn::UnixDatagram { .. }) {
                     self.telemetry.count("logit.output.datagrams", *datagrams as f64, &[]);
                 }
                 self.telemetry.count("logit.output.requests", 1.0, &[("class", "ok")]);
@@ -1718,11 +1846,13 @@ impl Output for StatsdOutput {
         result.map(|_| ())
     }
 
-    /// `send` flushes and retains nothing between calls, so this only flushes the TCP stream as a
+    /// `send` flushes and retains nothing between calls, so this only flushes a stream as a
     /// backstop at shutdown.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
-            stream.flush().await.context("flushing statsd_out TCP stream")?;
+        if let Conn::Tcp { stream: Some(stream), .. }
+        | Conn::UnixStream { stream: Some(stream), .. } = &mut self.conn
+        {
+            stream.flush().await.context("flushing statsd_out stream")?;
         }
         Ok(())
     }
@@ -1773,15 +1903,26 @@ impl StatsdOutput {
             .next()
             .context("statsd_out endpoint resolved to no addresses")
             .context(Fault::Clean)?;
+        let mut dest = DatagramDest::Udp { socket, addr };
+        Self::send_datagrams(&mut dest, lines, max_packet_bytes, packet_buf, diag, telemetry).await
+    }
 
+    /// [`Self::send_udp`]'s packing loop over either datagram family.
+    async fn send_datagrams(
+        dest: &mut DatagramDest<'_>,
+        lines: &MessageBuf,
+        max_packet_bytes: usize,
+        packet_buf: &mut Vec<u8>,
+        diag: &mut Diagnostics,
+        telemetry: &Telemetry,
+    ) -> anyhow::Result<(usize, usize)> {
         let mut counts = UdpSendCounts::default();
         packet_buf.clear();
         for msg in lines.iter() {
             let needs_sep = !packet_buf.is_empty();
             let extra = msg.len() + usize::from(needs_sep);
             if !packet_buf.is_empty() && packet_buf.len() + extra > max_packet_bytes {
-                Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry)
-                    .await?;
+                Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
             }
             if needs_sep && !packet_buf.is_empty() {
                 packet_buf.push(b'\n');
@@ -1790,7 +1931,7 @@ impl StatsdOutput {
             counts.entries_in_packet += 1;
         }
         if !packet_buf.is_empty() {
-            Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry).await?;
+            Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
         }
         Ok((counts.messages, counts.datagrams))
     }
@@ -1800,14 +1941,13 @@ impl StatsdOutput {
     /// or, when the kernel rejects the datagram as too large,
     /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
     async fn flush_datagram(
-        socket: &UdpSocket,
-        addr: std::net::SocketAddr,
+        dest: &mut DatagramDest<'_>,
         packet_buf: &mut Vec<u8>,
         counts: &mut UdpSendCounts,
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<()> {
-        match socket.send_to(packet_buf, addr).await {
+        match dest.send(packet_buf, counts.datagrams == 0).await {
             Ok(_) => {
                 counts.messages += counts.entries_in_packet;
                 counts.datagrams += 1;
@@ -1835,7 +1975,8 @@ impl StatsdOutput {
         Ok(())
     }
 
-    /// Writes the whole batch as one frame, every line `\n`-terminated including the last, with at
+    /// Writes the whole batch as one frame, every line `\n`-terminated including the last (or, on
+    /// a Unix stream, as length-prefixed packets; module doc's "Packing and framing"), with at
     /// most one internal reconnect-and-retry. Shares `syslog::send_tcp`'s two properties:
     /// cancellation safety via `stream.take()`, and never resending once a byte has left this
     /// host. Returns `(messages sent, 0)`; TCP has no datagram count.
@@ -1883,10 +2024,17 @@ impl StatsdOutput {
         lines: &MessageBuf,
         frame_buf: &mut Vec<u8>,
     ) -> anyhow::Result<(usize, usize)> {
-        frame_buf.clear();
-        for msg in lines.iter() {
-            frame_buf.extend_from_slice(msg);
-            frame_buf.push(b'\n');
+        match dial.kind {
+            StreamKind::Tcp => {
+                frame_buf.clear();
+                for msg in lines.iter() {
+                    frame_buf.extend_from_slice(msg);
+                    frame_buf.push(b'\n');
+                }
+            }
+            StreamKind::Unix { max_packet_bytes } => {
+                build_length_prefixed_frame(lines, max_packet_bytes, frame_buf);
+            }
         }
 
         let mut retried_after_a_zero_byte_failure = false;
@@ -1959,8 +2107,11 @@ impl StatsdOutput {
 struct TcpDial<'a> {
     endpoint: &'a str,
     connect_timeout: Duration,
-    /// `Some` exactly when a `tls:` block was configured -- see [`StatsdOutput::tls`].
+    /// `Some` if and only if a `tls:` block was configured -- see [`StatsdOutput::tls`]. Always
+    /// `None` for [`StreamKind::Unix`].
     tls: Option<&'a Arc<rustls::ClientConfig>>,
+    /// What `endpoint` names and how a batch is framed on it.
+    kind: StreamKind,
     telemetry: &'a Telemetry,
     has_connected_once: &'a mut bool,
 }
@@ -1977,6 +2128,16 @@ impl TcpDial<'_> {
     /// to twice the configured value. Both phases fail `Fault::Clean`: nothing of the batch has
     /// left the host yet.
     async fn connect(&mut self) -> anyhow::Result<Box<dyn AsyncStream>> {
+        if let StreamKind::Unix { .. } = self.kind {
+            let unix =
+                tokio::time::timeout(self.connect_timeout, UnixStream::connect(self.endpoint))
+                    .await
+                    .context("connecting to statsd_out socket timed out")
+                    .and_then(|r| r.context("connecting to statsd_out socket"))
+                    .context(Fault::Clean)?;
+            self.count_connect();
+            return Ok(Box::new(unix));
+        }
         let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.endpoint))
             .await
             .context("connecting to statsd_out endpoint timed out")
@@ -2003,15 +2164,154 @@ impl TcpDial<'_> {
             None => Box::new(tcp),
         };
 
-        // Counted at connect, not after the write, so a reconnect whose first write fails still
-        // shows up.
-        if *self.has_connected_once {
-            self.telemetry.count("logit.output.reconnects", 1.0, &[]);
-        } else {
-            *self.has_connected_once = true;
-        }
+        self.count_connect();
         Ok(conn)
     }
+
+    /// Counts every connect after the first as `logit.output.reconnects`. Counted at connect, not
+    /// after the write, so a reconnect whose first write fails still shows up.
+    fn count_connect(&mut self) {
+        count_connect(self.telemetry, self.has_connected_once);
+    }
+}
+
+/// [`TcpDial::count_connect`]'s rule, shared with [`UnixDest`].
+fn count_connect(telemetry: &Telemetry, has_connected_once: &mut bool) {
+    if *has_connected_once {
+        telemetry.count("logit.output.reconnects", 1.0, &[]);
+    } else {
+        *has_connected_once = true;
+    }
+}
+
+/// Which stream [`TcpDial`] opens and how [`StatsdOutput::send_tcp`] frames a batch on it.
+#[derive(Debug, Clone, Copy)]
+enum StreamKind {
+    /// A TCP connection to a `host:port`, optionally TLS; every line `\n`-terminated.
+    Tcp,
+    /// A Unix stream socket at a path; packets of up to `max_packet_bytes`, each after a 4-byte
+    /// little-endian length.
+    Unix { max_packet_bytes: usize },
+}
+
+/// Packs `lines` into packets of at most `max_packet_bytes` (newline-joined, no trailing newline,
+/// as [`StatsdOutput::send_udp`] packs a datagram) and writes each into `frame` after its length as
+/// a 4-byte little-endian integer: the `unix_stream` framing. The encoder already dropped any line
+/// over the cap, so every line fits a packet alone.
+fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, frame: &mut Vec<u8>) {
+    const PREFIX: usize = 4;
+    fn close(frame: &mut [u8], start: usize) {
+        let body = (frame.len() - start - PREFIX) as u32;
+        frame[start..start + PREFIX].copy_from_slice(&body.to_le_bytes());
+    }
+    frame.clear();
+    let mut open: Option<usize> = None; // where the current packet's prefix starts
+    for msg in lines.iter() {
+        if let Some(start) = open {
+            let body = frame.len() - start - PREFIX;
+            if body + 1 + msg.len() <= max_packet_bytes {
+                frame.push(b'\n');
+                frame.extend_from_slice(msg);
+                continue;
+            }
+            close(frame, start);
+        }
+        open = Some(frame.len());
+        frame.extend_from_slice(&[0; PREFIX]);
+        frame.extend_from_slice(msg);
+    }
+    if let Some(start) = open {
+        close(frame, start);
+    }
+}
+
+/// Where [`StatsdOutput::send_datagrams`] sends each packed packet.
+enum DatagramDest<'a> {
+    Udp { socket: &'a UdpSocket, addr: std::net::SocketAddr },
+    Unix(UnixDest<'a>),
+}
+
+impl DatagramDest<'_> {
+    /// One datagram; `first_of_batch` is whether nothing of this batch has been sent yet.
+    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
+        match self {
+            DatagramDest::Udp { socket, addr } => socket.send_to(buf, *addr).await,
+            DatagramDest::Unix(dest) => dest.send(buf, first_of_batch).await,
+        }
+    }
+}
+
+/// A `transport: unix` sender: a datagram socket connected to `path` (module doc's "Packing and
+/// framing" has why it's connected and when it reconnects).
+struct UnixDest<'a> {
+    socket: &'a mut Option<UnixDatagram>,
+    path: &'a Path,
+    send_timeout: Duration,
+    telemetry: &'a Telemetry,
+    has_connected_once: &'a mut bool,
+}
+
+impl UnixDest<'_> {
+    /// Sends one datagram. When it's the batch's first and an inherited socket finds its receiver
+    /// gone, reconnects and retries once: nothing of the batch has left, so the retry can't
+    /// duplicate.
+    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
+        let inherited = self.socket.is_some();
+        match self.send_once(buf).await {
+            Err(err) if first_of_batch && inherited && is_receiver_gone(&err) => {
+                self.send_once(buf).await
+            }
+            result => result,
+        }
+    }
+
+    /// Connects when there's no socket, then sends under `send_timeout`. Drops the socket on a
+    /// timeout or a gone receiver, so the next send reconnects to whatever is at `path`. A connect
+    /// doesn't block on a datagram socket; its failure reaches `flush_datagram` as a send error,
+    /// `Fault::Clean` on a batch's first datagram.
+    async fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let socket: &UnixDatagram = match &mut *self.socket {
+            Some(socket) => socket,
+            slot @ None => {
+                let socket = UnixDatagram::unbound()
+                    .and_then(|socket| socket.connect(self.path).map(|()| socket))
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            err.kind(),
+                            format!(
+                                "connecting to statsd_out socket {}: {err}",
+                                self.path.display()
+                            ),
+                        )
+                    })?;
+                count_connect(self.telemetry, self.has_connected_once);
+                slot.insert(socket)
+            }
+        };
+        let result = match tokio::time::timeout(self.send_timeout, socket.send(buf)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the receiver at {} did not take a datagram within {:?}",
+                    self.path.display(),
+                    self.send_timeout
+                ),
+            )),
+        };
+        if let Err(err) = &result {
+            if err.kind() == std::io::ErrorKind::TimedOut || is_receiver_gone(err) {
+                *self.socket = None;
+            }
+        }
+        result
+    }
+}
+
+/// `ECONNREFUSED` (the connected receiver's socket closed) or `ENOTCONN` (a later send on a socket
+/// the kernel already disconnected): the path may now name a new receiver.
+fn is_receiver_gone(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotConnected)
 }
 
 /// `90` is `EMSGSIZE` on Linux, the only target (`syslog::is_message_too_large` has more).
@@ -2919,6 +3219,139 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T0"]);
     }
 
+    // -- external data (`|e:`) and cardinality (`|card:`) ---------------------------------------
+
+    /// `|c:`, `|e:`, `|card:`, `|T`, in that order, after the tag segment.
+    #[test]
+    fn external_data_and_cardinality_come_between_the_container_id_and_the_timestamp() {
+        let (msgs, stats) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("env", "prod".into()),
+                ("statsd.container_id", Value::str("abcd1234")),
+                ("statsd.external_data", Value::str("it-false,cn-web,pu-abc")),
+                ("statsd.cardinality", Value::str("high")),
+                ("statsd.timestamp", Value::U64(5)),
+            ],
+        )]);
+        assert_eq!(stats, EncodeStats::default());
+        assert_eq!(
+            msgs,
+            vec!["hits:1|c|#env:prod|c:abcd1234|e:it-false,cn-web,pu-abc|card:high|T5"]
+        );
+    }
+
+    #[test]
+    fn external_data_alone_and_cardinality_alone_each_render_their_own_segment() {
+        let (msgs, _) = encode(vec![
+            metric_event(
+                "a",
+                MetricKind::counter(1.0),
+                &[("statsd.external_data", Value::str("x"))],
+            ),
+            metric_event(
+                "b",
+                MetricKind::counter(1.0),
+                &[("statsd.cardinality", Value::str("low"))],
+            ),
+        ]);
+        assert_eq!(msgs, vec!["a:1|c|e:x", "b:1|c|card:low"]);
+    }
+
+    /// Each field is one dropped dialect field per emitted line under `format: statsd`, as `|c:`
+    /// and `|T` are.
+    #[test]
+    fn external_data_and_cardinality_are_dropped_and_counted_under_plain_statsd() {
+        let (msgs, stats) = encode_with_format(
+            vec![metric_event(
+                "hits",
+                MetricKind::counter(1.0),
+                &[
+                    ("statsd.container_id", Value::str("abcd1234")),
+                    ("statsd.external_data", Value::str("ext")),
+                    ("statsd.cardinality", Value::str("high")),
+                    ("statsd.timestamp", Value::U64(5)),
+                ],
+            )],
+            Format::Statsd,
+        );
+        assert_eq!(msgs, vec!["hits:1|c"]);
+        assert_eq!(stats.dropped_dialect_fields, 4);
+    }
+
+    /// Cardinality is sanitized as a tag value. External data keeps its own `,` separators (and
+    /// `#`, `:`), losing only `|`, control characters, and whitespace
+    /// ([`is_forbidden_in_external_data`]).
+    #[test]
+    fn external_data_and_cardinality_are_sanitized() {
+        let (msgs, _) = encode(vec![metric_event(
+            "hits",
+            MetricKind::counter(1.0),
+            &[
+                ("statsd.external_data", Value::str("a|b#c:d\ne,f g")),
+                ("statsd.cardinality", Value::str("hi gh,x")),
+            ],
+        )]);
+        assert_eq!(msgs, vec!["hits:1|c|e:a_b#c:d_e,f_g|card:hi_gh_x"]);
+    }
+
+    #[test]
+    fn external_data_and_cardinality_follow_the_container_id_on_an_event_line() {
+        let event = event_line_event(
+            "t",
+            "x",
+            &[
+                ("statsd.container_id", Value::str("cid1")),
+                ("statsd.external_data", Value::str("ext1")),
+                ("statsd.cardinality", Value::str("low")),
+                ("env", "prod".into()),
+            ],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_e{1,1}:t|x|#env:prod|c:cid1|e:ext1|card:low"]);
+    }
+
+    #[test]
+    fn external_data_and_cardinality_precede_the_message_on_a_service_check_line() {
+        let event = service_check_event(
+            "check",
+            MetricKind::Gauge(0.0),
+            &[
+                ("statsd.service_check.status", Value::U64(0)),
+                ("statsd.container_id", Value::str("cid1")),
+                ("statsd.external_data", Value::str("ext1")),
+                ("statsd.cardinality", Value::str("orchestrator")),
+                ("statsd.service_check.message", Value::str("all good")),
+            ],
+        );
+        let (msgs, _) = encode(vec![event]);
+        assert_eq!(msgs, vec!["_sc|check|0|c:cid1|e:ext1|card:orchestrator|m:all good"]);
+    }
+
+    #[test]
+    fn external_data_and_cardinality_round_trip_through_the_real_statsd_decoder() {
+        for line in [
+            "hits:1|c|#env:prod|c:abcd1234|e:it-false,cn-web|card:high|T1700000000",
+            "_e{5,4}:title|text|c:cid1|e:ext1|card:low",
+            "_sc|check|0|c:cid1|e:ext1|card:none|m:ok",
+        ] {
+            // Receipt time differs between the two decodes of a line with no wire timestamp.
+            let zeroed = |mut events: Vec<Event>| {
+                events.iter_mut().for_each(|e| e.timestamp = 0);
+                events
+            };
+            let original = decode_one(line);
+            let (msgs, _) = encode(original.clone());
+            assert_eq!(msgs, vec![line.to_string()], "byte for byte");
+            assert_eq!(
+                zeroed(decode_one(&msgs[0])),
+                zeroed(original),
+                "decode(encode(x)) == x for {line:?}"
+            );
+        }
+    }
+
     // -- Events -----------------------------------------------------------------------------
 
     fn event_line_event(title: &str, text: &str, extra_attrs: &[(&str, Value)]) -> Event {
@@ -3127,15 +3560,16 @@ mod tests {
         assert_eq!(msgs, vec!["_sc|my.check|1|d:1700000000|h:web1|#env:prod|c:cid1"]);
     }
 
+    /// A `|` would end the message at the Agent, so it's substituted like any other field's.
     #[test]
-    fn a_service_check_message_containing_a_pipe_is_kept_since_m_is_last() {
+    fn a_service_check_message_s_pipe_is_substituted() {
         let event = service_check_event(
             "chk",
             MetricKind::Gauge(0.0),
             &[("statsd.service_check.message", Value::str("a|b"))],
         );
         let (msgs, _) = encode(vec![event]);
-        assert_eq!(msgs, vec!["_sc|chk|0|m:a|b"]);
+        assert_eq!(msgs, vec!["_sc|chk|0|m:a_b"]);
     }
 
     #[test]
@@ -3252,6 +3686,268 @@ mod tests {
         let received =
             tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
         assert_eq!(received, "a:1|c\nb:2|c");
+    }
+
+    // -- transport: unix / unix_stream ---------------------------------------------------------
+
+    /// A per-test directory for a socket file, removed on drop.
+    struct SocketDir(std::path::PathBuf);
+
+    impl SocketDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("los-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn socket(&self) -> String {
+            self.0.join("dsd.socket").display().to_string()
+        }
+    }
+
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn two_counters() -> EventBatch {
+        batch_with(vec![
+            metric_event("a", MetricKind::counter(1.0), &[]),
+            metric_event("b", MetricKind::counter(2.0), &[]),
+        ])
+    }
+
+    /// Packs lines into one Unix datagram, as UDP does, and counts it as a datagram.
+    #[tokio::test]
+    async fn unix_datagram_packs_lines_into_one_datagram_sent_to_the_path() {
+        let dir = SocketDir::new("dgram");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1));
+        output.send(&two_counters()).await.expect("send should succeed");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"a:1|c\nb:2|c");
+    }
+
+    /// `max_packet_bytes` caps a Unix datagram as it caps a UDP one.
+    #[tokio::test]
+    async fn unix_datagram_starts_a_new_datagram_at_max_packet_bytes() {
+        let dir = SocketDir::new("dgram-cap");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let mut output =
+            StatsdOutput::unix_datagram(&path, Duration::from_secs(1)).with_max_packet_bytes(10);
+        output.send(&two_counters()).await.expect("send should succeed");
+        let mut buf = vec![0u8; 4096];
+        for expected in [&b"a:1|c"[..], b"b:2|c"] {
+            let n = receiver.recv(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], expected);
+        }
+    }
+
+    /// No socket at the path: nothing was sent, so the failure is `Fault::Clean`.
+    #[tokio::test]
+    async fn unix_datagram_to_a_missing_socket_fails_clean() {
+        let dir = SocketDir::new("dgram-missing");
+        let mut output = StatsdOutput::unix_datagram(dir.socket(), Duration::from_secs(1));
+        let err = output.send(&two_counters()).await.expect_err("no receiver");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    /// A receiver that never reads fills its queue; the next send waits at most `send_timeout`
+    /// and then fails rather than hanging the sink.
+    #[tokio::test]
+    async fn unix_datagram_send_to_a_full_receiver_times_out() {
+        let dir = SocketDir::new("dgram-full");
+        let path = dir.socket();
+        let _receiver = UnixDatagram::bind(&path).unwrap();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_millis(200))
+            .with_max_packet_bytes(16); // one line per datagram
+        let events =
+            (0..5000).map(|i| metric_event("m", MetricKind::counter(f64::from(i)), &[])).collect();
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), output.send(&batch_with(events)))
+            .await
+            .expect("the send must not hang")
+            .expect_err("a queue that never drains must fail the send");
+        assert!(format!("{err:#}").contains("did not take a datagram"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "earlier datagrams landed");
+    }
+
+    /// Other clients' datagrams fill the receiver's queue; the pending send parks until the
+    /// receiver drains, then completes. Linux parks a sender on a full receiver only when it's
+    /// connected to it; an unconnected one is reported writable again right after each `EAGAIN`
+    /// and retries in a busy loop, which the poll count catches.
+    #[tokio::test]
+    async fn unix_datagram_send_behind_other_clients_completes_when_the_receiver_drains() {
+        let dir = SocketDir::new("dgram-fanin");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        // One filler socket is capped by its own send buffer before the receiver's queue length,
+        // so add fillers until a fresh one can't queue a single datagram.
+        let mut fillers = Vec::new();
+        loop {
+            assert!(fillers.len() < 256, "the receiver's queue never filled");
+            let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+            filler.connect(&path).unwrap();
+            filler.set_nonblocking(true).unwrap();
+            let mut sent = 0;
+            loop {
+                match filler.send(b"filler:1|c") {
+                    Ok(_) => sent += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("filler send: {err}"),
+                }
+            }
+            fillers.push(filler);
+            if sent == 0 {
+                break;
+            }
+        }
+
+        let send_timeout = Duration::from_secs(5);
+        let mut output = StatsdOutput::unix_datagram(&path, send_timeout);
+        let batch = batch_with(vec![metric_event("mine", MetricKind::counter(1.0), &[])]);
+        let drain = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(3), receiver.recv(&mut buf))
+                    .await
+                    .expect("the sink's datagram should arrive once the queue drains")
+                    .unwrap();
+                if &buf[..n] == b"mine:1|c" {
+                    break;
+                }
+            }
+        };
+        let polls = std::cell::Cell::new(0u32);
+        let mut send = std::pin::pin!(output.send(&batch));
+        let counted = std::future::poll_fn(|cx| {
+            polls.set(polls.get() + 1);
+            std::future::Future::poll(send.as_mut(), cx)
+        });
+        let started = std::time::Instant::now();
+        let (result, ()) = tokio::join!(counted, drain);
+        result.expect("the send should complete once the receiver drains");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "woken by the drain, not by send_timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(polls.get() < 50, "the send spun instead of parking: {} polls", polls.get());
+    }
+
+    /// A receiver restarted at the same path between batches receives the second batch: the
+    /// refused send on the old connection reconnects and retries once, counted as a reconnect.
+    #[tokio::test]
+    async fn unix_datagram_follows_a_receiver_rebound_at_the_same_path() {
+        let dir = SocketDir::new("dgram-rebind");
+        let path = dir.socket();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_out", "statsd_out", "sink");
+        let mut output =
+            StatsdOutput::unix_datagram(&path, Duration::from_secs(1)).with_telemetry(telemetry);
+        let mut buf = vec![0u8; 4096];
+
+        let first = UnixDatagram::bind(&path).unwrap();
+        let batch = batch_with(vec![metric_event("first", MetricKind::counter(1.0), &[])]);
+        output.send(&batch).await.expect("first send");
+        let n = first.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"first:1|c");
+
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let second = UnixDatagram::bind(&path).unwrap();
+        let batch = batch_with(vec![metric_event("second", MetricKind::counter(2.0), &[])]);
+        output.send(&batch).await.expect("the send should reconnect to the new receiver");
+        let n = tokio::time::timeout(Duration::from_secs(2), second.recv(&mut buf))
+            .await
+            .expect("the new receiver should get the second batch")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second:2|c");
+        assert_eq!(reconnects_in(registry.drain(0)), Some(1.0));
+    }
+
+    #[test]
+    fn a_length_prefixed_frame_packs_lines_into_le_prefixed_packets() {
+        let mut lines = MessageBuf::default();
+        for line in ["a:1|c", "b:2|c", "ccc:3|c"] {
+            lines.push(line);
+        }
+        let mut frame = Vec::new();
+        // "a:1|c\nb:2|c" is 11 bytes; the third line doesn't fit an 11-byte packet.
+        build_length_prefixed_frame(&lines, 11, &mut frame);
+        let mut expected = 11u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(b"a:1|c\nb:2|c");
+        expected.extend_from_slice(&7u32.to_le_bytes());
+        expected.extend_from_slice(b"ccc:3|c");
+        assert_eq!(frame, expected);
+
+        build_length_prefixed_frame(&MessageBuf::default(), 11, &mut frame);
+        assert!(frame.is_empty(), "no lines, no packets");
+    }
+
+    /// One connection, LE-length-prefixed packets, the lines packed as in a datagram.
+    #[tokio::test]
+    async fn unix_stream_writes_length_prefixed_packets_on_one_connection() {
+        use tokio::io::AsyncReadExt;
+        let dir = SocketDir::new("stream");
+        let path = dir.socket();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let reader = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            conn.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+        let mut output = StatsdOutput::unix_stream(&path, Duration::from_secs(1));
+        output.send(&two_counters()).await.expect("first batch");
+        output
+            .send(&batch_with(vec![metric_event("c", MetricKind::counter(3.0), &[])]))
+            .await
+            .expect("second batch, same connection");
+        drop(output);
+        let got = tokio::time::timeout(Duration::from_secs(2), reader).await.unwrap().unwrap();
+        let mut expected = 11u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(b"a:1|c\nb:2|c");
+        expected.extend_from_slice(&5u32.to_le_bytes());
+        expected.extend_from_slice(b"c:3|c");
+        assert_eq!(got, expected);
+    }
+
+    /// The encoder caps a line at `max_packet_bytes` on a Unix stream, since a packet can't be
+    /// longer; TCP stays uncapped.
+    #[test]
+    fn the_encoder_line_cap_applies_on_both_unix_transports() {
+        let stream = StatsdOutput::unix_stream("/tmp/x.socket", Duration::from_secs(1))
+            .with_max_packet_bytes(64);
+        assert_eq!(stream.encoder_cap(), 64);
+        let tcp =
+            StatsdOutput::tcp("127.0.0.1:1", Duration::from_secs(1)).with_max_packet_bytes(64);
+        assert_eq!(tcp.encoder_cap(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn with_tls_on_a_unix_statsd_out_is_an_error() {
+        let settings = TlsClientSettings::default();
+        let err = StatsdOutput::unix_stream("/tmp/x.socket", Duration::from_secs(1))
+            .with_tls(&settings, Path::new("."))
+            .err()
+            .expect("a Unix socket is always plaintext");
+        assert!(err.to_string().contains("plaintext"), "{err}");
+        let err = StatsdOutput::unix_datagram("/tmp/x.socket", Duration::from_secs(1))
+            .with_tls(&settings, Path::new("."))
+            .err()
+            .expect("a Unix socket is always plaintext");
+        assert!(err.to_string().contains("plaintext"), "{err}");
     }
 
     #[tokio::test]
@@ -3928,6 +4624,7 @@ mod tests {
             endpoint: "127.0.0.1:1",
             connect_timeout: Duration::from_millis(200),
             tls: Some(&cfg),
+            kind: StreamKind::Tcp,
             telemetry: &telemetry,
             has_connected_once: &mut connected,
         };
@@ -3961,6 +4658,7 @@ mod tests {
             endpoint: &dead_addr,
             connect_timeout: Duration::from_millis(500),
             tls: None,
+            kind: StreamKind::Tcp,
             telemetry: &telemetry,
             has_connected_once: &mut connected,
         };
@@ -3991,6 +4689,7 @@ mod tests {
             endpoint: "127.0.0.1:1",
             connect_timeout: Duration::from_secs(1),
             tls: Some(&cfg),
+            kind: StreamKind::Tcp,
             telemetry: &telemetry,
             has_connected_once: &mut connected,
         };
@@ -4270,10 +4969,10 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
-    /// Every optional field, and a `|` inside the last field (`m:a|b`), survives the relay.
+    /// Every optional field survives the relay.
     #[test]
     fn a_service_check_line_round_trips_through_the_real_statsd_decoder() {
-        let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a|b";
+        let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a b";
         let original = decode_one(original_line);
         assert_eq!(original.len(), 1, "one service-check event per line");
         let (msgs, _) = encode(original);
@@ -4286,7 +4985,7 @@ mod tests {
         );
         assert_eq!(
             relayed[0].attributes.get("statsd.service_check.message").and_then(|v| v.as_str()),
-            Some("a|b")
+            Some("a b")
         );
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
@@ -4380,8 +5079,37 @@ mod tests {
             );
         }
 
-        fn opt_container_id() -> impl Strategy<Value = Option<String>> {
-            prop_oneof![Just(None), "[a-z0-9]{4,12}".prop_map(Some)]
+        /// The rendered `|c:<id>|e:<data>|card:<card>` tail, each part optional and in
+        /// `append_origin_fields`' order, or `None` for no tail at all. External data carries
+        /// its own `,` separators.
+        fn opt_origin() -> impl Strategy<Value = Option<String>> {
+            (
+                prop_oneof![Just(None), "[a-z0-9]{4,12}".prop_map(Some)],
+                prop_oneof![
+                    Just(None),
+                    "it-(true|false)(,cn-[a-z]{1,6})?(,pu-[a-z0-9]{1,8})?".prop_map(Some)
+                ],
+                prop_oneof![
+                    Just(None),
+                    Just(Some("none")),
+                    Just(Some("low")),
+                    Just(Some("orchestrator")),
+                    Just(Some("high")),
+                ],
+            )
+                .prop_map(|(id, data, card)| {
+                    let mut tail = String::new();
+                    if let Some(id) = id {
+                        let _ = write!(tail, "|c:{id}");
+                    }
+                    if let Some(data) = data {
+                        let _ = write!(tail, "|e:{data}");
+                    }
+                    if let Some(card) = card {
+                        let _ = write!(tail, "|card:{card}");
+                    }
+                    (!tail.is_empty()).then_some(tail)
+                })
         }
 
         fn opt_secs() -> impl Strategy<Value = Option<u32>> {
@@ -4396,7 +5124,7 @@ mod tests {
             values: &[String],
             rate: Option<u32>,
             tags: &[(String, Option<String>)],
-            container_id: &Option<String>,
+            origin: &Option<String>,
             secs: Option<u32>,
         ) -> String {
             let mut line = format!("{name}:{}|{kind}", values.join(":"));
@@ -4404,8 +5132,8 @@ mod tests {
                 let _ = write!(line, "|@{:.2}", f64::from(r) / 100.0);
             }
             push_tag_segment(&mut line, tags);
-            if let Some(id) = container_id {
-                let _ = write!(line, "|c:{id}");
+            if let Some(origin) = origin {
+                line.push_str(origin);
             }
             if let Some(s) = secs {
                 let _ = write!(line, "|T{s}");
@@ -4470,7 +5198,7 @@ mod tests {
                 values: Vec<String>,
                 rate: Option<u32>,
                 tags: Vec<(String, Option<String>)>,
-                container_id: Option<String>,
+                origin: Option<String>,
                 secs: Option<u32>,
             },
             Event {
@@ -4483,7 +5211,7 @@ mod tests {
                 key: Option<String>,
                 source: Option<String>,
                 tags: Vec<(String, Option<String>)>,
-                container_id: Option<String>,
+                origin: Option<String>,
             },
             ServiceCheck {
                 name: String,
@@ -4491,13 +5219,13 @@ mod tests {
                 secs: Option<u32>,
                 host: Option<String>,
                 tags: Vec<(String, Option<String>)>,
-                container_id: Option<String>,
+                origin: Option<String>,
                 message: Option<String>,
             },
         }
 
         /// Renders a `GeneratedLine::Event` in [`render_event`]'s field order (`d:`, `h:`, `p:`,
-        /// `t:`, `k:`, `s:`, tags, `c:`).
+        /// `t:`, `k:`, `s:`, tags, `c:`/`e:`/`card:`).
         #[allow(clippy::too_many_arguments)]
         fn render_event_line(
             title: &str,
@@ -4509,7 +5237,7 @@ mod tests {
             key: &Option<String>,
             source: &Option<String>,
             tags: &[(String, Option<String>)],
-            container_id: &Option<String>,
+            origin: &Option<String>,
         ) -> String {
             let mut line = format!("_e{{{},{}}}:{title}|{text}", title.len(), text.len());
             if let Some(s) = secs {
@@ -4531,8 +5259,8 @@ mod tests {
                 let _ = write!(line, "|s:{s}");
             }
             push_tag_segment(&mut line, tags);
-            if let Some(id) = container_id {
-                let _ = write!(line, "|c:{id}");
+            if let Some(origin) = origin {
+                line.push_str(origin);
             }
             line
         }
@@ -4544,7 +5272,7 @@ mod tests {
             secs: Option<u32>,
             host: &Option<String>,
             tags: &[(String, Option<String>)],
-            container_id: &Option<String>,
+            origin: &Option<String>,
             message: &Option<String>,
         ) -> String {
             let mut line = format!("_sc|{name}|{status}");
@@ -4555,8 +5283,8 @@ mod tests {
                 let _ = write!(line, "|h:{h}");
             }
             push_tag_segment(&mut line, tags);
-            if let Some(id) = container_id {
-                let _ = write!(line, "|c:{id}");
+            if let Some(origin) = origin {
+                line.push_str(origin);
             }
             if let Some(m) = message {
                 let _ = write!(line, "|m:{m}");
@@ -4575,21 +5303,10 @@ mod tests {
                 opt_word(),
                 opt_word(),
                 tags(),
-                opt_container_id(),
+                opt_origin(),
             )
                 .prop_map(
-                    |(
-                        title,
-                        text,
-                        secs,
-                        host,
-                        priority,
-                        alert_type,
-                        key,
-                        source,
-                        tags,
-                        container_id,
-                    )| {
+                    |(title, text, secs, host, priority, alert_type, key, source, tags, origin)| {
                         GeneratedLine::Event {
                             title,
                             text,
@@ -4600,7 +5317,7 @@ mod tests {
                             key,
                             source,
                             tags,
-                            container_id,
+                            origin,
                         }
                     },
                 )
@@ -4613,46 +5330,21 @@ mod tests {
                 opt_secs(),
                 opt_word(),
                 tags(),
-                opt_container_id(),
-                // `event_piece` includes `|`, which must survive in the last field, `m:`.
-                prop_oneof![Just(None), event_piece().prop_map(Some)],
+                opt_origin(),
+                // `event_piece` without its `|`, which ends `m:` like any other field.
+                prop_oneof![Just(None), event_piece().prop_map(|m| Some(m.replace('|', "/")))],
             )
-                .prop_map(|(name, status, secs, host, tags, container_id, message)| {
-                    GeneratedLine::ServiceCheck {
-                        name,
-                        status,
-                        secs,
-                        host,
-                        tags,
-                        container_id,
-                        message,
-                    }
+                .prop_map(|(name, status, secs, host, tags, origin, message)| {
+                    GeneratedLine::ServiceCheck { name, status, secs, host, tags, origin, message }
                 })
         }
 
         fn arb_line() -> impl Strategy<Value = GeneratedLine> {
             prop_oneof![
-                (
-                    metric_name(),
-                    kind_and_values(),
-                    opt_rate(),
-                    tags(),
-                    opt_container_id(),
-                    opt_secs()
-                )
-                    .prop_map(
-                        |(name, (kind, values), rate, tags, container_id, secs)| {
-                            GeneratedLine::Metric {
-                                name,
-                                kind,
-                                values,
-                                rate,
-                                tags,
-                                container_id,
-                                secs,
-                            }
-                        }
-                    ),
+                (metric_name(), kind_and_values(), opt_rate(), tags(), opt_origin(), opt_secs())
+                    .prop_map(|(name, (kind, values), rate, tags, origin, secs)| {
+                        GeneratedLine::Metric { name, kind, values, rate, tags, origin, secs }
+                    }),
                 event_strategy(),
                 service_check_strategy(),
             ]
@@ -4664,23 +5356,23 @@ mod tests {
             #[test]
             fn decode_encode_decode_is_a_fixed_point(generated in arb_line()) {
                 let (line, secs, is_set_members) = match &generated {
-                    GeneratedLine::Metric { name, kind, values, rate, tags, container_id, secs } => (
-                        render_line(name, kind, values, *rate, tags, container_id, *secs),
+                    GeneratedLine::Metric { name, kind, values, rate, tags, origin, secs } => (
+                        render_line(name, kind, values, *rate, tags, origin, *secs),
                         *secs,
                         *kind == "s",
                     ),
                     GeneratedLine::Event {
-                        title, text, secs, host, priority, alert_type, key, source, tags, container_id,
+                        title, text, secs, host, priority, alert_type, key, source, tags, origin,
                     } => (
                         render_event_line(
                             title, text, *secs, host, *priority, *alert_type, key, source, tags,
-                            container_id,
+                            origin,
                         ),
                         *secs,
                         false,
                     ),
-                    GeneratedLine::ServiceCheck { name, status, secs, host, tags, container_id, message } => (
-                        render_service_check_line(name, *status, *secs, host, tags, container_id, message),
+                    GeneratedLine::ServiceCheck { name, status, secs, host, tags, origin, message } => (
+                        render_service_check_line(name, *status, *secs, host, tags, origin, message),
                         *secs,
                         false,
                     ),

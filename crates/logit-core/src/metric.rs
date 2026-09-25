@@ -155,14 +155,16 @@ pub struct Sum {
     pub monotonic: bool,
 }
 
-/// The largest inline capacity that keeps [`MetricKind`] at 176 bytes, the size of its inlined
-/// [`DdSketch`] (measured).
+/// The largest inline capacity that keeps [`MetricKind`] at 176 bytes -- now [`Samples`]'s own
+/// footprint plus its discriminant, not the size of its inlined [`DdSketch`] as before (measured).
 ///
-/// `Distribution(DdSketch)` needs no discriminant byte: rustc niche-fills the tag into spare bit
-/// patterns inside `DDSketch`'s layout. `Samples` has no such niche. Under the workspace's
+/// `Distribution(DdSketch)` no longer sets the bound: the hand-rolled [`DdSketch`] is 128 bytes,
+/// down from a wrapped `sketches_ddsketch::DDSketch`'s 176, which used to niche-fill the tag into
+/// spare bit patterns inside its layout. `Samples` has no such niche. Under the workspace's
 /// smallvec `union` feature, `Samples` costs `N * 8 + 16` bytes: `N = 20` makes it 176 and grows
-/// `MetricKind` to 184 for the tag, while `N = 19` makes it 168 and leaves room for the tag.
-/// `crates/logit-core/tests/type_sizes.rs` asserts both sizes.
+/// `MetricKind` to 184 for the tag, while `N = 19` makes it 168 and leaves room for the tag; `N`
+/// stays 19 because growing it grows every metric. `crates/logit-core/tests/type_sizes.rs`
+/// asserts both sizes.
 pub const SAMPLES_INLINE: usize = 19;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -263,97 +265,7 @@ pub struct Exemplar {
     pub filtered_attributes: AttrMap,
 }
 
-/// A mergeable quantile sketch wrapping `sketches_ddsketch::DDSketch`.
-///
-/// It merges with a guaranteed relative-error bound (1%, `Config::defaults()`), unlike a naive
-/// percentile of percentiles; the split-collection topology (`docs/OVERVIEW.md`) depends on that.
-/// See `docs/design/data-model.md`. Don't replace it with a non-mergeable shortcut.
-#[derive(Clone)]
-pub struct DdSketch(sketches_ddsketch::DDSketch);
-
-// `sketches_ddsketch::DDSketch` doesn't implement `Debug`; summarize instead of deriving.
-impl std::fmt::Debug for DdSketch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DdSketch").field("count", &self.0.count()).finish()
-    }
-}
-
-/// `DDSketch` has no `PartialEq` and exposes no bins, so compare [`DdSketch::to_java_bytes`], the
-/// only lossless view it offers.
-impl PartialEq for DdSketch {
-    fn eq(&self, other: &Self) -> bool {
-        self.to_java_bytes() == other.to_java_bytes()
-    }
-}
-
-impl DdSketch {
-    pub fn new() -> Self {
-        Self(sketches_ddsketch::DDSketch::new(sketches_ddsketch::Config::defaults()))
-    }
-
-    pub fn add(&mut self, value: f64) {
-        self.0.add(value);
-    }
-
-    /// Adds `value` as `count` samples, e.g. `100|ms|@0.1` as ten. `count == 0` is a no-op.
-    ///
-    /// O(1) via `DDSketch::add_with_count`. Keep it that way: `count` is attacker-influenced (a
-    /// sampled statsd line's weight), and an `add` loop is O(count) while a doubling `merge` costs
-    /// O(log count) allocations.
-    pub fn add_weighted(&mut self, value: f64, count: u64) {
-        self.0.add_with_count(value, count);
-    }
-
-    /// Merges `other` into `self`.
-    ///
-    /// Never panics today: every `DdSketch` is built with `Config::defaults()` via
-    /// [`DdSketch::new`], so configs always match. A second config would need a real `Result`.
-    pub fn merge(&mut self, other: &DdSketch) {
-        self.0.merge(&other.0).expect("DdSketch configs always match (Config::defaults())");
-    }
-
-    pub fn quantile(&self, q: f64) -> Option<f64> {
-        self.0.quantile(q).ok().flatten()
-    }
-
-    pub fn count(&self) -> usize {
-        self.0.count()
-    }
-
-    /// The exact sum of every value added, not an estimate like [`DdSketch::quantile`].
-    ///
-    /// The inner crate keeps it as a plain `f64` beside the bins and adds the two on `merge`. The
-    /// java-bytes format ([`DdSketch::to_java_bytes`], DataDog's
-    /// `DDSketchWithExactSummaryStatistics`) carries it as its own `f64`, so it survives the
-    /// native wire and disk spool exactly, and `PartialEq` tells apart sketches whose sums differ.
-    ///
-    /// `0.0` for an empty sketch, where the inner crate returns `None`: callers accumulate a total,
-    /// where the two mean the same. Use [`DdSketch::count`] to tell "empty" from "sums to zero".
-    pub fn sum(&self) -> f64 {
-        self.0.sum().unwrap_or(0.0)
-    }
-
-    /// Serializes to DataDog's cross-language "java bytes" sketch format (not JVM-specific).
-    ///
-    /// `DDSketch`'s fields are private and expose no bins, so this blob is the only lossless way
-    /// in or out; `logit_proto::native` carries it as-is (`docs/design/wire-protocol.md`).
-    pub fn to_java_bytes(&self) -> Vec<u8> {
-        self.0.to_java_bytes()
-    }
-
-    /// The inverse of [`DdSketch::to_java_bytes`]. Fails only on a malformed blob (bad magic,
-    /// truncated, or an unrecognized encoding), never on value range or precision: the format
-    /// carries the bins directly.
-    pub fn from_java_bytes(bytes: &[u8]) -> Result<Self, sketches_ddsketch::DecodeError> {
-        sketches_ddsketch::DDSketch::from_java_bytes(bytes).map(Self)
-    }
-}
-
-impl Default for DdSketch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use crate::sketch::DdSketch;
 
 /// A mergeable HyperLogLog cardinality estimator wrapping
 /// `cardinality_estimator::CardinalityEstimator<[u8]>`.
@@ -373,7 +285,7 @@ impl Default for DdSketch {
 /// has no `to_bytes` and private fields) through the small hand-rolled byte codec below, built
 /// for its one `(data, members: Option<Vec<u32>>)` shape. The bytes are tied to the locked
 /// `cardinality-estimator` version, with no cross-version guarantee: unlike
-/// [`DdSketch::to_java_bytes`], this isn't an interchange format.
+/// [`DdSketch::to_bytes`], this isn't an interchange format.
 pub struct HyperLogLog(cardinality_estimator::CardinalityEstimator<[u8]>);
 
 impl HyperLogLog {
@@ -1065,110 +977,6 @@ mod tests {
         for (kind, expected) in cases {
             assert_eq!(kind.name(), expected);
         }
-    }
-
-    /// `add_weighted(v, 1)` is indistinguishable from `add(v)`.
-    #[test]
-    fn add_weighted_with_count_one_matches_plain_add() {
-        let mut weighted = DdSketch::new();
-        weighted.add_weighted(42.0, 1);
-
-        let mut plain = DdSketch::new();
-        plain.add(42.0);
-
-        assert_eq!(weighted.count(), plain.count());
-        assert_eq!(weighted.quantile(0.5), plain.quantile(0.5));
-        assert_eq!(weighted.quantile(0.99), plain.quantile(0.99));
-    }
-
-    /// A weight of 100 counts 100 samples, and every quantile lands within 1% of `v` (not exactly
-    /// `v`: `quantile` returns a bucket estimate).
-    #[test]
-    fn add_weighted_with_large_count_extrapolates_count_and_every_quantile() {
-        let mut sketch = DdSketch::new();
-        sketch.add_weighted(7.5, 100);
-
-        assert_eq!(sketch.count(), 100);
-        for q in [0.0, 0.1, 0.5, 0.9, 0.99, 1.0] {
-            let value = sketch.quantile(q).expect("quantile should be present");
-            let relative_error = (value - 7.5).abs() / 7.5;
-            assert!(
-                relative_error <= 0.01,
-                "quantile({q}) = {value} is more than 1% away from the true value 7.5"
-            );
-        }
-    }
-
-    #[test]
-    fn add_weighted_with_zero_count_is_a_no_op() {
-        let mut sketch = DdSketch::new();
-        sketch.add_weighted(1.0, 0);
-        assert_eq!(sketch.count(), 0);
-        assert_eq!(sketch.quantile(0.5), None);
-    }
-
-    /// A weighted add keeps `Config::defaults()`'s 1% relative-error bound (alpha = 0.01).
-    #[test]
-    fn add_weighted_quantile_stays_within_the_configured_relative_error_bound() {
-        let mut sketch = DdSketch::new();
-        sketch.add_weighted(200.0, 50);
-
-        let q = sketch.quantile(0.5).expect("quantile should be present");
-        let relative_error = (q - 200.0).abs() / 200.0;
-        assert!(
-            relative_error <= 0.01,
-            "quantile {q} is more than 1% away from the true value 200.0"
-        );
-    }
-
-    /// `sum` is exact through plain adds, weighted adds, and a merge, and `0.0` when empty.
-    #[test]
-    fn ddsketch_sum_is_exact_and_survives_a_merge() {
-        let mut sketch = DdSketch::new();
-        assert_eq!(sketch.sum(), 0.0, "the sum of no values is the additive identity");
-
-        sketch.add(1.0);
-        sketch.add(2.5);
-        sketch.add(-4.0);
-        assert_eq!(sketch.sum(), -0.5);
-
-        let mut weighted = DdSketch::new();
-        weighted.add_weighted(3.0, 4);
-        assert_eq!(weighted.sum(), 12.0, "a weighted add contributes value * count");
-
-        sketch.merge(&weighted);
-        assert_eq!(sketch.sum(), 11.5, "merge adds the merged sketch's sum");
-        assert_eq!(sketch.count(), 7);
-    }
-
-    /// The sum survives java bytes exactly; `logit-perf attribute` reads it from native dumps.
-    #[test]
-    fn ddsketch_sum_round_trips_through_java_bytes() {
-        let mut sketch = DdSketch::new();
-        for value in [0.25, 1.0, 7.5, 100.0] {
-            sketch.add(value);
-        }
-
-        let decoded = DdSketch::from_java_bytes(&sketch.to_java_bytes())
-            .expect("a sketch's own bytes should decode");
-
-        assert_eq!(decoded.sum(), sketch.sum());
-        assert_eq!(decoded.sum(), 108.75);
-    }
-
-    #[test]
-    fn ddsketch_partial_eq_compares_via_java_bytes() {
-        let mut a = DdSketch::new();
-        a.add(1.0);
-        a.add(2.0);
-        let mut b = DdSketch::new();
-        b.add(1.0);
-        b.add(2.0);
-        assert_eq!(a, b);
-
-        let mut c = DdSketch::new();
-        c.add(99.0);
-        assert_ne!(a, c);
     }
 
     #[test]

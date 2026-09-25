@@ -2,7 +2,7 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-vmagent, and statsd/DogStatsD clients. The fixtures check `logit`'s decoders against what those producers put on
+vmagent, statsd/DogStatsD clients, a Datadog Agent, and a dd-trace tracer. The fixtures check `logit`'s decoders against what those producers put on
 the wire:
 
 - `crates/logit-inputs/src/syslog.rs`
@@ -11,6 +11,8 @@ the wire:
 - `crates/logit-proto/src/otlp/`
 - `crates/logit-proto/src/graphite/`
 - `crates/logit-proto/src/prometheus/remote_write.rs`
+- `crates/logit-proto/src/datadog/`, `crates/logit-inputs/src/datadog.rs`, and
+  `crates/logit-inputs/src/datadog_trace.rs`
 
 Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
@@ -59,11 +61,21 @@ testdata/interop/
                           datagram -- the corpus that records how a real client *packs* metrics,
                           which the hand-written grammar fixtures under
                           `crates/logit-cli/tests/fixtures/statsd/` deliberately don't
+  datadog/README.md    -- provenance table for datadog/*, and what each capture settled
+  datadog/*.bin        -- request bodies a real Datadog Agent sent its intake and a real dd-trace
+                          tracer sent an Agent, compressed as sent, one file per request
+  datadog/*.headers    -- one sidecar per body, as for prometheus/*.headers: the route, body form,
+                          and compression are only recoverable from it
+  datadog/*.raw        -- DogStatsD over the Agent's Unix sockets: one file per datagram, or one
+                          per stream connection with its length prefixes intact
+  datadog/agent-info.json -- a real Agent's `/info` document
 ```
 
 The capture methods differ on purpose. The `*.raw` corpora come from read-only UDP and TCP sinks.
-The Prometheus corpus (`prometheus/*.bin`) comes from `raw_capture.py --proto http`, which answers
-`204`, because an HTTP sender won't send another request until it gets a response. The OTLP corpus
+The Prometheus and Datadog HTTP corpora (`prometheus/*.bin`, `datadog/*.bin`) come from
+`raw_capture.py --proto http`, which answers `204`, because an HTTP sender won't send another
+request until it gets a response; for a tracer, which reads its Agent's answers, it replies with
+a configured document instead. The OTLP corpus
 (`otlp/*.json`) is the Collector's own re-emitted output. Each subdirectory's README has the
 details.
 
@@ -75,14 +87,14 @@ explains how to add one.
 Recording is a **deliberate, reviewed act**, not part of `script/cibuild`, like `script/protogen`
 and `testdata/tls/regen.sh`. It pulls real third-party images from Docker Hub and ghcr.io, and runs
 them against the internet-facing package mirrors those images use: the `rsyslog`, `collectd`, and
-`graphite` producers each run a fresh `apt-get install`, and the `statsd` producer a fresh
-`pip install`. CI shouldn't repeat that non-determinism on every push.
+`graphite` producers each run a fresh `apt-get install`, and the `statsd` and `datadog` producers a
+fresh `pip install`. CI shouldn't repeat that non-determinism on every push.
 
 To regenerate:
 
 1. Run `script/record-fixtures` by hand.
 2. Review `git diff testdata/interop/`. For the binary fixtures (`collectd/*.raw`, the graphite
-   pickle captures, and `prometheus/*.bin`), use `git diff --stat`.
+   pickle captures, `prometheus/*.bin`, and `datadog/*.bin`), use `git diff --stat`.
 3. Commit.
 
 A re-run doesn't reproduce these exact bytes. Container hostnames, timestamps, trace and span IDs,
@@ -102,8 +114,10 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **OTLP:** low single-digit KB per fixture.
 - **statsd:** ~12 KB for the whole corpus. It needs 56 small datagrams, because its subject is the
   *distribution* of datagram sizes rather than one message shape.
+- **Datadog:** under 40 KB for the whole corpus. A zstd request body is small; a trace body isn't,
+  since one Flask request is about ten spans, so trace captures serve few requests.
 - **Whole directory:** well under 100 KB total. As of 2026-09-24, the fixtures, excluding READMEs,
-  total about 37 KB.
+  total about 74 KB.
 
 If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
 at record time instead of committing everything the producer emits. `script/record-fixtures`'s
@@ -128,5 +142,6 @@ For the pattern, see the `interop_fixture_*` tests in these files:
 - `crates/logit-inputs/src/statsd.rs`
 
 None of them asserts a measured value, which differs on every run.
-`crates/logit-proto/tests/prometheus_remote_write_interop.rs` follows the same rule for the
-Prometheus corpus.
+`crates/logit-proto/tests/prometheus_remote_write_interop.rs` and
+`crates/logit-proto/tests/datadog_interop.rs` follow the same rule for the Prometheus and Datadog
+corpora.

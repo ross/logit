@@ -65,11 +65,13 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 
 | Kind | Code | What it does | Decision record |
 |---|---|---|---|
-| `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default) or `transport: tcp` | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
+| `statsd_in` | `crates/logit-inputs/src/statsd.rs` | statsd/DogStatsD over UDP (default), `transport: tcp`, or a Unix socket (`unix`, `unix_stream`) | [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) |
 | `syslog_in` | `crates/logit-inputs/src/syslog.rs` | syslog over UDP (default) or `transport: tcp`, optional TLS (RFC 5425) | [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) |
 | `graphite_in` | `crates/logit-inputs/src/graphite/` | carbon plaintext and pickle, UDP or TCP | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
 | `collectd_in` | `crates/logit-inputs/src/collectd.rs` | collectd's binary `network` protocol, unicast or multicast | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md) |
+| `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
+| `datadog_trace_in` | `crates/logit-inputs/src/datadog_trace.rs` | the Datadog Agent's APM API for dd-trace tracers (`/v0.3`–`/v0.7/traces` msgpack, `/v0.6/stats`, `/info`) over TCP and/or a Unix socket; keeps every span, `503` (a tracer's loss) when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
@@ -87,8 +89,10 @@ Sinks live in `crates/logit-outputs`.
 | `stdio_out` | `crates/logit-outputs/src/stdio.rs` | human-readable render (default) or `format: native`; its file target is `file_out` with an empty rotation policy | [ADR `file-output-native-format`](docs/adr/file-output-native-format.md) |
 | `file_out` | `crates/logit-outputs/src/file.rs` | rotating file sink sharing `stdio_out`'s implementation | [ADR `rotating-file-output`](docs/adr/rotating-file-output.md) |
 | `syslog_out` | `crates/logit-outputs/src/syslog.rs` | RFC 3164/5424 over UDP, TCP, or TLS (RFC 5425) | [ADR `syslog-output`](docs/adr/syslog-output.md) |
-| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP or TCP, optionally TLS | [ADR `statsd-output`](docs/adr/statsd-output.md) |
+| `statsd_out` | `crates/logit-outputs/src/statsd.rs` | statsd/DogStatsD over UDP, TCP (optionally TLS), or a Unix socket (`unix`, `unix_stream`) | [ADR `statsd-output`](docs/adr/statsd-output.md) |
 | `otlp_out` | `crates/logit-outputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP and OTLP/gRPC | [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md) |
+| `datadog_out` | `crates/logit-outputs/src/datadog.rs` | Datadog's intake API: series, distribution points, sketches, service checks, events, logs, and Agent-processed APM traces and stats, one request per route; drops stale points and unprocessed traces, counted | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
+| `datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | a Datadog Agent's APM API (traces and `/v0.6/stats`), v0.4 or v0.7, over TCP or the Agent's Unix socket, restoring the tracer's request headers | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
@@ -113,7 +117,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
 | `keep_values` | clamps attribute values to a per-field allow-list | [ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md) |
-| `trace_context` | gives a `LogRecord` a native application trace/span reference; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
+| `trace_context` | gives a `LogRecord` a native application trace/span reference, from W3C hex ids or, under `format: datadog`, a dd-trace tracer's decimal and 128-bit `dd.trace_id`/`dd.span_id`; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
@@ -205,11 +209,12 @@ Details an agent needs beyond the table:
 
 ### Lossless like-protocol relays
 
-Six like-protocol pairs must each relay losslessly, modulo a named list of permitted
+Eight like-protocol pairs must each relay losslessly, modulo a named list of permitted
 normalizations ([ADR `lossless-transit`](docs/adr/lossless-transit.md); the rule itself is under
 [Design constraints that aren't optional](#design-constraints-that-arent-optional)).
 [docs/plans/lossless-transit.md](docs/plans/lossless-transit.md) has the closing assessment for
-the first three pairs. What the model and codecs carry for them:
+the first three pairs, and [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) for the two
+Datadog pairs. What the model and codecs carry for them:
 
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
@@ -218,17 +223,23 @@ the first three pairs. What the model and codecs carry for them:
   status-message field, and dropped-attribute counts.
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
-- **statsd**: raw timers/sets, `|c:`/`|T`, and events/service checks.
+- **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
+- **Datadog**: `datadog.*` carriers for every raw field without a typed home (a `rate`'s type, a
+  count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch` under
+  `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
+  sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
 
 Residual debt lives in `docs/known-gaps.md`: post-sketch metric kinds at `statsd_out`;
 `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress timestamp only
 on a `|T`-marked line; and syslog's `event.timestamp` staying receipt time while the wire
-TIMESTAMP follows the precedence table.
+TIMESTAMP follows the precedence table. The Datadog pairs' residual debt is in the same file's
+"Datadog" section, listed by the closing assessment.
 
 Per pair:
 
-- **`statsd_in -> statsd_out`**: `statsd_out` is the mirror of `statsd_in`, over UDP or TCP
-  (optionally TLS, the `syslog_out` arrangement ported verbatim), with DogStatsD tags
+- **`statsd_in -> statsd_out`**: `statsd_out` is the mirror of `statsd_in`, over UDP, TCP
+  (optionally TLS, the `syslog_out` arrangement ported verbatim), or the Datadog Agent's two Unix
+  sockets (`transport: unix`/`unix_stream`, graph rule 65), with DogStatsD tags
   round-tripped through the real decoder. It encodes `Sum` (delta, monotonic),
   `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD events/service checks. A relay with
   no `aggregate` in between, or one configured `distributions: samples`/`sets: members`,
@@ -304,6 +315,31 @@ Per pair:
   fixed point modulo its own named normalization list
   ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
   [examples/graphite-relay.yaml](examples/graphite-relay.yaml)).
+- **`datadog_in -> datadog_out`** (Datadog's intake API): `crates/logit-proto/src/datadog/` holds
+  one codec module per payload family, and `mod.rs`'s doc is the mapping table: series v1 and v2
+  (JSON and protobuf), distribution points, sketches bin-for-bin, service checks, events (the
+  Agent's `/intake/` envelope and public v1), logs, `AgentPayload` traces, and `StatsPayload` APM
+  stats, relayed rather than recomputed. `datadog_in` decodes gzip, deflate, and zstd (`ruzstd`)
+  and answers a full pipeline `503` after a bounded wait. `datadog_out` sends a trace chunk only
+  when its root carries the Agent's `_top_level` mark, so `datadog_trace_in` must not feed it;
+  it drops stale points before sending, and isn't duplicate-safe. Normalizations include
+  whole-second metric timestamps, one point per series, `avg` recomputed from `sum`/`cnt`, and a
+  batch per `TracerPayload`
+  ([ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md),
+  [examples/datadog-intake-standin.yaml](examples/datadog-intake-standin.yaml),
+  [examples/datadog-direct.yaml](examples/datadog-direct.yaml)).
+- **`datadog_trace_in -> datadog_trace_out`** (a Datadog Agent's APM API): v0.3, v0.4, v0.5,
+  and v0.7 msgpack traces and `/v0.6/stats` over TCP or the Agent's Unix socket, the tracer's
+  request headers carried as `datadog.tracer.*` resource attributes and restored as headers. v0.4
+  egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
+  `version: v0.7`. A `503` from `datadog_trace_in` defers a payload only for the tracer's short
+  retry window
+  ([examples/datadog-agent-standin.yaml](examples/datadog-agent-standin.yaml),
+  [examples/datadog-agent-relay.yaml](examples/datadog-agent-relay.yaml)).
+
+  [docs/datadog.md](docs/datadog.md) is the operator-facing account of both pairs: the four
+  topologies (direct, through a local Agent, and standing in for an Agent or for the intake),
+  best practice in each direction, and the rules that lose data when missed.
 
 ### Listener I/O
 
@@ -466,6 +502,9 @@ the operator-facing account of all of this.
 - Credit-based flow control beyond one frame in flight, and QUIC, for the native transport
   (`docs/known-gaps.md`).
 - Prometheus native histograms, skipped and counted in both directions.
+- An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
+  stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
+  ([docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) §14).
 
 ## Environment
 
@@ -609,13 +648,18 @@ not a style preference:
 - **Metric kinds must stay mergeable.** `Distribution` needs a sketch with a real error bound
   (`DDSketch`, not a naive percentile), `Set` needs a real union (`HyperLogLog`) — this is what
   makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate.
-  `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
-  `aggregate` is its first caller); `HyperLogLog` wraps the `cardinality-estimator` crate, also a
-  real, mergeable sketch — don't replace either with a non-mergeable shortcut.
+  `logit-core::sketch::DdSketch` is a hand-rolled DDSketch with a working `merge`
+  (`crates/logit-transforms`' `aggregate` is its first caller) that keys bins exactly as the
+  Datadog Agent does, so a sketch relays to and from Datadog bin-for-bin
+  ([ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md)); its
+  mapping is part of the wire, so don't change `Mapping::agent`'s constants. `HyperLogLog` wraps
+  the `cardinality-estimator` crate, also a real, mergeable sketch — don't replace either with a
+  non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
-  prometheus_out`, `collectd_in -> collectd_out`, and `graphite_in -> graphite_out` must each be a
-  lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
-  sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
+  prometheus_out`, `collectd_in -> collectd_out`, `graphite_in -> graphite_out`, `datadog_in ->
+  datadog_out`, and `datadog_trace_in -> datadog_trace_out` must each be a lossless relay**,
+  modulo a named list of permitted normalizations (batching, tag reordering, a sink-configured
+  dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
   decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
   field a protocol can carry that `Event` can't represent is tracked debt
   ([`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md)), not an accepted codec
@@ -672,8 +716,8 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp drivers
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, logit (logit_out), null_out (load-test discard sink)
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), logit (logit_out), null_out (load-test discard sink)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)

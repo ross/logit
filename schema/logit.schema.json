@@ -130,7 +130,7 @@
       "type": "object",
       "oneOf": [
         {
-          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
+          "description": "statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.\n\n`bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path under `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory must exist; a stale socket file left by an earlier run is replaced, and anything else at the path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running as any user can send; restrict access with the directory's permissions. To listen on UDP and a socket at once, configure two `statsd_in` components.\n\n`transport: unix` behaves as UDP does: the whole `receive:` block applies. Under `transport: unix_stream`, each 4-byte little-endian length prefix frames one packet of newline-separated lines, `handshake_timeout`/`idle_timeout` apply as under TCP, and `receive:`'s queue fields are rejected. A packet declaring more than 64 KiB closes its connection, counted as `logit.input.frames.dropped{reason=\"oversize\"}`: a length-framed stream has no point to resynchronize at.\n\nUnder `transport: tcp` a message is one LF-delimited line; there is no `framing:` field and no octet-counted alternative, because a statsd line may begin with a digit. A line longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason=\"oversize\"}`); the connection stays open and the next line still decodes.\n\n`tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only and is rejected under any other transport. Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.\n\nA TCP or `unix_stream` listener has no receive queue (the connection's own flow control is the backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply per connection: N live connections can hold up to N times `batch_max_events` in flight.",
           "type": "object",
           "required": [
             "bind",
@@ -141,12 +141,12 @@
               "type": "string"
             },
             "handshake_timeout": {
-              "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` only: a non-default value under `transport: udp` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next line is bounded by `idle_timeout` if set, and unbounded otherwise.",
+              "description": "How long one connection has, per pre-message phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for the connection's first byte. Each phase gets its own budget, so a silent TLS connection costs up to twice this value. Defaults to `5s`; `0s` is rejected. `transport: tcp` or `unix_stream` only: a non-default value under `transport: udp` or `unix` is rejected.\n\nNot an idle timeout. Once a connection has sent its first byte, the gap before its next line is bounded by `idle_timeout` if set, and unbounded otherwise.",
               "default": "5s",
               "type": "string"
             },
             "idle_timeout": {
-              "description": "How long one connection may stay quiet before this listener closes it and frees its connection-cap slot. Off unless set: with no value, a connection that sent one line and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to disable. `transport: tcp` only: any value under `transport: udp` is rejected.\n\nRecommended wherever steady traffic is expected: a connection quiet for longer than this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it returns the slot. Set it well above the sender's longest normal gap (several `batch_flush_interval`s, say). Leave it unset for sparse or bursty senders, and think twice on plaintext transports, where the sender cannot detect the close before its next write. A statsd client flushing on a fixed interval is the easy case; one that only emits when its process sees traffic is not.\n\nThe clock runs only while this listener is waiting on the peer's socket, and resets on bytes read from the peer and on this listener handing an accumulated batch downstream. Time blocked on a full downstream never counts, so a stalled pipeline cannot make a busy connection look idle.\n\nAn idle close is policy, not a fault: complete buffered frames are flushed downstream first (`logit.component.receive.flushed{reason=\"closed\"}`), a buffered partial frame is counted `logit.input.frames.dropped{reason=\"truncated\"}`, and the close is counted `logit.input.connections.closed{reason=\"idle\"}`, never diagnosed as a `connection_error`.",
+              "description": "How long one connection may stay quiet before this listener closes it and frees its connection-cap slot. Off unless set: with no value, a connection that sent one line and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to disable. `transport: tcp` or `unix_stream` only: any value under `transport: udp` or `unix` is rejected.\n\nRecommended wherever steady traffic is expected: a connection quiet for longer than this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it returns the slot. Set it well above the sender's longest normal gap (several `batch_flush_interval`s, say). Leave it unset for sparse or bursty senders, and think twice on plaintext transports, where the sender cannot detect the close before its next write. A statsd client flushing on a fixed interval is the easy case; one that only emits when its process sees traffic is not.\n\nThe clock runs only while this listener is waiting on the peer's socket, and resets on bytes read from the peer and on this listener handing an accumulated batch downstream. Time blocked on a full downstream never counts, so a stalled pipeline cannot make a busy connection look idle.\n\nAn idle close is policy, not a fault: complete buffered frames are flushed downstream first (`logit.component.receive.flushed{reason=\"closed\"}`), a buffered partial frame is counted `logit.input.frames.dropped{reason=\"truncated\"}`, and the close is counted `logit.input.connections.closed{reason=\"idle\"}`, never diagnosed as a `connection_error`.",
               "default": null,
               "type": [
                 "string",
@@ -377,6 +377,114 @@
               "type": "string",
               "enum": [
                 "otlp_in"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`, `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at. Serves series (v1 and v2), distribution points, sketches, service checks, events, logs, APM traces, and APM stats over HTTP, decompressing gzip, deflate, and zstd. Host and inventory metadata are acknowledged and discarded. A request on a known path with the wrong method gets `405`; a request on any other path gets `404`, so an Agent reports a route this listener doesn't speak rather than having it silently dropped. When the pipeline can't take a request's data within 5s, the request gets `503` with `Retry-After: 1`, and the Agent retries it.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "api_keys": {
+              "description": "The API keys this listener accepts, compared with each request's `DD-API-KEY` header. A request with none of them gets `403`. Empty, the default, accepts any request, whatever key it carries. Take each entry from the environment (`!env DD_API_KEY`) rather than writing a key into the file. An empty entry is rejected.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "bind": {
+              "type": "string"
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long one connection may sit with no request in flight before this listener closes it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s` is rejected. An Agent keeps its intake connections open between flushes, so set it well above the Agent's flush interval (15s for metrics) if you set it at all. It also bounds a request body that stalls mid-upload, answered `408`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tls": {
+              "description": "Terminates TLS on this listener when present; plaintext when omitted.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_in"
+              ]
+            }
+          }
+        },
+        {
+          "description": "A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces` (msgpack), `/v0.6/stats`, and `/info`, over TCP (`bind`), a Unix stream socket (`socket`), or both at once; at least one is required. Every span is kept: the reply sets every service's sampling rate to 1.0. Profiling, debugger, and `evp_proxy` uploads are answered `200` and discarded; telemetry, Remote Configuration, and the other trace forms get `404`. A request the pipeline can't take within 2s gets `503`, which a tracer retries a few times and then drops. Spans pass through unprocessed (no obfuscation, normalization, or stats), so send them to a real Agent (`datadog_trace_out`) or `otlp_out`, never straight to `datadog_out`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "description": "The `host:port` to listen on. The Agent's default is `localhost:8126`. A tracer finds it through `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or `DD_TRACE_AGENT_URL=http://host:8126`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "handshake_timeout": {
+              "description": "How long one connection has, per pre-request phase, before this listener closes it and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an idle close gives the HTTP server, as on `otlp_in`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "idle_timeout": {
+              "description": "How long one connection may sit with no request in flight before this listener closes it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s` is rejected. A tracer flushes every second or so over a kept-alive connection, so set it well above that if you set it at all. It also bounds a request body that stalls mid-upload, answered `408`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "socket": {
+              "description": "An absolute path for a Unix stream socket, the Agent's `receiver_socket` (`/var/run/datadog/apm.socket` by default). A tracer finds it through `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a stale socket file at the path is replaced, and the new one is made writable by every user (mode `0722`, the Agent's own) so unprivileged tracers can connect.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tls": {
+              "description": "Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires `bind`: the Unix socket is always plaintext.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_trace_in"
               ]
             }
           }
@@ -907,18 +1015,26 @@
           }
         },
         {
-          "description": "Lifts an application trace/span reference off an event's attributes onto its log record, for the common \"my JSON log body already has a `trace.id` field\" case, and with a `span:` block also turns that log line into a real span on the same event: an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`, `span_id`, and `flags` rename the three id sources. A successful lift overwrites any trace reference the log already had. An event with no log, or with missing or unparseable attributes, passes through untouched; it is never an error.",
+          "description": "Lifts an application trace/span reference off an event's attributes onto its log record, for the common \"my JSON log body already has a `trace.id` field\" case, and with a `span:` block also turns that log line into a real span on the same event: an access log's ids plus its own start/end/duration become a span whose start is the event's timestamp. Reads the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`, `span_id`, and `flags` rename the three id sources. `format: datadog` reads the ids a Datadog tracer injects into its logs (`dd.trace_id`, `dd.span_id`) instead. A successful lift overwrites any trace reference the log already had. An event with no log, or with missing or unparseable attributes, passes through untouched; it is never an error.",
           "type": "object",
           "required": [
             "type"
           ],
           "properties": {
             "flags": {
-              "description": "The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to `trace.flags`; `null` disables the lookup, and an empty string is rejected. A `traceparent` attribute supplies the flags when this one is absent.",
-              "default": "trace.flags",
+              "description": "The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to `trace.flags` (no lookup under `format: datadog`); `null` disables the lookup, and an empty string is rejected. A `traceparent` attribute supplies the flags when this one is absent.",
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "format": {
+              "description": "The id grammar, and the attribute names the three id fields default to. `otel` (the default): a 32-character hex trace id and a 16-character hex span id, read from `trace.id`/`span.id`/`trace.flags`. `datadog`: what a Datadog tracer injects into a log, read from `dd.trace_id`/`dd.span_id` with no flags field: a trace id that is a decimal 64-bit number or 32 hex characters, and a span id that is a decimal 64-bit number. A 16-digit value is hex under `otel` and decimal under `datadog`; the format decides, never the value.",
+              "default": "otel",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TraceIdFormat"
+                }
               ]
             },
             "keep_source": {
@@ -939,17 +1055,27 @@
               ]
             },
             "span_id": {
-              "description": "The attribute holding this line's own 16-character hex span id. Defaults to `span.id`; `null` disables the lookup, and an empty string is rejected. An absent attribute means \"no span id\", not a skip (unless a `span:` block needs one); only a present but unparseable value is an error.",
-              "default": "span.id",
+              "description": "The attribute holding this line's own span id, in `format`'s grammar. Defaults to `span.id` (`dd.span_id` under `format: datadog`); `null` disables the lookup, and an empty string is rejected. An absent attribute means \"no span id\", not a skip (unless a `span:` block needs one); only a present but unparseable value is an error.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "trace_id": {
-              "description": "The attribute holding a 32-character hex trace id. Defaults to `trace.id`; an empty string is rejected. A `traceparent` attribute supplies the trace id when this one is absent.",
-              "default": "trace.id",
-              "type": "string"
+              "description": "The attribute holding the trace id, in `format`'s grammar. Defaults to `trace.id` (`dd.trace_id` under `format: datadog`); an empty string is rejected. A `traceparent` attribute supplies the trace id when this one is absent.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trace_id_high": {
+              "description": "`format: datadog` only: the attribute holding a 128-bit trace id's high 64 bits as 1 to 16 hex characters, the form a Datadog span's `_dd.p.tid` tag takes. Used only when the trace id itself carried no high half (a decimal id); a present but unparseable value is an error. Unset (the default) means no lookup.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
@@ -1624,6 +1750,156 @@
           }
         },
         {
+          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.",
+          "type": "object",
+          "required": [
+            "api_key",
+            "type"
+          ],
+          "properties": {
+            "api_key": {
+              "description": "The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it from the environment (`!env DD_API_KEY`) rather than writing it into the file. An empty key, or one with leading or trailing whitespace, is rejected.",
+              "type": "string"
+            },
+            "compression": {
+              "description": "How request bodies are compressed. `gzip`, the default, gzips every route except distribution points, which are zlib-deflated, and events, which Datadog accepts only uncompressed; `none` sends every body uncompressed.",
+              "default": "gzip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogCompression"
+                }
+              ]
+            },
+            "endpoints": {
+              "description": "Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to point this sink at another `logit`'s `datadog_in`.",
+              "default": {
+                "api": null,
+                "logs": null,
+                "traces": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogEndpoints"
+                }
+              ]
+            },
+            "headers": {
+              "description": "Extra headers sent on every request, a proxy's authorization header, say. A value is a plain string, so `!env` works on it. A name this sink sets itself (`dd-api-key`, `content-type`, `content-encoding`, `content-length`, `host`, `user-agent`) or an HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "site": {
+              "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
+              "default": "datadoghq.com",
+              "type": "string"
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for every `https://` request: a private CA, a client certificate, or no verification. A non-default block is rejected when every intake is a plain `http://` `endpoints` override.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_out"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Sends APM traces and tracer-computed stats to a Datadog Agent's trace API (port 8126, or its Unix socket), as a dd-trace tracer does: the sending half of `datadog_trace_in`, so a tracer's spans can pass through `logit` on their way to a real Agent, which still does all trace processing. Spans and stats are sent as they arrive; nothing is sampled, normalized, or derived, so a span that didn't come from a Datadog tracer arrives with empty service, resource, and type fields: send OpenTelemetry spans with `otlp_out` instead. Set `endpoint` or `socket`, not both.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "compression": {
+              "description": "How request bodies are compressed: `none` (the default, what tracers send) or `gzip`, worth it only when the Agent is across a slow link.",
+              "default": "none",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogTraceCompression"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "The Agent's trace API as an absolute `http://` or `https://` URL: `http://127.0.0.1:8126` for an Agent on the same host.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "headers": {
+              "description": "Extra headers sent on every request. A value is a plain string, so `!env` works on it. A name this sink sets itself (`content-type`, `content-encoding`, `content-length`, `host`, `user-agent`, and every `datadog-*` and `x-datadog-*` header) or an HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "socket": {
+              "description": "The absolute path of the Agent's trace Unix socket (its `receiver_socket`, `/var/run/datadog/apm.socket` by default), instead of `endpoint`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no verification. A non-default block is rejected with an `http://` endpoint or a `socket`.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_trace_out"
+              ]
+            },
+            "version": {
+              "description": "The trace form to send: `v0.4` (the default) or `v0.7`. `v0.4` is what most tracers send; it has no room for trace chunk fields (sampling priority, origin, chunk tags) or a tracer's hostname, environment, and tags, which are dropped and counted. `v0.7` carries all of them.",
+              "default": "v0.4",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogTraceVersion"
+                }
+              ]
+            }
+          }
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -1857,7 +2133,7 @@
           }
         },
         {
-          "description": "statsd / DogStatsD egress over UDP or TCP, the mirror of `statsd_in` and a real relay: names, values, and tags round-trip through the decoder on the other end.",
+          "description": "statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a real relay: names, values, and tags round-trip through the decoder on the other end.\n\nUnder `transport: unix` each packet is one datagram sent to the socket; under `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian integer, on a connection opened on the first send and reopened after an error, as under TCP.",
           "type": "object",
           "required": [
             "endpoint",
@@ -1865,12 +2141,12 @@
           ],
           "properties": {
             "connect_timeout": {
-              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) may take before `send` reports a failure. Also bounds the TLS handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this value. Defaults to `5s`.",
+              "description": "How long a connect attempt (including a reconnect after a dropped connection) may take before `send` reports a failure, under `tcp` and `unix_stream`. Also bounds the TLS handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice this value. Under `unix`, bounds each datagram's wait on a receiver whose queue is full (a Unix socket pushes back on the sender where UDP would drop). Ignored for `udp`. Defaults to `5s`.",
               "default": "5s",
               "type": "string"
             },
             "endpoint": {
-              "description": "`host:port`. Resolved at connect/bind time, never at config-load time.",
+              "description": "`host:port` under `udp`/`tcp`, resolved at connect/send time, never at config-load time. The socket file's absolute path under `unix`/`unix_stream` (the Datadog Agent's datagram socket is `/var/run/datadog/dsd.socket`).",
               "type": "string"
             },
             "format": {
@@ -1883,7 +2159,7 @@
               ]
             },
             "max_packet_bytes": {
-              "description": "Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined per send), not a single line's length. A byte-count string. Defaults to `\"1432\"`, the statsd and DogStatsD client default: a 1500-byte MTU minus IPv4/UDP headers minus headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently fragment or fail `EMSGSIZE`. `0` is rejected. Ignored for `transport: tcp`.",
+              "description": "Bounds one packet's worth of packed lines (several statsd lines newline-joined per send), not a single line's length: a UDP or Unix datagram, or one length-prefixed `unix_stream` packet. A byte-count string. Defaults to `\"1432\"`, the statsd and DogStatsD client default over UDP: a 1500-byte MTU minus IPv4/UDP headers minus headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently fragment or fail `EMSGSIZE`. DogStatsD clients default to `\"8192\"` over a Unix socket, the Agent's receive buffer size, which is the most a Datadog Agent reads per packet. `0` is rejected. Ignored for `transport: tcp`.",
               "default": "1432",
               "type": "string"
             },
@@ -1893,7 +2169,7 @@
               "type": "boolean"
             },
             "tls": {
-              "description": "Turns on TLS for this connection when present, and makes it required: a bare `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only; `tls:` under `transport: udp` is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.",
+              "description": "Turns on TLS for this connection when present, and makes it required: a bare `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only; `tls:` under any other transport is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or stunnel-shaped relay hop.",
               "default": null,
               "anyOf": [
                 {
@@ -2368,6 +2644,94 @@
       "enum": [
         "none",
         "lz4"
+      ]
+    },
+    "DatadogCompression": {
+      "description": "How `datadog_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "gzip on every route but distribution points, which get zlib-wrapped deflate, and events, which go uncompressed.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "Every body uncompressed.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "DatadogEndpoints": {
+      "description": "`datadog_out`'s per-intake base URLs (`endpoints:` in config). Each is an absolute `http://` or `https://` URL with a host and an optional path prefix, and replaces the host `site` derives for its intake; an omitted one keeps the derived `https://` host.",
+      "type": "object",
+      "properties": {
+        "api": {
+          "description": "Replaces `https://api.<site>`: series, distribution points, sketches, service checks, and events.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logs": {
+          "description": "Replaces `https://http-intake.logs.<site>`: logs.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traces": {
+          "description": "Replaces `https://trace.agent.<site>`: APM traces and stats.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DatadogTraceCompression": {
+      "description": "How `datadog_trace_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "Every body uncompressed, as tracers send.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "gzip, which the Agent accepts.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        }
+      ]
+    },
+    "DatadogTraceVersion": {
+      "description": "Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.",
+      "oneOf": [
+        {
+          "description": "`/v0.4/traces`: what most tracers send and every Agent accepts.",
+          "type": "string",
+          "enum": [
+            "v0.4"
+          ]
+        },
+        {
+          "description": "`/v0.7/traces`: carries the trace chunk and tracer payload fields v0.4 has no room for.",
+          "type": "string",
+          "enum": [
+            "v0.7"
+          ]
+        }
       ]
     },
     "DeliveryPosture": {
@@ -3265,11 +3629,29 @@
       ]
     },
     "StatsdTransport": {
-      "description": "`statsd_in`'s and `statsd_out`'s transport. `udp` (the default) matches classic statsd and DogStatsD clients; `tcp` is the reliable, framed transport, and what `tls:` needs underneath it. A TCP message is one LF-delimited line in both directions.",
-      "type": "string",
-      "enum": [
-        "udp",
-        "tcp"
+      "description": "`statsd_in`'s and `statsd_out`'s transport. `udp` (the default) matches classic statsd and DogStatsD clients; `tcp` is the reliable, framed transport, and what `tls:` needs underneath it. A TCP message is one LF-delimited line in both directions.\n\n`unix` and `unix_stream` are the Datadog Agent's two DogStatsD Unix sockets. Under either, `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, not a `host:port`, and `tls:` is rejected.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "udp",
+            "tcp"
+          ]
+        },
+        {
+          "description": "A Unix datagram socket, the Agent's `dogstatsd_socket` (default `/var/run/datadog/dsd.socket`), which a client reaches with `DD_DOGSTATSD_URL=unix:///var/run/datadog/dsd.socket`. One datagram carries one or more newline-separated lines, as over UDP, and the whole `receive:` block applies.",
+          "type": "string",
+          "enum": [
+            "unix"
+          ]
+        },
+        {
+          "description": "A Unix stream socket, the Agent's `dogstatsd_stream_socket`. Each packet (one datagram's worth of newline-separated lines) is preceded by its length as a 4-byte little-endian integer, what `datadog-go`'s stream writer sends, reached with `unixstream://<path>`.",
+          "type": "string",
+          "enum": [
+            "unix_stream"
+          ]
+        }
       ]
     },
     "StdioTarget": {
@@ -3401,6 +3783,25 @@
           "type": "string"
         }
       }
+    },
+    "TraceIdFormat": {
+      "description": "`trace_context`'s id grammar, which also picks its field-name defaults.",
+      "oneOf": [
+        {
+          "description": "W3C/OpenTelemetry: 32 hex characters for a trace id, 16 for a span id.",
+          "type": "string",
+          "enum": [
+            "otel"
+          ]
+        },
+        {
+          "description": "Datadog log injection: decimal 64-bit ids, or a 32-hex-character trace id.",
+          "type": "string",
+          "enum": [
+            "datadog"
+          ]
+        }
+      ]
     },
     "UserAgentRule": {
       "description": "One entry of `http_access`'s `user_agent_rules`: a regex over the uncapped `user_agent.original` (the identifying token of a spoofed UA is often at its tail) and the literal `user_agent.class` it assigns. Rules are tried in order, before the built-in table. A `class` of `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, as the built-in classes do. `match` is compiled by `logit validate`; an empty `match` or `class` is rejected.",

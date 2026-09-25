@@ -1,0 +1,6 @@
+method: GET
+path: /info
+user-agent: Libdatadog/9.0.0
+datadog-entity-id: in-751952
+datadog-external-env: it-false,cn-record-fixtures,pu-00000000-0000-4000-8000-000000000001
+host: capture:8126

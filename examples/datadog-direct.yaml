@@ -1,0 +1,46 @@
+# Sends DogStatsD metrics straight to Datadog's intake API, with no Datadog Agent in the path:
+# statsd/DogStatsD in, a 10s aggregation window, the host stamped on every point, and
+# `datadog_out` (docs/adr/datadog-agent-and-intake-relay.md) posting series to `/api/v2/series`
+# and timer sketches to `/api/beta/sketches`. docs/datadog.md compares this direct topology with
+# sending through a local Agent (datadog-via-agent.yaml).
+#
+# Point clients at it as at an Agent's DogStatsD port: `DD_AGENT_HOST=<this-host>` and
+# `DD_DOGSTATSD_PORT=8125`, or `statsd.Client("<this-host>", 8125)` for a plain statsd client.
+# Nothing on the client side changes otherwise.
+#
+# `datadog_out` drops points Datadog would refuse as stale (older than 1h, or more than 10m in the
+# future) before sending, counted `logit.output.records.dropped{reason="stale"}`. A `buffer.disk:`
+# on this sink replays after an outage, but only what is still inside that window goes out.
+components:
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  windowed:
+    type: aggregate
+    sources: [statsd_in]
+    interval: 10s
+    # Timers and histograms become DDSketches under the Datadog Agent's own bin mapping, sent to
+    # Datadog as native sketches (the default, spelled out). `samples` would send raw values to
+    # `/api/v1/distribution_points` instead.
+    distributions: sketch
+
+  host:
+    type: set
+    sources: [windowed]
+    # The Datadog host every series is reported under: `datadog_out` has no host field of its
+    # own and reads `host.name` from the resource. Use this machine's name, or `!env` a variable
+    # that holds it.
+    resource:
+      host.name: web-1
+    attributes:
+      # A count's interval, in seconds: the aggregation window above.
+      datadog.interval: 10
+
+  datadog:
+    type: datadog_out
+    sources: [host]
+    api_key: !env DD_API_KEY
+    # site: datadoghq.com        # the default; datadoghq.eu, us3.datadoghq.com, ... per your org
+    # compression: gzip          # the default; none sends bodies uncompressed
+    # timeout: 10s               # per request

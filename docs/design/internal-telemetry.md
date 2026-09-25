@@ -399,7 +399,7 @@ every producer the send-side numbers for free:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width |
+| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` (`datadog_in`) that times out sends nothing and counts nothing, span and `send.blocked.duration` included |
 | `logit.component.events.sent` | count | events in that batch |
 | `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
 | `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed |
@@ -643,6 +643,14 @@ LF-delimited statsd line), and `logit.input.frames.dropped{reason}`. Only two re
 `malformed` can't occur: it's an octet count RFC 6587's grammar doesn't permit, and this listener
 never reads one.
 
+**Under `transport: unix`:** the `udp` set, from the same driver on a Unix datagram socket. The
+`SO_MEMINFO` sampler reads it as it reads a UDP socket, but `AF_UNIX` makes a full receive queue
+block or refuse the *sender* rather than drop, so `logit.input.kernel.drops` stays at zero there.
+
+**Under `transport: unix_stream`:** the `tcp` set, less `logit.input.accept_queue.*` (a Unix
+listener has no `TCP_INFO`). One frame is one length-prefixed packet, which may hold several lines,
+and `oversize` is a packet declaring more than 64 KiB, which closes the connection.
+
 **On either transport:** a line that *parses* badly isn't a framing error. It's the decoder's own
 `bad_line`, throttled per listener because every connection's decoder clone shares one set of
 counts. The driver's `bad_frame` key fires only for the single whole-frame failure
@@ -854,6 +862,87 @@ client, with no socket of its own.
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
 every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
 tag-cardinality reason), and `connection_error` (never an idle close).
+
+##### `datadog_in`
+
+`crates/logit-inputs/src/datadog.rs`, codec in `crates/logit-proto/src/datadog/`,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+
+**The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
+and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
+(gauge), `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+
+**Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
+which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
+arriving or which were refused.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
+| `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
+| `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
+| `logit.input.requests.acknowledged{route}` | count | a payload answered `2xx` and never sent: `host_metadata`, `metadata`, `collector`, `container`, and `orch` on every request, and `intake` for host metadata posted to `/intake/` |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`: a batch is one or the other. See below |
+
+**A busy request is not a lost one.** When the pipeline doesn't accept a request's batches within
+5 seconds, the request gets `503` with `Retry-After: 1`, counted `class="busy"`, and its
+undelivered batches are counted `batches.dropped{reason="busy"}`. The Agent keeps the payload and
+retries it, so "dropped" here means "not delivered by this request", not "lost". Read a steady busy
+rate as a pipeline that can't keep up with its Agents: the Agent's retry queue is absorbing the
+difference and drops payloads only once it fills.
+
+Each batch reaches every downstream consumer or none (`Fanout::send_with_deadline`), so the batch
+that timed out is counted only under `batches.dropped{reason="busy"}`, never under
+`logit.component.batches.sent`, and no consumer holds it. A traces or stats request that decodes to
+several batches can still be answered `503` after some of them were fully delivered; those count as
+`batches.sent`, and the Agent's retry delivers them again (the module doc's "Backpressure" section,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) decision 5).
+
+The codec's own counters (a series, sketch, log, event, check, span, or stats group dropped while
+the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this
+component's id.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
+rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
+and an API key never appears at all), and `busy` (a `503`).
+
+##### `datadog_trace_in`
+
+`crates/logit-inputs/src/datadog_trace.rs`, codec in `crates/logit-proto/src/datadog/`,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+
+**The connection metrics are `datadog_in`'s, except the accept-queue gauges cover the TCP
+listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
+and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
+together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
+has no counterpart for, so a `socket:`-only listener has none.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `traces_v03`, `traces_v04`, `traces_v05`, `traces_v07`, `stats_v06`, `info`, one of the `404` or stub routes below, or `unknown` |
+| `logit.input.request.duration` | timing | one per request, every exit included |
+| `logit.input.request.bytes` | count | the body size as sent, once read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `unsupported_route` (`404`, also tagged `route`: `traces_v01`, `traces_v02`, `traces_v10`, `pipeline_stats`, `telemetry_proxy`, `remote_config`), `method` (`405`), `encoding` (`415`, anything but identity or gzip), `json_traces` (`415`, a JSON v0.3/v0.4 body), `oversize` (`413`), `stalled` (`408`), `body_read` (`413`), `malformed_encoding` (`400`), or `malformed` (`400`) |
+| `logit.input.requests.acknowledged{route}` | count | a stub's upload, answered `200` and discarded: `evp_proxy_v1`–`v4`, `profiling`, `debugger_v1_input`, `debugger_v1_diagnostics`, `debugger_v2_input`, `symdb`, `dogstatsd_v1_proxy`, `dogstatsd_v2_proxy`, `tracer_flare`, `openlineage` |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
+| `logit.input.spans` | count | spans delivered, counted once the batch is accepted |
+
+**A busy request is soon a lost one.** The wait is 2 seconds, not `datadog_in`'s 5, and a dd-trace
+tracer retries a `503` a few times and then drops the payload, over the window
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s decision 11
+derives. So `batches.dropped{reason="busy"}` here counts batches a retry may still deliver during
+a shorter stall and lost ones during a longer one, and the counter can't tell them apart. Any sustained rate calls for more downstream capacity, such as a `buffer:` on the sinks.
+
+The codec's own counters are in the [`datadog` codec section](#datadog), under this component's id.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a connect-and-close
+probe), `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
+appears in the message text only), `busy` (a `503`), `trace_count_mismatch` (an
+`X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
+served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
+left out of the resource).
 
 ##### `tail_in` and `docker_in`
 
@@ -1276,14 +1365,14 @@ data loss.
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
   `logit.output.requests{class="ok"|"error"}`: `syslog_out`'s shape.
-- `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on both transports,
+- `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on every transport,
   matching `syslog_out`'s. Usually one entry is one statsd line. A negative-absolute-gauge metric's
-  two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once,
-  over UDP and TCP alike, as does its `messages.dropped{reason="oversize_datagram"}` if a packed
+  two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once
+  on every transport, as does its `messages.dropped{reason="oversize_datagram"}` if a packed
   datagram carrying it is rejected.
-- `logit.output.datagrams` (UDP only): the packed datagrams a batch of lines was sent as. It's the
-  number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike `syslog_out`)
-  packs several lines per datagram.
+- `logit.output.datagrams` (`udp` and `unix`): the packed datagrams a batch of lines was sent as.
+  It's the number an operator tuning `max_packet_bytes` needs, because `statsd_out` (unlike
+  `syslog_out`) packs several lines per datagram.
 - `logit.output.messages.dropped{reason=...}`, with `reason` one of:
   `"unresolved_gauge_delta"|"unsupported_kind"|"unencodable_value"|"empty_name"|"oversize_line"|
   "oversize_datagram"|"dialect_field"|"dialect_event"|"invalid_service_check"|
@@ -1303,10 +1392,12 @@ data loss.
 - `logit.output.messages.normalized{reason="dialect"|"member_sanitized"}`: a lossless-but-different
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
-- `logit.output.reconnects` (count, TCP only): every connect *after* the first, as for
-  `syslog_out`. Counted on plaintext and TLS connections alike, because both take the same
-  `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment). UDP is
-  connectionless and never reports it.
+- `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
+  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because both take the
+  same `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment).
+  Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
+  receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
+  decision 12). UDP is connectionless and never reports it.
 
 A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges: false` reports under
 `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the same key `influxdb_out` uses, so
@@ -1392,6 +1483,53 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
 attempt.
+
+##### `datadog_out`
+
+`crates/logit-outputs/src/datadog.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+One `send` is up to eight routes' requests, so every point carries `route`: `series`,
+`distribution_points`, `sketches`, `check_run`, `events`, `logs`, `traces`, or `stats`.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
+| `logit.output.request.duration{route}` | timing | one per request |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
+| `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window when sent: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, or every entry of a request Datadog answered `413` |
+| `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all |
+
+A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
+`stale`, not as a delivery. The codec's own points (`logit.output.metrics.skipped`, including
+every kind no route carries; `metrics.degraded`, `tags.dropped`, `spans.degraded`, `stats.*`) are
+the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't repeat them.
+
+`Diagnostics` keys, each throttled: `api_key_rejected` (a `403`: Datadog refused the key; the key
+itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
+bytes of the body with the key redacted), and `oversize` (an event dropped for its size).
+
+##### `datadog_trace_out`
+
+`crates/logit-outputs/src/datadog_trace.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+One `send` is up to two routes' requests, so every point carries `route`: `traces` or `stats`.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout, over TCP or the Unix socket alike |
+| `logit.output.request.duration{route}` | timing | one per request |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.records{route}` | count | spans (`traces`) or stats groups (`stats`) in a request the Agent accepted |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | a trace's spans, or a stats group, too large for the Agent's 25 MiB request limit alone, or every record of a request the Agent answered `413` |
+
+The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't
+repeat them. The one to watch here is `logit.output.spans.degraded{reason="no_wire_form"}` under
+`version: v0.4`: the trace chunk and tracer payload fields v0.4 can't carry. A tracer header's
+carrier doesn't count there, because the request header carries it.
+
+`Diagnostics` keys, each throttled: `request_rejected` (a non-retryable `4xx`, `3xx`, or `1xx`,
+quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and
+`bad_header` (a tracer header left out because its attribute isn't a legal header value).
 
 ##### `logit_out`
 
@@ -1498,6 +1636,49 @@ retry, and in sender mode one `send` is one attempt by design, with `write_loop`
 generic write loop's `logit.component.batches.received`/`events.received`/`send.duration` already
 cover a sink that never fails and never varies; a dedicated counter would duplicate
 `events.received`.
+
+#### Codecs
+
+A codec shared by a listener and a sink reports through whichever component's handles it was
+given, so these points appear under the component id of `datadog_in`, `datadog_trace_in`,
+`datadog_out`, or `datadog_trace_out`.
+
+##### `datadog`
+
+`crates/logit-proto/src/datadog/`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.metrics.skipped{reason="bad_series"\|"bad_point"\|"null_value"\|"non_finite_value"\|"empty_distribution"}` | count | a series or point dropped while the rest of the request decodes: a malformed series, a malformed point, a v1 `null` value, a non-finite protobuf value, or a distribution point with no values |
+| `logit.input.metrics.skipped{reason="bad_sketch"\|"empty_sketch"\|"legacy_distribution"}` | count | a malformed `Dogsketch`, an empty one (no bins, zero count), or a legacy `distributions` entry, which is ignored |
+| `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
+| `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
+| `logit.output.metrics.skipped{reason="no_recorded_value"\|"non_finite_value"\|"empty_sketch"}` | count | a flagged record, a non-finite value, or a sketch with nothing in it |
+| `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
+| `logit.output.tags.dropped{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `datadog.*` carrier the target route has no field for |
+| `logit.input.logs.skipped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
+| `logit.input.events.skipped{reason="malformed"\|"no_title"}` | count | an events-envelope group that isn't an array or an item that isn't an object, or an event with neither a title nor a text |
+| `logit.input.metrics.skipped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
+| `logit.output.metrics.skipped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `statsd.service_check.status` or its gauge |
+| `logit.output.tags.dropped{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
+| `logit.input.stats.skipped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
+| `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
+| `logit.input.stats.skipped{reason="interpolation"\|"bad_sketch"}` | count | an `OkSummary`/`ErrorSummary` dropped from its group: an interpolated DDSketch mapping, or bytes that aren't a usable DDSketch |
+| `logit.input.stats.degraded{reason="unknown_trilean"\|"bucket_start_overflow"\|"inexact_count"}` | count | an `IsTraceRoot` outside 0 to 2 (dropped), a bucket `Start` above `i64::MAX` (clamped), or a count above 2^53 that `f64` can't hold exactly |
+| `logit.output.stats.skipped{reason="unrecognized_record"}` | count | a record on an APM stats event that is none of the six stats records, or one of their names with another kind |
+| `logit.output.stats.degraded{reason="fractional_count"\|"bad_count"\|"count_overflow"\|"negative_timestamp"}` | count | a stats count rounded to an integer, a negative or non-finite count sent as 0, a count above 2^64 sent as `u64::MAX`, or a negative timestamp sent as bucket start 0 |
+| `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |
+| `logit.input.spans.skipped{reason="malformed"\|"idx_payload"}` | count | a span, trace array, or chunk that doesn't parse (a v0.5 span of the wrong arity or with a dictionary index out of range included), dropped while the rest decodes; an `AgentPayload`'s v1.0 `idxTracerPayloads` entry, which isn't implemented |
+| `logit.input.spans.degraded{reason="bad_tid"\|"negative_duration"\|"key_collision"\|"timestamp_range"\|"bad_attribute_type"\|"invalid_utf8"}` | count | an unparseable `_dd.p.tid` (kept as an attribute, high half zero), a negative duration clamped to 0, one key in two of `meta`/`metrics`/`meta_struct` (or a field spelled like a carrier) keeping one value, a span event time above `i64::MAX` clamped, a span event attribute of unknown type dropped, or a non-UTF-8 string read lossily |
+| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `datadog.chunk.*` in v0.4/v0.5; `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (once per batch); `meta_struct`, links, and events in v0.5 |
+| `logit.output.spans.degraded{reason="int_as_f64"\|"json_text"\|"negative_duration"\|"timestamp_range"}` | count | an integer attribute sent as an inexact `metrics` double, an `Array`/`Map`/`Null` sent as JSON text, a span ending before it starts sent with duration 0, or a negative span event time sent as 0 |
+
+`Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log
+timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
+`malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
+`bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
+chunk).
 
 ## Metrics from Lua scripts
 

@@ -9,6 +9,7 @@ pub mod provenance;
 /// Consistent sampling's compare and frozen key hash. Not re-exported: `sampling::keep` reads
 /// better at a call site than a bare `keep`.
 pub mod sampling;
+pub mod sketch;
 pub mod telemetry;
 /// `{name}` placeholder templates. Not re-exported: the names are generic enough that
 /// `template::Template` reads better than `Template`.
@@ -33,6 +34,7 @@ pub use metric::{
 };
 pub use provenance::Provenance;
 pub use resource::{Resource, Scope};
+pub use sketch::{Bin, Mapping, MappingKind, SketchDecodeError, SketchStats};
 pub use span::{SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{
     trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, TelemetryLayer, DEFAULT_SPAN_SAMPLE_RATE,

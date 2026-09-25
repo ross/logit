@@ -8,7 +8,7 @@
 //! directly, with no remote-type wrappers. Two of the rules `logit_proto::native`'s module doc
 //! states apply here too, so the comparison is fair: a `Symbol` is dictionary-indexed rather than
 //! written raw, and `MetricKind::Distribution`/`MetricKind::Set` ride as
-//! `DdSketch::to_java_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
+//! `DdSketch::to_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
 //!
 //! **Keeping it current.** A change to `logit_proto::native`'s encoding needs nothing here unless
 //! it changes one of those two rules. A field added to the event model needs a matching field and
@@ -203,7 +203,7 @@ pub enum WireMetricKind {
     Gauge(f64),
     GaugeDelta(f64),
     Samples(WireSamples),
-    /// `DdSketch::to_java_bytes()`: the canonical, cross-language blob `logit_proto::native` also
+    /// `DdSketch::to_bytes()`: the canonical, cross-language blob `logit_proto::native` also
     /// uses, since `DDSketch`'s fields are private with no bin iteration
     /// (`crates/logit-core/src/metric.rs`).
     Distribution(Vec<u8>),
@@ -481,7 +481,7 @@ fn metric_kind_to_wire(kind: &MetricKind) -> WireMetricKind {
             values: s.values.iter().copied().collect(),
             rate: s.sample_rate,
         }),
-        MetricKind::Distribution(sketch) => WireMetricKind::Distribution(sketch.to_java_bytes()),
+        MetricKind::Distribution(sketch) => WireMetricKind::Distribution(sketch.to_bytes()),
         MetricKind::SetMembers(members) => {
             WireMetricKind::SetMembers(members.iter().map(|m| m.to_vec()).collect())
         }
@@ -531,7 +531,7 @@ fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
             sample_rate: s.rate,
         }),
         WireMetricKind::Distribution(blob) => {
-            MetricKind::Distribution(DdSketch::from_java_bytes(blob).expect("valid blob"))
+            MetricKind::Distribution(DdSketch::from_bytes(blob).expect("valid blob"))
         }
         WireMetricKind::SetMembers(members) => {
             MetricKind::SetMembers(members.iter().map(|m| bytes::Bytes::from(m.clone())).collect())

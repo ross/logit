@@ -1,0 +1,9 @@
+# The one integration the recording Agent runs: tail datadog-agent-app.txt from its first line.
+# `script/record-fixtures datadog-agent` mounts this as the Agent's whole `conf.d`, so none of the
+# image's default checks (cpu, disk, network, ...) run and the captured series stay small.
+logs:
+  - type: file
+    path: /var/log/record/app.log
+    service: record-fixtures
+    source: python
+    start_position: beginning

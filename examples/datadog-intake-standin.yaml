@@ -1,0 +1,56 @@
+# Stands in for Datadog's intake: a Datadog Agent sends this listener what it would send Datadog
+# (series, sketches, service checks, events, logs, APM traces, APM stats), and `stdio_out` prints
+# what arrives. `datadog_in` (docs/adr/datadog-agent-and-intake-relay.md) answers the Agent the
+# way the intake does, so the Agent needs no change beyond the URLs it sends to. It's the
+# topology a migration away from Datadog runs through: docs/datadog.md has the dual-ship, tee,
+# and cut-over stages.
+#
+# Point an Agent at it in datadog.yaml. Replacing Datadog outright:
+#
+#   dd_url: http://<this-host>:8080                   # metrics, sketches, checks, events, metadata
+#   logs_config:
+#     logs_dd_url: <this-host>:8080                   # host:port, no scheme
+#     logs_no_ssl: true                               # this listener runs without TLS
+#     force_use_http: true                            # HTTP, not the legacy TCP logs port
+#   apm_config:
+#     apm_dd_url: http://<this-host>:8080             # traces and APM stats
+#
+# Or dual-shipping, where Datadog keeps receiving everything and this listener gets a copy:
+#
+#   additional_endpoints:
+#     "http://<this-host>:8080": ["<a key from api_keys>"]
+#   logs_config:
+#     additional_endpoints:
+#       - host: <this-host>
+#         port: 8080
+#         api_key: <a key from api_keys>
+#         is_reliable: true
+#   apm_config:
+#     additional_endpoints:
+#       "http://<this-host>:8080": ["<a key from api_keys>"]
+#
+# With `tls:` set below and a certificate the Agent doesn't trust, also set `skip_ssl_validation:
+# true` on the Agent, and use `https://` URLs without `logs_no_ssl`. Agent 7.83.3 honors the
+# replacing set above (`dd_url`, `logs_dd_url` with `logs_no_ssl` and `force_use_http`,
+# `apm_dd_url`), sending series as v2 protobuf; the dual-shipping and TLS settings are untested.
+#
+# The Agent compresses with zstd by default (`serializer_compressor_kind`), and `datadog_in`
+# decodes zstd, gzip, and deflate, so nothing about compression needs changing.
+components:
+  datadog:
+    type: datadog_in
+    # Loopback: with `api_keys` set this listener checks each request's DD-API-KEY, but that is a
+    # shared secret, not transport security. Bind wider, and add `tls:`, deliberately.
+    bind: 127.0.0.1:8080
+    # The keys the Agents send. Empty accepts any key; `!env` keeps the key out of this file.
+    api_keys: [!env DD_API_KEY]
+    # tls:                        # presence turns server TLS on for this listener
+    #   cert_file: server.pem     # resolved against this config file's directory
+    #   key_file: server.key
+    # An Agent keeps its intake connections open between flushes (every 15s for metrics), so
+    # an idle timeout well above that only closes connections a gone Agent left behind.
+    idle_timeout: 120s
+
+  stdout:
+    type: stdio_out
+    sources: [datadog]

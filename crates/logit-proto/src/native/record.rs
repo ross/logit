@@ -319,7 +319,7 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
             out.extend_from_slice(&tmp);
         }
         MetricKind::Distribution(sketch) => {
-            let blob = sketch.to_java_bytes();
+            let blob = sketch.to_bytes();
             out.extend_from_slice(&[METRIC_DISTRIBUTION]);
             write_uvarint(out, blob.len() as u64);
             out.extend_from_slice(&blob);
@@ -337,7 +337,8 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
         }
         MetricKind::Set(hll) => {
             // `HyperLogLog::to_bytes()`'s blob, framed like `Distribution`'s. Unlike
-            // `to_java_bytes`, it's pinned to the `cardinality-estimator` version, not portable.
+            // `DdSketch::to_bytes`, it's pinned to the `cardinality-estimator` version, not
+            // portable.
             let blob = hll.to_bytes();
             out.extend_from_slice(&[METRIC_SET]);
             write_uvarint(out, blob.len() as u64);
@@ -421,7 +422,7 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             MetricKind::Samples(samples)
         }
         METRIC_DISTRIBUTION => {
-            let sketch = DdSketch::from_java_bytes(&body)
+            let sketch = DdSketch::from_bytes(&body)
                 .map_err(|e| CodecError::Malformed(format!("bad distribution blob: {e:?}")))?;
             MetricKind::Distribution(sketch)
         }
@@ -1299,7 +1300,8 @@ mod tests {
             let out = dict_round_trip_metric(&record);
             match (&kind, &out.kind) {
                 (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
-                    // DDSketch has no PartialEq; MetricKind's compares via to_java_bytes.
+                    // `DdSketch`'s derived PartialEq is structural (see
+                    // `logit_core::DdSketch`'s doc) -- exercised directly here too, for clarity.
                     assert_eq!(a, b);
                 }
                 (a, b) => assert_eq!(a, b, "kind mismatch for {a:?}"),

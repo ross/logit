@@ -1,4 +1,4 @@
-//! `statsd_out` -> `statsd_in` round trip over real UDP and TCP sockets. The components run
+//! `statsd_out` -> `statsd_in` round trip over real UDP, TCP, and Unix sockets. The components run
 //! in-process (a `StatsdOutput` sending to a bound, live `StatsdInput`), not through `logit run`.
 //! This lives in `logit-cli` because it already depends on both `logit-inputs` and
 //! `logit-outputs`; a dev-dependency between those two crates would be a cycle.
@@ -28,6 +28,11 @@
 //! - `event-text-trailing-space`, `service-check-message-trailing-space`: the last byte of `TEXT`
 //!   or of an `m:` message is a space followed by the `.in` file's own trailing `\n`;
 //!   `decode_into` must not trim it.
+//! - `dogstatsd-external-data-cardinality`, `event-service-check-external-data-cardinality`: the
+//!   `|e:<external-data>` (protocol v1.5) and `|card:<cardinality>` (v1.6) fields, written from the
+//!   DogStatsD datagram-format reference's grammar for those versions, on a metric line and on an
+//!   event and a service check. The metric line's segment order is the one the `datadog` Python
+//!   client writes (`testdata/interop/datadog/README.md`).
 //!
 //! ## Permitted normalizations (per `docs/adr/lossless-transit.md`)
 //!
@@ -64,7 +69,8 @@
 //!    - A multi-value `Samples` line (`name:v1:v2:v3|ms`) splits into one `name:v|ms` line per
 //!      value, repeating a non-`1.0` `sample_rate` on each.
 //!    - A timer's `h`/`d` type letter becomes `ms`.
-//!    - `|c:<container-id>` and `|T<timestamp>` are dropped.
+//!    - `|c:<container-id>`, `|e:<external-data>`, `|card:<cardinality>` and `|T<timestamp>` are
+//!      dropped, each counted in `EncodeStats::dropped_dialect_fields`.
 //!    - A DogStatsD event or service check has no classic form, so the whole event is dropped and
 //!      counted in `EncodeStats::dropped_dialect_events`.
 //!
@@ -84,18 +90,23 @@
 //!    `repeated-tag-exact-duplicate-deduped`, `bare-tag-exact-duplicate-deduped`.
 //! 9. **DogStatsD event and service check fields re-emit in canonical order.** `_e` order is
 //!    `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/`c:`; `_sc` order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:`
-//!    last, since it consumes the rest of the line on decode). Nothing else changes: titles, text,
-//!    names, hosts, aggregation keys, source types, and messages survive verbatim, embedded `|`
-//!    and the `TEXT` `\n` escape included. Fixture: `event-fields-reordered-canonicalized`.
+//!    last, the DogStatsD reference's order). Nothing else changes: titles, text, names, hosts,
+//!    aggregation keys, source types, and messages survive verbatim, an event's embedded `|` and
+//!    the `TEXT` `\n` escape included. Fixtures: `event-fields-reordered-canonicalized`, and
+//!    `service-check-origin-fields-after-message`, a service check in the order the `datadog`
+//!    Python client writes it (`c:`/`card:` after `m:`,
+//!    `testdata/interop/datadog/dogstatsd-unix-008.raw`).
 //!
 //! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
 //! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
 //! two-line idiom.
 //!
-//! `mod tcp` and `mod tls` add no entry to this list: both transports share
+//! `mod tcp`, `mod tls`, and `mod unix` add no entry to this list: every transport shares
 //! `StatsdEncoder`/`StatsdDecoder`, and only the framing differs. UDP newline-*joins* a batch's
 //! lines into one datagram; TCP newline-*terminates* each line, so the TCP capture is the UDP bytes
-//! plus one final `\n` (`mod tcp::strip_lf_framing`).
+//! plus one final `\n` (`mod tcp::strip_lf_framing`). `transport: unix` sends the UDP datagram's
+//! bytes as a Unix datagram, and `unix_stream` sends them after a 4-byte little-endian length
+//! (`mod unix::strip_length_prefix`).
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
@@ -304,6 +315,8 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
         "packed-datagram-counter-event-service-check",
         "event-text-trailing-space",
         "service-check-message-trailing-space",
+        "dogstatsd-external-data-cardinality",
+        "event-service-check-external-data-cardinality",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -320,6 +333,7 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
         "explicit-rate-one-omitted",
         "number-formatting-trailing-zeros",
         "event-fields-reordered-canonicalized",
+        "service-check-origin-fields-after-message",
     ];
     for name in cases {
         assert_byte_for_byte(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd)).await;
@@ -534,6 +548,17 @@ async fn statsd_dialect_normalizes_h_to_ms() {
 async fn statsd_dialect_drops_container_id_and_timestamp() {
     let mut harness = Harness::new().await;
     assert_dialect_output(&mut harness, "statsd-dialect-drops-container-and-timestamp").await;
+}
+
+#[tokio::test]
+async fn statsd_dialect_drops_external_data_and_cardinality() {
+    let mut harness = Harness::new().await;
+    assert_dialect_output(&mut harness, "statsd-dialect-drops-external-data-and-cardinality").await;
+    let batch =
+        direct_batch(&read_fixture("statsd-dialect-drops-external-data-and-cardinality", "in"));
+    let mut out = MessageBuf::default();
+    let stats = StatsdEncoder::new(Format::Statsd).encode_into(&batch, &mut out);
+    assert_eq!(stats.dropped_dialect_fields, 4, "|c:, |e:, |card: and |T, one each");
 }
 
 #[tokio::test]
@@ -915,6 +940,8 @@ mod tcp {
             "packed-datagram-counter-event-service-check",
             "event-text-trailing-space",
             "service-check-message-trailing-space",
+            "dogstatsd-external-data-cardinality",
+            "event-service-check-external-data-cardinality",
             // The `.expected`-differs-from-`.in` normalizations.
             "sampled-counter-rate-folded",
             "explicit-rate-one-omitted",
@@ -1220,5 +1247,150 @@ mod tls {
         let batch =
             send_over_tls(&connector("ca.pem", None), addr, &mut rx, b"still.serving:1|c\n").await;
         assert_eq!(metric_name(&batch), "still.serving");
+    }
+}
+
+// ---- transport: unix / unix_stream ----------------------------------------------------------
+
+/// `statsd_out` -> `statsd_in` over both Unix transports, on multi-line packets: the capture
+/// asserts the packet's bytes, the live listener the decode.
+mod unix {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{UnixDatagram, UnixListener};
+
+    /// A per-test directory for the socket files, removed on drop.
+    struct SocketDir(PathBuf);
+
+    impl SocketDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("lsrt-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+    }
+
+    impl Drop for SocketDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Multi-line packets: several metric lines, a counter packed with an event and a service
+    /// check, and the `|e:`/`|card:` fields.
+    const CASES: &[&str] = &[
+        "packed-multi-line-datagram",
+        "packed-datagram-counter-event-service-check",
+        "dogstatsd-external-data-cardinality",
+        "event-service-check-external-data-cardinality",
+    ];
+
+    /// Binds `input`, runs it into a fresh channel, and returns the channel.
+    async fn spawn_input(mut input: StatsdInput) -> mpsc::Receiver<Delivered> {
+        input.bind().await.expect("binding the Unix statsd_in listener");
+        let (tx, rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+        rx
+    }
+
+    async fn next_decoded(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
+        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("statsd_in should decode and forward the packet")
+            .expect("the Fanout channel should not have closed");
+        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        normalize_receipt_time(&mut decoded);
+        decoded
+    }
+
+    #[tokio::test]
+    async fn multi_line_packets_round_trip_over_a_unix_datagram_socket() {
+        let dir = SocketDir::new("dgram");
+        let capture_path = dir.path("capture.socket");
+        let capture = UnixDatagram::bind(&capture_path).unwrap();
+        let input_path = dir.path("dsd.socket");
+        let mut rx = spawn_input(StatsdInput::unix(&input_path)).await;
+
+        for name in CASES {
+            let raw = read_fixture(name, "in");
+            let batch = direct_batch(&raw);
+            let encoder = || StatsdEncoder::new(Format::DogStatsd);
+
+            let mut to_capture = StatsdOutput::unix_datagram(&capture_path, Duration::from_secs(1))
+                .with_encoder(encoder());
+            to_capture.send(&batch).await.expect("send to the capture socket");
+            let mut buf = vec![0u8; 65_536];
+            let n = tokio::time::timeout(Duration::from_secs(2), capture.recv(&mut buf))
+                .await
+                .expect("the capture socket should receive the datagram")
+                .unwrap();
+            assert_eq!(buf[..n], expected_bytes(name, &raw), "{name}: datagram bytes");
+
+            let mut to_input = StatsdOutput::unix_datagram(&input_path, Duration::from_secs(1))
+                .with_encoder(encoder());
+            to_input.send(&batch).await.expect("send to the live statsd_in");
+            assert_eq!(next_decoded(&mut rx).await, batch, "{name}: decode(sink_output)");
+        }
+    }
+
+    /// Strips the one 4-byte little-endian length prefix a small batch is framed in, asserting it
+    /// matches the rest.
+    fn strip_length_prefix(frame: &[u8]) -> &[u8] {
+        let (prefix, body) = frame.split_at(4);
+        let declared = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
+        assert_eq!(declared, body.len(), "one packet, its length prefixed little-endian");
+        body
+    }
+
+    #[tokio::test]
+    async fn multi_line_packets_round_trip_over_a_unix_stream_socket() {
+        let dir = SocketDir::new("stream");
+        let capture_path = dir.path("capture.socket");
+        let capture = UnixListener::bind(&capture_path).unwrap();
+        let (capture_tx, mut capture_rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = capture.accept().await else { break };
+                let tx = capture_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let _ = stream.read_to_end(&mut buf).await;
+                    let _ = tx.send(buf).await;
+                });
+            }
+        });
+        let input_path = dir.path("dsd-stream.socket");
+        let mut rx = spawn_input(StatsdInput::unix_stream(&input_path)).await;
+
+        for name in CASES {
+            let raw = read_fixture(name, "in");
+            let batch = direct_batch(&raw);
+            let encoder = || StatsdEncoder::new(Format::DogStatsd);
+
+            let mut to_capture = StatsdOutput::unix_stream(&capture_path, Duration::from_secs(1))
+                .with_encoder(encoder());
+            to_capture.send(&batch).await.expect("send to the capture listener");
+            drop(to_capture); // EOFs the capture task's read_to_end
+            let framed = tokio::time::timeout(Duration::from_secs(2), capture_rx.recv())
+                .await
+                .expect("the capture listener should receive the frame")
+                .unwrap();
+            assert_eq!(strip_length_prefix(&framed), expected_bytes(name, &raw), "{name}");
+
+            let mut to_input = StatsdOutput::unix_stream(&input_path, Duration::from_secs(1))
+                .with_encoder(encoder());
+            to_input.send(&batch).await.expect("send to the live statsd_in");
+            // Dropping it EOFs the connection, which flushes the listener's accumulator at once.
+            drop(to_input);
+            assert_eq!(next_decoded(&mut rx).await, batch, "{name}: decode(sink_output)");
+        }
     }
 }

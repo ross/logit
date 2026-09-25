@@ -1,0 +1,68 @@
+# Tails the JSON logs of an application instrumented with a Datadog tracer (dd-trace log
+# injection on), lifts the trace ids the tracer wrote into each line onto the log record with
+# `trace_context` under `format: datadog` (docs/adr/log-record-trace-context.md's Datadog
+# amendment), and sends the logs both to Datadog (`datadog_out`) and to an OTLP backend
+# (`otlp_out`), where they correlate with the application's traces. docs/datadog.md's "Log
+# correlation" section has the caveats.
+#
+# A dd-trace JSON log line carries the ids as decimal 64-bit numbers, or the trace id as 32 hex
+# characters when the tracer generates 128-bit ids:
+#
+#   {"message":"order placed","dd.trace_id":"1234567890123456789","dd.span_id":"987654321",
+#    "dd.service":"shop","dd.env":"prod","dd.version":"1.4.2"}
+#
+# Some libraries (dd-trace-js with pino or winston, dd-trace-rb with lograge) nest the same fields
+# under a `dd` object instead: `"dd":{"trace_id":"...","span_id":"..."}`. `dd_flat` expands that
+# object into the same dotted names, and is a no-op for a line that has none.
+#
+# Topology:
+#
+#   app.log --tail--> app_in (tail_in)
+#                        |
+#                        v
+#                   app_json (json)
+#                        |
+#                        v
+#                   dd_flat (flatten)      <- a nested `dd` object becomes dd.trace_id, dd.span_id
+#                        |
+#                        v
+#                   dd_trace (trace_context, format: datadog)
+#                        |
+#               +--------+---------+
+#               v                  v
+#           datadog_out         otlp_out
+components:
+  app_in:
+    type: tail_in
+    paths: ["/var/log/app/*.jsonl"]
+
+  app_json:
+    type: json
+    sources: [app_in]
+
+  dd_flat:
+    type: flatten
+    sources: [app_json]
+    attributes: [dd]
+
+  # Reads `dd.trace_id`/`dd.span_id` (the `format: datadog` defaults). A decimal trace id fills the
+  # low 64 bits of the 128-bit id OTLP carries; the high 64 bits stay zero, as a Datadog tracer's
+  # own 64-bit ids are. A line with no ids, or ids that don't parse, passes through unchanged.
+  # The `dd.*` id attributes are consumed; both sinks send the lifted reference instead.
+  dd_trace:
+    type: trace_context
+    sources: [dd_flat]
+    format: datadog
+
+  # Writes the lifted reference as `trace_id`/`span_id` in hex, which Datadog's log intake
+  # correlates on.
+  datadog:
+    type: datadog_out
+    sources: [dd_trace]
+    api_key: !env DD_API_KEY
+
+  # Carries the lifted ids as OTLP's native LogRecord trace_id/span_id.
+  otlp:
+    type: otlp_out
+    sources: [dd_trace]
+    endpoint: http://otel-collector:4318

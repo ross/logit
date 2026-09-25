@@ -931,6 +931,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "flate2",
  "http",
  "http-body-util",
  "hyper",
@@ -947,6 +948,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "ruzstd",
  "serde_json",
  "serde_norway",
  "snap",
@@ -974,8 +976,8 @@ dependencies = [
  "bytes",
  "cardinality-estimator",
  "lasso",
+ "proptest",
  "serde",
- "sketches-ddsketch",
  "smallvec",
  "tracing",
  "tracing-subscriber",
@@ -1003,6 +1005,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "ruzstd",
  "serde",
  "serde_json",
  "snap",
@@ -1039,6 +1042,7 @@ dependencies = [
  "snap",
  "tokio",
  "tokio-rustls",
+ "tower-service",
  "tracing-subscriber",
  "webpki-roots",
 ]
@@ -1088,6 +1092,7 @@ dependencies = [
  "base64",
  "bytes",
  "crc32c",
+ "flate2",
  "logit-core",
  "lz4_flex",
  "proptest",
@@ -1946,12 +1951,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "sketches-ddsketch"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513c3f5f732bfd6fbb187619c2dfe9d2f25f1a2976f01d575f0fd329d565df56"
 
 [[package]]
 name = "slab"

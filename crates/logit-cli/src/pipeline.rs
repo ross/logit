@@ -18,6 +18,8 @@ use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
+use logit_inputs::datadog::DatadogInput;
+use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::graphite::GraphiteInput;
@@ -29,6 +31,13 @@ use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::collectd::CollectdOutput;
+use logit_outputs::datadog::{
+    DatadogCompression as DatadogOutCompression, DatadogEndpoints as DatadogOutEndpoints,
+    DatadogOutput,
+};
+use logit_outputs::datadog_trace::{
+    DatadogTraceCompression as DatadogTraceOutCompression, DatadogTraceOutput, TracerApiForm,
+};
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
@@ -60,13 +69,13 @@ use logit_transforms::{
     Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, HttpAccess as HttpAccessTransform, HttpAccessConfig,
-    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    IdFormat as TraceIdFormatTransform, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
+    Kv as KvTransform, KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform,
+    MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
+    Remove as RemoveTransform, Route as RouteTransform, Sample as SampleTransform,
+    Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -289,13 +298,20 @@ fn build_spec(
     let spec = match &component.kind {
         // The transport picks the constructor and the `receive:` translation: a TCP listener has
         // no receive queue, so it takes `tcp_receive_config`, not `receive_config` (graph rule 17).
-        // `tls:` is TCP-only: rule 43 rejects it under UDP, and `with_tls` refuses it again.
+        // `tls:` is TCP-only: rules 43 and 65 reject it elsewhere, and `with_tls` refuses it again.
         StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
                     StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
                 }
                 logit_config::StatsdTransport::Tcp => StatsdInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+                // The Unix transports take the same two translations: `unix` is a datagram
+                // listener, `unix_stream` a stream one (rules 17 and 65).
+                logit_config::StatsdTransport::Unix => {
+                    StatsdInput::unix(bind).with_receive(receive_config(&component.receive))
+                }
+                logit_config::StatsdTransport::UnixStream => StatsdInput::unix_stream(bind)
                     .with_tcp_receive(tcp_receive_config(&component.receive)),
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -382,6 +398,38 @@ fn build_spec(
                 // the grace an idle close gives `hyper` (`docs/adr/idle-connection-timeout.md`).
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        DatadogIn { bind, tls, api_keys, handshake_timeout, idle_timeout } => {
+            let mut input = DatadogInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout)
+                .with_api_keys(api_keys.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        // Graph rule 64 guarantees at least one of `bind`/`socket`, and `tls` only with `bind`.
+        DatadogTraceIn { bind, socket, tls, handshake_timeout, idle_timeout } => {
+            let mut input = DatadogTraceInput::new()
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout);
+            if let Some(bind) = bind {
+                input = input.with_bind(bind.clone());
+            }
+            if let Some(socket) = socket {
+                input = input.with_socket(socket);
+            }
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -578,14 +626,17 @@ fn build_spec(
             SetTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
-        TraceContext { trace_id, span_id, flags, keep_source, span } => {
-            let mut transform = TraceContextTransform::new(
-                trace_id.clone(),
-                span_id.clone(),
-                flags.clone(),
-                *keep_source,
-            )
-            .with_telemetry(telemetry.clone());
+        TraceContext { format, trace_id, span_id, flags, trace_id_high, keep_source, span } => {
+            let (trace_id, span_id, flags) = format.resolve_fields(trace_id, span_id, flags);
+            let id_format = match format {
+                logit_config::TraceIdFormat::Otel => TraceIdFormatTransform::Otel,
+                logit_config::TraceIdFormat::Datadog => {
+                    TraceIdFormatTransform::Datadog { trace_id_high: trace_id_high.clone() }
+                }
+            };
+            let mut transform = TraceContextTransform::new(trace_id, span_id, flags, *keep_source)
+                .with_format(id_format)
+                .with_telemetry(telemetry.clone());
             if let Some(span) = span {
                 transform = transform.with_span(to_span_lift(span));
             }
@@ -704,6 +755,56 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
+        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls } => {
+            let output = DatadogOutput::new(api_key)?
+                .with_site(site.clone())
+                .with_endpoints(DatadogOutEndpoints {
+                    api: endpoints.api.clone(),
+                    logs: endpoints.logs.clone(),
+                    traces: endpoints.traces.clone(),
+                })
+                .with_compression(match compression {
+                    logit_config::DatadogCompression::Gzip => DatadogOutCompression::Gzip,
+                    logit_config::DatadogCompression::None => DatadogOutCompression::None,
+                })
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        DatadogTraceOut { endpoint, socket, version, compression, timeout, headers, tls } => {
+            // Rule 67 has already required one of `endpoint`/`socket`, not both.
+            let output = match (endpoint, socket) {
+                (Some(endpoint), _) => DatadogTraceOutput::http(endpoint.clone()),
+                (None, Some(socket)) => DatadogTraceOutput::unix(socket),
+                (None, None) => anyhow::bail!("datadog_trace_out needs 'endpoint' or 'socket'"),
+            };
+            let output = output
+                .with_version(match version {
+                    logit_config::DatadogTraceVersion::V04 => TracerApiForm::V04,
+                    logit_config::DatadogTraceVersion::V07 => TracerApiForm::V07,
+                })
+                .with_compression(match compression {
+                    logit_config::DatadogTraceCompression::None => DatadogTraceOutCompression::None,
+                    logit_config::DatadogTraceCompression::Gzip => DatadogTraceOutCompression::Gzip,
+                })
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
         LogitOut { endpoint, compression, tls, request_timeout } => {
             let mut output = LogitOutput::new(endpoint.clone())
                 .with_compression(to_native_compression(*compression))
@@ -807,11 +908,18 @@ fn build_spec(
             connect_timeout,
             tls,
         } => {
-            // Eager for UDP, lazy for TCP, as `SyslogOut`.
+            // Eager for UDP, lazy for the Unix and stream transports. A Unix datagram send's wait
+            // on a full receiver is bounded by `connect_timeout`.
             let output = match transport {
                 logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
                 logit_config::StatsdTransport::Tcp => {
                     StatsdOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+                logit_config::StatsdTransport::Unix => {
+                    StatsdOutput::unix_datagram(endpoint.clone(), *connect_timeout)
+                }
+                logit_config::StatsdTransport::UnixStream => {
+                    StatsdOutput::unix_stream(endpoint.clone(), *connect_timeout)
                 }
             };
             let encoder =
@@ -3477,9 +3585,11 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
-                trace_id: "tid".to_string(),
-                span_id: Some("sid".to_string()),
-                flags: None,
+                format: logit_config::TraceIdFormat::Otel,
+                trace_id: Some("tid".to_string()),
+                span_id: Some(Some("sid".to_string())),
+                flags: Some(None),
+                trace_id_high: None,
                 keep_source: true,
                 span: None,
             },
@@ -3528,9 +3638,11 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::TraceContext {
-                trace_id: "trace.id".to_string(),
-                span_id: Some("span.id".to_string()),
-                flags: None,
+                format: logit_config::TraceIdFormat::Otel,
+                trace_id: None,
+                span_id: None,
+                flags: Some(None),
+                trace_id_high: None,
                 keep_source: false,
                 span: Some(logit_config::SpanLiftConfig {
                     kind: logit_config::SpanKindConfig::Client,
@@ -3570,6 +3682,56 @@ mod tests {
         assert_eq!(span.name.as_str(), Some("http.request"));
         assert_eq!(event.timestamp, 1_725_000_000_000_000_000);
         assert_eq!(span.end_timestamp, 1_725_000_000_005_000_000);
+    }
+
+    /// `format: datadog` reaches the transform with its `dd.*` defaults and `trace_id_high`.
+    #[test]
+    fn build_spec_builds_a_datadog_trace_context_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::TraceContext {
+                format: logit_config::TraceIdFormat::Datadog,
+                trace_id: None,
+                span_id: None,
+                flags: None,
+                trace_id_high: Some("_dd.p.tid".to_string()),
+                keep_source: false,
+                span: None,
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("trace", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("dd.trace_id", logit_core::Value::str("1311768467750121234"));
+        attrs.insert("dd.span_id", logit_core::Value::str("42"));
+        attrs.insert("_dd.p.tid", logit_core::Value::str("64de8e2b00000000"));
+        let mut event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        let trace = event.log.expect("log should survive").trace.expect("trace should be lifted");
+        assert_eq!(logit_core::trace::to_hex(&trace.trace_id), "64de8e2b0000000012345678abcdef12");
+        assert_eq!(trace.span_id, Some(42_u64.to_be_bytes()));
+        assert!(event.attributes.is_empty(), "all three consumed: {:?}", event.attributes);
     }
 
     /// Runs the built transform: the configured factor reaches `Scale::new`.

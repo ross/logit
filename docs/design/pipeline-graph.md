@@ -291,7 +291,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 17. A non-default `receive:` outside a datagram, stream, or tail listener, or a receive-queue field
     on a stream or tail listener.
 18. A `0` receive-queue or batch-assembly bound (`batch_flush_interval: 0s` is legal).
-19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name.
+19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
+    defaults.
 20. A `scale` with no `fields`, an empty field name, or a non-finite factor.
 21. An empty `signals:` list, or all three signals on `keep_signals`/`drop_signals`.
 22. An `otlp_out` header the transport sets itself, or two that differ only in case.
@@ -349,6 +350,20 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `always_keep`, or `missing:` without `key:`.
 62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose
     `checkpoint_path` is another's `<checkpoint_path>.tmp`.
+63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
+    whitespace.
+64. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
+    path, or `tls` without `bind`.
+65. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
+    `transport: unix`/`unix_stream`, or `tls:` under either Unix transport.
+66. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
+    scheme or `/`, an `endpoints` entry that isn't an absolute `http://`/`https://` URL,
+    `timeout: 0s`, a reserved or colliding header, or a bad `tls`.
+67. A `datadog_trace_out` with both or neither of `endpoint`/`socket`, an `endpoint` that isn't an
+    absolute `http://`/`https://` URL, a relative `socket` path, `timeout: 0s`, a reserved
+    (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
+    `tls` with `socket`).
+68. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

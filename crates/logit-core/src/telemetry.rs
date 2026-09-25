@@ -250,6 +250,12 @@ impl Timer {
             self.telemetry.timing(self.name, start.elapsed(), tags);
         }
     }
+
+    /// Discards this timer without recording a sample, for a wait that turned out not to be the
+    /// thing it measures (`Fanout::send_with_deadline` giving up before anything was sent).
+    pub fn cancel(mut self) {
+        self.start = None;
+    }
 }
 
 impl Drop for Timer {
@@ -371,6 +377,12 @@ impl SpanGuard {
     /// Finishes this span now rather than at `Drop`.
     pub fn finish(mut self) {
         self.finish_inner();
+    }
+
+    /// Discards this span without recording it, for a visit that turned out not to happen
+    /// (`Fanout::send_with_deadline` giving up before anything was sent).
+    pub fn cancel(mut self) {
+        self.span = None;
     }
 
     fn finish_inner(&mut self) {
@@ -1056,6 +1068,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_cancelled_timer_records_nothing() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("x", "x", "transform");
+        telemetry.timer("logit.component.send.blocked.duration").cancel();
+
+        let events = registry.drain(0);
+        assert!(events.is_empty(), "a cancelled timer should record no sample, got: {events:?}");
+    }
+
     // -------------------------------------------------------------------------------------------
     // Spans
     // -------------------------------------------------------------------------------------------
@@ -1102,6 +1124,21 @@ mod tests {
         span.tag("k", "v");
         span.error();
         drop(span);
+    }
+
+    #[test]
+    fn a_cancelled_span_records_nothing() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("x", "x", "listener");
+        let mut span = telemetry.span("send", SpanKind::Producer, trace_id(1), span_id(1), None);
+        span.events(2);
+        span.cancel();
+
+        let events = registry.drain(0);
+        assert!(
+            find_span_event(&events).is_none(),
+            "a cancelled span should never be pushed, got: {events:?}"
+        );
     }
 
     #[test]
