@@ -42,8 +42,8 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 
 | # | Lead | Entry | Status |
 |---|---|---|---|
-| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). in-progress (dos/w2) for WIRE-03; the replacement `DdSketch` in-progress (dos/w3) |
-| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | in-progress (dos/w3, dos/w2) |
+| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). in-progress (dos/w2) for WIRE-03; the replacement `DdSketch` done: findings → dos/w3 (decoded `bin_limit` capped, Agent keys range-checked) |
+| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → dos/w3 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 in-progress (dos/w2) |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | in-progress (dos/w6) |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | in-progress (dos/w5) |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 in-progress (dos/w4); measured 2026-09-25: JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; downgraded to P2 pending W4's pinning tests. CORE-17 open |
@@ -203,8 +203,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | in-progress (dos/w6) |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | in-progress (dos/w6) |
 | [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P0 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | in-progress (dos/w4) |
-| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | in-progress (dos/w3) |
-| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | in-progress (dos/w3) |
+| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | findings → dos/w3 |
+| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | findings → dos/w3 |
 | [CORE-15](#core-15--scriptworker-vm-lifecycle-the-luajit-sandbox-and-return-value-validation) | P0 | `ScriptWorker`: VM lifecycle, the LuaJIT sandbox, and return-value validation | `crates/logit-script/src/lib.rs` (`sandbox_libs`, `remove_unsandboxed_base_globals`, `ScriptWorker`) | unreviewed |
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | unreviewed |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | unreviewed |
@@ -5380,6 +5380,20 @@ the telemetry buffers are `std::collections::HashMap`.
   Nobody has re-reviewed the replacement. Start from `sketch.rs`'s `merge`, `from_bytes`, and
   `malformed_bytes_are_rejected_not_panicked_on`, and check the decode-side bounds (bin counts, key ranges,
   weights) as well as merge. The re-review is `dos/w3`.
+- **Verified 2026-09-25** (`dos/w3`, atop `dos/w0`): ~~the wrapper and its `.expect()`~~ are gone,
+  and the hand-rolled `sketch::DdSketch`'s `merge` can't panic: a fresh-context refuter drove
+  degenerate mappings, non-finite counts, and hostile summaries through it, and the new
+  `crates/logit-core/tests/robustness.rs` runs truncations, seeded bit flips, and hostile counts
+  through `from_bytes` and every operation `aggregate` runs after it. **fixed: two decode bounds.**
+  A decoded `bin_limit` was unbounded (`u32::MAX` meant no collapse, so a cross-mapping merge of
+  two such sketches took 62 s at 320k bins); `Mapping::MAX_BIN_LIMIT` (4096) now caps it
+  (`a_decoded_bin_limit_past_the_cap_is_malformed`,
+  `a_cross_mapping_merge_of_two_capped_sketches_is_bounded`). An Agent-mapped blob accepted any
+  `i32` key, and `datadog_out` negates a negative-store key (`i32::MIN` panicked in debug); keys
+  outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
+  `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
+  large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
+  `docs/known-gaps.md`.
 
 ---
 
@@ -5401,6 +5415,18 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `hyperloglog_*` tests and `hll_slice_len_matches_upstream_constant`) — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner).
 - **Suggested verification approach:** **run the HLL tests under Miri and ASan specifically** (this is the one place in the area where UB is the documented failure mode); fuzz `from_bytes` with arbitrary bytes; proptest merge as a set-union law; add a guard test that pins serde's `with_capacity`-from-`size_hint` behaviour if one can be written.
 - **Priority:** **P0** — untrusted bytes feeding a codec whose stated purpose is preventing UB in a dependency, with version-pinned constants mirrored by hand.
+- **Verified 2026-09-25** (`dos/w3`, atop `dos/w0`): the size hint is the rounded capacity, a
+  `None` tag is rejected, and canonicalization clears only bits upstream discards. **fixed:** a
+  zero-register count past `M` (4096) panicked upstream's `estimate` in debug and read 0 in release,
+  and now fails decode; a blob with trailing bytes decoded `Ok` and now fails. ~~Only the first has
+  a guard test~~: serde's preallocation is now pinned by
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, and the
+  circular `hll_slice_len_matches_upstream_constant` is replaced by
+  `hll_slice_len_matches_what_upstream_serializes`, which measures a blob upstream wrote. A merge-law
+  proptest checks union on `estimate`. Miri runs the HLL tests only under
+  `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`, where a regressed hint still fails
+  with the `Layout` error (ADR `out-of-ci-unsafe-verification`'s "Sketch and HyperLogLog targets"
+  amendment).
 
 ---
 

@@ -195,3 +195,25 @@ and the separate cargo-home volume are unchanged. Fuzz builds get their own targ
 artifact in `logit_unsafe_check_target`. `MIRI_TARGETS` also gains the `HyperLogLog` fuzz
 regressions, because AddressSanitizer can't see the wrong-`Layout` deallocation that codec guards
 against and Miri can.
+
+## Amendment: Sketch and HyperLogLog targets (2026-09-25)
+
+`MIRI_TARGETS` entries now carry their own Miri flags, as `"<package>|<libtest args>|<extra
+MIRIFLAGS>"`, because the `logit-core` sketch targets can't run under the defaults.
+
+- **`HyperLogLog` (`hyperloglog`, `hll_`) runs with `-Zmiri-disable-stacked-borrows
+  -Zmiri-permissive-provenance`.** `cardinality-estimator` 1.0.3 stores its heap pointer in a
+  tagged `usize` and casts it back (`array.rs`, `hyperloglog.rs`). Under the default Stacked
+  Borrows, and under Tree Borrows ("retag from <wildcard>"), Miri stops inside upstream before
+  any assertion in our tests runs. With both aliasing models off and permissive provenance, the
+  tests run and Miri still checks allocation layouts. The negative control confirms this: with
+  `validate_members_len` returning the unrounded length as the size hint,
+  `hyperloglog_round_trips_non_power_of_two_member_counts` fails with "incorrect layout on
+  deallocation: alloc has size 24 and alignment 4, but gave size 16 and alignment 4". So these
+  flags give up aliasing checks of upstream's pointer tagging, which we can't fix, and keep the
+  `Layout` check the codec exists for.
+- **`DdSketch` (`sketch::tests`) runs with `-Zmiri-deterministic-floats`.** Miri perturbs float
+  results by default, so two calls to `Mapping::agent()` can derive different `gamma_ln` or bias
+  values, and structural equality tests fail for a reason no real build shows.
+- **Proptest `properties` modules are skipped** (`--skip properties`). They run minutes each
+  under Miri at proptest's default case count and touch no `unsafe`.

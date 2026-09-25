@@ -154,6 +154,10 @@ Each of these needs crafted input, and none has a free defense. Each is recorded
 - **OTLP/JSON peak heap under crafted tiny objects.** A body of tiny objects under an unknown key
   peaks at about 98 bytes of heap per input byte, against about 16 for ordinary structure
   ("OTLP").
+- **Decoded sketch summaries.** `DdSketch::from_bytes` takes `count`/`min`/`max`/`sum` as
+  written and `HyperLogLog::from_bytes` its harmonic sum; a wrong one skews answers without a
+  panic, and recomputing either from the bins or registers wouldn't reproduce the bytes ("Event
+  model and interner").
 - **Compression-ratio amplification in general.** Each decompressed body is capped, but nothing
   bounds many connections each inflating a small body to its cap at once (the in-flight byte
   budget entry under "TLS and connection lifecycle").

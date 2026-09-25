@@ -179,9 +179,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   the already-rounded capacity as `serde::de::SeqAccess::size_hint` for the members list (so the
   first allocation is the size the crate settles on), and bounds the claimed member count before
   allocating at all. Full mechanism: `HyperLogLog`'s and `HllBytesReader`'s doc comments (same file);
-  pinning test: `hyperloglog_round_trips_non_power_of_two_member_counts`. Pinned to
+  pinning tests: `hyperloglog_round_trips_non_power_of_two_member_counts`, which Miri fails on a
+  regressed size hint only under `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`
+  (`script/unsafe-check miri` passes both), and
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, which pins
+  serde's `Vec` preallocation on stable. Pinned to
   `cardinality-estimator` 1.0.3; the upstream fix would be `into_boxed_slice`/`shrink_to_fit` in
   `Array::from_vec`, so the freed layout always matches the `Vec`'s capacity by construction.
+- **A decoded sketch's or HyperLogLog's summary fields are taken as written**
+  (`crates/logit-core/src/sketch.rs`'s module doc, `HyperLogLog::from_bytes`). `from_bytes`
+  bounds what a blob can allocate or make later operations cost, and rejects a zero-register
+  count past the register count, but trusts the rest of a peer's summary under
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model (accidental data
+  from private peers; a check is added only where it is free and would catch an accident). None of
+  these panics:
+  - A `DdSketch` with `min > max` answers non-monotonic quantiles.
+  - A `DdSketch` with an infinite or `NaN` `min` or `max` hands it to `quantile`'s clamp, so a
+    decoded sketch can answer `±∞`.
+  - A `DdSketch` with a `count` of 0 over populated bins is skipped by `merge`, which returns
+    early on an empty incoming sketch.
+  - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong: the sum is an `f32`
+    accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
 - ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ **Closed, both halves.**
   - **Real implementation** ([`docs/plans/lossless-transit.md`](plans/lossless-transit.md)):
     `HyperLogLog` (`crates/logit-core/src/metric.rs`) wraps the `cardinality-estimator` crate —
@@ -1092,6 +1110,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
     pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
     believing it helps.
+- **`datadog_out` drops a sketch that would encode as more than 2^20 `k`/`n` entries**
+  (`MAX_DOGSKETCH_ENTRIES`, `crates/logit-proto/src/datadog/sketches.rs`), counted
+  `logit.output.metrics.skipped{reason="oversized_sketch"}` with diag `oversized_sketch`, rather
+  than splitting each bin's count into `uint16` entries without bound; it takes per-bin counts of
+  millions (a statsd sample-rate typo extrapolated through `aggregate`) across many bins, and
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model treats that as an
+  accident to bound, not data to scale down.
 
 ## syslog
 
