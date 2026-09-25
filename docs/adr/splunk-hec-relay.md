@@ -196,8 +196,11 @@ Four facts from the survey drive the shape of the decision:
   every gauge. The exporter's shape was chosen; the added dimension on a relayed metric that had
   none is a permitted normalization.
 - **Rejecting a nested `fields` value, as Splunk does.** It would turn one nested attribute into
-  a failed request for the whole batch. Flattening to dotted keys, `flatten`'s rule, is what the
-  exporter does and what an operator would place a `flatten` for anyway.
+  a failed request for the whole batch. Flattening to dotted keys is what the exporter does and
+  what an operator would place a `flatten` for anyway. The codec's `flatten_into` departs from
+  the `flatten` transform where a flat JSON object has no room for what `flatten` keeps: it drops
+  an empty map, and writes an array holding a container, or a map nested past the depth bound, as
+  its JSON text.
 - **Rejecting a whole body on a blank event, as Splunk does.** Faithful, but one bad object from
   one client would lose every other object in the request.
 - **Reading `time` through `f64`.** Loses up to a few hundred nanoseconds at epoch magnitude on

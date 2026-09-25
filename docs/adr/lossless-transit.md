@@ -225,4 +225,5 @@ namespace, the metric and span mappings, and acknowledgment, and
 [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md) for the workstreams closing it. Its
 permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s module doc (framing
 and batching by resource; number spelling; the single-metric form leaving as multi-metric, with
-`metric_type`; a nested `fields` value leaving flattened; `/raw` split into one event per line).
+`metric_type`; a nested `fields` value leaving flattened; hex ids leaving lowercase; `/raw` split
+into one event per line).
