@@ -82,14 +82,14 @@
 //!
 //! ## Acknowledgment
 //!
-//! Under `ack: true`, each 2xx body's `ackID` is kept. Once every body of the batch is accepted,
+//! Under `ack: true`, each 2xx body's `ackId` is kept. Once every body of the batch is accepted,
 //! the sink polls `POST {endpoint}/ack` with `{"acks":[…]}` after 0.5s, 1s, 2s, and then every
 //! 5s, dropping each id answered `true`, until none is left (`Ok`) or `ack_timeout` has passed
 //! since the last body was accepted (a last poll at the deadline, then [`Fault::Ambiguous`], so
 //! `write_loop` may resend the batch). A poll that fails in transport, answers another non-2xx,
 //! or answers a body that isn't an ack reply is retried on the same schedule.
 //!
-//! Two answers mean the token doesn't acknowledge: a 2xx with no `ackID`, and a poll answered
+//! Two answers mean the token doesn't acknowledge: a 2xx with no `ackId`, and a poll answered
 //! `400` code 14 (`ACK is disabled`). Either counts the request, or every id still pending, as
 //! delivered, counted `logit.output.acks{result="unsupported"}` with a throttled
 //! `ack_unsupported` diagnostic. Splunk Cloud answers this way.
@@ -181,7 +181,7 @@ type Object<'a> = (&'a [u8], usize);
 /// What a `/event` request's non-failing answer was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventReply {
-    /// A 2xx, with the `ackID` it carried when `ack` is on.
+    /// A 2xx, with the `ackId` it carried when `ack` is on.
     Accepted { ack_id: Option<u64> },
     /// `400` code 6 naming object `n` of the body.
     InvalidEvent { n: u64 },
@@ -517,7 +517,7 @@ impl SplunkHecOutput {
             .map_err(|err| err.context(fault))
     }
 
-    /// Keeps a 2xx's `ackID` under `ack: true`; a 2xx without one means the token doesn't
+    /// Keeps a 2xx's `ackId` under `ack: true`; a 2xx without one means the token doesn't
     /// acknowledge (module doc's "Acknowledgment").
     fn keep_ack_id(&mut self, ack_id: Option<u64>, ack_ids: &mut Vec<u64>) {
         if !self.ack {
@@ -525,7 +525,7 @@ impl SplunkHecOutput {
         }
         match ack_id {
             Some(id) => ack_ids.push(id),
-            None => self.ack_unsupported(1, "a 2xx answer carried no ackID"),
+            None => self.ack_unsupported(1, "a 2xx answer carried no ackId"),
         }
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
 
     // ---- acknowledgment ----------------------------------------------------------------------
 
-    /// A collector that answers every `/event` with a fresh `ackID` from 1, and each `/ack` poll
+    /// A collector that answers every `/event` with a fresh `ackId` from 1, and each `/ack` poll
     /// with `acked(poll number)` for every id asked.
     async fn acking(acked: impl Fn(usize) -> bool + Send + Sync + 'static) -> (SocketAddr, Log) {
         let next_id = Arc::new(AtomicUsize::new(1));
@@ -1317,7 +1317,7 @@ mod tests {
         assert_eq!(total(&registry.drain(0), ACKS, &[("result", "timeout")]), 1.0);
     }
 
-    /// A 2xx with no `ackID` is success, counted `unsupported`, and nothing is polled.
+    /// A 2xx with no `ackId` is success, counted `unsupported`, and nothing is polled.
     #[tokio::test]
     async fn a_success_without_an_ack_id_counts_as_delivered() {
         let (addr, log) = accepting().await;

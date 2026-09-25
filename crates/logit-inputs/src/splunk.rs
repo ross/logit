@@ -19,11 +19,12 @@
 //!
 //! | Request | Handling | Response |
 //! |---|---|---|
-//! | `POST /services/collector`, `/services/collector/event`, `/services/collector/event/1.0` | `decode_events`: concatenated objects or an array, one batch per resource | `200` `{"text":"Success","code":0}`, plus `"ackID":N` with a channel |
+//! | `POST /services/collector`, `/services/collector/event`, `/services/collector/event/1.0` | `decode_events`: concatenated objects or an array, one batch per resource | `200` `{"text":"Success","code":0}`, plus `"ackId":N` with a channel |
 //! | `POST /services/collector/raw`, `/services/collector/raw/1.0` | `decode_raw`: one log per line, the envelope from the query string's `host`, `source`, `sourcetype`, and `index` | as `/event` |
 //! | `POST /services/collector/ack` | `{"acks":[<id>,…]}` | `200` `{"acks":{"<id>":true,…}}` |
 //! | `GET`/`HEAD /services/collector/health`, `/services/collector/health/1.0` | none; no authentication | `200` `{"text":"HEC is healthy","code":17}` |
-//! | another method on a path above | none | `405` + `Allow`, `{"text":"Method Not Allowed","code":405}` |
+//! | `OPTIONS` on a path above | none; no authentication | `200`, empty, `Allow: POST,OPTIONS` (`GET,HEAD,OPTIONS` on `/health`), as Splunk answers; Docker's `splunk` log driver won't start a container without it |
+//! | another method on a path above | none | `405` + that `Allow`, `{"text":"Method Not Allowed","code":405}` |
 //! | any other path | none | `404` `{"text":"Not Found","code":404}` |
 //!
 //! Every body is Splunk's own `{"text","code"}` shape ([`logit_proto::splunk::response`]), so a
@@ -32,8 +33,8 @@
 //! as its `code`.
 //!
 //! **Channels and acknowledgment.** A request that names a channel (the `X-Splunk-Request-Channel`
-//! header, or `?channel=`) is answered with an `ackID`, drawn from one per-listener counter that
-//! starts at 1; a request without one gets no `ackID`, as from a token without `useACK`. `/ack`
+//! header, or `?channel=`) is answered with an `ackId`, drawn from one per-listener counter that
+//! starts at 1; a request without one gets no `ackId`, as from a token without `useACK`. `/ack`
 //! answers every id it is asked about `true`: a `200` already means the data reached the pipeline,
 //! and a pipeline that can't take it answers `503` instead. No channel is ever required, and
 //! neither the channel nor the id enters an event.
@@ -49,7 +50,7 @@
 //!    the `Authorization` header must be `Splunk <token>`, or `Basic` with the token as the
 //!    password, else `401` or `403` with Splunk's code. The comparison takes the same time for
 //!    every token of one length, and no token is ever logged, counted, or kept on an event. The
-//!    per-outcome codes, the error bodies, and when an `ackID` is issued are recorded in
+//!    per-outcome codes, the error bodies, and when an `ackId` is issued are recorded in
 //!    [ADR `splunk-hec-relay`](../../../../docs/adr/splunk-hec-relay.md)'s amendment "what the
 //!    listener settled"; [`authenticate`] and [`respond`] implement them.
 //! 4. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`: `deflate` and `zstd`
@@ -161,7 +162,7 @@ pub struct SplunkHecInput {
     max_request_bytes: usize,
     max_connections: usize,
     busy_after: Duration,
-    /// The next `ackID`, shared by every connection of this listener.
+    /// The next `ackId`, shared by every connection of this listener.
     next_ack_id: Arc<AtomicU64>,
 }
 
@@ -479,10 +480,11 @@ impl Route {
         }
     }
 
+    /// Splunk's own `Allow` values.
     fn allow_header(self) -> &'static str {
         match self {
-            Self::Health => "GET, HEAD",
-            _ => "POST",
+            Self::Health => "GET,HEAD,OPTIONS",
+            _ => "POST,OPTIONS",
         }
     }
 }
@@ -500,6 +502,17 @@ async fn respond(
         return ("unknown", REJECTED, reject(shared, "unknown_route", None, response));
     };
     let name = route.name();
+    if req.method() == Method::OPTIONS {
+        // Docker's `splunk` log driver sends this before it starts a container and refuses to
+        // start one on anything but a `200`. Splunk answers it on every route, unauthenticated,
+        // with an empty body.
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::ALLOW, route.allow_header())
+            .body(Full::new(Bytes::new()))
+            .expect("a well-formed response always builds");
+        return (name, OK, response);
+    }
     if !route.allows(req.method()) {
         let mut response = http_error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
         response
@@ -918,15 +931,15 @@ mod tests {
         let path = "/services/collector/event";
         let channel = "X-Splunk-Request-Channel: 0f3c2a1e-7d4b-4c55-9a1d-3b0e8d6f2c10\r\n";
         let cases = [
-            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackID":1}"#),
+            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":1}"#),
             (path.to_string(), "", SUCCESS),
-            (format!("{path}?channel=abc"), "", r#"{"text":"Success","code":0,"ackID":2}"#),
+            (format!("{path}?channel=abc"), "", r#"{"text":"Success","code":0,"ackId":2}"#),
             (
                 "/services/collector/raw?channel=abc".to_string(),
                 "",
-                r#"{"text":"Success","code":0,"ackID":3}"#,
+                r#"{"text":"Success","code":0,"ackId":3}"#,
             ),
-            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackID":4}"#),
+            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":4}"#),
         ];
         for (path, headers, expected) in cases {
             let response = post_raw(&addr, &path, headers, ONE_EVENT).await;
@@ -961,7 +974,10 @@ mod tests {
         }
         let response = request_raw(&addr, "POST", "/services/collector/health", "", b"").await;
         assert!(response.starts_with("HTTP/1.1 405"), "{response}");
-        assert!(response.to_ascii_lowercase().contains("allow: get, head\r\n"), "{response}");
+        assert!(
+            response.to_ascii_lowercase().contains("allow: get,head,options\r\n"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -1083,7 +1099,7 @@ mod tests {
         let channel = "X-Splunk-Request-Channel: c\r\n";
 
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
-        assert_eq!(body_of(&response), r#"{"text":"Success","code":0,"ackID":1}"#);
+        assert_eq!(body_of(&response), r#"{"text":"Success","code":0,"ackId":1}"#);
         let started = Instant::now();
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -1096,8 +1112,8 @@ mod tests {
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
         assert_eq!(
             body_of(&response),
-            r#"{"text":"Success","code":0,"ackID":2}"#,
-            "a 503 draws no ackID"
+            r#"{"text":"Success","code":0,"ackId":2}"#,
+            "a 503 draws no ackId"
         );
         recv_batch(&mut rx).await;
 
@@ -1183,6 +1199,25 @@ mod tests {
         }
     }
 
+    /// Docker's `splunk` log driver checks `OPTIONS /services/collector/event/1.0` before it starts
+    /// a container (`testdata/interop/splunk/docker-services-collector-event-1-0-000.headers`).
+    #[tokio::test]
+    async fn options_is_200_on_every_route_without_a_token() {
+        let (addr, _rx) =
+            start(SplunkHecInput::new("127.0.0.1:0").with_tokens(vec!["t".into()]), 16).await;
+        for (path, allow) in [
+            ("/services/collector/event/1.0", "allow: post,options\r\n"),
+            ("/services/collector/raw", "allow: post,options\r\n"),
+            ("/services/collector/ack", "allow: post,options\r\n"),
+            ("/services/collector/health", "allow: get,head,options\r\n"),
+        ] {
+            let response = request_raw(&addr, "OPTIONS", path, "", b"").await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+            assert!(response.to_ascii_lowercase().contains(allow), "{path}: {response}");
+            assert_eq!(body_of(&response), "", "{path}");
+        }
+    }
+
     #[tokio::test]
     async fn an_unknown_path_is_404_and_a_wrong_method_is_405_with_allow() {
         let registry = logit_core::Registry::new();
@@ -1199,7 +1234,10 @@ mod tests {
         {
             let response = request_raw(&addr, "GET", path, "", b"").await;
             assert!(response.starts_with("HTTP/1.1 405"), "{path}: {response}");
-            assert!(response.to_ascii_lowercase().contains("allow: post\r\n"), "{response}");
+            assert!(
+                response.to_ascii_lowercase().contains("allow: post,options\r\n"),
+                "{response}"
+            );
             assert_eq!(body_of(&response), r#"{"text":"Method Not Allowed","code":405}"#);
         }
         let events = registry.drain(0);

@@ -83,7 +83,7 @@ fn metrics() -> EventBatch {
 /// A span whose envelope `fields` are its resource.
 fn spans() -> EventBatch {
     seed(
-        r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","kind":"Server","attributes":{"http.method":"POST","http.status_code":200},"start_time":1700000002500000000,"end_time":1700000002750000000,"status":{"message":"","code":"Unset"},"events":[{"attributes":{"k":"v"},"name":"retry","timestamp":1700000002600000000}]},"fields":{"service.name":"auth"}}"#,
+        r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","kind":"SPAN_KIND_SERVER","attributes":{"http.method":"POST","http.status_code":200},"start_time":1700000002500000000,"end_time":1700000002750000000,"status":{"message":"","code":"STATUS_CODE_UNSET"},"events":[{"attributes":{"k":"v"},"name":"retry","timestamp":1700000002600000000}]},"fields":{"service.name":"auth"}}"#,
     )
 }
 

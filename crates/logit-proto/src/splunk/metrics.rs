@@ -4,13 +4,16 @@
 //!
 //! ## Decode
 //!
-//! A metric event is `event` `"metric"` with at least one `metric_name:<n>` field (the
-//! multi-metric form) or both `metric_name` and `_value` (the single-metric form). It decodes to one
-//! `Event` carrying one `MetricRecord` per measurement, in name order.
+//! A metric event is `event` `"metric"`, or no `event` at all, with at least one
+//! `metric_name:<n>` field (the multi-metric form) or both `metric_name` and `_value` (the
+//! single-metric form). It decodes to one `Event` carrying one `MetricRecord` per measurement, in
+//! name order. Splunk indexes the object with no `event` as a metric, and SC4S sends its own
+//! metrics that way, every measurement a numeric string (`"metric_name:spl.sc4syslog.dst.written":
+//! "0"`).
 //!
 //! | Wire | Model | Counter |
 //! |---|---|---|
-//! | `metric_name:<n>`: a JSON number, or `"+Inf"` / `"-Inf"` / `"NaN"` | a record named `<n>` | -- |
+//! | `metric_name:<n>`: a JSON number, `"+Inf"` / `"-Inf"` / `"NaN"`, or a string holding a finite number | a record named `<n>` | -- |
 //! | `metric_name` (a non-empty string) + `_value` | a record named by `metric_name` | -- |
 //! | `metric_type` `"Sum"` | every record `Sum{Cumulative, monotonic: true}`; the field is consumed | -- |
 //! | `metric_type` `"Gauge"` or absent | every record `Gauge`; the field is consumed | -- |
@@ -101,7 +104,8 @@ pub(super) fn is_metric_fields(fields: &Map<String, Json>) -> bool {
         || (fields.contains_key(SINGLE_METRIC_NAME) && fields.contains_key(SINGLE_METRIC_VALUE))
 }
 
-/// A measurement: a JSON number, or the exporter's strings for the non-finite values.
+/// A measurement: a JSON number, the exporter's strings for the non-finite values, or a string
+/// holding a finite number, which Splunk indexes as that number.
 fn metric_value(value: &Json) -> Option<f64> {
     match value {
         Json::Number(n) => n.as_f64(),
@@ -109,7 +113,7 @@ fn metric_value(value: &Json) -> Option<f64> {
             "+Inf" => Some(f64::INFINITY),
             "-Inf" => Some(f64::NEG_INFINITY),
             "NaN" => Some(f64::NAN),
-            _ => None,
+            text => text.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
         },
         _ => None,
     }
@@ -584,6 +588,28 @@ mod tests {
             );
         }
         assert_eq!(counted(&registry, "logit.input.events.skipped", ("reason", "no_metric")), 1.0);
+    }
+
+    /// SC4S 3.40.0's own metrics, one object as it posted them: no `event`, every value a string.
+    /// A 10.4.3 Splunk indexed this shape as a metric (`docs/plans/splunk-relay.md`, W5's run).
+    #[test]
+    fn sc4s_metrics_with_no_event_and_string_values_decode() {
+        let batches = decode(
+            r#"{"time": "1790358237", "host": "splunk-sc4s-fixture", "source": "sc4s", "sourcetype": "sc4s:metrics:v2", "index": "_metrics", "fields": {"sc4s_proto": "0", "module": "parser", "name": "p_cef_ts_end", "metric_name:spl.sc4syslog.parser.processed": "0", "metric_name:spl.sc4syslog.parser.discarded": "3"}}"#,
+        );
+        let event = &batches[0].events[0];
+        assert!(event.log.is_none());
+        assert_eq!(
+            record_values(event),
+            vec![
+                ("spl.sc4syslog.parser.discarded".into(), MetricKind::Gauge(3.0)),
+                ("spl.sc4syslog.parser.processed".into(), MetricKind::Gauge(0.0)),
+            ]
+        );
+        assert_eq!(event.attributes.get("module"), Some(&Value::str("parser")));
+        let relayed = encode(&batches);
+        assert!(relayed.contains(r#""event":"metric""#), "{relayed}");
+        assert_eq!(decode(&relayed), batches);
     }
 
     #[test]

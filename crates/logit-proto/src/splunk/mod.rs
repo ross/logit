@@ -54,7 +54,8 @@
 //! | `fields` not an object | ignored | `degraded{reason="bad_fields"}` |
 //! | `fields` object | event attributes (a span's: resource attributes), each value typed as [`crate::json`] converts it, a nested map flattened to dotted keys by [`crate::json::flatten_into`] (an empty map dropped, an array holding a container as its JSON text) | -- |
 //! | objects with an equal resource | one batch, in first-appearance order | -- |
-//! | `event` absent or `null` | skipped; the rest delivered | `logit.input.events.skipped{reason="no_event"}` |
+//! | `event` absent or `null`, with a `metric_name:<n>` field or both `metric_name` and `_value` | a metric event ([`metrics`]), as Splunk indexes it | see [`metrics`] |
+//! | `event` absent or `null` otherwise | skipped; the rest delivered | `logit.input.events.skipped{reason="no_event"}` |
 //! | `event` `""` | skipped; the rest delivered | `skipped{reason="blank_event"}` |
 //! | `event` `"metric"` with a `metric_name:<n>` field, or both `metric_name` and `_value` | a metric event ([`metrics`]) | see [`metrics`] |
 //! | `event` an object carrying valid `trace_id`, `span_id`, `start_time`, `end_time` | a span event ([`spans`]) | see [`spans`] |
@@ -96,11 +97,14 @@
 //! 4. `fields` leaves flat ([`crate::json::flatten_into`]): a nested map as dotted keys, an empty
 //!    map dropped, and an array holding a map or array as its JSON text;
 //! 5. a metric event's single-metric form (`metric_name` + `_value`) leaves in multi-metric form
-//!    (`metric_name:<n>`), its records in name order, and a metric object with no `metric_type`
-//!    leaves with `metric_type` `Gauge`, the OpenTelemetry exporter's form;
-//! 6. a span's `kind` spelled `SPAN_KIND_*`, as a number, or `Unspecified` leaves as the exporter's
-//!    name (`Unspecified` as `Internal`), a status code the same way, an absent `name` as `""`,
-//!    and an absent `status` as `{"message":"","code":"Unset"}`;
+//!    (`metric_name:<n>`), its records in name order, a metric object with no `metric_type`
+//!    leaves with `metric_type` `Gauge`, the OpenTelemetry exporter's form, one with no `event`
+//!    leaves with `"event":"metric"`, and a measurement written as a numeric string leaves as a
+//!    number;
+//! 6. a span's `kind` spelled without the `SPAN_KIND_` prefix or as a number leaves as the
+//!    exporter's `SPAN_KIND_*` name (unspecified as `SPAN_KIND_INTERNAL`), a status code the same
+//!    way (`STATUS_CODE_*`), an absent `name` as `""`, and an absent `status` as
+//!    `{"message":"","code":"STATUS_CODE_UNSET"}`;
 //! 7. `/raw` splits a body into one event per line, as Splunk's line breaker does, and a relayed
 //!    line leaves through `/event`;
 //! 8. an unknown envelope key, a `fields` that isn't an object, an event with no `event` or a
@@ -352,6 +356,14 @@ impl SplunkDecoder {
             }
         };
         let event = match object.event {
+            // Splunk indexes an object with no `event` whose `fields` carry a measurement as a
+            // metric; SC4S sends its own metrics that way.
+            None | Some(Json::Null) if metrics::is_metric_fields(&fields) => {
+                if let Some(decoded) = self.decode_metric(fields, timestamp) {
+                    groups.push(envelope.to_resource(), decoded);
+                }
+                return;
+            }
             None | Some(Json::Null) => return self.skip_event("no_event"),
             Some(Json::String(s)) if s.is_empty() => return self.skip_event("blank_event"),
             Some(event) => event,

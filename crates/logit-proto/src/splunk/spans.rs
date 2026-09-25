@@ -1,7 +1,9 @@
 //! HEC span events, both directions, in the shape the OpenTelemetry Collector's `splunk_hec`
 //! exporter writes: `event` is a span object, `time` its start in seconds, and `fields` the span's
-//! resource attributes. The object's members follow the exporter's `hecSpan` struct order; W5's
-//! recorded exporter fixture verifies it (`docs/plans/splunk-relay.md`).
+//! resource attributes. The object's members follow the exporter's `hecSpan` struct order, and
+//! `kind` and `status.code` take the enum names it writes (`SPAN_KIND_SERVER`,
+//! `STATUS_CODE_UNSET`), both as recorded from Collector contrib 0.161.0
+//! (`testdata/interop/splunk/otel-services-collector-000.bin`).
 //!
 //! ## Decode
 //!
@@ -32,7 +34,7 @@
 //! | the ids | lowercase hex; no parent → `parent_span_id` `""` | -- |
 //! | `name` | a string (a non-`Str` name as its text) | -- |
 //! | event attributes | `attributes`, omitted when empty | -- |
-//! | `kind`, `status` | the exporter's names; `status` always written, `{"message":"","code":"Unset"}` at its emptiest | -- |
+//! | `kind`, `status` | the exporter's enum names (`SPAN_KIND_*`, `STATUS_CODE_*`); `status` always written, `{"message":"","code":"STATUS_CODE_UNSET"}` at its emptiest | -- |
 //! | `events`, `links` | omitted when empty | -- |
 //! | the resource's non-carrier attributes | `fields`, flattened | -- |
 //! | `flags`, `ext.trace_state`, the dropped counts, a link's `flags` or dropped count, an event's dropped count | nothing: the exporter's span object has no field for them | `logit.output.spans.degraded{reason="no_wire_form"}`, once per span |
@@ -141,11 +143,11 @@ fn span_kind(value: &Json) -> Option<SpanKind> {
 
 fn span_kind_name(kind: SpanKind) -> &'static str {
     match kind {
-        SpanKind::Internal => "Internal",
-        SpanKind::Server => "Server",
-        SpanKind::Client => "Client",
-        SpanKind::Producer => "Producer",
-        SpanKind::Consumer => "Consumer",
+        SpanKind::Internal => "SPAN_KIND_INTERNAL",
+        SpanKind::Server => "SPAN_KIND_SERVER",
+        SpanKind::Client => "SPAN_KIND_CLIENT",
+        SpanKind::Producer => "SPAN_KIND_PRODUCER",
+        SpanKind::Consumer => "SPAN_KIND_CONSUMER",
     }
 }
 
@@ -190,9 +192,9 @@ fn span_status(value: &Json) -> Option<StatusAndMessage> {
 
 fn span_status_name(status: SpanStatus) -> &'static str {
     match status {
-        SpanStatus::Unset => "Unset",
-        SpanStatus::Ok => "Ok",
-        SpanStatus::Error => "Error",
+        SpanStatus::Unset => "STATUS_CODE_UNSET",
+        SpanStatus::Ok => "STATUS_CODE_OK",
+        SpanStatus::Error => "STATUS_CODE_ERROR",
     }
 }
 
@@ -400,7 +402,7 @@ mod tests {
     use logit_core::{EventBatch, Resource};
     use std::sync::Arc;
 
-    const SPAN: &str = r#"{"time":1700000000.5,"host":"web-1","sourcetype":"otel","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"","name":"GET /","attributes":{"http.method":"GET","n":{"deep":1}},"end_time":1700000000750000000,"kind":"Server","status":{"message":"boom","code":"Error"},"start_time":1700000000500000000,"events":[{"attributes":{"k":"v"},"name":"retry","timestamp":1700000000600000000}],"links":[{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","trace_state":"a=b"}]},"fields":{"service.name":"cart"}}"#;
+    const SPAN: &str = r#"{"time":1700000000.5,"host":"web-1","sourcetype":"otel","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"","name":"GET /","attributes":{"http.method":"GET","n":{"deep":1}},"end_time":1700000000750000000,"kind":"SPAN_KIND_SERVER","status":{"message":"boom","code":"STATUS_CODE_ERROR"},"start_time":1700000000500000000,"events":[{"attributes":{"k":"v"},"name":"retry","timestamp":1700000000600000000}],"links":[{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7","trace_state":"a=b"}]},"fields":{"service.name":"cart"}}"#;
 
     #[test]
     fn the_exporter_span_shape_decodes_to_a_span() {

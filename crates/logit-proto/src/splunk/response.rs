@@ -1,6 +1,6 @@
 //! HEC's JSON response bodies, both sides: the `{"text":…,"code":N}` status a listener answers
 //! and a sink reads, and the `/services/collector/ack` request and reply. The bodies are written
-//! byte-exact, with no whitespace, in Splunk's key order (`text`, `code`, then `ackID` or
+//! byte-exact, with no whitespace, in Splunk's key order (`text`, `code`, then `ackId` or
 //! `invalid-event-number`), so a HEC client's error handling reads a `logit` answer as it reads
 //! Splunk's. Lives in the codec rather than in `logit-inputs`/`logit-outputs` because only this
 //! crate depends on `serde_json`.
@@ -114,13 +114,13 @@ pub fn encode_status(status: HecStatus) -> Vec<u8> {
     status_body(status.text, status.code, |_| {})
 }
 
-/// A success body; with `ack_id`, `{"text":"Success","code":0,"ackID":<id>}`, what a `useACK`
+/// A success body; with `ack_id`, `{"text":"Success","code":0,"ackId":<id>}`, what a `useACK`
 /// token's POST answers.
 pub fn encode_success(ack_id: Option<u64>) -> Vec<u8> {
     let status = HecStatus::SUCCESS;
     status_body(status.text, status.code, |obj| {
         if let Some(id) = ack_id {
-            obj.key("ackID").extend_from_slice(id.to_string().as_bytes());
+            obj.key("ackId").extend_from_slice(id.to_string().as_bytes());
         }
     })
 }
@@ -158,7 +158,7 @@ pub fn parse_reply(body: &[u8]) -> Option<HecReply> {
     Some(HecReply {
         code,
         text,
-        ack_id: obj.get("ackID").and_then(Json::as_u64),
+        ack_id: obj.get("ackId").and_then(Json::as_u64),
         invalid_event_number: obj.get("invalid-event-number").and_then(Json::as_u64),
     })
 }
@@ -226,7 +226,7 @@ mod tests {
             r#"{"text":"HEC is healthy","code":17}"#
         );
         assert_eq!(text(encode_success(None)), r#"{"text":"Success","code":0}"#);
-        assert_eq!(text(encode_success(Some(7))), r#"{"text":"Success","code":0,"ackID":7}"#);
+        assert_eq!(text(encode_success(Some(7))), r#"{"text":"Success","code":0,"ackId":7}"#);
         assert_eq!(
             text(encode_invalid_event(HecStatus::INVALID_DATA_FORMAT, 2)),
             r#"{"text":"Invalid data format","code":6,"invalid-event-number":2}"#

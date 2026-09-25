@@ -6,7 +6,7 @@
 //! themselves one decode of a hand-written HEC body, so they are on the codec's fixed point
 //! (`crates/logit-proto/tests/splunk_fixed_point.rs`): decoding the encoder's output gives the
 //! encoder's input back, whole-`EventBatch` equal. What this file adds is the HTTP hop: routing,
-//! authentication, `Content-Encoding`, the channel and `ackID`, and delivery to the `Fanout`. It
+//! authentication, `Content-Encoding`, the channel and `ackId`, and delivery to the `Fanout`. It
 //! also covers the busy contract (`crates/logit-inputs/src/splunk.rs`'s "Backpressure" section).
 
 use logit_core::EventBatch;
@@ -36,7 +36,7 @@ const OTEL_EXPORTER_BODY: &str = concat!(
     r#"{"time":1700000000.2,"host":"web-1","source":"app","sourcetype":"otel","index":"main","event":{"msg":"structured","attempt":2},"fields":{"service.name":"auth"}}"#,
     r#"{"time":1700000001,"host":"web-1","event":"metric","fields":{"service.name":"auth","metric_type":"Gauge","metric_name:process.memory.usage":123456789}}"#,
     r#"{"time":1700000001,"host":"web-1","event":"metric","fields":{"service.name":"auth","metric_type":"Sum","metric_name:http.server.requests":1500}}"#,
-    r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","attributes":{"http.method":"POST"},"end_time":1700000002750000000,"kind":"Server","status":{"message":"","code":"Unset"},"start_time":1700000002500000000},"fields":{"service.name":"auth"}}"#,
+    r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","attributes":{"http.method":"POST"},"end_time":1700000002750000000,"kind":"SPAN_KIND_SERVER","status":{"message":"","code":"STATUS_CODE_UNSET"},"start_time":1700000002500000000},"fields":{"service.name":"auth"}}"#,
 );
 
 // -------------------------------------------------------------------------------------------------
@@ -170,7 +170,7 @@ async fn raw_delivers_one_log_per_line_under_the_query_envelope() {
     assert_eq!(delivered, expected);
 }
 
-/// A client with a channel gets an `ackID` per request, and `/ack` reports each one delivered.
+/// A client with a channel gets an `ackId` per request, and `/ack` reports each one delivered.
 #[tokio::test]
 async fn a_channel_draws_ack_ids_that_ack_reports_true() {
     let (addr, mut rx) = start(16).await;
@@ -178,8 +178,8 @@ async fn a_channel_draws_ack_ids_that_ack_reports_true() {
     let channel = Some("0f3c2a1e-7d4b-4c55-9a1d-3b0e8d6f2c10");
     let (_, first) = post(addr, "/services/collector/event", &body, false, channel).await;
     let (_, second) = post(addr, "/services/collector/event", &body, true, channel).await;
-    assert_eq!(first, r#"{"text":"Success","code":0,"ackID":1}"#);
-    assert_eq!(second, r#"{"text":"Success","code":0,"ackID":2}"#);
+    assert_eq!(first, r#"{"text":"Success","code":0,"ackId":1}"#);
+    assert_eq!(second, r#"{"text":"Success","code":0,"ackId":2}"#);
     recv(&mut rx).await;
     recv(&mut rx).await;
     let (status, acks) =
@@ -253,4 +253,72 @@ async fn a_wrong_token_is_403_code_4() {
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     assert_eq!(response.text().await.unwrap(), r#"{"text":"Invalid token","code":4}"#);
     assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err());
+}
+
+// -------------------------------------------------------------------------------------------------
+// Recorded traffic (testdata/interop/splunk/, `script/record-fixtures splunk`)
+// -------------------------------------------------------------------------------------------------
+
+/// Every request four real HEC clients sent (the OpenTelemetry Collector contrib 0.161.0
+/// `splunk_hec` exporter, Docker 29.8.1's `splunk` log driver, Splunk Connect for Syslog 3.40.0,
+/// and splunk-library-javalogging 1.11.11's Logback appenders), replayed with its recorded
+/// method, path (query included), headers, and body (still gzip where sent). No `tokens` are
+/// configured, so every recorded `Authorization` value passes. Every request, `OPTIONS` and `GET`
+/// included, is answered `2xx`; the channel is generously sized and drained as it fills, so no
+/// request sees backpressure.
+#[tokio::test]
+async fn every_recorded_request_is_answered_2xx() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/splunk");
+    let mut input = SplunkHecInput::new("127.0.0.1:0");
+    input.bind().await.expect("binding splunk_hec_in");
+    let addr = input.local_addr().expect("bind() leaves an address");
+    let (tx, mut rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let _ = input.run(Fanout::new(vec![tx])).await;
+    });
+    // Drains continuously, concurrently with the send loop below, so a bounded channel never
+    // fills and no request waits out `BUSY_AFTER`.
+    let delivered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = delivered.clone();
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    let mut stems: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the recorded corpus")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".headers"))
+        .map(|n| n.trim_end_matches(".headers").to_string())
+        .collect();
+    stems.sort();
+    assert_eq!(stems.len(), 32, "the whole recorded corpus");
+    for stem in &stems {
+        let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers"))).unwrap();
+        let body = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
+        let mut fields = sidecar.lines().filter_map(|l| l.split_once(": "));
+        let (_, method) = fields.next().expect("method first");
+        let (_, path) = fields.next().expect("path second");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = client().request(method, format!("http://{addr}{path}"));
+        for (name, value) in fields {
+            // reqwest writes its own framing and host; `connection` is a hop-by-hop header the
+            // recorded client sent its own proxy, not this listener.
+            if !matches!(name, "host" | "content-length" | "connection") {
+                request = request.header(name, value);
+            }
+        }
+        let response = request.body(body).send().await.expect("the request reaches splunk_hec_in");
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert!(status.is_success(), "{stem} ({path}): {status} {text}");
+    }
+
+    // Give the drain task a moment to catch up, then check it saw at least one batch per
+    // `/event` or `/raw` capture (the `OPTIONS`/`GET` captures in the corpus deliver nothing).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let delivered = delivered.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(delivered >= 24, "at least one batch per /event and /raw capture: {delivered}");
 }

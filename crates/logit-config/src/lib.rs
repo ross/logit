@@ -974,7 +974,7 @@ pub enum ComponentKind {
     /// with one log per line and `host`, `source`, `sourcetype`, and `index` from the query
     /// string, `/services/collector/ack`, and `/services/collector/health`, answering Splunk's own
     /// `{"text","code"}` bodies. Decompresses gzip; any other `Content-Encoding` gets `415`. A
-    /// request that names a channel gets an `ackID`, and `/ack` reports every id delivered. The
+    /// request that names a channel gets an `ackId`, and `/ack` reports every id delivered. The
     /// envelope's `host`, `source`, `sourcetype`, and `index` become the resource attributes
     /// `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When
     /// the pipeline can't take a request's data within 5s, the request gets `503` code 9 with

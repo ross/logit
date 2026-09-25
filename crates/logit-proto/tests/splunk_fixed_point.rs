@@ -143,7 +143,9 @@ fn uppercase_hex_ids_leave_lowercase() {
     assert!(e1.contains(r#""trace_id":"0af7651916cd43dd8448eb211c80319c""#), "{e1}");
     assert!(e1.contains(r#""parent_span_id":"b7ad6b7169203331""#), "{e1}");
     assert!(e1.contains(r#""span_id":"00f067aa0ba902b7""#), "{e1}");
-    assert!(!e1.chars().any(|c| ('A'..='F').contains(&c)), "{e1}");
+    for upper in ["0AF7651916CD43DD", "B7AD6B7169203331", "4BF92F3577B34DA6", "00F067AA0BA902B7"] {
+        assert!(!e1.contains(upper), "{e1}");
+    }
 }
 
 #[test]
@@ -162,7 +164,9 @@ fn raw_lines_relay_through_event() {
 
 /// A body in the OpenTelemetry Collector `splunk_hec` exporter's shape, one object per record
 /// (its `use_multi_metric_format` default), written by hand from `docs/plans/splunk-relay.md`'s
-/// "Third-party HEC conventions" table. W5 replaces it with a recorded exporter fixture.
+/// "Third-party HEC conventions" table. It carries what the recorded exporter captures in
+/// `testdata/interop/splunk/` don't (`otel.log.name`, a summary quantile, a span event);
+/// `tests/splunk_interop.rs` holds the codec to the recorded ones.
 const OTEL_EXPORTER_BODY: &str = concat!(
     r#"{"time":1700000000.123,"host":"web-1","source":"app","sourcetype":"otel","index":"main","event":"user logged in","fields":{"service.name":"auth","k8s.pod.name":"auth-7","otel.log.severity.text":"INFO","otel.log.severity.number":9,"otel.log.name":"login","trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","user.id":42}}"#,
     r#"{"time":1700000000.2,"host":"web-1","source":"app","sourcetype":"otel","index":"main","event":{"msg":"structured","attempt":2},"fields":{"service.name":"auth"}}"#,
@@ -173,7 +177,7 @@ const OTEL_EXPORTER_BODY: &str = concat!(
     r#"{"time":1700000001,"host":"web-1","event":"metric","fields":{"service.name":"auth","metric_type":"Histogram","le":"0.5","metric_name:http.server.duration_bucket":4}}"#,
     r#"{"time":1700000001,"host":"web-1","event":"metric","fields":{"service.name":"auth","metric_type":"Histogram","le":"+Inf","metric_name:http.server.duration_bucket":10}}"#,
     r#"{"time":1700000001,"host":"web-1","event":"metric","fields":{"service.name":"auth","metric_type":"Summary","qt":"0.99","metric_name:rpc.latency_0.99":0.8}}"#,
-    r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","attributes":{"http.method":"POST","http.status_code":200},"end_time":1700000002750000000,"kind":"Server","status":{"message":"","code":"Unset"},"start_time":1700000002500000000,"events":[{"name":"auth.check","timestamp":1700000002600000000}]},"fields":{"service.name":"auth","telemetry.sdk.language":"go"}}"#,
+    r#"{"time":1700000002.5,"host":"web-1","source":"app","sourcetype":"otel","index":"traces","event":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331","parent_span_id":"00f067aa0ba902b7","name":"POST /login","attributes":{"http.method":"POST","http.status_code":200},"end_time":1700000002750000000,"kind":"SPAN_KIND_SERVER","status":{"message":"","code":"STATUS_CODE_UNSET"},"start_time":1700000002500000000,"events":[{"name":"auth.check","timestamp":1700000002600000000}]},"fields":{"service.name":"auth","telemetry.sdk.language":"go"}}"#,
 );
 
 #[test]

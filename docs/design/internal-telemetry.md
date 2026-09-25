@@ -1579,7 +1579,7 @@ quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for i
 | `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent |
 | `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` code 6 named, dropped before the rest of its body is resent once |
 | `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
-| `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackID`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
+| `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
 
 The codec's own counters (`logit.output.metrics.skipped` and `metrics.degraded` by `metric_kind`
 under `multi_value`, `metrics.normalized{reason="name_sanitized"}`, `tags.dropped`,
