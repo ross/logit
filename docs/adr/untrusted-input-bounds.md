@@ -20,9 +20,9 @@ some not at all:
   `otlp/common.rs`'s `any_value_to_value`) has a depth cap of its own. They rely on serde_json's
   parser limit of 128 and prost's decode limit of 100, each one feature flag away from gone. The
   native `Value` decoder caps itself at 128 (CODEC-16).
-- **Timestamps.** 16 OTLP decode sites cast a wire `u64` timestamp with `as i64`, so a value past
-  `i64::MAX` wraps negative. The encode side clamps with `.max(0)`, and `value_to_any_value` wraps
-  a `Value::U64` the same way on encode (CODEC-17).
+- **Timestamps.** 17 OTLP decode sites cast a wire `u64` timestamp with `as i64`, so a value past
+  `i64::MAX` wraps negative: 3 in `logs.rs`, 3 in `traces.rs`, and 11 in `metrics.rs`. The encode
+  side clamps with `.max(0)` (CODEC-17).
 - **Declared counts.** The native metric-kind list arms bound allocation only by remaining wire
   bytes, so a 1-byte set member becomes a `Bytes` (about 32 times its wire size) and an
   exponential bucket becomes 8 times its wire size. `read_metric_kind` and `for_each_field` ignore
@@ -56,14 +56,21 @@ Some of the code checked out and needs only a test to pin it: `frame.rs` checks 
 lengths before allocating; `prometheus_in`'s snappy and zstd paths are bounded; and
 `drive_with_idle`'s wait-out loop has no ceiling by design.
 
-`logit`'s listeners are private by deployment shape ([OVERVIEW.md](../OVERVIEW.md)), so the bar is
-that a misbehaving or compromised peer can't crash the process, hold resources without bound, or
-corrupt what it relays, not that a listener survives the open internet.
 
 ## Decision
 
 Every decoder and listener that reads peer bytes follows the rules below. Each rule is stated once
 here, and the code that enforces it points at this ADR.
+
+### Threat model
+
+The peer these rules defend against is a misbehaving or compromised peer on a private network:
+another `logit`, an agent, an SDK, or an exporter the operator runs, sending malformed or hostile
+bytes. The bar is that no input crashes the process or makes it allocate without bound, and that
+nothing a peer sends corrupts what `logit` relays. Surviving direct exposure to the open internet
+is not the bar. `docs/known-gaps.md`'s "Event model and interner" section already relies on the
+same premise for the never-evicting interner, and its revisit trigger (a listener that stops being
+private) applies to these rules too.
 
 ### Decoders
 
@@ -84,9 +91,9 @@ here, and the code that enforces it points at this ADR.
   padding to preserve.
 - **A writer refuses what a reader would reject.** `write_frame` returns an error for a payload
   over `MAX_SANE_UNCOMPRESSED_LEN` instead of truncating its length, so the cap is enforced once.
-- **Out-of-range OTLP values saturate.** An OTLP wire timestamp past `i64::MAX` nanoseconds
-  decodes as `i64::MAX` through one helper, and a `Value::U64` past `i64::MAX` encodes as
-  `i64::MAX` the same way. This is a permitted normalization under
+- **Out-of-range OTLP timestamps saturate.** An OTLP wire timestamp past `i64::MAX` nanoseconds
+  decodes as `i64::MAX` through one helper, applied at all 17 decode sites: `logs.rs`'s `decode_log_record` (`time_unix_nano`, the `observed_time_unix_nano` fallback, and `observed_timestamp`); `traces.rs`'s `decode_span_event` and `decode_span` (start and end); and `metrics.rs`'s `decode_exemplar` plus `time_unix_nano` and `start_time_unix_nano` for each of `Sum`, `Gauge`, `Histogram`, `Summary`, and `ExponentialHistogram`.
+  This is a permitted normalization under
   [ADR `lossless-transit`](lossless-transit.md): a saturated timestamp relays as
   2262-04-11T23:47:16.854775807Z, not the original value.
 
@@ -148,10 +155,13 @@ here, and the code that enforces it points at this ADR.
   request over one field the sender can't correct. Treating it as unset makes it look like a real
   zero, which OTLP gives a meaning (for example, "use the observed time"). Saturating keeps the
   event and its ordering, and is a named, testable normalization.
-- **A total body deadline.** A deadline on the whole body would close the dribbled-body gap (one
-  byte per read, each slightly under the per-read stall bound). It was declined: a slow link sending a
-  large legitimate body looks the same, and the per-read stall bound is the contract every
-  listener shares. The cost is recorded in `docs/known-gaps.md`.
+- **A total body deadline.** A deadline on the whole body would close the dribbled-body gap. It
+  was declined: a slow link sending a large legitimate body looks the same. The body read has a
+  per-frame (per-`read` on `logit_in`) stall bound, and that bound is `idle_timeout`, which is off
+  by default. With `idle_timeout` unset, a stalled or dribbled body is unbounded in time. With it
+  set, a peer sending one byte per frame, each slightly under the bound, holds a request for up to
+  `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener and `max_frame_bytes × idle_timeout` on
+  `logit_in`. Both costs are recorded in `docs/known-gaps.md`.
 - **A lower default `max_frame_bytes`.** Declined. Incremental reads remove the up-front
   allocation that made 64 MiB costly, and a relay that batches aggressively needs the headroom.
 - **A listener-wide request semaphore.** Declined in favor of the per-connection stream cap. A

@@ -639,14 +639,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   with nothing in flight the drop still happens at the end of the grace, and a stalled body is
   bounded by the per-frame stall timeout.
 
-- **A dribbled body holds a connection permit far longer than any one stall bound.** Every body
-  read is bounded per frame (per `read` on `logit_in`), not in total, so a peer that sends one byte
-  per frame, each slightly under the stall bound, keeps its request alive and its connection permit
-  held. On an HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
-  `datadog_trace_in`) that is up to `MAX_REQUEST_BYTES` times the stall bound per request; on
-  `logit_in` it is up to `max_frame_bytes` times the stall bound per frame. With enough
-  connections, such a peer can hold the connection cap. A documented cost of the per-frame design,
-  not a bug: a total body deadline was declined because a slow link sending a large legitimate
+- **A stalled or dribbled body holds a connection permit, without bound unless `idle_timeout` is
+  set.** A body read's only time bound is a per-frame stall bound (per `read` on `logit_in`), and
+  that bound is the listener's `idle_timeout`, which is off by default. With `idle_timeout` unset,
+  a peer that stops sending mid-body, or sends one byte at a time, holds its request and its
+  connection permit indefinitely. With it set, a peer that sends one byte per frame, each slightly
+  under `idle_timeout`, holds them for up to `MAX_REQUEST_BYTES × idle_timeout` per request on an
+  HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
+  `datadog_trace_in`) and up to `max_frame_bytes × idle_timeout` per frame on `logit_in`. With
+  enough connections, such a peer can hold the connection cap. A documented cost of the per-frame
+  design, not a bug: a total body deadline was declined because a slow link sending a large legitimate
   body looks the same ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md), [ADR
   `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment). **Revisit
   trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum transfer
@@ -1292,10 +1294,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
   considered"). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
   concurrent large requests.
-- **An OTLP timestamp or `U64` value past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
+- **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
   (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
-  and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX`, and a `Value::U64`
-  attribute past `i64::MAX` encodes as that value, through one helper. A saturated timestamp
+  and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper. A
+  saturated timestamp
   relays as 2262-04-11T23:47:16.854775807Z, not the original. This is a permitted normalization
   ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
   [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s closing assessment); no real

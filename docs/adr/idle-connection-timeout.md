@@ -294,9 +294,11 @@ kept both:
 - `drive_with_idle`'s wait for an in-flight request has no ceiling. A request blocked in
   `Fanout::send` is backpressure, which question 1 of this ADR's Context rules out treating as
   idleness, and the request's body read is bounded by the stall timeout on its own.
-- The body stall bound is per frame (per `read` on `logit_in`), not a total deadline. A peer that
-  sends one byte per frame slightly under the bound holds a connection permit for up to
-  `MAX_REQUEST_BYTES` times the bound on an HTTP listener, and `max_frame_bytes` times the bound on
+- The body stall bound is per frame (per `read` on `logit_in`), not a total deadline, and it is
+  `idle_timeout` itself, so it exists only when `idle_timeout` is set. With `idle_timeout` unset,
+  the default, a stalled or dribbled body is unbounded in time. With it set, a peer that sends one
+  byte per frame slightly under the bound holds a connection permit for up to
+  `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener, and `max_frame_bytes × idle_timeout` on
   `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
   looks the same. The cost is recorded under "TLS and connection lifecycle" in
   [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle).

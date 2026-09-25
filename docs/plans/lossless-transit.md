@@ -564,8 +564,8 @@ against the three like-protocol pairs is closed:
   outranking the normalized `Severity`), and every span field (`trace_state`/`flags` on
   `Span`/`Span.Link`, every `dropped_*_count`, a real status-message field) are closed — see "W4
   outcome: every named loss above is closed, not just narrowed" above. Lossless modulo one named
-  normalization: a wire timestamp or `Value::U64` past `i64::MAX` saturates to `i64::MAX`
-  (2262-04-11T23:47:16.854775807Z for a timestamp), which no real clock produces
+  normalization: a wire timestamp past `i64::MAX` nanoseconds saturates to `i64::MAX`
+  (2262-04-11T23:47:16.854775807Z), which no real clock produces
   ([ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md)).
 - **syslog_in -> syslog_out**: RFC 5424 STRUCTURED-DATA parses and re-emits through `syslog.sd`, a
   non-numeric PROCID survives as `Value::Str`, a non-UTF-8 MSG decodes to `Value::Bytes`, and
