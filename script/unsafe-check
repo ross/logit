@@ -36,16 +36,10 @@ IMAGE=logit-unsafe-check:local
 #   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec` construction and post-call harvest
 #   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
 #                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
-#   hyperloglog, hll_       metric.rs's `HyperLogLog` codec, which keeps `cardinality-estimator`'s
-#                           `Layout` UB unreachable. Upstream's pointer tagging fails Stacked and
-#                           Tree Borrows before any test assertion, so these run with both off and
-#                           permissive provenance, which still reports the `Layout` UB (the ADR's
-#                           "Sketch and HyperLogLog targets" amendment)
-#   sketch::tests           sketch.rs's `DdSketch`; Miri perturbs float results by default, which
-#                           breaks `Mapping` equality, so these run with deterministic floats
+#   hyperloglog, hll_       metric.rs's `HyperLogLog` codec; Stacked Borrows off, permissive provenance
+#   sketch::tests           sketch.rs's `DdSketch`; deterministic floats
 #
-# The proptest `properties` modules are skipped: at proptest's default case count they take
-# minutes each under Miri, and they exercise no unsafe code.
+# Why those flags, and why `--skip properties`: the ADR's "Sketch and HyperLogLog targets" amendment.
 MIRI_TARGETS=(
     "logit-inputs|parse_events|"
     "logit-inputs|batch_reader_helpers|"

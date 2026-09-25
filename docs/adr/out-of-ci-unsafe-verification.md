@@ -216,4 +216,5 @@ MIRIFLAGS>"`, because the `logit-core` sketch targets can't run under the defaul
   results by default, so two calls to `Mapping::agent()` can derive different `gamma_ln` or bias
   values, and structural equality tests fail for a reason no real build shows.
 - **Proptest `properties` modules are skipped** (`--skip properties`). They run minutes each
-  under Miri at proptest's default case count and touch no `unsafe`.
+  under Miri at proptest's default case count and touch no `unsafe`. The libtest arguments in a
+  `MIRI_TARGETS` entry are word-split so an entry can carry `--skip`.
