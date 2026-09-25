@@ -227,3 +227,20 @@ value past `i64::MAX` used to wrap negative on decode. [ADR
 `otlp_in -> otlp_out` relay of such a timestamp emits 2262-04-11T23:47:16.854775807Z, not the
 original value, and still counts as lossless. No real clock produces a timestamp past 2262, so
 the normalization touches only malformed or hostile input.
+
+## Amendment: a ninth like pair (2026-09-25)
+
+`splunk_hec_in -> splunk_hec_out` (Splunk's HTTP Event Collector) is the ninth like-protocol pair
+in scope under this ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`, `collectd`,
+`graphite`, and the two Datadog pairs. See [ADR `splunk-hec-relay`](splunk-hec-relay.md) for the
+protocol, the OpenTelemetry exporter's attribute vocabulary it adopts in place of a `splunk.*`
+namespace, the metric and span mappings, and acknowledgment, and
+[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md) for the workstreams closing it. Its
+permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s module doc (framing
+and batching by resource; number spelling; the single-metric form leaving as multi-metric, with
+`metric_type`; a nested `fields` value leaving flattened; hex ids leaving lowercase; `/raw` split
+into one event per line).
+
+Realized as of 2026-09-25: the pair relays losslessly modulo the normalizations its codec's
+module doc lists; see [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing
+assessment.

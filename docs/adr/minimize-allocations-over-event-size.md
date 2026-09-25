@@ -17,7 +17,7 @@ smaller, universal per-event byte footprint (paid by every event, on every hop, 
 carries that payload), in exchange for one added heap allocation on construction and one more on
 `Clone` — but *only* for an event that actually carries the payload in question.
 
-Measured on the project's own reference config (`examples/nginx-to-influxdb.yaml`, whose event
+Measured on the project's own reference config (`fixtures/nginx-to-influxdb.yaml`, whose event
 carries 2 distribution metrics out of 4), boxing `DdSketch` alone moved the headline ingest number
 `docs/design/memory.md` tracks from 5 to 7 allocations per line — a real, present-day cost, not a
 theoretical one. That prompted the question this ADR settles: when a design choice must trade

@@ -2,8 +2,8 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-vmagent, statsd/DogStatsD clients, a Datadog Agent, and a dd-trace tracer. The fixtures check `logit`'s decoders against what those producers put on
-the wire:
+vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, and four Splunk HEC
+clients. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-inputs/src/syslog.rs`
 - `crates/logit-inputs/src/statsd.rs`
@@ -13,6 +13,7 @@ the wire:
 - `crates/logit-proto/src/prometheus/remote_write.rs`
 - `crates/logit-proto/src/datadog/`, `crates/logit-inputs/src/datadog.rs`, and
   `crates/logit-inputs/src/datadog_trace.rs`
+- `crates/logit-proto/src/splunk/` and `crates/logit-inputs/src/splunk.rs`
 
 Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
@@ -69,13 +70,20 @@ testdata/interop/
   datadog/*.raw        -- DogStatsD over the Agent's Unix sockets: one file per datagram, or one
                           per stream connection with its length prefixes intact
   datadog/agent-info.json -- a real Agent's `/info` document
+  splunk/README.md     -- provenance table for splunk/*, and what each capture settled
+  splunk/*.bin         -- HEC request bodies from the OTel Collector's `splunk_hec` exporter,
+                          Docker's `splunk` log driver, SC4S, and Splunk's Java logging library,
+                          compressed as sent, one file per request
+  splunk/*.headers     -- one sidecar per body: the method, the route with its query string (the
+                          `/raw` envelope), and the compression
 ```
 
 The capture methods differ on purpose. The `*.raw` corpora come from read-only UDP and TCP sinks.
-The Prometheus and Datadog HTTP corpora (`prometheus/*.bin`, `datadog/*.bin`) come from
-`raw_capture.py --proto http`, which answers `204`, because an HTTP sender won't send another
-request until it gets a response; for a tracer, which reads its Agent's answers, it replies with
-a configured document instead. The OTLP corpus
+The Prometheus, Datadog, and Splunk HTTP corpora (`prometheus/*.bin`, `datadog/*.bin`,
+`splunk/*.bin`) come from `raw_capture.py --proto http`, which answers `204`, because an HTTP
+sender won't send another request until it gets a response; for a tracer, which reads its
+Agent's answers, and a HEC client, which reads Splunk's, it replies with a configured document
+instead. The OTLP corpus
 (`otlp/*.json`) is the Collector's own re-emitted output. Each subdirectory's README has the
 details.
 
@@ -87,8 +95,8 @@ explains how to add one.
 Recording is a **deliberate, reviewed act**, not part of `script/cibuild`, like `script/protogen`
 and `testdata/tls/regen.sh`. It pulls real third-party images from Docker Hub and ghcr.io, and runs
 them against the internet-facing package mirrors those images use: the `rsyslog`, `collectd`, and
-`graphite` producers each run a fresh `apt-get install`, and the `statsd` and `datadog` producers a
-fresh `pip install`. CI shouldn't repeat that non-determinism on every push.
+`graphite` producers each run a fresh `apt-get install`, the `statsd` and `datadog` producers a
+fresh `pip install`, and the `splunk` producer a fresh Maven build. CI shouldn't repeat that non-determinism on every push.
 
 To regenerate:
 
@@ -116,8 +124,9 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
   *distribution* of datagram sizes rather than one message shape.
 - **Datadog:** under 40 KB for the whole corpus. A zstd request body is small; a trace body isn't,
   since one Flask request is about ten spans, so trace captures serve few requests.
-- **Whole directory:** well under 100 KB total. As of 2026-09-24, the fixtures, excluding READMEs,
-  total about 74 KB.
+- **Splunk:** under 20 KB for the whole corpus: one request per client format or metric type.
+- **Whole directory:** well under 100 KB total. As of 2026-09-25, the fixtures, excluding READMEs,
+  total about 92 KB.
 
 If a producer's natural output is bigger, such as a verbose OTLP payload with many spans, trim it
 at record time instead of committing everything the producer emits. `script/record-fixtures`'s
@@ -142,6 +151,6 @@ For the pattern, see the `interop_fixture_*` tests in these files:
 - `crates/logit-inputs/src/statsd.rs`
 
 None of them asserts a measured value, which differs on every run.
-`crates/logit-proto/tests/prometheus_remote_write_interop.rs` and
-`crates/logit-proto/tests/datadog_interop.rs` follow the same rule for the Prometheus and Datadog
-corpora.
+`crates/logit-proto/tests/prometheus_remote_write_interop.rs`,
+`crates/logit-proto/tests/datadog_interop.rs`, and `crates/logit-proto/tests/splunk_interop.rs`
+follow the same rule for the Prometheus, Datadog, and Splunk corpora.

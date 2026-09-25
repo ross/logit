@@ -266,7 +266,7 @@
 //! bound on a half-uploaded request: it holds its [`MAX_CONCURRENT_CONNECTIONS`] permit until the
 //! sender goes away. Set it on any listener a real fleet writes to
 //! ([ADR `idle-connection-timeout`](../../../docs/adr/idle-connection-timeout.md)'s "recommend it
-//! on wherever consistent traffic is expected"; `examples/prometheus-remote-write-receive.yaml`
+//! on wherever consistent traffic is expected"; `fixtures/prometheus-remote-write-receive.yaml`
 //! ships a value). There is no listener-level graceful shutdown here or anywhere else in this
 //! repo: shutdown is per connection.
 //!

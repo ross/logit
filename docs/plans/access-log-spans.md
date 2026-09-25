@@ -8,7 +8,7 @@ updated: 2026-09-04
 ## Context
 
 [ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md) is the design decision;
-this is the workstream plan that lands it and carries it through to `examples/` and `demo/`. See
+this is the workstream plan that lands it and carries it through to `fixtures/` and `demo/`. See
 that ADR for the full reasoning — this file tracks what's built and what's left, PR by PR.
 
 Goal, restated from `docs/OVERVIEW.md`'s own framing: see one request pass through the stack,
@@ -45,14 +45,14 @@ new `span:` block closes that gap without a new component or a second config con
   not-yet-built upstream CLIENT-span derivation; the service-graph panel item updated), `AGENTS.md`
   and `README.md`'s transform blurbs, `docs/design/pipeline-graph.md`'s rule list.
 
-### B. `examples/nginx` emits the convention — next
+### B. `fixtures/nginx` emits the convention — next
 
-`examples/nginx/nginx.conf` gains stock `map`s splitting `$http_traceparent` (no njs needed for
+`fixtures/nginx/nginx.conf` gains stock `map`s splitting `$http_traceparent` (no njs needed for
 this part — the existing `delay.js` stays as is) into `trace_id`/`span_id`, forwards a
 `traceparent` header on the proxied vhost, and its `access_json_syslog` format gains
 `traceparent`/`trace.id`/`span.id`/`span.end_s`/`span.duration_s`/`span.status` fields per the
 ADR's nginx pairing (`$msec` as end, `$request_time` as duration — never `$msec` as a start).
-`examples/nginx-to-influxdb.yaml` gains an `nginx_trace` (`trace_context`, `span: {kind: server,
+`fixtures/nginx-to-influxdb.yaml` gains an `nginx_trace` (`trace_context`, `span: {kind: server,
 name: http.request}`) stage between `nginx_json` and `nginx_metrics`, plus a `keep_signals:
 [traces]` branch to a `stdio_out` tap so the resulting span is visible without standing up Tempo.
 A new bench-adjacent fixture line documents the shape. Verify with `nginx -t` in the pinned image
@@ -92,7 +92,7 @@ Deltas to the already-landed haproxy/nginx/app chain, not a rebuild of it:
 
 `script/cibuild` after A and B — passes. `haproxy -c` against the edited config confirmed the
 dotted-name risk was real (see workstream C's own note above) and `nginx -t` passes for both
-`examples/nginx/nginx.conf` and `demo/nginx/nginx.conf`. `script/demo up --build`, verified live:
+`fixtures/nginx/nginx.conf` and `demo/nginx/nginx.conf`. `script/demo up --build`, verified live:
 per request, `logit`'s `stdio_out` shows a haproxy span and an nginx span sharing one trace id with
 nginx's `parent_span_id` equal to haproxy's `span_id`, and Tempo's `/api/traces/<id>` shows
 haproxy (root) → nginx → demo-app with start times in the expected order given each tier's actual

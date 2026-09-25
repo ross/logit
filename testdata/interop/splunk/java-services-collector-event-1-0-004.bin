@@ -1,0 +1,1 @@
+{"host":"splunk-java-fixture","index":"main","sourcetype":"java:json","source":"java:logback","time":"1790358635.875","fields":{"messageFormat":"json"},"event":{"severity":"ERROR","logger":"splunk-java-fixture","thread":"main","message":"splunk-java fixture: request failed"}}

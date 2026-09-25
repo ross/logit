@@ -1,0 +1,38 @@
+# Pushes statsd metrics into VictoriaMetrics over remote-write, compressed with zstd: the
+# VictoriaMetrics remote write protocol vmagent sends by default. `prometheus_out` with `endpoint:`
+# is the remote-write sender (docs/adr/victoriametrics-interop.md). Change `endpoint` to your
+# VictoriaMetrics, or to a vmagent's `:8429`.
+#
+# `statsd_in -> aggregate -> prometheus_out`, so this runs against the dev stack's statsd port with
+# nothing external on the ingress side. The `aggregate` is not optional: VictoriaMetrics keeps no
+# temporality, `prometheus_out` skips a delta `Sum`/`Histogram`, and `temporality: cumulative` is
+# the named stage that keeps the running total, as in fixtures/prometheus-remote-write-send.yaml.
+#
+# Two settings are VictoriaMetrics-specific (docs/deploying.md's "VictoriaMetrics, VictoriaLogs,
+# and VictoriaTraces" section):
+#
+# - `version: 1`, always. VictoriaMetrics answers a remote-write 2.0 request `204` and stores
+#   nothing, so `version: 2` loses every batch while this sink counts each one delivered.
+# - `compression: zstd` is optional. VictoriaMetrics accepts the default Snappy too; Prometheus and
+#   Mimir reject zstd, so keep `snappy` for anything else.
+components:
+  app_metrics:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  windowed:
+    type: aggregate
+    sources: [app_metrics]
+    interval: 10s
+    temporality: cumulative
+
+  victoria_metrics:
+    type: prometheus_out
+    sources: [windowed]
+    # The full write URL, path included. A cluster's `vminsert` takes
+    # http://HOST:8480/insert/<accountID>/prometheus/api/v1/write instead.
+    endpoint: http://127.0.0.1:8428/api/v1/write
+    version: 1
+    # No negotiation and no fallback: a receiver that refuses zstd fails every batch, and the
+    # `remote_write_rejected` diagnostic names `compression: snappy` as the fix. Needs `version: 1`.
+    compression: zstd

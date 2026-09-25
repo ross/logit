@@ -44,5 +44,5 @@ To regenerate, run `script/record-fixtures logger python-syslog-handler rsyslog 
   `TCP_Framing="octet-counted"`) is the natural next fixture.
 - **syslog-ng over TCP.** Not attempted, same as the UDP case above.
 - **HAProxy/nginx access-log syslog output.** Deliberately out of scope for this corpus. The
-  existing `demo/`/`examples/nginx/` integration already covers it, so it isn't a fixture-corpus
+  existing `demo/`/`fixtures/nginx/` integration already covers it, so it isn't a fixture-corpus
   concern (see the plan doc's scope section).

@@ -994,7 +994,7 @@ fn sketch_summary(sketch: &DdSketch) -> Point {
 /// plus the total. Bounds are sorted ascending first (the model doesn't promise an order) and a
 /// `+Inf` bucket is appended when the highest bound is finite -- every conforming exposition has
 /// one, and the total has to live somewhere.
-fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64) {
+pub(crate) fn cumulative_counts(buckets: &[(f64, u64)]) -> (Vec<(f64, u64)>, u64) {
     let mut sorted: Vec<(f64, u64)> = buckets.to_vec();
     sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     let mut out = Vec::with_capacity(sorted.len() + 1);

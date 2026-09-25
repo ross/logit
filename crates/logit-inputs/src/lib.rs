@@ -25,6 +25,7 @@ mod listener;
 pub mod logit;
 pub mod otlp;
 pub mod prometheus;
+pub mod splunk;
 pub mod statsd;
 pub mod syslog;
 pub mod tail;

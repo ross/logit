@@ -34,7 +34,7 @@ and targeting its parent's branch, brought up to date with `git merge origin/mai
 | `json` | Gains `invalid_utf8: reject \| replace` (default `reject`); `replace` retries a failed parse on a `from_utf8_lossy` copy, failure path only |
 | Route rule shape | One flat struct `{builtin?, match?, route?}`, validated by graph rule 60 to be exactly `builtin` xor `match`+`route` — not an untagged enum |
 | UA matching | Ordered `Vec<(Value, Regex)>` scanned with `is_match` (config rules first, then scanner > tool > crawler > browser), not `RegexSet` |
-| Repo configs | `examples/nginx/nginx.conf`, `demo/nginx/nginx.conf`, `demo/haproxy/haproxy.cfg`, `examples/nginx-to-influxdb.yaml`, `demo/logit.yaml` all move onto it; `$status` quoted; demo's `scale` stage removed |
+| Repo configs | `fixtures/nginx/nginx.conf`, `demo/nginx/nginx.conf`, `demo/haproxy/haproxy.cfg`, `fixtures/nginx-to-influxdb.yaml`, `demo/logit.yaml` all move onto it; `$status` quoted; demo's `scale` stage removed |
 | Landing | PR stack only. Nothing merged by this workstream; Ross directs merging |
 
 ## Design
@@ -242,7 +242,7 @@ un-configured traffic classifies `browser`, not `scanner`, regardless of table t
 
 ### Producer configs (W5)
 
-`examples/nginx/nginx.conf`: all three `map`s deleted; `access_json_syslog` becomes
+`fixtures/nginx/nginx.conf`: all three `map`s deleted; `access_json_syslog` becomes
 `access_semconv` — raw semconv keys, `url.original: $request_uri` (never `$uri`), quoted
 `$status`, quoted `$msec` as `span.end_s`, bare `$request_time` as `http.request.duration_s`,
 `$upstream_*` quoted, `traceparent` raw. `access_json_full` unchanged. `demo/nginx/nginx.conf`:
@@ -256,7 +256,7 @@ semconv keys, quoted `$status`. `demo/haproxy/haproxy.cfg`: `%{+json}o` with das
 
 ### Consumer configs (W6)
 
-`examples/nginx-to-influxdb.yaml`: `nginx_http` between `nginx_json` and `nginx_trace`
+`fixtures/nginx-to-influxdb.yaml`: `nginx_http` between `nginx_json` and `nginx_trace`
 (`routes: [probes, assets, '^/$' -> /]`, `route_other: /{other}`); `nginx_trace` gains
 `mint_id: true` (its `name:` is now a fallback — `http_access`'s `span.name` wins);
 `kv_metrics` reads `http.response.body.size`, `http.request.duration_s` (s),
@@ -304,9 +304,9 @@ lists, plus the corrected `$uri`/invalid-UTF-8 entry and a narrowing of the `$ho
 - Negative configs by hand after W2: an uncompilable `match`; empty `match`/`route`; `builtin`
   and `match` together; two `builtin: assets`; `max_length: {url.paths: 10}`;
   `max_length: {url.path: 0}`; `forwarded: {trust: false}`; `redact_query: ['']`.
-- `logit graph examples/nginx-to-influxdb.yaml` renders `nginx_http` between `nginx_json` and
+- `logit graph fixtures/nginx-to-influxdb.yaml` renders `nginx_http` between `nginx_json` and
   `nginx_trace`.
-- `script/server` against `examples/`: `curl` at `static.local`/`proxy.local` for
+- `script/server` against `fixtures/`: `curl` at `static.local`/`proxy.local` for
   `/favicon.ico`, a 500, a `curl` user agent, a `?X-Amz-Signature=…` query, and a Latin-1
   `User-Agent` byte; `stdio_out` shows an integer `http.response.status_code`,
   `http.route: /{asset}`, `user_agent.class: tool`, `REDACTED`, `span.name: GET /{asset}`,

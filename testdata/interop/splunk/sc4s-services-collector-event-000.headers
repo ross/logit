@@ -1,0 +1,8 @@
+method: POST
+path: /services/collector/event
+host: capture:8088
+user-agent: curl/8.17.0
+accept: */*
+authorization: Splunk 00000000-0000-0000-0000-000000000000
+content-length: 72
+content-type: application/x-www-form-urlencoded

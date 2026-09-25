@@ -1,0 +1,100 @@
+# Collector config for script/record-fixtures's `splunk-otel` producer.
+#
+# Receives OTLP from `telemetrygen` and re-exports it through the `splunk_hec` exporter at the
+# capture sink, so the fixture is what the exporter puts on the wire: its envelope, its span
+# object, both metric forms, and gzip (on by default). One exporter per shape:
+#
+#   splunk_hec/logs           logs, `/services/collector`
+#   splunk_hec/raw            the same logs with `export_raw: true`, `/services/collector/raw`
+#   splunk_hec/traces         spans, `/services/collector`
+#   splunk_hec/metrics        single-metric form (the default), `/services/collector`
+#   splunk_hec/metrics_multi  `use_multi_metric_format: true`, `/services/collector`
+#
+# `source`, `sourcetype`, and `index` are set on every exporter so the envelope carries all four
+# keys. `health_check_enabled` (off by default) is on for the logs exporter only, so the capture
+# holds one `GET /services/collector/health`.
+#
+# The `batch` processor holds a telemetrygen run's records until its timeout, so one run is one
+# request per exporter and the capture's request count doesn't depend on how the SDK split its
+# exports.
+#
+# The `splunk_hec` receiver, into the `debug` exporter, is the probe for whether that receiver
+# decodes the exporter's span objects back to spans: script/record-fixtures posts the recorded
+# span body to it and prints what `debug` logs.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+  splunk_hec:
+    endpoint: 0.0.0.0:8088
+
+processors:
+  batch:
+    timeout: 3s
+    send_batch_size: 10000
+
+exporters:
+  splunk_hec/logs:
+    endpoint: http://capture:8088/services/collector
+    token: 00000000-0000-0000-0000-000000000000
+    source: otel:telemetrygen
+    sourcetype: otel:logs
+    index: main
+    health_check_enabled: true
+    tls:
+      insecure_skip_verify: true
+  splunk_hec/raw:
+    endpoint: http://capture:8088/services/collector/raw
+    token: 00000000-0000-0000-0000-000000000000
+    source: otel:telemetrygen
+    sourcetype: otel:raw
+    index: main
+    export_raw: true
+    tls:
+      insecure_skip_verify: true
+  splunk_hec/traces:
+    endpoint: http://capture:8088/services/collector
+    token: 00000000-0000-0000-0000-000000000000
+    source: otel:telemetrygen
+    sourcetype: otel:traces
+    index: main
+    tls:
+      insecure_skip_verify: true
+  splunk_hec/metrics:
+    endpoint: http://capture:8088/services/collector
+    token: 00000000-0000-0000-0000-000000000000
+    source: otel:telemetrygen
+    sourcetype: otel:metrics
+    index: metrics
+    tls:
+      insecure_skip_verify: true
+  splunk_hec/metrics_multi:
+    endpoint: http://capture:8088/services/collector
+    token: 00000000-0000-0000-0000-000000000000
+    source: otel:telemetrygen
+    sourcetype: otel:metrics:multi
+    index: metrics
+    use_multi_metric_format: true
+    tls:
+      insecure_skip_verify: true
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [splunk_hec/logs, splunk_hec/raw]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [splunk_hec/traces]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [splunk_hec/metrics, splunk_hec/metrics_multi]
+    logs/hec_receiver:
+      receivers: [splunk_hec]
+      exporters: [debug]

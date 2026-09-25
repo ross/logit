@@ -30,20 +30,20 @@ Related docs:
 Four topologies cover the ways `logit` sits next to Datadog. Each has a runnable example.
 
 - **Direct to Datadog's API.** `logit` is the host collector and posts to Datadog's intake with no
-  Agent in the path: [`examples/datadog-direct.yaml`](../examples/datadog-direct.yaml) runs
+  Agent in the path: [`fixtures/datadog-direct.yaml`](../fixtures/datadog-direct.yaml) runs
   DogStatsD through `aggregate` into `datadog_out`.
 - **Through a local Agent.** `logit` hands data to an Agent on the host, which sends it on:
-  [`examples/datadog-via-agent.yaml`](../examples/datadog-via-agent.yaml) sends OTLP traces and
+  [`fixtures/datadog-via-agent.yaml`](../fixtures/datadog-via-agent.yaml) sends OTLP traces and
   metrics to the Agent's OTLP receiver and DogStatsD to its `:8125`.
 - **Standing in for an Agent.** Applications point their Datadog libraries at `logit` instead of an
-  Agent: [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml) listens
+  Agent: [`fixtures/datadog-agent-standin.yaml`](../fixtures/datadog-agent-standin.yaml) listens
   for DogStatsD on `:8125` (`statsd_in`) and for traces and client stats on `:8126`
   (`datadog_trace_in`), optionally on the Agent's Unix sockets too.
-  [`examples/datadog-agent-relay.yaml`](../examples/datadog-agent-relay.yaml) relays both on to a
+  [`fixtures/datadog-agent-relay.yaml`](../fixtures/datadog-agent-relay.yaml) relays both on to a
   real Agent, which is where tracer spans must go next (see
   [Rules that lose data when missed](#rules-that-lose-data-when-missed)).
 - **Standing in for the intake.** Agents send `logit` what they'd send Datadog, over Datadog's
-  intake API: [`examples/datadog-intake-standin.yaml`](../examples/datadog-intake-standin.yaml)
+  intake API: [`fixtures/datadog-intake-standin.yaml`](../fixtures/datadog-intake-standin.yaml)
   runs `datadog_in` and has the Agent-side settings for replacing Datadog and for dual-shipping.
   This is the topology a migration away from Datadog runs through
   ([From Datadog](#from-datadog-dual-ship-tee-then-cut-over)).
@@ -227,7 +227,7 @@ Three details catch people out:
   `span_id`, which Datadog's log intake correlates on, unless the log already has an attribute of
   either name.
 
-[`examples/datadog-logs-correlation.yaml`](../examples/datadog-logs-correlation.yaml) runs
+[`fixtures/datadog-logs-correlation.yaml`](../fixtures/datadog-logs-correlation.yaml) runs
 `tail_in`, `json`, `flatten`, and `trace_context` into both `datadog_out` and `otlp_out`.
 
 ### Credentials

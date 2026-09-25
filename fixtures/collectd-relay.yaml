@@ -1,0 +1,65 @@
+# A collectd relay: receive collectd's binary `network` protocol, forward it to a central collectd
+# or anything else that speaks the protocol (docs/adr/collectd-binary-relay.md). Point an edge
+# fleet's `<Plugin network> Server "<this host>" "25826" </Plugin>` at this host and set `endpoint`
+# below to the central collector; nothing collectd-side changes.
+#
+# The relay is lossless modulo the normalization list in the ADR. Encrypted packets (collectd's
+# `SecurityLevel Encrypt`) are the one input the codec can't read; the datagram's tail is dropped
+# and counted (docs/known-gaps.md). Because `collectd_out` restates elided time and interval
+# parts, budget about a third more egress bytes and packets than the fleet sends
+# (docs/deploying.md).
+#
+# No `aggregate`, unlike fixtures/statsd-relay.yaml: every collectd value list is already one
+# reading per `Interval` with its own timestamp, and a window would re-stamp a GAUGE or ABSOLUTE
+# with the flush time, so the relay stops being byte-for-byte. Add one only when you want to
+# re-window, and then point the sink's `sources` at it.
+components:
+  collectd_in:
+    type: collectd_in
+    # collectd's default port. `0.0.0.0` accepts unicast from any sender.
+    bind: 0.0.0.0:25826
+    # A multicast group instead, for a fleet configured with a bare `Server "239.192.74.66"`
+    # (collectd's IPv4 default; `ff18::efc0:4a42` is the IPv6 one). A multicast address is
+    # detected and joined with no extra field, and the listener still accepts unicast on the port.
+    # bind: 239.192.74.66:25826
+    #
+    # Optional, and it changes nothing on the wire: `types_db:` names data sources, and
+    # `collectd_out` re-encodes from the `collectd.*` attributes, never from the record name. Set
+    # it only if something else in the pipeline reads the names. collectd's own types.db is
+    # GPL-licensed and not shipped with logit; point this at the sending hosts' copy.
+    # types_db:
+    #   - /usr/share/collectd/types.db
+    #
+    # Every field below is its default; omit the block for the same effect. `receive:` is valid
+    # only on a datagram listener.
+    # receive:
+    #   max_datagrams: 10000        # queue depth; whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest; blocking a UDP reader moves
+    #                               # loss into the kernel, where nothing counts it
+    #   batch_max_events: 1000      # 1 means one send per datagram
+    #   batch_max_bytes: "1MiB"
+    #   batch_flush_interval: 100ms # 0s disables the timer
+    #   # receive_buffer_bytes: 8MiB  # SO_RCVBUF; omitted leaves the kernel default alone
+    #   read_batch: 64              # datagrams per recvmmsg(2) read; Linux-only effect
+    #   shutdown_grace: 5s
+
+  collectd_out:
+    type: collectd_out
+    sources: [collectd_in]
+    # `host:port`, resolved at send time, so a collector that isn't up yet is not a config error.
+    # UDP only: collectd's `network` plugin has no TCP mode.
+    endpoint: central-collectd:25826
+    # Every field below is its default; omit it for the same effect.
+    # max_packet_bytes: "1452"   # bounds one datagram, not one value list; 1024..=65535. Lower it
+    #                            # to match a path MTU. A list that alone exceeds it is dropped
+    #                            # whole and counted, not split.
+    # hostname:                  # unset: used only for an event carrying neither `collectd.host`
+    #                            # nor `host.name`, which a pure relay never produces. Set it if
+    #                            # this pipeline also carries metrics from another source; without
+    #                            # it such an event is dropped and counted (reason="no_host").
+    # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
+    #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
+    #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
+    #          `delivery:` derives from duplicate_safe(), which is false here: a redelivered list
+    #          double-counts every COUNTER/DERIVE/ABSOLUTE it carries)

@@ -27,6 +27,7 @@ use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
+use logit_inputs::splunk::SplunkHecInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
@@ -48,6 +49,10 @@ use logit_outputs::otlp::{
     SignalPaths,
 };
 use logit_outputs::prometheus::{ExposeOutput, PrometheusOutput, RemoteWriteOutput};
+use logit_outputs::splunk::{
+    SplunkCompression as SplunkOutCompression, SplunkHecOutput,
+    DEFAULT_ACK_TIMEOUT as SPLUNK_DEFAULT_ACK_TIMEOUT,
+};
 use logit_outputs::statsd::{StatsdEncoder, StatsdOutput};
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
@@ -411,6 +416,21 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_api_keys(api_keys.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        SplunkHecIn { bind, tls, tokens, max_request_bytes, handshake_timeout, idle_timeout } => {
+            let mut input = SplunkHecInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout)
+                .with_tokens(tokens.clone())
+                // Saturates on a 32-bit target: a cap past the address space is no cap.
+                .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -796,6 +816,34 @@ fn build_spec(
                 })
                 .with_timeout(*timeout)
                 .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        SplunkHecOut {
+            endpoint,
+            token,
+            compression,
+            multi_value,
+            ack,
+            ack_timeout,
+            timeout,
+            tls,
+            max_body_bytes,
+        } => {
+            let output = SplunkHecOutput::new(endpoint.clone(), token)?
+                .with_compression(splunk_compression(*compression))
+                .with_multi_value(splunk_multi_value(*multi_value))
+                // Rule 70 allows `ack_timeout` only with `ack`; the default applies under `ack`.
+                .with_ack(*ack, ack_timeout.unwrap_or(SPLUNK_DEFAULT_ACK_TIMEOUT))
+                .with_timeout(*timeout)
+                // Saturates on a 32-bit target: a cap past the address space is no cap.
+                .with_max_body_bytes(usize::try_from(*max_body_bytes).unwrap_or(usize::MAX))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_tls(&to_tls_client_settings(tls), base_dir)?;
@@ -1335,6 +1383,22 @@ fn graphite_multi_value(cfg: logit_config::GraphiteMultiValue) -> GraphiteWireMu
     match cfg {
         logit_config::GraphiteMultiValue::Skip => GraphiteWireMultiValue::Skip,
         logit_config::GraphiteMultiValue::Expand => GraphiteWireMultiValue::Expand,
+    }
+}
+
+/// Config's `SplunkCompression` into `logit_outputs::splunk::SplunkCompression`.
+fn splunk_compression(cfg: logit_config::SplunkCompression) -> SplunkOutCompression {
+    match cfg {
+        logit_config::SplunkCompression::Gzip => SplunkOutCompression::Gzip,
+        logit_config::SplunkCompression::None => SplunkOutCompression::None,
+    }
+}
+
+/// Config's `SplunkMultiValue` into `logit_proto::MultiValue`.
+fn splunk_multi_value(cfg: logit_config::SplunkMultiValue) -> logit_proto::MultiValue {
+    match cfg {
+        logit_config::SplunkMultiValue::Skip => logit_proto::MultiValue::Skip,
+        logit_config::SplunkMultiValue::Expand => logit_proto::MultiValue::Expand,
     }
 }
 

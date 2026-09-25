@@ -36,7 +36,10 @@ crc32c.workspace = true
 # Cargo unifies features, so this also makes OTLP/JSON and the `json` transform parse floats
 # exactly; the feature costs about 2x on float parsing only (serde_json's own documentation), and
 # `docs/known-gaps.md`'s Datadog entry gates the merge on a perf-VM measurement.
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+# `raw_value` lets the Splunk HEC decoder read an envelope's `time` as the sender's number text, so
+# a nanosecond-precise decimal keeps every digit instead of rounding through an `f64`. Not
+# `arbitrary_precision`, which would change every `serde_json::Number` in the workspace.
+serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 base64.workspace = true
 # Prometheus remote-write's two body encodings, Snappy block format and zstd, both through
 # prometheus/compression.rs, which the remote-write sink and receiver share.

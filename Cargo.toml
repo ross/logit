@@ -111,6 +111,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-lega
 tower-service = "0.3.3"
 http = "1"
 http-body-util = "0.1"
+# splunk_hec_in's `/raw` query-string envelope (`host`, `source`, `sourcetype`, `index`) and
+# channel, percent-decoded (docs/adr/splunk-hec-relay.md). Already present transitively (via
+# `url` and `serde_urlencoded`) at this version.
+form_urlencoded = "1.2"
 # otlp_out's optional gzip request compression and otlp_in's matching decode
 # (docs/adr/otlp-compression-and-decompression-bounds.md) -- default features only, which pulls in
 # the pure-Rust `miniz_oxide` backend rather than a C zlib, keeping "no host toolchain needed"
