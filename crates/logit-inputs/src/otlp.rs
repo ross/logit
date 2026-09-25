@@ -186,9 +186,9 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once. With 4 MiB requests this listener's worst
 /// case is 1.6 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
-/// has the formula). The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an OTLP listener
-/// to differ, and one figure for an operator to learn. Not operator-tunable; make it a config
-/// field if a deployment needs a different number.
+/// has the formula). The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason
+/// for an OTLP listener to differ, and one figure for an operator to learn. Not operator-tunable;
+/// make it a config field if a deployment needs a different number.
 ///
 /// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
 /// `OtlpInput::with_max_connections` lowers it in tests.

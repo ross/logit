@@ -772,9 +772,9 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bounds the connections [`PrometheusReceiver`] serves at once. With 4 MiB requests this
 /// listener's worst case is 1.6 TiB, a bound rather than a memory budget
-/// ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). The same 1024 as `otlp_in`, `logit_in` and `crate::tcp`'s listeners: no protocol reason to
-/// differ, and one figure for an operator to learn. A connection past the cap is **rejected, not
-/// queued**, as on those.
+/// ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). The same 1024 as `otlp_in`,
+/// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
+/// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// How long a connection has, per pre-request phase, before this listener releases its
