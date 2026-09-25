@@ -21,12 +21,11 @@ pub const FLAG_CONTROL: u16 = 1 << 0;
 /// allocation: otherwise a crafted 30-byte lz4 frame could force a multi-gigabyte one. Same
 /// reasoning as `native::dict`'s `MAX_SANE_DICT_ENTRIES` and `native`'s `MAX_SANE_EVENT_COUNT`.
 ///
-/// `write_frame` doesn't enforce it, so it can produce a frame `read_frame` rejects. A writer
-/// that must never do that checks this bound itself: `DiskQueue`
-/// (`crates/logit-pipeline/src/disk_queue.rs`) drops an oversize batch rather than spool it. A
-/// reader outside this module shares it too: `logit_in` (`crates/logit-inputs/src/logit.rs`)
-/// checks declared lengths against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` before
-/// reading a body off the socket.
+/// [`write_frame_with_flags`] refuses a payload over it, so no writer produces a frame
+/// `read_frame` rejects, and the header's `u32` length fields can't wrap. A reader outside this
+/// module shares it too: `logit_in` (`crates/logit-inputs/src/logit.rs`) checks declared lengths
+/// against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` before reading a body off the
+/// socket.
 pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
 /// The largest `compressed_len` a reader accepts: [`MAX_SANE_UNCOMPRESSED_LEN`] plus lz4's
@@ -133,7 +132,8 @@ impl FrameHeader {
 /// Frames `payload` under `codec`, compressing it first if asked.
 ///
 /// The CRC covers the compressed bytes, so a reader catches corruption before `lz4_flex` sees
-/// them. Rejects `Compression::Zstd` with [`CodecError::Unsupported`].
+/// them. Rejects `Compression::Zstd` with [`CodecError::Unsupported`], and a payload over
+/// [`MAX_SANE_UNCOMPRESSED_LEN`] with [`CodecError::Malformed`].
 pub fn write_frame(
     codec: u8,
     compression: Compression,
@@ -150,6 +150,12 @@ pub fn write_frame_with_flags(
     flags: u16,
     payload: &[u8],
 ) -> Result<Bytes, CodecError> {
+    if payload.len() > MAX_SANE_UNCOMPRESSED_LEN as usize {
+        return Err(CodecError::Malformed(format!(
+            "frame payload is {} bytes, over the {MAX_SANE_UNCOMPRESSED_LEN}-byte uncompressed cap",
+            payload.len()
+        )));
+    }
     let compressed = match compression {
         Compression::None => payload.to_vec(),
         Compression::Lz4 => lz4_compress(payload),

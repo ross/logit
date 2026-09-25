@@ -994,9 +994,11 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"}`
+- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag.
+  mismatch doesn't hide behind a generic "bad frame" tag. `decode_budget` is a well-formed batch
+  that would decode past its per-frame budget (`native::DecodeBudget`), a batch too large for the
+  frame cap it arrived under rather than corrupt bytes.
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the 1024-connection cap binding).
   `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same
@@ -1006,6 +1008,10 @@ the property the minimal-watch-set design is for.
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
   `logit.proto.errors{reason="handshake"}` or any other diagnostic.
+
+`Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
+budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
+idle close).
 
 ##### `generate_in`
 

@@ -300,14 +300,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
     `docs/design/wire-protocol.md`'s "Open question" section.
-  - **`cargo-fuzz` targets over the decoders.** `crates/logit-proto/tests/robustness.rs`'s seeded
-    mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the ground a
-    corpus-driven fuzzer would, but `cargo-fuzz` needs nightly Rust, and the dev toolchain is
-    stable-only (`docs/adr/containerized-development.md`), so fuzz targets are deferred.
-    [ADR `out-of-ci-unsafe-verification`](adr/out-of-ci-unsafe-verification.md)'s throwaway
-    nightly image serves a different, narrower need (miri/`cargo-careful`/fault injection over the
-    raw-`libc` `unsafe`) and defers `cargo-fuzz` again in its "Alternatives considered". Closing
-    this gap still means writing `cargo-fuzz` targets, not just pointing them at that image.
+  - ~~**`cargo-fuzz` targets over the decoders.**~~ **Closed (2026-09-25).** `fuzz/` holds
+    `cargo-fuzz` targets over the native, sketch, HyperLogLog, OTLP, and Prometheus remote-write
+    decoders, built in the `tools/unsafe-check` nightly image and run by hand with
+    `script/unsafe-check fuzz <target>` or `fuzz-all`, never in CI. A crash lands as a stable
+    regression test in the owning crate. [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md) has
+    the design and the campaign record.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
     validation's rule 17 rejects a `receive:` block on both (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace`. Both use that grace:
@@ -352,6 +350,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   with tens of thousands of keys in the worst order pays it. A non-goal under
   [ADR `deployment-threat-model`](adr/deployment-threat-model.md): the fix (collect, then sort
   once) changes the ordinary decode path for a shape only crafted input produces.
+- **The native decode budget bounds only what arrives over `logit_in`.** The `buffer.disk:` spool
+  decodes its records with no budget (`parse_record` in `crates/logit-pipeline/src/disk_queue.rs`),
+  because each spooled batch was already that size in memory when `DiskQueue::push` wrote it, and
+  a budget refusal there would discard the batch as corrupt. `NativeDecoder` (the `Decoder` seam)
+  uses the 256 MiB default. See [`docs/design/wire-protocol.md`](design/wire-protocol.md)'s
+  "Decode amplification". A sender learns only `max_frame_bytes` from `HelloAck`, not the budget,
+  so a stock `logit_out` batch between roughly 10% and 100% of the cap can be refused; the
+  refusal is deterministic, `logit_in` answers it with `REJECT_FRAME_TOO_LARGE` (#372) so the
+  sender drops the batch as permanent and diagnoses it rather than retrying, and the operator's
+  fix is the sender's batching.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)

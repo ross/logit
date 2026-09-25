@@ -43,6 +43,11 @@ pub enum CodecError {
     /// [`frame::FrameHeader::read`] on a short header or body.
     #[error("truncated input: need {needed} more byte(s)")]
     Truncated { needed: usize },
+    /// A well-formed native payload that would decode into more heap than its
+    /// `native::DecodeBudget` allows: a batch too large for the frame cap it arrived under, not
+    /// corrupt bytes.
+    #[error("payload decodes past its {limit}-byte decode budget")]
+    BudgetExceeded { limit: u64 },
 }
 
 /// Turns wire bytes into events sharing one [`Resource`] (`docs/design/data-model.md`).

@@ -35,7 +35,8 @@ reserved discriminant that `write_frame` and `read_frame` both reject with
 `CodecError::Unsupported`, per the same ADR.
 
 A reader rejects a frame whose `uncompressed_len` exceeds 64 MiB (`MAX_SANE_UNCOMPRESSED_LEN`) as
-`Malformed` on the header alone, before the value sizes a decompression buffer.
+`Malformed` on the header alone, before the value sizes a decompression buffer. `write_frame`
+refuses such a payload too, so no writer emits a frame a reader rejects.
 
 ## Payload: dictionary-first batches
 
@@ -93,6 +94,70 @@ with nothing for a dictionary to amortize.
 without provenance, otherwise, so neither side needs a protocol version bump. `DiskQueue`'s
 spooled records (`crates/logit-pipeline/src/disk_queue.rs`) carry the same per-record codec byte,
 so a v1 record spooled before an upgrade still replays after it.
+
+## Decode amplification
+
+The frame caps bound what arrives, not what it decodes into. An element at its smallest wire
+encoding can become a much larger in-memory struct: one empty event is 1 wire byte and an 864-byte
+`Event`. So every payload decodes against a per-frame budget (`native::DecodeBudget`,
+`crates/logit-proto/src/native/budget.rs`), and a payload that would exceed it fails with
+`CodecError::BudgetExceeded` before the elements are built. `logit_in` counts that under
+`logit.proto.errors{reason="decode_budget"}` and diagnoses it under its own `decode_budget` key.
+The rule and the 4× multiplier are decided in
+[ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md). The budget per reader:
+
+- `logit_in` gives each frame 4 × its effective `max_frame_bytes` (at most 64 MiB, so at most a
+  256 MiB budget).
+- `NativeDecoder` uses the 256 MiB default.
+- The disk spool decodes with no budget: `DiskQueue::push` wrote each record from a batch already
+  that size in memory, and a refusal would discard a spooled batch as corrupt.
+
+A list is charged its element size times its count once, after the count is checked against the
+bytes left (every element costs at least one wire byte). A dictionary entry is charged its string
+bytes plus a 4-byte `Symbol`, and an attribute-map entry a 48-byte `(Symbol, Value)` slot. A
+`Str`/`Bytes` value is a slice of the frame's buffer and costs nothing.
+
+Measured peak heap per wire byte for a payload of one element repeated at its smallest encoding,
+at a power-of-two count (`tests/robustness.rs`'s
+`peak_allocation_per_wire_byte_matches_the_documented_ratio` holds these within 5%):
+
+| Element | Smallest wire cost | Heap cost | Peak / wire byte | Charged |
+|---|--:|--:|--:|---|
+| Event | 1 B | 864 B `Event` | 864 | `size_of::<Event>()` |
+| `MR_EXEMPLARS` entry | 1 B | 440 B `Exemplar` | 440 | `size_of::<Exemplar>()` |
+| `TAG_ARRAY` item holding an empty `Map` | 3 B | 40 B `Value` + 392 B boxed `AttrMap` | 144 | both |
+| `SR_EVENTS` entry | 5 B | 448 B `SpanEvent` | 89.6 | `size_of::<SpanEvent>()` |
+| `METRIC_SET_MEMBERS` member | 1 B | 32 B `Bytes` | 32 | `size_of::<Bytes>()` |
+| `TAG_ARRAY` item | 2 B | 40 B `Value` | 20 | `size_of::<Value>()` |
+| `SR_LINKS` entry | 29 B | 456 B `SpanLink` | 15.7 | `size_of::<SpanLink>()` |
+| `FIELD_METRICS` record | 19 B | 224 B `MetricRecord` | 11.8 | `size_of::<MetricRecord>()` |
+| Exponential-histogram bucket | 1 B | 8 B `u64` | 8 | 8 B |
+| `METRIC_SAMPLES` value | 8 B | 8 B `f64` | 2 | 8 B |
+| `METRIC_HISTOGRAM` bucket | 9 B | 16 B `(f64, u64)` | 1.8 | 16 B |
+| `METRIC_SUMMARY` quantile | 16 B | 16 B `(f64, f64)` | 1 | 16 B |
+
+Two caveats:
+
+- Between powers of two, a list's `Vec` can hold up to twice its length in capacity, so the peak
+  is up to 2× the ratio above, while the charge stays at 1×. A budget of 4 × the frame cap can
+  therefore admit up to 8 × the frame cap of real heap.
+- `METRIC_SAMPLES` peaks at 2 because the values are built in a `Vec` and then copied into
+  `Samples`; the copy is transient and not charged.
+
+The dictionary's cost lands mostly in the process-wide interner, which never evicts and isn't a
+per-frame cost ([`docs/known-gaps.md`](../known-gaps.md)'s interner entry).
+
+**A real batch is charged 1.5 to 39 bytes of heap per wire byte.** The 864-byte event slot
+dominates a small event; a wide parsed log carries enough wire bytes to hide it. Measured on
+`crates/logit-bench/src/fixtures.rs`'s batches of 1,000 events: parsed JSON, access-log, and
+`http_access` batches 1.5 to 2.4, nginx access logs 6.1, sshd logs 7.8, spans 8.0, collectd 16.6,
+pino-http logs 18.7, statsd 19.2, graphite 32.0, Prometheus gauges 32.5, and a bare `Sum` metric
+38.8. So a frame is refused once its payload passes `4 / ratio` of the frame cap it arrived under:
+about 10% of it for a small-metric batch, about 65% for an nginx one, and never for the widest
+logs. At the 64 MiB default the first of those is a payload of roughly 6.5 MiB, about 250,000
+small metric events. A sender learns only `max_frame_bytes` from `HelloAck`, not the budget, so
+a stock `logit_out` can send a batch the budget refuses; see
+[`docs/known-gaps.md`](../known-gaps.md)'s decode-budget entry.
 
 ## Encoding: decided — hand-rolled
 
