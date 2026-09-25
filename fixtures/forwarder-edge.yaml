@@ -1,13 +1,13 @@
 # The native-transport forwarding pair (docs/plans/native-transport.md): a sidecar-shaped `logit`
 # collects statsd locally and forwards everything, unaggregated, to a central `logit` over the
-# native protocol. The edge collects; examples/forwarder-central.yaml windows and sinks.
+# native protocol. The edge collects; fixtures/forwarder-central.yaml windows and sinks.
 #
-# Run alongside examples/forwarder-central.yaml. Start the central process first, or `logit_out`
+# Run alongside fixtures/forwarder-central.yaml. Start the central process first, or `logit_out`
 # keeps retrying the connection (lazy connect, not a config error). Change `endpoint` below to
 # the central host.
 #
-#   logit run examples/forwarder-central.yaml &
-#   logit run examples/forwarder-edge.yaml
+#   logit run fixtures/forwarder-central.yaml &
+#   logit run fixtures/forwarder-edge.yaml
 #
 # Topology (this file):
 #

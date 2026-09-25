@@ -2,7 +2,7 @@
 //! nothing in the shipped binary depends on it.
 //!
 //! Both halves share one set of inputs, [`fixtures`], built around the pre-`http_access` shape of
-//! the `examples/nginx-to-influxdb.yaml` reference pipeline, kept unchanged so the pinned counts
+//! the `fixtures/nginx-to-influxdb.yaml` reference pipeline, kept unchanged so the pinned counts
 //! stay comparable ([`fixtures`]'s module doc says how the pipeline has since moved on):
 //!
 //! - **`tests/allocations.rs`**: ordinary `#[test]`s asserting exact allocation counts per stage
