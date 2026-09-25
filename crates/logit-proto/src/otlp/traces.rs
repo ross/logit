@@ -73,7 +73,7 @@ fn decode_span_event(event: pb::span::Event) -> SpanEvent {
     let mut attributes = AttrMap::new();
     common::key_values_into_attrs(event.attributes, &mut attributes);
     SpanEvent {
-        timestamp: event.time_unix_nano as i64,
+        timestamp: common::wire_nanos(event.time_unix_nano),
         name: Value::str(event.name),
         attributes,
         dropped_attributes_count: event.dropped_attributes_count,
@@ -220,11 +220,11 @@ pub(crate) fn decode_span(span: pb::Span, mut attrs: AttrMap) -> Result<Event, C
         status: decode_status_code(code),
         events: span.events.into_iter().map(decode_span_event).collect(),
         links,
-        end_timestamp: span.end_time_unix_nano as i64,
+        end_timestamp: common::wire_nanos(span.end_time_unix_nano),
         flags: span.flags,
         ext,
     };
-    Ok(Event::span(span.start_time_unix_nano as i64, attrs, record))
+    Ok(Event::span(common::wire_nanos(span.start_time_unix_nano), attrs, record))
 }
 
 #[cfg(test)]

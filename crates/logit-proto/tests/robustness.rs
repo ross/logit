@@ -4,7 +4,9 @@
 //! in both protocols, and `prometheus::compression::decompress_bounded`, which inflates every
 //! remote-write body `prometheus_in` receives. Pickle is the highest-risk parser in the repo: a format built for arbitrary
 //! object construction, read from a socket. A network-facing decoder must pass this suite
-//! (`docs/plans/native-transport.md`).
+//! (`docs/plans/native-transport.md`). The OTLP section pins the limits OTLP decoding relies on
+//! instead of caps of its own: each parser's nesting limit, timestamp saturation, and OTLP/JSON's
+//! peak memory per input byte.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -23,8 +25,14 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
 use logit_proto::native::varint::{read_uvarint, write_uvarint};
 use logit_proto::native::{self, DecodeBudget, NativeDecoder};
+use logit_proto::otlp::generated::opentelemetry::proto::common::v1 as otlp_common;
+use logit_proto::otlp::generated::opentelemetry::proto::logs::v1 as otlp_logs;
+use logit_proto::otlp::generated::opentelemetry::proto::metrics::v1 as otlp_metrics;
+use logit_proto::otlp::generated::opentelemetry::proto::resource::v1 as otlp_resource;
+use logit_proto::otlp::generated::opentelemetry::proto::trace::v1 as otlp_trace;
+use logit_proto::otlp::{OtlpDecoder, OtlpEncoder};
 use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
-use logit_proto::{CodecError, Decoder, Encoder};
+use logit_proto::{CodecError, Decoder, Encoder, Signal, SignalDecoder, SignalEncoder};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
@@ -821,6 +829,469 @@ fn zstd_memory_is_bounded_by_the_cap_not_by_what_an_undeclared_frame_inflates_to
     );
     let bound = 4 * REMOTE_WRITE_CAP as i64;
     assert!(peak < bound, "peak live bytes {peak} over {bound} for a {}-byte bomb", bomb.len());
+}
+
+// -- otlp -------------------------------------------------------------------------------------
+
+/// `otlp_in`'s request body cap (`MAX_REQUEST_BYTES`) is 4 MiB; the memory test uses 1 MiB so it
+/// stays fast, since the per-byte ratio doesn't depend on the size.
+const OTLP_JSON_MEMORY_BODY_BYTES: usize = 1024 * 1024;
+
+const OTLP_TRACE_ID: [u8; 16] = [1; 16];
+const OTLP_SPAN_ID: [u8; 8] = [2; 8];
+
+/// One past the largest wire timestamp the model's `i64` nanoseconds can hold, and the largest a
+/// `fixed64` can carry.
+const OTLP_TIMESTAMPS_PAST_I64_MAX: [u64; 2] = [i64::MAX as u64 + 1, u64::MAX];
+
+fn otlp_int_leaf() -> otlp_common::AnyValue {
+    otlp_common::AnyValue { value: Some(otlp_common::any_value::Value::IntValue(1)) }
+}
+
+fn otlp_key_value(key: &str, value: otlp_common::AnyValue) -> otlp_common::KeyValue {
+    otlp_common::KeyValue { key: key.into(), value: Some(value), key_strindex: 0 }
+}
+
+/// `levels` `AnyValue`s: `levels - 1` `arrayValue` wrappers around an `intValue` leaf.
+fn otlp_pb_array_value(levels: usize) -> otlp_common::AnyValue {
+    use otlp_common::any_value::Value as Any;
+    let mut v = otlp_int_leaf();
+    for _ in 1..levels {
+        v = otlp_common::AnyValue {
+            value: Some(Any::ArrayValue(otlp_common::ArrayValue { values: vec![v] })),
+        };
+    }
+    v
+}
+
+/// `levels` `AnyValue`s: `levels - 1` single-entry `kvlistValue` wrappers around an `intValue`
+/// leaf.
+fn otlp_pb_kvlist_value(levels: usize) -> otlp_common::AnyValue {
+    use otlp_common::any_value::Value as Any;
+    let mut v = otlp_int_leaf();
+    for _ in 1..levels {
+        v = otlp_common::AnyValue {
+            value: Some(Any::KvlistValue(otlp_common::KeyValueList {
+                values: vec![otlp_key_value("k", v)],
+            })),
+        };
+    }
+    v
+}
+
+/// A `LogsData` whose resource carries `value` under the attribute `k`: the shallowest place an
+/// `AnyValue` sits in any OTLP message, so the deepest nesting either parser admits lands there.
+fn otlp_pb_logs_with_resource_attribute(value: otlp_common::AnyValue) -> Bytes {
+    let data = otlp_logs::LogsData {
+        resource_logs: vec![otlp_logs::ResourceLogs {
+            resource: Some(otlp_resource::Resource {
+                attributes: vec![otlp_key_value("k", value)],
+                ..Default::default()
+            }),
+            scope_logs: vec![otlp_logs::ScopeLogs {
+                log_records: vec![otlp_logs::LogRecord {
+                    body: Some(otlp_int_leaf()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// `levels` OTLP/JSON `AnyValue`s: `levels - 1` `arrayValue` wrappers around an `intValue` leaf.
+/// Each wrapper opens three JSON levels (`{`, `{`, `[`).
+fn otlp_json_array_value(levels: usize) -> String {
+    let mut s = String::from(r#"{"intValue":"1"}"#);
+    for _ in 1..levels {
+        s = format!(r#"{{"arrayValue":{{"values":[{s}]}}}}"#);
+    }
+    s
+}
+
+/// `levels` OTLP/JSON `AnyValue`s: `levels - 1` single-entry `kvlistValue` wrappers around an
+/// `intValue` leaf. Each wrapper opens four JSON levels (`{`, `{`, `[`, `{`).
+fn otlp_json_kvlist_value(levels: usize) -> String {
+    let mut s = String::from(r#"{"intValue":"1"}"#);
+    for _ in 1..levels {
+        s = format!(r#"{{"kvlistValue":{{"values":[{{"key":"k","value":{s}}}]}}}}"#);
+    }
+    s
+}
+
+/// The OTLP/JSON counterpart of [`otlp_pb_logs_with_resource_attribute`].
+fn otlp_json_logs_with_resource_attribute(value: &str) -> Bytes {
+    Bytes::from(format!(
+        r#"{{"resourceLogs":[{{"resource":{{"attributes":[{{"key":"k","value":{value}}}]}},"scopeLogs":[{{"logRecords":[{{"body":{{"stringValue":"x"}}}}]}}]}}]}}"#
+    ))
+}
+
+fn value_depth(v: &Value) -> usize {
+    match v {
+        Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
+        Value::Map(map) => 1 + map.iter().map(|(_, v)| value_depth(v)).max().unwrap_or(0),
+        _ => 1,
+    }
+}
+
+/// The depth of the resource attribute `k` the builders above nest into.
+fn otlp_resource_attribute_depth(batches: &[EventBatch]) -> usize {
+    assert_eq!(batches.len(), 1);
+    value_depth(batches[0].resource.attributes.get("k").expect("resource attribute k"))
+}
+
+fn assert_malformed_with(result: Result<Vec<EventBatch>, CodecError>, needle: &str) {
+    match result {
+        Err(CodecError::Malformed(msg)) => {
+            assert!(msg.contains(needle), "expected {needle:?} in the error, got {msg:?}")
+        }
+        other => panic!("expected CodecError::Malformed containing {needle:?}, got {other:?}"),
+    }
+}
+
+/// serde_json stops at 128 JSON levels. An `arrayValue` costs three of them per `AnyValue` and a
+/// `kvlistValue` four, so a resource attribute, three levels below the root, holds 41 and 31
+/// `AnyValue`s. A log body, span attribute, or data-point attribute sits deeper and holds fewer.
+#[test]
+fn otlp_json_nesting_is_bounded_by_serde_json_at_41_any_value_levels() {
+    assert_json_nesting_limit(41, otlp_json_array_value);
+    assert_json_nesting_limit(31, otlp_json_kvlist_value);
+}
+
+/// `levels` `AnyValue`s from `nest` decode at full depth, and one more is serde_json's error.
+fn assert_json_nesting_limit(levels: usize, nest: fn(usize) -> String) {
+    let decode = |body: Bytes| OtlpDecoder::new().decode_signal_json(Signal::Logs, body);
+    let at_limit = decode(otlp_json_logs_with_resource_attribute(&nest(levels))).unwrap();
+    assert_eq!(otlp_resource_attribute_depth(&at_limit), levels);
+    assert_malformed_with(
+        decode(otlp_json_logs_with_resource_attribute(&nest(levels + 1))),
+        "recursion limit exceeded",
+    );
+}
+
+/// prost 0.14 stops at 100 nested messages. An `AnyValue` inside an `arrayValue` costs two of
+/// them (`AnyValue`, `ArrayValue`) and inside a `kvlistValue` three (plus `KeyValue`), so a
+/// resource attribute holds 49 and 33 `AnyValue`s.
+#[test]
+fn otlp_proto_nesting_is_bounded_by_prost_at_49_any_value_levels() {
+    assert_proto_nesting_limit(49, otlp_pb_array_value);
+    assert_proto_nesting_limit(33, otlp_pb_kvlist_value);
+}
+
+/// `levels` `AnyValue`s from `nest` decode at full depth, and one more is prost's error.
+fn assert_proto_nesting_limit(levels: usize, nest: fn(usize) -> otlp_common::AnyValue) {
+    let decode = |body: Bytes| OtlpDecoder::new().decode_signal(Signal::Logs, body);
+    let at_limit = decode(otlp_pb_logs_with_resource_attribute(nest(levels))).unwrap();
+    assert_eq!(otlp_resource_attribute_depth(&at_limit), levels);
+    assert_malformed_with(
+        decode(otlp_pb_logs_with_resource_attribute(nest(levels + 1))),
+        "recursion limit reached",
+    );
+}
+
+/// The deepest `Value` either OTLP parser admits (49, from protobuf) is under native's own cap
+/// (128), so an `otlp_in -> logit_out` hop never builds a frame the peer's `logit_in` rejects.
+#[test]
+fn otlp_nesting_stays_under_the_native_depth_cap() {
+    let from_proto = OtlpDecoder::new()
+        .decode_signal(Signal::Logs, otlp_pb_logs_with_resource_attribute(otlp_pb_array_value(49)))
+        .unwrap();
+    let from_json = OtlpDecoder::new()
+        .decode_signal_json(
+            Signal::Logs,
+            otlp_json_logs_with_resource_attribute(&otlp_json_array_value(41)),
+        )
+        .unwrap();
+    for batches in [from_proto, from_json] {
+        let batch = &batches[0];
+        let mut payload = native::encode_batch(batch);
+        let decoded = native::decode_batch(&mut payload, &DecodeBudget::default()).unwrap();
+        assert_eq!(&decoded, batch);
+    }
+}
+
+/// Every model timestamp an OTLP decode sets, labelled by the field it came from.
+fn otlp_timestamps(batches: &[EventBatch]) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        for event in &batch.events {
+            if let Some(log) = &event.log {
+                out.push(("log timestamp".to_string(), event.timestamp));
+                out.push(("log observed_timestamp".to_string(), log.observed_timestamp));
+            }
+            if let Some(span) = &event.span {
+                out.push(("span start".to_string(), event.timestamp));
+                out.push(("span end".to_string(), span.end_timestamp));
+                for e in &span.events {
+                    out.push(("span event".to_string(), e.timestamp));
+                }
+            }
+            for m in &event.metrics {
+                let name = logit_core::interner::resolve(m.name);
+                out.push((format!("{name} timestamp"), event.timestamp));
+                out.push((format!("{name} start_timestamp"), m.start_timestamp));
+                for x in &m.exemplars {
+                    out.push((format!("{name} exemplar"), x.timestamp));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Asserts `batches` carry `fields` timestamps and every one is `i64::MAX`.
+fn assert_every_timestamp_saturated(case: &str, batches: &[EventBatch], fields: usize) {
+    let stamps = otlp_timestamps(batches);
+    assert_eq!(stamps.len(), fields, "{case}: {stamps:?}");
+    for (field, ts) in &stamps {
+        assert_eq!(*ts, i64::MAX, "{case}: {field}");
+    }
+}
+
+fn otlp_pb_logs_at(time: u64, observed: u64) -> Bytes {
+    let data = otlp_logs::LogsData {
+        resource_logs: vec![otlp_logs::ResourceLogs {
+            scope_logs: vec![otlp_logs::ScopeLogs {
+                log_records: vec![otlp_logs::LogRecord {
+                    time_unix_nano: time,
+                    observed_time_unix_nano: observed,
+                    body: Some(otlp_int_leaf()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// A span starting and ending at `t`, with one span event at `t`.
+fn otlp_pb_traces_at(t: u64) -> Bytes {
+    let data = otlp_trace::TracesData {
+        resource_spans: vec![otlp_trace::ResourceSpans {
+            scope_spans: vec![otlp_trace::ScopeSpans {
+                spans: vec![otlp_trace::Span {
+                    trace_id: OTLP_TRACE_ID.to_vec(),
+                    span_id: OTLP_SPAN_ID.to_vec(),
+                    name: "s".into(),
+                    start_time_unix_nano: t,
+                    end_time_unix_nano: t,
+                    events: vec![otlp_trace::span::Event {
+                        time_unix_nano: t,
+                        name: "e".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// One metric of each of OTLP's five kinds with every time field at `t`, plus an exemplar at `t`
+/// on each kind that has an `exemplars` field (all but `Summary`): 14 model timestamps.
+fn otlp_pb_metrics_at(t: u64) -> Bytes {
+    use otlp_metrics::metric::Data;
+    let exemplar = || otlp_metrics::Exemplar {
+        time_unix_nano: t,
+        value: Some(otlp_metrics::exemplar::Value::AsDouble(1.0)),
+        ..Default::default()
+    };
+    let number_point = || otlp_metrics::NumberDataPoint {
+        start_time_unix_nano: t,
+        time_unix_nano: t,
+        exemplars: vec![exemplar()],
+        value: Some(otlp_metrics::number_data_point::Value::AsDouble(1.0)),
+        ..Default::default()
+    };
+    let metric = |name: &str, data| otlp_metrics::Metric {
+        name: name.into(),
+        data: Some(data),
+        ..Default::default()
+    };
+    let metrics = vec![
+        metric(
+            "sum",
+            Data::Sum(otlp_metrics::Sum {
+                data_points: vec![number_point()],
+                aggregation_temporality: 1,
+                is_monotonic: true,
+            }),
+        ),
+        metric("gauge", Data::Gauge(otlp_metrics::Gauge { data_points: vec![number_point()] })),
+        metric(
+            "histogram",
+            Data::Histogram(otlp_metrics::Histogram {
+                data_points: vec![otlp_metrics::HistogramDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    bucket_counts: vec![1],
+                    exemplars: vec![exemplar()],
+                    ..Default::default()
+                }],
+                aggregation_temporality: 1,
+            }),
+        ),
+        metric(
+            "summary",
+            Data::Summary(otlp_metrics::Summary {
+                data_points: vec![otlp_metrics::SummaryDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    ..Default::default()
+                }],
+            }),
+        ),
+        metric(
+            "exponential_histogram",
+            Data::ExponentialHistogram(otlp_metrics::ExponentialHistogram {
+                data_points: vec![otlp_metrics::ExponentialHistogramDataPoint {
+                    start_time_unix_nano: t,
+                    time_unix_nano: t,
+                    count: 1,
+                    exemplars: vec![exemplar()],
+                    ..Default::default()
+                }],
+                aggregation_temporality: 1,
+            }),
+        ),
+    ];
+    let data = otlp_metrics::MetricsData {
+        resource_metrics: vec![otlp_metrics::ResourceMetrics {
+            scope_metrics: vec![otlp_metrics::ScopeMetrics { metrics, ..Default::default() }],
+            ..Default::default()
+        }],
+    };
+    Bytes::from(prost::Message::encode_to_vec(&data))
+}
+
+/// Every protobuf case at `t`, with the number of model timestamps each decodes to. A `time` of
+/// 0 takes `decode_log_record`'s fallback to `observed_time_unix_nano`.
+fn otlp_pb_cases_at(t: u64) -> [(&'static str, Signal, Bytes, usize); 4] {
+    [
+        ("logs, time and observed", Signal::Logs, otlp_pb_logs_at(t, t), 2),
+        ("logs, time 0 falls back to observed", Signal::Logs, otlp_pb_logs_at(0, t), 2),
+        ("traces", Signal::Traces, otlp_pb_traces_at(t), 3),
+        ("metrics, all five kinds", Signal::Metrics, otlp_pb_metrics_at(t), 14),
+    ]
+}
+
+#[test]
+fn every_otlp_wire_timestamp_past_i64_max_saturates() {
+    for t in OTLP_TIMESTAMPS_PAST_I64_MAX {
+        for (case, signal, body, fields) in otlp_pb_cases_at(t) {
+            let batches = OtlpDecoder::new().decode_signal(signal, body).unwrap();
+            assert_every_timestamp_saturated(&format!("protobuf {case} at {t}"), &batches, fields);
+        }
+
+        // proto3 JSON writes a 64-bit integer as a decimal string.
+        let t = format!("\"{t}\"");
+        let json_cases = [
+            (
+                "logs",
+                Signal::Logs,
+                format!(
+                    r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{"timeUnixNano":{t},"observedTimeUnixNano":{t},"body":{{"stringValue":"x"}}}}]}}]}}]}}"#
+                ),
+                2,
+            ),
+            (
+                "traces",
+                Signal::Traces,
+                format!(
+                    r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"traceId":"01010101010101010101010101010101","spanId":"0202020202020202","name":"s","startTimeUnixNano":{t},"endTimeUnixNano":{t},"events":[{{"timeUnixNano":{t},"name":"e"}}]}}]}}]}}]}}"#
+                ),
+                3,
+            ),
+            (
+                "metrics",
+                Signal::Metrics,
+                format!(
+                    r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{{"name":"g","gauge":{{"dataPoints":[{{"startTimeUnixNano":{t},"timeUnixNano":{t},"asDouble":1.0,"exemplars":[{{"timeUnixNano":{t},"asDouble":1.0}}]}}]}}}}]}}]}}]}}"#
+                ),
+                3,
+            ),
+        ];
+        for (case, signal, body, fields) in json_cases {
+            let batches = OtlpDecoder::new().decode_signal_json(signal, Bytes::from(body)).unwrap();
+            assert_every_timestamp_saturated(&format!("JSON {case} at {t}"), &batches, fields);
+        }
+    }
+}
+
+/// A saturated timestamp is a fixed point: the encoder's `.max(0)` clamp passes `i64::MAX`
+/// through to the wire, and it decodes as `i64::MAX` again.
+#[test]
+fn a_saturated_timestamp_relays_as_i64_max() {
+    for (case, signal, body, fields) in otlp_pb_cases_at(u64::MAX) {
+        let first = OtlpDecoder::new().decode_signal(signal, body).unwrap();
+        let mut relayed = Vec::new();
+        for batch in &first {
+            for (signal, bytes) in OtlpEncoder::new().encode_signals(batch).unwrap() {
+                if signal == Signal::Logs {
+                    let wire: otlp_logs::LogsData = prost::Message::decode(bytes.clone()).unwrap();
+                    let record = &wire.resource_logs[0].scope_logs[0].log_records[0];
+                    assert_eq!(record.time_unix_nano, i64::MAX as u64, "{case}");
+                    assert_eq!(record.observed_time_unix_nano, i64::MAX as u64, "{case}");
+                }
+                relayed.extend(OtlpDecoder::new().decode_signal(signal, bytes).unwrap());
+            }
+        }
+        assert_every_timestamp_saturated(&format!("relayed {case}"), &relayed, fields);
+    }
+}
+
+/// OTLP/JSON parses into a whole `serde_json::Value` tree before any OTLP field is read, so its
+/// peak heap per input byte is higher than protobuf's. `docs/known-gaps.md`'s OTLP section records
+/// both measured ratios. The ceilings leave headroom over them, so a change that moves either
+/// ratio fails here instead of drifting from that entry.
+#[test]
+fn otlp_json_peak_memory_per_input_byte_is_documented() {
+    // A real OTel SDK export (`testdata/interop/otlp/README.md` has its provenance): ordinary
+    // OTLP/JSON structure. Measured at about 19 bytes of heap per input byte.
+    let ordinary = Bytes::from(
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/interop/otlp/logs.json"
+        ))
+        .unwrap(),
+    );
+    // Crafted: tiny `{"":0}` objects under a key OTLP doesn't define, which serde_json builds in
+    // full and the decoder then ignores. Measured at about 98 bytes of heap per input byte, the
+    // worst shape found.
+    let crafted = {
+        let head = r#"{"resourceLogs":[],"x":["#;
+        let element = r#"{"":0}"#;
+        let n = (OTLP_JSON_MEMORY_BODY_BYTES - head.len() - 2) / (element.len() + 1);
+        let mut body = String::with_capacity(OTLP_JSON_MEMORY_BODY_BYTES);
+        body.push_str(head);
+        body.push_str(&vec![element; n].join(","));
+        body.push_str("]}");
+        Bytes::from(body)
+    };
+    for (case, body, ceiling) in [("ordinary", ordinary, 24.0), ("crafted", crafted, 128.0)] {
+        // The first decode grows the process interner once; the second is the one measured.
+        OtlpDecoder::new().decode_signal_json(Signal::Logs, body.clone()).unwrap();
+        let len = body.len();
+        let peak = peak_live_bytes(move || {
+            let decoded = OtlpDecoder::new().decode_signal_json(Signal::Logs, body).unwrap();
+            std::hint::black_box(&decoded);
+        });
+        let ratio = peak as f64 / len as f64;
+        assert!(
+            ratio <= ceiling,
+            "{case}: {len}-byte body peaked at {peak} live bytes, {ratio:.1} per input byte, \
+             over the documented ceiling of {ceiling}"
+        );
+    }
 }
 
 // -- native decode: canonical varints, trailing bytes, the decode budget -----------------------

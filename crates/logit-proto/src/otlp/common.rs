@@ -17,11 +17,27 @@
 //! and are never copied into `Event::attributes`; a sink that wants resource → scope → point
 //! precedence merges them at render time, as `crates/logit-outputs/src/influxdb.rs`'s
 //! `render_tag_suffix` does.
+//!
+//! **`AnyValue` nesting has no local depth cap.** Neither [`any_value_to_value`] nor the OTLP/JSON
+//! walk (`json`'s `any_value`) counts depth. Each parser's own limit bounds them: serde_json
+//! rejects past 128 JSON levels (at most 41 `AnyValue` levels), and prost past 100 nested
+//! messages (at most 49). Both stay under native's `MAX_VALUE_DEPTH` (128).
+//! `crates/logit-proto/tests/robustness.rs`'s `otlp_*_nesting_*` tests pin both numbers, so a
+//! dependency bump that moves one fails a test rather than a process (ADR
+//! `deployment-threat-model`).
 
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Resource, Scope, Value};
+
+/// Converts a wire timestamp to the model's. OTLP's `*_unix_nano` fields are `fixed64`, and the
+/// model's timestamps are `i64` nanoseconds, so a wire value past `i64::MAX` (a date past
+/// 2262-04-11) saturates to `i64::MAX` instead of wrapping negative. ADR `lossless-transit`'s
+/// "Permitted normalizations" list names the saturation.
+pub(crate) fn wire_nanos(nanos: u64) -> i64 {
+    i64::try_from(nanos).unwrap_or(i64::MAX)
+}
 
 /// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the lossy cases.
 pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {

@@ -120,9 +120,9 @@
 //! bound made explicit, opt-in, and available on both transports.
 //!
 //! **Gzip, and nothing else.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's compressed flag
-//! with `grpc-encoding: gzip` are decoded via [`inflate`]; any other declared encoding is
-//! rejected (`415`/`grpc-status: 12`). Both headers are matched case-insensitively, since
-//! content-coding names are (RFC 9110 §8.4.1). `inflate` bounds the *decompressed* size to
+//! with `grpc-encoding: gzip` are decoded via [`grpc::inflate_bounded`]; any other declared
+//! encoding is rejected (`415`/`grpc-status: 12`). Both headers are matched case-insensitively,
+//! since content-coding names are (RFC 9110 §8.4.1). The *decompressed* size is bounded to
 //! [`MAX_REQUEST_BYTES`], the cap already on the compressed body, so a compression bomb is
 //! rejected rather than inflated (`docs/adr/otlp-compression-and-decompression-bounds.md`).
 //!
@@ -167,6 +167,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
+use logit_proto::otlp::grpc::{self, InflateError};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
 // Only the test module's `tls_connector` reads PEM files directly; server TLS is `crate::tls`.
@@ -564,7 +565,7 @@ async fn handle_http(
         }
     };
     let bytes = if gzip_encoded {
-        match inflate(&bytes) {
+        match grpc::inflate_bounded(&bytes, MAX_REQUEST_BYTES) {
             Ok(inflated) => inflated,
             Err(InflateError::TooLarge) => {
                 return Ok(text_response(
@@ -653,7 +654,7 @@ async fn handle_grpc(
     else {
         return Ok(grpc_response(12, &format!("unknown method {path}"), None));
     };
-    // The frame's compressed flag (`grpc_unframe`) drives decompression; this check only rejects
+    // The frame's compressed flag (`grpc::unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
         // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is;
@@ -681,7 +682,7 @@ async fn handle_grpc(
             return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None))
         }
     };
-    let Some((compressed, payload)) = grpc_unframe(&framed) else {
+    let Some((compressed, payload)) = grpc::unframe(&framed) else {
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
     };
     // `Export` is unary, so its body is one message. Bytes after it are a sender's encoder bug,
@@ -698,7 +699,7 @@ async fn handle_grpc(
         ));
     }
     let payload = if compressed {
-        match inflate(payload) {
+        match grpc::inflate_bounded(payload, MAX_REQUEST_BYTES) {
             Ok(inflated) => inflated,
             Err(InflateError::TooLarge) => {
                 return Ok(grpc_response(
@@ -799,45 +800,6 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
     buf
-}
-
-/// The mirror of [`grpc_frame`], returning the compressed flag with the payload so the caller
-/// knows whether to [`inflate`]. Unlike `logit_outputs::otlp::grpc_unframe`, a compressed frame
-/// is accepted: a request may be gzipped. `None` for less than one complete frame, a flag byte
-/// other than `0`/`1`, or a declared length past the end.
-fn grpc_unframe(bytes: &[u8]) -> Option<(bool, &[u8])> {
-    if bytes.len() < 5 {
-        return None;
-    }
-    let compressed = match bytes[0] {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let len = u32::from_be_bytes(bytes[1..5].try_into().expect("checked len >= 5 above")) as usize;
-    bytes.get(5..5 + len).map(|payload| (compressed, payload))
-}
-
-/// Why [`inflate`] failed: `400`/`INVALID_ARGUMENT` (not valid gzip) versus
-/// `413`/`RESOURCE_EXHAUSTED` (decompressed past the cap).
-enum InflateError {
-    Malformed,
-    TooLarge,
-}
-
-/// Inflates `compressed` (gzip), bounded to [`MAX_REQUEST_BYTES`], the cap [`Limited`] already
-/// puts on the compressed body, so a few KiB of gzipped zeros can't inflate to gigabytes.
-/// `Read::take` allows one byte past the cap, so an input inflating to `MAX_REQUEST_BYTES + 1`
-/// is caught rather than truncated to fit.
-fn inflate(compressed: &[u8]) -> Result<Bytes, InflateError> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(compressed).take(MAX_REQUEST_BYTES as u64 + 1);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|_| InflateError::Malformed)?;
-    if out.len() > MAX_REQUEST_BYTES {
-        return Err(InflateError::TooLarge);
-    }
-    Ok(Bytes::from(out))
 }
 
 fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
@@ -1369,8 +1331,9 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
-    /// A few KiB of gzipped zeros inflating past `MAX_REQUEST_BYTES` is caught by `inflate`'s
-    /// decompressed bound, which `Limited`'s compressed bound (satisfied here) cannot.
+    /// A few KiB of gzipped zeros inflating past `MAX_REQUEST_BYTES` is caught by
+    /// `grpc::inflate_bounded`'s decompressed bound, which `Limited`'s compressed bound (satisfied
+    /// here) cannot.
     #[tokio::test]
     async fn a_gzip_body_that_would_inflate_past_the_size_cap_is_rejected_with_413() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;

@@ -1,8 +1,11 @@
 #!/bin/bash
 # Usage: script/format [--check]
+#
+# Also formats `fuzz/` (the fuzz targets and seedgen), its own workspace outside the root one.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 run cargo fmt --all -- "$@"
+run cargo fmt --manifest-path fuzz/Cargo.toml --all -- "$@"

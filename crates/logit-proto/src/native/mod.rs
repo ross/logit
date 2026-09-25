@@ -23,6 +23,8 @@
 //!   reproduces it byte for byte.
 //! - Every decode is charged against a [`DecodeBudget`] (see [`budget`]), so a small payload
 //!   can't expand past a bounded multiple of the frame cap.
+//!
+//! These two rules, and the budget's 4x multiplier, are decided in ADR `untrusted-input-bounds`.
 
 pub mod budget;
 pub mod control;

@@ -335,12 +335,32 @@ impl HyperLogLog {
         bytes
     }
 
-    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or malformed blob.
+    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or malformed blob, on
+    /// bytes left after it, and on an HLL representation whose zero-register count exceeds its
+    /// register count (upstream's `estimate` computes `M - zeros`). The harmonic sum in `data[1]`
+    /// is taken as written: it's an `f32` accumulated one register update at a time, so
+    /// recomputing it from the registers wouldn't reproduce the bytes, and a bad one skews the
+    /// estimate without panicking.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HllDecodeError> {
         let mut reader = HllBytesReader::new(bytes);
         let inner: cardinality_estimator::CardinalityEstimator<[u8]> =
             serde::Deserialize::deserialize(&mut reader)?;
-        Ok(HyperLogLog(inner))
+        // Wrapped before the checks below, so an early return drops it through upstream's `Drop`.
+        let hll = HyperLogLog(inner);
+        if !reader.bytes.is_empty() {
+            return Err(HllDecodeError(format!(
+                "{} trailing bytes after the blob",
+                reader.bytes.len()
+            )));
+        }
+        if let Some(zeros) = hll_zero_register_count(bytes) {
+            if zeros as usize > CE_HLL_REGISTERS {
+                return Err(HllDecodeError(format!(
+                    "HLL zero-register count {zeros} exceeds the {CE_HLL_REGISTERS} registers"
+                )));
+            }
+        }
+        Ok(hll)
     }
 }
 
@@ -597,10 +617,30 @@ const CE_REPRESENTATION_HLL: u8 = 3;
 // `validate_members_len` rejects the same range before allocating.
 const CE_ARRAY_MAX_CAPACITY: usize = 128;
 
-// Mirrors upstream's `pub(crate)` `HLL_SLICE_LEN` for `CardinalityEstimator<[u8]>`'s default
-// `P = 12, W = 6`: `(1 << P) * W / 32 + 3`. `hll_slice_len_matches_upstream_constant` recomputes
-// it; an upgrade that changes `P`, `W`, or the formula must update this in lockstep.
-const CE_HLL_SLICE_LEN: usize = 771;
+// Mirror upstream's `pub(crate)` `HyperLogLog::M` and `HLL_SLICE_LEN` for
+// `CardinalityEstimator<[u8]>`'s default `P = 12, W = 6`: `M = 1 << P` registers, and a slice of
+// `M * W / 32 + 3` words (zero-register count, harmonic sum, packed registers, one spare).
+// `hll_slice_len_matches_what_upstream_serializes` checks the slice length against a blob
+// upstream wrote; an upgrade that changes `P`, `W`, or the layout must update these in lockstep.
+const CE_HLL_P: usize = 12;
+const CE_HLL_W: usize = 6;
+const CE_HLL_REGISTERS: usize = 1 << CE_HLL_P;
+const CE_HLL_SLICE_LEN: usize = CE_HLL_REGISTERS * CE_HLL_W / 32 + 3;
+
+// Where `members` starts in a blob: the 8-byte `data` word, the presence byte, and the 4-byte
+// length (the codec's wire layout above).
+const HLL_MEMBERS_OFFSET: usize = 8 + 1 + 4;
+
+/// The HLL representation's `data[0]`, its zero-register count, read from a blob that already
+/// decoded; `None` for the small and array representations.
+fn hll_zero_register_count(bytes: &[u8]) -> Option<u32> {
+    let tag = bytes.first()? & 0x3;
+    if tag != CE_REPRESENTATION_HLL || bytes.get(8) != Some(&1) {
+        return None;
+    }
+    let word = bytes.get(HLL_MEMBERS_OFFSET..HLL_MEMBERS_OFFSET + 4)?;
+    Some(u32::from_le_bytes(word.try_into().expect("4 bytes")))
+}
 
 /// The deserializer behind [`HyperLogLog::from_bytes`], which works around an allocation-layout
 /// bug in `cardinality-estimator` 1.0.3.
@@ -1193,7 +1233,10 @@ mod tests {
 
     // -- `HllBytesReader`'s capacity-invariant workaround ------------------------------------
 
-    /// Non-power-of-two array counts and HLL counts round-trip; under Miri this catches the UB.
+    /// Non-power-of-two array counts and HLL counts round-trip. `script/unsafe-check miri` runs it
+    /// under `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`, where it catches the
+    /// `Layout` UB if `HllBytesReader`'s size hint regresses; under Miri's default Stacked Borrows,
+    /// or Tree Borrows, it fails first inside upstream (`docs/adr/out-of-ci-unsafe-verification.md`).
     #[test]
     fn hyperloglog_round_trips_non_power_of_two_member_counts() {
         for n in [3u32, 5, 9, 17, 100, 300] {
@@ -1241,12 +1284,152 @@ mod tests {
         }
     }
 
-    /// `CE_HLL_SLICE_LEN` matches upstream's formula at the default `P = 12, W = 6`.
+    /// A hand-built blob: the `data` word, then the optional `members` list.
+    fn hll_blob(data: u64, members: Option<&[u32]>) -> Vec<u8> {
+        let mut out = data.to_le_bytes().to_vec();
+        match members {
+            None => out.push(0),
+            Some(m) => {
+                out.push(1);
+                out.extend_from_slice(&(m.len() as u32).to_le_bytes());
+                for v in m {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// The HLL representation's `data[0]` counts zero registers, and upstream's `estimate`
+    /// computes `M - zeros`: a count past `M` underflows (a debug panic, a release estimate of 0)
+    /// and survives every later merge into the window's accumulator.
     #[test]
-    fn hll_slice_len_matches_upstream_constant() {
-        const P: usize = 12;
-        const W: usize = 6;
-        let m = 1usize << P;
-        assert_eq!(CE_HLL_SLICE_LEN, m * W / 32 + 3);
+    fn an_hll_zero_register_count_past_m_is_rejected() {
+        let registers = CE_HLL_REGISTERS as u32;
+        let with_zeros = |zeros: u32| {
+            let mut members = hll_with(5000).to_bytes()[HLL_MEMBERS_OFFSET..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect::<Vec<_>>();
+            members[0] = zeros;
+            hll_blob(CE_REPRESENTATION_HLL as u64, Some(&members))
+        };
+        for zeros in [registers + 1, u32::MAX] {
+            let err = HyperLogLog::from_bytes(&with_zeros(zeros)).expect_err("rejected");
+            assert!(err.to_string().contains("zero-register count"), "{err}");
+        }
+        assert!(HyperLogLog::from_bytes(&with_zeros(registers)).is_ok());
+    }
+
+    /// A valid blob followed by anything is malformed, in every representation.
+    #[test]
+    fn trailing_bytes_after_an_hll_blob_are_rejected() {
+        for n in [0u32, 1, 10, 5000] {
+            let mut bytes = hll_with(n).to_bytes();
+            bytes.push(0);
+            let err = HyperLogLog::from_bytes(&bytes).expect_err("rejected");
+            assert!(err.to_string().contains("trailing"), "{n} members: {err}");
+        }
+    }
+
+    /// `CE_HLL_SLICE_LEN` matches the members list upstream's own `Serialize` writes for an HLL
+    /// representation, and `CE_HLL_REGISTERS` the zero-register count of a fresh one.
+    #[test]
+    fn hll_slice_len_matches_what_upstream_serializes() {
+        let bytes = hll_with(5000).to_bytes();
+        assert_eq!(bytes[0] & 0x3, CE_REPRESENTATION_HLL);
+        assert_eq!(bytes.len(), HLL_MEMBERS_OFFSET + CE_HLL_SLICE_LEN * 4);
+
+        let mut one = HyperLogLog::new();
+        for i in 0..200u32 {
+            one.insert(&i.to_le_bytes());
+        }
+        let zeros = hll_zero_register_count(&one.to_bytes()).expect("HLL representation");
+        assert!(zeros as usize <= CE_HLL_REGISTERS && zeros as usize > CE_HLL_REGISTERS - 200);
+    }
+
+    /// Pins the assumption `HllBytesReader`'s size hint rests on: serde_core 1.0.229's `Vec<T>`
+    /// visitor allocates `Vec::with_capacity(size_hint::cautious::<T>(seq.size_hint()))`, and
+    /// `cautious` caps that at 1 MiB (262,144 `u32`s), far above either representation's. So the
+    /// members `Vec` has the capacity upstream later frees: `len.next_power_of_two()` for the
+    /// array representation, `CE_HLL_SLICE_LEN` for HLL. A serde release that sizes the `Vec`
+    /// differently fails here before it can reinstate the `Layout` UB.
+    #[test]
+    fn a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees() {
+        use serde::Deserialize;
+        for n in [3u32, 4, 5, 7, 9, 17, 33, 65, 100, 127, 128, 5000] {
+            let bytes = hll_with(n).to_bytes();
+            let mut reader = HllBytesReader::new(&bytes);
+            let (data, members): (usize, Option<Vec<u32>>) =
+                Deserialize::deserialize(&mut reader).expect("valid blob");
+            let members = members.expect("array or HLL representation");
+            let expected = match (data & 0x3) as u8 {
+                CE_REPRESENTATION_ARRAY => members.len().next_power_of_two(),
+                CE_REPRESENTATION_HLL => CE_HLL_SLICE_LEN,
+                tag => panic!("{n} members: tag {tag}"),
+            };
+            assert_eq!(members.capacity(), expected, "{n} members");
+        }
+        let bytes = hll_with(5000).to_bytes();
+        let mut reader = HllBytesReader::new(&bytes);
+        let (_, members): (usize, Option<Vec<u32>>) =
+            Deserialize::deserialize(&mut reader).expect("valid blob");
+        assert_eq!(members.expect("HLL representation").capacity(), 771);
+    }
+
+    /// Set-union laws on `estimate`: idempotent, commutative, associative, and a merge of two
+    /// estimators estimates what one fed both populations does. Byte-level commutativity does not
+    /// hold (the array representation keeps insertion order), which `HyperLogLog`'s `PartialEq`
+    /// doc records; these compare estimates.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn members() -> impl Strategy<Value = Vec<u32>> {
+            prop_oneof![
+                prop::collection::vec(any::<u32>(), 0..4),
+                prop::collection::vec(any::<u32>(), 0..140),
+                prop::collection::vec(any::<u32>(), 100..3000),
+            ]
+        }
+
+        fn hll_of(members: &[u32]) -> HyperLogLog {
+            let mut hll = HyperLogLog::new();
+            for m in members {
+                hll.insert(&m.to_le_bytes());
+            }
+            hll
+        }
+
+        fn union(a: &HyperLogLog, b: &HyperLogLog) -> HyperLogLog {
+            let mut out = a.clone();
+            out.merge(b);
+            out
+        }
+
+        proptest! {
+            #[test]
+            fn hll_merge_is_idempotent_commutative_and_associative(
+                a in members(),
+                b in members(),
+                c in members(),
+            ) {
+                let (a, b, c) = (hll_of(&a), hll_of(&b), hll_of(&c));
+                prop_assert_eq!(union(&a, &a).estimate(), a.estimate());
+                prop_assert_eq!(union(&a, &b).estimate(), union(&b, &a).estimate());
+                prop_assert_eq!(
+                    union(&union(&a, &b), &c).estimate(),
+                    union(&a, &union(&b, &c)).estimate()
+                );
+            }
+
+            #[test]
+            fn hll_merge_estimates_what_inserting_both_does(a in members(), b in members()) {
+                let both: Vec<u32> = a.iter().chain(&b).copied().collect();
+                prop_assert_eq!(union(&hll_of(&a), &hll_of(&b)).estimate(), hll_of(&both).estimate());
+            }
+        }
     }
 }

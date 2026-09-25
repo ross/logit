@@ -24,6 +24,19 @@
 //! [`DdSketch::quantile`] for why not the Agent's own interpolation), clamped to the exact
 //! `[min, max]`, so the relative error is at most the mapping's: `1 - 1/√γ` (0.78%) under the
 //! Agent mapping, `1 - 2/(1+γ)` under a logarithmic one.
+//!
+//! [`DdSketch::from_bytes`] reads blobs from `logit_in` peers and the disk spool, and bounds what
+//! a blob can cost: the bin count by the blob's length, `bin_limit` by
+//! [`Mapping::MAX_BIN_LIMIT`] (store operations are linear in the store size and a cross-mapping
+//! merge quadratic, so that cap is their bound), and an Agent key by the Agent's key space. Every
+//! bin count, and the zero count, stays finite: a fold, merge, or collapse sums counts saturating
+//! at `f64::MAX`, so `to_bytes` is a fixed point across `from_bytes`, which drops a non-finite
+//! count. It
+//! takes the summary as written. A decoded `min > max` makes quantiles non-monotonic, an infinite
+//! or `NaN` `min`/`max` reaches [`DdSketch::quantile`]'s clamp unchanged, and a `count` of 0 over
+//! populated bins makes [`DdSketch::merge`] skip the sketch. None of these panics;
+//! `docs/known-gaps.md` ("Event model and interner") records them as accepted under
+//! `docs/adr/untrusted-input-bounds.md`'s "Threat model".
 
 use std::fmt;
 
@@ -58,7 +71,19 @@ impl Mapping {
     pub const AGENT_MIN: f64 = 1e-9;
     /// The Agent's `maxKey`; `Self::AGENT_INF_KEY` is `InfKey(1)`.
     pub const AGENT_MAX_KEY: i32 = 32766;
+    /// The highest Agent key, and so the highest `|k|` a `Dogsketch` carries: under
+    /// [`MappingKind::Agent`] every stored key is in `1..=AGENT_INF_KEY`, in either store.
     pub const AGENT_INF_KEY: i32 = 32767;
+    /// The largest `bin_limit` a [`Mapping`] takes: the Agent's own, which is also the larger of
+    /// the two limits Datadog uses (APM stats sketches collapse at 2048). A logarithmic mapping
+    /// asking for more is clamped by [`Mapping::logarithmic`] and refused by
+    /// [`Mapping::try_logarithmic`], so no encoder writes more and [`DdSketch::from_bytes`]
+    /// rejects more as malformed.
+    ///
+    /// The cap is what bounds the stores' cost. `insert_bin` shifts the store on every new key
+    /// and `merge_bins` rebuilds it, so a cross-mapping merge is `O(N·M)` and each later insert
+    /// or merge `O(N)` in the store size; a store that never collapses makes those unbounded.
+    pub const MAX_BIN_LIMIT: u32 = Self::AGENT_BIN_LIMIT;
 
     /// The Agent's `Config.Default()`.
     pub fn agent() -> Self {
@@ -75,17 +100,23 @@ impl Mapping {
     }
 
     /// `sketches-go`'s `NewLogarithmicMappingWithGamma(gamma, index_offset)` over a
-    /// collapsing-lowest store of `bin_limit` bins. `gamma` must be greater than 1; anything
-    /// else falls back to the Agent mapping, since a mapping that can't key a value has no use.
+    /// collapsing-lowest store of `bin_limit` bins, clamped to `2..=MAX_BIN_LIMIT`. `gamma` must
+    /// be greater than 1; anything else falls back to the Agent mapping, since a mapping that
+    /// can't key a value has no use.
     pub fn logarithmic(gamma: f64, index_offset: f64, bin_limit: u32) -> Self {
-        Self::try_logarithmic(gamma, index_offset, bin_limit.max(2)).unwrap_or_else(Self::agent)
+        Self::try_logarithmic(gamma, index_offset, bin_limit.clamp(2, Self::MAX_BIN_LIMIT))
+            .unwrap_or_else(Self::agent)
     }
 
     /// [`Mapping::logarithmic`] without its fallbacks: `None` unless `gamma` is finite and
-    /// greater than 1, `index_offset` is finite, and `bin_limit` is at least 2. A decoder uses it
-    /// to reject a corrupt header rather than read bins in the wrong key space.
+    /// greater than 1, `index_offset` is finite, and `bin_limit` is in `2..=MAX_BIN_LIMIT`. A
+    /// decoder uses it to reject a corrupt header rather than read bins in the wrong key space.
     pub fn try_logarithmic(gamma: f64, index_offset: f64, bin_limit: u32) -> Option<Self> {
-        if !(gamma.is_finite() && gamma > 1.0 && index_offset.is_finite() && bin_limit >= 2) {
+        if !(gamma.is_finite()
+            && gamma > 1.0
+            && index_offset.is_finite()
+            && (2..=Self::MAX_BIN_LIMIT).contains(&bin_limit))
+        {
             return None;
         }
         Some(Mapping {
@@ -124,6 +155,14 @@ impl Mapping {
         match self.kind {
             MappingKind::Agent => magnitude < self.agent_min(),
             MappingKind::Logarithmic => magnitude < Self::AGENT_MIN,
+        }
+    }
+
+    /// The keys a store under this mapping can hold: what [`Mapping::key`] returns.
+    fn key_range(&self) -> std::ops::RangeInclusive<i32> {
+        match self.kind {
+            MappingKind::Agent => 1..=Self::AGENT_INF_KEY,
+            MappingKind::Logarithmic => i32::MIN..=i32::MAX,
         }
     }
 
@@ -197,10 +236,13 @@ pub struct Bin {
 #[derive(Clone, PartialEq)]
 pub struct DdSketch {
     mapping: Mapping,
-    /// Ascending by key, one entry per key, every count positive.
+    /// Ascending by key, one entry per key, every count positive and finite: every sum of two
+    /// counts goes through `add_counts`, which saturates at `f64::MAX`, so a fold never writes an
+    /// `inf` bin that the next `from_bytes` would drop.
     positive: Vec<Bin>,
     /// Keys of `|v|` for negative values, same invariants.
     negative: Vec<Bin>,
+    /// Finite and non-negative, summed through `add_counts` like a bin's.
     zero_count: f64,
     count: f64,
     min: f64,
@@ -328,7 +370,7 @@ impl DdSketch {
     fn insert(&mut self, value: f64, count: f64) {
         let magnitude = value.abs();
         if self.mapping.is_zero(magnitude) {
-            self.zero_count += count;
+            self.zero_count = add_counts(self.zero_count, count);
             return;
         }
         let key = self.mapping.key(magnitude);
@@ -373,7 +415,7 @@ impl DdSketch {
                 insert_bin(&mut self.negative, rebin(bin.key), bin.count, self.mapping.bin_limit);
             }
         }
-        self.zero_count += other.zero_count;
+        self.zero_count = add_counts(self.zero_count, other.zero_count);
         self.count += other.count;
         self.sum += other.sum;
         if other.min < self.min {
@@ -427,8 +469,10 @@ impl DdSketch {
     /// That representative is then clamped to `[min, max]`, where the true quantile always lies,
     /// so a clamp only ever moves an estimate toward the truth. It matters at the extremes: a
     /// single-bin population near its minimum or maximum answers with that exact value rather
-    /// than the bin's representative, and a finite population never answers `±∞`, which the
-    /// Agent's ∞ keys (`|v| ≥ γ^31428.5`, about `4.17e211`) would otherwise represent.
+    /// than the bin's representative, and a sketch whose summary was tracked from finite
+    /// observations never answers `±∞`, which the Agent's ∞ keys (`|v| ≥ γ^31428.5`, about
+    /// `4.17e211`) would otherwise represent. A decoded summary is taken as written, so a decoded
+    /// sketch answers within whatever `[min, max]` its blob carried (see the module doc).
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.count <= 0.0 || q.is_nan() {
             return None;
@@ -516,7 +560,10 @@ impl DdSketch {
         out
     }
 
-    /// The inverse of [`DdSketch::to_bytes`]. Fails only on a malformed blob, never on a value.
+    /// The inverse of [`DdSketch::to_bytes`]. Fails only on a malformed blob, never on a value:
+    /// a header no [`Mapping`] constructor accepts (a `bin_limit` past
+    /// [`Mapping::MAX_BIN_LIMIT`] included), a key outside the mapping's key space, or trailing
+    /// bytes. The summary is taken as written; see the module doc.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SketchDecodeError> {
         let mut r = Reader { bytes, pos: 0 };
         if r.u8()? != BYTES_VERSION {
@@ -539,8 +586,9 @@ impl DdSketch {
         let max = r.f64()?;
         let sum = r.f64()?;
         let zero_count = r.f64()?;
-        let positive = read_bins(&mut r)?;
-        let negative = read_bins(&mut r)?;
+        let keys = mapping.key_range();
+        let positive = read_bins(&mut r, &keys)?;
+        let negative = read_bins(&mut r, &keys)?;
         if r.pos != bytes.len() {
             return Err(SketchDecodeError::Malformed);
         }
@@ -591,7 +639,7 @@ const BYTES_VERSION: u8 = 1;
 /// dense store's policy.
 fn insert_bin(store: &mut Vec<Bin>, key: i32, count: f64, bin_limit: u32) {
     match store.binary_search_by(|b| b.key.cmp(&key)) {
-        Ok(i) => store[i].count += count,
+        Ok(i) => store[i].count = add_counts(store[i].count, count),
         Err(i) => {
             if store.capacity() == 0 {
                 store.reserve_exact(INITIAL_BINS);
@@ -608,8 +656,8 @@ fn collapse(store: &mut Vec<Bin>, bin_limit: u32) {
         return;
     }
     let remove = store.len() - limit;
-    let folded: f64 = store[..remove].iter().map(|b| b.count).sum();
-    store[remove].count += folded;
+    let folded = store[..remove].iter().fold(0.0, |sum, b| add_counts(sum, b.count));
+    store[remove].count = add_counts(store[remove].count, folded);
     store.drain(..remove);
 }
 
@@ -631,7 +679,7 @@ fn merge_bins(a: &[Bin], b: &[Bin], bin_limit: u32) -> Vec<Bin> {
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                out.push(Bin { key: a[i].key, count: a[i].count + b[j].count });
+                out.push(Bin { key: a[i].key, count: add_counts(a[i].count, b[j].count) });
                 i += 1;
                 j += 1;
             }
@@ -643,14 +691,21 @@ fn merge_bins(a: &[Bin], b: &[Bin], bin_limit: u32) -> Vec<Bin> {
     out
 }
 
-/// Sorts, folds repeated keys, drops empty or non-finite counts, and collapses.
+/// Sum of two finite, non-negative counts, saturating at `f64::MAX`. A count is a weight, so a
+/// saturated bin keeps its place in the rank walk and stays mergeable, where an `inf` one would
+/// be dropped on the next decode.
+fn add_counts(a: f64, b: f64) -> f64 {
+    (a + b).min(f64::MAX)
+}
+
+/// Drops empty or non-finite counts, sorts, folds repeated keys, and collapses.
 fn normalize_bins(mut bins: Vec<Bin>, bin_limit: u32) -> Vec<Bin> {
     bins.retain(|b| b.count.is_finite() && b.count > 0.0);
     bins.sort_by_key(|b| b.key);
     let mut out: Vec<Bin> = Vec::with_capacity(bins.len());
     for bin in bins {
         match out.last_mut() {
-            Some(last) if last.key == bin.key => last.count += bin.count,
+            Some(last) if last.key == bin.key => last.count = add_counts(last.count, bin.count),
             _ => out.push(bin),
         }
     }
@@ -728,7 +783,10 @@ impl Reader<'_> {
     }
 }
 
-fn read_bins(r: &mut Reader<'_>) -> Result<Vec<Bin>, SketchDecodeError> {
+fn read_bins(
+    r: &mut Reader<'_>,
+    keys: &std::ops::RangeInclusive<i32>,
+) -> Result<Vec<Bin>, SketchDecodeError> {
     let n = r.uvarint()?;
     // Each bin is at least 9 bytes; a length past the input is malformed, not a huge allocation.
     if n > (r.bytes.len() / 9) as u64 {
@@ -741,7 +799,10 @@ fn read_bins(r: &mut Reader<'_>) -> Result<Vec<Bin>, SketchDecodeError> {
         let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
         let key = previous.checked_add(delta).ok_or(SketchDecodeError::Malformed)?;
         previous = key;
-        let key = i32::try_from(key).map_err(|_| SketchDecodeError::Malformed)?;
+        let key = i32::try_from(key)
+            .ok()
+            .filter(|k| keys.contains(k))
+            .ok_or(SketchDecodeError::Malformed)?;
         let count = r.f64()?;
         bins.push(Bin { key, count });
     }
@@ -1148,6 +1209,155 @@ mod tests {
         assert_eq!(a, stats);
     }
 
+    /// A logarithmic header's `bin_limit` past `Mapping::MAX_BIN_LIMIT` is malformed: a store
+    /// under it would never collapse, and every later insert or merge into it is linear in its
+    /// size.
+    #[test]
+    fn a_decoded_bin_limit_past_the_cap_is_malformed() {
+        let mut sketch = DdSketch::with_mapping(Mapping::logarithmic(1.02, 0.5, 2048));
+        sketch.add(3.0);
+        let bytes = sketch.to_bytes();
+        // Version byte, tag byte, gamma (8), offset (8), then bin_limit (4).
+        let with_limit = |limit: u32| {
+            let mut b = bytes.clone();
+            b[18..22].copy_from_slice(&limit.to_le_bytes());
+            b
+        };
+        for limit in [Mapping::MAX_BIN_LIMIT + 1, u32::MAX] {
+            assert_eq!(
+                DdSketch::from_bytes(&with_limit(limit)),
+                Err(SketchDecodeError::Malformed),
+                "bin_limit {limit}"
+            );
+        }
+        let at_cap = DdSketch::from_bytes(&with_limit(Mapping::MAX_BIN_LIMIT)).expect("decodes");
+        assert_eq!(at_cap.mapping().bin_limit(), Mapping::MAX_BIN_LIMIT);
+        assert_eq!(Mapping::try_logarithmic(1.02, 0.5, Mapping::MAX_BIN_LIMIT + 1), None);
+        assert_eq!(Mapping::logarithmic(1.02, 0.5, u32::MAX).bin_limit(), Mapping::MAX_BIN_LIMIT);
+    }
+
+    /// `mapping`'s empty-sketch blob with its positive store replaced by `bins`, each a raw
+    /// `(key delta, count)` pair, so repeated keys and counts reach `from_bytes` unnormalized.
+    fn blob_with_positive_bins(mapping: Mapping, bins: &[(i64, f64)]) -> Vec<u8> {
+        let mut blob = DdSketch::with_mapping(mapping).to_bytes();
+        // The empty sketch ends in two zero bin counts.
+        blob.truncate(blob.len() - 2);
+        write_uvarint(&mut blob, bins.len() as u64);
+        for &(delta, count) in bins {
+            write_uvarint(&mut blob, ((delta << 1) ^ (delta >> 63)) as u64);
+            blob.extend_from_slice(&count.to_le_bytes());
+        }
+        write_uvarint(&mut blob, 0);
+        blob
+    }
+
+    /// Decodes `blob`, then checks every bin is finite and `to_bytes` is a fixed point.
+    fn assert_round_trip_is_a_fixed_point(blob: &[u8]) -> DdSketch {
+        let once = DdSketch::from_bytes(blob).expect("decodes");
+        for bin in once.positive_bins() {
+            assert!(bin.count.is_finite() && bin.count > 0.0, "{bin:?}");
+        }
+        let bytes = once.to_bytes();
+        let twice = DdSketch::from_bytes(&bytes).expect("re-decodes");
+        assert_eq!(twice.to_bytes(), bytes);
+        assert_eq!(twice, once);
+        once
+    }
+
+    /// An Agent blob repeating one key with two `f64::MAX` counts: folding them saturates at
+    /// `f64::MAX` rather than writing an `inf` bin the next decode would drop.
+    #[test]
+    fn folding_two_finite_counts_never_produces_an_infinite_bin() {
+        let blob = blob_with_positive_bins(Mapping::agent(), &[(5, f64::MAX), (0, f64::MAX)]);
+        let sketch = assert_round_trip_is_a_fixed_point(&blob);
+        assert_eq!(sketch.positive_bins(), &[Bin { key: 5, count: f64::MAX }]);
+    }
+
+    /// Three huge bins under `bin_limit` 2: collapse folds the lowest into the next, and that
+    /// sum saturates too. A later merge and insert keep the bin finite.
+    #[test]
+    fn to_bytes_is_a_fixed_point_after_a_saturating_fold() {
+        let mapping = Mapping::logarithmic(1.02, 0.0, 2);
+        let blob = blob_with_positive_bins(mapping, &[(1, f64::MAX), (1, f64::MAX), (1, f64::MAX)]);
+        let mut sketch = assert_round_trip_is_a_fixed_point(&blob);
+        assert_eq!(
+            sketch.positive_bins(),
+            &[Bin { key: 2, count: f64::MAX }, Bin { key: 3, count: f64::MAX }]
+        );
+        let copy = sketch.clone();
+        sketch.merge(&copy);
+        sketch.add_count(mapping.representative(3), f64::MAX);
+        assert_round_trip_is_a_fixed_point(&sketch.to_bytes());
+    }
+
+    /// Two decoded sketches at the largest limit a blob can carry, under different mappings and
+    /// with interleaved keys, merge into one `aggregate`-style accumulator: the first is adopted,
+    /// the second re-binned bin by bin. The store stays within the cap and keeps every count.
+    #[test]
+    fn a_cross_mapping_merge_of_two_capped_sketches_is_bounded() {
+        let cap = Mapping::MAX_BIN_LIMIT;
+        let decoded = |gamma: f64, key: &dyn Fn(i32) -> i32| {
+            let mapping = Mapping::logarithmic(gamma, 0.0, cap);
+            let bins = (0..2 * cap as i32).map(|i| Bin { key: key(i), count: 1.0 }).collect();
+            let blob = DdSketch::from_parts(mapping, bins, vec![], 0.0, None).to_bytes();
+            DdSketch::from_bytes(&blob).expect("decodes")
+        };
+        let a = decoded(1.0001, &|i| 50_000_000 + i);
+        let b = decoded(1.00011, &|i| i * 2);
+        assert_eq!(
+            (a.positive_bins().len(), b.positive_bins().len()),
+            (cap as usize, cap as usize)
+        );
+        let mut acc = DdSketch::new();
+        acc.merge(&a);
+        acc.merge(&b);
+        assert_eq!(acc.mapping(), a.mapping());
+        assert!(acc.positive_bins().len() <= cap as usize, "{} bins", acc.positive_bins().len());
+        let binned: f64 = acc.positive_bins().iter().map(|b| b.count).sum();
+        assert_eq!(binned, 4.0 * f64::from(cap));
+        assert_eq!(acc.count(), 4 * cap as usize);
+    }
+
+    /// Under the Agent mapping `Mapping::key` puts every magnitude in `1..=AGENT_INF_KEY`, in
+    /// either store, and `logit_proto`'s Dogsketch encoder negates a negative-store key. A decoded
+    /// Agent sketch with a key outside that range is malformed; a logarithmic one keys any `i32`.
+    #[test]
+    fn an_agent_key_outside_the_int16_range_is_malformed() {
+        let blob = |mapping: Mapping, positive: i32, negative: i32| {
+            DdSketch::from_parts(
+                mapping,
+                vec![Bin { key: positive, count: 1.0 }],
+                vec![Bin { key: negative, count: 1.0 }],
+                0.0,
+                Some(SketchStats { count: 2.0, min: -1.0, max: 1.0, sum: 0.0 }),
+            )
+            .to_bytes()
+        };
+        let agent = Mapping::agent();
+        for (positive, negative) in [
+            (1, i32::MIN),
+            (1, 0),
+            (1, 40000),
+            (0, 1),
+            (-5, 1),
+            (Mapping::AGENT_INF_KEY + 1, 1),
+            (i32::MAX, 1),
+        ] {
+            assert_eq!(
+                DdSketch::from_bytes(&blob(agent, positive, negative)),
+                Err(SketchDecodeError::Malformed),
+                "positive key {positive}, negative key {negative}"
+            );
+        }
+        let edges = blob(agent, Mapping::AGENT_INF_KEY, 1);
+        assert_eq!(
+            DdSketch::from_bytes(&edges).map(|s| s.positive_bins()[0].key),
+            Ok(Mapping::AGENT_INF_KEY)
+        );
+        let log = blob(Mapping::logarithmic(1.02, 0.0, 2048), -40000, i32::MIN);
+        assert!(DdSketch::from_bytes(&log).is_ok());
+    }
+
     /// Randomized checks against the exact answer. A population is a list of `(value, weight)`
     /// pairs, values log-uniform over 12 decades with some negatives and zeros, so keys span
     /// thousands of bins and every branch of the rank walk (negative store, zero bin, positive
@@ -1173,7 +1383,11 @@ mod tests {
         fn mapping() -> impl Strategy<Value = Mapping> {
             prop_oneof![
                 Just(Mapping::agent()),
-                (1.01f64..1.2, -3.0f64..3.0).prop_map(|(g, o)| Mapping::logarithmic(g, o, 1 << 16)),
+                (1.01f64..1.2, -3.0f64..3.0).prop_map(|(g, o)| Mapping::logarithmic(
+                    g,
+                    o,
+                    Mapping::MAX_BIN_LIMIT
+                )),
             ]
         }
 
@@ -1306,7 +1520,7 @@ mod tests {
                 population in population(),
                 gamma in 1.01f64..1.1,
             ) {
-                let log = Mapping::logarithmic(gamma, 0.0, 1 << 16);
+                let log = Mapping::logarithmic(gamma, 0.0, Mapping::MAX_BIN_LIMIT);
                 let mut agent = sketch_of(Mapping::agent(), &population[..population.len() / 2]);
                 agent.merge(&sketch_of(log, &population[population.len() / 2..]));
                 let all = sorted_expansion(&population);
