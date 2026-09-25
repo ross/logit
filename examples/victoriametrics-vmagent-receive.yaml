@@ -1,0 +1,30 @@
+# Receives vmagent's remote-write and re-exposes the series for something else to scrape.
+# `prometheus_in` with `bind:` is the remote-write receiver; `prometheus_out` with `bind:` serves
+# an exposition endpoint (docs/adr/victoriametrics-interop.md). Add this as one of vmagent's
+# remote-write URLs:
+#
+#   -remoteWrite.url=http://<this-host>:9201/api/v1/write
+#
+# Nothing else is needed on either side. vmagent sends the VictoriaMetrics remote write protocol
+# (remote-write 1.0 compressed with zstd) by default, and the receiver accepts it, so vmagent stays
+# on zstd. `logit.input.writes` counts each request with an `encoding` tag. To have vmagent send
+# Snappy instead, start it with `-remoteWrite.forcePromProto`.
+#
+# `instance` and `job`, which vmagent's scrape adds, arrive as labels and stay attributes,
+# verbatim. docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and VictoriaTraces" section has
+# the rest.
+components:
+  from_vmagent:
+    type: prometheus_in
+    # Transport security at most, never authentication (docs/known-gaps.md): bind loopback or
+    # pod-local and front it with something that authenticates.
+    bind: 127.0.0.1:9201
+    # Off by default. vmagent flushes on a fixed cadence (`-remoteWrite.flushInterval`), so a
+    # connection quiet for a minute isn't coming back.
+    idle_timeout: 60s
+
+  metrics:
+    type: prometheus_out
+    sources: [from_vmagent]
+    # No TLS and no auth on this endpoint: bind loopback or pod-local.
+    bind: 127.0.0.1:9464

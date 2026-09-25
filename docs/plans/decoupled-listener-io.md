@@ -275,7 +275,7 @@ the workstream's code, in the same commit):
   must find exactly its configured depth (4), never 0.
 - `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered`.
 - `a_malformed_datagram_is_skipped_without_stopping_the_decode_loop`.
-- `shutdown_drains_the_queue_and_delivers_every_already_queued_datagram` — the empty-queue happy
+- `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing` — the empty-queue happy
   path, driven through `UdpListener::run_until_shutdown` end to end via `tokio::spawn` (fully
   `'static`, unlike the other four).
 - `bind_socket_reports_the_granted_receive_buffer_even_when_unset`.

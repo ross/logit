@@ -173,9 +173,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   pinning test: `hyperloglog_round_trips_non_power_of_two_member_counts`. Pinned to
   `cardinality-estimator` 1.0.3; the upstream fix would be `into_boxed_slice`/`shrink_to_fit` in
   `Array::from_vec`, so the freed layout always matches the `Vec`'s capacity by construction.
-- ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ **Closed, both halves
-  (W3).**
-  - **Real implementation** ([`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2):
+- ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ **Closed, both halves.**
+  - **Real implementation** ([`docs/plans/lossless-transit.md`](plans/lossless-transit.md)):
     `HyperLogLog` (`crates/logit-core/src/metric.rs`) wraps the `cardinality-estimator` crate —
     merge (union), `estimate()`, and a canonical `to_bytes`/`from_bytes` pinned to that crate's
     version. `logit-transforms::Aggregator` merges `MetricKind::SetMembers` into a `Set`
@@ -184,7 +183,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s amendment.
     `logit-outputs::influxdb` renders a `Set`'s estimate as a `value=` field instead of erroring,
     and `logit-outputs::stdio` renders `set=<estimate>`.
-  - **statsd producer** (W3): statsd's `s` type is no longer a decode error.
+  - **statsd producer**: statsd's `s` type is no longer a decode error.
     `crates/logit-inputs/src/statsd.rs` decodes `s` to `MetricKind::SetMembers`, one event per line,
     every member a zero-copy datagram slice; `crates/logit-outputs/src/statsd.rs` encodes one
     `name:<member>|s` line per member — `SetMembers`/`Set`'s own producer, the same way `ms`/`h`/`d` produce
@@ -336,10 +335,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     from the last persisted read cursor, replaying at most the batches committed since the last
     checkpoint. The same frames would serve the receive side, but its design isn't started: a
     listener has no equivalent of a sink's "haven't delivered yet" boundary to resume from.
-  - **The disk-backed sink spool has a real, accepted power-loss window.** Durability is
-    `fdatasync` on segment rotation, on the cursor file, and at shutdown, not per push (the ADR's
-    "Durability" section). A power loss (not a process crash) can lose the active segment's most
-    recent un-`fsync`ed writes. A `disk.sync: every_push` knob that closes the window at a real
+  - **The disk-backed sink spool has a real, accepted power-loss window.** Every cursor write is
+    `fsync`ed (tmp file, then directory); a segment is `fsync`ed only when it rotates away and at
+    shutdown, not per push (the ADR's "Durability" section and its 2026-09-24 amendment). A power
+    loss (not a process crash) can lose the active segment's most recent un-`fsync`ed writes. A `disk.sync: every_push` knob that closes the window at a real
     throughput cost is a plausible follow-up, not built.
   - **`logit_proto::buffer::Buffer<T>`'s role narrowed to `InMemoryBuffer` alone.** Written ahead
     of its caller ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)), the trait's
@@ -379,7 +378,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   messages per batch into a shared, generic `logit_proto::MessageBuf<M>`, never failing, with a
   per-sink `Stats` for drop accounting. `syslog_out` and `statsd_out` implement it (statsd's
   per-call datagram cap became encoder state set once per transport). The collectd codec
-  (`crates/logit-proto/src/collectd/encode.rs`) adopted it in `collectd_out`'s own PR (W3): its
+  (`crates/logit-proto/src/collectd/encode.rs`) adopted it in `collectd_out`: its
   `Packets` buffer became `MessageBuf<usize>`, whose per-datagram `usize` meta is the value-list
   count `EMSGSIZE` accounting needs. `prometheus_out` stays outside all three traits by design.
 
@@ -388,7 +387,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **A UDP listener's read and decode loops share one task.** `read_loop` and `decode_loop`
   (`crates/logit-inputs/src/udp.rs`) run under `run_until_shutdown`'s one two-arm `select!`, so
   they interleave, yielding to each other on the coop budget, but never run on two cores at once.
-  W4's coop-budget analysis found no measurable cost from that sharing
+  The coop-budget analysis found no measurable cost from that sharing
   (`docs/design/performance.md` §7). A report-only experiment alongside it, not shipped, found real
   headroom in splitting them: `decode_loop` spawned onto its own task, pinned to cores 2, 3, 14, 15
   (two fast physical cores plus their SMT siblings), against the same branch and pins otherwise.
@@ -706,7 +705,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a `logit`-only concept with nowhere else on the wire to go, so it stays. **Closed, formerly
   filed here:** a bare `LogRecord`'s OTLP `trace_id`/`span_id`/`flags` (now
   `logit_core::LogRecord::trace`, [ADR `log-record-trace-context`](adr/log-record-trace-context.md));
-  a span's `Status.message` (W4: `SpanRecord.ext`'s boxed `SpanExt.status_message`,
+  a span's `Status.message` (`SpanRecord.ext`'s boxed `SpanExt.status_message`,
   [ADR `metrics-model-v2`](adr/metrics-model-v2.md), so `otlp/traces.rs` no longer stamps or reads
   `otel.status_message`); and a `NO_RECORDED_VALUE`-flagged point skipped on decode (same
   amendment: `MetricRecord.flags` carries the bit and the point round-trips).
@@ -728,11 +727,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`unsupported_metric_kind`).** These kinds exist only after some stage has summarized, and a
   merged `DdSketch`/`HyperLogLog` has no lossless statsd rendering; `docs/adr/statsd-output.md`'s
   original Decision section explains why that mapping needs its own design rather than a guess.
-  Narrowed by W3: `crates/logit-outputs/src/statsd.rs` now encodes `MetricKind::Samples`/`SetMembers`,
+  Narrowed: `crates/logit-outputs/src/statsd.rs` now encodes `MetricKind::Samples`/`SetMembers`,
   the raw shapes `statsd_in` decodes `ms`/`h`/`d`/`s` to losslessly
-  (`docs/adr/lossless-transit.md`'s W3), back to statsd lines: `name:v1:v2|<type>|@rate` under
+  ([ADR `lossless-transit`](adr/lossless-transit.md)), back to statsd lines: `name:v1:v2|<type>|@rate` under
   `format: dogstatsd`, one line per value under `format: statsd`, and `name:m|s` one line per set
-  member. Before W3, `ms`/`h`/`d` decoded to `MetricKind::Distribution` and `s` was a decode error,
+  member. Before that, `ms`/`h`/`d` decoded to `MetricKind::Distribution` and `s` was a decode error,
   so a `statsd_in -> aggregate -> statsd_out` relay dropped every timer/set metric.
   - **What round-trips:** a `statsd_in -> statsd_out` relay with no `aggregate`, or one configured
     `distributions: samples`/`sets: members`, relays a timer or set line intact.
@@ -751,7 +750,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   but only on a `|T`-marked line.**
   - **Timestamp:** any event without a `statsd.timestamp` `U64` carrier (everything but a relayed
     `|T`-carrying line) is stamped with the receiver's receipt time, like `syslog_out` (see
-    "`event.timestamp` is still receipt time" under [syslog](#syslog)). Narrowed by W3:
+    "`event.timestamp` is still receipt time" under [syslog](#syslog)). Narrowed:
     DogStatsD's `|T<unix-seconds>` segment (`format: dogstatsd` only) round-trips. `statsd_in` sets
     `Event::timestamp` from an incoming `|T<secs>` and stamps a `statsd.timestamp: Value::U64(secs)`
     per-line carrier holding the raw wire value, not a marker bit (`docs/adr/statsd-output.md`'s
@@ -765,8 +764,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     Alternatives) in favor of a future general metric-rename *transform* (native, not Lua), which
     doesn't exist yet. Workaround: a `lua` component ahead of `statsd_out` can rename or retag,
     `event.metrics[i].name = "..."`. ~~`docs/design/lua-api.md` notes a metric's value/fields are
-    unexposed to Lua~~ — narrowed by W7: `event.metrics` exposes every metric field for reading and
-    `name`/`unit`/`description`/`start_timestamp` for writing on every kind. W7 didn't add a way to
+    unexposed to Lua~~ — narrowed: `event.metrics` exposes every metric field for reading and
+    `name`/`unit`/`description`/`start_timestamp` for writing on every kind. There is still no way to
     *construct or append* a metric from Lua, or to write any field besides
     `value`/`temporality`/`monotonic` on kinds other than `sum`/`gauge` (see
     `docs/design/lua-api.md`'s "Reading and writing `event.metrics`").
@@ -802,11 +801,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`sample_rate_clamped`, mirrored into `logit.component.diagnostics{key="sample_rate_clamped"}`
   by `Diagnostics`), never silent. A sample rate on `g` (gauge) or `s` (set) stays ignored.
 
-  **Where it lives now (updated 2026-09-12, W3):** not in `statsd_in`.
-  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 moved the sketch-and-clamp
+  **Where it lives now (updated 2026-09-12):** not in `statsd_in`.
+  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) moved the sketch-and-clamp
   step verbatim (including `MAX_SAMPLE_WEIGHT`/`sample_rate_clamped`) into `aggregate`'s default
   `distributions: sketch` absorb path (`Samples::sketch`/`Samples::MAX_WEIGHT`,
-  `crates/logit-core/src/metric.rs`), and W3 deleted `statsd_in`'s copy: `ms`/`h`/`d` decode to a
+  `crates/logit-core/src/metric.rs`), and `statsd_in`'s copy was deleted: `ms`/`h`/`d` decode to a
   raw `MetricKind::Samples` with `sample_rate` carried verbatim. A `statsd_in -> aggregate`
   pipeline reports `sample_rate_clamped` once, not twice. See
   [ADR `statsd-output`](adr/statsd-output.md)'s amendment and
@@ -1028,8 +1027,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   decode replies with an empty (all-default, "fully accepted") `partial_success`, even when a point
   was skipped. The one remaining skip case is a `Metric` whose `data` oneof isn't set
   (`crates/logit-proto/src/otlp/metrics.rs::decode_metric`'s `None => Vec::new()` arm); an over-cap
-  exponential histogram and a `NO_RECORDED_VALUE`-flagged point both round-trip in full now (W4,
-  [ADR `metrics-model-v2`](adr/metrics-model-v2.md)). A fully malformed request (bad protobuf, an
+  exponential histogram and a `NO_RECORDED_VALUE`-flagged point both round-trip in full now
+  ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)). A fully malformed request (bad protobuf, an
   invalid span id) still fails the *whole* request (`400`/`grpc-status: 3`), the one shape the
   response does reflect. **To close:** thread a per-call count through `SignalDecoder` (a
   `crates/logit-proto` API change, out of scope for the PR that added `otlp_in`), when OTLP input
@@ -1065,6 +1064,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
   worst case across all connections is a finite multiple of the existing 4 GiB figure, but no one
   has measured the multiplier. **Revisit:** profile it before OTLP/JSON sees production volume.
+- **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
+  close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
+  about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
+  ([`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings", leg
+  7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
+  because the server may have processed it, so `otlp_out`, at-most-once by default, drops the
+  batch. An isolated 20 s run at 1 batch/s saw 3 closes and 2 dropped batches.
+  **Workaround:** OTLP over HTTP to VictoriaTraces (`docs/deploying.md`'s "VictoriaMetrics,
+  VictoriaLogs, and VictoriaTraces"), or `buffer: { delivery: at_least_once }`, which retries at
+  the cost of a duplicate span when the first attempt was stored. Whether `otlp_out` should retry
+  a gRPC request that got no response frame before the connection closed is a larger question:
+  without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
+  sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
+  raced a close; it counts `send_failed` lines but can't force the race.
 - ~~**`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON**~~ **Closed.** `otlp_in`
   (`crates/logit-inputs/src/otlp.rs`) accepts `Content-Type: application/json` alongside protobuf
   on the HTTP transport, through a hand-written dialect layer (`crates/logit-proto/src/otlp/json/`)
@@ -1217,6 +1230,34 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Narrow in practice (shutdown is per-connection and the window is the drain); closes when that open
   question does.
 
+- **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
+  VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with
+  nothing in its log and `vm_http_request_errors_total` unchanged
+  ([`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings", leg
+  2). A `204` is success under both specs, and the sink doesn't read the 2.0
+  `X-Prometheus-Remote-Write-*-Written` headers, so `prometheus_out` `version: 2` counts every
+  batch delivered while all of it is lost. **Workaround:** `version: 1` for VictoriaMetrics
+  (`docs/deploying.md`'s "Choosing `version: 1` or `2`"). Reading the `-Written` headers would only
+  help against a receiver that sends them, which VictoriaMetrics doesn't.
+- **An `ExponentialHistogram` can't reach VictoriaMetrics's native-histogram ingest over
+  remote-write.** VictoriaMetrics accepts a remote-write native histogram and converts it to its
+  `vmrange` buckets, but `prometheus_out` skips and counts every `ExponentialHistogram` on both
+  wires: the native-histogram row under [Cross-protocol mappings](#cross-protocol-mappings).
+  **Workaround:** send it over OTLP instead. `otlp_out` to VictoriaMetrics's `/opentelemetry`
+  carries it, and VictoriaMetrics stores it as `_bucket` series with a `vmrange` label plus `_count`
+  and `_sum` (verified, leg 6). Closes with that native-histogram row.
+- **A `Distribution` isn't re-binned onto VictoriaMetrics's `vmrange` buckets.** Both are
+  log-bucketed, but `prometheus_out` sends a `Distribution` as the five-quantile summary it sends
+  any Prometheus receiver, so VictoriaMetrics's histogram functions (`prometheus_buckets()`,
+  `histogram_quantile()` over `vmrange`) don't apply to it and the quantiles can't be merged across
+  series. Not a loss VictoriaMetrics imposes: re-binning is a mapping nobody has built, a non-goal
+  of [ADR `victoriametrics-interop`](adr/victoriametrics-interop.md).
+- **A series scraped back from VictoriaMetrics's `/federate` is untyped.** `/federate` emits no
+  `# TYPE` or `# HELP`, so `prometheus_in` decodes every series as a `Gauge` tagged
+  `prometheus.type="untyped"`: a counter can't be told from a gauge, and a histogram's `_bucket`,
+  `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics stores no
+  metric type, so there's nothing for `logit` to recover.
+
 ## File, stdio, and InfluxDB sinks
 
 - **`file_out` rotates and retains by count, but has no SIGHUP/external-rotator reopen, no
@@ -1251,6 +1292,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     by a kill between that rename and its promotion is promoted to `.1` on the next rotation, never
     silently lost.
 
+- **`file_out` never fsyncs, by design.** Nothing in `crates/logit-outputs/src/file.rs` fsyncs
+  the active file, the `.rotating` staging file, or the directory after a rename, so a power loss
+  (not a process crash) can lose the most recent writes or leave a rotation half-applied. A
+  log-file sink doesn't pay per-batch fsyncs for a guarantee few deployments need; see the
+  "`file_out` makes no durability promise" amendment to
+  [ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24).
+  No revisit trigger short of a deployment that needs a power-loss-safe log file.
 - **`stdio_out` has no reopen** — a file target is opened once, in append mode, and held for the
   process's lifetime, so an external log rotator that moves the file leaves `logit` writing to the
   unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
@@ -1305,7 +1353,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   sentinel. `observed_time_unix_nano` is preserved both ways: decode copies it onto
   `LogRecord.observed_timestamp` verbatim (`0` stays `0`), and encode prefers that field over the
   wall clock whenever it is non-zero, which makes `otlp_in -> otlp_out` a fixed point for it
-  (`otlp/logs.rs`'s module doc, [ADR `metrics-model-v2`](adr/metrics-model-v2.md)'s W4 amendment).
+  (`otlp/logs.rs`'s module doc, [ADR `metrics-model-v2`](adr/metrics-model-v2.md)).
 - **`tail_in`/`docker_in`'s checkpoint identity is `(dev, ino)`, which doesn't survive a bind
   mount or filesystem migration that preserves content but not inode numbers.** A restored backup,
   a volume moved to different storage, or a bind mount re-created from a snapshot resumes from the
@@ -1731,7 +1779,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     independently on the same `trace_id`, per ADR
     `internal-span-emission-and-deterministic-sampling`'s "no propagated bit"); or thin metrics
     (`internal`'s point-side buffer and `otlp_out`'s metrics encoding ignore it, which is why the
-    demo's InfluxDB dashboard looks the same at `0.1` or `1.0`).
+    demo's metrics dashboard looks the same at `0.1` or `1.0`).
 
     **Still open, deliberately:**
     1. **The listener span's window is the `send` call only, not decode-to-send.** `Fanout::send`
@@ -1855,7 +1903,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (gate `compare` on each file's `min`, or a per-scenario threshold) stay unbuilt until a scenario
   needs them.
 - **`buffered`'s events/s was the least reproducible number this harness reported; the harness-side
-  fix has landed (W8, #165) and is now confirmed on a quiet machine — resolved, with one
+  fix has landed (#165) and is now confirmed on a quiet machine — resolved, with one
   product-side question left open, tracked below.** **Still open:** whether `DiskQueue::open`'s
   unchanged double-read startup scan (`crates/logit-pipeline/src/disk_queue.rs`) accounts for any
   remaining spread. Nobody has picked it up, and on the VM's tighter numbers it matters less than it
