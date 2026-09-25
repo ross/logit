@@ -87,7 +87,7 @@ Repo-wide gaps that cut across entries:
 
 Entries that share a mechanism and should be verified together, in suggested order:
 
-1. **Remote-reachable crash/DoS (done, #361, #366, #369–#372, #374, #377)** — CORE-05, CORE-06, WIRE-01..03, WIRE-06, WIRE-10/11/15,
+1. **Remote-reachable crash/DoS (done, #361, #366, #369–#372, #374, #377, plus the one-off #367 (the spool walk its refuter found))** — CORE-05, CORE-06, WIRE-01..03, WIRE-06, WIRE-10/11/15,
    CODEC-16, CODEC-17. Mostly fuzz targets + size/depth caps; highest severity, most mechanical.
 2. **Durability (done, #322–#337)** — DISK-01..06, DISK-09, DISK-13, TAIL-05, DISK-10. One crash-injection harness
    serves all of it; settle the fsync policy (tmp file + directory) once for spool *and* checkpoints.

@@ -306,6 +306,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     `script/unsafe-check fuzz <target>` or `fuzz-all`, never in CI. A crash lands as a stable
     regression test in the owning crate. [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md) has
     the design and the campaign record.
+  - **Nothing builds `fuzz/` in `script/check` or CI.** `fuzz/` is its own cargo workspace, so a
+    signature change in `logit-proto` or `logit-core` breaks the targets without failing any
+    check, and the break shows only at the next campaign's `cargo fuzz build`. #370's decode-budget
+    argument broke both native batch targets this way. See
+    [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md). **Revisit:** add a
+    `cargo check --manifest-path fuzz/Cargo.toml` step to `script/check` if it works on the stable
+    toolchain (`libfuzzer-sys` compiles on stable; only `cargo fuzz run` needs nightly), or else a
+    build step in the nightly image, run by hand.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
     validation's rule 17 rejects a `receive:` block on both (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace`. Both use that grace:
