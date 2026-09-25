@@ -205,11 +205,12 @@
 //!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
 //!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/splunk-hec-relay.md`).
-//! 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL or ends in a
-//!     HEC route (`/event`, `/event/1.0`, `/raw`, `/raw/1.0`, `/ack`, `/health`, `/health/1.0`)
-//!     rather than the `/services/collector` base, an empty `token` or one with leading or
-//!     trailing whitespace, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
-//!     `max_body_bytes` of `0`, or a `tls` failing rule 24's checks (`docs/adr/splunk-hec-relay.md`).
+//! 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a
+//!     query or fragment, or ends in a HEC route (`/event`, `/event/1.0`, `/raw`, `/raw/1.0`,
+//!     `/ack`, `/health`, `/health/1.0`) rather than the `/services/collector` base, an empty
+//!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
+//!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
+//!     (`docs/adr/splunk-hec-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -603,6 +604,10 @@ const RESERVED_DATADOG_HEADERS: &[&str] =
 const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
     &["content-type", "content-encoding", "content-length", "host", "user-agent"];
 
+/// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
+const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
+    ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
+
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
 /// (`docs/design/pipeline-graph.md`'s "Crate layout"), so it catches a typo'd scheme or a bare
@@ -610,10 +615,6 @@ const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
 /// unbalanced IPv6 `[`, a port past `u16::MAX`). `crates/logit-inputs/src/prometheus.rs` does the
 /// real parse, and keys an unparseable target's placeholder `Resource` by its configured index so
 /// two never collide.
-/// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
-const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
-    ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
-
 fn is_absolute_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
@@ -3142,7 +3143,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 70: `splunk_hec_out` (`docs/adr/splunk-hec-relay.md`). The sink appends `/event` and
     // `/ack` to `endpoint`, so a URL already naming a route would post to
-    // `/services/collector/event/event`. The token gets rule 66's checks for the same reason:
+    // `/services/collector/event/event`, and one with a query or fragment would bury the route
+    // inside it. The token gets rule 66's checks for the same reason:
     // HTTP strips a header value's surrounding whitespace. An `ack_timeout` without `ack` would
     // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS.
     for (id, component) in &components {
@@ -3165,7 +3167,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  https:// URL with a host, got {endpoint:?}"
             );
         }
-        let path = endpoint.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        if endpoint.contains(['?', '#']) {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'endpoint' ({endpoint:?}) has a query or \
+                 fragment -- the base URL takes neither, since the sink appends '/event' and \
+                 '/ack' to it"
+            );
+        }
+        let path = endpoint.to_ascii_lowercase();
         let path = path.trim_end_matches('/');
         if SPLUNK_HEC_ROUTE_SUFFIXES.iter().any(|suffix| path.ends_with(suffix)) {
             anyhow::bail!(
@@ -5764,6 +5773,19 @@ mod tests {
                 assert!(err.contains("names a HEC route"), "{bad:?}: {err}");
                 assert!(err.contains("'/services/collector'"), "{bad:?}: {err}");
             }
+        }
+    }
+
+    /// Rule 70: the base URL takes no query or fragment; the routes are appended to it.
+    #[test]
+    fn a_splunk_hec_out_endpoint_with_a_query_or_fragment_is_rejected() {
+        for bad in [
+            "https://splunk:8088/services/collector?channel=x",
+            "https://splunk:8088/services/collector#frag",
+            "https://splunk:8088/services/collector/event?x=1",
+        ] {
+            let err = splunk_hec_out_err(splunk_hec_out(bad));
+            assert!(err.contains("has a query or fragment"), "{bad:?}: {err}");
         }
     }
 

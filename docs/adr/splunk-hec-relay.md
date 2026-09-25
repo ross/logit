@@ -166,9 +166,9 @@ Four facts from the survey drive the shape of the decision:
 
 19. **Graph rules 69 and 70** validate the two kinds: 69 for `splunk_hec_in` (a non-empty
     `bind`, no empty or whitespace-padded token, a positive `max_request_bytes`), 70 for
-    `splunk_hec_out` (an absolute `http(s)` base `endpoint` not ending in a route path, a
-    non-empty token, positive `timeout` and `max_body_bytes`, `ack_timeout` only with `ack`, and
-    rule 24's TLS checks).
+    `splunk_hec_out` (an absolute `http(s)` base `endpoint` with no query or fragment, not
+    ending in a route path, no empty or whitespace-padded token, positive `timeout` and
+    `max_body_bytes`, `ack_timeout` only with `ack`, and rule 24's TLS checks).
 
 20. **The connection cap stays an internal constant.** No HTTP listener exposes
     `max_connections`; `splunk_hec_in` keeps the shared cap, not a new operator knob.
