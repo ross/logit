@@ -221,6 +221,16 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        // One directory per example, each with a `logit.yaml`; a directory without one fails
+        // `load_with` below.
+        let examples_dir = root.join("examples");
+        configs.extend(
+            std::fs::read_dir(&examples_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", examples_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .map(|dir| dir.join("logit.yaml")),
+        );
         // `perf/scenarios/`, `script/shape-survey`'s capture configs, and `script/victoria-interop`'s
         // leg configs run only out of CI, so a field rename must fail here, not on their next run.
         let perf_scenarios_dir = root.join("perf/scenarios");
