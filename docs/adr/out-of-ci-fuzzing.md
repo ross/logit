@@ -78,12 +78,16 @@ targets cover:
 
 ### The driver
 
-`script/unsafe-check` gains three subcommands:
+`script/unsafe-check` gains four subcommands:
 
 - `fuzz <target> [-- <libFuzzer args>]` runs one target.
 - `fuzz-all [seconds]` runs every target for the given time (default 120 seconds each), keeps
-  going past a failing target, and prints a per-target summary with a `cargo fuzz tmin` hint for
-  each crash.
+  going past a failing target, and prints a per-target summary with a `fuzz-tmin` line for each
+  crash. Each target's output lands in `perf/results/fuzz/<timestamp>/<target>.log`.
+- `fuzz-tmin <target> <crash file>` runs `cargo fuzz tmin`. An `oom-*` file gets the target's
+  limits, because an allocation-limit crash reproduces only under `-malloc_limit_mb`. Any other
+  crash gets none, because under the limit libFuzzer can minimize a panic down to an empty file
+  that doesn't reproduce.
 - `fuzz-seed` runs `seedgen` to regenerate `fuzz/seeds/`.
 
 Every run passes the target's `-max_len` and `-malloc_limit_mb` from `FUZZ_TARGETS`, plus
@@ -98,7 +102,8 @@ MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`
 
 `tools/unsafe-check/Dockerfile` installs a pinned `cargo-fuzz` with `cargo install --locked` next
 to `cargo-careful` and `cargo-nextest`. The image already carries `build-essential` and `clang`,
-and nightly's `rust-std` ships the ASan runtime, so nothing else is added. Fuzz builds use a new
+and nightly's `rust-std` ships the ASan runtime. The one package added is `llvm`, for
+`llvm-symbolizer`: without it, ASan prints a crash's stack as bare addresses. Fuzz builds use a new
 named volume, `logit_fuzz_target`, because sanitizer `RUSTFLAGS` invalidate every artifact in the
 miri and careful target volume and the reverse. The cargo-home volume is shared.
 
@@ -166,4 +171,47 @@ harness, not by CI.
 
 ## Running it
 
-The first campaign is recorded here when the harness lands.
+### First campaign (2026-09-25)
+
+`script/unsafe-check fuzz-seed`, then `fuzz native_frame -- -max_total_time=30` as a smoke test,
+then `fuzz-all 120`, on the dev box, one target at a time, against `dos/w1`. Image
+`logit-unsafe-check:local` with `nightly-2026-09-01` and `cargo-fuzz` 0.13.2. The smoke test ran
+448,354 inputs in 31 seconds with no crash.
+
+The executions per second and corpus size come from libFuzzer's last stats line. A failing target
+stopped at its first crash, so its line is the last one before the crash, and its time is how long
+the crash took to find.
+
+| Target | Seconds | Executions | exec/s | Corpus (inputs/size) | Result |
+|---|---|---|---|---|---|
+| `native_frame` | 121 | 1,346,503 | 11,128 | 263 / 577 KB | clean |
+| `native_batch_v1` | ~40 | 2,286,271 | 57,156 | 693 / 121 KB | `oom`: interner arena growth |
+| `native_batch_v2` | ~39 | 1,976,749 | 50,685 | 637 / 132 KB | `oom`: interner arena growth |
+| `native_control` | 121 | 6,495,351 | 53,680 | 309 / 47 KB | clean |
+| `sketch_bytes` | 121 | 4,502,624 | 37,211 | 520 / 929 KB | clean |
+| `sketch_merge` | 121 | 3,231,840 | 26,709 | 591 / 1,754 KB | clean |
+| `hll_bytes` | <1 | 38,579 | n/a | 88 / 22 KB | crash: `estimate` overflow |
+| `otlp_proto` | 121 | 3,667,327 | 30,308 | 1,857 / 399 KB | clean |
+| `otlp_json` | 121 | 2,006,625 | 16,583 | 1,540 / 405 KB | clean |
+| `otlp_grpc` | 121 | 3,481,103 | 28,769 | 1,752 / 407 KB | clean |
+| `prom_decompress` | 121 | 911,925 | 7,536 | 754 / 205 KB | clean |
+| `prom_remote_write` | 121 | 1,739,336 | 14,374 | 1,544 / 1,126 KB | clean |
+
+Two findings, handed to the workstreams that own the decoders:
+
+- **`hll_bytes`: `HyperLogLog::estimate` overflows on a decoded estimator.**
+  `cardinality-estimator` 1.0.3's `hyperloglog.rs` computes `M - zeros` from the estimator's
+  stored zero-register count, and `HyperLogLog::from_bytes` accepts a count larger than `M`
+  (4096). Under the fuzz build's debug assertions that panics with "attempt to subtract with
+  overflow". A release build wraps and returns a meaningless estimate. The 3,097-byte reproducer
+  doesn't minimize further, because the HLL representation's register array fills most of it. It
+  is committed as `fuzz/seeds/hll_bytes/regress-9a8fd57a`, so `hll_bytes` fails at startup until
+  the decoder rejects it (CORE-06).
+- **`native_batch_v1`/`v2`: an `oom` that no single input reproduces.** The failing allocation is
+  16 MiB (`malloc(16777240)`), from `lasso`'s arena growing a bucket under
+  `logit_core::interner::intern`, called from `Dict::read`. The process-wide interner never
+  evicts, so after about two million decoded dictionaries it outgrows the target's 16 MiB malloc
+  limit. Rerunning the saved input alone doesn't crash, so `fuzz-tmin` has nothing to minimize.
+  This is the native dictionary's cross-frame interner growth (WIRE-02), and it ends every
+  `native_batch_*` run at about 40 seconds until the decoder bounds it or the target's limit
+  changes.
