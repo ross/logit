@@ -335,12 +335,32 @@ impl HyperLogLog {
         bytes
     }
 
-    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or malformed blob.
+    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or malformed blob, on
+    /// bytes left after it, and on an HLL representation whose zero-register count exceeds its
+    /// register count (upstream's `estimate` computes `M - zeros`). The harmonic sum in `data[1]`
+    /// is taken as written: it's an `f32` accumulated one register update at a time, so
+    /// recomputing it from the registers wouldn't reproduce the bytes, and a bad one skews the
+    /// estimate without panicking.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HllDecodeError> {
         let mut reader = HllBytesReader::new(bytes);
         let inner: cardinality_estimator::CardinalityEstimator<[u8]> =
             serde::Deserialize::deserialize(&mut reader)?;
-        Ok(HyperLogLog(inner))
+        // Wrapped before the checks below, so an early return drops it through upstream's `Drop`.
+        let hll = HyperLogLog(inner);
+        if !reader.bytes.is_empty() {
+            return Err(HllDecodeError(format!(
+                "{} trailing bytes after the blob",
+                reader.bytes.len()
+            )));
+        }
+        if let Some(zeros) = hll_zero_register_count(bytes) {
+            if zeros as usize > CE_HLL_REGISTERS {
+                return Err(HllDecodeError(format!(
+                    "HLL zero-register count {zeros} exceeds the {CE_HLL_REGISTERS} registers"
+                )));
+            }
+        }
+        Ok(hll)
     }
 }
 
@@ -597,10 +617,30 @@ const CE_REPRESENTATION_HLL: u8 = 3;
 // `validate_members_len` rejects the same range before allocating.
 const CE_ARRAY_MAX_CAPACITY: usize = 128;
 
-// Mirrors upstream's `pub(crate)` `HLL_SLICE_LEN` for `CardinalityEstimator<[u8]>`'s default
-// `P = 12, W = 6`: `(1 << P) * W / 32 + 3`. `hll_slice_len_matches_upstream_constant` recomputes
-// it; an upgrade that changes `P`, `W`, or the formula must update this in lockstep.
-const CE_HLL_SLICE_LEN: usize = 771;
+// Mirror upstream's `pub(crate)` `HyperLogLog::M` and `HLL_SLICE_LEN` for
+// `CardinalityEstimator<[u8]>`'s default `P = 12, W = 6`: `M = 1 << P` registers, and a slice of
+// `M * W / 32 + 3` words (zero-register count, harmonic sum, packed registers, one spare).
+// `hll_slice_len_matches_upstream_constant` recomputes the slice length from the formula;
+// an upgrade that changes `P`, `W`, or the layout must update these in lockstep.
+const CE_HLL_P: usize = 12;
+const CE_HLL_W: usize = 6;
+const CE_HLL_REGISTERS: usize = 1 << CE_HLL_P;
+const CE_HLL_SLICE_LEN: usize = CE_HLL_REGISTERS * CE_HLL_W / 32 + 3;
+
+// Where `members` starts in a blob: the 8-byte `data` word, the presence byte, and the 4-byte
+// length (the codec's wire layout above).
+const HLL_MEMBERS_OFFSET: usize = 8 + 1 + 4;
+
+/// The HLL representation's `data[0]`, its zero-register count, read from a blob that already
+/// decoded; `None` for the small and array representations.
+fn hll_zero_register_count(bytes: &[u8]) -> Option<u32> {
+    let tag = bytes.first()? & 0x3;
+    if tag != CE_REPRESENTATION_HLL || bytes.get(8) != Some(&1) {
+        return None;
+    }
+    let word = bytes.get(HLL_MEMBERS_OFFSET..HLL_MEMBERS_OFFSET + 4)?;
+    Some(u32::from_le_bytes(word.try_into().expect("4 bytes")))
+}
 
 /// The deserializer behind [`HyperLogLog::from_bytes`], which works around an allocation-layout
 /// bug in `cardinality-estimator` 1.0.3.
@@ -1238,6 +1278,56 @@ mod tests {
                 HyperLogLog::from_bytes(&bytes).is_err(),
                 "length {bad_len} should be rejected"
             );
+        }
+    }
+
+    /// A hand-built blob: the `data` word, then the optional `members` list.
+    fn hll_blob(data: u64, members: Option<&[u32]>) -> Vec<u8> {
+        let mut out = data.to_le_bytes().to_vec();
+        match members {
+            None => out.push(0),
+            Some(m) => {
+                out.push(1);
+                out.extend_from_slice(&(m.len() as u32).to_le_bytes());
+                for v in m {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// The HLL representation's `data[0]` counts zero registers, and upstream's `estimate`
+    /// computes `M - zeros`: a count past `M` underflows (a debug panic, a release estimate of 0)
+    /// and survives every later merge into the window's accumulator.
+    #[test]
+    fn an_hll_zero_register_count_past_m_is_rejected() {
+        let registers = CE_HLL_REGISTERS as u32;
+        let with_zeros = |zeros: u32| {
+            let mut members = hll_with(5000).to_bytes()[HLL_MEMBERS_OFFSET..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect::<Vec<_>>();
+            members[0] = zeros;
+            hll_blob(CE_REPRESENTATION_HLL as u64, Some(&members))
+        };
+        for zeros in [registers + 1, u32::MAX] {
+            let err = HyperLogLog::from_bytes(&with_zeros(zeros)).expect_err("rejected");
+            assert!(err.to_string().contains("zero-register count"), "{err}");
+        }
+        assert!(HyperLogLog::from_bytes(&with_zeros(registers)).is_ok());
+    }
+
+    /// A valid blob followed by anything is malformed, in every representation.
+    #[test]
+    fn trailing_bytes_after_an_hll_blob_are_rejected() {
+        for n in [0u32, 1, 10, 5000] {
+            let mut bytes = hll_with(n).to_bytes();
+            bytes.push(0);
+            let err = HyperLogLog::from_bytes(&bytes).expect_err("rejected");
+            assert!(err.to_string().contains("trailing"), "{n} members: {err}");
         }
     }
 
