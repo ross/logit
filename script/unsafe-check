@@ -16,10 +16,10 @@
 # helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
 # force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
 #
-# The same image fuzzes the decoders an unauthenticated peer feeds (`fuzz/`, cargo-fuzz under
-# ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all` runs each for
-# `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash under the target's
-# limits, and `fuzz-seed` rewrites the committed seeds.
+# The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
+# cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
+# runs each for `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash, and
+# `fuzz-seed` rewrites the committed seeds.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
 #   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -372,10 +372,10 @@ tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs
 helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
 force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
 
-The same image fuzzes the decoders an unauthenticated peer feeds (`fuzz/`, cargo-fuzz under
-ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all` runs each for
-`seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash under the target's
-limits, and `fuzz-seed` rewrites the committed seeds.
+The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
+cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
+runs each for `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash, and
+`fuzz-seed` rewrites the committed seeds.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
