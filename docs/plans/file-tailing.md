@@ -174,7 +174,7 @@ to end, not just in unit tests.
 ## Verification
 
 All four workstreams landed; `script/cibuild` green on every PR (format, clippy `-D warnings`,
-nextest, `script/validate` on `demo/logit.yaml` and every `examples/*.yaml`, schema regenerated and
+nextest, `script/validate` on `demo/logit.yaml` and every `fixtures/*.yaml`, schema regenerated and
 committed, `script/audit` clean) — workstream A alone landed 1053 nextest tests including the new
 `tail`/`graph`/`pipeline` coverage, B added `inotify` unit and latency-comparison tests, C added
 the full `docker.rs` suite. Workstream D's own bar was higher than a config-only PR would need,

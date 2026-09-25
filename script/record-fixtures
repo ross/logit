@@ -2,7 +2,8 @@
 # Usage: script/record-fixtures [producer ...]
 #   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
 #              prometheus, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
-#              datadog-dogstatsd-unix)
+#              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
+#              splunk-java, then check_splunk_capture.py)
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -65,7 +66,8 @@ finish_capture() {
 }
 
 cleanup() {
-    ${DOCKER} rm -f capture otelcol prometheus vmagent metatarget dd-agent dd-clients >/dev/null 2>&1 || true
+    ${DOCKER} rm -f -v capture otelcol prometheus vmagent metatarget dd-agent dd-clients \
+        splunk-dind splunk-sc4s splunk-java >/dev/null 2>&1 || true
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
     # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
@@ -659,9 +661,239 @@ record_datadog_dogstatsd_unix() {
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
 }
 
+# ---- Splunk HEC ---------------------------------------------------------------------------------
+#
+# Four producers, all writing testdata/interop/splunk/ (its README has the provenance table):
+#   splunk-otel    the OpenTelemetry Collector's `splunk_hec` exporter, fed by telemetrygen
+#   splunk-docker  Docker's `splunk` log driver in each `splunk-format`, in a docker:dind daemon
+#   splunk-sc4s    Splunk Connect for Syslog, fed RFC 5424 and RFC 3164 lines over UDP
+#   splunk-java    splunk-library-javalogging's Logback appender, `/event` and `/raw`
+# `splunk` runs all four, then check_splunk_capture.py.
+#
+# The capture sink stands where a HEC listener would, on port 8088, answering every route alias a
+# client may use with Splunk's own bodies (`splunk-hec-success.json`, `splunk-hec-health.json`).
+# Every producer carries the dummy token below; nothing here reaches a Splunk.
+
+SPLUNK_TOKEN="00000000-0000-0000-0000-000000000000"
+SPLUNK_OUT="${OUT_ROOT}/splunk"
+SPLUNK_OTEL_IMAGE="otel/opentelemetry-collector-contrib:0.161.0"
+SPLUNK_TELEMETRYGEN_IMAGE="ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.161.0"
+SPLUNK_DIND_IMAGE="docker:29.8.1-dind"
+SPLUNK_ALPINE_IMAGE="alpine:3.22"
+SPLUNK_SC4S_IMAGE="ghcr.io/splunk/splunk-connect-for-syslog/container3:3.40.0"
+SPLUNK_MAVEN_IMAGE="maven:3.9.16-eclipse-temurin-17"
+
+# splunk_capture <prefix> <timeout> [raw_capture.py args...]: start_capture on port 8088, named
+# by path, with Splunk's success body on every data route and its health body on both health
+# routes.
+splunk_capture() {
+    local prefix="$1" timeout="$2"
+    shift 2
+    local replies=() route
+    for route in /services/collector /services/collector/event /services/collector/event/1.0 \
+        /services/collector/raw /services/collector/raw/1.0; do
+        replies+=(--reply "${route}=/replies/success.json")
+    done
+    for route in /services/collector/health /services/collector/health/1.0; do
+        replies+=(--reply "${route}=/replies/health.json")
+    done
+    CAPTURE_DOCKER_ARGS=(
+        -v "${TOOLS_DIR}/splunk-hec-success.json:/replies/success.json:ro,z"
+        -v "${TOOLS_DIR}/splunk-hec-health.json:/replies/health.json:ro,z"
+    )
+    start_capture http 8088 "${SPLUNK_OUT}" "${prefix}" 0 "${timeout}" --name-by-path \
+        "${replies[@]}" "$@"
+    CAPTURE_DOCKER_ARGS=()
+}
+
+# The `splunk_hec` exporter (otel-collector-splunk.yaml says which exporter writes what), fed by
+# telemetrygen: one traces run, one logs run, and one metrics run per `--metric-type`, unthrottled
+# (`--rate=0`). The config's `batch` processor makes each run one request per exporter, so the
+# capture's count is fixed: traces 1, logs 1 (plus one `/raw`), and two per metrics run (default
+# and multi-metric form), except ExponentialHistogram, which the exporter drops and so never
+# sends. That run goes before Histogram's, so a release that started sending it would complete the
+# capture early and check_splunk_capture.py would fail on the missing histogram. A log carries a
+# fixed trace and span id, a non-default severity, and an array attribute.
+#
+# Then the Collector's own `splunk_hec` receiver is posted the recorded span body
+# (splunk_hec_receiver_probe.py), and the `debug` exporter's rendering of what it decoded is
+# printed for testdata/interop/splunk/README.md.
+record_splunk_otel() {
+    echo "== recording: OpenTelemetry Collector splunk_hec exporter (${SPLUNK_OTEL_IMAGE}) =="
+    ${DOCKER} run --rm "${SPLUNK_OTEL_IMAGE}" --version 2>&1 | sed 's/^/  [otelcol] /'
+    splunk_capture otel 90 --max-per-path 1 \
+        --require /services/collector=8 --require /services/collector/raw \
+        --require /services/collector/health
+    ${DOCKER} run -d --name otelcol --network "${NET}" --hostname splunk-otel-fixture \
+        -v "${TOOLS_DIR}/otel-collector-splunk.yaml:/etc/otelcol-config.yaml:ro,z" \
+        "${SPLUNK_OTEL_IMAGE}" --config /etc/otelcol-config.yaml >/dev/null
+    sleep 3
+
+    local gen_args=(--otlp-endpoint otelcol:4317 --otlp-insecure --service splunk-otel-fixture --rate=0)
+    local run
+    for run in \
+        "traces --traces=3" \
+        "logs --logs=3 --severity-text=Warn --severity-number=13 --trace-id=0af7651916cd43dd8448eb211c80319c --span-id=b7ad6b7169203331 --telemetry-attributes=fixture.tags=[\"a\",\"b\"]" \
+        "metrics --metrics=3 --metric-type=Gauge" \
+        "metrics --metrics=3 --metric-type=Sum" \
+        "metrics --metrics=3 --metric-type=ExponentialHistogram" \
+        "metrics --metrics=3 --metric-type=Histogram"; do
+        echo "-- telemetrygen ${run%% *}"
+        # shellcheck disable=SC2086 # word splitting is the point: one run's flags
+        ${DOCKER} run --rm --network "${NET}" "${SPLUNK_TELEMETRYGEN_IMAGE}" ${run} "${gen_args[@]}" \
+            2>&1 | grep -E 'error|fail' | sed 's/^/  [telemetrygen] /' || true
+        # Past the batch processor's 3 s timeout, so each run is its own request.
+        sleep 5
+    done
+    local status=0
+    finish_capture || status=$?
+
+    echo "-- the Collector's splunk_hec receiver, posted the recorded span body"
+    ${DOCKER} run --rm --network "${NET}" -v "${SPLUNK_OUT}:/data:ro,z" \
+        -v "${TOOLS_DIR}/splunk_hec_receiver_probe.py:/probe.py:ro,z" python:3.12-slim \
+        python3 /probe.py /data http://otelcol:8088/services/collector 2>&1 | sed 's/^/  [probe] /' || status=1
+    sleep 2
+    ${DOCKER} logs otelcol 2>&1 | sed -n '/ResourceLog #0/,$p' | head -60 | sed 's/^/  [otelcol debug] /'
+    ${DOCKER} rm -f otelcol >/dev/null 2>&1 || true
+    return "${status}"
+}
+
+# Docker's `splunk` log driver, run by a docker:dind daemon rather than this machine's, so the
+# `host` the driver stamps is the dind container's fixed hostname. The inner daemon reaches the
+# capture sink through the outer network's resolver. Three containers, one per `splunk-format`,
+# each echoing a JSON line and a plain line and exiting; the driver flushes on close, so each is
+# one request. `json` also sets `splunk-source`/`-sourcetype`/`-index`, and `raw` sets
+# `splunk-gzip`. The alpine image is loaded into the inner daemon from this one, not pulled.
+record_splunk_docker() {
+    echo "== recording: Docker's splunk log driver (${SPLUNK_DIND_IMAGE}) =="
+    ${DOCKER} image inspect "${SPLUNK_ALPINE_IMAGE}" >/dev/null 2>&1 || ${DOCKER} pull -q "${SPLUNK_ALPINE_IMAGE}" >/dev/null
+    splunk_capture docker 180 --max-per-path 1 \
+        --require /services/collector/event/1.0=6
+    ${DOCKER} run -d --name splunk-dind --privileged --hostname splunk-docker-fixture \
+        --network "${NET}" -e DOCKER_TLS_CERTDIR= "${SPLUNK_DIND_IMAGE}" >/dev/null
+    local tries=0
+    until ${DOCKER} exec splunk-dind docker info >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if [ "${tries}" -gt 60 ]; then
+            echo "record-fixtures: the dind daemon never came up" >&2
+            ${DOCKER} logs splunk-dind 2>&1 | tail -20 | sed 's/^/  [dind] /'
+            return 1
+        fi
+        sleep 1
+    done
+    ${DOCKER} exec splunk-dind docker version --format 'server {{.Server.Version}}' | sed 's/^/  [dind] /'
+    ${DOCKER} save "${SPLUNK_ALPINE_IMAGE}" | ${DOCKER} exec -i splunk-dind docker load -q | sed 's/^/  [dind] /'
+
+    local common=(--log-driver splunk --log-opt splunk-url=http://capture:8088
+        --log-opt "splunk-token=${SPLUNK_TOKEN}" --log-opt splunk-insecureskipverify=true)
+    local format extra
+    for format in inline json raw; do
+        extra=()
+        case "${format}" in
+        json) extra=(--log-opt splunk-source=docker:fixture --log-opt splunk-sourcetype=docker:json
+            --log-opt splunk-index=main) ;;
+        raw) extra=(--log-opt splunk-gzip=true) ;;
+        esac
+        echo "-- splunk-format=${format}"
+        ${DOCKER} exec splunk-dind docker run --rm --name "splunk-${format}" "${common[@]}" \
+            --log-opt "splunk-format=${format}" "${extra[@]}" "${SPLUNK_ALPINE_IMAGE}" \
+            sh -c "echo '{\"level\":\"info\",\"msg\":\"splunk-docker fixture ${format}\",\"n\":1}'; echo 'splunk-docker fixture plain line (${format})'" \
+            2>&1 | sed 's/^/  [dind] /'
+    done
+    local status=0
+    finish_capture || status=$?
+    ${DOCKER} rm -f -v splunk-dind >/dev/null 2>&1 || true
+    return "${status}"
+}
+
+# Splunk Connect for Syslog, forwarding three syslog lines (splunk-sc4s-lines.txt: two RFC 5424,
+# one RFC 3164, each naming the fixed host `sc4s-fixture-host`) over UDP 514 to HEC. Seven
+# requests, in a fixed order: the entrypoint's two `curl` connection tests ("HEC TEST EVENT"),
+# syslog-ng's two startup events, then one request per line (sent 200 ms apart). The lines go as
+# soon as syslog-ng is up, because SC4S also posts its own metrics every 30 s, a ~44 KB body per
+# flush that the corpus doesn't keep (testdata/interop/splunk/README.md describes its shape).
+record_splunk_sc4s() {
+    echo "== recording: Splunk Connect for Syslog (${SPLUNK_SC4S_IMAGE}) =="
+    splunk_capture sc4s 120 --max-per-path 1 --require /services/collector/event=7
+    ${DOCKER} run -d --name splunk-sc4s --network "${NET}" --hostname splunk-sc4s-fixture \
+        -e SC4S_DEST_SPLUNK_HEC_DEFAULT_URL=http://capture:8088 \
+        -e "SC4S_DEST_SPLUNK_HEC_DEFAULT_TOKEN=${SPLUNK_TOKEN}" \
+        -e SC4S_DEST_SPLUNK_HEC_DEFAULT_TLS_VERIFY=no \
+        -e SC4S_DEST_SPLUNK_HEC_DEFAULT_DISKBUFF_ENABLE=no \
+        -e SC4S_SOURCE_LISTEN_UDP_SOCKETS=1 \
+        "${SPLUNK_SC4S_IMAGE}" >/dev/null
+    local tries=0
+    until ${DOCKER} logs splunk-sc4s 2>&1 | grep -q 'starting syslog-ng'; do
+        tries=$((tries + 1))
+        if [ "${tries}" -gt 90 ]; then
+            echo "record-fixtures: SC4S never started syslog-ng" >&2
+            ${DOCKER} logs splunk-sc4s 2>&1 | tail -20 | sed 's/^/  [sc4s] /'
+            break
+        fi
+        sleep 1
+    done
+    # syslog-ng binds its sources a moment after the entrypoint says it is starting.
+    sleep 3
+    ${DOCKER} run --rm --network "${NET}" -v "${TOOLS_DIR}/splunk-sc4s-lines.txt:/lines.txt:ro,z" \
+        python:3.12-slim python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for line in open('/lines.txt').read().splitlines():
+    s.sendto(line.encode(), ('splunk-sc4s', 514))
+    time.sleep(0.2)
+"
+    local status=0
+    finish_capture || status=$?
+    ${DOCKER} logs splunk-sc4s 2>&1 | grep -E 'version|HEC|error' | sed 's/^/  [sc4s] /'
+    ${DOCKER} rm -f -v splunk-sc4s >/dev/null 2>&1 || true
+    return "${status}"
+}
+
+# Splunk's Java logging library (`splunk-library-javalogging`), through a one-class Logback app
+# built and run in one maven container from tools/record-fixtures/splunk-java/ (its logback.xml
+# says what each of the three appenders sends). Three lines each, one request per line: six to
+# `/services/collector/event/1.0` and three to `/services/collector/raw`. The appenders send
+# asynchronously, so the two `/event` appenders' requests interleave in no fixed order. The 600 s
+# timeout covers the first run's Maven downloads.
+record_splunk_java() {
+    echo "== recording: splunk-library-javalogging Logback appender (${SPLUNK_MAVEN_IMAGE}) =="
+    splunk_capture java 600 --max-per-path 1 \
+        --require /services/collector/event/1.0=6 --require /services/collector/raw=3
+    ${DOCKER} run --rm --name splunk-java --network "${NET}" --hostname splunk-java-fixture \
+        -v "${TOOLS_DIR}/splunk-java:/src:ro,z" "${SPLUNK_MAVEN_IMAGE}" \
+        bash -c "cp -r /src /build && cd /build && java -version 2>&1 | head -1 \
+            && mvn -q -B package dependency:copy-dependencies -DskipTests \
+            && ls target/dependency | grep -E 'splunk|logback|okhttp' \
+            && java -Dlogback.configurationFile=/build/logback.xml -cp 'target/classes:target/dependency/*' Main" \
+        2>&1 | sed 's/^/  [java] /'
+    finish_capture
+}
+
+# check_splunk_capture.py over the whole directory: fails on anything describing this machine
+# (its hostname, read here and passed in) and on a construct the tests read that no capture holds.
+check_splunk_capture() {
+    ${DOCKER} run --rm -v "${SPLUNK_OUT}:/data:ro,z" \
+        -v "${TOOLS_DIR}/check_splunk_capture.py:/check.py:ro,z" python:3.12-slim \
+        python3 /check.py /data "$(hostname)" 2>&1 | sed 's/^/  [check] /'
+    return "${PIPESTATUS[0]}"
+}
+
+# The four producers, then the check, which runs whatever their outcome: a failed producer can
+# still have written captures into testdata/.
+record_splunk() {
+    local status=0
+    record_splunk_otel || status=1
+    record_splunk_docker || status=1
+    record_splunk_sc4s || status=1
+    record_splunk_java || status=1
+    check_splunk_capture || status=1
+    return "${status}"
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus vmagent statsd datadog)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus vmagent statsd datadog
+    splunk)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -686,6 +918,11 @@ for p in "${producers[@]}"; do
     datadog-agent) record_datadog_agent ;;
     datadog-tracer) record_datadog_tracer ;;
     datadog-dogstatsd-unix) record_datadog_dogstatsd_unix ;;
+    splunk-otel) record_splunk_otel ;;
+    splunk-docker) record_splunk_docker ;;
+    splunk-sc4s) record_splunk_sc4s ;;
+    splunk-java) record_splunk_java ;;
+    splunk) record_splunk ;;
     datadog)
         record_datadog_dogstatsd_unix
         record_datadog_tracer

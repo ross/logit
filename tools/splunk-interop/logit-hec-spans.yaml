@@ -1,0 +1,56 @@
+# Leg `hec-spans` of `script/splunk-interop`: spans through `splunk_hec_out` as the OpenTelemetry
+# exporter's span events, into `main`.
+#
+# A `lua` stage mints one server span per tick with `Event.new`, its ids from the tick's own
+# nanosecond timestamp, with an error status and a span event, so the harness can search for
+# the span object's `trace_id`, `kind`, and `status`.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+    resource:
+      service.name: splunk-interop-spans
+
+  mint:
+    type: lua
+    sources: [tick]
+    script: |
+      function process(event)
+        local ts = event.timestamp
+        -- Plain decimal digits are valid hex.
+        local trace_id = "5" .. string.rep("0", 31 - #ts) .. ts
+        local span_id = string.sub(ts, -16)
+        return Event.new{
+          timestamp = ts,
+          attributes = {leg = "hec-spans", ["http.route"] = "/checkout"},
+          span = {
+            trace_id = trace_id,
+            span_id = span_id,
+            name = "splunk-interop-span",
+            kind = "server",
+            status = "error",
+            status_message = "boom",
+            end_timestamp = ts,
+            events = {{timestamp = ts, name = "retry"}},
+          },
+        }
+      end
+
+  envelope:
+    type: set
+    sources: [mint]
+    resource:
+      com.splunk.index: main
+      com.splunk.sourcetype: logit:span
+      com.splunk.source: splunk-interop
+      host.name: splunk-interop-logit
+
+  splunk:
+    type: splunk_hec_out
+    sources: [envelope]
+    endpoint: http://splunk:8088/services/collector
+    token: 11111111-1111-1111-1111-111111111111

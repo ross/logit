@@ -39,7 +39,7 @@ components:
 ```
 
 This is the statsd → aggregate → Lua → InfluxDB shape of
-[examples/statsd-to-influxdb.yaml](../../examples/statsd-to-influxdb.yaml). There is no `inputs`/
+[fixtures/statsd-to-influxdb.yaml](../../fixtures/statsd-to-influxdb.yaml). There is no `inputs`/
 `outputs`/`pipelines` split and no separate `transforms:` chain: `sources` carries all the wiring.
 A "pipeline" is whatever subgraph is reachable from a listener; config has no notion of one.
 
@@ -260,7 +260,7 @@ filters. A `target` has no fields and no `sources:`. A router points at it, and 
 components read it like any other source (for example, `windowed: {sources: [host_stream]}`).
 `lua`/`lua_file` is the other router kind: it picks a target per event with `event:to("id")`
 instead of an equality table (see `docs/design/lua-api.md`'s "Routing to a target."). A complete,
-runnable version of the config above is `examples/fan-out-central.yaml`.
+runnable version of the config above is `fixtures/fan-out-central.yaml`.
 
 ## Validation
 
@@ -364,6 +364,12 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
     `tls` with `socket`).
 68. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
+69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
+    whitespace, or a `max_request_bytes` of `0`.
+70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a query
+    or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
+    whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
+    `max_body_bytes` of `0`, or a bad `tls` (including any `tls` with an `http://` endpoint).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -641,9 +647,10 @@ this config actually do" for a graph that's hard to read from YAML.
   at a glance without the arity table.
 - It renders a `target` as a dashed box, and every router → target edge dashed, labeled with the
   `routes:` key that directs an event down it. A `lua`/`lua_file` `targets:` edge has no label,
-  because the script picks the destination with `event:to("..")`. These edges come from
-  `graph::target_edges`, which reads the raw `Config` too, so a router whose target id resolves to
-  nothing renders as a dangling dashed edge rather than blocking output
+  because the script picks the destination with `event:to("..")`. A targeting node's ordinary
+  edges to its consumers, which carry the events no target took, are labeled `[else]`. The target
+  edges come from `graph::target_edges`, which reads the raw `Config` too, so a router whose
+  target id resolves to nothing renders as a dangling dashed edge rather than blocking output
   ([ADR `target-components`](../adr/target-components.md)).
 - Every `!env` reference must still resolve ("Environment substitution" above). A missing variable
   fails the load before `render` is called, as with `run`/`validate`, even for a field this command
