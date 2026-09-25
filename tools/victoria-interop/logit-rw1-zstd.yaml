@@ -1,0 +1,48 @@
+# Leg 1z of `script/victoria-interop` (docs/plans/victoriametrics-interop.md, "W1's legs"): a copy
+# of leg 1's `prometheus_out` remote-write 1.0 into VictoriaMetrics's `/api/v1/write`, with
+# `compression: zstd` in place of the default Snappy, proving W2's sender-side codec against real
+# VictoriaMetrics (the VictoriaMetrics remote write protocol vmagent itself sends by default).
+#
+# One gauge straight from `generate_in`, and one counter through `aggregate` with
+# `temporality: cumulative`, because `prometheus_out` skips a delta `Sum`.
+admin:
+  # The release image's HEALTHCHECK runs `logit ready` against this address.
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: rw1z
+      metric:
+        name: vi_rw1z_gauge
+        kind: gauge
+        value: 42
+
+  counter_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: rw1z
+      metric:
+        name: vi_rw1z_requests
+        kind: sum
+        value: 1
+
+  cumulative:
+    type: aggregate
+    sources: [counter_gen]
+    interval: 5s
+    temporality: cumulative
+
+  victoria_metrics:
+    type: prometheus_out
+    sources: [gauge_gen, cumulative]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd

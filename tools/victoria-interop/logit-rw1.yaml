@@ -1,0 +1,45 @@
+# Leg 1 of `script/victoria-interop` (docs/plans/victoriametrics-interop.md, "W1's legs"):
+# `prometheus_out` remote-write 1.0 into VictoriaMetrics's `/api/v1/write`.
+#
+# One gauge straight from `generate_in`, and one counter through `aggregate` with
+# `temporality: cumulative`, because `prometheus_out` skips a delta `Sum`.
+admin:
+  # The release image's HEALTHCHECK runs `logit ready` against this address.
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: rw1
+      metric:
+        name: vi_rw1_gauge
+        kind: gauge
+        value: 42
+
+  counter_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: rw1
+      metric:
+        name: vi_rw1_requests
+        kind: sum
+        value: 1
+
+  cumulative:
+    type: aggregate
+    sources: [counter_gen]
+    interval: 5s
+    temporality: cumulative
+
+  victoria_metrics:
+    type: prometheus_out
+    sources: [gauge_gen, cumulative]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1

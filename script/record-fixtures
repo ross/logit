@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
 #   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
-#              prometheus, statsd
+#              prometheus, vmagent, statsd
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -56,7 +56,7 @@ finish_capture() {
 }
 
 cleanup() {
-    ${DOCKER} rm -f capture otelcol prometheus metatarget >/dev/null 2>&1 || true
+    ${DOCKER} rm -f capture otelcol prometheus vmagent metatarget >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
     # record_prometheus renders its config into a temp dir; remove it here too so a run that dies
     # mid-capture doesn't leave one behind.
@@ -343,6 +343,52 @@ record_prometheus() {
     PROM_CFG_DIR=""
 }
 
+# Remote-write from `victoriametrics/vmagent:v1.152.0`, on both of its wires:
+#   vmagent-zstd    the "VictoriaMetrics remote write protocol", vmagent's default: the 1.0
+#                   `WriteRequest` with `Content-Encoding: zstd`. raw_capture.py answers `204`, so
+#                   vmagent never sees the `415`/`400` that would downgrade it to Snappy.
+#   vmagent-snappy  the same sender with `-remoteWrite.forcePromProto`: plain remote-write 1.0.
+# Two requests each, because vmagent (`-enableMetadata`, on by default) sends a scrape's samples
+# and its 1.0 `MetricMetadata` in separate requests, in no fixed order: one of each. vmagent
+# scrapes the static prometheus-metadata-target.prom (the `prometheus` producer's metadata target,
+# the same four families) through tools/record-fixtures/vmagent.yml, so a sample request is one
+# whole scrape of a small, fixed exposition and the set stays inside testdata/interop/README.md's
+# size budget.
+record_vmagent() {
+    local image="victoriametrics/vmagent:v1.152.0"
+    echo "== recording: vmagent remote-write (${image}) =="
+    local out="${OUT_ROOT}/prometheus"
+    ${DOCKER} run --rm "${image}" --version 2>&1 | sed 's/^/  [vmagent] /'
+
+    ${DOCKER} run -d --name metatarget --network "${NET}" -w /srv \
+        -v "${TOOLS_DIR}/prometheus-metadata-target.prom:/srv/metrics:ro,z" \
+        python:3.12-slim \
+        python3 -m http.server 9100 >/dev/null
+    sleep 1
+
+    # prefix:extra vmagent flag
+    for spec in "vmagent-zstd:" "vmagent-snappy:-remoteWrite.forcePromProto"; do
+        local prefix flag extra=()
+        IFS=: read -r prefix flag <<<"${spec}"
+        [ -n "${flag}" ] && extra=("${flag}")
+        echo "-- ${prefix} (${flag:-the default wire})"
+        start_capture http 9091 "${out}" "${prefix}" 2 60
+        ${DOCKER} run -d --name vmagent --network "${NET}" \
+            -v "${TOOLS_DIR}/vmagent.yml:/etc/vmagent/vmagent.yml:ro,z" \
+            "${image}" \
+            -promscrape.config=/etc/vmagent/vmagent.yml \
+            -remoteWrite.url=http://capture:9091/api/v1/write \
+            -remoteWrite.tmpDataPath=/tmp/vmagent-remotewrite-data \
+            "${extra[@]}" \
+            >/dev/null
+        finish_capture
+        ${DOCKER} logs vmagent 2>&1 | grep -E 'remotewrite|error|warn' | sed 's/^/  [vmagent] /' || true
+        ${DOCKER} rm -f vmagent >/dev/null 2>&1 || true
+    done
+
+    ${DOCKER} rm -f metatarget >/dev/null 2>&1 || true
+}
+
 # statsd/DogStatsD from the two common Python clients: Datadog's `datadog` package (`DogStatsd`)
 # and the plain `statsd` package (`StatsClient`). This corpus is also the ground truth
 # perf/load/README.md's traffic model is calibrated against.
@@ -385,7 +431,7 @@ record_statsd() {
 
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus statsd)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus vmagent statsd)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -405,6 +451,7 @@ for p in "${producers[@]}"; do
     otlp) record_otlp ;;
     graphite) record_graphite ;;
     prometheus) record_prometheus ;;
+    vmagent) record_vmagent ;;
     statsd) record_statsd ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2

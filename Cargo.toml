@@ -36,9 +36,10 @@ bytes = "1"
 # (docs/adr/committed-pregenerated-otlp-protobuf.md); no `prost-build`/`protoc` at build time.
 prost = "0.14"
 # The native wire format's compression (docs/design/wire-protocol.md) -- pure Rust, no C toolchain
-# (ADR `containerized-development`). `zstd` is deliberately not a dependency: the real `zstd` crate
-# builds C via `zstd-sys`, and the pure-Rust alternatives aren't yet competitive -- see
-# `docs/adr/native-wire-format-encoding.md`.
+# (ADR `containerized-development`). The native frame has no zstd: the real `zstd` crate builds C
+# via `zstd-sys`, and the pure-Rust alternative isn't competitive on ratio or speed there, so its
+# `Compression::Zstd` stays reserved and rejected (`docs/adr/native-wire-format-encoding.md`).
+# `ruzstd` below is scoped to Prometheus remote-write.
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "checked-decode"] }
 # CRC-32C (Castagnoli) for the native frame header -- distinct polynomial from the CRC-32/IEEE
 # `crc32fast` already pulls in transitively; hardware-accelerated on x86-64/aarch64 with a pure-Rust
@@ -82,6 +83,14 @@ cardinality-estimator = { version = "1.0.3", features = ["with_serde"] }
 # Prometheus remote-write mandates Snappy **block** compression (not framed) for the request body
 # (docs/plans/prometheus-remote-write.md). BSD-3-Clause, allowed in `deny.toml`.
 snap = "1"
+# zstd, two uses: Prometheus remote-write's zstd variant, the VictoriaMetrics remote write
+# protocol, both directions (docs/adr/victoriametrics-interop.md); and datadog_in's request decode
+# (docs/adr/datadog-agent-and-intake-relay.md, decision 4), since a Datadog Agent compresses with
+# zstd by default. Pure Rust, MIT, no C toolchain, unlike the `zstd` crate (see the `lz4_flex`
+# note above). Its encoder reaches about libzstd level 1 and its decoder is slower than libzstd;
+# the goal is interop with vmagent, VictoriaMetrics, and the Agent, not libzstd's ratio. Not the
+# native frame's compression. `hash` lets the decoder verify a frame's content checksum.
+ruzstd = { version = "0.9", features = ["hash"] }
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR `containerized-development`) intact, since rustls has no system OpenSSL to link against.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -102,11 +111,6 @@ http-body-util = "0.1"
 # the pure-Rust `miniz_oxide` backend rather than a C zlib, keeping "no host toolchain needed"
 # intact (ADR `containerized-development`).
 flate2 = "1"
-# datadog_in's zstd request decode (docs/adr/datadog-agent-and-intake-relay.md, decision 4): a
-# Datadog Agent compresses with zstd by default. `ruzstd` is pure Rust (MIT) and is used here to
-# decompress only. The rationale above against the C `zstd` crate is about compressing, and it
-# stands: senders use gzip. `hash` lets the decoder verify a frame's content checksum.
-ruzstd = { version = "0.9", features = ["hash"] }
 # TLS for otlp_out (both transports) and otlp_in (docs/adr/otlp-tls-and-pooled-grpc-client.md).
 # All four already resolve in Cargo.lock at these exact versions, transitively via `reqwest`'s
 # `rustls-tls` feature -- promoting them to direct dependencies adds no new crate version to the
@@ -156,11 +160,12 @@ tracing = "0.1"
 # already promoted above. All MIT or (MIT OR Apache-2.0); `deny.toml`'s allowlist already covers
 # both -- script/audit confirms, not assumes.
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-# Pure-codec fixed-point property tests only, dev-only everywhere it's used: `logit-proto`'s
-# OTLP suite (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s
-# W4) and `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5),
-# both asserting `decode(encode(decode(x))) == decode(x)`. MIT OR Apache-2.0, covered by
-# deny.toml's allowlist (`script/audit` confirms, not assumes).
+# Property tests, dev-only everywhere it's used: `logit-proto`'s OTLP suite
+# (`crates/logit-proto/tests/otlp_fixed_point.rs`, `docs/plans/lossless-transit.md`'s W4) and
+# `crates/logit-outputs/src/syslog.rs`'s RFC 5424 STRUCTURED-DATA grammar suite (W5), both
+# asserting `decode(encode(decode(x))) == decode(x)`, and `logit-pipeline`'s disk spool recovery
+# suite (`crates/logit-pipeline/src/disk_queue_verification.rs`), which mutates real segments.
+# MIT OR Apache-2.0, covered by deny.toml's allowlist (`script/audit` confirms, not assumes).
 proptest = "1"
 
 [profile.release]

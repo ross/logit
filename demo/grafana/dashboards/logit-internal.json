@@ -14,14 +14,16 @@
       "id": 1,
       "type": "timeseries",
       "title": "web.requests (nginx)",
-      "description": "Requests reaching the nginx tier -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> scale -> kv_metrics -> keep -> aggregate end to end. Filtered on service.name so this and the haproxy panel beside it don't double-count the shared web.requests measurement.",
+      "description": "Requests reaching the nginx tier -- real visits plus a background synthetic loop -- by status code, proving syslog_in -> json -> scale -> kv_metrics -> keep -> aggregate end to end. Requests per second, filtered on the service_name label so this and the haproxy panel beside it don't double-count the shared web_requests_total counter.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")\n  |> group(columns: [\"http.response.status_code\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (http_response_status_code) (rate(web_requests_total{service_name=\"nginx\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}"
         }
       ]
     },
@@ -29,14 +31,16 @@
       "id": 13,
       "type": "timeseries",
       "title": "web.requests (haproxy)",
-      "description": "The same web.requests measurement as the nginx panel beside it, filtered to HAProxy's own service.name tag instead -- haproxy_metrics (demo/logit.yaml) is the front door's own request count, upstream of nginx's.",
+      "description": "The same web_requests_total counter as the nginx panel beside it, filtered to HAProxy's own service_name label instead -- haproxy_metrics (demo/logit.yaml) is the front door's own request count, upstream of nginx's.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")\n  |> group(columns: [\"http.response.status_code\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (http_response_status_code) (rate(web_requests_total{service_name=\"haproxy\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}"
         }
       ]
     },
@@ -44,15 +48,16 @@
       "id": 2,
       "type": "timeseries",
       "title": "web.request_time (nginx, p50 / p99)",
-      "description": "Seconds -- nginx_http (http_access, demo/logit.yaml) hands nginx_metrics $request_time as http.request.duration_s, the same quantity and unit haproxy_http derives from HAProxy's %Ta, so this shares a measurement with haproxy's panel beside it.",
+      "description": "Seconds -- nginx_http (http_access, demo/logit.yaml) hands nginx_metrics $request_time as http.request.duration_s, the same quantity and unit haproxy_http derives from HAProxy's %Ta, so this shares a metric with haproxy's panel beside it. Each 10s aggregate window's sketch reaches VictoriaMetrics as a summary (quantile=\"0.5\" ... \"0.99\"); a quantile can't be merged across series, so this plots the worst series per route.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max by (http_route, quantile) (web_request_time{service_name=\"nginx\", quantile=~\"0.5|0.99\"})",
+          "legendFormat": "{{http_route}} q{{quantile}}"
         }
       ]
     },
@@ -60,15 +65,16 @@
       "id": 14,
       "type": "timeseries",
       "title": "web.request_time (haproxy, p50 / p99)",
-      "description": "Seconds -- HAProxy logs %Ta in milliseconds as http-request-duration_ms, and haproxy_http (http_access, demo/logit.yaml) converts it to http.request.duration_s, the same quantity and unit as nginx's panel beside it.",
+      "description": "Seconds -- HAProxy logs %Ta in milliseconds as http-request-duration_ms, and haproxy_http (http_access, demo/logit.yaml) converts it to http.request.duration_s, the same quantity and unit as nginx's panel beside it. Plotted the same way: the worst series' quantile per route.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.request_time\")\n  |> filter(fn: (r) => r._field == \"p50\" or r._field == \"p99\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max by (http_route, quantile) (web_request_time{service_name=\"haproxy\", quantile=~\"0.5|0.99\"})",
+          "legendFormat": "{{http_route}} q{{quantile}}"
         }
       ]
     },
@@ -76,14 +82,15 @@
       "id": 15,
       "type": "timeseries",
       "title": "web.connections_active (haproxy)",
-      "description": "HAProxy's own process-wide concurrent-connection gauge (%ac, demo/haproxy/haproxy.cfg), riding on each request event -- one series per request/response tag combination rather than one true process-wide series, so this groups everything together and takes the last value seen per window instead of plotting the raw per-tag series (docs/adr/scale-transform.md's sibling reasoning doesn't cover this; see haproxy_metrics's own comment in demo/logit.yaml).",
+      "description": "HAProxy's own process-wide concurrent-connection gauge (%ac, demo/haproxy/haproxy.cfg), riding on each request event -- one series per request/response tag combination rather than one true process-wide series, so this takes max() across them instead of plotting the raw per-label series (docs/adr/scale-transform.md's sibling reasoning doesn't cover this; see haproxy_metrics's own comment in demo/logit.yaml).",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.connections_active\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group()\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(web_connections_active{service_name=\"haproxy\"})",
+          "legendFormat": "active"
         }
       ]
     },
@@ -93,12 +100,26 @@
       "title": "logit.component.events.{sent,received,dropped}",
       "description": "The uniform per-component runtime instrumentation every component gets for free (Fanout::send / run_transform / run_output).",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.component.events.sent\" or r._measurement == \"logit.component.events.received\" or r._measurement == \"logit.component.events.dropped\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"_measurement\", \"component\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (component) (rate(logit_component_events_sent_total[$__rate_interval]))",
+          "legendFormat": "sent {{component}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (component) (rate(logit_component_events_received_total[$__rate_interval]))",
+          "legendFormat": "received {{component}}"
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (component) (rate(logit_component_events_dropped_total[$__rate_interval]))",
+          "legendFormat": "dropped {{component}}"
         }
       ]
     },
@@ -107,28 +128,32 @@
       "type": "timeseries",
       "title": "logit.component.process.duration (p99, by component)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.component.process.duration\")\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> group(columns: [\"component\"])"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max by (component) (logit_component_process_duration{quantile=\"0.99\"})",
+          "legendFormat": "{{component}}"
         }
       ]
     },
     {
       "id": 5,
       "type": "timeseries",
-      "title": "logit.output.requests (influxdb_out, by class)",
-      "description": "influxdb_out's own retry-loop detail -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish.",
+      "title": "logit.output.requests (victoria_out, by class)",
+      "description": "victoria_out's (prometheus_out remote-write) own per-request outcome -- 2xx/4xx/5xx/network_error -- that run_output's single send.duration timer can't distinguish. Filtered on component, because loki_out and tempo_out count the same metric.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.output.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"class\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (class) (rate(logit_output_requests_total{component=\"victoria_out\"}[$__rate_interval]))",
+          "legendFormat": "{{class}}"
         }
       ]
     },
@@ -137,13 +162,15 @@
       "type": "stat",
       "title": "logit.process.uptime",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 32 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.process.uptime\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> last()"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(logit_process_uptime)",
+          "legendFormat": "uptime"
         }
       ]
     },
@@ -153,12 +180,14 @@
       "title": "logit.process.interner.strings",
       "description": "Distinct strings in the process-wide interner. The interner never evicts, so this only ever grows.",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 32 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.process.interner.strings\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> last()"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(logit_process_interner_strings)",
+          "legendFormat": "strings"
         }
       ]
     },
@@ -268,14 +297,16 @@
       "id": 16,
       "type": "timeseries",
       "title": "logit.internal.spans.dropped (buffer_full)",
-      "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume; a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
+      "description": "The per-component span buffer's overflow counter (MAX_SPANS_PER_COMPONENT, docs/design/internal-telemetry.md) -- should stay at zero at demo volume (the counter isn't exported until it first increments, so `or vector(0)` draws the zero line); a nonzero value means the demo's traffic is outrunning the bounded buffer between `internal`'s drain ticks, not that traces are being lost silently.",
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 80 },
-      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"logit.internal.spans.dropped\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> group(columns: [\"component\", \"reason\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (component, reason) (rate(logit_internal_spans_dropped_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{component}} {{reason}}"
         }
       ]
     }

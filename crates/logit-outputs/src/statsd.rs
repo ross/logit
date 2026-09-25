@@ -180,7 +180,7 @@
 //! ## TLS
 //!
 //! `transport: tcp` optionally runs over TLS ([`StatsdOutput::with_tls`]) in `syslog_out`'s
-//! arrangement; a Unix socket never does (graph rule 64) (`docs/adr/statsd-output.md`'s "Amendment: TLS" section). A `tls:` block's presence
+//! arrangement; a Unix socket never does (graph rule 65) (`docs/adr/statsd-output.md`'s "Amendment: TLS" section). A `tls:` block's presence
 //! turns TLS on and makes it *required*: `endpoint` is a bare `host:port` with no scheme to carry
 //! the signal, so there is no plaintext fallback. No statsd client in the wild speaks TLS, so this
 //! is for a `logit`-to-`logit` (or stunnel-shaped) relay hop. DTLS is out of scope, so `tls:` under
@@ -1542,7 +1542,7 @@ enum Conn {
         socket: Option<UnixDatagram>,
         send_timeout: Duration,
     },
-    /// Always plaintext (graph rule 64); boxed like `Tcp` so both share
+    /// Always plaintext (graph rule 65); boxed like `Tcp` so both share
     /// [`StatsdOutput::send_tcp`].
     UnixStream {
         stream: Option<Box<dyn AsyncStream>>,
@@ -1648,7 +1648,7 @@ impl StatsdOutput {
     /// selected TLS. TLS is then *required*; there is no plaintext fallback.
     ///
     /// Errors on UDP (DTLS is out of scope) and on a Unix socket. `logit-pipeline::graph::resolve`'s
-    /// rules 52 and 64 already reject those configs; this check stops a caller that skips graph
+    /// rules 52 and 65 already reject those configs; this check stops a caller that skips graph
     /// validation from getting an unencrypted socket.
     ///
     /// Paths in `settings` resolve against `base_dir` (the config file's directory) and load here,
@@ -3071,10 +3071,10 @@ mod tests {
         );
     }
 
-    /// `@`, `,`, and a space, which the name rule would substitute, survive in a member.
+    /// `@`, `#`, `,`, and a space, which the name rule would substitute, survive in a member.
     #[test]
     fn members_with_at_hash_comma_or_a_space_round_trip_byte_for_byte() {
-        for line in ["users:a@b|s", "users:a,b|s", "users:a b|s"] {
+        for line in ["users:a@b|s", "users:a#b|s", "users:a,b|s", "users:a b|s"] {
             let original = decode_one(line);
             let (msgs, stats) = encode(original.clone());
             assert_eq!(msgs, vec![line], "expected {line:?} to round-trip byte for byte");
