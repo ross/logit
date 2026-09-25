@@ -227,3 +227,7 @@ permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s 
 and batching by resource; number spelling; the single-metric form leaving as multi-metric, with
 `metric_type`; a nested `fields` value leaving flattened; hex ids leaving lowercase; `/raw` split
 into one event per line).
+
+Realized as of 2026-09-25: the pair relays losslessly modulo the normalizations its codec's
+module doc lists; see [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing
+assessment.

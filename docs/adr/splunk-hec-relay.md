@@ -8,6 +8,11 @@ updated: 2026-09-25
 ## Status
 Accepted
 
+Realized as of 2026-09-25: the plan's W1 through W6 built the pair this record decides, and
+W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3; see
+[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing assessment for the proof and
+what stays open.
+
 ## Context
 
 `logit` has no Splunk component. `syslog_out` can feed a Splunk network input and `otlp_out` can

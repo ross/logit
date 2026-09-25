@@ -251,9 +251,9 @@ Don't send one signal both ways.
 3. Cut over: remove the `splunk_hec_out` leg.
 
 For a forwarder-fed Splunk, `logit` can't stand in front of the universal forwarders (§9). A
-heavy forwarder's `[syslog]` output into `syslog_in` is the tee, and Edge Processor's HEC
-destination into `splunk_hec_in` is the one to try once W5 settles whether it accepts a
-non-Splunk target.
+heavy forwarder's `[syslog]` output into `syslog_in` is the tee. Edge Processor's HEC
+destination into `splunk_hec_in` would be another, but whether it accepts a non-Splunk target is
+still unverified (item 3 of "Settled by W5").
 
 ## Design
 
@@ -378,7 +378,87 @@ and ADR) precedes both because the pair test needs both halves of the codec.
 Landing order: W0 → W1 → W2 → W3 → W4 → W5 → W6, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
-**Status (2026-09-25):** W1–W5 on their branches; W6 not started.
+**Status (2026-09-25):** W0 through W6 complete. W0 (#338) is merged to `main`; W1 #363, W2
+#368, W3 #373, W4 #376, W5 #378, and W6 (this PR) are open, each stacked on the one before,
+nothing else merged. The [closing assessment](#closing-assessment) below records what the
+stack closed and what it left open.
+
+## Closing assessment
+
+The new like-protocol pair relays losslessly modulo the permitted normalizations
+`crates/logit-proto/src/splunk/mod.rs`'s module doc lists:
+
+- **`splunk_hec_in -> splunk_hec_out`** (Splunk's HTTP Event Collector): `/event` bodies,
+  concatenated or as an array, regrouped into one batch per envelope, with `host`, `source`,
+  `sourcetype`, and `index` on the resource under the OTel exporter's names; `time` kept to the
+  nanosecond without an `f64`; and `/raw` lines with the query-string envelope, which leave
+  through `/event`. The normalizations are framing and batching by resource, JSON formatting and
+  number spelling, a flattened `fields`, the single-metric form leaving as multi-metric with a
+  `metric_type`, span enum spellings, lowercase hex ids, and `/raw` split into one event per line.
+
+Per signal:
+
+- **Logs** relay both ways with the exporter's `otel.log.severity.*`, `otel.log.name`, and
+  `trace_id`/`span_id` decoded into `LogRecord`'s typed fields and written back from them (§6); an
+  object with no `event` or a blank one is skipped and counted where Splunk would reject the
+  request (ADR decision 16).
+- **Metrics**: gauges and sums relay in both metric forms, `metric_type` carrying `Sum` versus
+  `Gauge`, and SC4S's `event`-less objects with numeric-string measurements decode as metrics.
+  Another protocol's multi-number kinds leave through `multi_value: skip | expand` (§4), with
+  histograms and summaries in the exporter's shape.
+- **Traces**: the exporter's span object decodes to a `SpanRecord` and leaves in its `hecSpan`
+  member order and enum names, so a Splunk index fed by the Collector and by `splunk_hec_out`
+  holds one span schema. The Platform itself has no trace store; Observability Cloud's OTLP
+  ingest is reached by `otlp_out` with `examples/splunk-observability.yaml` (W4), unverified.
+
+Each is proven by a test suite and by real traffic:
+
+- **Codec fixed point**: `crates/logit-proto/tests/splunk_fixed_point.rs` checks
+  `decode(encode(decode(b)))` against the normalization list over hand-written bodies and a
+  grammar of generated ones, the OTel log and span shapes and both metric forms included.
+- **Pair round trips over real sockets**: `crates/logit-cli/tests/splunk_pair_round_trip.rs`
+  (`splunk_hec_out -> splunk_hec_in`: gzip, the token check, body splitting, and the channel and
+  acknowledgment exchange) and `splunk_hec_in_round_trip.rs` for the listener's routes, answers,
+  and backpressure.
+- **Recorded interop corpus** (W5): [`testdata/interop/splunk/`](../../testdata/interop/splunk/README.md),
+  from the Collector contrib 0.161.0 `splunk_hec` exporter, Docker 29.8.1's `splunk` log driver,
+  SC4S 3.40.0, and splunk-library-javalogging 1.11.11, replayed through the codec by
+  `crates/logit-proto/tests/splunk_interop.rs` and over a socket through `splunk_hec_in`. Where it
+  contradicted the survey, the code changed: `splunk_hec_in` answers `OPTIONS` (Docker's driver
+  starts no container without it), `splunk_hec_out` writes the `SPAN_KIND_*`/`STATUS_CODE_*`
+  names, and the decoder reads SC4S's metric objects.
+- **Splunk Enterprise 10.4.3 run** (W5): `script/splunk-interop` delivered logs, every metric kind
+  under `expand` (queried with `mstats` and `histperc`), spans, an `ack: true` leg on a `useACK`
+  token, and the whole corpus through `splunk_hec_in` and `splunk_hec_out`, every leg `PASS`. It
+  fixed the ack key (`ackId`, not `ackID`, which the sink had misread as "no acknowledgment") and
+  settled the survey's UNVERIFIED items, including decision 18's code 6 rule
+  (["Settled by W5"](#settled-by-w5-2026-09-25)).
+
+What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section, one entry
+each:
+
+- No S2S listener, so a universal forwarder can't point at `logit` (§9).
+- No REST search export input (§9).
+- No listener for a forwarder's `[tcpout] sendCookedData = false` lines, shared with the Datadog
+  section's plain-lines gap (§9).
+- An Edge Processor's HEC destination pointed at `splunk_hec_in`, still unverified (item 3).
+- No acknowledgment on Splunk Cloud.
+- HEC codes 21, 22, 24, and 25 unmodeled, and no code 18 or above seen from a real Splunk.
+- Codes 7, 12, 13, and 15 permanent in `splunk_hec_out`, where only code 6 drops one object.
+- What neither the corpus nor the run exercised: the exporter's `Summary` and a link's
+  `trace_state`, Vector's HEC sinks, a `useACK` client against `splunk_hec_in`, Splunk Cloud and
+  other Splunk releases (including which one raised `max_content_length`), and Observability
+  Cloud.
+
+Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Splunk encode and decode
+rows in `known-gaps.md`'s "Cross-protocol semantic gaps" table (non-carrier resource attributes
+returning as event attributes, `Sum` temporality, the multi-number kinds, the span and log fields
+the exporter's objects have no member for, the `/raw` line split) are counted or documented, not
+closed.
+
+[ADR `splunk-hec-relay`](../adr/splunk-hec-relay.md)'s Status, and
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s ninth-pair amendment, now record this
+closing assessment as the realization of their decisions.
 
 ## Verification
 
