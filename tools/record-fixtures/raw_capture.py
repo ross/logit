@@ -27,10 +27,10 @@ socket-only framing reaches disk.
 
 HTTP: per request, the body byte-for-byte as `<prefix>-000.bin`, plus a `<prefix>-000.headers`
 sidecar with `method:`, `path:`, and every header (name lowercased, in received order), so a
-replay test can read the content type, encoding, and version headers. `GET`, `POST`, and `PUT` are
-captured; a `GET` has an empty `.bin`. It refuses a `POST` or `PUT` with no `Content-Length`, or
-with any `Transfer-Encoding`, with `411 Length Required`, not counted: de-framing a chunked body is
-re-encoding. Connections are served on threads, so one idle peer can't park the capture.
+replay test can read the content type, encoding, and version headers. `GET`, `OPTIONS`, `POST`,
+and `PUT` are captured; a `GET` or `OPTIONS` has an empty `.bin`. It refuses a `POST` or `PUT` with
+no `Content-Length`, or with any `Transfer-Encoding`, with `411 Length Required`, not counted:
+de-framing a chunked body is re-encoding. Connections are served on threads, so one idle peer can't park the capture.
 
 The HTTP reply is `--status` (default `204 No Content`) with an empty body, because an HTTP client
 won't send a second request to a listener that never replied. `--reply PATH=FILE` answers requests
@@ -237,6 +237,11 @@ def capture_http(args, out_dir: pathlib.Path) -> int:
 
         def do_POST(self) -> None:
             self.capture(has_body=True)
+
+        # Docker's `splunk` log driver checks its endpoint with an `OPTIONS` before it will start
+        # a container, and needs a `200`.
+        def do_OPTIONS(self) -> None:
+            self.capture(has_body=False)
 
         def do_PUT(self) -> None:
             self.capture(has_body=True)
