@@ -450,8 +450,22 @@ the operator-facing account of all of this.
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).
 
-### Demo and fixtures
+### Demo, examples, and fixtures
 
+- **`examples/`** is user-facing: one directory per example holding a `logit.yaml` and the
+  `graph.svg` rendered from it, indexed by `examples/README.md`. Its comments are written for
+  someone adopting `logit`: no ADR paths, rule numbers, or history.
+  `every_shipped_config_loads_and_validates` covers `examples/*/logit.yaml`. Re-render
+  `graph.svg` whenever its `logit.yaml` changes. `demo/graph-renderer` is the image with `dot`,
+  since neither the host nor `Dockerfile.dev` has graphviz:
+
+  ```sh
+  set -o pipefail
+  sudo COMPOSE_PROJECT_NAME=logit docker compose run --rm -T -e DD_API_KEY=unused dev \
+      cargo run --quiet -p logit-cli -- graph examples/canonical/logit.yaml \
+    | sudo docker run --rm -i logit-graph-renderer 'dot -Tsvg' \
+    > examples/canonical/graph.svg
+  ```
 - **`fixtures/`** holds contributor-facing configs, roughly one per component or topology, that
   the dev stack (`script/server`) runs against. Keep them real: `compose.yaml`'s `nginx` service
   builds `fixtures/nginx/`, and `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` mirrors
@@ -522,7 +536,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
-| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `fixtures/`, `perf/scenarios/`, `tools/shape-survey/configs/`, `tools/victoria-interop/logit-*.yaml`); ordinary tests enforce this too |
+| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`, `fixtures/`, `perf/scenarios/`, `tools/shape-survey/configs/`, `tools/victoria-interop/logit-*.yaml`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, is denominated over events *delivered*, and takes `--verify` (a strict zero-drop self-check) / `--rate-scale` (moves the operating point without editing a spec) ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
 | `script/shape-survey [producer ...]` | Out-of-CI data-shape capture harness (`tools/shape-survey/`, [docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)) — drives real traffic through the `shape` component and summarizes what the events look like. Producers are discovered by globbing `tools/shape-survey/producers/*.sh`, one file each, six today: `interop` replays `testdata/interop/` and is the instrument's acceptance test (it must reproduce the statsd corpus's independently-counted numbers), `exporters` scrapes six official Prometheus exporters in default configuration through one `prometheus_in` per target (where `logit.shape.attributes` reads as labels per series and `logit.shape.batch.events` as series per scrape; cAdvisor is deliberately not among them — it needs `--privileged`), `applogs` runs eight real logging libraries at pinned versions in tiny HTTP apps through `tail_in` plus one auto-instrumented Django exporting OTLP straight to `otlp_in`, `oteldemo` runs the OpenTelemetry Demo at a pinned tag through its own Collector (~10 SDK languages at once, and ~20 GB of RAM), `hostagents` runs collectd and Telegraf in default configuration over five wires at once (collectd binary, carbon ×2, a scrape, OTLP/gRPC), and `demo` taps `demo/`'s own stack without modifying it. Each states its own representativeness line and its own caveats — `tools/shape-survey/README.md`'s "Producers" table has all six side by side. Every run is namespaced `shape-survey-<producer>-…`, so **two invocations can run concurrently** on one daemon (`SHAPE_SURVEY_SKIP_IMAGE=1` for the second). `tools/shape-survey/combine.py` folds several runs into one cross-producer table set. Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
@@ -747,10 +761,10 @@ crates/
 
 `perf/scenarios/*.yaml` are the harness's own shipped configs (ordinary `logit` YAML, a
 `generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
-`every_shipped_config_loads_and_validates` alongside `demo/`/`fixtures/`; `perf/results/` is
+`every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`/`fixtures/`; `perf/results/` is
 where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
 
-`tools/shape-survey/` is the data-shape capture harness `script/shape-survey` drives ([docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)): `lib.sh` (shared docker plumbing, nothing producer-specific), stdlib-only `replay.py`/`summarize.py` (which parses `stdio_out`'s human render — the whole `render_value` grammar, arrays and maps included, under `--self-test`)/`check_interop.py`/`combine.py` (the cross-run report), one file per producer under `producers/` (`interop`, `exporters`, `applogs`, `oteldemo`, `hostagents`, `demo` — see that directory's README for what each runs and what its numbers are worth), and capture configs under `configs/` — which join `script/validate` and `every_shipped_config_loads_and_validates` alongside `demo/`/`fixtures/`/`perf/scenarios/`. Runs land in `perf/results/shape-survey/<producer>/<timestamp>/` (gitignored); raw traffic never enters the repo and nothing there writes under `testdata/`. Everything a run creates is namespaced by producer (`shape-survey-<producer>-net`, `shape-survey-<producer>-<suffix>` containers and compose projects), so two producers can be captured at the same time on one shared daemon and cleanup can only ever touch its own. Every producer states a one-line **representativeness** in `provenance.txt`, which `summarize.py` prints as the banner above every table and `combine.py` repeats on every row — the `demo` producer's numbers in particular are a harness exercise, not evidence of production shape, and some of the formats it measures were authored in this repo.
+`tools/shape-survey/` is the data-shape capture harness `script/shape-survey` drives ([docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)): `lib.sh` (shared docker plumbing, nothing producer-specific), stdlib-only `replay.py`/`summarize.py` (which parses `stdio_out`'s human render — the whole `render_value` grammar, arrays and maps included, under `--self-test`)/`check_interop.py`/`combine.py` (the cross-run report), one file per producer under `producers/` (`interop`, `exporters`, `applogs`, `oteldemo`, `hostagents`, `demo` — see that directory's README for what each runs and what its numbers are worth), and capture configs under `configs/` — which join `script/validate` and `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`/`fixtures/`/`perf/scenarios/`. Runs land in `perf/results/shape-survey/<producer>/<timestamp>/` (gitignored); raw traffic never enters the repo and nothing there writes under `testdata/`. Everything a run creates is namespaced by producer (`shape-survey-<producer>-net`, `shape-survey-<producer>-<suffix>` containers and compose projects), so two producers can be captured at the same time on one shared daemon and cleanup can only ever touch its own. Every producer states a one-line **representativeness** in `provenance.txt`, which `summarize.py` prints as the banner above every table and `combine.py` repeats on every row — the `demo` producer's numbers in particular are a harness exercise, not evidence of production shape, and some of the formats it measures were authored in this repo.
 
 `tools/victoria-interop/` is the interop harness `script/victoria-interop` drives: `compose.yaml` (the pinned Victoria images, vmagent, and one `logit` service per leg), one `logit-<leg>.yaml` per leg (which join `script/validate` and `every_shipped_config_loads_and_validates`), `vmagent-scrape.yaml`, and the stdlib-only `check.py` that queries each backend and replays committed `testdata/interop/prometheus/` captures at VictoriaMetrics. Runs land in `perf/results/victoria-interop/<timestamp>/` (gitignored); [its README](tools/victoria-interop/README.md) has the rest.
 

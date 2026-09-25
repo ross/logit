@@ -5,7 +5,8 @@
 #
 # This is a contributor-facing fixture, not the recommended starting point: compose.yaml's
 # `nginx` service and crates/logit-bench/src/fixtures.rs's NGINX_SYSLOG_LINE depend on
-# fixtures/nginx/ staying real. To see `logit` work, run `demo/` instead (`script/demo`).
+# fixtures/nginx/ staying real. To see `logit` work, run `demo/` instead (`script/demo`), or
+# start from `examples/`.
 #
 # Topology:
 #

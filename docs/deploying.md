@@ -5,6 +5,8 @@ validating a config, probing readiness, and what `logit` does when a sink, a sen
 orchestrator's signal doesn't cooperate. To point a real nginx at a running `logit`, see
 [the nginx-side recipe](#the-nginx-side-recipe). To see `logit` running without deploying it, use
 [`demo/`](../demo/README.md), a self-contained `docker compose up` with no image-building steps.
+For a complete config to adapt, start from
+[`examples/canonical/logit.yaml`](../examples/canonical/logit.yaml).
 
 ## Getting the image
 
