@@ -64,7 +64,7 @@ it requires nothing this repo provides beyond the compose file itself.
 - The demo always builds `logit` from source on first run (no published image exists yet,
   `docs/deploying.md`) — several minutes before anything appears. Publishing an image to a
   registry would fix this and is a natural follow-up, out of scope here.
-- `examples/nginx/` remains real and runnable for the dev stack's sake even though it is no longer
+- `fixtures/nginx/` remains real and runnable for the dev stack's sake even though it is no longer
   anyone's onboarding path — see `docs/plans/demo-stack.md` workstream E for why deleting it
   isn't free.
 - Reusing the release image for a second purpose (`logit graph`, in `graph-dot`) works only

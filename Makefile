@@ -44,7 +44,7 @@ check:      ## Routine format + lint + test loop
 schema:     ## Regenerate schema/logit.schema.json
 	./script/schema
 
-validate:   ## logit validate over every shipped config (demo/, examples/)
+validate:   ## logit validate over every shipped config (demo/, fixtures/)
 	./script/validate
 
 audit:      ## Supply-chain checks (cargo-deny, cargo-audit)

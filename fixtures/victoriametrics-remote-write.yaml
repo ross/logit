@@ -6,7 +6,7 @@
 # `statsd_in -> aggregate -> prometheus_out`, so this runs against the dev stack's statsd port with
 # nothing external on the ingress side. The `aggregate` is not optional: VictoriaMetrics keeps no
 # temporality, `prometheus_out` skips a delta `Sum`/`Histogram`, and `temporality: cumulative` is
-# the named stage that keeps the running total, as in examples/prometheus-remote-write-send.yaml.
+# the named stage that keeps the running total, as in fixtures/prometheus-remote-write-send.yaml.
 #
 # Two settings are VictoriaMetrics-specific (docs/deploying.md's "VictoriaMetrics, VictoriaLogs,
 # and VictoriaTraces" section):

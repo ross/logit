@@ -17,7 +17,7 @@ field appearing in a log format later can never silently become a new tag dimens
 that is the half that matters once a key is legitimately kept but the producer doesn't enforce what
 values it carries.
 
-[examples/nginx-to-influxdb.yaml](../../examples/nginx-to-influxdb.yaml) is the live instance of the
+[fixtures/nginx-to-influxdb.yaml](../../fixtures/nginx-to-influxdb.yaml) is the live instance of the
 gap:
 
 ```yaml
@@ -29,7 +29,7 @@ gap:
 
 `request_method` and `status` are closed sets nginx itself constrains. `host` is nginx's `$host` —
 the client's `Host` header, unbounded and attacker-controlled behind a public IP.
-[examples/nginx/nginx.conf](../../examples/nginx/nginx.conf) serves exactly two vhosts
+[fixtures/nginx/nginx.conf](../../fixtures/nginx/nginx.conf) serves exactly two vhosts
 (`static.local`, `proxy.local`), so the intended cardinality of `host` is 2; traffic stuffing junk
 into the header makes it effectively unbounded. That value lands directly in `aggregate`'s
 `SeriesKey` (`crates/logit-transforms/src/aggregate.rs`, keyed on the whole of `event.attributes`),
@@ -200,7 +200,7 @@ meaning no normalization.
   the intended cardinality win, but an operator wanting the original preserved for some other
   consumer has to place the clamp after whatever needs the untouched value, the same caveat
   `scale`'s ADR already states about its own in-place rewrite.
-- `examples/nginx-to-influxdb.yaml` gains a `bounded: keep_values` component between `trimmed`
+- `fixtures/nginx-to-influxdb.yaml` gains a `bounded: keep_values` component between `trimmed`
   (`keep`) and `windowed` (`aggregate`), closing the unbounded-`host` gap
   [`docs/known-gaps.md`](../known-gaps.md) already flags the truncation half of. `docs/known-gaps.md`
   is updated to note the cardinality half is now closed by example, without removing the truncation

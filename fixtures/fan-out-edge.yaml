@@ -1,16 +1,16 @@
-# One connection, N streams: the edge half. examples/fan-out-central.yaml is the far side;
-# examples/forwarder-edge.yaml has the `logit_out` field reference this file doesn't repeat.
+# One connection, N streams: the edge half. fixtures/fan-out-central.yaml is the far side;
+# fixtures/forwarder-edge.yaml has the `logit_out` field reference this file doesn't repeat.
 #
 # Two streams (a host's statsd metrics and an application's syslog lines) share one `logit_out`,
 # so one TCP connection, through the graph's N->1 fan-in. `set` stamps each with a `stream` tag
 # that the central `route` splits on; the native wire format carries it end to end.
 #
-# Run alongside examples/fan-out-central.yaml. Start the central process first, or `logit_out`
+# Run alongside fixtures/fan-out-central.yaml. Start the central process first, or `logit_out`
 # keeps retrying the connection (lazy connect, not a config error). Change `endpoint` below to
 # the central host.
 #
-#   logit run examples/fan-out-central.yaml &
-#   logit run examples/fan-out-edge.yaml
+#   logit run fixtures/fan-out-central.yaml &
+#   logit run fixtures/fan-out-edge.yaml
 #
 # Topology (this file):
 #

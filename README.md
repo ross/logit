@@ -91,7 +91,7 @@ For production use, including health probes, exit codes, buffering, TLS, and for
 
 A config is a flat graph of named components. Each component has a `type` and lists the
 components it reads from in `sources`. `logit graph <config>` prints the resolved graph in Graphviz
-DOT format. [examples/](examples) has a runnable config for most components.
+DOT format. [fixtures/](examples) has a runnable config for most components.
 
 | Role | Types |
 |---|---|
@@ -179,9 +179,9 @@ during routine cleanup.
 |---|---|---|
 | InfluxDB 2.x | http://localhost:8086 | Org `logit`, bucket `metrics`, with a dev token. |
 | Grafana | http://localhost:3000 | Anonymous admin access, with InfluxDB already provisioned as a datasource. |
-| nginx | http://localhost:8080 | Sends access logs to `logit` over syslog, for [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml). |
+| nginx | http://localhost:8080 | Sends access logs to `logit` over syslog, for [fixtures/nginx-to-influxdb.yaml](fixtures/nginx-to-influxdb.yaml). |
 
-`script/server` runs [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) unless
+`script/server` runs [fixtures/statsd-to-influxdb.yaml](fixtures/statsd-to-influxdb.yaml) unless
 you pass another config.
 
 ## Contributing
@@ -208,7 +208,7 @@ crates/
   logit-bench       dev only: allocation-count tests and throughput benchmarks
   logit-perf        dev only: the load-test harness
 demo/               self-contained demo stack
-examples/           example configs, also used by the local test stack
+fixtures/           example configs, also used by the local test stack
 docs/               overview, deployment guide, ADRs, design docs, and plans
 perf/               load-test scenarios; results are gitignored
 schema/             generated JSON Schema for the config
