@@ -1,0 +1,98 @@
+# splunk-interop
+
+`script/splunk-interop` checks `splunk_hec_out` and `splunk_hec_in` against a real Splunk
+Enterprise container, then probes that Splunk directly for what
+[`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
+one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a run; the
+plan's "Unverified, to be settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
+the decisions it settled.
+
+The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
+`script/victoria-interop` and `script/record-fixtures`. It isn't part of `script/cibuild`, and no
+test depends on it running. Splunk needs several GB of RAM and two to three minutes to start.
+
+## What it runs
+
+`compose.yaml` starts one stack under the compose project `splunk-interop`, on the network
+`splunk-interop-net`, with no host ports. Every credential is a fixed dummy for a throwaway
+container; `compose.yaml`'s header lists them.
+
+| Service | Image | Role |
+|---|---|---|
+| `splunk` | `splunk/splunk:10.4.3` | Splunk Enterprise, HEC over plain HTTP on `:8088`, the default token `splunk_hec_token` |
+| `splunk-init` | `curlimages/curl:8.22.0` | One-shot REST setup on `:8089`: a metrics index `metrics`, event indexes `osnix` and `tcpout_probe`, a `useACK` token `ack`, and the `[tcpout]` probe's output group and token, then a restart for the output group to load |
+| `rawcap` | `python:3.12-slim` | `tools/record-fixtures/raw_capture.py --proto tcp`, the `[tcpout] sendCookedData=false` destination |
+| `logit-<leg>` | `logit:splunk-interop`, built from the current tree | one per `logit-<leg>.yaml` |
+| `replay` | `python:3.12-slim` | `replay.py`: every request in `testdata/interop/splunk/` into the `hec-relay` leg, once |
+
+The legs:
+
+| Leg | Config | What it sends |
+|---|---|---|
+| `hec-logs` | `logit-hec-logs.yaml` | a warn-level log per second with a trace reference and a nested attribute, sourcetype `logit:test`, into `main` |
+| `hec-metrics` | `logit-hec-metrics.yaml` | every metric kind under `multi_value: expand` into `metrics`: gauge, cumulative and delta sum, samples, set members, histogram, summary, exponential histogram, and, through `aggregate`, a distribution and a set |
+| `hec-spans` | `logit-hec-spans.yaml` | a server span per second with an error status and a span event, sourcetype `logit:span` |
+| `hec-ack` | `logit-hec-ack.yaml` | the logs leg on the `ack` token with `ack: true`; `internal` writes the sink's telemetry to `ack-telemetry.log` |
+| `hec-relay` | `logit-hec-relay.yaml` | `splunk_hec_in` fed by `replay`, relayed by `splunk_hec_out` into Splunk: the tee topology |
+
+Every config passes `logit validate`: `script/validate` and the
+`every_shipped_config_loads_and_validates` test both cover `logit-*.yaml` here.
+
+## A run
+
+1. Builds `logit:splunk-interop` from `Dockerfile` (set `SPLUNK_INTEROP_SKIP_IMAGE=1` to reuse
+   it) and validates every leg config with it.
+2. Brings the stack up with `docker compose up --wait`, which waits on Splunk's health check
+   (`GET /services/collector/health`), on `splunk-init`, and on each `logit` service's `logit
+   ready`, then starts `replay`.
+3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60).
+4. Copies every service's log into the run directory and runs `check.py` in a
+   `python:3.12-slim` container on the stack's network. `check.py` searches Splunk over REST
+   (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, then runs the
+   probes: gzip, `max_content_length`, the code 6 batch semantics, `metric_type`, the dimension
+   count, `OPTIONS`, acknowledgment, and `[tcpout]` framing.
+5. Tears the project down (`down -v --remove-orphans`) on every exit.
+
+A leg's row is `PASS`, `GAP` (it arrived, with a difference recorded below), or `FAIL`; a probe's
+is `INFO`, what Splunk answered. The script exits 1 on any `FAIL`.
+
+A run writes `perf/results/splunk-interop/<timestamp>/` (gitignored, or under
+`SPLUNK_INTEROP_OUT`): `results.md` and `results.json`, `provenance.txt` with the image tags,
+`logs/<service>.log`, `replay.log`, `ack-telemetry.log`, and `tcpout/tcpout-000.raw`.
+
+## Cleanup and a shared daemon
+
+Everything the script creates belongs to the `splunk-interop` project, so cleanup can't touch
+another session's containers. The project name is fixed, so one run at a time per daemon: the
+script refuses to start while the project has containers, and prints the `down` command for a
+stack a crashed run left behind.
+
+## What the run showed
+
+A run on 2026-09-25 against `splunk/splunk:10.4.3` (build `4174a2deda5d`), `logit` built from
+this branch, `SPLUNK_INTEROP_WINDOW=60`. Every leg passed; the probe rows are what Splunk
+answered. The recording of the `[tcpout]` capture is described but not committed: see its row.
+
+| Leg | Result | What Splunk held |
+|---|---|---|
+| `hec-logs` | PASS | Each log with `host`, `source`, and `sourcetype` from the resource; `otel.log.severity.text` `Warn` and `.number` `13`, `trace_id`, `span_id`, and the flattened `detail.stage` and `detail.ok` as indexed fields (`tstats` groups by them) |
+| `hec-metrics` | PASS | 21 series: `gauge`, `sum_cumulative`, `sum_delta`, `samples_{count,sum,min,max}`, `set_members`, `histogram_{sum,count,bucket}`, `summary_{sum,count,0.5,0.99}`, `distribution_{count,sum,p50,p90,p99}`, and `set`; no exponential histogram. `metric_type` takes `Gauge`, `Histogram`, `Sum`, and `Summary`. The histogram's `_bucket` series carries `le` `0.1`, `1`, `10`, and `+Inf` with cumulative counts, and `` `histperc(0.5, c, le)` `` answers 2.8 |
+| `hec-spans` | PASS | The span object, searchable by `trace_id`, `span_id`, `name`, `kind` `SPAN_KIND_SERVER`, `status.code` `STATUS_CODE_ERROR`, `status.message`, `start_time`, `end_time`, and `events{}.name`, with `service.name` as an indexed field |
+| `hec-ack` | PASS | 69 requests acknowledged, none timed out or unsupported, 104 `/ack` polls; 71 events indexed |
+| `hec-relay` | PASS | All 32 recorded requests answered `2xx` by `splunk_hec_in`, and every producer's events relayed: the Docker driver's 6, the Java appender's 9, SC4S's 3 lines (index `osnix`) and 4 own events, the exporter's 3 logs, 3 raw lines, and 6 spans, and its metrics `gen`, `gen_sum`, `gen_count`, `gen_bucket` |
+
+| Probe | Splunk 10.4.3's answer |
+|---|---|
+| `max_content_length` | `limits.conf [http_input] max_content_length = 838860800` (800 MiB) |
+| gzip | `Content-Encoding: gzip` on `/event` and `/raw`: `200`, indexed. `deflate`: `415` with an HTML body |
+| code 6 | A syntax error in object 1 of 3: `400` `{"text":"Invalid data format","code":6,"invalid-event-number":1}`; object 0 indexed, objects 1 and 2 not. In object 0: `invalid-event-number` 0, nothing indexed |
+| other per-object errors | A blank `event` (code 13), `fields` with a nested object (code 15), and an object with neither `event` nor `fields` (code 12), each in object 1 of 3: `400` naming 1, object 0 indexed, the rest not. An index the token doesn't allow in object 1 (code 7): `400` naming 2, object 0 indexed, the rest not |
+| lenient cases | An object with `fields` and no `event`: `200`, skipped, the others indexed (as a metric when `fields` carry a measurement). An unknown envelope key in object 1 of 3: `200`, but only object 0 indexed; in a body's only object: `400` code 5 `No data` |
+| metric forms | No `event` with a string measurement (SC4S's shape), and the single-metric `metric_name`/`_value` pair: both `200` and stored as metrics |
+| `metric_type` | An ordinary dimension: `mcatalog values(metric_type)` lists it and `mstats … by metric_type` groups by it; a `Sum`'s value is stored as sent |
+| dimensions | 200 and 1,000 dimensions on one metric event: `200`, and `mcatalog` sees all of them (201 and 1,001 with the probe's own) |
+| `OPTIONS` | Every route: `200`, empty body, no token needed, `Allow: POST,OPTIONS` (`GET,HEAD,OPTIONS` on `/health`) |
+| HTTP errors | Unknown path: `404` `{"text":"The requested URL was not found on this server.","code":404}`; `GET` on `/event`: `405` with the same body |
+| `/raw` without a channel | On a token without `useACK`: `200` |
+| `useACK` | No channel: `400` code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1` (the key is `ackId`, ids count from 0 per channel). The id polled `true` within about a second; the same id polled on another channel: `false` |
+| `[tcpout] sendCookedData=false` | Each event's `_raw` followed by one LF, nothing else: no header, no length, no metadata. An event with an embedded newline arrives as two lines; a JSON `event` as its JSON text; a `/raw` body's lines one each. Splunk forwarded its own logs from every index too, whatever `defaultGroup` (unset) and the `forwardedindex` filters (tried: only `tcpout_probe`) said, so the capture isn't committed: it is mostly Splunk's `_internal` and `_introspection` data |

@@ -18,8 +18,9 @@ Usage:
 UDP and Unix datagram: one file per datagram (`<prefix>-000.raw`, `<prefix>-001.raw`, ...).
 
 TCP and Unix stream: one file per accepted connection, holding everything read until the peer
-closes it or --timeout passes with no new bytes, so framing (RFC 6587, a length prefix) is kept as
-sent.
+closes it or --idle-timeout (default --timeout) passes with no new bytes, so framing (RFC 6587, a
+length prefix) is kept as sent. A sender that holds its connection open, such as a Splunk
+forwarder, is written once it has been quiet that long.
 
 The Unix modes bind --path, replacing a stale socket file, and make it mode 0777 so a client
 running as any user can send; a real client connects to a path, not a port, so these are how a
@@ -95,7 +96,7 @@ def capture_datagrams(sock: socket.socket, what: str, out_dir: pathlib.Path, pre
     return got
 
 
-def capture_streams(listener: socket.socket, what: str, out_dir: pathlib.Path, prefix: str, count: int, timeout: float) -> int:
+def capture_streams(listener: socket.socket, what: str, out_dir: pathlib.Path, prefix: str, count: int, timeout: float, idle: float) -> int:
     listener.listen(1)
     listener.settimeout(timeout)
     print(f"raw_capture: listening {what}, want {count} connection(s)", flush=True)
@@ -107,7 +108,7 @@ def capture_streams(listener: socket.socket, what: str, out_dir: pathlib.Path, p
         except socket.timeout:
             print(f"raw_capture: timed out after {got}/{count} connections", file=sys.stderr)
             break
-        conn.settimeout(timeout)
+        conn.settimeout(idle)
         chunks = []
         try:
             while True:
@@ -137,7 +138,7 @@ def capture_tcp(args, out_dir: pathlib.Path) -> int:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("0.0.0.0", args.port))
-    return capture_streams(listener, f"tcp/{args.port}", out_dir, args.prefix, args.count, args.timeout)
+    return capture_streams(listener, f"tcp/{args.port}", out_dir, args.prefix, args.count, args.timeout, args.idle_timeout or args.timeout)
 
 
 def capture_unix(args, out_dir: pathlib.Path) -> int:
@@ -147,7 +148,7 @@ def capture_unix(args, out_dir: pathlib.Path) -> int:
 
 def capture_unix_stream(args, out_dir: pathlib.Path) -> int:
     listener = bind_unix(socket.SOCK_STREAM, args.path)
-    return capture_streams(listener, f"unix-stream:{args.path}", out_dir, args.prefix, args.count, args.timeout)
+    return capture_streams(listener, f"unix-stream:{args.path}", out_dir, args.prefix, args.count, args.timeout, args.idle_timeout or args.timeout)
 
 
 #: How often the HTTP accept loop wakes to check whether its handler threads finished the capture.
@@ -416,6 +417,7 @@ def main() -> None:
     ap.add_argument("--prefix", required=True, help="Filename prefix, 'logger' -> logger-000.raw (-000.bin/.headers for http)")
     ap.add_argument("--count", type=int, default=1, help="Number of datagrams/connections/requests to capture")
     ap.add_argument("--timeout", type=float, default=10.0, help="Seconds to wait for each message before giving up")
+    ap.add_argument("--idle-timeout", type=float, default=0, help="tcp/unix-stream: seconds a connection may stay quiet before it is written (default --timeout)")
     ap.add_argument("--status", type=int, default=204, help="http: the status answered where no --reply applies")
     ap.add_argument("--reply", action="append", default=[], metavar="PATH=FILE", help="http: answer PATH with 200 and FILE as JSON")
     ap.add_argument("--name-by-path", action="store_true", help="http: name and number files per request path")
