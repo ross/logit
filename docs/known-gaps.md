@@ -179,9 +179,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   the already-rounded capacity as `serde::de::SeqAccess::size_hint` for the members list (so the
   first allocation is the size the crate settles on), and bounds the claimed member count before
   allocating at all. Full mechanism: `HyperLogLog`'s and `HllBytesReader`'s doc comments (same file);
-  pinning test: `hyperloglog_round_trips_non_power_of_two_member_counts`. Pinned to
+  pinning tests: `hyperloglog_round_trips_non_power_of_two_member_counts`, which Miri fails on a
+  regressed size hint only under `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`
+  (`script/unsafe-check miri` passes both), and
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, which pins
+  serde's `Vec` preallocation on stable. Pinned to
   `cardinality-estimator` 1.0.3; the upstream fix would be `into_boxed_slice`/`shrink_to_fit` in
   `Array::from_vec`, so the freed layout always matches the `Vec`'s capacity by construction.
+- **A decoded sketch's or HyperLogLog's summary fields are taken as written**
+  (`crates/logit-core/src/sketch.rs`'s module doc, `HyperLogLog::from_bytes`). `from_bytes`
+  bounds what a blob can allocate or make later operations cost, and rejects a zero-register
+  count past the register count, but trusts the rest of a peer's summary under
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model (accidental data
+  from private peers; a check is added only where it is free and would catch an accident). None of
+  these panics:
+  - A `DdSketch` with `min > max` answers non-monotonic quantiles.
+  - A `DdSketch` with an infinite or `NaN` `min` or `max` hands it to `quantile`'s clamp, so a
+    decoded sketch can answer `±∞`.
+  - A `DdSketch` with a `count` of 0 over populated bins is skipped by `merge`, which returns
+    early on an empty incoming sketch.
+  - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong: the sum is an `f32`
+    accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
 - ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ **Closed, both halves.**
   - **Real implementation** ([`docs/plans/lossless-transit.md`](plans/lossless-transit.md)):
     `HyperLogLog` (`crates/logit-core/src/metric.rs`) wraps the `cardinality-estimator` crate —
@@ -282,14 +300,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
     `docs/design/wire-protocol.md`'s "Open question" section.
-  - **`cargo-fuzz` targets over the decoders.** `crates/logit-proto/tests/robustness.rs`'s seeded
-    mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the ground a
-    corpus-driven fuzzer would, but `cargo-fuzz` needs nightly Rust, and the dev toolchain is
-    stable-only (`docs/adr/containerized-development.md`), so fuzz targets are deferred.
-    [ADR `out-of-ci-unsafe-verification`](adr/out-of-ci-unsafe-verification.md)'s throwaway
-    nightly image serves a different, narrower need (miri/`cargo-careful`/fault injection over the
-    raw-`libc` `unsafe`) and defers `cargo-fuzz` again in its "Alternatives considered". Closing
-    this gap still means writing `cargo-fuzz` targets, not just pointing them at that image.
+  - ~~**`cargo-fuzz` targets over the decoders.**~~ **Closed (2026-09-25).** `fuzz/` holds
+    `cargo-fuzz` targets over the native, sketch, HyperLogLog, OTLP, and Prometheus remote-write
+    decoders, built in the `tools/unsafe-check` nightly image and run by hand with
+    `script/unsafe-check fuzz <target>` or `fuzz-all`, never in CI. A crash lands as a stable
+    regression test in the owning crate. [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md) has
+    the design and the campaign record.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
     validation's rule 17 rejects a `receive:` block on both (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace`. Both use that grace:
@@ -339,7 +355,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   because each spooled batch was already that size in memory when `DiskQueue::push` wrote it, and
   a budget refusal there would discard the batch as corrupt. `NativeDecoder` (the `Decoder` seam)
   uses the 256 MiB default. See [`docs/design/wire-protocol.md`](design/wire-protocol.md)'s
-  "Decode amplification".
+  "Decode amplification". A sender learns only `max_frame_bytes` from `HelloAck`, not the budget,
+  so a stock `logit_out` batch between roughly 10% and 100% of the cap can be refused; the
+  refusal is deterministic, `logit_in` answers it with `REJECT_FRAME_TOO_LARGE` (#372) so the
+  sender drops the batch as permanent and diagnoses it rather than retrying, and the operator's
+  fix is the sender's batching.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
@@ -1114,6 +1134,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
     pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
     believing it helps.
+- **`datadog_out` drops a sketch that would encode as more than 2^20 `k`/`n` entries**
+  (`MAX_DOGSKETCH_ENTRIES`, `crates/logit-proto/src/datadog/sketches.rs`), counted
+  `logit.output.metrics.skipped{reason="oversized_sketch"}` with diag `oversized_sketch`, rather
+  than splitting each bin's count into `uint16` entries without bound; it takes per-bin counts of
+  millions (a statsd sample-rate typo extrapolated through `aggregate`) across many bins, and
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model treats that as an
+  accident to bound, not data to scale down.
 
 ## syslog
 
@@ -1312,15 +1339,23 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
   same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
-  node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
-  `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the protobuf path's
-  1024 × 200 × 2 × 4 MiB = 1.6 TiB, itself a bound rather than a memory budget. Measured
-  2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
-  98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
-  the 98× shape needs crafted input, a non-goal under
-  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:**
-  profile it before OTLP/JSON sees production volume.
+  node, where `prost::Message::decode` builds the target structs directly. Measured 2026-09-25 as
+  peak live heap bytes per input byte, debug build:
+  - Ordinary OTLP/JSON structure (`testdata/interop/otlp/logs.json`, a real SDK export): about 19.
+    The same batch as protobuf: about 17.
+  - Crafted input, a body of tiny `{"":0}` objects under a key OTLP doesn't define, which
+    serde_json builds in full and the decoder then ignores: about 98, at both 1 MiB and 4 MiB. At
+    4 MiB that is about 400 MiB for one request.
+
+  `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
+  asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
+  a test before this entry drifts. The bound still holds: `MAX_CONCURRENT_CONNECTIONS`'s doc
+  comment (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
+  finite multiple of the protobuf path's 1.6 TiB, itself a bound rather than a memory budget
+  (`MAX_CONCURRENT_STREAMS` in `crates/logit-inputs/src/http.rs` has the formula). No cap and no streaming parser are added: the
+  98× shape needs crafted input, a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:** if
+  an OTLP listener ever faces an untrusted network.
 - **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
   close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
   about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
@@ -1477,7 +1512,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   would have no right answer. A mode tag was considered and not added: the modes are already told
   apart by which of `logit.input.scrapes`/`logit.input.writes` the component reports.
 - **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**
-  `Fanout::send_reserved`, like every `Fanout` send, silently skips a closed consumer (counted
+  `Fanout::send`, which the receiver's delivery task calls, silently skips a closed consumer (counted
   `logit.component.events.dropped{reason="closed_consumer"}`,
   `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
   the `Fanout` *before* building the response — `otlp_in`'s ordering, which lets channel

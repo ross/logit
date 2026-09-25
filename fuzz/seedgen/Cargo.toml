@@ -1,0 +1,13 @@
+[package]
+name = "logit-fuzz-seedgen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A plain binary with no libfuzzer-sys, so `script/unsafe-check fuzz-seed` builds it without a
+# sanitizer and it runs on stable too.
+[dependencies]
+bytes = "1"
+flate2 = "1"
+logit-core = { path = "../../crates/logit-core" }
+logit-proto = { path = "../../crates/logit-proto" }

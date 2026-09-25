@@ -17,3 +17,10 @@ __pycache__/
 # checkout dirty from the first `script/vm build` on, which poisons LOGIT_PERF_GIT_DIRTY in every
 # results file `script/perf run` writes afterward on that same checkout.
 /perf/bins/
+
+# script/unsafe-check fuzz's working state (docs/adr/out-of-ci-fuzzing.md). Seeds under
+# fuzz/seeds/ are committed; the corpus libFuzzer grows, its crash artifacts, and coverage are not.
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/

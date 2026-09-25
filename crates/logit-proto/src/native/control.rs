@@ -28,7 +28,8 @@ pub const REJECT_FRAME_TOO_LARGE: u16 = 3;
 pub const REJECT_GOING_AWAY: u16 = 4;
 pub const REJECT_INTERNAL: u16 = 5;
 
-/// Bounds `Reject.message` so a hostile peer can't force an unbounded allocation.
+/// Bounds `Reject.message` so a hostile peer can't force an unbounded allocation. Decode checks
+/// the wire bytes against it, then truncates the lossy UTF-8 conversion to it on a char boundary.
 const MAX_REJECT_MESSAGE_BYTES: usize = 1024;
 
 /// Bounds `Hello.codecs`/`Hello.compressions`, each drawn from a handful of values, before a
@@ -298,6 +299,13 @@ impl Reject {
                         )));
                     }
                     message = String::from_utf8_lossy(&field).into_owned();
+                    // Each invalid byte becomes a 3-byte U+FFFD, so the lossy string can exceed
+                    // the cap; cut it back so a decoded message always re-encodes within it.
+                    let mut cut = message.len().min(MAX_REJECT_MESSAGE_BYTES);
+                    while !message.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    message.truncate(cut);
                 }
                 _unknown => {}
             }
@@ -456,6 +464,17 @@ mod tests {
             Reject { code: REJECT_INTERNAL, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES + 1) };
         let mut encoded = reject.encode();
         assert!(matches!(Reject::decode(&mut encoded), Err(CodecError::Malformed(_))));
+    }
+
+    /// 342 bytes of `0xFF` pass the byte cap, and each becomes a 3-byte U+FFFD under the lossy
+    /// UTF-8 conversion: 1026 bytes, which a second decode would refuse.
+    #[test]
+    fn a_reject_message_of_invalid_utf8_re_encodes_within_the_cap() {
+        let mut wire = vec![MSG_REJECT, REJECT_FIELD_MESSAGE, 0xd6, 0x02];
+        wire.extend(std::iter::repeat_n(0xFF, 342));
+        let decoded = Reject::decode(&mut Bytes::from(wire)).unwrap();
+        assert!(decoded.message.len() <= MAX_REJECT_MESSAGE_BYTES, "{}", decoded.message.len());
+        assert_eq!(Reject::decode(&mut decoded.encode()).unwrap(), decoded);
     }
 
     #[test]

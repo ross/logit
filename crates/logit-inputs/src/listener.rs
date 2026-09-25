@@ -4,7 +4,8 @@
 //! The gauge is a drop guard ([`LiveConnection`]) rather than an increment and a decrement around
 //! a connection's serving future, so every way a connection task ends, a panic included, brings
 //! it back down. tokio runs a task's `poll` under `catch_unwind` and drops the task's future on a
-//! panic, which runs the guard's `Drop`; no build profile sets `panic = "abort"`.
+//! panic, which runs the guard's `Drop`; no build profile sets `panic = "abort"`. ADR
+//! `untrusted-input-bounds` ("Every listener") records the rule.
 //!
 //! An accept loop hands every `accept()` error to [`absorb_accept_error`] and ends only on the one
 //! it returns. Classifying per error, rather than wrapping the accept call, lets the same helper

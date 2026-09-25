@@ -10,6 +10,8 @@
 //! its count once, after checking the count against the bytes left (every element costs at least
 //! one wire byte), and a dictionary entry its string bytes plus a `Symbol`. A `Str`/`Bytes`
 //! value is a slice of the frame's own buffer, so it's charged nothing.
+//!
+//! The rule and the 4x multiplier are decided in ADR `untrusted-input-bounds`.
 
 use std::cell::Cell;
 

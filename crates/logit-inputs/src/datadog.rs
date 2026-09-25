@@ -64,7 +64,7 @@
 //!    `api_keys` every request passes, and the validate routes answer `200` to any key.
 //! 4. **`Content-Encoding`.** `identity` (or none), `gzip`, `deflate` (zlib-wrapped: what the
 //!    Agent's `zlib` compressor kind sends under that name), or `zstd` (the Agent's default), else
-//!    `415`. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
+//!    `415`. A header that is present but empty, or not ASCII, is a `415` too, not identity. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
 //!    [`MAX_TRACES_DECOMPRESSED_BYTES`] for traces, by `otlp_in`'s pattern: read through
 //!    `Read::take(cap + 1)`, and `413` when that last byte arrives. A stream that doesn't decode is a
 //!    `400`. zstd has its own bounds ([`crate::zstd`]).
@@ -154,10 +154,9 @@ const MAX_DECOMPRESSED_BYTES: usize = 5_242_880;
 const MAX_TRACES_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once: the same 1024 as `otlp_in`, `logit_in`,
-/// and `crate::tcp`'s listeners. A connection past the cap is rejected, not queued. The
-/// listener's worst case is this times [`crate::http::MAX_CONCURRENT_STREAMS`] times a compressed
-/// body and its decompressed copy: 1024 × 200 × (5 MiB + 16 MiB) = 4.1 TiB on the traces route, a
-/// bound on what peers could make the process try to allocate, not a memory budget.
+/// and `crate::tcp`'s listeners. A connection past the cap is rejected, not queued. With a 5 MiB
+/// body inflating to 16 MiB on the traces route, this listener's worst case is 4.1 TiB, a bound
+/// rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula).
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogInput::with_handshake_timeout`]: the same 5s as every other TCP listener,

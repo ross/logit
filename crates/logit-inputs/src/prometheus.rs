@@ -250,8 +250,8 @@
 //! streaming decode that stops one byte past the cap. So a compression bomb is rejected rather
 //! than inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
 //! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
-//! An HTTP/2 connection carries up to [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once, so
-//! the listener's worst case is the product [`MAX_CONCURRENT_CONNECTIONS`] states.
+//! An HTTP/2 connection carries up to [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once;
+//! [`MAX_CONCURRENT_CONNECTIONS`] states the listener's worst case.
 //! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
 //! listener, its first byte on a plaintext one. None of the three is a config field: the first
 //! two are denial-of-service bounds rather than tuning knobs, and graph rule 45's
@@ -770,13 +770,11 @@ impl Input for PrometheusInput {
 /// operator who hits this has a misconfigured sender.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`PrometheusReceiver`] serves at once. The listener's worst case is this
-/// times [`crate::http::MAX_CONCURRENT_STREAMS`] (200 streams per HTTP/2 connection) times twice
-/// [`MAX_REQUEST_BYTES`] (a compressed body and its decompressed copy): 1024 × 200 × 2 × 4 MiB =
-/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget.
-/// The same 1024 as `otlp_in`, `logit_in` and `crate::tcp`'s listeners: no protocol reason to
-/// differ, and one figure for an operator to learn. A connection past the cap is **rejected, not
-/// queued**, as on those.
+/// Bounds the connections [`PrometheusReceiver`] serves at once. With 4 MiB requests this
+/// listener's worst case is 1.6 TiB, a bound rather than a memory budget
+/// ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). The same 1024 as `otlp_in`,
+/// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
+/// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// How long a connection has, per pre-request phase, before this listener releases its
@@ -1240,8 +1238,9 @@ impl Input for PrometheusReceiver {
             let resource = Arc::clone(&self.resource);
             let metadata_cache = metadata_cache.clone();
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                // Held for the connection's lifetime; released on drop.
+                let _permit = permit;
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
                 let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
@@ -1618,7 +1617,10 @@ async fn write_response(
     if !events.is_empty() {
         // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
-        sink.send_reserved(EventBatch { resource, scope: None, events }).await;
+        // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
+        // part of the fan-out (`crate::http::deliver_detached`).
+        crate::http::deliver_detached(sink, vec![EventBatch { resource, scope: None, events }])
+            .await;
     }
     ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }

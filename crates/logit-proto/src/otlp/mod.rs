@@ -5,7 +5,8 @@
 //! **This module doc is the mapping table** for what all three signals share. Each sibling module
 //! doc has its own: [`common`] (`Value` ↔ `AnyValue`, attributes, resource and scope), [`logs`]
 //! (`Severity`, `BodyFormat`, trace context), [`traces`], and [`metrics`] (temporality and the
-//! kinds OTLP can't carry natively). [`json`] is the OTLP/JSON dialect layer.
+//! kinds OTLP can't carry natively). [`json`] is the OTLP/JSON dialect layer, and [`grpc`] is
+//! gRPC message framing and bounded gzip inflation.
 //!
 //! **Wire types.** This codec encodes and decodes `TracesData`/`LogsData`/`MetricsData`, not
 //! `Export*ServiceRequest`. The two are wire-identical (one `repeated Resource* = 1` field), so
@@ -25,13 +26,15 @@
 //! ([`SignalEncoder::encode_signals`]).
 
 pub mod common;
+pub mod grpc;
 pub mod json;
 pub mod logs;
 pub mod metrics;
 pub mod traces;
 
-#[allow(dead_code)] // prost emits types the codec never names (the `*Flags` enums, for one).
-pub(crate) mod generated;
+/// The committed `prost` types. Public so a test outside the crate can build a wire message the
+/// encoder never emits, such as a timestamp past `i64::MAX`.
+pub mod generated;
 
 use crate::{CodecError, Signal, SignalDecoder, SignalEncoder};
 use bytes::Bytes;

@@ -121,7 +121,8 @@
 //! 2. **Size.** A `Content-Length` over [`MAX_REQUEST_BYTES`] (25 MiB, the Agent's
 //!    `max_request_bytes`) is a `413` before any byte is read, and the body is read through
 //!    [`Limited`] at the same cap. No API key is checked: tracers send none.
-//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`. Tracers don't compress,
+//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`, including a header that
+//!    is present but empty or not ASCII. Tracers don't compress,
 //!    and the Agent accepts gzip. The decompressed size is capped at the same 25 MiB.
 //! 4. **Decode.** `CodecError::Malformed` is a `400`.
 //! 5. **Delivery**, bounded (below), then the route's `200`. A body that decodes to no events is
@@ -208,10 +209,8 @@ const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
 /// socket together: the same 1024 as `datadog_in`, and the `connection_limit` `/info` reports.
-/// The listener's worst case is this times [`crate::http::MAX_CONCURRENT_STREAMS`] times twice
-/// [`MAX_REQUEST_BYTES`] (a compressed body and its decompressed copy): 1024 × 200 × 2 × 25 MiB,
-/// about 9.8 TiB, a bound on what peers could make the process try to allocate, not a memory
-/// budget.
+/// With 25 MiB requests this listener's worst case is about 9.8 TiB, a bound rather than a memory
+/// budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula).
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogTraceInput::with_handshake_timeout`]: the same 5s as every other TCP

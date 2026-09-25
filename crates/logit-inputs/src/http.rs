@@ -229,7 +229,7 @@ where
             break;
         }
         // A request started inside the grace window and its handler has not returned, most
-        // likely parked in `Fanout::send` on a full downstream. Dropping now would discard a
+        // likely waiting on a send parked on a full downstream. Dropping now would discard a
         // batch that never reached the fanout (backpressure causing loss), so wait it out: keep
         // polling `conn` (on h1 the handler's future is polled inside it) until the count is
         // zero, then run the grace again so the response reaches the wire. A stalled body is
@@ -245,6 +245,10 @@ where
                 () = activity.changed.notified() => {}
             }
         }
+        // A delivery a handler runs on its own task ([`deliver_detached`]) outlives the
+        // connection only if the client itself closed: it then holds its `Fanout` clone until the
+        // downstream drains, as a handler parked in a send held its connection. Shutdown waits
+        // on it the same way.
         if connection_finished {
             break;
         }
@@ -360,14 +364,21 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1). `Err`
-    /// carries what was sent, for the `415` message.
+    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1); ADR
+    /// `untrusted-input-bounds` makes that uniform across the HTTP listeners. Only an absent header
+    /// means identity: a present one that is empty or not ASCII names no coding, so it is an `Err`
+    /// like an unknown name. `Err` carries what was sent, for the `415` message.
     pub(crate) fn from_headers(headers: &http::HeaderMap) -> Result<Self, String> {
         let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
             return Ok(Self::Identity);
         };
-        let value = value.to_str().unwrap_or("").trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+        let Ok(value) = value.to_str() else {
+            return Err(String::from_utf8_lossy(value.as_bytes()).into_owned());
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            Err(String::new())
+        } else if value.eq_ignore_ascii_case("identity") {
             Ok(Self::Identity)
         } else if value.eq_ignore_ascii_case("gzip") {
             Ok(Self::Gzip)
@@ -498,6 +509,37 @@ pub(crate) fn error_response(
     // Formatted rather than built as a `serde_json::Value`, whose map would sort `errors` first.
     let message = serde_json::to_string(message).expect("a string always serializes");
     json_response(status, Bytes::from(format!(r#"{{"status":"error","errors":[{message}]}}"#)))
+}
+
+/// Sends one request's `batches` in order through [`logit_pipeline::Fanout::send`] on a task of
+/// their own, and waits for it. Dropping this future (a client that closed mid-request cancels
+/// hyper's service future) cancels only the wait: the task still delivers every batch to every
+/// consumer, where a `send` dropped part way would leave some consumers with a batch and others
+/// without (`logit_pipeline::fanout`'s module doc). The client never saw a success, so its retry
+/// duplicates on every branch alike, the ordinary at-least-once outcome. No slot is held while
+/// waiting on another consumer, so this cannot deadlock a diamond the way a reservation without a
+/// deadline would.
+///
+/// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
+/// does ([`drive_with_idle`]'s wait-out loop). A panic inside it is resumed here.
+pub(crate) async fn deliver_detached(
+    sink: &logit_pipeline::Fanout,
+    batches: Vec<logit_core::EventBatch>,
+) {
+    if batches.is_empty() {
+        return;
+    }
+    let sink = sink.clone();
+    let delivery = tokio::spawn(async move {
+        for batch in batches {
+            sink.send(batch).await;
+        }
+    });
+    if let Err(err) = delivery.await {
+        if err.is_panic() {
+            std::panic::resume_unwind(err.into_panic());
+        }
+    }
 }
 
 /// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait both

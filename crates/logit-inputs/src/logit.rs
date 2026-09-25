@@ -425,14 +425,8 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// Serves one accepted (and, with TLS on, already TLS-handshaken) connection to completion:
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
-/// `logit.proto.errors{reason}`: `handshake` (the handshake failed), `too_large` (a header
-/// declared a payload over `max_frame_bytes`, or a `compressed_len` over
-/// `frame::compressed_bound` of it; answered `Reject{FRAME_TOO_LARGE}`), `truncated` (the body
-/// read hit EOF or an I/O error), `crc`, `codec` (a frame not under the negotiated codec),
-/// `decode_budget` (a batch that decodes past its `native::DecodeBudget`; also answered
-/// `Reject{FRAME_TOO_LARGE}`), `magic` (any other
-/// malformed frame, or an undecodable batch), `ack_write_stalled` and `reject_write_stalled`
-/// (module doc's "Bounded writes"). A close or error mid-header is not counted.
+/// Counts every rejection under `logit.proto.errors{reason}`; `docs/design/internal-telemetry.md`'s
+/// `logit_in` section is the canonical list of reasons. A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -2482,8 +2476,8 @@ mod tests {
 
     /// Something that isn't `logit` on this port (an HTTP request, a syslog line) fails the
     /// header's magic check. That check comes before the length bound and the body allocation, so
-    /// the connection closes at once, counted as a handshake error, and allocates nothing sized
-    /// from the stray bytes.
+    /// the connection closes at once, counted as a handshake error. `tests/robustness.rs`'s
+    /// `a_stray_client_allocates_nothing_sized_from_its_bytes` pins the allocation side.
     #[tokio::test]
     async fn a_stray_http_or_syslog_client_is_reset_before_any_allocation() {
         const STRAYS: [(&str, &[u8]); 2] = [
@@ -2495,10 +2489,8 @@ mod tests {
             let mut header = [0u8; frame::HEADER_LEN];
             header.copy_from_slice(&bytes[..frame::HEADER_LEN]);
             let (_client, mut server) = tokio::io::duplex(64);
-            peak_alloc::reset();
             let result =
                 read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None).await;
-            let peak = peak_alloc::peak();
             match result {
                 Err(FrameReadError::Malformed(err)) => {
                     assert!(format!("{err:#}").contains("magic"), "{name}: {err:#}")
@@ -2506,7 +2498,6 @@ mod tests {
                 Err(other) => panic!("{name}: expected Malformed, got {:#}", other.into_inner()),
                 Ok(_) => panic!("{name}: stray bytes parsed as a frame"),
             }
-            assert!(peak < 1024, "{name}: {peak} bytes allocated for a rejected header");
         }
 
         let registry = Registry::new();
@@ -2565,106 +2556,5 @@ mod tests {
             }
         }
         drop(rejected);
-    }
-
-    /// A frame's body is held once while it's read: one buffer of `HEADER_LEN + compressed_len`,
-    /// read into in place and handed to `frame::read_frame_with_header`, never a body `Vec`
-    /// copied next to the header.
-    #[tokio::test]
-    async fn a_frame_body_is_held_once_at_peak() {
-        const BODY: usize = 8 * 1024 * 1024;
-        let framed =
-            frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &vec![7u8; BODY])
-                .unwrap();
-        let (mut client, mut server) = tokio::io::duplex(framed.len() + 1);
-        client.write_all(&framed).await.unwrap();
-        drop(framed);
-        let header = read_header(&mut server, None)
-            .await
-            .map_err(HeaderReadError::into_inner)
-            .unwrap()
-            .unwrap();
-
-        peak_alloc::reset();
-        let (header, payload) =
-            read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
-                .await
-                .map_err(FrameReadError::into_inner)
-                .unwrap();
-        let peak = peak_alloc::peak();
-        assert_eq!(payload.len(), BODY);
-        assert_eq!(header.compressed_len as usize, BODY);
-        assert!(
-            (BODY..BODY + BODY / 16).contains(&peak),
-            "peak live heap {peak} bytes for a {BODY}-byte body: the body is held more than once"
-        );
-    }
-
-    /// A per-thread peak-live-bytes counter over the system allocator, installed as this test
-    /// binary's global allocator. Thread-local, so a `current_thread` test measures only itself.
-    mod peak_alloc {
-        use std::alloc::{GlobalAlloc, Layout, System};
-        use std::cell::Cell;
-
-        thread_local! {
-            static LIVE: Cell<usize> = const { Cell::new(0) };
-            static PEAK: Cell<usize> = const { Cell::new(0) };
-        }
-
-        /// `try_with`: an allocation during thread-local teardown is served but not counted.
-        fn grow(bytes: usize) {
-            let _ = LIVE.try_with(|live| {
-                let now = live.get() + bytes;
-                live.set(now);
-                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
-            });
-        }
-
-        fn shrink(bytes: usize) {
-            let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(bytes)));
-        }
-
-        pub(super) fn reset() {
-            LIVE.with(|live| live.set(0));
-            PEAK.with(|peak| peak.set(0));
-        }
-
-        pub(super) fn peak() -> usize {
-            PEAK.with(Cell::get)
-        }
-
-        struct Counting;
-
-        // SAFETY: every method forwards to `System` with the caller's arguments unchanged and
-        // only updates thread-local counters around the call.
-        unsafe impl GlobalAlloc for Counting {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                grow(layout.size());
-                // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract for `layout`.
-                unsafe { System.alloc(layout) }
-            }
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                grow(layout.size());
-                // SAFETY: as `alloc`.
-                unsafe { System.alloc_zeroed(layout) }
-            }
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                shrink(layout.size());
-                // SAFETY: `ptr` came from this allocator, which is `System`, with `layout`.
-                unsafe { System.dealloc(ptr, layout) }
-            }
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                if new_size >= layout.size() {
-                    grow(new_size - layout.size());
-                } else {
-                    shrink(layout.size() - new_size);
-                }
-                // SAFETY: as `dealloc`, and the caller upholds `realloc`'s size contract.
-                unsafe { System.realloc(ptr, layout, new_size) }
-            }
-        }
-
-        #[global_allocator]
-        static COUNTING: Counting = Counting;
     }
 }

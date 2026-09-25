@@ -17,12 +17,14 @@
 //! connections by [`hyper::server::conn::http2::Builder`] directly, since gRPC is HTTP/2 only.
 //!
 //! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
-//! datagrams; TCP has no such escape hatch. A slow `sink.send_reserved(batch).await` blocks the
-//! handler, which stops reading that connection, which the client feels as its own write
-//! blocking. That is correct for a reliable protocol (an OTLP exporter retries or buffers on its
-//! own timeout): `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up
-//! and closes cancels the handler mid-send; `Fanout::send_reserved` reserves every consumer before
-//! delivering to any, so the retry never lands twice on one branch of a fan-out.
+//! datagrams; TCP has no such escape hatch. A slow downstream blocks the handler's delivery, which
+//! stops reading that connection, which the client feels as its own write blocking. That is
+//! correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
+//! `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up and closes
+//! cancels only the handler's wait: [`crate::http::deliver_detached`] runs the request's sends on
+//! a task of their own, so every consumer still gets every batch of the request, however many
+//! batches (one per resource) it decoded to. The retry then duplicates on every branch alike
+//! rather than on some.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -118,9 +120,9 @@
 //! bound made explicit, opt-in, and available on both transports.
 //!
 //! **Gzip, and nothing else.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's compressed flag
-//! with `grpc-encoding: gzip` are decoded via [`inflate`]; any other declared encoding is
-//! rejected (`415`/`grpc-status: 12`). Both headers are matched case-insensitively, since
-//! content-coding names are (RFC 9110 §8.4.1). `inflate` bounds the *decompressed* size to
+//! with `grpc-encoding: gzip` are decoded via [`grpc::inflate_bounded`]; any other declared
+//! encoding is rejected (`415`/`grpc-status: 12`). Both headers are matched case-insensitively,
+//! since content-coding names are (RFC 9110 §8.4.1). The *decompressed* size is bounded to
 //! [`MAX_REQUEST_BYTES`], the cap already on the compressed body, so a compression bomb is
 //! rejected rather than inflated (`docs/adr/otlp-compression-and-decompression-bounds.md`).
 //!
@@ -138,7 +140,7 @@
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one request;
 //! [`crate::http::MAX_CONCURRENT_STREAMS`] bounds the requests on one HTTP/2 connection and
 //! [`MAX_CONCURRENT_CONNECTIONS`] how many connections are served at once, so the listener's
-//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the product).
+//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the figure).
 //!
 //! **`partial_success` is always empty on a successful decode.** It exists to report which
 //! records in an accepted request were rejected, but `logit_proto::SignalDecoder::decode_signal`
@@ -165,6 +167,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
+use logit_proto::otlp::grpc::{self, InflateError};
 use logit_proto::otlp::OtlpDecoder;
 use logit_proto::{Signal, SignalDecoder};
 // Only the test module's `tls_connector` reads PEM files directly; server TLS is `crate::tls`.
@@ -182,13 +185,11 @@ use tokio_rustls::TlsAcceptor;
 /// Matches the OTel collector's default `max_recv_msg_size`.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once. The listener's worst case is this times
-/// [`crate::http::MAX_CONCURRENT_STREAMS`] (200 streams per HTTP/2 connection) times twice
-/// [`MAX_REQUEST_BYTES`] (a compressed body and its inflated copy): 1024 × 200 × 2 × 4 MiB =
-/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget. The
-/// same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an OTLP listener
-/// to differ, and one figure for an operator to learn. Not operator-tunable; make it a config
-/// field if a deployment needs a different number.
+/// Bounds the connections [`Input::run`] serves at once. With 4 MiB requests this listener's worst
+/// case is 1.6 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
+/// has the formula). The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason
+/// for an OTLP listener to differ, and one figure for an operator to learn. Not operator-tunable;
+/// make it a config field if a deployment needs a different number.
 ///
 /// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
 /// `OtlpInput::with_max_connections` lowers it in tests.
@@ -365,8 +366,9 @@ impl Input for OtlpInput {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                // Held for the connection's lifetime; released on drop.
+                let _permit = permit;
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
                 let _live = live_connections.enter();
 
                 // The handshake runs here, after the permit, so it stalls only this connection.
@@ -571,7 +573,7 @@ async fn handle_http(
         }
     };
     let bytes = if gzip_encoded {
-        match inflate(&bytes) {
+        match grpc::inflate_bounded(&bytes, MAX_REQUEST_BYTES) {
             Ok(inflated) => inflated,
             Err(InflateError::TooLarge) => {
                 return Ok(text_response(
@@ -594,9 +596,7 @@ async fn handle_http(
     };
     match result {
         Ok(batches) => {
-            for batch in batches {
-                sink.send_reserved(batch).await;
-            }
+            crate::http::deliver_detached(&sink, batches).await;
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
             // ([`export_response_json`]).
@@ -662,10 +662,11 @@ async fn handle_grpc(
     else {
         return Ok(grpc_response(12, &format!("unknown method {path}"), None));
     };
-    // The frame's compressed flag (`grpc_unframe`) drives decompression; this check only rejects
+    // The frame's compressed flag (`grpc::unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
-        // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is.
+        // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is;
+        // ADR `untrusted-input-bounds` makes that uniform across the HTTP listeners.
         let enc = enc.to_str().unwrap_or("").trim();
         if !enc.eq_ignore_ascii_case("identity") && !enc.eq_ignore_ascii_case("gzip") {
             return Ok(grpc_response(
@@ -689,11 +690,11 @@ async fn handle_grpc(
             return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None))
         }
     };
-    let Some((compressed, payload)) = grpc_unframe(&framed) else {
+    let Some((compressed, payload)) = grpc::unframe(&framed) else {
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
     };
     // `Export` is unary, so its body is one message. Bytes after it are a sender's encoder bug,
-    // answered rather than dropped unread.
+    // answered rather than dropped unread (ADR `untrusted-input-bounds`).
     let leftover = framed.len() - 5 - payload.len();
     if leftover != 0 {
         return Ok(grpc_response(
@@ -706,7 +707,7 @@ async fn handle_grpc(
         ));
     }
     let payload = if compressed {
-        match inflate(payload) {
+        match grpc::inflate_bounded(payload, MAX_REQUEST_BYTES) {
             Ok(inflated) => inflated,
             Err(InflateError::TooLarge) => {
                 return Ok(grpc_response(
@@ -726,9 +727,7 @@ async fn handle_grpc(
     let mut decoder = OtlpDecoder::new().with_telemetry(telemetry);
     match decoder.decode_signal(signal, payload) {
         Ok(batches) => {
-            for batch in batches {
-                sink.send_reserved(batch).await;
-            }
+            crate::http::deliver_detached(&sink, batches).await;
             Ok(grpc_response(0, "", Some(export_response(0, ""))))
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
@@ -809,45 +808,6 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(payload);
     buf
-}
-
-/// The mirror of [`grpc_frame`], returning the compressed flag with the payload so the caller
-/// knows whether to [`inflate`]. Unlike `logit_outputs::otlp::grpc_unframe`, a compressed frame
-/// is accepted: a request may be gzipped. `None` for less than one complete frame, a flag byte
-/// other than `0`/`1`, or a declared length past the end.
-fn grpc_unframe(bytes: &[u8]) -> Option<(bool, &[u8])> {
-    if bytes.len() < 5 {
-        return None;
-    }
-    let compressed = match bytes[0] {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let len = u32::from_be_bytes(bytes[1..5].try_into().expect("checked len >= 5 above")) as usize;
-    bytes.get(5..5 + len).map(|payload| (compressed, payload))
-}
-
-/// Why [`inflate`] failed: `400`/`INVALID_ARGUMENT` (not valid gzip) versus
-/// `413`/`RESOURCE_EXHAUSTED` (decompressed past the cap).
-enum InflateError {
-    Malformed,
-    TooLarge,
-}
-
-/// Inflates `compressed` (gzip), bounded to [`MAX_REQUEST_BYTES`], the cap [`Limited`] already
-/// puts on the compressed body, so a few KiB of gzipped zeros can't inflate to gigabytes.
-/// `Read::take` allows one byte past the cap, so an input inflating to `MAX_REQUEST_BYTES + 1`
-/// is caught rather than truncated to fit.
-fn inflate(compressed: &[u8]) -> Result<Bytes, InflateError> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(compressed).take(MAX_REQUEST_BYTES as u64 + 1);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|_| InflateError::Malformed)?;
-    if out.len() > MAX_REQUEST_BYTES {
-        return Err(InflateError::TooLarge);
-    }
-    Ok(Bytes::from(out))
 }
 
 fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
@@ -1285,6 +1245,26 @@ mod tests {
         }
     }
 
+    /// A `Content-Encoding` header that is present but empty, or carries a non-ASCII byte, names
+    /// no coding this input can trust, so it is a `415` like any unknown one, never identity.
+    /// Only an absent header means identity.
+    #[tokio::test]
+    async fn an_empty_or_non_ascii_content_encoding_is_415() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for encoding in ["", "gzip\u{e9}", "\u{e9}zstd"] {
+            let headers = format!(
+                "Content-Type: application/x-protobuf\r\nContent-Encoding: {encoding}\r\n\
+                 Connection: close\r\n"
+            );
+            let response = post_raw(&addr, "/v1/traces", &headers, &one_span_payload()).await;
+            assert!(response.starts_with("HTTP/1.1 415"), "{encoding:?}: got {response}");
+        }
+    }
+
     fn one_span_payload() -> Vec<u8> {
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {
@@ -1359,8 +1339,9 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
-    /// A few KiB of gzipped zeros inflating past `MAX_REQUEST_BYTES` is caught by `inflate`'s
-    /// decompressed bound, which `Limited`'s compressed bound (satisfied here) cannot.
+    /// A few KiB of gzipped zeros inflating past `MAX_REQUEST_BYTES` is caught by
+    /// `grpc::inflate_bounded`'s decompressed bound, which `Limited`'s compressed bound (satisfied
+    /// here) cannot.
     #[tokio::test]
     async fn a_gzip_body_that_would_inflate_past_the_size_cap_is_rejected_with_413() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
@@ -2202,36 +2183,67 @@ mod tests {
         recv_batch(&mut rx).await;
     }
 
+    /// One `/v1/metrics` body carrying two `ResourceMetrics` (hosts `a` and `b`), which decodes to
+    /// two batches. Concatenated encodings of a message are a valid merge, and `MetricsData`'s only
+    /// field is the repeated `resource_metrics`.
+    fn two_resource_metrics_payload() -> Vec<u8> {
+        let mut body = Vec::new();
+        for host in ["a", "b"] {
+            let mut resource = logit_core::Resource::default();
+            resource.attributes.insert("host", host);
+            let batch = logit_core::EventBatch {
+                resource: std::sync::Arc::new(resource),
+                scope: None,
+                events: metric_batch().events,
+            };
+            let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+            let payloads =
+                logit_proto::SignalEncoder::encode_signals(&mut encoder, &batch).unwrap();
+            body.extend_from_slice(&payloads[0].1);
+        }
+        body
+    }
+
+    /// The `host` resource attribute of each batch `rx` holds, waiting up to 300ms for each.
+    async fn hosts_received(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> Vec<String> {
+        let mut hosts = Vec::new();
+        while let Ok(Some(delivered)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            let batch = logit_pipeline::unwrap_batch(delivered);
+            let host = batch.resource.attributes.get("host").and_then(|v| v.as_str());
+            hosts.push(host.unwrap_or("").to_string());
+        }
+        hosts
+    }
+
     /// A client that gives up while its request waits on a full consumer (an exporter's own
-    /// timeout under backpressure) cancels the handler. With two consumers, the first must not
-    /// keep a batch the second never got: the client retries, and the first would see it twice.
+    /// timeout under backpressure) cancels only the handler's wait, not the delivery: every
+    /// consumer still gets every batch of the request. The client never saw a `200`, so its retry
+    /// duplicates on every branch alike, the ordinary at-least-once outcome, where a split would
+    /// duplicate on some branches and not others.
     #[tokio::test]
-    async fn a_client_that_closes_while_its_batch_waits_leaves_no_consumer_with_it() {
+    async fn a_client_that_closes_while_its_batches_wait_still_delivers_them_to_every_consumer() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (tx_a, mut rx_a) = mpsc::channel(16);
         let (tx_b, mut rx_b) = mpsc::channel(1);
         let sink = Fanout::new(vec![tx_a, tx_b]);
-        // Fills b's one slot, so the request's send waits on b; a's copy is drained here.
+        // Fills b's one slot, so the request's first send waits on b; a's copy is drained here.
         sink.send(metric_batch()).await;
         recv_batch(&mut rx_a).await;
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        write_request(&mut client, &addr, "/v1/traces", &one_span_payload()).await;
+        write_request(&mut client, &addr, "/v1/metrics", &two_resource_metrics_payload()).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(client);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let filler = recv_batch(&mut rx_b).await;
-        assert!(filler.events[0].span.is_none(), "b's first batch is the metric filler");
-        let a = tokio::time::timeout(Duration::from_millis(300), rx_a.recv()).await;
-        let b = tokio::time::timeout(Duration::from_millis(300), rx_b.recv()).await;
-        assert_eq!(
-            (a.is_ok(), b.is_ok()),
-            (false, false),
-            "a cancelled request's batch reaches every consumer or none (a, b)"
-        );
+        let b = hosts_received(&mut rx_b).await;
+        let a = hosts_received(&mut rx_a).await;
+        assert_eq!(b, ["", "a", "b"], "b: the filler, then both of the request's batches");
+        assert_eq!(a, ["a", "b"], "a: both of the request's batches");
     }
 
     fn metric_batch() -> logit_core::EventBatch {

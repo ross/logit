@@ -106,7 +106,8 @@ encoding can become a much larger in-memory struct: one empty event is 1 wire by
 `crates/logit-proto/src/native/budget.rs`), and a payload that would exceed it fails with
 `CodecError::BudgetExceeded` before the elements are built. `logit_in` counts that under
 `logit.proto.errors{reason="decode_budget"}` and diagnoses it under its own `decode_budget` key.
-The budget per reader:
+The rule and the 4× multiplier are decided in
+[ADR `untrusted-input-bounds`](../adr/untrusted-input-bounds.md). The budget per reader:
 
 - `logit_in` gives each frame 4 × its effective `max_frame_bytes` (at most 64 MiB, so at most a
   256 MiB budget).
@@ -149,13 +150,17 @@ Two caveats:
 The dictionary's cost lands mostly in the process-wide interner, which never evicts and isn't a
 per-frame cost ([`docs/known-gaps.md`](../known-gaps.md)'s interner entry).
 
-**A real batch is charged 6 to 39 bytes per wire byte, not under 4.** The 864-byte event slot
-dominates a small event. Measured on `crates/logit-bench/src/fixtures.rs`'s 1,000-event batches:
-nginx access logs 6.1, spans 8.0, sshd logs 7.8, pino-http logs 18.7, statsd 19.2, collectd
-16.6, graphite 32.0, Prometheus gauges 32.5, and a bare `Sum` metric 38.8. So a frame is refused
-once its payload passes `4 / ratio` of the frame cap it arrived under: about 10% of it for a
-metric batch, and about 65% for an nginx one. At the 64 MiB default that is a payload of roughly
-6.5 MiB, or about 250,000 small metric events (about 120,000 nginx access-log events).
+**A real batch is charged 1.5 to 39 bytes of heap per wire byte.** The 864-byte event slot
+dominates a small event; a wide parsed log carries enough wire bytes to hide it. Measured on
+`crates/logit-bench/src/fixtures.rs`'s batches of 1,000 events: parsed JSON, access-log, and
+`http_access` batches 1.5 to 2.4, nginx access logs 6.1, sshd logs 7.8, spans 8.0, collectd 16.6,
+pino-http logs 18.7, statsd 19.2, graphite 32.0, Prometheus gauges 32.5, and a bare `Sum` metric
+38.8. So a frame is refused once its payload passes `4 / ratio` of the frame cap it arrived under:
+about 10% of it for a small-metric batch, about 65% for an nginx one, and never for the widest
+logs. At the 64 MiB default the first of those is a payload of roughly 6.5 MiB, about 250,000
+small metric events. A sender learns only `max_frame_bytes` from `HelloAck`, not the budget, so
+a stock `logit_out` can send a batch the budget refuses; see
+[`docs/known-gaps.md`](../known-gaps.md)'s decode-budget entry.
 
 ## Encoding: decided — hand-rolled
 

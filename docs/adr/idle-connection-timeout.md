@@ -330,7 +330,10 @@ Two findings came out of the same review, both fixed in the shared listener code
 - **A client that closes mid-send cancels the handler.** On h1 an EOF drops hyper's service
   future, and on h2 an `RST_STREAM` or a dropped connection cancels the stream's task. A handler
   parked in `Fanout::send` on its second consumer then leaves the first holding the batch, and
-  the client's retry duplicates it there. `otlp_in` and `prometheus_in`'s receiver now send
-  through `Fanout::send_reserved`, which reserves every consumer before delivering to any. The
-  wait-out loop's contract is unchanged: a handler blocked forever in a send holds its connection
-  and permit, as the amendment above records.
+  the client's retry duplicates it there. `otlp_in` and `prometheus_in`'s receiver now run a
+  request's sends on a task of their own and await it, so a closing client cancels only the wait
+  and every consumer gets every batch; the retry then duplicates on every branch alike, the
+  ordinary at-least-once outcome. Reserving every consumer first was rejected: without a deadline,
+  senders holding one consumer's slots while waiting on another deadlock a diamond graph
+  (`logit_pipeline::fanout`'s module doc). The wait-out loop's contract is unchanged: a handler
+  blocked forever in a send holds its connection and permit, as the amendment above records.

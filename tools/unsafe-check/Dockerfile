@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# Nightly-only image for script/unsafe-check (miri, cargo-careful, strace). Dockerfile.dev stays
-# stable-only. See docs/adr/out-of-ci-unsafe-verification.md.
+# Nightly-only image for script/unsafe-check (miri, cargo-careful, strace, cargo-fuzz).
+# Dockerfile.dev stays stable-only. See docs/adr/out-of-ci-unsafe-verification.md and
+# docs/adr/out-of-ci-fuzzing.md.
 FROM debian:bookworm-slim
 
 ARG USERNAME=dev
@@ -9,7 +10,8 @@ ARG USER_GID=1000
 
 # Dockerfile.dev's native build deps, plus `build-essential`, which its `rust:*-bookworm` base
 # already carries: mlua's vendored LuaJIT build runs `make`. `curl`, `ca-certificates`, and
-# `xz-utils` fetch rustup; `strace` serves `inject`.
+# `xz-utils` fetch rustup; `strace` serves `inject`. `llvm` provides the `llvm-symbolizer` ASan
+# needs to name the frames in a fuzz crash's stack trace.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         clang \
@@ -21,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         xz-utils \
         strace \
+        llvm \
     && rm -rf /var/lib/apt/lists/*
 
 # Match the host user, so bind-mounted files come back owned by the host account, not root.
@@ -64,6 +67,12 @@ RUN --mount=type=cache,id=logit-unsafe-check-cargo-registry,target=/home/dev/.ca
 ARG CARGO_NEXTEST_VERSION=0.9.144
 RUN --mount=type=cache,id=logit-unsafe-check-cargo-registry,target=/home/dev/.cargo/registry,sharing=locked,uid=1000,gid=1000 \
     cargo install cargo-nextest --version ${CARGO_NEXTEST_VERSION} --locked --root ${TOOLS_ROOT}
+
+# `script/unsafe-check fuzz` drives the `fuzz/` workspace (docs/adr/out-of-ci-fuzzing.md). Its
+# ASan and libFuzzer runtimes come with the nightly toolchain and `clang` above.
+ARG CARGO_FUZZ_VERSION=0.13.2
+RUN --mount=type=cache,id=logit-unsafe-check-cargo-registry,target=/home/dev/.cargo/registry,sharing=locked,uid=1000,gid=1000 \
+    cargo install cargo-fuzz --version ${CARGO_FUZZ_VERSION} --locked --root ${TOOLS_ROOT}
 
 # Docker copies a mount point's ownership into a new named volume, so without this the target
 # volume is root-owned and every build fails to write to it. Root only to create /work.
