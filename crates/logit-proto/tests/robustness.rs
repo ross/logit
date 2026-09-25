@@ -922,6 +922,15 @@ fn decode_v1(payload: &[u8]) -> Result<EventBatch, CodecError> {
     native::decode_batch(&mut Bytes::copy_from_slice(payload), &DecodeBudget::default())
 }
 
+/// Asserts `result` is a [`CodecError::BudgetExceeded`] for `limit`.
+fn assert_over_budget<T>(result: Result<T, CodecError>, limit: u64, case: &str) {
+    match result {
+        Err(CodecError::BudgetExceeded { limit: got }) => assert_eq!(got, limit, "{case}"),
+        Err(other) => panic!("{case}: expected BudgetExceeded {{ limit: {limit} }}, got {other:?}"),
+        Ok(_) => panic!("{case}: decoded, expected BudgetExceeded {{ limit: {limit} }}"),
+    }
+}
+
 fn assert_malformed<T>(result: Result<T, CodecError>, needle: &str, case: &str) {
     match result {
         Err(CodecError::Malformed(msg)) => {
@@ -1143,7 +1152,7 @@ fn a_frame_of_empty_events_is_rejected_past_the_decode_budget() {
         let mut events = Vec::new();
         result = Some(NativeDecoder.decode_into(framed.clone(), 0, &mut events).map(|_| ()));
     });
-    assert_malformed(result.unwrap(), "decode budget", "a million empty events");
+    assert_over_budget(result.unwrap(), native::DEFAULT_DECODE_BUDGET, "a million empty events");
     // The 1 MiB decompressed payload is the only large allocation.
     assert!(peak < 2 * 1024 * 1024, "peak live bytes {peak}: events were built before refusal");
 
@@ -1155,7 +1164,7 @@ fn a_frame_of_empty_events_is_rejected_past_the_decode_budget() {
     assert_eq!(exact.charged(), cost);
     let short = DecodeBudget::new(cost - 1);
     let result = native::decode_batch(&mut payload.clone(), &short);
-    assert_malformed(result, &format!("{}-byte decode budget", cost - 1), "one byte short");
+    assert_over_budget(result, cost - 1, "one byte short");
 }
 
 /// One empty exemplar is 1 wire byte and a `size_of::<Exemplar>()` slot.
@@ -1180,7 +1189,7 @@ fn a_frame_of_empty_exemplars_is_rejected_past_the_decode_budget() {
 
     let short = DecodeBudget::new(cost - 1);
     let result = native::decode_batch(&mut payload.clone(), &short);
-    assert_malformed(result, "decode budget", "one byte short");
+    assert_over_budget(result, cost - 1, "one byte short");
     let peak = peak_live_bytes(|| {
         let _ = native::decode_batch(&mut payload.clone(), &DecodeBudget::new(64 * 1024));
     });

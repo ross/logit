@@ -59,7 +59,7 @@ impl DecodeBudget {
         self.limit - self.remaining.get()
     }
 
-    /// Takes `bytes` from the budget, or fails with [`CodecError::Malformed`] naming it.
+    /// Takes `bytes` from the budget, or fails with [`CodecError::BudgetExceeded`].
     pub(crate) fn charge(&self, bytes: u64) -> Result<(), CodecError> {
         let remaining = self.remaining.get();
         if bytes > remaining {
@@ -90,7 +90,7 @@ impl DecodeBudget {
 
     #[cold]
     fn exceeded(&self) -> CodecError {
-        CodecError::Malformed(format!("payload decodes past its {}-byte decode budget", self.limit))
+        CodecError::BudgetExceeded { limit: self.limit }
     }
 }
 
@@ -111,8 +111,10 @@ mod tests {
         budget.charge(40).unwrap();
         assert_eq!(budget.charged(), 100);
         match budget.charge(1) {
-            Err(CodecError::Malformed(msg)) => assert!(msg.contains("100-byte decode budget")),
-            other => panic!("expected Malformed, got {other:?}"),
+            Err(err @ CodecError::BudgetExceeded { limit: 100 }) => {
+                assert!(err.to_string().contains("100-byte decode budget"))
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
         }
         assert_eq!(budget.charged(), 100, "a refused charge takes nothing");
     }

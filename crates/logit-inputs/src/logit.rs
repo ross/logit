@@ -292,7 +292,23 @@ impl Input for LogitInput {
                 // or timed-out TLS accept, a cap reject that failed to write) is never fatal to
                 // the listener; only `accept` failing above is.
                 if let Err(err) = result {
-                    diag.warn_throttled("connection_error", err);
+                    match err.downcast_ref::<CodecError>() {
+                        Some(CodecError::BudgetExceeded { limit }) => {
+                            diag.warn_throttled(
+                                "decode_budget",
+                                format_args!(
+                                    "closing a connection whose batch decodes past its \
+                                     {limit}-byte budget ({}x max_frame_bytes of \
+                                     {max_frame_bytes}); the sender's batches are too large \
+                                     for this listener: {err:#}",
+                                    native::budget::DECODE_BUDGET_PER_FRAME_BYTE
+                                ),
+                            );
+                        }
+                        _ => {
+                            diag.warn_throttled("connection_error", err);
+                        }
+                    }
                 }
             });
         }
@@ -370,13 +386,22 @@ fn codec_tag(codec: u8) -> &'static str {
     }
 }
 
+/// The `logit.proto.errors` reason for a batch that failed to decode.
+fn decode_error_reason(err: &CodecError) -> &'static str {
+    match err {
+        CodecError::BudgetExceeded { .. } => "decode_budget",
+        _ => "magic",
+    }
+}
+
 /// Serves one accepted (and, with TLS on, already TLS-handshaken) connection to completion:
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
 /// `logit.proto.errors{reason}`: `handshake` (the handshake failed), `too_large` (a header
 /// declared more than `max_frame_bytes`), `truncated` (the body read hit EOF or an I/O error),
-/// `crc`, `codec` (a frame not under the negotiated codec), `magic` (any other malformed frame, or
-/// an undecodable batch). A close or error mid-header is not counted.
+/// `crc`, `codec` (a frame not under the negotiated codec), `decode_budget` (a batch that decodes
+/// past its `native::DecodeBudget`), `magic` (any other malformed frame, or an undecodable batch).
+/// A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -478,12 +503,20 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
         let (batch, provenance) = if negotiated.codec == native::CODEC_NATIVE_V2 {
             native::decode_batch_v2(&mut payload, &budget).map_err(|err| {
-                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
+                telemetry.count(
+                    "logit.proto.errors",
+                    1.0,
+                    &[("reason", decode_error_reason(&err))],
+                );
                 anyhow::Error::new(err).context("decoding a native v2 batch")
             })?
         } else {
             let batch = native::decode_batch(&mut payload, &budget).map_err(|err| {
-                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
+                telemetry.count(
+                    "logit.proto.errors",
+                    1.0,
+                    &[("reason", decode_error_reason(&err))],
+                );
                 anyhow::Error::new(err).context("decoding a native batch")
             })?;
             (batch, Provenance::default())
@@ -1342,6 +1375,45 @@ mod tests {
         // The server task records the counter after closing the socket.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(drained_counter(&registry, "logit.proto.errors", ("reason", "crc")), Some(1.0));
+    }
+
+    /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
+    /// connection, counted as `decode_budget` rather than `magic` and diagnosed under its own key.
+    #[tokio::test]
+    async fn a_batch_past_the_decode_budget_is_counted_and_diagnosed_as_decode_budget() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let diag = Diagnostics::new("logit_in");
+        let listener_diag = diag.clone();
+        let (addr, input) = bound_input().await;
+        // A 4 KiB budget: five empty events (864 bytes each) exceed it in a ~10-byte payload.
+        let mut input =
+            input.with_telemetry(telemetry).with_diagnostics(diag).with_max_frame_bytes(1024);
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        send_data_frame(&mut client, &batch, Compression::None).await;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("should observe a close within 2s")
+            .unwrap();
+        assert_eq!(n, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "decode_budget")),
+            Some(1.0)
+        );
+        assert_eq!(listener_diag.occurrences("decode_budget"), 1);
+        assert_eq!(listener_diag.occurrences("connection_error"), 0);
     }
 
     #[tokio::test]
