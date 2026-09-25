@@ -161,19 +161,17 @@ connection and dials a fresh one before anything is written, the ordinary `Clean
 rather than a lost or ambiguous batch. The residual case is unchanged: a FIN racing the probe
 itself, the peer closing *while* this sink is writing, is still today's `Fault::Ambiguous`.
 
-## Amendment: incremental body reads, a handshake-sized `Hello` cap, and bounded control writes (2026-09-25)
+## Amendment: a single-copy body read and bounded control writes (2026-09-25)
 
 [ADR `untrusted-input-bounds`](untrusted-input-bounds.md) changes how `logit_in` reads and writes,
 without changing a byte on the wire:
 
-- **Incremental body read.** `read_frame_body` no longer allocates the declared
-  `compressed_len` up front. It starts one buffer at the header plus `min(compressed_len, 64 KiB)`,
-  reads into it, and grows it by doubling as bytes arrive, never past the declared end. The header
-  isn't copied into a second buffer. The per-read stall bound and every `FrameReadError` are
-  unchanged.
-- **`MAX_HELLO_BYTES`.** The `Hello` read is bounded by `MAX_HELLO_BYTES` (4 KiB) instead of
-  `max_frame_bytes`. A real `Hello` is a few dozen bytes.
+- **Single-copy body read.** `read_frame_body` still sizes its buffer from the header's declared
+  `compressed_len`, but it reads the body into the frame's final buffer directly instead of into a
+  separate `Vec` that is then copied next to the header. The body is copied once, not twice. The
+  per-read stall bound and every `FrameReadError` are unchanged.
 - **Bounded control writes.** `HelloAck`, the per-frame `Ack`, the handshake's two `Reject`s, the
-  past-the-cap `Reject`, and `GOING_AWAY` are each written under `handshake_timeout`. A peer that
-  stops reading can no longer hold a connection, and its permit, in a blocked write. A timed-out
-  past-the-cap `Reject` is an error; the others end the connection and are counted.
+  past-the-cap `Reject`, and `GOING_AWAY` are each written under `handshake_timeout`. A wedged
+  peer, such as a stopped process or one whose receive buffer is full, can no longer hold a
+  connection, and its permit, in a blocked write. A timed-out past-the-cap `Reject` is an error;
+  the others end the connection and are counted.

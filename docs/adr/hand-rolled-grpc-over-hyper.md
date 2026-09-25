@@ -87,16 +87,16 @@ gRPC response needs exactly one.
   `http2` feature, resolves to the same version `reqwest` already pins) — confirmed via
   `script/audit`, not assumed. `deny.toml` needed no edit.
 
-## Amendment: an explicit stream cap, one message per unary body, and a shared framing module (2026-09-25)
+## Amendment: a pinned stream cap, one message per unary body, and a shared framing module (2026-09-25)
 
 [ADR `untrusted-input-bounds`](untrusted-input-bounds.md) changes four things about the server
 half:
 
 - **Stream cap.** `otlp_in` builds both transports through a shared builder that sets
-  `max_concurrent_streams` to 32 and pins `max_pending_accept_reset_streams` (20) and
-  `max_header_list_size` (16 KiB) explicitly. Before this, the server ran on hyper 1.11.1's
-  default of 200 concurrent streams per connection, which the per-listener worst case didn't
-  account for.
+  `max_concurrent_streams` to hyper 1.11.1's own default of 200, and
+  `max_pending_accept_reset_streams` (20) and `max_header_list_size` (16 KiB) to theirs,
+  explicitly, so a hyper upgrade can't move them. The values don't change; the per-listener
+  worst case now accounts for the 200 streams, which it didn't before.
 - **One message per unary body.** A unary request body that carries a second gRPC frame after the
   first is answered `INVALID_ARGUMENT` (`grpc-status: 3`). It used to be decoded as its first
   frame alone.

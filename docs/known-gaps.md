@@ -145,10 +145,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) demonstrates.
   - **`logit_in`'s native dictionary.** `crates/logit-proto/src/native/dict.rs`'s `Dict::read`
     interns every dictionary string a `logit_in` peer sends before the rest of the batch
-    validates, so a frame that fails to decode after its dictionary still leaves its strings in the
-    interner, and nothing budgets dictionary strings across frames. The per-frame bound is the
-    dictionary entry cap and the frame size; the process-lifetime bound is the same premise as
-    every other feeder: `logit_in`'s peers are other `logit` processes the operator runs.
+    validates, so its strings stay in the interner, including from a batch the decoder then
+    rejects; not defended, per the threat model in
+    [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md). Nothing budgets dictionary
+    strings across frames. The per-frame bound is the dictionary entry cap and the frame size; the
+    process-lifetime bound is the same premise as every other feeder: `logit_in`'s peers are other
+    `logit` processes the operator runs.
   - **`flatten` adds no new bound, by design** (`crates/logit-transforms/src/flatten.rs`,
     [ADR `flatten-transform`](adr/flatten-transform.md)). Its marginal exposure over
     `json`/`syslog_in`/`otlp_in`: path *combinations* of already-interned keys (a product, bounded by
@@ -322,6 +324,15 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     idle-connection timeout on a TCP listener" under
     [TLS and connection lifecycle](#tls-and-connection-lifecycle)), not by this pre-message bound.
 
+- **A native attribute map with keys in descending dictionary order inserts in quadratic time.**
+  `read_attr_map` inserts each key into `AttrMap`'s sorted storage (`AttrMap::insert_sym`, a
+  binary search and a `Vec::insert`) as it reads it, so a map whose keys arrive in descending order
+  of the receiver's interned symbols shifts every earlier entry on each insert. Measured
+  2026-09-25: 80,000 keys take 3.4 s in descending order against 20 ms ascending. Real maps are far
+  too small for this to show ([`docs/design/data-shapes.md`](design/data-shapes.md)); only a map
+  with tens of thousands of keys in the worst order pays it. A non-goal under
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model: the fix (collect,
+  then sort once) changes the ordinary decode path for a shape only crafted input produces.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
@@ -650,13 +661,15 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   design, not a bug: a total body deadline was declined because a slow link sending a large
   legitimate body looks the same ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
   [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment).
-  **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum transfer
-  rate, or a per-peer connection cap is worth the false positives.
+  **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum
+  transfer rate, or a per-peer connection cap is worth the false positives.
 - **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener
   (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps
-  concurrent connections and, per connection, concurrent streams (32), so its worst case is
-  `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 256 GiB for
-  `otlp_in`. The stream cap bounds one factor of that product, not the product. A budget over the
+  concurrent connections and, per connection, concurrent streams (hyper's default of 200, pinned),
+  so its worst case is
+  `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 1024 × 200 × 2 ×
+  4 MiB = 1.6 TiB for `otlp_in`, which is why this is a follow-up and not a fix.
+  The stream cap bounds one factor of that product, not the product. A budget over the
   bytes held in request bodies across a listener (a semaphore acquired per body chunk) would bound
   the product directly. Recorded as a follow-up, not built: it changes how every HTTP listener
   reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
@@ -1278,8 +1291,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
   node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
   `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the existing 4 GiB figure, but no one
-  has measured the multiplier. **Revisit:** profile it before OTLP/JSON sees production volume.
+  worst case across all connections is a finite multiple of the existing 4 GiB figure. Measured
+  2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
+  98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
+  the 98× shape needs crafted input, a non-goal under
+  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model. **Revisit:**
+  profile it before OTLP/JSON sees production volume.
 - **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
   close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
   about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`

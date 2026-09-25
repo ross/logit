@@ -88,9 +88,9 @@ targets cover:
 
 Every run passes the target's `-max_len` and `-malloc_limit_mb` from `FUZZ_TARGETS`, plus
 `-rss_limit_mb=4096`, `-timeout=10`, and `-max_total_time=${FUZZ_SECONDS:-600}`. Caller arguments
-come last, so they override any default. The per-target malloc limit is how the fuzzer enforces
-[ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s rule that a declared length never
-sizes an allocation: a single allocation past the limit is a crash. The limit is set slightly above
+come last, so they override any default. The per-target malloc limit is how the fuzzer checks
+[ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s per-frame decode budget: a single
+allocation past the limit is a crash. The limit is set slightly above
 the largest allocation a valid input of `max_len` bytes can need. For the native frame that is 65
 MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`.
 
