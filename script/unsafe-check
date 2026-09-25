@@ -9,8 +9,9 @@
 #
 # Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
 # tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-# helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
-# force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
+# helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+# debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+# `all` runs `miri` then `careful`.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
 #   UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose
@@ -25,18 +26,33 @@ source "${SCRIPT_PATH}/common.sh"
 
 IMAGE=logit-unsafe-check:local
 
-# One "<package>|<libtest filter>" per line; `miri` with no arguments runs each in order. Miri
-# can't execute these syscalls, so each entry is a pure helper split out of the code around one
-# (the ADR's "What each tool verifies, and its limits"). Add an entry when a new one lands.
+# One "<package>|<libtest args>|<extra MIRIFLAGS>" per line; `miri` with no arguments runs each
+# in order, with the extra flags appended to MIRIFLAGS. The libtest args are word-split, so an
+# entry can add `--skip`. Miri can't execute the three syscalls, so each of their entries is a
+# pure helper split out of the code around one (the ADR's "What each tool verifies, and its
+# limits"). Add an entry when a new one lands.
 #
 #   parse_events            the `inotify_event` parser in tail/watch.rs
 #   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec` construction and post-call harvest
 #   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
 #                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
+#   hyperloglog, hll_       metric.rs's `HyperLogLog` codec, which keeps `cardinality-estimator`'s
+#                           `Layout` UB unreachable. Upstream's pointer tagging fails Stacked and
+#                           Tree Borrows before any test assertion, so these run with both off and
+#                           permissive provenance, which still reports the `Layout` UB (the ADR's
+#                           "Sketch and HyperLogLog targets" amendment)
+#   sketch::tests           sketch.rs's `DdSketch`; Miri perturbs float results by default, which
+#                           breaks `Mapping` equality, so these run with deterministic floats
+#
+# The proptest `properties` modules are skipped: at proptest's default case count they take
+# minutes each under Miri, and they exercise no unsafe code.
 MIRI_TARGETS=(
-    "logit-inputs|parse_events"
-    "logit-inputs|batch_reader_helpers"
-    "logit-pipeline|sockstat::tests::reply_parsing"
+    "logit-inputs|parse_events|"
+    "logit-inputs|batch_reader_helpers|"
+    "logit-pipeline|sockstat::tests::reply_parsing|"
+    "logit-core|hyperloglog --skip properties|-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance"
+    "logit-core|hll_ --skip properties|-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance"
+    "logit-core|sketch::tests --skip properties|-Zmiri-deterministic-floats"
 )
 
 # Every checkout binds at the same `/work`, so cargo fingerprints match across branches and two
@@ -106,11 +122,15 @@ cmd_miri() {
         run_in_image cargo miri test "$@"
         return
     fi
+    local base_flags="${MIRIFLAGS:--Zmiri-disable-isolation}"
     for target in "${MIRI_TARGETS[@]}"; do
         local package="${target%%|*}"
-        local filter="${target#*|}"
-        echo "## miri: -p ${package} -- ${filter} ################################"
-        run_in_image cargo miri test -p "${package}" --lib -- "${filter}"
+        local rest="${target#*|}"
+        local filter="${rest%%|*}"
+        local flags="${rest#*|}"
+        echo "## miri: -p ${package} -- ${filter} (MIRIFLAGS: ${base_flags} ${flags}) ##########"
+        # shellcheck disable=SC2086 # `filter` is a word-split libtest argument list
+        MIRIFLAGS="${base_flags} ${flags}" run_in_image cargo miri test -p "${package}" --lib -- ${filter}
     done
 }
 
@@ -219,8 +239,9 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
 
 Checks the three raw-`libc` `unsafe` call sites (udp.rs `recvmmsg`, sockstat.rs `getsockopt`,
 tail/watch.rs inotify) with nightly-only tools in a throwaway image. `miri` runs the pure
-helpers, `careful` runs the real tests under a debug-assertion std, and `inject`/`inject-all`
-force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
+helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
+debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+`all` runs `miri` then `careful`.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
   UNSAFE_CHECK_SECCOMP_UNCONFINED  1 adds seccomp=unconfined to `inject`, for a host whose

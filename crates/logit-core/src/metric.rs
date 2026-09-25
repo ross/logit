@@ -1233,7 +1233,10 @@ mod tests {
 
     // -- `HllBytesReader`'s capacity-invariant workaround ------------------------------------
 
-    /// Non-power-of-two array counts and HLL counts round-trip; under Miri this catches the UB.
+    /// Non-power-of-two array counts and HLL counts round-trip. `script/unsafe-check miri` runs it
+    /// under `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`, where it catches the
+    /// `Layout` UB if `HllBytesReader`'s size hint regresses; under Miri's default Stacked Borrows,
+    /// or Tree Borrows, it fails first inside upstream (`docs/adr/out-of-ci-unsafe-verification.md`).
     #[test]
     fn hyperloglog_round_trips_non_power_of_two_member_counts() {
         for n in [3u32, 5, 9, 17, 100, 300] {
