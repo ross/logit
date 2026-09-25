@@ -92,10 +92,13 @@ private) applies to these rules too.
 - **A writer refuses what a reader would reject.** `write_frame` returns an error for a payload
   over `MAX_SANE_UNCOMPRESSED_LEN` instead of truncating its length, so the cap is enforced once.
 - **Out-of-range OTLP timestamps saturate.** An OTLP wire timestamp past `i64::MAX` nanoseconds
-  decodes as `i64::MAX` through one helper, applied at all 17 decode sites: `logs.rs`'s `decode_log_record` (`time_unix_nano`, the `observed_time_unix_nano` fallback, and `observed_timestamp`); `traces.rs`'s `decode_span_event` and `decode_span` (start and end); and `metrics.rs`'s `decode_exemplar` plus `time_unix_nano` and `start_time_unix_nano` for each of `Sum`, `Gauge`, `Histogram`, `Summary`, and `ExponentialHistogram`.
-  This is a permitted normalization under
-  [ADR `lossless-transit`](lossless-transit.md): a saturated timestamp relays as
-  2262-04-11T23:47:16.854775807Z, not the original value.
+  decodes as `i64::MAX` through one helper, applied at all 17 decode sites: `logs.rs`'s
+  `decode_log_record` (`time_unix_nano`, the `observed_time_unix_nano` fallback, and
+  `observed_timestamp`); `traces.rs`'s `decode_span_event` and `decode_span` (start and end); and
+  `metrics.rs`'s `decode_exemplar` plus `time_unix_nano` and `start_time_unix_nano` for each of
+  `Sum`, `Gauge`, `Histogram`, `Summary`, and `ExponentialHistogram`. [ADR
+  `lossless-transit`](lossless-transit.md)'s "Permitted normalizations" list records this as a
+  permitted normalization.
 
 ### `logit_in`
 

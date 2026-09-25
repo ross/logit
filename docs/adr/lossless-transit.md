@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-24
+updated: 2026-09-25
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -72,6 +72,9 @@ round-trip test can assert equality against a concrete expectation rather than "
   the wire carried. A repeated key whose values *differ* (`#team:a,team:b`) is not a duplicate and
   is not folded away; it decodes to a `Value::Array` in wire order instead (`docs/adr/statsd-output.md`'s
   amendment).
+- OTLP timestamp saturation: a wire timestamp past `i64::MAX` nanoseconds decodes as `i64::MAX`
+  and relays as 2262-04-11T23:47:16.854775807Z, not the original value (the 2026-09-25
+  amendment below).
 
 **The internal model is a superset of every supported protocol's data model, not only OTLP's.**
 A field or semantic a protocol can carry that `Event`/`EventBatch` cannot represent at all is a
@@ -214,3 +217,13 @@ their permitted normalizations (a batch boundary per `TracerPayload`; `avg` reco
 Realized as of 2026-09-24: both pairs relay losslessly modulo the normalizations their codec's
 module doc lists; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s closing
 assessment.
+
+## Amendment: OTLP timestamp saturation is a permitted normalization (2026-09-25)
+
+OTLP carries every timestamp as a `fixed64` of nanoseconds, and `Event` holds an `i64`. A wire
+value past `i64::MAX` used to wrap negative on decode. [ADR
+`untrusted-input-bounds`](untrusted-input-bounds.md) makes every OTLP decode site saturate it to
+`i64::MAX` instead, and this amendment adds that to the permitted normalizations above: an
+`otlp_in -> otlp_out` relay of such a timestamp emits 2262-04-11T23:47:16.854775807Z, not the
+original value, and still counts as lossless. No real clock produces a timestamp past 2262, so
+the normalization touches only malformed or hostile input.
