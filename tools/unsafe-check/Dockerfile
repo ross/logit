@@ -10,7 +10,8 @@ ARG USER_GID=1000
 
 # Dockerfile.dev's native build deps, plus `build-essential`, which its `rust:*-bookworm` base
 # already carries: mlua's vendored LuaJIT build runs `make`. `curl`, `ca-certificates`, and
-# `xz-utils` fetch rustup; `strace` serves `inject`.
+# `xz-utils` fetch rustup; `strace` serves `inject`. `llvm` provides the `llvm-symbolizer` ASan
+# needs to name the frames in a fuzz crash's stack trace.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         clang \
@@ -22,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         xz-utils \
         strace \
+        llvm \
     && rm -rf /var/lib/apt/lists/*
 
 # Match the host user, so bind-mounted files come back owned by the host account, not root.

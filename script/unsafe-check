@@ -6,6 +6,7 @@
 #        script/unsafe-check all
 #        script/unsafe-check fuzz <target> [-- <libfuzzer args>]
 #        script/unsafe-check fuzz-all [seconds]
+#        script/unsafe-check fuzz-tmin <target> <crash file>
 #        script/unsafe-check fuzz-seed
 #        script/unsafe-check shell
 #        script/unsafe-check --help
@@ -17,7 +18,8 @@
 #
 # The same image fuzzes the decoders an unauthenticated peer feeds (`fuzz/`, cargo-fuzz under
 # ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all` runs each for
-# `seconds` (default 120) and prints a summary, and `fuzz-seed` rewrites the committed seeds.
+# `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash under the target's
+# limits, and `fuzz-seed` rewrites the committed seeds.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
 #   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -249,34 +251,60 @@ fuzz_target_entry() {
     return 1
 }
 
+# Prints the libFuzzer limits FUZZ_TARGETS gives `target`, or exits with the target list.
+fuzz_limits() {
+    local target="${1}"
+    local usage="${2}"
+    local entry
+    if [ -z "${target}" ] || ! entry="$(fuzz_target_entry "${target}")"; then
+        echo "usage: ${usage}" >&2
+        echo "targets: $(printf '%s ' "${FUZZ_TARGETS[@]%%|*}")" >&2
+        exit 1
+    fi
+    local rest="${entry#*|}"
+    echo "-max_len=${rest%%|*} -malloc_limit_mb=${rest#*|} -rss_limit_mb=4096 -timeout=10"
+}
+
 # libFuzzer writes new inputs only to the first corpus directory, so fuzz/corpus/<target> grows
 # and fuzz/seeds/<target> stays as committed. Caller arguments come last, so they win.
 cmd_fuzz() {
     local target="${1:-}"
-    local entry
-    if [ -z "${target}" ] || ! entry="$(fuzz_target_entry "${target}")"; then
-        echo "usage: script/unsafe-check fuzz <target> [-- <libfuzzer args>]" >&2
-        echo "targets: $(printf '%s ' "${FUZZ_TARGETS[@]%%|*}")" >&2
-        exit 1
-    fi
+    local limits
+    limits="$(fuzz_limits "${target}" "script/unsafe-check fuzz <target> [-- <libfuzzer args>]")"
     shift
     if [ "${1:-}" = "--" ]; then
         shift
     fi
-    local rest="${entry#*|}"
-    local max_len="${rest%%|*}"
-    local malloc_limit_mb="${rest#*|}"
 
     build_image
     mkdir -p "${ROOT}/fuzz/corpus/${target}"
+    # shellcheck disable=SC2086 # `limits` is a word-split argument list
     run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz run "${target}" \
         "fuzz/corpus/${target}" "fuzz/seeds/${target}" -- \
-        -max_len="${max_len}" \
-        -malloc_limit_mb="${malloc_limit_mb}" \
-        -rss_limit_mb=4096 \
-        -timeout=10 \
-        -max_total_time="${FUZZ_SECONDS:-600}" \
-        "$@"
+        ${limits} -max_total_time="${FUZZ_SECONDS:-600}" "$@"
+}
+
+# An `oom-*` file gets the target's limits, since without `-malloc_limit_mb` an allocation-limit
+# crash doesn't reproduce. Any other crash gets none: under the malloc limit, a mutated candidate
+# that trips it counts as the crash and libFuzzer "minimizes" to an empty file that doesn't
+# reproduce. cargo-fuzz writes the result beside the crash file as `minimized-from-<hash>`.
+cmd_fuzz_tmin() {
+    local target="${1:-}"
+    local crash="${2:-}"
+    local limits
+    limits="$(fuzz_limits "${target}" "script/unsafe-check fuzz-tmin <target> <crash file>")"
+    if [ -z "${crash}" ]; then
+        echo "usage: script/unsafe-check fuzz-tmin <target> <crash file>" >&2
+        exit 1
+    fi
+    case "$(basename -- "${crash}")" in
+    oom-*) ;;
+    *) limits="" ;;
+    esac
+    build_image
+    # shellcheck disable=SC2086 # `limits` is a word-split argument list
+    run_in_image "${FUZZ_TARGET_VOLUME}" cargo fuzz tmin "${target}" "${crash}" \
+        ${limits:+-- ${limits}}
 }
 
 # Runs every target past a failure, which `set -e` would otherwise stop at. Each run's output
@@ -304,8 +332,7 @@ cmd_fuzz_all() {
             artifact="$(grep -oE 'fuzz/artifacts/[^ ]+' "${log}" | tail -1 || true)"
             summary+=("FAILED ${target} (exit ${status}): ${stats}")
             if [ -n "${artifact}" ]; then
-                local hint="cargo fuzz tmin ${target} ${artifact}"
-                summary+=("       minimize: script/unsafe-check shell, then ${hint}")
+                summary+=("       minimize: script/unsafe-check fuzz-tmin ${target} ${artifact}")
             fi
         fi
     done
@@ -335,6 +362,7 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
        script/unsafe-check all
        script/unsafe-check fuzz <target> [-- <libfuzzer args>]
        script/unsafe-check fuzz-all [seconds]
+       script/unsafe-check fuzz-tmin <target> <crash file>
        script/unsafe-check fuzz-seed
        script/unsafe-check shell
        script/unsafe-check --help
@@ -346,7 +374,8 @@ force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
 
 The same image fuzzes the decoders an unauthenticated peer feeds (`fuzz/`, cargo-fuzz under
 ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all` runs each for
-`seconds` (default 120) and prints a summary, and `fuzz-seed` rewrites the committed seeds.
+`seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash under the target's
+limits, and `fuzz-seed` rewrites the committed seeds.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -386,6 +415,10 @@ fuzz)
 fuzz-all)
     shift
     cmd_fuzz_all "$@"
+    ;;
+fuzz-tmin)
+    shift
+    cmd_fuzz_tmin "$@"
     ;;
 fuzz-seed)
     cmd_fuzz_seed
