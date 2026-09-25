@@ -942,15 +942,6 @@ fn otlp_resource_attribute_depth(batches: &[EventBatch]) -> usize {
     value_depth(batches[0].resource.attributes.get("k").expect("resource attribute k"))
 }
 
-fn assert_malformed_with(result: Result<Vec<EventBatch>, CodecError>, needle: &str) {
-    match result {
-        Err(CodecError::Malformed(msg)) => {
-            assert!(msg.contains(needle), "expected {needle:?} in the error, got {msg:?}")
-        }
-        other => panic!("expected CodecError::Malformed containing {needle:?}, got {other:?}"),
-    }
-}
-
 /// serde_json stops at 128 JSON levels. An `arrayValue` costs three of them per `AnyValue` and a
 /// `kvlistValue` four, so a resource attribute, three levels below the root, holds 41 and 31
 /// `AnyValue`s. A log body, span attribute, or data-point attribute sits deeper and holds fewer.
@@ -965,9 +956,10 @@ fn assert_json_nesting_limit(levels: usize, nest: fn(usize) -> String) {
     let decode = |body: Bytes| OtlpDecoder::new().decode_signal_json(Signal::Logs, body);
     let at_limit = decode(otlp_json_logs_with_resource_attribute(&nest(levels))).unwrap();
     assert_eq!(otlp_resource_attribute_depth(&at_limit), levels);
-    assert_malformed_with(
+    assert_malformed(
         decode(otlp_json_logs_with_resource_attribute(&nest(levels + 1))),
         "recursion limit exceeded",
+        &format!("OTLP/JSON, {} levels", levels + 1),
     );
 }
 
@@ -985,9 +977,10 @@ fn assert_proto_nesting_limit(levels: usize, nest: fn(usize) -> otlp_common::Any
     let decode = |body: Bytes| OtlpDecoder::new().decode_signal(Signal::Logs, body);
     let at_limit = decode(otlp_pb_logs_with_resource_attribute(nest(levels))).unwrap();
     assert_eq!(otlp_resource_attribute_depth(&at_limit), levels);
-    assert_malformed_with(
+    assert_malformed(
         decode(otlp_pb_logs_with_resource_attribute(nest(levels + 1))),
         "recursion limit reached",
+        &format!("OTLP protobuf, {} levels", levels + 1),
     );
 }
 
