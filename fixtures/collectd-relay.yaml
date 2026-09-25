@@ -9,7 +9,7 @@
 # parts, budget about a third more egress bytes and packets than the fleet sends
 # (docs/deploying.md).
 #
-# No `aggregate`, unlike examples/statsd-relay.yaml: every collectd value list is already one
+# No `aggregate`, unlike fixtures/statsd-relay.yaml: every collectd value list is already one
 # reading per `Interval` with its own timestamp, and a window would re-stamp a GAUGE or ABSOLUTE
 # with the flush time, so the relay stops being byte-for-byte. Add one only when you want to
 # re-window, and then point the sink's `sources` at it.

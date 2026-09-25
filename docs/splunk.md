@@ -31,20 +31,20 @@ store. Splunk Observability Cloud keeps traces and metrics, and no logs. Four to
 ways `logit` sits next to them:
 
 - **Direct to the Platform over HEC.** `logit` is the host collector and posts to Splunk's HEC
-  with `splunk_hec_out`: [`examples/splunk-hec-send.yaml`](../examples/splunk-hec-send.yaml)
+  with `splunk_hec_out`: [`fixtures/splunk-hec-send.yaml`](../fixtures/splunk-hec-send.yaml)
   tails a log file, stamps the index, source, sourcetype, and host, and sends it.
 - **Through SC4S or the Splunk OTel Collector.** `logit` hands data to Splunk's own collectors,
   which send HEC on: `syslog_out` to Splunk Connect for Syslog (SC4S), or `otlp_out` to the Splunk
   OTel Collector's OTLP receiver. No Splunk-specific component is involved.
 - **Standing in for HEC.** HEC clients point at `splunk_hec_in` instead of Splunk:
-  [`examples/splunk-hec-receive.yaml`](../examples/splunk-hec-receive.yaml) has the listener and
+  [`fixtures/splunk-hec-receive.yaml`](../fixtures/splunk-hec-receive.yaml) has the listener and
   the client-side settings for Docker's driver, the OTel exporter, and Splunk's Java appender.
-  [`examples/splunk-hec-relay.yaml`](../examples/splunk-hec-relay.yaml) relays what arrives on to
+  [`fixtures/splunk-hec-relay.yaml`](../fixtures/splunk-hec-relay.yaml) relays what arrives on to
   Splunk, the tee a migration runs through
   ([From Splunk](#from-splunk-tee-compare-then-cut-over)).
 - **Observability Cloud over OTLP.** `otlp_out` posts traces and metrics to Observability Cloud's
   OTLP ingest with an `X-SF-Token` header:
-  [`examples/splunk-observability.yaml`](../examples/splunk-observability.yaml). This leg is
+  [`fixtures/splunk-observability.yaml`](../fixtures/splunk-observability.yaml). This leg is
   unverified ([What's verified](#whats-verified)).
 
 Which component carries each signal in each topology:
@@ -234,7 +234,7 @@ decodes and gets a `2xx` from `splunk_hec_in`, including the Docker driver's `OP
 - probes settled what Splunk does with gzip and per-object-invalid bodies, read its
   `max_content_length` from `limits.conf` over REST, and settled `metric_type`, 1,000 dimensions, `OPTIONS`, and acknowledgment.
 
-Not verified: the Observability Cloud leg (`examples/splunk-observability.yaml`), since no trial
+Not verified: the Observability Cloud leg (`fixtures/splunk-observability.yaml`), since no trial
 org was run; Splunk Cloud; Vector's HEC sinks and an Edge Processor as clients; and any Splunk
 release other than 10.4.3. `docs/known-gaps.md`'s "Splunk" section lists everything else that
 isn't built or isn't verified.

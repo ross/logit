@@ -2,7 +2,7 @@
 # stage parses their bodies, and `null_out` drops the result. Every perf scenario takes this shape
 # (docs/plans/load-test-harness.md). Run it directly to see the generator's completion line:
 #
-#   logit --log-format json run examples/generate-to-null.yaml
+#   logit --log-format json run fixtures/generate-to-null.yaml
 #
 # It ends with `{"message":"generation complete","events":1000,...}` on stderr and exits 0 on its
 # own once `count` is reached; nothing here needs a signal or a timeout.

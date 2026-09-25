@@ -5,6 +5,8 @@ validating a config, probing readiness, and what `logit` does when a sink, a sen
 orchestrator's signal doesn't cooperate. To point a real nginx at a running `logit`, see
 [the nginx-side recipe](#the-nginx-side-recipe). To see `logit` running without deploying it, use
 [`demo/`](../demo/README.md), a self-contained `docker compose up` with no image-building steps.
+For a complete config to adapt, start from
+[`examples/canonical/logit.yaml`](../examples/canonical/logit.yaml).
 
 ## Getting the image
 
@@ -206,7 +208,7 @@ in memory by default, that decouples receiving events from delivering them
 slow or temporarily down destination instead of stalling or killing the whole pipeline.
 
 To tune it, add a `buffer:` block to the sink; see the commented example in
-[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Validation rejects
+[`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml). Validation rejects
 `buffer:` on anything but a sink. Every field has a default, so omitting `buffer:` gives the values
 in this section. To make the queue survive a restart, see [Durable buffering](#durable-buffering).
 
@@ -355,7 +357,7 @@ socket from decoding and batching what it read
 or backed-up destination downstream is ridden out.
 
 To tune it, add a `receive:` block to the listener; see the commented example in
-[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field has a
+[`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml). Every field has a
 default, so omitting `receive:` gives the values below. Validation rejects `receive:` on any kind
 except a datagram listener, a TCP listener, or a tail listener (`tail_in`/`docker_in`). A TCP or
 tail listener has no receive *queue*, so only the four batch-assembly fields apply to it; see
@@ -698,10 +700,10 @@ deployment conventions:
   series: `collectd_out` re-encodes from the `collectd.*` attributes, so a
   `collectd_in -> collectd_out` relay puts the same bytes on the wire either way.
 
-[`examples/collectd-to-influxdb.yaml`](../examples/collectd-to-influxdb.yaml) is a complete,
+[`fixtures/collectd-to-influxdb.yaml`](../fixtures/collectd-to-influxdb.yaml) is a complete,
 runnable topology: `collectd_in` on `0.0.0.0:25826` straight into `influxdb_out`, with both settings
 above as commented alternatives. **Don't put an `aggregate` between them.** Unlike
-[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml), it has none, because a
+[`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml), it has none, because a
 collectd value list is already one pre-aggregated reading per `Interval` with its own timestamp;
 re-windowing it would average averages and re-stamp them with the flush time. The file's header
 comment lists what the cross-protocol hop costs: the `collectd.*` attributes become ordinary
@@ -713,9 +715,9 @@ InfluxDB tags instead of wire identity, and one N-data-source list becomes N mea
 `graphite_in` ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)) is a carbon receiver:
 point a `write_graphite` plugin, a StatsD backend, a `carbon-relay`, or anything else that speaks
 carbon at it. Two settings, `transport:` and `protocol:`, change a lot about how it behaves.
-[`examples/graphite-relay.yaml`](../examples/graphite-relay.yaml) is the like-for-like runnable
+[`fixtures/graphite-relay.yaml`](../fixtures/graphite-relay.yaml) is the like-for-like runnable
 topology (`graphite_in` straight into `graphite_out`, every default present as a commented
-reference); [`examples/statsd-to-graphite.yaml`](../examples/statsd-to-graphite.yaml) is the
+reference); [`fixtures/statsd-to-graphite.yaml`](../fixtures/statsd-to-graphite.yaml) is the
 cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out`.
 
 - **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
@@ -781,8 +783,8 @@ Two smaller behaviors to know before deploying one:
 ### `statsd_in`: `transport: tcp` and TLS
 
 `statsd_in` defaults to UDP, which classic statsd and every DogStatsD client speak, and which
-[`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml) and
-[`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml) use. `transport: tcp` runs the same
+[`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml) and
+[`fixtures/statsd-relay.yaml`](../fixtures/statsd-relay.yaml) use. `transport: tcp` runs the same
 shared stream driver as a TCP `syslog_in`/`graphite_in`, so what the `graphite_in` section says
 about connections, `handshake_timeout:`, `idle_timeout:`, and `receive:` applies unchanged:
 
@@ -853,7 +855,7 @@ components:
 
 - **One `statsd_in` per transport.** A component listens on one socket, so to accept UDP and the
   Unix socket at once, configure two components, as above, and list both as sources downstream.
-  [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml) carries the
+  [`fixtures/datadog-agent-standin.yaml`](../fixtures/datadog-agent-standin.yaml) carries the
   socket component, commented out.
 - **Create the directory first.** `logit` never creates the socket's directory, because its owner
   and mode are the access control. At startup a stale socket file from an earlier run is replaced;
@@ -886,12 +888,12 @@ Use `collectd_out` when the destination is another collectd (or anything else sp
 modulo the named normalization list in
 [ADR `collectd-binary-relay`](adr/collectd-binary-relay.md), which
 `crates/logit-cli/tests/collectd_round_trip.rs` pins fixture by fixture over real sockets.
-[`examples/collectd-relay.yaml`](../examples/collectd-relay.yaml) is the runnable topology:
+[`fixtures/collectd-relay.yaml`](../fixtures/collectd-relay.yaml) is the runnable topology:
 `collectd_in` on `0.0.0.0:25826` straight into `collectd_out`, every default present as a commented
 reference. Before deploying one:
 
 - **It is UDP only; don't put an `aggregate` in the middle.** collectd's `network` plugin has no
-  TCP mode to relay onto. Unlike [`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml), the
+  TCP mode to relay onto. Unlike [`fixtures/statsd-relay.yaml`](../fixtures/statsd-relay.yaml), the
   collectd relay has no `aggregate`, because collectd data is already one pre-aggregated reading
   per `Interval`. A window would re-window it and break byte-for-byte relay for the kinds
   `aggregate` absorbs: a GAUGE and an ABSOLUTE come back stamped with the flush time, while a
@@ -969,7 +971,7 @@ one:
 ### `statsd_out`: `transport: tcp` and TLS
 
 `statsd_out` defaults to UDP, like every statsd client;
-[`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml) is the runnable topology with every
+[`fixtures/statsd-relay.yaml`](../fixtures/statsd-relay.yaml) is the runnable topology with every
 default present as a commented reference. `transport: tcp` replaces the packed datagram with one
 LF-terminated line per metric on a lazily opened connection, and a `tls:` block requires it:
 
@@ -1291,7 +1293,7 @@ how many distinct key-sets a source produces, and how many events arrive per bat
 
 **Put `shape` on its own branch of a fan-out, never in the flow you care about.** It is a
 transform that rewrites each event into a measurement of that event and drops the original payload.
-[`examples/shape-tap.yaml`](../examples/shape-tap.yaml) is the runnable shape:
+[`fixtures/shape-tap.yaml`](../fixtures/shape-tap.yaml) is the runnable shape:
 
 ```
 statsd ─┬─> rollup ─> metrics          (the real pipeline, unchanged)
@@ -1364,7 +1366,7 @@ for the life of the process, and nothing else stops it.
 
 A `keep` turns the unbounded, peer-controlled key set into a fixed, `logit`-controlled one like
 every other listener's, the same reasoning
-[`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) applies ahead of `aggregate`,
+[`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) applies ahead of `aggregate`,
 extended to cover interning as well as series cardinality. It matters most where `otlp_in` faces
 something other than `logit`'s own trusted fleet (a third-party exporter, a multi-tenant ingest
 path); see `docs/known-gaps.md`'s interner entry for when the underlying "listeners are private by
@@ -1396,7 +1398,7 @@ sketches, service checks, events, logs, APM traces, and APM stats with nothing c
 Point the Agent's `dd_url`, `logs_config.logs_dd_url`, and `apm_config.apm_dd_url` at it to replace
 Datadog, or add it under `additional_endpoints` (and the `logs_config`/`apm_config` equivalents) to
 receive a copy while Datadog keeps receiving everything.
-[`examples/datadog-intake-standin.yaml`](../examples/datadog-intake-standin.yaml) has a runnable
+[`fixtures/datadog-intake-standin.yaml`](../fixtures/datadog-intake-standin.yaml) has a runnable
 config and the Agent-side settings for both. See
 [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md) for the design.
 
@@ -1492,7 +1494,7 @@ next.
 `datadog_trace_in` answers a dd-trace tracer the way a local Datadog Agent's APM receiver does, so
 an application sends it traces and client-computed stats with nothing changed but where it points:
 `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or `DD_TRACE_AGENT_URL` (`http://HOST:8126` or
-`unix:///PATH`). [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml)
+`unix:///PATH`). [`fixtures/datadog-agent-standin.yaml`](../fixtures/datadog-agent-standin.yaml)
 pairs it with a DogStatsD `statsd_in` on `:8125`, the Agent's other application-side listener.
 
 ```yaml
@@ -1565,7 +1567,7 @@ doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section 
 
 `datadog_out` posts each batch to Datadog's intake API with no Datadog Agent in the path: series
 and sketches, raw distribution values, service checks, events, logs, and Agent-processed APM traces
-and stats, each to its own route. [`examples/datadog-direct.yaml`](../examples/datadog-direct.yaml)
+and stats, each to its own route. [`fixtures/datadog-direct.yaml`](../fixtures/datadog-direct.yaml)
 runs DogStatsD through `aggregate` into it.
 
 ```yaml
@@ -1690,7 +1692,7 @@ so those lines pass through uncorrelated. `format: datadog` reads them:
 - **Some libraries nest the ids** under a `dd` object (`"dd":{"trace_id":"..."}`); a `flatten`
   with `attributes: [dd]` ahead of `trace_context` turns that into the dotted names.
 
-[`examples/datadog-logs-correlation.yaml`](../examples/datadog-logs-correlation.yaml) runs
+[`fixtures/datadog-logs-correlation.yaml`](../fixtures/datadog-logs-correlation.yaml) runs
 `tail_in` → `json` → `flatten` → `trace_context` into both `datadog_out` and `otlp_out`.
 
 ## `datadog_trace_out`: sending to an Agent's APM API
@@ -1700,7 +1702,7 @@ so those lines pass through uncorrelated. `format: datadog` reads them:
 `datadog_trace_out` sends APM traces and tracer-computed stats to a real Datadog Agent's trace API,
 as a dd-trace tracer does. It's the sending half of `datadog_trace_in`: a tracer's spans pass
 through `logit` on their way to the Agent, which still does all the trace processing Datadog
-expects. [`examples/datadog-agent-relay.yaml`](../examples/datadog-agent-relay.yaml) relays a
+expects. [`fixtures/datadog-agent-relay.yaml`](../fixtures/datadog-agent-relay.yaml) relays a
 tracer's traces and its DogStatsD to an Agent this way.
 
 ```yaml
@@ -1758,8 +1760,8 @@ missed, see [`docs/splunk.md`](splunk.md). This section and the next are the ref
 `splunk_hec_in` answers a HEC client the way Splunk's HTTP Event Collector does, so Docker's
 `splunk` log driver, Splunk's logging libraries, the OpenTelemetry Collector's `splunk_hec`
 exporter, SC4S, and other HEC clients send it what they'd send Splunk with nothing changed but
-their URL. [`examples/splunk-hec-receive.yaml`](../examples/splunk-hec-receive.yaml) has a runnable
-config and the client-side settings; [`examples/splunk-hec-relay.yaml`](../examples/splunk-hec-relay.yaml)
+their URL. [`fixtures/splunk-hec-receive.yaml`](../fixtures/splunk-hec-receive.yaml) has a runnable
+config and the client-side settings; [`fixtures/splunk-hec-relay.yaml`](../fixtures/splunk-hec-relay.yaml)
 relays what arrives on to Splunk. See [ADR `splunk-hec-relay`](adr/splunk-hec-relay.md) for the
 design.
 
@@ -1827,7 +1829,7 @@ OTel Collector.
 
 `splunk_hec_out` posts logs, metrics, and spans to Splunk's HTTP Event Collector as
 `/services/collector/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter
-writes. [`examples/splunk-hec-send.yaml`](../examples/splunk-hec-send.yaml) tails a log file into
+writes. [`fixtures/splunk-hec-send.yaml`](../fixtures/splunk-hec-send.yaml) tails a log file into
 it.
 
 ```yaml
@@ -1896,8 +1898,8 @@ Splunk Cloud offers none. Against a token without it, each request counts as del
 Setting a field that belongs to the *other* mode is a config error (graph rules 55 and 56), not a
 silently ignored setting. See [ADR `prometheus-remote-write`](adr/prometheus-remote-write.md) for
 the design and
-[`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml)/
-[`examples/prometheus-remote-write-send.yaml`](../examples/prometheus-remote-write-send.yaml) for
+[`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml)/
+[`fixtures/prometheus-remote-write-send.yaml`](../fixtures/prometheus-remote-write-send.yaml) for
 runnable configs.
 
 **Bind the receiver to loopback or pod-local, and front it with something that authenticates.**
@@ -1905,7 +1907,7 @@ runnable configs.
 no basic auth, and no mutual-TLS identity check beyond `rustls` accepting whatever chain a client
 presents when `client_ca_file` is set. Anything that can reach the socket can write series into the
 pipeline. So bind `127.0.0.1:9201`, as
-[`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml)
+[`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml)
 does, and put an ingress, a service mesh, or an authenticating reverse proxy in front, the same
 posture as `admin:` and `prometheus_out`'s exposition `bind:`. Making it reachable from off-host is
 a deliberate choice, not one to inherit from an example. Tracked in `docs/known-gaps.md`.
@@ -2045,9 +2047,9 @@ and VictoriaTraces `:10428`.
 | vmagent `-remoteWrite.url` | `prometheus_in` | `bind:` | No configuration on either side; see below |
 
 Runnable configs:
-[`examples/victoriametrics-remote-write.yaml`](../examples/victoriametrics-remote-write.yaml),
-[`examples/victoriametrics-otlp.yaml`](../examples/victoriametrics-otlp.yaml), and
-[`examples/victoriametrics-vmagent-receive.yaml`](../examples/victoriametrics-vmagent-receive.yaml).
+[`fixtures/victoriametrics-remote-write.yaml`](../fixtures/victoriametrics-remote-write.yaml),
+[`fixtures/victoriametrics-otlp.yaml`](../fixtures/victoriametrics-otlp.yaml), and
+[`fixtures/victoriametrics-vmagent-receive.yaml`](../fixtures/victoriametrics-vmagent-receive.yaml).
 
 **Run one `otlp_out` per product, each behind a `keep_signals`.** One `otlp_out` posts every signal
 it carries to one host, and a product answers a signal it doesn't ingest with a `404`, which is a
@@ -2301,8 +2303,8 @@ plugin is UDP-only, and carbon's own senders speak no TLS.
 split collection from processing across nodes, the shape [`docs/OVERVIEW.md`](OVERVIEW.md) names as
 the reason the native wire format exists: an edge or sidecar process collects and forwards
 unaggregated, and a central process receives, aggregates, and delivers.
-[`examples/forwarder-edge.yaml`](../examples/forwarder-edge.yaml)/
-[`examples/forwarder-central.yaml`](../examples/forwarder-central.yaml) are a complete, runnable
+[`fixtures/forwarder-edge.yaml`](../fixtures/forwarder-edge.yaml)/
+[`fixtures/forwarder-central.yaml`](../fixtures/forwarder-central.yaml) are a complete, runnable
 pair.
 
 ```yaml
@@ -2398,8 +2400,8 @@ This section covers the operational side of running `logit` against a real nginx
 (which attribute name each nginx variable is logged under, the quoting rules, what `http_access`
 does to each field, and the equivalent snippet for Apache, HAProxy, Varnish, Squid, Envoy, Caddy,
 and Traefik) lives in [`docs/http-access-logs.md`](http-access-logs.md). The working reference
-config is [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf) (its `access_semconv`
-`log_format`) with [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+config is [`fixtures/nginx/nginx.conf`](../fixtures/nginx/nginx.conf) (its `access_semconv`
+`log_format`) with [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml)
 (`syslog_in` → `json` → `http_access` → `trace_context` → `kv_metrics` → `keep` → `keep_values` →
 `aggregate` → `influxdb_out`, plus `stdio_out` for visibility).
 

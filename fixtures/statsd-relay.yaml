@@ -33,4 +33,4 @@ components:
     #   cert_file: client.pem    # cert_file/key_file together, for mutual TLS
     #   key_file: client.key
     #   insecure_skip_verify: false
-    # buffer: (all defaults; examples/statsd-to-influxdb.yaml has the full block)
+    # buffer: (all defaults; fixtures/statsd-to-influxdb.yaml has the full block)

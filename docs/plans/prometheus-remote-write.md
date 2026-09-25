@@ -354,8 +354,8 @@ untyped again; cap eviction.
   `docker run prom/prometheus --web.enable-remote-write-receiver` as a target for
   `prometheus_out(endpoint)` in both versions, and a Prometheus `remote_write`-ing into
   `prometheus_in(bind)`. Commands and outcome go in the PR body.
-- Examples: `examples/prometheus-remote-write-receive.yaml`,
-  `examples/prometheus-remote-write-send.yaml`.
+- Examples: `fixtures/prometheus-remote-write-receive.yaml`,
+  `fixtures/prometheus-remote-write-send.yaml`.
 - Docs: [`docs/known-gaps.md`](../known-gaps.md) — delete the "Prometheus remote-write is not built"
   row; reword the `ExponentialHistogram` row to point at the native-histogram follow-up; add rows for
   the receiver having no auth, 1.0 typing depending on the cache, stale markers for
@@ -396,7 +396,7 @@ stack.
 - Per PR: `script/cibuild` green in the dev container — fmt, clippy with warnings denied, the
   workspace test suite, `cargo deny`, and schema freshness. `script/schema` regenerated and
   `schema/logit.schema.json` committed by any workstream that changes a config type;
-  `script/validate` over `demo/` and `examples/` for any workstream that adds one.
+  `script/validate` over `demo/` and `fixtures/` for any workstream that adds one.
 - W2: both fixed-point suites green, and `prometheus_fixed_point.rs` plus `text.rs`'s own tests pass
   with **no expectation changes** after the assembler hoist — that is the whole point of doing the
   hoist as a pure refactor in its own commit.
