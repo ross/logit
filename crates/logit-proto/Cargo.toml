@@ -42,10 +42,11 @@ base64.workspace = true
 # prometheus/compression.rs, which the remote-write sink and receiver share.
 snap.workspace = true
 ruzstd.workspace = true
+# OTLP/gRPC and OTLP/HTTP gzip bodies, through otlp/grpc.rs's `inflate_bounded`.
+flate2.workspace = true
 
 [dev-dependencies]
 # Generated corpora for the property tests (most of tests/*_fixed_point.rs, src/otlp/metrics.rs).
 proptest.workspace = true
 # tests/datadog_interop.rs undoes a recorded request's Content-Encoding as datadog_in does.
 ruzstd.workspace = true
-flate2.workspace = true

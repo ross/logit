@@ -23,8 +23,8 @@ use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Se
 use logit_proto::frame::{self, Compression};
 use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
-use logit_proto::native::varint::write_uvarint;
-use logit_proto::native::{self, NativeDecoder};
+use logit_proto::native::varint::{read_uvarint, write_uvarint};
+use logit_proto::native::{self, DecodeBudget, NativeDecoder};
 use logit_proto::otlp::generated::opentelemetry::proto::common::v1 as otlp_common;
 use logit_proto::otlp::generated::opentelemetry::proto::logs::v1 as otlp_logs;
 use logit_proto::otlp::generated::opentelemetry::proto::metrics::v1 as otlp_metrics;
@@ -356,13 +356,17 @@ fn read_frame_never_allocates_proportionally_to_a_hostile_uncompressed_len() {
 #[test]
 fn decode_batch_survives_every_single_byte_truncation() {
     let payload = native::encode_batch(&sample_batch());
-    assert_every_truncation_fails_cleanly(&payload, |bytes| native::decode_batch(bytes).is_err());
+    assert_every_truncation_fails_cleanly(&payload, |bytes| {
+        native::decode_batch(bytes, &DecodeBudget::default()).is_err()
+    });
 }
 
 #[test]
 fn decode_batch_survives_seeded_bit_flips() {
     let payload = native::encode_batch(&sample_batch());
-    assert_bit_flips_never_panic(&payload, 5000, |bytes| native::decode_batch(bytes).is_ok());
+    assert_bit_flips_never_panic(&payload, 5000, |bytes| {
+        native::decode_batch(bytes, &DecodeBudget::default()).is_ok()
+    });
 }
 
 #[test]
@@ -371,7 +375,7 @@ fn decode_batch_rejects_a_dictionary_count_inflated_far_past_the_sanity_cap() {
     let mut out = BytesMut::new();
     write_uvarint(&mut out, u32::MAX as u64);
     let mut bytes = out.freeze();
-    assert!(native::decode_batch(&mut bytes).is_err());
+    assert!(native::decode_batch(&mut bytes, &DecodeBudget::default()).is_err());
 }
 
 #[test]
@@ -380,7 +384,7 @@ fn decode_batch_never_allocates_proportionally_to_a_hostile_dictionary_count() {
     write_uvarint(&mut out, u32::MAX as u64);
     let mut bytes = out.freeze();
     let peak = peak_live_bytes(|| {
-        let _ = native::decode_batch(&mut bytes);
+        let _ = native::decode_batch(&mut bytes, &DecodeBudget::default());
     });
     assert!(peak < 1024 * 1024, "peak live bytes {peak} suggests the dict count was trusted");
 }
@@ -390,14 +394,14 @@ fn decode_batch_rejects_value_nesting_past_the_depth_cap() {
     // One past `native::value`'s `MAX_VALUE_DEPTH` (128), through the real encoder.
     let batch = deeply_nested_batch(129);
     let mut payload = native::encode_batch(&batch);
-    assert!(native::decode_batch(&mut payload).is_err());
+    assert!(native::decode_batch(&mut payload, &DecodeBudget::default()).is_err());
 }
 
 #[test]
 fn decode_batch_at_exactly_the_depth_cap_still_decodes() {
     let batch = deeply_nested_batch(127);
     let mut payload = native::encode_batch(&batch);
-    assert!(native::decode_batch(&mut payload).is_ok());
+    assert!(native::decode_batch(&mut payload, &DecodeBudget::default()).is_ok());
 }
 
 // -- native::decode_batch_v2 ----------------------------------------------------------------
@@ -413,21 +417,23 @@ fn sample_provenance() -> Provenance {
 fn decode_batch_v2_survives_every_single_byte_truncation() {
     let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
     assert_every_truncation_fails_cleanly(&payload, |bytes| {
-        native::decode_batch_v2(bytes).is_err()
+        native::decode_batch_v2(bytes, &DecodeBudget::default()).is_err()
     });
 }
 
 #[test]
 fn decode_batch_v2_survives_seeded_bit_flips() {
     let payload = native::encode_batch_v2(&sample_batch(), sample_provenance());
-    assert_bit_flips_never_panic(&payload, 5000, |bytes| native::decode_batch_v2(bytes).is_ok());
+    assert_bit_flips_never_panic(&payload, 5000, |bytes| {
+        native::decode_batch_v2(bytes, &DecodeBudget::default()).is_ok()
+    });
 }
 
 /// `decode_batch_v2` rejects a plain v1 payload rather than decoding it as "no provenance".
 #[test]
 fn decode_batch_v2_rejects_a_plain_v1_payload() {
     let mut payload = native::encode_batch(&sample_batch());
-    assert!(native::decode_batch_v2(&mut payload).is_err());
+    assert!(native::decode_batch_v2(&mut payload, &DecodeBudget::default()).is_err());
 }
 
 #[test]
@@ -1001,7 +1007,7 @@ fn otlp_nesting_stays_under_the_native_depth_cap() {
     for batches in [from_proto, from_json] {
         let batch = &batches[0];
         let mut payload = native::encode_batch(batch);
-        let decoded = native::decode_batch(&mut payload).unwrap();
+        let decoded = native::decode_batch(&mut payload, &DecodeBudget::default()).unwrap();
         assert_eq!(&decoded, batch);
     }
 }
@@ -1287,3 +1293,517 @@ fn otlp_json_peak_memory_per_input_byte_is_documented() {
         );
     }
 }
+
+// -- native decode: canonical varints, trailing bytes, the decode budget -----------------------
+//
+// Hand-built payloads, so a test can place bytes the encoder never writes. The builders mirror
+// `docs/design/wire-protocol.md`'s "Batch grammar" and "Record layout"; the tag numbers are the
+// `record.rs`/`value.rs` constants.
+
+/// Appends `v` as an unsigned LEB128 varint.
+fn uv(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            out.push(byte | 0x80);
+        } else {
+            out.push(byte);
+            break;
+        }
+    }
+}
+
+/// One `tag + uvarint(len) + body` TLV field (or `Value`).
+fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    uv(&mut out, body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+/// A counted list of length-prefixed entries.
+fn counted_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    uv(&mut out, items.len() as u64);
+    for item in items {
+        uv(&mut out, item.len() as u64);
+        out.extend_from_slice(item);
+    }
+    out
+}
+
+/// A v1 payload: `dict`, an empty resource, no scope, then `events` as a counted list.
+fn wire_batch(dict: &[&str], events: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    uv(&mut out, dict.len() as u64);
+    for s in dict {
+        uv(&mut out, s.len() as u64);
+        out.extend_from_slice(s.as_bytes());
+    }
+    uv(&mut out, 0); // resource section length
+    out.push(0); // scope absent
+    out.extend_from_slice(&counted_list(events));
+    out
+}
+
+/// A metric record named `dict[0]`, with `extra` fields ahead of its `MR_KIND` field (6).
+fn wire_metric_record(kind: &[u8], extra: &[u8]) -> Vec<u8> {
+    let mut out = tlv(1, &0u32.to_le_bytes()); // MR_NAME: dictionary index 0
+    out.extend_from_slice(extra);
+    out.extend_from_slice(&tlv(6, kind));
+    out
+}
+
+/// An event whose `FIELD_METRICS` (4) list holds one record.
+fn wire_metric_event(record: Vec<u8>) -> Vec<u8> {
+    tlv(4, &counted_list(&[record]))
+}
+
+/// A one-event, one-metric batch whose metric kind is `kind_tag` with `body`.
+fn wire_kind_batch(kind_tag: u8, body: &[u8]) -> Vec<u8> {
+    wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(kind_tag, body), &[]))])
+}
+
+/// An event whose span (`FIELD_SPAN`, 5) has the required trace id, span id, and a `Null` name,
+/// plus `extra` fields.
+fn wire_span_event_field(extra: &[u8]) -> Vec<u8> {
+    let mut span = tlv(1, &[0u8; 16]); // SR_TRACE_ID
+    span.extend_from_slice(&tlv(2, &[0u8; 8])); // SR_SPAN_ID
+    span.extend_from_slice(&tlv(4, &tlv(0, &[]))); // SR_NAME: Value::Null
+    span.extend_from_slice(extra);
+    tlv(5, &span)
+}
+
+/// An event whose log (`FIELD_LOG`, 3) has a `Null` message plus `extra` fields.
+fn wire_log_event_field(extra: &[u8]) -> Vec<u8> {
+    let mut log = tlv(1, &tlv(0, &[])); // LR_MESSAGE: Value::Null
+    log.extend_from_slice(extra);
+    tlv(3, &log)
+}
+
+/// An event whose `FIELD_ATTRIBUTES` (2) map holds one entry: key `dict[0]`, then `value`.
+fn wire_attr_event(value: Vec<u8>) -> Vec<u8> {
+    let mut map = vec![1u8, 0]; // count 1, key index 0
+    map.extend_from_slice(&value);
+    tlv(2, &map)
+}
+
+fn decode_v1(payload: &[u8]) -> Result<EventBatch, CodecError> {
+    native::decode_batch(&mut Bytes::copy_from_slice(payload), &DecodeBudget::default())
+}
+
+/// Asserts `result` is a [`CodecError::BudgetExceeded`] for `limit`.
+fn assert_over_budget<T>(result: Result<T, CodecError>, limit: u64, case: &str) {
+    match result {
+        Err(CodecError::BudgetExceeded { limit: got }) => assert_eq!(got, limit, "{case}"),
+        Err(other) => panic!("{case}: expected BudgetExceeded {{ limit: {limit} }}, got {other:?}"),
+        Ok(_) => panic!("{case}: decoded, expected BudgetExceeded {{ limit: {limit} }}"),
+    }
+}
+
+fn assert_malformed<T>(result: Result<T, CodecError>, needle: &str, case: &str) {
+    match result {
+        Err(CodecError::Malformed(msg)) => {
+            assert!(msg.contains(needle), "{case}: Malformed({msg:?}) does not name {needle:?}")
+        }
+        Err(other) => panic!("{case}: expected Malformed naming {needle:?}, got {other:?}"),
+        Ok(_) => panic!("{case}: decoded, expected Malformed naming {needle:?}"),
+    }
+}
+
+/// A 10th varint byte carries bit 63 alone, so any bit above its lowest overflows a `u64`. The
+/// over-long encoding of a small value (`80 00` for 0) is still accepted: rejecting it costs a
+/// compare per byte, and no writer emits one.
+#[test]
+fn a_ten_byte_varint_with_bits_above_the_low_bit_is_malformed() {
+    let overflowing: [&[u8]; 3] = [
+        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        &[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x03],
+    ];
+    for bytes in overflowing {
+        let result = read_uvarint(&mut Bytes::copy_from_slice(bytes));
+        assert_malformed(result, "overflows", &format!("{bytes:02x?}"));
+    }
+    let mut max = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+    assert_eq!(read_uvarint(&mut max).unwrap(), u64::MAX);
+    let mut over_long = Bytes::from_static(&[0x80, 0x00]);
+    assert_eq!(read_uvarint(&mut over_long).unwrap(), 0);
+    assert!(over_long.is_empty());
+}
+
+/// Every sequential kind body is parsed field by field, so junk after its last field is
+/// `Malformed`. `Distribution`'s blob goes whole to `DdSketch::from_bytes`, which checks its own
+/// end. `Set`'s goes whole to `HyperLogLog::from_bytes`, whose end check belongs to
+/// `logit-core`'s `HllBytesReader`, so it isn't asserted here.
+#[test]
+fn every_metric_kind_rejects_trailing_bytes_in_its_body() {
+    let f64_bytes = 1.5f64.to_le_bytes();
+    let mut sum = f64_bytes.to_vec();
+    sum.extend_from_slice(&[0, 1]); // temporality Delta, monotonic
+    let mut samples = vec![1u8]; // one sample
+    samples.extend_from_slice(&f64_bytes);
+    samples.extend_from_slice(&1.0f64.to_le_bytes()); // sample_rate
+    let set_members = vec![1u8, 1, b'a']; // one one-byte member
+    let mut histogram = vec![1u8]; // one bucket
+    histogram.extend_from_slice(&f64_bytes);
+    histogram.extend_from_slice(&[3, 0, 0, 0, 0]); // count 3, Delta, sum/min/max absent
+    let mut exponential = vec![0u8, 0]; // scale 0, zero_count 0
+    exponential.extend_from_slice(&0f64.to_le_bytes()); // zero_threshold
+    exponential.extend_from_slice(&[0, 1, 4]); // positive: offset 0, one bucket of 4
+    exponential.extend_from_slice(&[0, 0]); // negative: offset 0, no buckets
+    exponential.extend_from_slice(&[0, 4, 0, 0, 0]); // Delta, count 4, sum/min/max absent
+    let mut summary = vec![1u8]; // one quantile
+    summary.extend_from_slice(&0.5f64.to_le_bytes());
+    summary.extend_from_slice(&f64_bytes);
+    summary.push(2); // count
+    summary.extend_from_slice(&f64_bytes); // sum
+    let mut sketch = logit_core::DdSketch::new();
+    sketch.add(1.5);
+
+    let kinds: [(&str, u8, Vec<u8>); 9] = [
+        ("Sum", 0, sum),
+        ("Gauge", 1, f64_bytes.to_vec()),
+        ("GaugeDelta", 2, f64_bytes.to_vec()),
+        ("Samples", 3, samples),
+        ("Distribution", 4, sketch.to_bytes()),
+        ("SetMembers", 5, set_members),
+        ("Histogram", 7, histogram),
+        ("ExponentialHistogram", 8, exponential),
+        ("Summary", 9, summary),
+    ];
+    for (name, tag, body) in kinds {
+        assert!(decode_v1(&wire_kind_batch(tag, &body)).is_ok(), "{name}: the valid body failed");
+        let mut padded = body.clone();
+        padded.extend_from_slice(&[0xde, 0xad]);
+        let needle = if tag == 4 { "distribution" } else { "trailing bytes" };
+        assert_malformed(decode_v1(&wire_kind_batch(tag, &padded)), needle, name);
+    }
+}
+
+/// A field whose reader consumes a prefix of it (a varint, one `Value`, an attribute map, a list,
+/// a trace reference) rejects bytes after that prefix, as does a scalar `Value` payload.
+#[test]
+fn a_record_field_with_trailing_bytes_is_malformed() {
+    const JUNK: [u8; 2] = [0xde, 0xad];
+    let with_junk = |body: &[u8]| {
+        let mut out = body.to_vec();
+        out.extend_from_slice(&JUNK);
+        out
+    };
+    let null = tlv(0, &[]);
+    let mut trace = vec![0u8; 16];
+    trace.extend_from_slice(&[0, 0]); // no span id, flags 0
+    let gauge = tlv(1, &[0; 8]);
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("FIELD_TIMESTAMP", tlv(1, &with_junk(&[0x02]))),
+        ("FIELD_ATTRIBUTES", tlv(2, &with_junk(&[0]))),
+        ("FIELD_METRICS", tlv(4, &with_junk(&counted_list(&[])))),
+        ("LR_MESSAGE", tlv(3, &tlv(1, &with_junk(&null)))),
+        ("LR_SEVERITY", wire_log_event_field(&tlv(2, &with_junk(&[2])))),
+        ("LR_BODY_FORMAT", wire_log_event_field(&tlv(3, &with_junk(&[1])))),
+        ("LR_TRACE", wire_log_event_field(&tlv(4, &with_junk(&trace)))),
+        ("SR_NAME", {
+            let mut span = tlv(1, &[0u8; 16]);
+            span.extend_from_slice(&tlv(2, &[0u8; 8]));
+            span.extend_from_slice(&tlv(4, &with_junk(&null)));
+            tlv(5, &span)
+        }),
+        ("SR_KIND", wire_span_event_field(&tlv(5, &with_junk(&[1])))),
+        ("SR_STATUS", wire_span_event_field(&tlv(6, &with_junk(&[1])))),
+        ("SR_EVENTS", wire_span_event_field(&tlv(7, &with_junk(&counted_list(&[]))))),
+        ("SE_NAME", wire_span_event_field(&tlv(7, &counted_list(&[tlv(2, &with_junk(&null))])))),
+        ("SE_ATTRIBUTES", {
+            let mut event = tlv(2, &null);
+            event.extend_from_slice(&tlv(3, &with_junk(&[0])));
+            wire_span_event_field(&tlv(7, &counted_list(&[event])))
+        }),
+        ("MR_EXEMPLARS", {
+            let field = tlv(5, &with_junk(&counted_list(&[Vec::new()])));
+            wire_metric_event(wire_metric_record(&gauge, &field))
+        }),
+        ("EX_TRACE", {
+            let field = tlv(5, &counted_list(&[tlv(3, &with_junk(&trace))]));
+            wire_metric_event(wire_metric_record(&gauge, &field))
+        }),
+        ("MR_KIND", {
+            let mut record = tlv(1, &0u32.to_le_bytes());
+            record.extend_from_slice(&tlv(6, &with_junk(&gauge)));
+            wire_metric_event(record)
+        }),
+        ("TAG_NULL", wire_attr_event(tlv(0, &JUNK))),
+        ("TAG_BOOL", wire_attr_event(tlv(1, &with_junk(&[1])))),
+        ("TAG_I64", wire_attr_event(tlv(2, &with_junk(&[0x02])))),
+        ("TAG_U64", wire_attr_event(tlv(3, &with_junk(&[0x02])))),
+        ("TAG_TIMESTAMP", wire_attr_event(tlv(7, &with_junk(&[0x02])))),
+        ("TAG_ARRAY", wire_attr_event(tlv(8, &with_junk(&[0])))),
+        ("TAG_MAP", wire_attr_event(tlv(9, &with_junk(&[0])))),
+    ];
+    for (name, event) in cases {
+        assert_malformed(decode_v1(&wire_batch(&["k"], &[event])), "trailing bytes", name);
+    }
+}
+
+/// Bytes after the last event (v1) or after the provenance trailer (v2) are `Malformed`: a
+/// payload is one batch.
+#[test]
+fn a_batch_with_bytes_after_its_last_event_is_malformed() {
+    let mut v1 = native::encode_batch(&sample_batch()).to_vec();
+    v1.extend_from_slice(b"junk");
+    assert_malformed(decode_v1(&v1), "trailing bytes", "v1");
+
+    let mut v2 = native::encode_batch_v2(&sample_batch(), sample_provenance()).to_vec();
+    v2.extend_from_slice(b"junk");
+    assert_malformed(
+        native::decode_batch_v2(&mut Bytes::from(v2), &DecodeBudget::default()),
+        "trailing bytes",
+        "v2",
+    );
+}
+
+/// The native codec is a fixed point: re-encoding what it decoded reproduces the payload byte
+/// for byte, in both codec versions.
+#[test]
+fn encode_then_decode_then_encode_is_byte_identical() {
+    let v1 = native::encode_batch(&sample_batch());
+    let decoded = decode_v1(&v1).unwrap();
+    assert_eq!(native::encode_batch(&decoded), v1);
+
+    let v2 = native::encode_batch_v2(&sample_batch(), sample_provenance());
+    let (decoded, provenance) =
+        native::decode_batch_v2(&mut v2.clone(), &DecodeBudget::default()).unwrap();
+    assert_eq!(native::encode_batch_v2(&decoded, provenance), v2);
+}
+
+/// `write_frame` refuses what `read_frame` would refuse, so no writer can emit a frame over the
+/// uncompressed cap.
+#[test]
+fn write_frame_refuses_a_payload_over_the_uncompressed_cap() {
+    let over = vec![0u8; frame::MAX_SANE_UNCOMPRESSED_LEN as usize + 1];
+    for compression in [Compression::None, Compression::Lz4] {
+        let result = frame::write_frame(1, compression, &over);
+        assert_malformed(result, "uncompressed cap", &format!("{compression:?}"));
+    }
+}
+
+/// `NativeDecoder::decode_into` moves the decoded events into the caller's empty `Vec`, so each
+/// event is held once at peak, not once in the batch and again in `out`.
+#[test]
+fn decode_into_holds_each_event_once_at_peak() {
+    let n = 16 * 1024;
+    let payload = wire_batch(&[], &vec![Vec::new(); n]);
+    let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload).unwrap();
+    let mut events = Vec::new();
+    let peak = peak_live_bytes(|| {
+        NativeDecoder.decode_into(framed.clone(), 0, &mut events).unwrap();
+    });
+    assert_eq!(events.len(), n);
+    let once = (n * std::mem::size_of::<Event>()) as i64;
+    assert!(
+        peak < once + once / 8,
+        "peak live bytes {peak} for {n} events of {} bytes: each event held more than once",
+        std::mem::size_of::<Event>()
+    );
+}
+
+/// One empty event is 1 wire byte and a `size_of::<Event>()` slot, so a 4 KiB lz4 frame of a
+/// million of them would decode into ~900 MB. `NativeDecoder`'s default budget (256 MiB) refuses
+/// it before building any event. An explicit budget of the events' cost admits them; one byte less
+/// refuses them.
+#[test]
+fn a_frame_of_empty_events_is_rejected_past_the_decode_budget() {
+    let n = 1 << 20;
+    let payload = wire_batch(&[], &vec![Vec::new(); n]);
+    let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::Lz4, &payload).unwrap();
+    assert!(framed.len() < 8 * 1024, "the frame is {} bytes", framed.len());
+    let mut result = None;
+    let peak = peak_live_bytes(|| {
+        let mut events = Vec::new();
+        result = Some(NativeDecoder.decode_into(framed.clone(), 0, &mut events).map(|_| ()));
+    });
+    assert_over_budget(result.unwrap(), native::DEFAULT_DECODE_BUDGET, "a million empty events");
+    // The 1 MiB decompressed payload is the only large allocation.
+    assert!(peak < 2 * 1024 * 1024, "peak live bytes {peak}: events were built before refusal");
+
+    let n = 1000;
+    let payload = Bytes::from(wire_batch(&[], &vec![Vec::new(); n]));
+    let cost = (n * std::mem::size_of::<Event>()) as u64;
+    let exact = DecodeBudget::new(cost);
+    assert_eq!(native::decode_batch(&mut payload.clone(), &exact).unwrap().events.len(), n);
+    assert_eq!(exact.charged(), cost);
+    let short = DecodeBudget::new(cost - 1);
+    let result = native::decode_batch(&mut payload.clone(), &short);
+    assert_over_budget(result, cost - 1, "one byte short");
+}
+
+/// One empty exemplar is 1 wire byte and a `size_of::<Exemplar>()` slot.
+#[test]
+fn a_frame_of_empty_exemplars_is_rejected_past_the_decode_budget() {
+    let n = 1000;
+    let exemplars = tlv(5, &counted_list(&vec![Vec::new(); n])); // MR_EXEMPLARS
+    let payload = Bytes::from(wire_batch(
+        &["m"],
+        &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &exemplars))],
+    ));
+    // The dictionary's one string and its `Symbol`, the event, the metric record, the exemplars.
+    let cost = (1
+        + std::mem::size_of::<logit_core::Symbol>()
+        + std::mem::size_of::<Event>()
+        + std::mem::size_of::<logit_core::MetricRecord>()
+        + n * std::mem::size_of::<logit_core::Exemplar>()) as u64;
+    let exact = DecodeBudget::new(cost);
+    let batch = native::decode_batch(&mut payload.clone(), &exact).unwrap();
+    assert_eq!(batch.events[0].metrics[0].exemplars.len(), n);
+    assert_eq!(exact.charged(), cost);
+
+    let short = DecodeBudget::new(cost - 1);
+    let result = native::decode_batch(&mut payload.clone(), &short);
+    assert_over_budget(result, cost - 1, "one byte short");
+    let peak = peak_live_bytes(|| {
+        let _ = native::decode_batch(&mut payload.clone(), &DecodeBudget::new(64 * 1024));
+    });
+    assert!(peak < 64 * 1024, "peak live bytes {peak}: exemplars were built before refusal");
+}
+
+/// An ordinary batch decodes well inside its budget, and the budget reports each charge: the
+/// dictionary's strings and `Symbol`s, the event slot, and one attribute-map entry each on the
+/// resource and the event. The log's `Str` message is a slice of the payload, charged nothing.
+#[test]
+fn a_batch_under_the_budget_decodes_and_the_budget_reports_what_it_charged() {
+    let payload = native::encode_batch(&sample_batch());
+    let budget = DecodeBudget::new(1024 * 1024);
+    let decoded = native::decode_batch(&mut payload.clone(), &budget).unwrap();
+    assert_eq!(decoded, sample_batch());
+
+    let symbol = std::mem::size_of::<logit_core::Symbol>();
+    let dictionary = "service.name".len() + symbol + "host".len() + symbol;
+    let entry = std::mem::size_of::<(logit_core::Symbol, Value)>();
+    let expected = dictionary + std::mem::size_of::<Event>() + 2 * entry;
+    assert_eq!(budget.charged(), expected as u64);
+    assert_eq!(budget.limit(), 1024 * 1024);
+}
+
+/// Peak heap per wire byte for a payload made of one element repeated `n` times, each at its
+/// smallest wire encoding. `docs/design/wire-protocol.md`'s "Decode amplification" table records
+/// these ratios; this test keeps it true to within 5%. `n` is a power of two so a `Vec`'s
+/// doubling lands on its exact capacity; between powers of two a list can hold up to twice its
+/// length in capacity.
+#[test]
+fn peak_allocation_per_wire_byte_matches_the_documented_ratio() {
+    const N: usize = 1 << 16;
+    fn events(n: usize) -> Vec<u8> {
+        wire_batch(&[], &vec![Vec::new(); n])
+    }
+    fn metric_records(n: usize) -> Vec<u8> {
+        let record = wire_metric_record(&tlv(1, &[0; 8]), &[]);
+        wire_batch(&["m"], &[tlv(4, &counted_list(&vec![record; n]))])
+    }
+    fn exemplars(n: usize) -> Vec<u8> {
+        let field = tlv(5, &counted_list(&vec![Vec::new(); n]));
+        wire_batch(&["m"], &[wire_metric_event(wire_metric_record(&tlv(1, &[0; 8]), &field))])
+    }
+    fn span_events(n: usize) -> Vec<u8> {
+        let event = tlv(2, &tlv(0, &[])); // SE_NAME: Null
+        wire_batch(&[], &[wire_span_event_field(&tlv(7, &counted_list(&vec![event; n])))])
+    }
+    fn span_links(n: usize) -> Vec<u8> {
+        let mut link = tlv(1, &[0u8; 16]);
+        link.extend_from_slice(&tlv(2, &[0u8; 8]));
+        wire_batch(&[], &[wire_span_event_field(&tlv(8, &counted_list(&vec![link; n])))])
+    }
+    fn array_items(n: usize) -> Vec<u8> {
+        let mut items = Vec::new();
+        uv(&mut items, n as u64);
+        items.extend(std::iter::repeat_n([0u8, 0], n).flatten()); // Null
+        wire_batch(&["k"], &[wire_attr_event(tlv(8, &items))])
+    }
+    fn map_values(n: usize) -> Vec<u8> {
+        let mut items = Vec::new();
+        uv(&mut items, n as u64);
+        items.extend(std::iter::repeat_n([9u8, 1, 0], n).flatten()); // an empty Map
+        wire_batch(&["k"], &[wire_attr_event(tlv(8, &items))])
+    }
+    fn kind(tag: u8, n: usize, element: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        uv(&mut body, n as u64);
+        body.extend(std::iter::repeat_n(element, n).flatten());
+        body.extend_from_slice(tail);
+        wire_kind_batch(tag, &body)
+    }
+    fn set_members(n: usize) -> Vec<u8> {
+        kind(5, n, &[0], &[])
+    }
+    fn samples(n: usize) -> Vec<u8> {
+        kind(3, n, &[0; 8], &[0; 8])
+    }
+    fn histogram(n: usize) -> Vec<u8> {
+        kind(7, n, &[0; 9], &[0, 0, 0, 0])
+    }
+    fn summary(n: usize) -> Vec<u8> {
+        kind(9, n, &[0; 16], &[0; 9])
+    }
+    fn exponential_buckets(n: usize) -> Vec<u8> {
+        let mut body = vec![0u8, 0];
+        body.extend_from_slice(&[0; 8]);
+        body.push(0);
+        uv(&mut body, n as u64);
+        body.extend(std::iter::repeat_n(0u8, n));
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+        wire_kind_batch(8, &body)
+    }
+
+    let arms: [Arm; 13] = [
+        ("event", events, RATIO_EVENT),
+        ("MR_EXEMPLARS entry", exemplars, RATIO_EXEMPLAR),
+        ("TAG_ARRAY of empty maps", map_values, RATIO_MAP_VALUE),
+        ("SR_EVENTS entry", span_events, RATIO_SPAN_EVENT),
+        ("SET_MEMBERS member", set_members, RATIO_SET_MEMBER),
+        ("TAG_ARRAY item", array_items, RATIO_ARRAY_ITEM),
+        ("SR_LINKS entry", span_links, RATIO_SPAN_LINK),
+        ("FIELD_METRICS record", metric_records, RATIO_METRIC_RECORD),
+        ("exponential bucket", exponential_buckets, RATIO_EXPONENTIAL_BUCKET),
+        ("sample", samples, RATIO_SAMPLE),
+        ("histogram bucket", histogram, RATIO_HISTOGRAM_BUCKET),
+        ("summary quantile", summary, RATIO_SUMMARY_QUANTILE),
+        ("event, at N / 2 + 1", |n| events(n / 2 + 1), RATIO_EVENT * 2.0),
+    ];
+    let mut failures = Vec::new();
+    for (name, build, documented) in arms {
+        let payload = Bytes::from(build(N));
+        let wire = payload.len() as f64;
+        let budget = DecodeBudget::unlimited();
+        let peak = peak_live_bytes(|| {
+            let batch = native::decode_batch(&mut payload.clone(), &budget);
+            assert!(batch.is_ok(), "{name}: {:?}", batch.err());
+        });
+        let ratio = peak as f64 / wire;
+        eprintln!(
+            "{name:<26} wire {wire:>9} peak {peak:>11} ratio {ratio:>8.2} charged/wire {:>8.2}",
+            budget.charged() as f64 / wire
+        );
+        if (ratio - documented).abs() > documented * 0.05 {
+            failures.push(format!("{name}: measured {ratio:.2}, documented {documented}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// One ratio-test arm: the element, a payload builder taking the element count, and the ratio
+/// the doc table records.
+type Arm = (&'static str, fn(usize) -> Vec<u8>, f64);
+
+// `docs/design/wire-protocol.md`'s "Decode amplification" table, element by element.
+const RATIO_EVENT: f64 = 864.0;
+const RATIO_EXEMPLAR: f64 = 440.0;
+const RATIO_MAP_VALUE: f64 = 144.0;
+const RATIO_SPAN_EVENT: f64 = 89.6;
+const RATIO_SET_MEMBER: f64 = 32.0;
+const RATIO_ARRAY_ITEM: f64 = 20.0;
+const RATIO_SPAN_LINK: f64 = 15.7;
+const RATIO_METRIC_RECORD: f64 = 11.8;
+const RATIO_EXPONENTIAL_BUCKET: f64 = 8.0;
+const RATIO_SAMPLE: f64 = 2.0;
+const RATIO_HISTOGRAM_BUCKET: f64 = 1.8;
+const RATIO_SUMMARY_QUANTILE: f64 = 1.0;

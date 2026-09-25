@@ -754,29 +754,28 @@ The native format is a hop between processes, not a stage in the reference pipel
 own table. `logit_out`/`logit_in` (`docs/plans/native-transport.md`) each do slightly less work
 than the raw `NativeEncoder`/`NativeDecoder` pair: `logit_out` skips `NativeEncoder`'s bundling and
 calls `encode_batch`/`write_frame_with_flags` directly, to frame with whatever compression the
-connection negotiated; `logit_in` has no caller-held scratch buffer to `out.extend` into the way
-`NativeDecoder::decode_into` does, since `Fanout::send` takes the `EventBatch` `decode_batch`
-returns. (The disk buffer's encode cost is §2's `disk_queue` row.) One event
+connection negotiated; `logit_in` calls `decode_batch` directly, since `Fanout::send` takes the
+`EventBatch` it returns. (The disk buffer's encode cost is §2's `disk_queue` row.) One event
 (`fixtures::nginx_batch(1)`), `crates/logit-bench/tests/allocations.rs`:
 
 | Stage | allocs | Notes |
 |---|---:|---|
 | `NativeEncoder::encode`, 1 event | **30** | 32 -> 30 once `kv_metrics`'s two distributions became inline `Samples` -- a `Distribution` record serializes its sketch via `to_java_bytes` (one blob each), a `Samples` writes its values directly; dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields -- 23 -> 32 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md), which TLV-framed every record too: the fixture's four metrics each pay one scratch buffer for their `kind` field and one length prefix as a list entry (+8), and the log's `message` one (+1) (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
 | `logit_out`: encode + frame, 1 event | **30** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
-| `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
-| `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
+| `NativeDecoder::decode_into`, 1 event | **7** | the decoded `Vec<Event>` is moved into the caller's empty `Vec`, not copied, so this matches `logit_in` below; dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
+| `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly; `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
 The same pair over the six survey-derived shapes (`docs/plans/event-sizing.md` W1), one event per
 batch except the last:
 
 | Shape | encode | decode | Notes |
 |---|---:|---:|---|
-| 12-attribute flat JSON log | **16** | **5** | |
-| 10-attribute nested pino-http record | **24** | **9** | decode's extra four are the boxed `Value::Map`s, same cause as `json`'s |
-| 30-attribute access log | **24** | **5** | **decode is flat in width** -- the same 5 as the 12-attribute row, with the growth chain showing up as reallocs instead. This is `read_attr_map_at` reading the exact count off the wire and discarding it, then rebuilding the map by 30 sorted `insert_sym`s in the *writer's* symbol order, which dictionary remapping has already made unsorted for the reader |
-| 17-attribute server span | **20** | **5** | |
-| 3-record collectd event | **20** | **5** | |
-| 5 events, 17-attribute `Resource` | **53** | **10** | the one measurement where the resource's own width is paid: `logit_proto::native` writes it once per batch rather than `Arc`-sharing it |
+| 12-attribute flat JSON log | **16** | **4** | |
+| 10-attribute nested pino-http record | **24** | **8** | decode's extra four are the boxed `Value::Map`s, same cause as `json`'s |
+| 30-attribute access log | **24** | **4** | **decode is flat in width** -- the same 4 as the 12-attribute row, with the growth chain showing up as reallocs instead. This is `read_attr_map_at` reading the exact count off the wire and discarding it, then rebuilding the map by 30 sorted `insert_sym`s in the *writer's* symbol order, which dictionary remapping has already made unsorted for the reader |
+| 17-attribute server span | **20** | **4** | |
+| 3-record collectd event | **20** | **4** | |
+| 5 events, 17-attribute `Resource` | **53** | **9** | the one measurement where the resource's own width is paid: `logit_proto::native` writes it once per batch rather than `Arc`-sharing it |
 
 Encode cost tracks the number of *fields* written, not the attribute count: the span and the
 three-record collectd event write more structure than the 12-attribute log while carrying fewer

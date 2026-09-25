@@ -98,6 +98,7 @@
 //! | `Distribution` under a logarithmic mapping | re-binned into `Mapping::agent` at each bin's representative value, summary kept | `degraded{reason="rebinned"}` |
 //! | a sketch bin with a fractional count | rounded; a bin rounding to 0 is omitted | `degraded{reason="fractional_count"}`, once per sketch |
 //! | a `Distribution` with no bins and zero count | skipped | `logit.output.metrics.skipped{reason="empty_sketch"}` |
+//! | a `Distribution` whose counts split into more than [`sketches::MAX_DOGSKETCH_ENTRIES`] `k`/`n` entries | skipped | `skipped{reason="oversized_sketch"}` + diag `oversized_sketch` |
 //! | `Sum{Cumulative}` / `Sum{Delta, !monotonic}` | skipped by the series encoders | `skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"}` |
 //! | `GaugeDelta`, `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `skipped{metric_kind="gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |

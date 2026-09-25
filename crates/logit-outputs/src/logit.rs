@@ -836,7 +836,8 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            let (_batch, provenance) = native::decode_batch_v2(&mut payload).unwrap();
+            let (_batch, provenance) =
+                native::decode_batch_v2(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
             provenance
@@ -885,8 +886,8 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            assert!(native::decode_batch_v2(&mut payload.clone()).is_err());
-            native::decode_batch(&mut payload).unwrap();
+            assert!(native::decode_batch_v2(&mut payload.clone(), &Default::default()).is_err());
+            native::decode_batch(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
         });

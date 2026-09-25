@@ -42,8 +42,8 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 
 | # | Lead | Entry | Status |
 |---|---|---|---|
-| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). in-progress (dos/w2) for WIRE-03; the replacement `DdSketch` in-progress (dos/w3) |
-| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | in-progress (dos/w3, dos/w2) |
+| 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → #370 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` done: findings → #369 (decoded `bin_limit` capped, Agent keys range-checked) |
+| 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → #369 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 findings → #370: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is CORE-06's |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | in-progress (dos/w6) |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | in-progress (dos/w5) |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 open |
@@ -193,9 +193,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | unreviewed (lead 11 fixed in #333) |
 | [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | unreviewed |
 | [RT-11](#rt-11--lua-node-hosting-os-thread-two-oneshot-handshake-catch_unwind-handleblock_on) | P0 | Lua node hosting: OS thread, two-oneshot handshake, `catch_unwind`, `Handle::block_on` | `runtime.rs` (`run_lua`, `watch_lua_thread`, `run_lua_loop`) | unreviewed |
-| [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | in-progress (dos/w2) |
-| [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | in-progress (dos/w2) |
-| [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | in-progress (dos/w2) |
+| [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → #370 |
+| [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → #370 |
+| [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → #370 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | in-progress (dos/w5) |
 | [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
@@ -203,8 +203,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | in-progress (dos/w6) |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | in-progress (dos/w6) |
 | [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P2 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | reviewed @dc39d1c (pinned, no change) |
-| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | in-progress (dos/w3) |
-| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | in-progress (dos/w3) |
+| [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | findings → #369 |
+| [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | findings → #369 |
 | [CORE-15](#core-15--scriptworker-vm-lifecycle-the-luajit-sandbox-and-return-value-validation) | P0 | `ScriptWorker`: VM lifecycle, the LuaJIT sandbox, and return-value validation | `crates/logit-script/src/lib.rs` (`sandbox_libs`, `remove_unsandboxed_base_globals`, `ScriptWorker`) | unreviewed |
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | unreviewed |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | unreviewed |
@@ -3593,32 +3593,45 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `Truncated` vs `Malformed` classification makes a disk-spool reader silently discard every
   record after the bad one — see the assertion message in `rejects_a_compressed_len_over_the_sanity_cap`); nontrivial-3p-use(lz4_flex) (raw
   *block* API with caller-sized buffers, `decompress_into` + truncate, not the framed API).
-- **Invariants to verify:**
-  - CRC is computed and checked over exactly the bytes on the wire (compressed form), on both
-    sides, and always *before* decompression runs.
-  - `MAX_SANE_COMPRESSED_LEN = MAX + MAX/255 + 16` genuinely covers lz4 block worst-case
+- **Invariants to verify:** *(checked in #370: a fresh-context refuter pass over the code
+  and `lz4_flex` 0.14's source, then the implementer's tests)*
+  - ✅ CRC is computed and checked over exactly the bytes on the wire (compressed form), on both
+    sides, and always *before* decompression runs. **Holds**: `read_frame_with_header` checks
+    `crc32c(&compressed)` before the `Compression` match.
+  - ✅ `MAX_SANE_COMPRESSED_LEN = MAX + MAX/255 + 16` genuinely covers lz4 block worst-case
     expansion for a payload at `MAX_SANE_UNCOMPRESSED_LEN`, so `write_frame` can never emit a
-    frame `read_frame` refuses.
-  - `lz4_decompress` truncates to bytes actually written, so the `payload.len() != uncompressed_len`
-    check in `read_frame_with_header` is a real check, not a tautology.
-  - "Too few bytes" is `Truncated`; "the bytes present are wrong" is `Malformed`. No path returns
-    `Truncated` for a corrupt length field.
-  - `FrameHeader::read` consumes exactly `HEADER_LEN` bytes on every path including the error
+    frame `read_frame` refuses. **Holds**, pinned by `frame_fixed_point.rs`'s
+    `a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none` and its lz4-expansion
+    proptest; the uncompressed side is now enforced at the writer too (below).
+  - ✅ `lz4_decompress` truncates to bytes actually written, so the `payload.len() != uncompressed_len`
+    check in `read_frame_with_header` is a real check, not a tautology. **Holds**, and `lz4_flex`
+    0.14's safe block decoder can't write past the `uncompressed_len`-sized buffer it's given.
+  - ✅ "Too few bytes" is `Truncated`; "the bytes present are wrong" is `Malformed`. No path returns
+    `Truncated` for a corrupt length field. **Holds** for both over-cap lengths; an in-cap corrupt
+    `compressed_len` reads as `Truncated` by design (`walk_segment`'s doc comment).
+  - ✅ `FrameHeader::read` consumes exactly `HEADER_LEN` bytes on every path including the error
     ones a caller may retry after (it does not, on the early-return for `bytes.len() < HEADER_LEN`;
-    verify no caller depends on partial consumption).
-  - `write_frame`/`read_frame` reject `Compression::Zstd` symmetrically rather than treating it as
-    `None`.
-- **Observed concerns (unverified):**
-  - `write_frame_with_flags` casts `payload.len() as u32` (the `uncompressed_len` field of its
+    verify no caller depends on partial consumption). **Holds**: no caller reuses the buffer
+    after a short-path error (`logit_in` reads exactly `HEADER_LEN` first; `DiskQueue` and
+    `read_frame` treat it as `Truncated` and stop).
+  - ✅ `write_frame`/`read_frame` reject `Compression::Zstd` symmetrically rather than treating it as
+    `None`. **Holds**, pinned by `frame.rs`'s two zstd tests.
+- **Observed concerns:**
+  - ~~`write_frame_with_flags` casts `payload.len() as u32` (the `uncompressed_len` field of its
     `FrameHeader`) with no check against
-    `MAX_SANE_UNCOMPRESSED_LEN`; a >4 GiB payload would wrap silently. Callers do bound it
-    (`logit_out` in `crates/logit-outputs/src/logit.rs`'s `Output::send`, the `v1_payload.len()`
-    check, and `DiskQueue`), and the doc comment on `MAX_SANE_UNCOMPRESSED_LEN`
-    explicitly acknowledges the asymmetry, but the check lives in every caller rather
-    than here. **Low confidence this is reachable; medium confidence it's worth centralizing.**
-  - `resync` is `O(n)` per call over the remaining buffer and a caller that resyncs
-    repeatedly past spurious magics is `O(n²)`; not a concern for a 24-byte-header stream, worth a
-    glance at the disk-spool caller. **Low confidence.**
+    `MAX_SANE_UNCOMPRESSED_LEN`; a >4 GiB payload would wrap silently.~~ **fixed: the cap is
+    enforced once, at the writer.** The wrap was unreachable: every caller bounds the payload
+    first (`logit_out`'s `send`, `DiskQueue::push`, and control frames that are a few bytes).
+    `write_frame_with_flags` now returns `Malformed` for a payload over
+    `MAX_SANE_UNCOMPRESSED_LEN`. `logit_out` keeps its own pre-check because it refuses the batch
+    before connecting, with a throttled diagnostic; `DiskQueue::push` drops its own check and
+    counts `write_frame`'s error as `frame_too_large`. Pinned by
+    `write_frame_refuses_a_payload_over_the_uncompressed_cap` (seen to fail first).
+  - ~~`resync` is `O(n)` per call over the remaining buffer and a caller that resyncs
+    repeatedly past spurious magics is `O(n²)`~~ **Holds for `resync` itself**: one linear
+    `windows` scan per call. The quadratic cost in the spool walk is `parse_record` copying the
+    rest of the segment for each record, not `resync`; it's fixed separately in #367
+    (DISK-02/DISK-13).
 - **Existing coverage:** in-file unit tests in `frame.rs` (round trips, bad magic, unknown
   version, corrupt CRC, both truncation classes, both sanity caps, short-decompress, zstd,
   resync); `crates/logit-proto/tests/robustness.rs` (`read_frame_survives_every_single_byte_truncation`,
@@ -3656,31 +3669,46 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   tag silently becomes `Null` — a real value disappears rather than erroring);
   accounting (every decoded string permanently grows the never-evicting global interner).
 - **Invariants to verify:**
-  - Every declared length is compared against `bytes.len()` *before* `split_to`, and every count
+  - ✅ Every declared length is compared against `bytes.len()` *before* `split_to`, and every count
     is `.min(4096)`-clamped before `with_capacity` (`Dict::read`, and the `TAG_ARRAY` arm of
-    `read_value_at`).
-  - The decode-side recursion cap is reached on both the `Array` and `Map` paths and cannot be
+    `read_value_at`). **Holds** (refuter pass: every carve is `split_to` after a length check,
+    every fixed-width read checks its length before `get_*`). Array and attribute-map counts are
+    now also checked against the bytes left before the decode budget charges them.
+  - ✅ The decode-side recursion cap is reached on both the `Array` and `Map` paths and cannot be
     bypassed by alternating them (`read_attr_map_at` passes `depth` unchanged to `read_value_at`,
     and the `TAG_MAP` arm adds 1 — confirm the combination still increments once per nesting
-    level).
-  - `read_uvarint`'s 10-byte bound cannot loop forever and cannot produce a value that then
-    overflows a downstream `as usize`/`as u32` cast.
+    level). **Holds**, pinned by `value.rs`'s `alternating_arrays_and_maps_count_one_level_each`
+    (128 alternating levels decode, 129 are `Malformed`).
+  - ✅ `read_uvarint`'s 10-byte bound cannot loop forever and cannot produce a value that then
+    overflows a downstream `as usize`/`as u32` cast. **Holds** for the loop; the silent
+    truncation of the 10th byte is fixed (below).
   - Re-interning an attacker-supplied dictionary cannot grow the process-global interner without
     bound across many connections (the interner never evicts — this is an unbounded-growth vector
-    distinct from per-request memory caps).
-  - `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is not.
-- **Observed concerns (unverified):**
-  - `read_uvarint` (`crates/logit-proto/src/native/varint.rs`) accepts non-canonical encodings and, on the 10th byte,
+    distinct from per-request memory caps). **Documented non-goal** under
+    [ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md): `docs/known-gaps.md`'s
+    interner entry names the native dictionary, and `dict.rs`'s module doc points there.
+  - ✅ `Str` is UTF-8-validated (the `TAG_STR` arm of `read_value_at`) and `Bytes` deliberately is
+    not. **Holds.**
+- **Observed concerns:**
+  - ~~`read_uvarint` (`crates/logit-proto/src/native/varint.rs`) accepts non-canonical encodings and, on the 10th byte,
     `<< 63` silently discards the byte's upper 6 bits — two distinct byte strings decode to the
-    same `u64`. Harmless for correctness of a single decode, but it means `encode(decode(x)) != x`
-    at the byte level for a crafted input, which matters if any code ever compares wire bytes.
-    **Medium confidence this is real, low confidence it matters today.**
-  - `Dict::read` interns every entry into the *global* interner before any of the batch has been
-    validated (`Dict::read`). A peer that sends frames whose dictionaries are all-unique random
-    strings grows that interner permanently, at up to `MAX_SANE_DICT_ENTRIES` (16M) per frame,
-    with no per-connection or global budget. This is the one resource here that survives the
-    request. **Medium-high confidence; `docs/known-gaps.md` discusses interner growth for
-    `otlp_in`/`json` but I did not find this specific native-path case named.**
+    same `u64`.~~ **fixed: a 10th byte above `0x01` is `Malformed`** (`ff×9 7f` used to decode to
+    `u64::MAX`, `81 80×8 02` to 1). The check sits in the loop's terminating branch, so it costs
+    nothing on the common one-byte varint. Over-long encodings of small values (`80 00`) stay
+    accepted: no writer emits one, and rejecting them costs a compare per byte. `read_ivarint`
+    shares the loop. Pinned by `a_ten_byte_varint_with_bits_above_the_low_bit_is_malformed` (seen
+    to fail first). Byte-level fixed point for valid payloads is pinned by
+    `encode_then_decode_then_encode_is_byte_identical`.
+  - ~~`Dict::read` interns every entry into the *global* interner before any of the batch has been
+    validated (`Dict::read`).~~ **Documented non-goal**, not changed: CRC-32C rejects accidental
+    corruption before the dictionary is read, and a lazy interner would change the ordinary decode
+    path for a case only crafted input produces. `docs/known-gaps.md` names the native dictionary
+    as an interner feeder; `dict.rs`'s module doc points there. The dictionary's per-frame
+    strings are now charged to the decode budget (WIRE-03).
+  - **New, documented non-goal:** `read_attr_map_at` inserts through `AttrMap::insert_sym`, which
+    is quadratic for a large map whose keys arrive in descending symbol order (refuter measured
+    80,000 keys at 3.4 s descending against 20 ms ascending). `docs/known-gaps.md` records it;
+    `value.rs`'s module doc points there.
   - Unknown `Value` tag → `Value::Null` (the `_unknown` arm of `read_value_at`) is documented, but it means a lossy-transit
     failure that no counter records — no `logit.proto.errors` or skip counter fires.
     **High confidence it's intentional (module doc argues it), low confidence it's fully benign.**
@@ -3727,23 +3755,38 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `read_record_list_into`'s unbounded `count` loop terminates on truncated input via the
     per-entry length check (`bytes.len() < len`), and cannot be made to allocate proportionally to a huge
     `count` before any entry is read.
-  - `read_metric_kind`'s per-variant sequential layouts consume exactly their declared `len`
+  - ✅ `read_metric_kind`'s per-variant sequential layouts consume exactly their declared `len`
     (nothing checks for trailing bytes inside a kind body, unlike `read_record_list_into`'s
-    "list entry had trailing bytes" check).
+    "list entry had trailing bytes" check). **fixed**: see the first concern below.
   - `HyperLogLog::from_bytes`/`DdSketch::from_java_bytes` bound their own claimed member/bucket
     counts before allocating, since the blob here is fully attacker-controlled.
   - `read_trace_ref`'s fixed-width reads (the 16-byte `trace_id` and 8-byte `span_id` length
     checks) can never read past the field slice.
-- **Observed concerns (unverified):**
-  - `read_metric_kind` does not reject trailing bytes inside a kind body, so a
-    crafted frame can carry padding the writer never emits; benign, but it breaks byte-level
-    fixed-point for that record. **Medium confidence.**
-  - `read_exponential_buckets` reads `count` uvarints with the `.min(4096)` reserve
-    clamp but no cap on `count`; truncation stops it, but a 64 MiB frame of 1-byte varints
-    produces a ~500M-element `Vec<u64>` (4 GiB). The frame cap bounds bytes-in, not
-    elements-out — the expansion ratio is ~8×. Same shape in `read_metric_kind`'s `METRIC_SAMPLES`,
-    `METRIC_SET_MEMBERS`, `METRIC_HISTOGRAM`, and `METRIC_SUMMARY` arms. **Medium-high confidence this is a
-    real amplification factor worth measuring.**
+- **Observed concerns:**
+  - ~~`read_metric_kind` does not reject trailing bytes inside a kind body, so a
+    crafted frame can carry padding the writer never emits~~ **fixed: every carve rejects
+    leftovers.** `read_metric_kind` checks its body after the match; `for_each_field` checks
+    every field after its visitor returns (a visitor skips an unknown tag by clearing it); each
+    scalar, array, and map `Value` payload is checked by `varint::ensure_consumed`; and the batch
+    is checked after `decode_batch`'s events and after `decode_batch_v2`'s trailer. `Set`'s blob
+    goes whole to `HyperLogLog::from_bytes`, whose own end check is W3's. Pinned by
+    `every_metric_kind_rejects_trailing_bytes_in_its_body`,
+    `a_record_field_with_trailing_bytes_is_malformed`, and
+    `a_batch_with_bytes_after_its_last_event_is_malformed` (each seen to fail first).
+  - ~~`read_exponential_buckets` reads `count` uvarints with the `.min(4096)` reserve
+    clamp but no cap on `count`~~ **fixed: a per-frame decode budget.** Measured, the worst
+    amplifier wasn't a metric kind: one empty event is 1 wire byte and 864 heap bytes, so a 4 KiB
+    lz4 frame of a million of them peaked at 1.8 GB. Every list is now charged its element size
+    times its count against `native::DecodeBudget` before it's built: 4 × the effective
+    `max_frame_bytes` for `logit_in`, 256 MiB for `NativeDecoder`, unlimited for the disk spool
+    (it decodes what it encoded). `docs/design/wire-protocol.md`'s "Decode amplification" table
+    has every element's measured ratio, pinned within 5% by
+    `peak_allocation_per_wire_byte_matches_the_documented_ratio`; the refusals by
+    `a_frame_of_empty_events_is_rejected_past_the_decode_budget` and
+    `a_frame_of_empty_exemplars_is_rejected_past_the_decode_budget` (seen to fail first). Also
+    fixed: `NativeDecoder::decode_into` held every event twice at peak (it copied the batch's
+    `Vec` into `out`); it now moves it, pinned by `decode_into_holds_each_event_once_at_peak`
+    (seen to fail first), and three allocation pins drop by one.
   - The `logit-core` sketch readers are outside this area but are reached *only* through here and
     through OTLP; flag to whoever surveys `logit-core`.
 - **Existing coverage:** the in-file unit tests of `record.rs` (round trips for every metric kind,
@@ -5405,7 +5448,21 @@ the telemetry buffers are `std::collections::HashMap`.
   re-binned into the receiver's. Every location, invariant, and concern above describes the removed wrapper.
   Nobody has re-reviewed the replacement. Start from `sketch.rs`'s `merge`, `from_bytes`, and
   `malformed_bytes_are_rejected_not_panicked_on`, and check the decode-side bounds (bin counts, key ranges,
-  weights) as well as merge. The re-review is `dos/w3`.
+  weights) as well as merge. The re-review is #369.
+- **Verified 2026-09-25** (#369): ~~the wrapper and its `.expect()`~~ are gone,
+  and the hand-rolled `sketch::DdSketch`'s `merge` can't panic: a fresh-context refuter drove
+  degenerate mappings, non-finite counts, and hostile summaries through it, and the new
+  `crates/logit-core/tests/robustness.rs` runs truncations, seeded bit flips, and hostile counts
+  through `from_bytes` and every operation `aggregate` runs after it. **fixed: two decode bounds.**
+  A decoded `bin_limit` was unbounded (`u32::MAX` meant no collapse, so a cross-mapping merge of
+  two such sketches took 62 s at 320k bins); `Mapping::MAX_BIN_LIMIT` (4096) now caps it
+  (`a_decoded_bin_limit_past_the_cap_is_malformed`,
+  `a_cross_mapping_merge_of_two_capped_sketches_is_bounded`). An Agent-mapped blob accepted any
+  `i32` key, and `datadog_out` negates a negative-store key (`i32::MIN` panicked in debug); keys
+  outside `1..=AGENT_INF_KEY` are now malformed (`an_agent_key_outside_the_int16_range_is_malformed`).
+  `datadog_out` also drops, counted, a sketch past `MAX_DOGSKETCH_ENTRIES` instead of expanding
+  large counts into unbounded `k`/`n` entries. A decoded summary stays trusted, recorded in
+  `docs/known-gaps.md`.
 
 ---
 
@@ -5427,6 +5484,18 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Existing coverage:** `crates/logit-core/src/metric.rs`'s `tests` module (the `hyperloglog_*` tests and `hll_slice_len_matches_upstream_constant`) — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner).
 - **Suggested verification approach:** **run the HLL tests under Miri and ASan specifically** (this is the one place in the area where UB is the documented failure mode); fuzz `from_bytes` with arbitrary bytes; proptest merge as a set-union law; add a guard test that pins serde's `with_capacity`-from-`size_hint` behaviour if one can be written.
 - **Priority:** **P0** — untrusted bytes feeding a codec whose stated purpose is preventing UB in a dependency, with version-pinned constants mirrored by hand.
+- **Verified 2026-09-25** (#369): the size hint is the rounded capacity, a
+  `None` tag is rejected, and canonicalization clears only bits upstream discards. **fixed:** a
+  zero-register count past `M` (4096) panicked upstream's `estimate` in debug and read 0 in release,
+  and now fails decode; a blob with trailing bytes decoded `Ok` and now fails. ~~Only the first has
+  a guard test~~: serde's preallocation is now pinned by
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, and the
+  circular `hll_slice_len_matches_upstream_constant` is replaced by
+  `hll_slice_len_matches_what_upstream_serializes`, which measures a blob upstream wrote. A merge-law
+  proptest checks union on `estimate`. Miri runs the HLL tests only under
+  `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`, where a regressed hint still fails
+  with the `Layout` error (ADR `out-of-ci-unsafe-verification`'s "Sketch and HyperLogLog targets"
+  amendment).
 
 ---
 

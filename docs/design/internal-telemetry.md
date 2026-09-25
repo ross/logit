@@ -994,9 +994,11 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"}`
+- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag.
+  mismatch doesn't hide behind a generic "bad frame" tag. `decode_budget` is a well-formed batch
+  that would decode past its per-frame budget (`native::DecodeBudget`), a batch too large for the
+  frame cap it arrived under rather than corrupt bytes.
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the 1024-connection cap binding).
   `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same
@@ -1006,6 +1008,10 @@ the property the minimal-watch-set design is for.
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
   `logit.proto.errors{reason="handshake"}` or any other diagnostic.
+
+`Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
+budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
+idle close).
 
 ##### `generate_in`
 
@@ -1654,7 +1660,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="bad_sketch"\|"empty_sketch"\|"legacy_distribution"}` | count | a malformed `Dogsketch`, an empty one (no bins, zero count), or a legacy `distributions` entry, which is ignored |
 | `logit.input.metrics.degraded{reason="no_timestamp"}` | count | a point or sketch with no timestamp, stamped with `received_at` |
 | `logit.output.metrics.skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"\|"gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` | count | a metric kind no Datadog route carries; counted by the series encoders only |
-| `logit.output.metrics.skipped{reason="no_recorded_value"\|"non_finite_value"\|"empty_sketch"}` | count | a flagged record, a non-finite value, or a sketch with nothing in it |
+| `logit.output.metrics.skipped{reason="no_recorded_value"\|"non_finite_value"\|"empty_sketch"\|"oversized_sketch"}` | count | a flagged record, a non-finite value, a sketch with nothing in it, or a sketch whose counts split into more than `MAX_DOGSKETCH_ENTRIES` `k`/`n` entries |
 | `logit.output.metrics.degraded{reason="set_estimate"\|"sample_rate_expanded"\|"rebinned"\|"fractional_count"}` | count | a `Set` sent as a gauge of its estimate, a sampled `Samples` expanded into repeated values, a non-Agent sketch re-binned into the Agent mapping, or a fractional bin count rounded |
 | `logit.output.tags.dropped{reason="unrepresentable"\|"no_wire_form"}` | count | a tag value with no tag form (`Map`, `Bytes`, `Null`) or a carrier attribute of the wrong type; a `datadog.*` carrier the target route has no field for |
 | `logit.input.logs.skipped{reason="not_an_object"\|"no_message"}` | count | a log array element that isn't an object, or a log with no `message` |
@@ -1678,7 +1684,7 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
 `malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
 `bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
-chunk).
+chunk); `oversized_sketch` (an outgoing sketch dropped past the entry cap).
 
 ## Metrics from Lua scripts
 
