@@ -15,8 +15,9 @@
 //! The `proptest`s generate bodies from a grammar, so they reach every decode branch a valid body
 //! can: array and concatenated framing, every `time` form, each carrier present or absent, string,
 //! object, array, number, and bool log bodies, the OpenTelemetry exporter's log fields (valid and
-//! invalid trace pairs included), both metric forms under each `metric_type`, and span objects
-//! with events, links, and statuses, over flat and nested `fields`. Generated field keys start
+//! invalid trace pairs included), both metric forms under each `metric_type` with numeric and
+//! numeric-string measurements and with `event` `"metric"`, `null`, or absent, and span objects
+//! with events, links, and every `kind` and status spelling, over flat and nested `fields`. Generated field keys start
 //! with `x` so none collides with a reserved or carrier name, generated metric names already
 //! satisfy the sanitizer, and no generated value is `NaN`, which equality can't compare.
 
@@ -333,6 +334,8 @@ fn metric_value() -> impl Strategy<Value = Json> {
         (-10_000i32..10_000, 0u8..8).prop_map(|(n, q)| json!(n as f64 + q as f64 / 8.0)),
         any::<f64>().prop_filter("finite", |f| f.is_finite()).prop_map(|f| json!(f)),
         prop::sample::select(vec!["+Inf", "-Inf"]).prop_map(|s| json!(s)),
+        // A finite number as a string, as SC4S writes every measurement.
+        prop::sample::select(vec!["5", "1.5", " 2 ", "-0.25", "1e3"]).prop_map(|s| json!(s)),
     ]
 }
 
@@ -346,11 +349,14 @@ fn metric_event() -> impl Strategy<Value = (Json, Map<String, Json>)> {
         opt((metric_name(), metric_value())),
         opt(prop::sample::select(vec!["Gauge", "Sum", "Histogram", "Summary"])),
         prop::collection::btree_map("x[a-z_.]{0,6}", "[a-z0-9]{0,6}", 0..4),
+        // `"metric"`, or `null`, which `hec_object` sometimes writes as no `event` key at all:
+        // Splunk indexes a measurement with no `event` as a metric, and SC4S sends that shape.
+        prop_oneof![3 => Just(json!("metric")), 1 => Just(Json::Null)],
     )
-        .prop_filter("a metric event needs a measurement", |(multi, single, _, _)| {
+        .prop_filter("a metric event needs a measurement", |(multi, single, _, _, _)| {
             !multi.is_empty() || single.is_some()
         })
-        .prop_map(|(multi, single, metric_type, dims)| {
+        .prop_map(|(multi, single, metric_type, dims, event)| {
             let mut fields: Map<String, Json> =
                 dims.into_iter().map(|(k, v)| (k, Json::String(v))).collect();
             for (name, value) in multi {
@@ -363,7 +369,7 @@ fn metric_event() -> impl Strategy<Value = (Json, Map<String, Json>)> {
             if let Some(t) = metric_type {
                 fields.insert("metric_type".into(), json!(t));
             }
-            (json!("metric"), fields)
+            (event, fields)
         })
 }
 
@@ -388,10 +394,23 @@ fn span_event() -> impl Strategy<Value = (Json, Map<String, Json>)> {
                 json!("Producer"),
                 json!("Consumer"),
                 json!("Unspecified"),
+                json!("SPAN_KIND_UNSPECIFIED"),
+                json!("SPAN_KIND_INTERNAL"),
+                json!("SPAN_KIND_SERVER"),
                 json!("SPAN_KIND_CLIENT"),
+                json!("SPAN_KIND_PRODUCER"),
+                json!("SPAN_KIND_CONSUMER"),
                 json!(3),
             ]),
-            prop::sample::select(vec![json!("Unset"), json!("Ok"), json!("Error"), json!(2)]),
+            prop::sample::select(vec![
+                json!("Unset"),
+                json!("Ok"),
+                json!("Error"),
+                json!("STATUS_CODE_UNSET"),
+                json!("STATUS_CODE_OK"),
+                json!("STATUS_CODE_ERROR"),
+                json!(2),
+            ]),
             "\\PC{0,8}",
         ),
         (0i64..4_000_000_000_000_000_000, 0i64..1_000_000_000),
@@ -463,6 +482,7 @@ fn hec_object() -> impl Strategy<Value = Json> {
     (
         prop_oneof![3 => log_event(), 2 => metric_event(), 1 => span_event()],
         time(),
+        any::<bool>(),
         (
             opt(prop::sample::select(vec!["web-1", "web-2", ""])),
             opt(prop::sample::select(vec!["app", "/var/log/x.log"])),
@@ -470,7 +490,7 @@ fn hec_object() -> impl Strategy<Value = Json> {
             opt(prop::sample::select(vec!["main", "metrics"])),
         ),
     )
-        .prop_map(|((event, fields), time, (host, source, sourcetype, index))| {
+        .prop_map(|((event, fields), time, omit_null, (host, source, sourcetype, index))| {
             let mut obj = Map::new();
             for (key, value) in [
                 ("time", time),
@@ -483,7 +503,10 @@ fn hec_object() -> impl Strategy<Value = Json> {
                     obj.insert(key.into(), value);
                 }
             }
-            obj.insert("event".into(), event);
+            // Only a metric event is ever `null`; half of those leave the key out instead.
+            if !(event.is_null() && omit_null) {
+                obj.insert("event".into(), event);
+            }
             if !fields.is_empty() {
                 obj.insert("fields".into(), Json::Object(fields));
             }

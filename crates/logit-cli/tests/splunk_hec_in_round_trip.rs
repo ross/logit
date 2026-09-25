@@ -295,6 +295,7 @@ async fn every_recorded_request_is_answered_2xx() {
         .collect();
     stems.sort();
     assert_eq!(stems.len(), 32, "the whole recorded corpus");
+    let mut posts = 0;
     for stem in &stems {
         let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers"))).unwrap();
         let body = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
@@ -302,6 +303,9 @@ async fn every_recorded_request_is_answered_2xx() {
         let (_, method) = fields.next().expect("method first");
         let (_, path) = fields.next().expect("path second");
         let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        if method == reqwest::Method::POST {
+            posts += 1;
+        }
         let mut request = client().request(method, format!("http://{addr}{path}"));
         for (name, value) in fields {
             // reqwest writes its own framing and host; `connection` is a hop-by-hop header the
@@ -316,9 +320,15 @@ async fn every_recorded_request_is_answered_2xx() {
         assert!(status.is_success(), "{stem} ({path}): {status} {text}");
     }
 
-    // Give the drain task a moment to catch up, then check it saw at least one batch per
-    // `/event` or `/raw` capture (the `OPTIONS`/`GET` captures in the corpus deliver nothing).
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let delivered = delivered.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(delivered >= 24, "at least one batch per /event and /raw capture: {delivered}");
+    // Every `POST` is an `/event` or `/raw` capture that carries at least one event, so each
+    // delivers at least one batch; the `OPTIONS` and `GET` captures deliver nothing. The drain
+    // task trails the last answer, so wait for it rather than read once.
+    assert_eq!(posts, 28, "the corpus's /event and /raw captures");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = delivered.load(std::sync::atomic::Ordering::Relaxed);
+    while seen < posts && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        seen = delivered.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    assert!(seen >= posts, "at least one batch per POST capture: {seen} batches for {posts}");
 }
