@@ -94,9 +94,10 @@
 //! `graceful_shutdown` closes an *idle keep-alive* h1 connection promptly (`disable_keep_alive`
 //! calls `state.close()` when the connection's `KA` state is `Idle`) and GOAWAYs an established
 //! h2 one, the common cases. But a *fresh* h1 connection stopped mid-head is `KA::Busy` and keeps
-//! waiting, hyper-util's pre-sniff `ReadVersion` future resolves to `Err("Cancelled")`, and an h2
-//! connection still handshaking only sets an internal `close_pending` flag. The grace-then-drop
-//! exists for those three, which is why the post-shutdown result is ignored. The drop waits for
+//! waiting, and an h2 connection still handshaking only sets an internal `close_pending` flag: the
+//! grace-then-drop exists for those two. hyper-util's pre-sniff `ReadVersion` is a third shape:
+//! `graceful_shutdown` cancels it, and the first grace poll resolves at once to
+//! `Err("Cancelled")`, which is why the post-shutdown result is ignored. The drop waits for
 //! one thing: a request that *started* inside the grace and has not returned. Dropping the
 //! connection while its handler is parked in `Fanout::send` would discard a batch that never
 //! reached the fanout, so [`drive_with_idle`] polls that request out and then lets the grace run
@@ -2405,9 +2406,10 @@ mod tests {
 
     /// A connection that sent one head byte has completed nothing, so it is closed at the idle
     /// deadline from its own start. One byte leaves `auto`'s pre-sniff `ReadVersion` undecided
-    /// (`P` begins `POST` or the h2 `PRI` preface), which `graceful_shutdown` alone cannot close,
-    /// so the grace-then-drop ends it. `handshake_timeout` (the grace) is 50ms to fit inside
-    /// `expect_closed`'s 2s ceiling.
+    /// (`P` begins `POST` or the h2 `PRI` preface). `graceful_shutdown` cancels it, and the first
+    /// grace poll resolves at once to the `Err("Cancelled")` the driver discards, so the close
+    /// does not wait out the grace. `handshake_timeout` (the grace) is 50ms regardless, to fit
+    /// inside `expect_closed`'s 2s ceiling.
     #[tokio::test]
     async fn a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;

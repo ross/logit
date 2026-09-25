@@ -212,10 +212,12 @@ where
     }
 
     // Idle, or a stalled body asked for this. Ask hyper to close, give it `grace`, then drop the
-    // connection whatever that returned: `graceful_shutdown` alone leaves three cases parked, and
-    // the pre-sniff `ReadVersion` resolves `Err("Cancelled")` rather than `Ok(())`, so the result
-    // is discarded (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket
-    // closes with the pinned future.
+    // connection whatever that returned. `graceful_shutdown` alone leaves two cases parked, an h1
+    // head stopped mid-way (`KA::Busy`) and an h2 connection still handshaking, and those spend
+    // the grace. A pre-sniff `ReadVersion` does not: `graceful_shutdown` cancels it and the first
+    // poll below resolves at once to `Err("Cancelled")`, which is why the result is discarded
+    // (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket closes with
+    // the pinned future.
     shutdown(conn.as_mut());
     loop {
         if tokio::time::timeout(grace, conn.as_mut()).await.is_ok() {
@@ -223,7 +225,7 @@ where
         }
         if activity.in_flight() == 0 {
             // Nothing in flight, so the drop costs nothing: this is the case the grace exists
-            // for (a `KA::Busy` head, a cancelled pre-sniff, an h2 still handshaking).
+            // for (a `KA::Busy` head, an h2 still handshaking).
             break;
         }
         // A request started inside the grace window and its handler has not returned, most

@@ -594,7 +594,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.connections` | gauge | connections holding a permit, sampled on every connect and disconnect |
+| `logit.input.connections` | gauge | connections holding a permit, sampled on every connect and disconnect. Published by a drop guard (`crates/logit-inputs/src/listener.rs`), so a connection task that panics still counts itself out |
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |

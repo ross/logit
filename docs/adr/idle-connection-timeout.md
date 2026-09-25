@@ -302,3 +302,35 @@ kept both:
   `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
   looks the same. The cost is recorded under "TLS and connection lifecycle" in
   [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle).
+
+## Amendment: the hyper derivation re-run, and one claim corrected (2026-09-25)
+
+The close sequence in "`otlp_in`: a service-level in-flight tracker" depends on hyper internals,
+so it was derived again from the pinned sources (hyper 1.11.1, hyper-util 0.1.20, h2 0.4.19) and
+each claim checked with a test against a real socket:
+
+| Claim | Result |
+|---|---|
+| The h1 server polls the socket mid-message (`mid_message_detect_eof`'s `force_io_read`) | Holds |
+| `graceful_shutdown` closes a `KA::Idle` h1 connection at once (`disable_keep_alive` calls `state.close()`) | Holds |
+| A fresh h1 connection stopped mid-head is `KA::Busy` and keeps waiting after `graceful_shutdown` | Holds; it spends the grace |
+| An h2 connection still handshaking only sets `close_pending` | Holds; it spends the grace |
+| An established h2 connection gets `GOAWAY` | Holds |
+| `header_read_timeout` re-arms across idle keep-alive gaps | Holds |
+| hyper-util's pre-sniff `ReadVersion` is one of the cases the grace exists for | **Corrected.** `graceful_shutdown` cancels it, and the first grace poll resolves at once to `Err("Cancelled")`. It never spends the grace; it is the reason the post-shutdown result is discarded |
+| A pipelined h1 client, or an h2 client opening streams, can hold the wait-out loop open while silent | Retired. Requests pipelined inside the grace are served one at a time and the connection then closes; only being served extends the window |
+
+Two findings came out of the same review, both fixed in the shared listener code:
+
+- **A body read held one hyper buffer per read.** On h1, each body frame is a slice of the
+  connection's read buffer, and hyper allocates a fresh buffer behind it while the frame is
+  alive. `collect_with_stall_bound` kept every frame until the body ended, so a 4 MiB body
+  arriving one MSS per read held about 23 MiB. It now copies every frame after the first into one
+  growing buffer.
+- **A client that closes mid-send cancels the handler.** On h1 an EOF drops hyper's service
+  future, and on h2 an `RST_STREAM` or a dropped connection cancels the stream's task. A handler
+  parked in `Fanout::send` on its second consumer then leaves the first holding the batch, and
+  the client's retry duplicates it there. `otlp_in` and `prometheus_in`'s receiver now send
+  through `Fanout::send_reserved`, which reserves every consumer before delivering to any. The
+  wait-out loop's contract is unchanged: a handler blocked forever in a send holds its connection
+  and permit, as the amendment above records.

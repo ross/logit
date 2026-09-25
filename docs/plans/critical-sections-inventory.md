@@ -44,7 +44,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 |---|---|---|---|
 | 1 | `DdSketch::merge` `.expect()`s matching configs, but sketches arrive decoded from peer bytes over `logit_in` / disk spool — a remote-reachable panic | CORE-05, WIRE-03 | CORE-05 side gone: the hand-rolled `DdSketch` re-bins on a mismatch instead of panicking (`f680bd06`). WIRE-03 findings → dos/w2 (the native decoder hands a sketch blob to `DdSketch::from_bytes` whole, and a decoded sketch reaches `merge` only through `aggregate`); the replacement `DdSketch` in-progress (dos/w3) |
 | 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | in-progress (dos/w3); WIRE-03 findings → dos/w2: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is W3's |
-| 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | in-progress (dos/w6) |
+| 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | **Done** (findings → dos/w6): the 200 is pinned explicitly with the reset and header-list defaults, and every worst-case figure is corrected |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → dos/w5): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 in-progress (dos/w4); measured 2026-09-25: JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; downgraded to P2 pending W4's pinning tests. CORE-17 open |
 | 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | open |
@@ -199,9 +199,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → dos/w5 |
 | [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
-| [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | in-progress (dos/w6) |
-| [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | in-progress (dos/w6) |
-| [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | in-progress (dos/w6) |
+| [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | findings → dos/w6 |
+| [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | findings → dos/w6 |
+| [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | findings → dos/w6 |
 | [CODEC-16](#codec-16--otlpjson-anyvalue-decode--unbounded-recursion-on-attacker-controlled-nesting) | P0 | OTLP/JSON `AnyValue` decode — unbounded recursion on attacker-controlled nesting | `crates/logit-proto/src/otlp/json/mod.rs` (`any_value`) | in-progress (dos/w4) |
 | [CORE-05](#core-05--ddsketch-wrapper-merge-panics-on-a-config-mismatch-reachable-from-the-wire) | P0 | `DdSketch` wrapper: `merge` panics on a config mismatch reachable from the wire | `crates/logit-core/src/metric.rs` (`DdSketch`, `DdSketch::merge`, `DdSketch::from_java_bytes`) | in-progress (dos/w3) |
 | [CORE-06](#core-06--hyperloglog-hand-rolled-serde-byte-codec-working-around-an-upstream-allocation-layout-ub) | P0 | `HyperLogLog`: hand-rolled serde byte codec working around an upstream allocation-layout UB | `crates/logit-core/src/metric.rs` (`HyperLogLog`, `HllBytesWriter`, `HllBytesReader`) | in-progress (dos/w3) |
@@ -4253,22 +4253,27 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 - **Invariants to verify:**
   - `inflate` truly bounds the decompressed size: `take(MAX + 1)` then
     `len() > MAX` catches an input inflating to exactly `MAX + 1` and never silently truncates.
-  - `grpc_unframe`'s `bytes.get(5..5 + len)` cannot overflow (`len` is `u32 as usize`,
-    safe on 64-bit; confirm the 32-bit target story is a non-goal).
+  - ~~`grpc_unframe`'s `bytes.get(5..5 + len)` cannot overflow (`len` is `u32 as usize`,
+    safe on 64-bit; confirm the 32-bit target story is a non-goal).~~ **retired.** `5 + len` fits in
+    a 64-bit `usize` for every `u32` length, and no shipped target is 32-bit.
   - A body carrying more than one gRPC frame is either rejected or documented as
-    first-frame-only — today it is silently first-frame-only.
+    first-frame-only — today it is silently first-frame-only. **fixed: rejected.** Bytes after the
+    first message answer `grpc-status: 3` naming the leftover count
+    (`a_second_grpc_frame_in_one_body_is_invalid_argument`, seen to fail first with status `0`).
   - Every error path answers HTTP 200 with a gRPC status in trailers (or headers), never a bare
     HTTP error, so a gRPC client sees a status rather than a transport failure.
   - `request_encoding` treats absent/empty/non-ASCII `Content-Type` as protobuf, and
     matches case-insensitively with parameters stripped.
   - `export_response`'s hand-written protobuf is wire-identical to the generated
-    `Export*ServiceResponse` for all three signals.
+    `Export*ServiceResponse` for all three signals. **Holds**: compared byte for byte against a
+    `prost::Message` built from the vendored protos over nine `(rejected, message)` cases,
+    including `i64::MIN`, a negative count, a 300-byte message, and non-ASCII text.
   - The 4 MiB `Limited` bounds the *compressed* body and `MAX_CONCURRENT_CONNECTIONS` bounds the
     multiplier; the JSON path's real multiple of that is explicitly unmeasured
     (`docs/known-gaps.md`).
 - **Observed concerns (unverified):**
-  - Multi-frame gRPC request bodies are silently truncated to the first message (`handle_grpc`'s
-    `grpc_unframe` call).
+  - ~~Multi-frame gRPC request bodies are silently truncated to the first message (`handle_grpc`'s
+    `grpc_unframe` call).~~ **fixed** (see the invariant above).
     Unary OTLP never sends more than one, so this is correct in practice, but it is an unsignalled
     drop rather than an `INVALID_ARGUMENT`. **High confidence in the behavior, low confidence it
     matters.**
@@ -4277,7 +4282,15 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     content-codings are case-insensitive. **Medium-high confidence this is a real (if minor)
     interop gap, and it is inconsistent with `request_encoding`'s deliberate
     case-insensitivity in the same file.**
-    Same pattern for `grpc-encoding` in `handle_grpc`.
+    Same pattern for `grpc-encoding` in `handle_grpc`. **fixed**: both headers match
+    case-insensitively (RFC 9110 §8.4.1); `a_capitalised_content_encoding_is_accepted` and
+    `a_capitalised_grpc_encoding_is_accepted` were seen to fail first with `415` and
+    `grpc-status: 12`.
+  - **Stream cap (dos/w6).** Both transports build through `crate::http::h2_builder`/
+    `auto_builder`, which set hyper's own defaults explicitly (200 streams, 20 pending-accept
+    resets, a 16 KiB header list); `the_h2_settings_frame_advertises_the_pinned_stream_cap` reads
+    the server's SETTINGS frame. `inflate`'s bound **holds**: an input inflating to
+    `MAX_REQUEST_BYTES` decodes and one byte more is `TooLarge`.
   - Error responses on the OTLP/HTTP path are `text/plain` rather than a protobuf `Status` —
     already recorded in `docs/known-gaps.md` as a pre-existing deviation. **Context.**
   - `partial_success` is always empty on success — recorded in `docs/known-gaps.md`. **Context.**
@@ -4326,27 +4339,51 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `in_flight == 0` with a stale `last_progress`.
   - The `notified()` arms cannot miss a notification (`Notify::notify_one` stores a permit, so a
     notification racing the `select!` arm's creation is not lost — verify for all three sites).
-  - The wait-out loop in `drive_with_idle` cannot spin forever against a peer that keeps starting new
+  - ~~The wait-out loop in `drive_with_idle` cannot spin forever against a peer that keeps starting new
     requests — the comment argues only "continuing to be served" extends it; confirm a pipelined
-    h1 client or an h2 client opening streams cannot hold it open indefinitely.
+    h1 client or an h2 client opening streams cannot hold it open indefinitely.~~ **retired.** A
+    fresh-context refuter pipelined requests inside the grace behind a slow consumer: they were
+    served in turn and the connection then closed, so only being served extends the window.
   - `conn` keeps being polled while waiting on `in_flight` (the deadlock `drive_with_idle`'s doc
     comment names) on both the h1 and h2 arms.
-  - The pinned-hyper claims still hold against the version in `Cargo.lock`.
+  - The pinned-hyper claims still hold against the version in `Cargo.lock`. **Holds, one claim
+    corrected**: the derivation was re-run against hyper 1.11.1, hyper-util 0.1.20, and h2 0.4.19
+    (the per-claim table is ADR `idle-connection-timeout`'s second 2026-09-25 amendment). The
+    pre-sniff `ReadVersion` is not a case the grace exists for: its first grace poll resolves at
+    once to the discarded `Err("Cancelled")`. `drive_with_idle`'s comment and `otlp.rs`'s module
+    doc say so now.
   - `collect_with_stall_bound`'s bound is per-frame, never total, and drops trailers exactly as
-    `Collected::to_bytes` does.
+    `Collected::to_bytes` does. **fixed: one buffer per body.** The bound and trailer handling
+    hold, but keeping every frame kept hyper's h1 read buffer behind each one: 256 KiB arriving in
+    256-byte writes held 31× the body (`a_body_arriving_in_small_writes_is_held_once`, seen to
+    fail first). Frames after the first are now copied into one growing buffer (1.0× at 256-byte
+    writes).
+  - **A client closing mid-send split a fan-out (dos/w6).** A client that closes while its
+    handler waits on a full second consumer cancels the handler (h1 EOF drops the service future;
+    h2 `RST_STREAM` cancels the stream task), leaving the first consumer holding the batch and
+    the retry duplicating on it. **fixed**: `otlp_in` and `prometheus_in` send through
+    `Fanout::send_reserved`, which reserves every consumer before delivering
+    (`a_send_cancelled_after_the_first_consumer_accepted_leaves_no_consumer_with_the_batch`,
+    `a_client_that_closes_while_its_batch_waits_leaves_no_consumer_with_it`, both seen to fail
+    first with `(true, false)`).
 - **Observed concerns (unverified):**
   - The wait-out loop (`drive_with_idle`'s post-`shutdown` loop) has no overall ceiling: `grace` restarts each iteration as long
     as `in_flight > 0`. A client that keeps a request in flight indefinitely (a handler blocked on
     a permanently-full downstream) keeps the connection and its permit alive past the idle close.
     That is the intended trade-off (better than losing the batch), but it means `idle_timeout` is
     not an upper bound on connection lifetime. **High confidence in the behavior; it is argued for
-    in the comment, so this is a "confirm it's the intended contract" item.**
+    in the comment, so this is a "confirm it's the intended contract" item.** **Holds** as the
+    contract: `docs/known-gaps.md` ("TLS and connection lifecycle") records that a handler blocked
+    forever in a send holds its connection and permit.
   - `otlp_in`'s accept loop (`OtlpInput::run` in `otlp.rs`) does not race shutdown at all, and connections hold
     `Fanout` clones — already recorded in `docs/known-gaps.md` ("`otlp_in` can hold the graph open
     past shutdown"), narrowed but not closed by `idle_timeout`. **Context, documented.**
   - The `logit.input.connections` gauge decrement (`live_connections.fetch_sub` in
     `OtlpInput::run`'s spawned task) is a statement, not a guard —
-    same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.**
+    same panic-leaks-the-gauge shape as `logit_in`. **High confidence in the shape.** **fixed**:
+    `crate::listener::LiveConnections` hands out a drop guard at all six gauge sites; an h1 handler
+    panic left the gauge at `1.0` before and `0.0` after
+    (`a_panicking_handler_still_returns_the_connections_gauge_to_zero`, seen to fail first).
 - **Existing coverage:** the idle/stall tests in `crates/logit-inputs/src/otlp.rs`'s test module,
   and the equivalents in `crates/logit-inputs/src/prometheus.rs`. ADR `idle-connection-timeout`,
   `otlp_in`'s own module doc (`crates/logit-inputs/src/otlp.rs`) is the reasoning of record.
@@ -4602,14 +4639,18 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - The decompressed body can never exceed `MAX_REQUEST_BYTES`: `decompress_len` (in
     `write_response`) is authoritative, and a block whose declared length lies about what it
     actually expands to must be a `snap` error rather than a larger allocation in the following
-    `decompress_vec`.
+    `decompress_vec`. **Holds**, per the refuter's measurements: a 200-byte block declared as 10,
+    199, 201, or 100,000 bytes is a `snap` error, `MAX_REQUEST_BYTES + 1` and `u32::MAX` are rejected before any expansion, and a
+    lying block over the wire is `400`. zstd holds too: a window over the cap and a declared
+    content size over it are rejected, and one at the cap decodes.
   - A connection's permit is released on every exit: rejected (the `try_acquire_owned` `else` arm's `drop(stream)`), handshake timeout,
     TLS failure, clean pre-first-byte close (the `Ok(Ok(0))` arm of the first-byte `peek`),
     normal exit, panic unwinding through the
-    spawned task.
+    spawned task. **Holds** on all six, each driven against a `with_max_connections(1)` receiver
+    that then served a follow-up request.
   - `logit.input.connections` (`live_connections.fetch_add` and `fetch_sub` in `run`'s spawned
     task) reconciles to 0 when the listener is
-    quiet.
+    quiet. **fixed**: a panic left it at 1; it is now a drop guard (WIRE-11).
   - Exactly one `logit.input.writes{class}` plus one `write.duration` per request, across all
     seven exits (`handle_write` wraps `write_response`).
   - `with_written_headers` emits the three `-Written` headers on 2.0 only, on both 2xx and 4xx,
@@ -4626,7 +4667,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     RFC 7540's default is unlimited. One h2c connection can therefore hold many concurrent
     streams, each with up to 4 MiB compressed + 4 MiB decompressed + a decoded `Vec<Event>`, so
     the worst case is `1024 × streams × ~8 MiB`, not `1024 × 8 MiB`. **Medium-high confidence —
-    this is the most consequential finding in the Prometheus half.**
+    this is the most consequential finding in the Prometheus half.** **Corrected, then pinned.**
+    hyper 1.11.1's h2 server default is 200 streams, not RFC 7540's unlimited. The receiver now
+    builds through `crate::http::auto_builder`, which sets the 200 explicitly, and
+    `MAX_CONCURRENT_CONNECTIONS`' doc states the 1024 × 200 × 2 × 4 MiB = 1.6 TiB product.
   - **The accept loop terminates the input on any `accept()` error** (the `?` on
     `accept_queue.accept` in `PrometheusReceiver::run`), where `prometheus_out`'s own loop backs
     off and continues (`crates/logit-outputs/src/prometheus.rs`'s `serve`). This is the
@@ -4636,9 +4680,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `EMFILE` burst kills the listener for the process's life while the sibling sink survives it.
   - A default `bind:` (no `idle_timeout:`) has no bound at all on a half-uploaded request,
     holding a permit until the peer goes away. **Documented deliberate gap; context.**
-  - `live_connections` is a manual `fetch_add`/`fetch_sub` pair rather than a
+  - ~~`live_connections` is a manual `fetch_add`/`fetch_sub` pair rather than a
     drop guard like `InFlight`, so a panic unwinding out of `serve_write_connection` leaks the
-    gauge permanently. **Low confidence it's reachable; same shape as `logit_in`/`otlp_in`.**
+    gauge permanently. **Low confidence it's reachable; same shape as `logit_in`/`otlp_in`.**~~
+    **fixed** (the gauge invariant above).
 - **Existing coverage:** in-file receiver tests
   (`bind_makes_the_port_live_before_run_and_a_second_bind_is_a_no_op` through
   `a_silent_connection_releases_its_permit_after_the_handshake_timeout`) — 204 on 1.0 and 2.0 with `-Written`, 404/405+Allow,

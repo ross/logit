@@ -693,6 +693,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
   considered"). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
   concurrent large requests.
+- **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
+  handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
+  the grace after it closes the connection; it ends when the send completes or the client goes
+  away ([ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
+  By design: closing it would drop a batch that never reached the fanout.
 
 ## Cross-protocol mappings
 
@@ -1309,7 +1314,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
   node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
   `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the existing 4 GiB figure. Measured
+  worst case across all connections is a finite multiple of the protobuf path's
+  1024 × 200 × 2 × 4 MiB = 1.6 TiB, itself a bound rather than a memory budget. Measured
   2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
   98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
   the 98× shape needs crafted input, a non-goal under
@@ -1470,9 +1476,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `X-Prometheus-Remote-Write-Samples-Written` header, and a counter disagreeing with that header
   would have no right answer. A mode tag was considered and not added: the modes are already told
   apart by which of `logit.input.scrapes`/`logit.input.writes` the component reports.
-- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.** `Fanout::send`
-  silently skips a closed consumer (counted `logit.component.events.dropped{reason=
-  "closed_consumer"}`, `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
+- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**
+  `Fanout::send_reserved`, like every `Fanout` send, silently skips a closed consumer (counted
+  `logit.component.events.dropped{reason="closed_consumer"}`,
+  `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
   the `Fanout` *before* building the response — `otlp_in`'s ordering, which lets channel
   backpressure throttle the sender's queue. So during a shutdown that has already torn down the
   downstream half of the graph, a sender gets `204` (and, on 2.0, a non-zero `Samples-Written`) for
