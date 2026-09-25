@@ -1314,8 +1314,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
   node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
   `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the protobuf path's
-  1024 × 200 × 2 × 4 MiB = 1.6 TiB, itself a bound rather than a memory budget. Measured
+  worst case across all connections is a finite multiple of the protobuf path's 1.6 TiB, itself
+  a bound rather than a memory budget (`MAX_CONCURRENT_STREAMS` in
+  `crates/logit-inputs/src/http.rs` has the formula). Measured
   2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
   98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
   the 98× shape needs crafted input, a non-goal under

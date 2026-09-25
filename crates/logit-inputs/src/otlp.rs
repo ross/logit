@@ -22,8 +22,9 @@
 //! correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
 //! `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up and closes
 //! cancels only the handler's wait: [`crate::http::deliver_detached`] runs the request's sends on
-//! a task of their own, so every consumer still gets every batch, and the retry duplicates on
-//! every branch alike rather than on some.
+//! a task of their own, so every consumer still gets every batch of the request, however many
+//! batches (one per resource) it decoded to. The retry then duplicates on every branch alike
+//! rather than on some.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -139,7 +140,7 @@
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one request;
 //! [`crate::http::MAX_CONCURRENT_STREAMS`] bounds the requests on one HTTP/2 connection and
 //! [`MAX_CONCURRENT_CONNECTIONS`] how many connections are served at once, so the listener's
-//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the product).
+//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the figure).
 //!
 //! **`partial_success` is always empty on a successful decode.** It exists to report which
 //! records in an accepted request were rejected, but `logit_proto::SignalDecoder::decode_signal`
@@ -183,11 +184,9 @@ use tokio_rustls::TlsAcceptor;
 /// Matches the OTel collector's default `max_recv_msg_size`.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once. The listener's worst case is this times
-/// [`crate::http::MAX_CONCURRENT_STREAMS`] (200 streams per HTTP/2 connection) times twice
-/// [`MAX_REQUEST_BYTES`] (a compressed body and its inflated copy): 1024 × 200 × 2 × 4 MiB =
-/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget. The
-/// same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an OTLP listener
+/// Bounds the connections [`Input::run`] serves at once. With 4 MiB requests this listener's worst
+/// case is 1.6 TiB, a bound rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`]
+/// has the formula). The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an OTLP listener
 /// to differ, and one figure for an operator to learn. Not operator-tunable; make it a config
 /// field if a deployment needs a different number.
 ///
@@ -657,7 +656,8 @@ async fn handle_grpc(
     // The frame's compressed flag (`grpc_unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
     if let Some(enc) = req.headers().get("grpc-encoding") {
-        // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is.
+        // A content-coding name, so case-insensitive (RFC 9110 §8.4.1), as `Content-Encoding` is;
+        // ADR `untrusted-input-bounds` makes that uniform across the HTTP listeners.
         let enc = enc.to_str().unwrap_or("").trim();
         if !enc.eq_ignore_ascii_case("identity") && !enc.eq_ignore_ascii_case("gzip") {
             return Ok(grpc_response(
@@ -685,7 +685,7 @@ async fn handle_grpc(
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
     };
     // `Export` is unary, so its body is one message. Bytes after it are a sender's encoder bug,
-    // answered rather than dropped unread.
+    // answered rather than dropped unread (ADR `untrusted-input-bounds`).
     let leftover = framed.len() - 5 - payload.len();
     if leftover != 0 {
         return Ok(grpc_response(
