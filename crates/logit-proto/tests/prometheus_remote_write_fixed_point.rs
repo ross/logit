@@ -24,9 +24,10 @@
 //!   round trip). The *stale* NaN is a different question -- it is a bit pattern, not a value --
 //!   and is generated and asserted.
 //! - sub-millisecond timestamps: both versions carry milliseconds, which is a named normalization.
-//! - a label value that is empty, or a label name that is not strictly ascending: both specs forbid
-//!   a sender from producing either, and this codec drops them on the way out and skips them on the
-//!   way in. Their own hand-built tests below cover that.
+//! - a label value that is empty, or a repeated label name: both specs forbid a sender from
+//!   producing either, and this codec drops them on the way out and skips them on the way in. Their
+//!   own hand-built tests below cover that, and cover a label set out of byte order, which the
+//!   decoder sorts rather than skips.
 //! - more than one exemplar per series, and exemplars on anything but a counter: an exemplar hangs
 //!   off a `TimeSeries` rather than a sample in both versions, so a series with several timestamps
 //!   cannot say which sample an exemplar came from. Hand-built tests cover placement instead.
@@ -390,18 +391,19 @@ fn version_1_with_metadata_assembles_one_histogram() {
 /// A bad label set skips one series, not the request: the good series still decodes.
 #[test]
 fn an_invalid_label_set_skips_one_series_rather_than_the_request() {
-    let bad: [&[(&str, &str)]; 5] = [
+    let bad: [&[(&str, &str)]; 6] = [
         // no `__name__`
         &[("code", "200")],
         // an empty `__name__`
         &[("__name__", "")],
-        // not ascending -- `_` is 0x5f, so `__name__` sorts *below* `code` and this pair is
-        // the wrong way round
-        &[("code", "200"), ("__name__", "foo")],
         // an empty label value
         &[("__name__", "foo"), ("zzz", "")],
-        // a repeated label name (which "strictly ascending" also rules out)
+        // a repeated label name
         &[("__name__", "foo"), ("code", "200"), ("code", "500")],
+        // a repeated label name the sort brings together
+        &[("code", "200"), ("__name__", "foo"), ("code", "500")],
+        // a repeated `__name__`
+        &[("__name__", "foo"), ("__name__", "bar")],
     ];
     for labels in bad {
         let decoded = decode_v1(pb1::WriteRequest {
@@ -413,6 +415,32 @@ fn an_invalid_label_set_skips_one_series_rather_than_the_request() {
         assert_eq!(families[0].name, "good");
         assert_eq!(decoded.samples, 1, "{labels:?}");
     }
+}
+
+/// A label set out of byte order decodes to the same series its sorted form does. vmagent sends
+/// one on every series with exposition labels: it appends the target's `instance`/`job` after them.
+#[test]
+fn an_unsorted_label_set_decodes_as_its_sorted_form() {
+    let sorted = decode_v1(pb1::WriteRequest {
+        timeseries: vec![v1_series(
+            &[("__name__", "foo"), ("instance", "a:9100"), ("job", "j"), ("leg", "x")],
+            1.0,
+        )],
+        metadata: Vec::new(),
+    });
+    // vmagent's order: `__name__`, the exposition's labels, then the target's.
+    let unsorted = decode_v1(pb1::WriteRequest {
+        timeseries: vec![v1_series(
+            &[("__name__", "foo"), ("leg", "x"), ("instance", "a:9100"), ("job", "j")],
+            1.0,
+        )],
+        metadata: Vec::new(),
+    });
+    assert_eq!(unsorted.samples, 1, "an unsorted label set is not skipped");
+    assert_eq!(unsorted.groups, sorted.groups);
+    let labels: Vec<&str> =
+        unsorted.groups[0][0].series[0].labels.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(labels, ["instance", "job", "leg"]);
 }
 
 /// Labels sort by byte order, so an uppercase-initial label name precedes `__name__` (`_` is 0x5f).

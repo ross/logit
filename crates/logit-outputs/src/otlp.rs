@@ -443,14 +443,22 @@ fn default_client_tls_config() -> rustls::ClientConfig {
 /// `http://` and ALPN `h2` for `https://`; `https_or_http` lets one connector serve both, since
 /// the scheme decides TLS. `tls.alpn_protocols` must be empty (`with_tls_config` panics
 /// otherwise); neither `default_client_tls_config` nor `crate::tls::build_client_config` sets it.
+///
+/// `TCP_NODELAY` is on because h2 writes a request's HEADERS and DATA frames separately: with
+/// Nagle's algorithm on, the DATA frame waits for the peer's delayed ACK of the HEADERS, which
+/// adds about 40 ms to every export on Linux. `enforce_http(false)` is what `build()` sets too,
+/// so the one connector still dials `https://`.
 fn build_grpc_client(
     tls: &rustls::ClientConfig,
 ) -> GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_nodelay(true);
     let connector = HttpsConnectorBuilder::new()
         .with_tls_config(tls.clone())
         .https_or_http()
         .enable_http2()
-        .build();
+        .wrap_connector(http);
     let mut builder = GrpcClient::builder(TokioExecutor::new());
     builder.http2_only(true);
     builder.build(connector)

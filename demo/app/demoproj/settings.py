@@ -15,7 +15,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# A fixed demo value, like demo/compose.yaml's INFLUXDB_TOKEN: this stack has no real users or
+# A fixed demo value, like demo/compose.yaml's POSTGRES_PASSWORD: this stack has no real users or
 # sessions to protect. Never do this outside a throwaway demo.
 SECRET_KEY = "demo-only-not-a-real-secret"
 

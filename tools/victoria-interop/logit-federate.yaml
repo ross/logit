@@ -1,0 +1,17 @@
+# Leg 9 of `script/victoria-interop`: `prometheus_in` scraping VictoriaMetrics's `/federate` for
+# leg 1's gauge, rendered to a file the harness reads. VictoriaMetrics writes no `# TYPE` lines,
+# so the series are expected back untyped.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  federate:
+    type: prometheus_in
+    # `match[]`, percent-encoded.
+    scrape_targets: ["http://victoria-metrics:8428/federate?match%5B%5D=vi_rw1_gauge"]
+    interval: 5s
+
+  scraped:
+    type: stdio_out
+    sources: [federate]
+    target: /out/federate.log

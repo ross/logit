@@ -301,7 +301,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component.
 27. A `docker_in` that would tail nothing, or with an empty or duplicate entry or an empty `root`.
 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
-29. A `file_out` that would never rotate, or a `rotate.max_bytes`/`max_files` of `0`.
+29. A `file_out` that would never rotate, a `rotate.max_bytes`/`max_files` of `0`, or a
+    `max_files` above 1000 (`logit_config::MAX_ROTATE_FILES`).
 30. A `kv` with an empty, identical, or overlapping `pair_sep`/`kv_sep`.
 31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named group.
 32. A `csv` with no `columns`, an empty or duplicate column name, or an unusable `delimiter`.
@@ -346,9 +347,11 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     route rule, a bad `max_length`, or `forwarded: {trust: false}`.
 61. A `sample` rate outside `[0, 1)` (`0` needs `always_keep`), an empty field name, a malformed
     `always_keep`, or `missing:` without `key:`.
-62. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
+62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose
+    `checkpoint_path` is another's `<checkpoint_path>.tmp`.
+63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
     whitespace.
-63. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
+64. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
     path, or `tls` without `bind`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*

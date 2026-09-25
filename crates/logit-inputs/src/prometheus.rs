@@ -109,13 +109,20 @@
 //!
 //! | Request | Response |
 //! |---|---|
-//! | `POST path`, `Content-Encoding: snappy`, recognised `Content-Type` | decode, then `204` |
+//! | `POST path`, `Content-Encoding: snappy` or `zstd`, recognised `Content-Type` | decode, then `204` |
 //! | any other path | `404` |
 //! | any other method on `path` | `405` + `Allow: POST` |
 //! | missing or other `Content-Encoding`, unrecognised or missing `Content-Type` | `415` |
-//! | a body, or a Snappy `decompress_len`, over [`MAX_REQUEST_BYTES`] | `413` |
+//! | a body, or its decompressed size, over [`MAX_REQUEST_BYTES`] | `413` |
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
-//! | Snappy or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
+//! | Snappy, zstd, or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
+//!
+//! **`zstd` is the VictoriaMetrics remote write protocol**: a 1.0 request compressed with zstd,
+//! which vmagent sends by default
+//! ([ADR `victoriametrics-interop`](../../../docs/adr/victoriametrics-interop.md)). Any other
+//! encoding stays `415` because vmagent downgrades to Snappy on a `415` or `400`, and on nothing
+//! else. A zstd body under a 2.0 `Content-Type` is decoded like any other; only the sender's rule
+//! 56 pairs zstd with 1.0.
 //!
 //! **`405` diverges from `otlp_in`**, which answers `404` for a non-`POST`. `prometheus_out`'s
 //! exposition server answers `405` for a wrong method on `/metrics`, and this receiver matches
@@ -237,9 +244,11 @@
 //!
 //! ## Size, concurrency, and shutdown
 //!
-//! [`MAX_REQUEST_BYTES`] (4 MiB) bounds the **decompressed** body, checked against Snappy's own
-//! `decompress_len` before a byte is expanded, so a compression bomb is rejected rather than
-//! inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
+//! [`MAX_REQUEST_BYTES`] (4 MiB) bounds the **decompressed** body, through
+//! [`logit_proto::prometheus::compression::decompress_bounded`]: Snappy's own `decompress_len`
+//! before a byte is expanded, and for zstd the declared content size, the window size, and a
+//! streaming decode that stops one byte past the cap. So a compression bomb is rejected rather
+//! than inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
 //! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
 //! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
 //! listener, its first byte on a plaintext one. None of the three is a config field: the first
@@ -271,7 +280,8 @@
 //! ## Counters
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
-//! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. `logit.input.write.duration`
+//! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. An `ok` count also carries
+//! `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent stayed on zstd. `logit.input.write.duration`
 //! -- a timing sample per request, recorded regardless of outcome. `logit.input.samples` --
 //! reused from scrape mode, counting the wire samples that reached the `Fanout`: every decoded
 //! series' worth minus every series the model mapping then dropped, the number the `-Written`
@@ -314,6 +324,7 @@ use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
+use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
 use logit_proto::prometheus::{
     families_to_events, families_to_events_with, remote_write, text, Dialect, FamilyType,
     MetricFamily, PrometheusDecoder, Series, ATTR_TARGET, LABEL_INSTANCE,
@@ -750,9 +761,10 @@ impl Input for PrometheusInput {
 // Bind mode: the remote-write receiver
 // -------------------------------------------------------------------------------------------------
 
-/// Hard cap on one remote-write request's **decompressed** body, checked against Snappy's
-/// `decompress_len` (read from the block header) *before* a byte is expanded, so a compression
-/// bomb is rejected rather than inflated. The same number and hardcoded posture as `otlp_in`'s
+/// Hard cap on one remote-write request's **decompressed** body, enforced by
+/// [`compression::decompress_bounded`] without expanding past it (its module doc has the Snappy
+/// check and zstd's three), so a compression bomb is rejected rather than inflated. Also the
+/// compressed body's cap. The same number and hardcoded posture as `otlp_in`'s
 /// cap: a denial-of-service bound, not a tuning knob. Prometheus's default
 /// `max_samples_per_send` of 2000 puts a real request orders of magnitude under it, so an
 /// operator who hits this has a misconfigured sender.
@@ -1367,7 +1379,8 @@ where
 }
 
 /// One request, timed and counted: every exit from [`write_response`], early rejections included,
-/// contributes one `logit.input.writes{class}` count and one `logit.input.write.duration` timing.
+/// contributes one `logit.input.writes{class}` count (plus `encoding` on `ok`) and one
+/// `logit.input.write.duration` timing.
 #[allow(clippy::too_many_arguments)]
 async fn handle_write(
     req: http::Request<Incoming>,
@@ -1382,7 +1395,7 @@ async fn handle_write(
     stall: Option<Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
     let started = Instant::now();
-    let (class, response) = write_response(
+    let (class, encoding, response) = write_response(
         req,
         path,
         resource,
@@ -1395,13 +1408,20 @@ async fn handle_write(
         stall,
     )
     .await;
-    telemetry.count("logit.input.writes", 1.0, &[("class", class)]);
+    match encoding {
+        Some(encoding) => {
+            let tags = [("class", class), ("encoding", encoding.as_str())];
+            telemetry.count("logit.input.writes", 1.0, &tags);
+        }
+        None => telemetry.count("logit.input.writes", 1.0, &[("class", class)]),
+    }
     telemetry.timing("logit.input.write.duration", started.elapsed(), &[]);
     Ok(response)
 }
 
 /// The routes table in this module's doc comment, in order, returning the
-/// `logit.input.writes{class}` label alongside the response.
+/// `logit.input.writes{class}` label alongside the response, and on `ok` the encoding the request
+/// arrived in.
 #[allow(clippy::too_many_arguments)]
 async fn write_response(
     req: http::Request<Incoming>,
@@ -1414,9 +1434,9 @@ async fn write_response(
     mut diag: Diagnostics,
     activity: &Activity,
     stall: Option<Duration>,
-) -> (&'static str, http::Response<Full<Bytes>>) {
+) -> (&'static str, Option<Encoding>, http::Response<Full<Bytes>>) {
     if req.uri().path() != path {
-        return ("not_found", text_response(None, StatusCode::NOT_FOUND, "not found"));
+        return ("not_found", None, text_response(None, StatusCode::NOT_FOUND, "not found"));
     }
     // `405 + Allow: POST` where `otlp_in` answers `404`: this matches `prometheus_out`'s
     // exposition server (the module doc's "Routes" section).
@@ -1427,24 +1447,31 @@ async fn write_response(
             "only POST is accepted on a remote-write endpoint",
         );
         response.headers_mut().insert(http::header::ALLOW, HeaderValue::from_static("POST"));
-        return ("method", response);
+        return ("method", None, response);
     }
 
     // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a
-    // missing header is as unusable as a wrong one.
-    let encoding = header_str(req.headers(), http::header::CONTENT_ENCODING);
-    if !encoding.eq_ignore_ascii_case(remote_write::CONTENT_ENCODING_SNAPPY) {
+    // missing header is as unusable as a wrong one. `zstd` is the VictoriaMetrics variant; the
+    // `415` for anything else is what vmagent's downgrade to Snappy keys on (the module doc's
+    // "Routes").
+    let header = header_str(req.headers(), http::header::CONTENT_ENCODING);
+    let Some(encoding) = Encoding::from_header(header) else {
         let message = format!(
-            "unsupported Content-Encoding {encoding:?} -- remote-write is always \
-             '{}' (block format)",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            "unsupported Content-Encoding {header:?} -- this receiver accepts '{}' (Snappy block \
+             format) and '{}'",
+            compression::CONTENT_ENCODING_SNAPPY,
+            compression::CONTENT_ENCODING_ZSTD
         );
         diag.warn_throttled(
             "write_rejected",
             format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
         );
-        return ("unsupported", text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message));
-    }
+        return (
+            "unsupported",
+            None,
+            text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message),
+        );
+    };
     // The version comes from this request's own `Content-Type`. An absent header is `""`, which no
     // version claims, so it is a `415` rather than a 1.0 default (the module doc's "Routes").
     let content_type = header_str(req.headers(), CONTENT_TYPE);
@@ -1459,7 +1486,11 @@ async fn write_response(
             "write_rejected",
             format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
         );
-        return ("unsupported", text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message));
+        return (
+            "unsupported",
+            None,
+            text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message),
+        );
     };
 
     // The `-Written` helpers take an `Option<Version>` because the rejections above precede
@@ -1482,7 +1513,7 @@ async fn write_response(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("timeout", text_response(seen, StatusCode::REQUEST_TIMEOUT, &message));
+            return ("timeout", None, text_response(seen, StatusCode::REQUEST_TIMEOUT, &message));
         }
         Err(BodyReadError::Failed(err)) => {
             let message = body_read_error_message(err.as_ref());
@@ -1490,43 +1521,29 @@ async fn write_response(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("oversize", text_response(seen, StatusCode::PAYLOAD_TOO_LARGE, &message));
+            return (
+                "oversize",
+                None,
+                text_response(seen, StatusCode::PAYLOAD_TOO_LARGE, &message),
+            );
         }
     };
 
-    // The decompressed size is read from the Snappy block header and checked *before* a byte is
-    // expanded, so a compression bomb is rejected, never inflated.
-    let declared = match snap::raw::decompress_len(&compressed) {
-        Ok(declared) => declared,
-        Err(err) => {
-            let message = format!("invalid snappy body: {err}");
-            diag.warn_throttled(
-                "write_rejected",
-                format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
-            );
-            return ("bad_request", text_response(seen, StatusCode::BAD_REQUEST, &message));
-        }
-    };
-    if declared > MAX_REQUEST_BYTES {
-        let message = format!(
-            "decompressed request would be {declared} bytes, over the {MAX_REQUEST_BYTES}-byte \
-             limit"
-        );
-        diag.warn_throttled(
-            "write_rejected",
-            format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
-        );
-        return ("oversize", text_response(seen, StatusCode::PAYLOAD_TOO_LARGE, &message));
-    }
-    let body = match snap::raw::Decoder::new().decompress_vec(&compressed) {
+    // Bounded by `MAX_REQUEST_BYTES` without expanding past it, so a compression bomb is
+    // rejected, never inflated.
+    let body = match compression::decompress_bounded(encoding, &compressed, MAX_REQUEST_BYTES) {
         Ok(body) => body,
         Err(err) => {
-            let message = format!("invalid snappy body: {err}");
+            let message = err.to_string();
             diag.warn_throttled(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("bad_request", text_response(seen, StatusCode::BAD_REQUEST, &message));
+            let (class, status) = match err {
+                DecompressError::TooLarge { .. } => ("oversize", StatusCode::PAYLOAD_TOO_LARGE),
+                DecompressError::Malformed { .. } => ("bad_request", StatusCode::BAD_REQUEST),
+            };
+            return (class, None, text_response(seen, status, &message));
         }
     };
 
@@ -1554,7 +1571,7 @@ async fn write_response(
                 "write_rejected",
                 format_args!("prometheus_in: rejecting a request from {peer}: {message}"),
             );
-            return ("bad_request", text_response(seen, StatusCode::BAD_REQUEST, &message));
+            return ("bad_request", None, text_response(seen, StatusCode::BAD_REQUEST, &message));
         }
     };
     // Learned from what *this* request declared, never from the seed: a cache that refreshed
@@ -1599,7 +1616,7 @@ async fn write_response(
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
         sink.send(EventBatch { resource, scope: None, events }).await;
     }
-    ("ok", no_content(seen, written, decoded.exemplars))
+    ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }
 
 /// `""` for an absent or non-ASCII header: either way it says nothing usable, and the caller's
@@ -2286,6 +2303,8 @@ mod tests {
         rx
     }
 
+    /// Through `snap` directly rather than the receiver's own `compression` module, as an
+    /// independent sender would.
     fn snappy(body: &[u8]) -> Vec<u8> {
         snap::raw::Encoder::new().compress_vec(body).expect("compressing a test body never fails")
     }
@@ -2327,7 +2346,7 @@ mod tests {
         format!(
             "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nUser-Agent: test\r\n",
             version.content_type(),
-            remote_write::CONTENT_ENCODING_SNAPPY,
+            compression::CONTENT_ENCODING_SNAPPY,
             remote_write::HEADER_VERSION,
             version.header_version()
         )
@@ -2519,6 +2538,133 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
         assert!(response.contains("gzip"), "the message names what arrived, got: {response}");
+        assert!(
+            response.contains("'snappy'") && response.contains("'zstd'"),
+            "the message names both accepted encodings, got: {response}"
+        );
+    }
+
+    // -- zstd, the VictoriaMetrics remote write protocol --------------------------------------
+
+    /// [`write_headers`] with `Content-Encoding: zstd`, as vmagent sends by default.
+    fn zstd_write_headers() -> String {
+        format!(
+            "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nConnection: close\r\n",
+            remote_write::Version::V1.content_type(),
+            compression::CONTENT_ENCODING_ZSTD,
+            remote_write::HEADER_VERSION,
+            remote_write::Version::V1.header_version()
+        )
+    }
+
+    /// A zstd frame header with no content checksum: a 4-byte content size when `content_size`
+    /// is set, else none, and `window` as the window-descriptor byte (`0x50` is 1 MiB).
+    fn zstd_frame_header(content_size: Option<u32>, window: u8) -> Vec<u8> {
+        let mut header = vec![0x28, 0xb5, 0x2f, 0xfd];
+        match content_size {
+            Some(size) => {
+                header.extend([0x80, window]);
+                header.extend(size.to_le_bytes());
+            }
+            None => header.extend([0x00, window]),
+        }
+        header
+    }
+
+    #[tokio::test]
+    async fn a_zstd_request_is_decoded_and_counted_by_encoding() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry);
+        let mut rx = spawn_receiver(receiver, 4);
+        let mut encoder = PrometheusEncoder::new();
+        let protobuf = remote_write::encode(
+            &[vec![gauge_family("queue_depth", ("job", "api"), 7.0, millis(1))]],
+            remote_write::Version::V1,
+            &mut encoder,
+        );
+        let body = compression::compress(Encoding::Zstd, &protobuf).unwrap();
+
+        let response = post_raw(&addr, "/api/v1/write", &zstd_write_headers(), &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "queue_depth");
+        let events = registry.drain(0);
+        let ok_zstd = events.iter().any(|e| {
+            e.attributes.get("class").and_then(|v| v.as_str()) == Some("ok")
+                && e.attributes.get("encoding").and_then(|v| v.as_str()) == Some("zstd")
+                && e.metrics
+                    .iter()
+                    .any(|m| logit_core::interner::resolve(m.name) == "logit.input.writes")
+        });
+        assert!(ok_zstd, "logit.input.writes{{class=ok,encoding=zstd}} should be counted");
+    }
+
+    /// Guard 1: a frame declaring more than the cap is refused on its header alone. The frame
+    /// has no blocks at all, so a `413` rather than a `400` proves nothing was decoded.
+    #[tokio::test]
+    async fn a_zstd_body_declaring_more_than_the_cap_is_413_before_decoding() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let _rx = spawn_receiver(receiver, 4);
+        let declared = MAX_REQUEST_BYTES as u32 + 1;
+        let header_only = zstd_frame_header(Some(declared), 0x50);
+
+        let response = post_raw(&addr, "/api/v1/write", &zstd_write_headers(), &header_only).await;
+
+        assert!(response.starts_with("HTTP/1.1 413"), "got: {response}");
+        assert!(response.contains(&format!("would be {declared} bytes")), "got: {response}");
+    }
+
+    /// Guard 3: no declared size and a 1 MiB window, then 33 RLE blocks of 128 KiB each: 132
+    /// bytes on the wire that inflate past 4 MiB.
+    #[tokio::test]
+    async fn an_undeclared_zstd_body_that_inflates_past_the_cap_is_413() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let _rx = spawn_receiver(receiver, 4);
+        let block_size: u32 = 128 * 1024;
+        let blocks = MAX_REQUEST_BYTES / block_size as usize + 1;
+        let mut bomb = zstd_frame_header(None, 0x50);
+        for i in 0..blocks {
+            // An RLE block: type 1, `block_size` copies of the one byte that follows.
+            let header = (block_size << 3) | (1 << 1) | u32::from(i + 1 == blocks);
+            bomb.extend(&header.to_le_bytes()[..3]);
+            bomb.push(0);
+        }
+        assert!(bomb.len() < 256, "the bomb is {} bytes", bomb.len());
+
+        let response = post_raw(&addr, "/api/v1/write", &zstd_write_headers(), &bomb).await;
+
+        assert!(response.starts_with("HTTP/1.1 413"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_zstd_body_is_400() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let _rx = spawn_receiver(receiver, 4);
+
+        let response =
+            post_raw(&addr, "/api/v1/write", &zstd_write_headers(), b"not zstd at all").await;
+
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+        assert!(response.contains("invalid zstd body"), "got: {response}");
+    }
+
+    /// A Snappy body labelled `zstd` is a `400`, one of the two statuses vmagent downgrades on.
+    #[tokio::test]
+    async fn a_snappy_body_labelled_zstd_is_400() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let _rx = spawn_receiver(receiver, 4);
+        let body = request_body(
+            &[vec![gauge_family("queue_depth", ("job", "api"), 7.0, millis(1))]],
+            remote_write::Version::V1,
+        );
+
+        let response = post_raw(&addr, "/api/v1/write", &zstd_write_headers(), &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
     /// Both specs mandate Snappy, so there is no identity fallback for a missing header to mean.
@@ -2543,7 +2689,7 @@ mod tests {
         let headers = format!(
             "Content-Type: application/x-protobuf;proto=some.other.Message\r\n\
              Content-Encoding: {}\r\nConnection: close\r\n",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            compression::CONTENT_ENCODING_SNAPPY
         );
 
         let response = post_raw(&addr, "/api/v1/write", &headers, &snappy(b"")).await;
@@ -2560,7 +2706,7 @@ mod tests {
         let _rx = spawn_receiver(receiver, 4);
         let headers = format!(
             "Content-Encoding: {}\r\nConnection: close\r\n",
-            remote_write::CONTENT_ENCODING_SNAPPY
+            compression::CONTENT_ENCODING_SNAPPY
         );
 
         let response = post_raw(&addr, "/api/v1/write", &headers, &snappy(b"")).await;
@@ -2601,8 +2747,9 @@ mod tests {
     /// A body that decompresses but is not protobuf (a truncated varint) is a `400`. Sent as 2.0,
     /// so this also pins the zero `-Written` report 2.0 requires on a `4xx`.
     ///
-    /// A *valid 1.0* body under a 2.0 `Content-Type` is also a `CodecError` now
-    /// (`logit_proto::prometheus::remote_write`'s module doc), but no test here posts one.
+    /// A *valid 1.0* body under a 2.0 `Content-Type` is also a `CodecError`
+    /// (`logit_proto::prometheus::remote_write`'s module doc) -- see
+    /// `a_valid_body_of_the_other_version_is_400_and_counted_bad_request`.
     #[tokio::test]
     async fn a_body_that_is_not_the_promised_message_is_400() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2621,6 +2768,57 @@ mod tests {
                 .contains(&format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN)),
             "got: {response}"
         );
+    }
+
+    /// A *valid* body of one version, posted under the other version's `Content-Type`, is also a
+    /// `400`: `logit_proto::prometheus::remote_write::decode_v1`/`decode_v2` refuse a non-empty
+    /// body that decodes to an empty message, since 1.0 and 2.0 field numbers don't overlap.
+    #[tokio::test]
+    async fn a_valid_body_of_the_other_version_is_400_and_counted_bad_request() {
+        for (sent, claimed) in [
+            (remote_write::Version::V1, remote_write::Version::V2),
+            (remote_write::Version::V2, remote_write::Version::V1),
+        ] {
+            let (receiver, addr) = bound_receiver("/api/v1/write").await;
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+            let receiver = receiver.with_telemetry(telemetry);
+            let mut rx = spawn_receiver(receiver, 4);
+            let groups = vec![vec![gauge_family(
+                "queue_depth",
+                ("job", "api"),
+                7.0,
+                millis(1_700_000_000_000),
+            )]];
+            let body = request_body(&groups, sent);
+
+            let response = post_write(&addr, "/api/v1/write", claimed, &body).await;
+
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{sent:?} as {claimed:?} got: {response}"
+            );
+            if claimed == remote_write::Version::V2 {
+                // 2.0 wants the `-Written` report on a 4xx too: zeros, since nothing was stored.
+                assert!(
+                    response
+                        .to_ascii_lowercase()
+                        .contains(&format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN)),
+                    "got: {response}"
+                );
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "{sent:?} as {claimed:?}: nothing should reach the fanout"
+            );
+
+            let events = registry.drain(0);
+            assert_eq!(
+                counter_in(&events, "logit.input.writes", ("class", "bad_request")),
+                Some(1.0),
+                "{sent:?} as {claimed:?}"
+            );
+        }
     }
 
     /// Three samples of one series become **one** batch of three events in ascending timestamp
@@ -3097,7 +3295,7 @@ mod tests {
              {}\r\nContent-Encoding: {}\r\n\r\n",
             body.len(),
             remote_write::Version::V1.content_type(),
-            remote_write::CONTENT_ENCODING_SNAPPY
+            compression::CONTENT_ENCODING_SNAPPY
         );
         keep_alive.write_all(request.as_bytes()).await.unwrap();
         keep_alive.write_all(&body).await.unwrap();

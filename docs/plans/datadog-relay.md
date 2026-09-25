@@ -270,7 +270,7 @@ The HTTP server driver behind `otlp_in`/`prometheus_in` (`crates/logit-inputs/sr
 `crate::http` in `logit-outputs` (`build_client`, `is_retryable_http_status`,
 `classify_reqwest_error`); `write_loop`'s bounded retry with `Fault` classification;
 `TlsClientConfig`/`TlsServerConfig`; the `TcpListener` driver for the Unix stream transport;
-graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 62+).
+graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 63+).
 
 ### 4. Sketch compatibility (W1, settled)
 
@@ -420,8 +420,8 @@ the OTel-direct topology is `otlp_out`.
 | W1 | **Landed** (`dd/w1`). Hand-rolled `DdSketch` with the Agent and logarithmic mappings, bins exposed, `sketches-ddsketch` removed, tripwires and wire doc updated; ADR `datadog-agent-and-intake-relay`; `lossless-transit` amendment; ADR index row. | M | W0 |
 | W2a | **Landed** (`dd/w2a`). Vendored `agent-payload` metrics proto as a third protogen family; `logit_proto::datadog` codecs for series v1/v2 (JSON and protobuf), distribution points, sketches, logs, events (Agent envelope and public v1), and service checks; two fixed-point suites. | L | W1 |
 | W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
-| W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
-| W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
+| W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 63; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
+| W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 64; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
 | W4b | `statsd_in`/`statsd_out` Unix sockets, `\|e:`, `\|card:` | S | W0 |
 | W5 | `datadog_out`: direct API client, stale filter, graph rules, schema | M | W3 |
 | W6 | `datadog_trace_out`: Agent client | S | W4a |

@@ -6,9 +6,10 @@
 //! [`super`]'s module doc already states: remote-write is a *transport* for the semantics the
 //! exposition format describes.
 //!
-//! Neither Snappy nor HTTP is this module's business. The caller decompresses (block format,
-//! `snap::raw`, **not** the framed one), enforces its own body cap, and hands over plain protobuf;
-//! [`Version`] holds the header knowledge both the receiver and the sender need.
+//! Neither compression nor HTTP is this module's business. The caller decompresses through
+//! [`super::compression`], which holds the `Content-Encoding`s and the body cap's enforcement, and
+//! hands over plain protobuf; [`Version`] holds the header knowledge both the receiver and the
+//! sender need.
 //!
 //! References:
 //! <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
@@ -22,15 +23,16 @@
 //! | message | `prometheus.WriteRequest` | `io.prometheus.write.v2.Request` |
 //! | `Content-Type` | `application/x-protobuf`, and `application/x-protobuf;proto=prometheus.WriteRequest` is what Prometheus itself sends | `application/x-protobuf;proto=io.prometheus.write.v2.Request` |
 //! | `X-Prometheus-Remote-Write-Version` | `0.1.0` | `2.0.0` |
-//! | `Content-Encoding` | `snappy` (block) | `snappy` (block) |
+//! | `Content-Encoding` | `snappy` (block), or `zstd` in the VictoriaMetrics variant | `snappy` (block) |
 //! | metadata | `WriteRequest.metadata[]`, one entry per family, naming the family explicitly | `TimeSeries.metadata`, inline per series, with **no family-name field** -- the family is derived from the sample name and the type ([`assemble::family_base`]) |
 //! | strings | inline | a request-wide `symbols` table, `symbols[0] == ""`, everything referenced by index |
 //! | created timestamp | no equivalent field | `Sample.start_timestamp` (milliseconds, `0` = unset) |
 //! | counts written | -- | `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` on 2xx *and* 4xx |
 //!
-//! A `TimeSeries` carries samples **or** native histograms, never both, and its labels are sorted
-//! by byte order -- which is not the same as "`__name__` first": `_` is `0x5f`, so a label named
-//! `Foo` sorts *before* `__name__`.
+//! A `TimeSeries` carries samples **or** native histograms, never both, and its labels should be
+//! sorted by byte order -- which is not the same as "`__name__` first": `_` is `0x5f`, so a label
+//! named `Foo` sorts *before* `__name__`. The decoder sorts a set that isn't (the `invalid_labels`
+//! row below).
 //!
 //! ## Timestamp groups
 //!
@@ -95,7 +97,7 @@
 //!
 //! | Reason | What it counts |
 //! |---|---|
-//! | `invalid_labels` | a series with no `__name__`, an empty label name or value, or a label set that is not strictly ascending by byte order -- all of which both specs forbid a sender from producing |
+//! | `invalid_labels` | a series with no `__name__`, an empty label name or value, or a repeated label name -- all of which both specs forbid a sender from producing. A label set out of byte order is sorted, not skipped: both specs forbid that too, but vmagent sends it and Prometheus's and VictoriaMetrics's own receivers accept it |
 //! | `native_histogram` | one entry of a `histograms[]` list (above) |
 //! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
 //!
@@ -190,8 +192,6 @@ pub const HEADER_SAMPLES_WRITTEN: &str = "x-prometheus-remote-write-samples-writ
 pub const HEADER_HISTOGRAMS_WRITTEN: &str = "x-prometheus-remote-write-histograms-written";
 /// 2.0's report of how many exemplars the receiver stored.
 pub const HEADER_EXEMPLARS_WRITTEN: &str = "x-prometheus-remote-write-exemplars-written";
-/// The only `Content-Encoding` either version defines -- Snappy **block** format, not framed.
-pub const CONTENT_ENCODING_SNAPPY: &str = "snappy";
 
 /// The media type both versions build on; the `proto=` parameter is what tells them apart.
 const MEDIA_TYPE: &str = "application/x-protobuf";
@@ -537,25 +537,39 @@ fn attach_exemplar(
     stored
 }
 
-/// A series' `__name__` and its remaining labels, or `None` -- counted `invalid_labels` by the
-/// caller -- when the label set breaks a rule both specs place on senders: a non-empty `__name__`,
-/// no empty names or values, and strictly ascending byte order (which also rules out a repeat).
+/// A series' `__name__` and its remaining labels, sorted by byte order, or `None` -- counted
+/// `invalid_labels` by the caller -- when the label set has no non-empty `__name__`, an empty name
+/// or value, or a repeated name.
+///
+/// Both specs also require a sender to sort the set, but vmagent doesn't: it appends a target's
+/// `instance`/`job` after the exposition's own labels. Prometheus's and VictoriaMetrics's own
+/// receivers sort on arrival, so this does too rather than drop every such series. An unsorted
+/// set costs one in-place sort; a sorted one costs nothing extra.
 fn series_labels<'a>(pairs: &[(&'a str, &'a str)]) -> Option<(&'a str, Vec<(String, String)>)> {
     let mut name = None;
-    let mut labels = Vec::with_capacity(pairs.len().saturating_sub(1));
+    let mut labels: Vec<(String, String)> = Vec::with_capacity(pairs.len().saturating_sub(1));
     let mut previous: Option<&str> = None;
+    let mut ascending = true;
     for (key, value) in pairs {
         if key.is_empty() || value.is_empty() {
             return None;
         }
         if previous.is_some_and(|earlier| earlier.as_bytes() >= key.as_bytes()) {
-            return None;
+            ascending = false;
         }
         previous = Some(key);
         if *key == "__name__" {
-            name = Some(*value);
+            if name.replace(*value).is_some() {
+                return None;
+            }
         } else {
             labels.push(((*key).to_string(), (*value).to_string()));
+        }
+    }
+    if !ascending {
+        labels.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        if labels.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
         }
     }
     Some((name?, labels))

@@ -69,7 +69,7 @@ pub trait FramedEncoder {
   `logit-outputs` has no `msgbuf` module and no `syslog::MessageBuf` re-export any more --
   pre-release, no compat shims.
 - **`Stats` is per sink.** A syslog drop reason (`dropped_oversize_header`,
-  `dropped_invalid_sd`) is not a statsd drop reason (`dropped_gauge_delta`,
+  `dropped_invalid_sd_name`) is not a statsd drop reason (`dropped_gauge_delta`,
   `dropped_dialect_events`, ...); the trait only requires the type be `Default + Debug +
   PartialEq`, and each sink's `send` keeps mapping its own struct onto `logit.output.*` counters
   by hand. No common core is split out.

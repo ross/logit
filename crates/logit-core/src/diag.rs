@@ -251,11 +251,19 @@ mod tests {
         assert!(diag.warn_throttled("a", "x"), "a's 1st occurrence reports");
         assert!(diag.warn_throttled("a", "x"), "a's 2nd occurrence reports (a power of two)");
         assert!(!diag.warn_throttled("a", "x"), "a's 3rd occurrence is suppressed");
-        // A shared counter would make this the 4th call, which also reports, so this assert can't
-        // tell the two apart.
         assert!(
             diag.warn_throttled("b", "y"),
             "b's 1st occurrence reports regardless of a's count"
+        );
+        assert_eq!(
+            diag.occurrences("a"),
+            3,
+            "a's count stays 3, distinct from b's -- a shared counter would read 4 here too"
+        );
+        assert_eq!(
+            diag.occurrences("b"),
+            1,
+            "b's count is 1, not 4 -- a shared counter would read 4 for b"
         );
     }
 

@@ -1,0 +1,106 @@
+# Leg 6 of `script/victoria-interop`: `otlp_out` over HTTP to all three products, one sink per
+# product behind a `keep_signals`, because one `otlp_out` posts every signal it carries to one
+# host.
+#
+# A `lua` stage mints, per tick, one event per signal with `Event.new`: a metrics event carrying a
+# delta `Sum`, a cumulative `Sum`, and an `ExponentialHistogram`; a log; and a span.
+#
+# Two log sinks differ only in `VL-Msg-Field`, so the harness can tell whether VictoriaLogs maps
+# an OTLP log body to `_msg` without being told. `VL-Extra-Fields` stamps each sink's records so
+# the two are told apart at query time.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+    resource:
+      service.name: victoria-interop-otlp-http
+
+  mint:
+    type: lua
+    sources: [tick]
+    script: |
+      local n = 0
+      local start = nil
+
+      function process(event)
+        n = n + 1
+        local ts = event.timestamp
+        start = start or ts
+        -- Ids from the tick's own nanosecond timestamp: unique per run and per tick, and plain
+        -- decimal digits are valid hex.
+        local trace_id = "1" .. string.rep("0", 31 - #ts) .. ts
+        local span_id = string.sub(ts, -16)
+        local attributes = {leg = "otlp-http"}
+
+        local metrics = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          metrics = {
+            {name = "vi_otlp_delta_sum", kind = "sum", value = 1, temporality = "delta"},
+            {name = "vi_otlp_cumulative_sum", kind = "sum", value = n,
+             temporality = "cumulative", start_timestamp = start},
+            {name = "vi_otlp_exphist", kind = "exponential_histogram", scale = 0,
+             zero_count = 1, count = 4, zero_threshold = 0, sum = 7,
+             positive = {offset = 0, counts = {1, 2}}, negative = {offset = 0, counts = {}},
+             temporality = "cumulative", start_timestamp = start},
+          },
+        }
+        local log = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          log = {message = "victoria-interop otlp-http log " .. n, severity = "info"},
+        }
+        local span = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          span = {trace_id = trace_id, span_id = span_id, name = "vi-otlp-http-span",
+                  kind = "server", end_timestamp = ts},
+        }
+        return {metrics, log, span}
+      end
+
+  only_metrics:
+    type: keep_signals
+    sources: [mint]
+    signals: [metrics]
+
+  only_logs:
+    type: keep_signals
+    sources: [mint]
+    signals: [logs]
+
+  only_traces:
+    type: keep_signals
+    sources: [mint]
+    signals: [traces]
+
+  victoria_metrics:
+    type: otlp_out
+    sources: [only_metrics]
+    endpoint: http://victoria-metrics:8428/opentelemetry
+
+  victoria_logs_msg_field:
+    type: otlp_out
+    sources: [only_logs]
+    endpoint: http://victoria-logs:9428/insert/opentelemetry
+    headers:
+      VL-Stream-Fields: service.name
+      VL-Msg-Field: body
+      VL-Extra-Fields: vi_sink=msg-field
+
+  victoria_logs_default:
+    type: otlp_out
+    sources: [only_logs]
+    endpoint: http://victoria-logs:9428/insert/opentelemetry
+    headers:
+      VL-Stream-Fields: service.name
+      VL-Extra-Fields: vi_sink=default
+
+  victoria_traces:
+    type: otlp_out
+    sources: [only_traces]
+    endpoint: http://victoria-traces:10428/insert/opentelemetry
