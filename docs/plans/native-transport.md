@@ -235,7 +235,7 @@ can be deleted outright.
   frame one batch` and `logit_in: read + decode one batch into a warm scratch` — and update
   `docs/design/memory.md` §2 in the same commit; rewrite that section's "no `ComponentKind`
   consumes this codec yet" sentence.
-- `examples/forwarder-edge.yaml` + `examples/forwarder-central.yaml`: edge = `statsd_in →
+- `fixtures/forwarder-edge.yaml` + `fixtures/forwarder-central.yaml`: edge = `statsd_in →
   logit_out`; central = `logit_in → aggregate → stdio_out`. Both pass `script/validate`.
 - Docs: ADR `native-transport-handshake-and-ack.md` (decisions table above, alternatives:
   gRPC-over-hyper reuse — rejected, the whole point of the native path is no per-request HTTP
@@ -252,7 +252,7 @@ can be deleted outright.
 
 - `script/cibuild` clean at every workstream boundary.
 - `script/test` includes the new robustness suite (must run in < 10s; tune iteration counts).
-- Manual: two `logit run` processes on one host (`examples/forwarder-*.yaml`), `kill -STOP` the
+- Manual: two `logit run` processes on one host (`fixtures/forwarder-*.yaml`), `kill -STOP` the
   central one → edge's `logit.component.buffer.utilization` climbs, no process exits; `kill
   -CONT` → drains, `logit.output.reconnects` stays 0; restart central → edge reconnects, exactly
   one `Ambiguous` classification for the in-flight batch (visible in

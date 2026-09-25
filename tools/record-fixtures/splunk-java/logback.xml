@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Three HEC appenders at the capture sink, every line to each:
+    hec-text  `/services/collector/event/1.0`, the message as a string, one request per line
+    hec-json  the same with `messageFormat=json`: a message that parses as JSON goes as an object
+    hec-raw   `type=raw`: `/services/collector/raw`, the layout's text as the body
+  `batch_size_count` stays unset on hec-raw: the library rejects batching with `type=raw`, and
+  sends each raw event on its own anyway. Its channel is set, because the library otherwise names
+  the query parameter with no value.
+-->
+<configuration>
+  <appender name="hec-text" class="com.splunk.logging.HttpEventCollectorLogbackAppender">
+    <url>http://capture:8088</url>
+    <token>00000000-0000-0000-0000-000000000000</token>
+    <host>splunk-java-fixture</host>
+    <source>java:logback</source>
+    <sourcetype>java:text</sourcetype>
+    <index>main</index>
+    <disableCertificateValidation>true</disableCertificateValidation>
+    <batch_size_count>1</batch_size_count>
+    <includeMDC>true</includeMDC>
+    <layout class="ch.qos.logback.classic.PatternLayout">
+      <pattern>%msg</pattern>
+    </layout>
+  </appender>
+
+  <appender name="hec-json" class="com.splunk.logging.HttpEventCollectorLogbackAppender">
+    <url>http://capture:8088</url>
+    <token>00000000-0000-0000-0000-000000000000</token>
+    <host>splunk-java-fixture</host>
+    <source>java:logback</source>
+    <sourcetype>java:json</sourcetype>
+    <index>main</index>
+    <messageFormat>json</messageFormat>
+    <disableCertificateValidation>true</disableCertificateValidation>
+    <batch_size_count>1</batch_size_count>
+    <includeMDC>true</includeMDC>
+    <layout class="ch.qos.logback.classic.PatternLayout">
+      <pattern>%msg</pattern>
+    </layout>
+  </appender>
+
+  <appender name="hec-raw" class="com.splunk.logging.HttpEventCollectorLogbackAppender">
+    <url>http://capture:8088</url>
+    <token>00000000-0000-0000-0000-000000000000</token>
+    <type>raw</type>
+    <channel>00000000-0000-0000-0000-00000000000a</channel>
+    <host>splunk-java-fixture</host>
+    <source>java:logback</source>
+    <sourcetype>java:raw</sourcetype>
+    <index>main</index>
+    <disableCertificateValidation>true</disableCertificateValidation>
+    <layout class="ch.qos.logback.classic.PatternLayout">
+      <pattern>%level %logger %msg</pattern>
+    </layout>
+  </appender>
+
+  <root level="INFO">
+    <appender-ref ref="hec-text"/>
+    <appender-ref ref="hec-json"/>
+    <appender-ref ref="hec-raw"/>
+  </root>
+</configuration>

@@ -4,7 +4,7 @@
 # directories (.git, .claude), target/, and tmp/ never reach the daemon.
 #
 # Only a build whose context is the repo root reads this file. The Dockerfiles under demo/,
-# examples/, tools/, and crates/logit-perf build from their own directory.
+# fixtures/, tools/, and crates/logit-perf build from their own directory.
 #
 # A build-time input outside crates/ (a new workspace member, a .cargo/config.toml, an
 # include_str! of a file elsewhere) needs its own `!` line, or the release build fails with a

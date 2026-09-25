@@ -1,0 +1,1 @@
+{"host":"splunk-java-fixture","index":"main","sourcetype":"java:json","source":"java:logback","time":"1790358635.845","fields":{"messageFormat":"json"},"event":{"severity":"INFO","logger":"splunk-java-fixture","thread":"main","message":{"action":"start","component":"splunk-java fixture","port":8080}}}

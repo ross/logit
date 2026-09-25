@@ -1,0 +1,43 @@
+# Sends OTLP traces and metrics on to Splunk Observability Cloud (the former SignalFx):
+# `otlp_out` over OTLP/HTTP protobuf, with `paths:` pointed at Observability Cloud's per-signal
+# ingest routes and an `X-SF-Token` header carrying an org access token
+# (docs/plans/splunk-relay.md's "Observability Cloud ingest"). Observability Cloud has no log
+# store — Log Observer Connect reads logs from the Platform instead — so this leg only ever
+# carries metrics and traces; `keep_signals` in front of `otlp_out` is the guard that stops a
+# batch's logs from being posted to a metrics/traces-only endpoint. Send logs to the Platform
+# over HEC with `splunk_hec_out` (docs/adr/splunk-hec-relay.md) instead.
+#
+# `us0` is a placeholder realm — substitute your org's (`us1`, `eu0`, and so on; Splunk's
+# Organization Settings page has it). Traces are also accepted over OTLP/gRPC on `:443`, with
+# the token sent as gRPC metadata rather than a header (`protocol: grpc`, `endpoint:
+# https://ingest.<realm>.observability.splunkcloud.com:443`, no `paths:` — gRPC method names are
+# fixed), but metrics are HTTP-only per Splunk's docs, so this config uses OTLP/HTTP for both to
+# keep one `otlp_out`.
+#
+# This leg is unverified against a real Observability Cloud org: no trial-org run has confirmed
+# either path (docs/plans/splunk-relay.md's "Settled by W5" covers Splunk Enterprise over HEC,
+# not Observability Cloud). Check the first batch lands in the org before relying on this in
+# production.
+components:
+  otlp_in:
+    type: otlp_in
+    bind: 127.0.0.1:4318
+    protocol: http
+
+  # Observability Cloud has nowhere to put a log: drop that signal's payload before it reaches
+  # `otlp_out`, rather than relying on the sink to notice.
+  no_logs:
+    type: keep_signals
+    sources: [otlp_in]
+    signals: [metrics, traces]
+
+  observability_cloud:
+    type: otlp_out
+    sources: [no_logs]
+    endpoint: https://ingest.us0.observability.splunkcloud.com
+    paths:
+      traces: /v2/trace/otlp
+      metrics: /v2/datapoint/otlp
+    headers:
+      X-SF-Token: !env SPLUNK_OBSERVABILITY_TOKEN
+    compression: gzip

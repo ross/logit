@@ -384,7 +384,7 @@ _tags/_multi_value` beside `statsd_format` (`:1014`).
 | W2 | **Opened** (#169). **`graphite_in`** | `crates/logit-inputs/src/graphite/{mod,tcp}.rs`, `lib.rs`; config `GraphiteIn` + `GraphiteTransport`/`GraphiteProtocol` + defaults + tests; `graph.rs` role/kind_name/is_implemented/is_datagram_listener/is_stream_listener/new rule (input half)/rules 17-18 text + tests; CLI arm + converters + test; `script/schema`; bench fixtures (`graphite_decoder`, `graphite_pickle_decoder`, `graphite_datagram(lines)`, `graphite_pickle_frame(n)`) + `allocations.rs` decode rows + `docs/design/memory.md` §2; `pipeline-graph.md`; `internal-telemetry.md` `graphite_in`; `deploying.md` `### graphite_in` | W1 |
 | W3 | **Opened** (#170). **`graphite_out`** | `crates/logit-outputs/src/graphite.rs`, `lib.rs`; config `GraphiteOut` + `GraphiteTags`/`GraphiteMultiValue` + defaults + tests; `graph.rs` rule 38 + new rule (output half) + tests; CLI arm + converters + test; `script/schema`; bench fixtures (`graphite_encoder`, `graphite_batch(n)`, `graphite_distribution_batch(n)`) + `allocations.rs` encode rows + `memory.md` §3; `internal-telemetry.md` `graphite_out`; `deploying.md` `### graphite_out` (model: its `collectd_out` section) | W1 (‖ W2) |
 | W4a | **Opened** (#171), alongside W4b. **Recorded interop** | `script/record-fixtures` `record_graphite()` + `all=`; `tools/record-fixtures/collectd-write-graphite.conf` (collectd `write_graphite` → plaintext TCP to `capture:2003`) and `python_graphite_pickle_producer.py` (stdlib `pickle` at protocol 2 and -1, length-prefixed to `capture:2004`); `testdata/interop/graphite/{README.md,*.raw}`; `testdata/interop/README.md` row; `interop_fixture_*` tests in `logit-inputs/src/graphite/mod.rs`; `docs/plans/recorded-interop-fixtures.md` follow-on list | W2 |
-| W4b | **Opened** (#175), alongside W4a. **Round trip + closeout** | `crates/logit-cli/tests/graphite_round_trip.rs` + `tests/fixtures/graphite/*.in\|.expected`; `examples/graphite-relay.yaml`, `examples/statsd-to-graphite.yaml`; `docs/OVERVIEW.md` scope line; `AGENTS.md` current-state paragraph + lossless-pairs bullet; `deploying.md` cross-links; plan status paragraph; known-gaps follow-up note on prometheus `_sum` | W2, W3 |
+| W4b | **Opened** (#175), alongside W4a. **Round trip + closeout** | `crates/logit-cli/tests/graphite_round_trip.rs` + `tests/fixtures/graphite/*.in\|.expected`; `fixtures/graphite-relay.yaml`, `fixtures/statsd-to-graphite.yaml`; `docs/OVERVIEW.md` scope line; `AGENTS.md` current-state paragraph + lossless-pairs bullet; `deploying.md` cross-links; plan status paragraph; known-gaps follow-up note on prometheus `_sum` | W2, W3 |
 
 **Landing order: W0 → W1 → (W2 ‖ W3) → (W4a ‖ W4b).** W2/W3 share only disjoint variants/arms in
 `logit-config`, `graph.rs`, `pipeline.rs`; W3 branches from `w1`, not `w2`. Each PR is opened against
@@ -484,14 +484,14 @@ counted); `statsd_in -> aggregate -> graphite_out` with `expand` yields the docu
 docker run -d --name graphite -p 2003:2003 -p 2004:2004 -p 8080:80 graphiteapp/graphite-statsd
 ```
 
-1. `logit run examples/statsd-to-graphite.yaml`; `echo 'page.views:1|c' | nc -u -w0 127.0.0.1 8125`;
+1. `logit run fixtures/statsd-to-graphite.yaml`; `echo 'page.views:1|c' | nc -u -w0 127.0.0.1 8125`;
    `curl 'http://localhost:8080/render?target=page.views&from=-5min&format=json'`.
 2. Same with `protocol: pickle`, `endpoint: 127.0.0.1:2004` — proves carbon's unpickler accepts
    our writer.
 3. `multi_value: expand` with a timer: `page.latency.count/.sum/.q0_5…q0_99` render.
 4. `tags: carbon`: `/tags/findSeries?expr=env=prod` returns the series; `tags: drop` shows the
    untagged path.
-5. `examples/graphite-relay.yaml` in front of the container: render output identical to direct.
+5. `fixtures/graphite-relay.yaml` in front of the container: render output identical to direct.
 
 ## Open risks
 

@@ -175,8 +175,8 @@ retargeted to `main` when it merges. `git merge origin/main` to update, never re
 | W2 | `syslog_in` over TCP/TLS | `logit-inputs/src/syslog.rs`, `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/design/internal-telemetry.md` | W1 |
 | W3 | `syslog_out` TLS | `logit-outputs/src/{syslog,tls,logit}.rs`, `logit-config/src/lib.rs`, `graph.rs`, `pipeline.rs`, `schema/logit.schema.json`, both design docs | W0 (∥ W1/W2) |
 | W4 | Recorded rsyslog-over-TCP fixture | `script/record-fixtures`, `tools/record-fixtures/rsyslog-tcp.conf` (new), `testdata/interop/syslog/rsyslog-tcp-000.raw` + `README.md`, a framer test in `tcp.rs`, `docs/plans/recorded-interop-fixtures.md` | W1 (∥ W2/W3) |
-| W5 | Round-trip tests, example, closeout | `crates/logit-cli/tests/syslog_round_trip.rs`, `examples/syslog-relay.yaml` (new), `docs/known-gaps.md`, `docs/adr/syslog-output.md`, `docs/deploying.md`, `docs/design/internal-telemetry.md`, `AGENTS.md` | W2 + W3 (+ W4) |
-| W6 | Operator-configurable `handshake_timeout` on all three TCP listeners | `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-inputs/src/{tcp,logit,syslog,otlp}.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/deploying.md`, `docs/known-gaps.md`, both syslog/native ADRs, `examples/{syslog-relay,forwarder-central}.yaml` | W5 |
+| W5 | Round-trip tests, example, closeout | `crates/logit-cli/tests/syslog_round_trip.rs`, `fixtures/syslog-relay.yaml` (new), `docs/known-gaps.md`, `docs/adr/syslog-output.md`, `docs/deploying.md`, `docs/design/internal-telemetry.md`, `AGENTS.md` | W2 + W3 (+ W4) |
+| W6 | Operator-configurable `handshake_timeout` on all three TCP listeners | `logit-config/src/lib.rs`, `logit-pipeline/src/graph.rs`, `logit-inputs/src/{tcp,logit,syslog,otlp}.rs`, `logit-cli/src/pipeline.rs`, `schema/logit.schema.json`, `docs/design/pipeline-graph.md`, `docs/deploying.md`, `docs/known-gaps.md`, both syslog/native ADRs, `fixtures/{syslog-relay,forwarder-central}.yaml` | W5 |
 
 Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5 → W6.**
 
@@ -185,7 +185,7 @@ Landing order: **W0 → (W1 ∥ W3) → (W2 ∥ W4) → W5 → W6.**
 PR numbers, per this plan's landing order: W1 (the generic TCP+TLS driver + framer) is #157, W3
 (`syslog_out` TLS) is #159, W4 (the recorded rsyslog-over-TCP fixture) is #161, and W2 (`syslog_in`
 over TCP/TLS, stacked on W1) is #163. This document's own workstream, W5 (round-trip tests, the new
-`examples/syslog-relay.yaml`, and the closeout doc edits below), is built as a branch on top of all
+`fixtures/syslog-relay.yaml`, and the closeout doc edits below), is built as a branch on top of all
 four but does not yet have a PR open. Both W2 and W3 have since picked up review fixes on their own
 branches (W2/#163: a first-byte deadline on both accept arms, a shared throttle for framing
 diagnostics, truncated-frame accounting on an abrupt close; W3/#159: `syslog_out` now flushes
@@ -241,8 +241,8 @@ row names the rsyslog version and invocation; the "TCP framing not covered" bull
 **W5** — `syslog_round_trip.rs` gains `mod tcp` (`syslog_out` TCP → `syslog_in` TCP over the existing
 corpus; a raw LF-framed client; the multiline octet case) and `mod tls` (server TLS, mTLS, wrong-CA
 refused + `Fault::Clean`), modelled on `logit_round_trip.rs` but using `bind()`+`local_addr()`, not
-`ephemeral_addr()`+sleep. `examples/syslog-relay.yaml` in `statsd-relay.yaml` style, `tls:` blocks
-commented as in `examples/forwarder-*.yaml`. Done: `cibuild` + `script/validate` clean; no remaining
+`ephemeral_addr()`+sleep. `fixtures/syslog-relay.yaml` in `statsd-relay.yaml` style, `tls:` blocks
+commented as in `fixtures/forwarder-*.yaml`. Done: `cibuild` + `script/validate` clean; no remaining
 "`syslog_in` is UDP-only" claim outside a closed `known-gaps.md` entry.
 
 **W6** -- Test list: config round-trip (default + set, all three kinds); rule 45's zero case per
