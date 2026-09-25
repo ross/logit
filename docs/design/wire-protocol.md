@@ -362,7 +362,8 @@ decision record.
 - **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
   `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
   `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
-  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as permanent. `logit_out` checks both its
+  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as permanent. So is a batch that decodes past
+  its decode budget, since it would on every resend. `logit_out` checks both its
   payload and its compressed frame against the same two numbers before sending, so it never sends
   a frame the listener refuses.
 - **The body is read once.** `logit_in` reads a frame's body into one buffer sized from the header,

@@ -207,7 +207,10 @@ saw an EOF, classified it `Fault::Ambiguous`, and dropped the batch at the defau
   `MAX_SANE_COMPRESSED_LEN` already used. `logit_in` bounds `compressed_len` by
   `compressed_bound(max_frame_bytes)`.
 - `logit_in` answers an over-bound header with `Reject{FRAME_TOO_LARGE}` before closing, so the
-  sender sees a permanent refusal instead of an EOF.
+  sender sees a permanent refusal instead of an EOF. A batch that decodes past its per-frame decode
+  budget ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)) gets the same answer: it
+  would fail the same way on every resend, and at-least-once would otherwise retry it forever. It
+  is counted once, as `logit.proto.errors{reason="decode_budget"}`.
 - `logit_out` checks its compressed frame against the same bound before sending, and drops a batch
   over it as `Fault::Permanent` with nothing written.
 

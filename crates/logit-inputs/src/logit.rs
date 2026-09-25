@@ -420,7 +420,8 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 /// declared a payload over `max_frame_bytes`, or a `compressed_len` over
 /// `frame::compressed_bound` of it; answered `Reject{FRAME_TOO_LARGE}`), `truncated` (the body
 /// read hit EOF or an I/O error), `crc`, `codec` (a frame not under the negotiated codec),
-/// `decode_budget` (a batch that decodes past its `native::DecodeBudget`), `magic` (any other
+/// `decode_budget` (a batch that decodes past its `native::DecodeBudget`; also answered
+/// `Reject{FRAME_TOO_LARGE}`), `magic` (any other
 /// malformed frame, or an undecodable batch), `ack_write_stalled` and `reject_write_stalled`
 /// (module doc's "Bounded writes"). A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -530,25 +531,33 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
         let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
-        let (batch, provenance) = if negotiated.codec == native::CODEC_NATIVE_V2 {
-            native::decode_batch_v2(&mut payload, &budget).map_err(|err| {
-                telemetry.count(
-                    "logit.proto.errors",
-                    1.0,
-                    &[("reason", decode_error_reason(&err))],
-                );
-                anyhow::Error::new(err).context("decoding a native v2 batch")
-            })?
+        let decoded = if negotiated.codec == native::CODEC_NATIVE_V2 {
+            native::decode_batch_v2(&mut payload, &budget)
+                .map_err(|err| (err, "decoding a native v2 batch"))
         } else {
-            let batch = native::decode_batch(&mut payload, &budget).map_err(|err| {
+            native::decode_batch(&mut payload, &budget)
+                .map(|batch| (batch, Provenance::default()))
+                .map_err(|err| (err, "decoding a native batch"))
+        };
+        let (batch, provenance) = match decoded {
+            Ok(decoded) => decoded,
+            Err((err, what)) => {
                 telemetry.count(
                     "logit.proto.errors",
                     1.0,
                     &[("reason", decode_error_reason(&err))],
                 );
-                anyhow::Error::new(err).context("decoding a native batch")
-            })?;
-            (batch, Provenance::default())
+                // A batch past its budget would be past it on every resend, so it's answered as
+                // a frame too large: a `logit_out` drops it as permanent rather than retrying.
+                if matches!(err, CodecError::BudgetExceeded { .. }) {
+                    let reject = control::Reject {
+                        code: control::REJECT_FRAME_TOO_LARGE,
+                        message: err.to_string(),
+                    };
+                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
+                }
+                return Err(anyhow::Error::new(err).context(what));
+            }
         };
 
         telemetry.count(
@@ -1521,6 +1530,8 @@ mod tests {
         let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
         send_data_frame(&mut client, &batch, Compression::None).await;
 
+        // `a_frame_past_the_decode_budget_is_answered_frame_too_large` pins the `Reject`.
+        let _ = read_control_response(&mut client).await;
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
@@ -1535,6 +1546,57 @@ mod tests {
         );
         assert_eq!(listener_diag.occurrences("decode_budget"), 1);
         assert_eq!(listener_diag.occurrences("connection_error"), 0);
+    }
+
+    /// A batch past its decode budget is answered `Reject{FRAME_TOO_LARGE}` before the close, so
+    /// a `logit_out` drops it as `Fault::Permanent` instead of resending it under at-least-once.
+    /// Counted once, as `decode_budget`.
+    #[tokio::test]
+    async fn a_frame_past_the_decode_budget_is_answered_frame_too_large() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // A 4 KiB budget: five empty events exceed it in a ~10-byte payload.
+        let mut input = input.with_telemetry(telemetry).with_max_frame_bytes(1024);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        send_data_frame(&mut client, &batch, Compression::None).await;
+
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("the listener answers within 2s")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE, "{}", reject.message);
+                assert!(reject.message.contains("decode budget"), "{}", reject.message);
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject")
+            .unwrap();
+        assert_eq!(n, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_value(&events, "logit.proto.errors", Some(("reason", "decode_budget"))),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&events, "logit.proto.errors", Some(("reason", "too_large"))),
+            None
+        );
+        assert!(rx.try_recv().is_err(), "nothing was forwarded");
     }
 
     #[tokio::test]
