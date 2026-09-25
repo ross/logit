@@ -3500,4 +3500,98 @@ mod tests {
             ACCEPTS * 5
         );
     }
+
+    /// Lowers the process's `RLIMIT_NOFILE` soft limit for as long as it lives and restores the
+    /// original on drop.
+    #[cfg(target_os = "linux")]
+    struct LoweredFdLimit(libc::rlimit);
+
+    #[cfg(target_os = "linux")]
+    impl LoweredFdLimit {
+        /// Sets the soft limit to the lowest free descriptor number, so every descriptor below it
+        /// is in use and the next one the process asks for fails `EMFILE`.
+        fn to_the_next_free_descriptor() -> Self {
+            use std::os::fd::AsRawFd;
+            let next_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+            let mut original = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: `getrlimit` writes one `rlimit` through a pointer to a live, aligned local.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) }, 0);
+            Self::set(libc::rlimit { rlim_cur: next_free as libc::rlim_t, ..original });
+            Self(original)
+        }
+
+        fn set(limit: libc::rlimit) {
+            // SAFETY: `setrlimit` reads one `rlimit` through a pointer to a live, aligned local.
+            let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+            assert_eq!(rc, 0, "setrlimit(RLIMIT_NOFILE): {}", std::io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LoweredFdLimit {
+        fn drop(&mut self) {
+            Self::set(self.0);
+        }
+    }
+
+    /// A listener that cannot get a descriptor for an accepted connection (`EMFILE`) backs off,
+    /// retries, and serves the connection once a descriptor is free again, instead of ending.
+    ///
+    /// Needs a process to itself: `RLIMIT_NOFILE` is process-wide, so the test runs only under
+    /// nextest's process-per-test mode and returns early in libtest's shared process
+    /// (`cargo test`, `script/unsafe-check careful`), where lowering the limit would fail other
+    /// tests' sockets. `script/unsafe-check`'s `tcp-accept-emfile` scenario covers the same path
+    /// through `strace` instead.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_resource_accept_error_backs_off_and_the_listener_keeps_serving() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!("skipped: lowers RLIMIT_NOFILE, so it needs nextest's process-per-test mode");
+            return;
+        }
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let diag = Diagnostics::new("syslog_in");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry).with_diagnostics(diag.clone());
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Created before the limit drops, so `connect` below needs no new descriptor.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        let limit = LoweredFdLimit::to_the_next_free_descriptor();
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = socket.connect(addr.parse().unwrap()).await.unwrap();
+        // Two occurrences: the first `EMFILE`, then the retry after the backoff failing again.
+        let started = std::time::Instant::now();
+        while diag.occurrences("accept_error") < 2 {
+            assert!(
+                !handle.is_finished(),
+                "the listener ended on a resource accept error: {:?}",
+                handle.await
+            );
+            assert!(started.elapsed() < Duration::from_secs(5), "no retried accept within 5s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let failures = diag.occurrences("accept_error");
+        let backoffs_elapsed =
+            started.elapsed().as_millis() / crate::listener::ACCEPT_ERROR_BACKOFF.as_millis() + 2;
+        assert!(
+            u128::from(failures) <= backoffs_elapsed,
+            "{failures} accept failures in {:?}: the loop retried without backing off",
+            started.elapsed()
+        );
+        drop(limit);
+
+        client.write_all(b"<13>after\n").await.unwrap();
+        let batch = recv_batch(&mut rx).await;
+        assert_eq!(payloads(&batch), vec!["<13>after"]);
+        let events = registry.drain(0);
+        let resource = sum_of(&events, "logit.input.accept.errors", Some(("reason", "resource")));
+        assert!(resource.is_some_and(|n| n >= 2.0), "resource accept errors counted: {resource:?}");
+        assert_eq!(sum_of(&events, "logit.input.accept.errors", Some(("reason", "fatal"))), None);
+
+        handle.abort();
+    }
 }

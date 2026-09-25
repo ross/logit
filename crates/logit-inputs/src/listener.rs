@@ -242,4 +242,100 @@ mod tests {
         drop(second);
         assert_eq!(gauge(&registry), Some(0.0));
     }
+
+    #[test]
+    fn accept_errors_are_classified_by_errno() {
+        use AcceptErrorClass::{Connection, Fatal, Other, Resource};
+        #[cfg(target_os = "linux")]
+        let by_errno = [
+            (libc::ECONNABORTED, Connection),
+            (libc::ECONNRESET, Connection),
+            (libc::EINTR, Connection),
+            (libc::EPERM, Connection),
+            (libc::EPROTO, Connection),
+            (libc::EHOSTDOWN, Connection),
+            (libc::ENONET, Connection),
+            (libc::EHOSTUNREACH, Connection),
+            (libc::EOPNOTSUPP, Connection),
+            (libc::ENETDOWN, Connection),
+            (libc::ENETUNREACH, Connection),
+            (libc::EMFILE, Resource),
+            (libc::ENFILE, Resource),
+            (libc::ENOBUFS, Resource),
+            (libc::ENOMEM, Resource),
+            (libc::EBADF, Fatal),
+            (libc::EINVAL, Fatal),
+            (libc::ENOTSOCK, Fatal),
+            (libc::EFAULT, Fatal),
+            (libc::EIO, Other),
+            (libc::ELOOP, Other),
+        ];
+        #[cfg(target_os = "linux")]
+        for (errno, class) in by_errno {
+            let err = io::Error::from_raw_os_error(errno);
+            assert_eq!(classify_accept_error(&err), class, "errno {errno}: {err}");
+        }
+
+        let by_kind = [
+            (io::ErrorKind::ConnectionAborted, Connection),
+            (io::ErrorKind::ConnectionReset, Connection),
+            (io::ErrorKind::Interrupted, Connection),
+            (io::ErrorKind::HostUnreachable, Connection),
+            (io::ErrorKind::NetworkDown, Connection),
+            (io::ErrorKind::NetworkUnreachable, Connection),
+            (io::ErrorKind::PermissionDenied, Connection),
+            (io::ErrorKind::OutOfMemory, Resource),
+            (io::ErrorKind::InvalidInput, Fatal),
+            (io::ErrorKind::TimedOut, Other),
+            (io::ErrorKind::Other, Other),
+        ];
+        for (kind, class) in by_kind {
+            assert_eq!(classify_accept_error(&io::Error::from(kind)), class, "{kind:?}");
+        }
+
+        let shutting_down =
+            io::Error::other("A Tokio 1.x context was found, but it is being shutdown.");
+        assert_eq!(classify_accept_error(&shutting_down), Fatal);
+        assert_eq!(classify_accept_error(&io::Error::other("something else")), Other);
+    }
+
+    fn accept_errors(registry: &Registry, reason: &str) -> Option<f64> {
+        registry.drain(0).iter().find_map(|e| {
+            if e.attributes.get("reason").and_then(|v| v.as_str()) != Some(reason) {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match m.kind {
+                MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name) == "logit.input.accept.errors" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn only_a_fatal_accept_error_is_returned_and_every_class_is_counted() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let mut diag = Diagnostics::new("in");
+
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        absorb_accept_error(reset, &telemetry, &mut diag).await.unwrap();
+        assert_eq!(accept_errors(&registry, "connection"), Some(1.0));
+
+        let fatal = io::Error::from(io::ErrorKind::InvalidInput);
+        let returned = absorb_accept_error(fatal, &telemetry, &mut diag).await.unwrap_err();
+        assert_eq!(returned.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(accept_errors(&registry, "fatal"), Some(1.0));
+
+        let started = std::time::Instant::now();
+        let other = io::Error::other("something else");
+        absorb_accept_error(other, &telemetry, &mut diag).await.unwrap();
+        assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF, "an `Other` error backs off");
+        assert_eq!(accept_errors(&registry, "other"), Some(1.0));
+
+        assert_eq!(diag.occurrences("accept_error"), 3);
+    }
 }
