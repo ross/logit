@@ -1,0 +1,49 @@
+# Leg `hec-logs` of `script/splunk-interop`: structured logs through `splunk_hec_out` into Splunk's
+# `main` index on the default token, no acknowledgment.
+#
+# A `lua` stage mints one warn-level log per tick with `Event.new`, carrying a trace reference and
+# a nested attribute, so the harness can find the severity fields, `trace_id`, and the flattened
+# `detail.*` keys as indexed fields. `set` stamps the envelope carriers onto the resource.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  tick:
+    type: generate_in
+    rate: 1
+    batch: 1
+
+  mint:
+    type: lua
+    sources: [tick]
+    script: |
+      local n = 0
+
+      function process(event)
+        n = n + 1
+        return Event.new{
+          timestamp = event.timestamp,
+          attributes = {leg = "hec-logs", n = n, detail = {stage = "mint", ok = true}},
+          log = {
+            message = "splunk-interop hec-logs line " .. n,
+            severity = "warn",
+            trace_id = "0af7651916cd43dd8448eb211c80319c",
+            span_id = "b7ad6b7169203331",
+          },
+        }
+      end
+
+  envelope:
+    type: set
+    sources: [mint]
+    resource:
+      com.splunk.index: main
+      com.splunk.sourcetype: logit:test
+      com.splunk.source: splunk-interop
+      host.name: splunk-interop-logit
+
+  splunk:
+    type: splunk_hec_out
+    sources: [envelope]
+    endpoint: http://splunk:8088/services/collector
+    token: 11111111-1111-1111-1111-111111111111

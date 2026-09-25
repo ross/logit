@@ -30,6 +30,9 @@ Relaying a protocol to itself is lossless. Each of these pairs is a transparent 
 - `prometheus_in` to `prometheus_out`
 - `collectd_in` to `collectd_out`
 - `graphite_in` to `graphite_out`
+- `datadog_in` to `datadog_out`
+- `datadog_trace_in` to `datadog_trace_out`
+- `splunk_hec_in` to `splunk_hec_out`
 
 A relay can regroup events into different batches and apply a short, named list of normalizations,
 but it drops no information. Summarizing, such as summing counters over a window, happens only in a

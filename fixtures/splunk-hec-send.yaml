@@ -1,0 +1,67 @@
+# Sends logs and metrics straight to Splunk Enterprise or Splunk Cloud Platform over the HTTP Event
+# Collector (HEC), with no Splunk forwarder or Collector in the path: an application's JSON log
+# lines and its statsd metrics in, the Splunk envelope stamped on each, and `splunk_hec_out`
+# (docs/adr/splunk-hec-relay.md) posting both to `/services/collector/event` in the shape the
+# OpenTelemetry Collector's `splunk_hec` exporter writes. docs/splunk.md compares this direct
+# topology with sending through SC4S or the Splunk OTel Collector.
+#
+# `splunk_hec_out` has no index or sourcetype field of its own: it reads `com.splunk.index`,
+# `com.splunk.source`, `com.splunk.sourcetype`, and `host.name` from the batch resource, so a
+# `set` per signal stamps them. Logs and metrics need different indexes, because Splunk keeps
+# metrics in a metrics index. Both indexes must be in the token's allowed list: an index the
+# token can't write fails the request with `400` code 7.
+#
+# The token comes from the environment (`SPLUNK_HEC_TOKEN`). A `200` means Splunk received a
+# request, not that it indexed it; `ack: true` waits for indexing on a token with indexer
+# acknowledgment, which Splunk Cloud doesn't offer.
+components:
+  app_logs:
+    type: tail_in
+    paths: ["/var/log/app/*.jsonl"]
+
+  app_json:
+    type: json
+    sources: [app_logs]
+
+  log_envelope:
+    type: set
+    sources: [app_json]
+    resource:
+      com.splunk.index: main
+      com.splunk.sourcetype: app:json
+      com.splunk.source: /var/log/app
+      host.name: web-1
+
+  app_metrics:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  windowed:
+    type: aggregate
+    sources: [app_metrics]
+    interval: 10s
+    # A Splunk metric is a sample, so counters go out as running totals and `mstats rate()`
+    # turns them back into rates. A delta sum would reach Splunk with nothing marking it delta.
+    temporality: cumulative
+
+  metric_envelope:
+    type: set
+    sources: [windowed]
+    resource:
+      com.splunk.index: metrics     # a metrics index
+      com.splunk.source: statsd
+      host.name: web-1
+
+  splunk:
+    type: splunk_hec_out
+    sources: [log_envelope, metric_envelope]
+    endpoint: https://splunk.example.com:8088/services/collector
+    token: !env SPLUNK_HEC_TOKEN
+    # Timers and histograms leave `aggregate` as sketches, which a one-number-per-name Splunk
+    # metric can't hold: `skip` (the default) drops them, counted; `expand` writes `_count`,
+    # `_sum`, and percentile series.
+    multi_value: expand
+    # compression: gzip          # the default; none sends bodies uncompressed
+    # max_body_bytes: 2MiB       # the default; keep it under Splunk's max_content_length
+    # tls:
+    #   ca_file: splunk-ca.pem   # Splunk Enterprise's HEC certificate is self-signed by default

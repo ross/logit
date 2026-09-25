@@ -3,7 +3,7 @@
 # telemetry, so every other scenario's numbers are read relative to this one. Scenario table:
 # docs/plans/load-test-harness.md, "Scenarios".
 #
-# An ordinary logit config like anything under examples/: `logit run perf/scenarios/passthrough.yaml`
+# An ordinary logit config like anything under fixtures/: `logit run perf/scenarios/passthrough.yaml`
 # works, as does the harness:
 #
 #   script/perf run --scenario passthrough

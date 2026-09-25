@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The `splunk-java` producer for script/record-fixtures: a one-class Logback app on Splunk's
+  `splunk-library-javalogging`, whose HEC appenders post to the capture sink (logback.xml).
+  Built and run in one maven container; `dependency:copy-dependencies` puts the runtime jars
+  beside the classes so the app runs with plain `java -cp`.
+
+  The library and its `com.splunk:splunk` dependency are published to Splunk's own repository,
+  not Maven Central.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>dev.logit.fixtures</groupId>
+  <artifactId>splunk-java-fixture</artifactId>
+  <version>1</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <repositories>
+    <repository>
+      <id>splunk-artifactory</id>
+      <url>https://splunk.jfrog.io/splunk/ext-releases-local</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.splunk.logging</groupId>
+      <artifactId>splunk-library-javalogging</artifactId>
+      <version>1.11.11</version>
+    </dependency>
+    <!-- `provided` in the library's own pom: the app brings its Logback. 1.3.x is the line the
+         library builds against. -->
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <version>1.3.16</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <!-- Main.java sits beside this file rather than under src/main/java. -->
+    <sourceDirectory>.</sourceDirectory>
+  </build>
+</project>

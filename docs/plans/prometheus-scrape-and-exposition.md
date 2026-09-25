@@ -190,7 +190,7 @@ count of consecutive idle flush windows, not a duration, per
 [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md); the rename below
 keeps that type) rather than inventing a second bounding scheme for this one mode — renamed from
 their gauge-specific names to `series_retention`/`max_retained_series` now that they bound more
-than gauges, with `demo/`/`examples/` and the existing config tests in
+than gauges, with `demo/`/`fixtures/` and the existing config tests in
 [`crates/logit-config/src/lib.rs`](../../crates/logit-config/src/lib.rs) updated for the rename.
 Every eviction is counted, distinguishing cardinality pressure from a series aging out under the
 windows-count TTL — `logit.transform.series.evicted{reason="cardinality"|"idle"}`, keeping the
@@ -246,10 +246,10 @@ text-format one.
 |---|---|---|
 | W0 | **Landed.** This plan; ADR [`prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md); amendments to [`internal-telemetry-as-pipeline-events`](../adr/internal-telemetry-as-pipeline-events.md) and [`lossless-transit`](../adr/lossless-transit.md); index rows in both `docs/adr/README.md` and `docs/plans/README.md`. | — |
 | W1 | **Landed.** Codec: `logit-proto/src/prometheus/{mod,text}.rs`, both dialects, decode+encode, `DISTRIBUTION_QUANTILES` shared with OTLP, telemetry counters; inline tests drawn from the exposition-format docs' and the OpenMetrics spec's own examples; `crates/logit-proto/tests/prometheus_fixed_point.rs` (`families -> events -> families`, byte-level `write(parse(x)) == canonical(x)`, and a `proptest` grammar generator); `docs/design/data-model.md`'s well-known-attribute rows; `docs/known-gaps.md` cross-protocol rows. | W0 |
-| W2 | **Landed.** `prometheus_in`: input, config variant, graph rule 40, registry arm, the `reqwest` dependency, unit tests against a canned `hyper` server, `examples/prometheus-scrape.yaml`, regenerated schema, `docs/design/pipeline-graph.md`'s arity table and rules. | W1 |
+| W2 | **Landed.** `prometheus_in`: input, config variant, graph rule 40, registry arm, the `reqwest` dependency, unit tests against a canned `hyper` server, `fixtures/prometheus-scrape.yaml`, regenerated schema, `docs/design/pipeline-graph.md`'s arity table and rules. | W1 |
 | W3 | **Landed.** `prometheus_out` + `Output::bind`: the runtime hook (extended to every `NodeSpec::Output`, not just inputs), the exposition sink and its registry, config, graph rule 41, registry arm, unit tests, regenerated schema, `docs/design/pipeline-graph.md`'s lifecycle note. | W1 (parallel with W2) |
 | W4 | **Landed.** `aggregate` cumulative mode: `temporality: delta \| cumulative` config, cumulative `Sum`/`Histogram` accumulators surviving flush, `gauge_retention`/`max_retained_gauge_series` renamed and generalized to `series_retention`/`max_retained_series`, graph rule 39, the `aggregation-window-semantics` ADR amendment, tests. | — (parallel with W1–W3 by dependency ordering, not file disjointness — W2/W3/W4 all edit `ComponentKind` in `crates/logit-config/src/lib.rs` and regenerate `schema/logit.schema.json`; merges resolve the overlap) |
-| W5 | **Landed.** Integration and closeout: `crates/logit-cli/tests/prometheus_round_trip.rs` -- a canned `hyper` target through a real `prometheus_in` through a real `prometheus_out` to a `reqwest` scrape, byte-exact in both dialects (and across a dialect change) against a 10-fixture corpus, plus `statsd_in -> aggregate(cumulative) -> prometheus_out` and `internal -> aggregate(cumulative) -> prometheus_out` cases through the real runtime pieces; `crates/logit-bench/tests/allocations.rs`'s `prometheus_decode_one_scrape`/`prometheus_encode_100_series` with `docs/design/memory.md` rows; `examples/prometheus-relay.yaml`, and `examples/prometheus-expose.yaml` switched to the `internal -> aggregate -> prometheus_out` shape with `temporality: cumulative` uncommented; `AGENTS.md`'s current-state paragraph; `docs/known-gaps.md`'s dedicated remote-write follow-up row (the other five follow-ups the plan named were already covered by W1/W3's own rows). | W2, W3, W4 |
+| W5 | **Landed.** Integration and closeout: `crates/logit-cli/tests/prometheus_round_trip.rs` -- a canned `hyper` target through a real `prometheus_in` through a real `prometheus_out` to a `reqwest` scrape, byte-exact in both dialects (and across a dialect change) against a 10-fixture corpus, plus `statsd_in -> aggregate(cumulative) -> prometheus_out` and `internal -> aggregate(cumulative) -> prometheus_out` cases through the real runtime pieces; `crates/logit-bench/tests/allocations.rs`'s `prometheus_decode_one_scrape`/`prometheus_encode_100_series` with `docs/design/memory.md` rows; `fixtures/prometheus-relay.yaml`, and `fixtures/prometheus-expose.yaml` switched to the `internal -> aggregate -> prometheus_out` shape with `temporality: cumulative` uncommented; `AGENTS.md`'s current-state paragraph; `docs/known-gaps.md`'s dedicated remote-write follow-up row (the other five follow-ups the plan named were already covered by W1/W3's own rows). | W2, W3, W4 |
 
 Landing order: W0 → (W1, W4) → (W2, W3) → W5.
 
@@ -257,7 +257,7 @@ Landing order: W0 → (W1, W4) → (W2, W3) → W5.
 
 - `script/check` (format check, clippy with warnings denied, and the workspace test suite) and
   `script/cibuild` pass for every workstream's PR; `script/schema` regenerated and committed for
-  any workstream that changes a config type; `script/validate` passes over `demo/` and `examples/`.
+  any workstream that changes a config type; `script/validate` passes over `demo/` and `fixtures/`.
 - W1: the codec's fixed-point tests pass for every fixture drawn from the exposition-format docs
   and the OpenMetrics spec's own examples.
 - W2/W3: the unit tests described above pass; `logit validate` accepts the new example configs.

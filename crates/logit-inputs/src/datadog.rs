@@ -120,7 +120,8 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
-    media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
+    matches_any_key, media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
+    MediaType,
 };
 use crate::Input;
 use bytes::Bytes;
@@ -758,9 +759,8 @@ fn acknowledge(shared: &Shared, route: &'static str) {
 }
 
 /// Whether the request carries a `DD-API-KEY` header, or else a `query_key`, equal to one of
-/// `api_keys`; always `true` when none are configured. Every configured key is compared, and each
-/// comparison runs over the whole key, so the time taken doesn't reveal how much of a guess
-/// matched.
+/// `api_keys` ([`matches_any_key`]'s constant-time comparison); always `true` when none are
+/// configured.
 fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap, query_key: Option<&[u8]>) -> bool {
     if api_keys.is_empty() {
         return true;
@@ -768,20 +768,13 @@ fn authorized(api_keys: &[Box<[u8]>], headers: &HeaderMap, query_key: Option<&[u
     let Some(sent) = headers.get("dd-api-key").map(HeaderValue::as_bytes).or(query_key) else {
         return false;
     };
-    api_keys.iter().fold(false, |matched, key| matched | constant_time_eq(key, sent))
+    matches_any_key(api_keys, sent)
 }
 
 /// The first `api_key=` parameter of a query string, as sent: an API key is hex, so nothing in it
 /// is percent-encoded.
 fn query_api_key(query: Option<&str>) -> Option<&[u8]> {
     query?.split('&').find_map(|pair| pair.strip_prefix("api_key=")).map(str::as_bytes)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The fields an `/intake/` body is probed for (this module's "`/intake/` carries events and
@@ -1318,11 +1311,8 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_compares_whole_keys() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(authorized(&[], &HeaderMap::new(), None), "no keys accepts anything");
+    fn no_api_keys_accepts_anything() {
+        assert!(authorized(&[], &HeaderMap::new(), None));
     }
 
     #[test]
