@@ -1,0 +1,1 @@
+{"event":{"line":"{\"level\":\"info\",\"msg\":\"splunk-docker fixture inline\",\"n\":1}","source":"stdout","tag":"08864e218903"},"time":"1790358587.350212","host":"splunk-docker-fixture"}{"event":{"line":"splunk-docker fixture plain line (inline)","source":"stdout","tag":"08864e218903"},"time":"1790358587.350273","host":"splunk-docker-fixture"}
