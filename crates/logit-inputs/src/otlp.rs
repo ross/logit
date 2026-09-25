@@ -17,12 +17,13 @@
 //! connections by [`hyper::server::conn::http2::Builder`] directly, since gRPC is HTTP/2 only.
 //!
 //! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
-//! datagrams; TCP has no such escape hatch. A slow `sink.send_reserved(batch).await` blocks the
-//! handler, which stops reading that connection, which the client feels as its own write
-//! blocking. That is correct for a reliable protocol (an OTLP exporter retries or buffers on its
-//! own timeout): `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up
-//! and closes cancels the handler mid-send; `Fanout::send_reserved` reserves every consumer before
-//! delivering to any, so the retry never lands twice on one branch of a fan-out.
+//! datagrams; TCP has no such escape hatch. A slow downstream blocks the handler's delivery, which
+//! stops reading that connection, which the client feels as its own write blocking. That is
+//! correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
+//! `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up and closes
+//! cancels only the handler's wait: [`crate::http::deliver_detached`] runs the request's sends on
+//! a task of their own, so every consumer still gets every batch, and the retry duplicates on
+//! every branch alike rather than on some.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -357,8 +358,9 @@ impl Input for OtlpInput {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = live_connections.clone();
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                // Held for the connection's lifetime; released on drop.
+                let _permit = permit;
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
                 let _live = live_connections.enter();
 
                 // The handshake runs here, after the permit, so it stalls only this connection.
@@ -586,9 +588,7 @@ async fn handle_http(
     };
     match result {
         Ok(batches) => {
-            for batch in batches {
-                sink.send_reserved(batch).await;
-            }
+            crate::http::deliver_detached(&sink, batches).await;
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
             // ([`export_response_json`]).
@@ -718,9 +718,7 @@ async fn handle_grpc(
     let mut decoder = OtlpDecoder::new().with_telemetry(telemetry);
     match decoder.decode_signal(signal, payload) {
         Ok(batches) => {
-            for batch in batches {
-                sink.send_reserved(batch).await;
-            }
+            crate::http::deliver_detached(&sink, batches).await;
             Ok(grpc_response(0, "", Some(export_response(0, ""))))
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
@@ -2194,36 +2192,67 @@ mod tests {
         recv_batch(&mut rx).await;
     }
 
+    /// One `/v1/metrics` body carrying two `ResourceMetrics` (hosts `a` and `b`), which decodes to
+    /// two batches. Concatenated encodings of a message are a valid merge, and `MetricsData`'s only
+    /// field is the repeated `resource_metrics`.
+    fn two_resource_metrics_payload() -> Vec<u8> {
+        let mut body = Vec::new();
+        for host in ["a", "b"] {
+            let mut resource = logit_core::Resource::default();
+            resource.attributes.insert("host", host);
+            let batch = logit_core::EventBatch {
+                resource: std::sync::Arc::new(resource),
+                scope: None,
+                events: metric_batch().events,
+            };
+            let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+            let payloads =
+                logit_proto::SignalEncoder::encode_signals(&mut encoder, &batch).unwrap();
+            body.extend_from_slice(&payloads[0].1);
+        }
+        body
+    }
+
+    /// The `host` resource attribute of each batch `rx` holds, waiting up to 300ms for each.
+    async fn hosts_received(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> Vec<String> {
+        let mut hosts = Vec::new();
+        while let Ok(Some(delivered)) =
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            let batch = logit_pipeline::unwrap_batch(delivered);
+            let host = batch.resource.attributes.get("host").and_then(|v| v.as_str());
+            hosts.push(host.unwrap_or("").to_string());
+        }
+        hosts
+    }
+
     /// A client that gives up while its request waits on a full consumer (an exporter's own
-    /// timeout under backpressure) cancels the handler. With two consumers, the first must not
-    /// keep a batch the second never got: the client retries, and the first would see it twice.
+    /// timeout under backpressure) cancels only the handler's wait, not the delivery: every
+    /// consumer still gets every batch of the request. The client never saw a `200`, so its retry
+    /// duplicates on every branch alike, the ordinary at-least-once outcome, where a split would
+    /// duplicate on some branches and not others.
     #[tokio::test]
-    async fn a_client_that_closes_while_its_batch_waits_leaves_no_consumer_with_it() {
+    async fn a_client_that_closes_while_its_batches_wait_still_delivers_them_to_every_consumer() {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (tx_a, mut rx_a) = mpsc::channel(16);
         let (tx_b, mut rx_b) = mpsc::channel(1);
         let sink = Fanout::new(vec![tx_a, tx_b]);
-        // Fills b's one slot, so the request's send waits on b; a's copy is drained here.
+        // Fills b's one slot, so the request's first send waits on b; a's copy is drained here.
         sink.send(metric_batch()).await;
         recv_batch(&mut rx_a).await;
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        write_request(&mut client, &addr, "/v1/traces", &one_span_payload()).await;
+        write_request(&mut client, &addr, "/v1/metrics", &two_resource_metrics_payload()).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         drop(client);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let filler = recv_batch(&mut rx_b).await;
-        assert!(filler.events[0].span.is_none(), "b's first batch is the metric filler");
-        let a = tokio::time::timeout(Duration::from_millis(300), rx_a.recv()).await;
-        let b = tokio::time::timeout(Duration::from_millis(300), rx_b.recv()).await;
-        assert_eq!(
-            (a.is_ok(), b.is_ok()),
-            (false, false),
-            "a cancelled request's batch reaches every consumer or none (a, b)"
-        );
+        let b = hosts_received(&mut rx_b).await;
+        let a = hosts_received(&mut rx_a).await;
+        assert_eq!(b, ["", "a", "b"], "b: the filler, then both of the request's batches");
+        assert_eq!(a, ["a", "b"], "a: both of the request's batches");
     }
 
     fn metric_batch() -> logit_core::EventBatch {

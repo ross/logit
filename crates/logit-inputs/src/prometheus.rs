@@ -1232,8 +1232,9 @@ impl Input for PrometheusReceiver {
             let resource = Arc::clone(&self.resource);
             let metadata_cache = metadata_cache.clone();
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                // Held for the connection's lifetime; released on drop.
+                let _permit = permit;
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
                 let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
@@ -1610,7 +1611,10 @@ async fn write_response(
     if !events.is_empty() {
         // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
-        sink.send_reserved(EventBatch { resource, scope: None, events }).await;
+        // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
+        // part of the fan-out (`crate::http::deliver_detached`).
+        crate::http::deliver_detached(sink, vec![EventBatch { resource, scope: None, events }])
+            .await;
     }
     ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }

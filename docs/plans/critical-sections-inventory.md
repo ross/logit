@@ -4364,11 +4364,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - **A client closing mid-send split a fan-out (dos/w6).** A client that closes while its
     handler waits on a full second consumer cancels the handler (h1 EOF drops the service future;
     h2 `RST_STREAM` cancels the stream task), leaving the first consumer holding the batch and
-    the retry duplicating on it. **fixed**: `otlp_in` and `prometheus_in` send through
-    `Fanout::send_reserved`, which reserves every consumer before delivering
-    (`a_send_cancelled_after_the_first_consumer_accepted_leaves_no_consumer_with_the_batch`,
-    `a_client_that_closes_while_its_batch_waits_leaves_no_consumer_with_it`, both seen to fail
-    first with `(true, false)`).
+    the retry duplicating on it. **fixed**: `otlp_in` and `prometheus_in` run a request's sends
+    on a task of their own (`http::deliver_detached`) and await it, so a closing client cancels
+    only the wait and every consumer gets every batch of the request
+    (`a_client_that_closes_while_its_batches_wait_still_delivers_them_to_every_consumer`, seen to
+    fail first with `b` holding only its filler). Reserving every consumer first was tried and
+    dropped: without a deadline it deadlocks a diamond graph (`fanout.rs`'s module doc).
 - **Observed concerns (unverified):**
   - The wait-out loop (`drive_with_idle`'s post-`shutdown` loop) has no overall ceiling: `grace` restarts each iteration as long
     as `in_flight > 0`. A client that keeps a request in flight indefinitely (a handler blocked on

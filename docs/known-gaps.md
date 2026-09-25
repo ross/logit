@@ -1477,7 +1477,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   would have no right answer. A mode tag was considered and not added: the modes are already told
   apart by which of `logit.input.scrapes`/`logit.input.writes` the component reports.
 - **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**
-  `Fanout::send_reserved`, like every `Fanout` send, silently skips a closed consumer (counted
+  `Fanout::send`, which the receiver's delivery task calls, silently skips a closed consumer (counted
   `logit.component.events.dropped{reason="closed_consumer"}`,
   `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
   the `Fanout` *before* building the response — `otlp_in`'s ordering, which lets channel
