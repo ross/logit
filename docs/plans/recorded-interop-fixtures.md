@@ -276,7 +276,7 @@ second, backing the hand-written literals in `crates/logit-proto/src/otlp/mod.rs
 already on `main`) and, once #113 lands, `crates/logit-proto/src/otlp/json/*.rs` (JSON, not yet on
 `main` — see "What this PR ships vs. what's follow-on work" above). HAProxy/nginx access-log
 capture is deliberately **not** a fixture-corpus concern — that's already covered by the existing
-`demo/`/`examples/nginx/` integration test path, and duplicating it here would just be a slower,
+`demo/`/`fixtures/nginx/` integration test path, and duplicating it here would just be a slower,
 less realistic copy of what `demo/` already proves. Docker json-file cross-version fixtures and
 `logit_in`/`logit_out` cross-version compatibility fixtures are real future work, named explicitly
 above, not silently out of scope. statsd/DogStatsD was the third item here until 2026-09-18, when it

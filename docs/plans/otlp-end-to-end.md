@@ -350,7 +350,7 @@ first-time user watching `docker compose logs -f logit` isn't alarmed by it.
 
 Per PR: `script/cibuild` — `script/format --check`, `script/lint` (`clippy -D warnings`),
 `script/test` (`cargo nextest run --workspace`), `script/validate` (`logit validate` over
-`demo/logit.yaml` and every `examples/*.yaml`), the `script/schema` drift check, and `script/audit`
+`demo/logit.yaml` and every `fixtures/*.yaml`), the `script/schema` drift check, and `script/audit`
 (`cargo-deny` + `cargo-audit`) — passed clean at every PR boundary, including on the combined
 `feat/demo-traces` branch after merging all three prior branches together.
 

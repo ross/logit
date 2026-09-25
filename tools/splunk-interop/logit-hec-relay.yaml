@@ -1,0 +1,18 @@
+# Leg `hec-relay` of `script/splunk-interop`: the tee topology end to end. `splunk_hec_in` stands
+# where Splunk's HEC port would, the `replay` service posts it every request recorded in
+# testdata/interop/splunk/ with its recorded method, path, and headers, and `splunk_hec_out`
+# relays what arrives into Splunk on the default token. The harness then searches Splunk for each
+# producer's events.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  hec:
+    type: splunk_hec_in
+    bind: 0.0.0.0:8088
+
+  splunk:
+    type: splunk_hec_out
+    sources: [hec]
+    endpoint: http://splunk:8088/services/collector
+    token: 11111111-1111-1111-1111-111111111111

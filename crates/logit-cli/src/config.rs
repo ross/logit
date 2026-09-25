@@ -216,13 +216,24 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut configs = vec![root.join("demo/logit.yaml")];
         configs.extend(
-            std::fs::read_dir(root.join("examples"))
+            std::fs::read_dir(root.join("fixtures"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        // One directory per example, each with a `logit.yaml`; a directory without one fails
+        // `load_with` below.
+        let examples_dir = root.join("examples");
+        configs.extend(
+            std::fs::read_dir(&examples_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", examples_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .map(|dir| dir.join("logit.yaml")),
+        );
         // `perf/scenarios/`, `script/shape-survey`'s capture configs, and `script/victoria-interop`'s
-        // leg configs run only out of CI, so a field rename must fail here, not on their next run.
+        // and `script/splunk-interop`'s leg configs run only out of CI, so a field rename must
+        // fail here, not on their next run.
         let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
             std::fs::read_dir(&perf_scenarios_dir)
@@ -237,27 +248,31 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // `script/victoria-interop`'s per-leg configs; the directory's other YAML is compose and
-        // vmagent config, so only `logit-*.yaml`.
-        let victoria_interop_dir = root.join("tools/victoria-interop");
-        configs.extend(
-            std::fs::read_dir(&victoria_interop_dir)
-                .unwrap_or_else(|err| panic!("reading {}: {err}", victoria_interop_dir.display()))
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml"))
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("logit-"))
-                }),
-        );
+        // The two interop harnesses' per-leg configs; each directory's other YAML is compose (and
+        // vmagent) config, so only `logit-*.yaml`.
+        for harness in ["tools/victoria-interop", "tools/splunk-interop"] {
+            let dir = root.join(harness);
+            configs.extend(
+                std::fs::read_dir(&dir)
+                    .unwrap_or_else(|err| panic!("reading {}: {err}", dir.display()))
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "yaml"))
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("logit-"))
+                    }),
+            );
+        }
         configs.sort();
 
-        assert!(configs.len() > 1, "expected demo and example configs");
+        assert!(configs.len() > 1, "expected demo and fixture configs");
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
                 "DD_API_KEY" => Some("logit-test-key".to_string()),
+                "SPLUNK_OBSERVABILITY_TOKEN" => Some("logit-test-token".to_string()),
+                "SPLUNK_HEC_TOKEN" => Some("logit-test-token".to_string()),
                 // The whole header value, `Bearer ` included: `!env` substitutes a field, it
                 // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {

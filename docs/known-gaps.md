@@ -143,7 +143,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     something other than a user's own naming mistake. Mitigation: [`docs/deploying.md`](deploying.md)
     recommends `keep` in front of `otlp_in` specifically, beyond the general
     `aggregate`-cardinality recommendation
-    [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) demonstrates.
+    [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) demonstrates.
   - **`logit_in`'s native dictionary.** `crates/logit-proto/src/native/dict.rs`'s `Dict::read`
     interns every dictionary string a `logit_in` peer sends before the rest of the batch
     validates, so its strings stay in the interner, including from a batch the decoder then
@@ -730,6 +730,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)), whose module
     doc's encode tables are the authority. They cover what leaves `datadog_out` and
     `datadog_trace_out` from another protocol's data; a Datadog-origin batch relays losslessly.
+  - The `encode (Splunk)`/`decode (Splunk)` rows are the Splunk HEC codec
+    (`crates/logit-proto/src/splunk/`, [ADR `splunk-hec-relay`](adr/splunk-hec-relay.md)), whose
+    module doc and its `logs`, `metrics`, and `spans` submodules are the authority. They cover what
+    another protocol's data loses through `splunk_hec_out`, and what comes back different through
+    `splunk_hec_in`; a HEC-origin batch relays losslessly modulo the codec's permitted
+    normalizations.
 
   | Direction | Mapping | Counter | Why |
   |---|---|---|---|
@@ -776,6 +782,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   | encode (Datadog) | A span attribute that is an `Array`, `Map`, or `Null` → a `meta` string of its JSON text; an integer an `f64` can't hold exactly → `metrics` as the nearest `f64` | `logit.output.spans.degraded{reason="json_text"\|"int_as_f64"}` | `meta` is string-to-string and `metrics` string-to-`f64`: the only typed homes a span attribute has. |
   | encode (Datadog) | `Histogram`, `ExponentialHistogram`, `Summary`, `GaugeDelta`, `SetMembers`, and a cumulative or non-monotonic `Sum` → **skipped** | `logit.output.metrics.skipped{metric_kind}` | A series is `count`, `rate`, `gauge`, or unspecified; a delta monotonic `Sum` is the only sum a `count` can carry. The "`datadog_out` sends no Agent-style `h`/`ms` aggregates" entry has the follow-up. |
   | encode (Datadog) | `Set` → a `gauge` of `estimate()`; a `Distribution` under a logarithmic mapping → re-binned into `Mapping::agent`; a `Samples` with `sample_rate < 1` → each value repeated `weight()` times | `logit.output.metrics.degraded{reason="set_estimate"\|"rebinned"\|"sample_rate_expanded"}` | A set gauge is the Agent's own `s`. A metrics sketch carries no mapping, so the receiver assumes the Agent's. Distribution points have no rate field. |
+  | encode/decode (Splunk) | A resource attribute other than the four envelope carriers → an object's `fields`, and back as an **event** attribute (a span's `fields` return to the resource) | none (documented) | Every HEC object carries one flat `fields` map; only `host`, `source`, `sourcetype`, and `index` have an envelope slot. The Graphite resource row's loss, one protocol over. |
+  | encode (Splunk) | `Samples`, `Distribution`, `Set`, `SetMembers`, `Histogram`, `Summary` → **skipped** under `multi_value: skip` (the default), or **expanded** into the exporter's `_sum`/`_count`/`_bucket{le}`/`<n>_<q>{qt}` and a count/sum/min/max/percentile series set under `expand`; `ExponentialHistogram` skipped under both | `logit.output.metrics.skipped{metric_kind}` / `logit.output.metrics.degraded{metric_kind}` | A Splunk metric is one number per name. `expand` is a naming convention `mstats`/`histperc` know, and loses mergeability; the exporter drops exponential histograms too. |
+  | encode (Splunk) | A `Sum`'s temporality and monotonicity → `metric_type` `Sum` only; a delta or non-monotonic `Sum` comes back `Sum{Cumulative, monotonic}` | `logit.output.metrics.degraded{metric_kind="delta_sum"\|"non_monotonic_sum"}` | HEC has no carrier for either: `metric_type` is an ordinary dimension. The Graphite `Sum` row's loss. |
+  | encode (Splunk) | `MetricRecord`'s `unit`, `description`, `start_timestamp`, `exemplars`, and `flags` → dropped | none (documented) | A metric object is `metric_name:<n>` numbers and dimensions; there is no metadata slot. |
+  | encode (Splunk) | A log's `body_format`, `observed_timestamp`, `dropped_attributes_count`, and `TraceRef` flags → not sent, and decoded back from the wire's shape (`Json` for an object or array, else `Raw`), `0`, `0`, `0`; a typed `severity` with no severity attribute → `otel.log.severity.text`/`.number` of its band's base, which come back as attributes beside the typed field | none (documented) | The exporter's log object has fields for none of them. The severity attributes are kept on decode because the band collapses OTLP's 24 numbers to 6 (ADR decision 15). |
+  | encode (Splunk) | A span's `flags`, `trace_state`, dropped counts, a link's flags and dropped count, and an event's dropped count → dropped; `SpanKind::Unspecified` → `Internal` | `logit.output.spans.degraded{reason="no_wire_form"}`, once per span | The exporter's span object has no member for them, and writes only named kinds. |
+  | encode (Splunk) | A nested `Map` attribute → dotted keys; an empty `Map` → dropped; an `Array` holding a container, or a map nested past the depth bound → its JSON text | none (documented) | HEC `fields` must be flat (Splunk rejects a nested value); flattening is what the exporter does. `flatten_into` departs from the `flatten` transform where a flat object has no room for what `flatten` keeps. |
+  | encode (Splunk) | A metric name outside `[A-Za-z0-9_.:]`, starting with a digit or `_`, or containing `metric_name` → sanitized, `m`-prefixed | `logit.output.metrics.normalized{reason="name_sanitized"}` | Splunk's metric-name rules; Prometheus's `_` prefix is forbidden as a leading character here (ADR decision 13). |
+  | encode (Splunk) | One event carrying several payloads → one object per payload (log, then metrics, then span), which decode back as separate events | none (documented) | A HEC object's `event` is a log, a metric event, or a span object, never two. |
+  | encode (Splunk) | `Value::Bytes` → a base64 string; `Value::Timestamp` → an RFC 3339 string; a non-finite `F64` attribute → `null`; each decodes back as a `Str` (or `Null`) | none (documented) | JSON has no bytes, timestamp, or non-finite number. A non-finite metric value is the exception: it goes out as `"+Inf"`/`"-Inf"`/`"NaN"` and comes back a number. |
+  | encode (Splunk) | An object Splunk names in a `400` code 6 (`invalid-event-number`) → dropped, and the rest of its request resent once | `logit.output.records.dropped{reason="invalid_event"}`, diagnostic key `invalid_event` | So one malformed object can't cost a whole request. Splunk Enterprise 10.4.3 indexes the objects ahead of the named one and none from it on (`docs/plans/splunk-relay.md`'s "Settled by W5", item 8). |
+  | decode (Splunk) | An `event` object in neither the OTel exporter's exact span shape nor a metric shape → a log with a `Map` body | `logit.input.spans.degraded{reason="malformed_span"}` when it carried the four span members but another member didn't parse | Spans are detected by shape (valid `trace_id`, `span_id`, `start_time`, `end_time`, and nothing the exporter never writes), so an ordinary JSON log is never read as a span (ADR decision 14). |
+  | decode (Splunk) | A metric object's `metric_type` `Sum` → `Sum{Cumulative, monotonic}`; `Gauge`, absent, or any other value → `Gauge`, the other value kept as an attribute | none (documented) | `metric_type` is an ordinary dimension to Splunk, and HEC carries no temporality, so a delta sender's sums read as cumulative (ADR decision 12). |
+  | decode (Splunk) | A `/raw` body → one `Str` log per LF-delimited line, stamped with receipt time, the envelope from the query string | none (documented) | Splunk would apply the sourcetype's `props.conf` line breaking and timestamp extraction; `logit` has neither, and `splunk_hec_out` relays each line through `/event` with that time. A `regex` or `lua` stage merges multi-line events. |
 
   **Still open, too narrow for a row:** `BodyFormat` has no OTLP field and round-trips through a
   reserved attribute (`logit.body_format`), lossless but attribute-shaped (`otlp/logs.rs`'s module
@@ -1125,6 +1145,89 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   millions (a statsd sample-rate typo extrapolated through `aggregate`) across many bins, and
   [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model treats that as an
   accident to bound, not data to scale down.
+- **`datadog_out` reports a connect failure `Clean` after an earlier request of the same batch
+  succeeded.** One `send` is up to eight routes' requests, and `crate::http`'s
+  `classify_reqwest_error` makes any connect failure `Fault::Clean`. `write_loop` retries `Clean`
+  under every delivery posture, and the retry re-sends the requests that already succeeded.
+  - **Consequence:** under the default at-most-once posture, a connect failure on route 2 after
+    route 1 was accepted resends route 1, and Datadog stores a resent log (and any route not
+    measured) twice.
+  - **Fix:** `splunk_hec_out`'s rule: once a request of the `send` is accepted, a later
+    transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
+    `after_delivery`).
+
+## Splunk
+
+- **No Splunk-to-Splunk (S2S) listener.** A universal forwarder speaks only S2S, over `:9997` or
+  `[httpout]` to `/services/collector/s2s`, and the protocol has no public specification: Splunk
+  9.1+ requires v4, the open implementations stop at v3, and Cribl's is proprietary
+  ([plan §9](plans/splunk-relay.md#9-not-in-this-stack)).
+  - **Consequence:** a universal forwarder can't point at `logit`, so a forwarder-fed Splunk
+    can't be teed through `splunk_hec_in`.
+  - **Workaround:** a heavy forwarder's `outputs.conf [syslog]` stanza into `syslog_in` (RFC 3164
+    over UDP or TCP).
+  - **Revisit trigger:** a published S2S specification, or a user whose forwarders can't be given
+    a `[syslog]` output.
+- **No REST search export input.** Splunk's `search/jobs/export` on the management port `:8089`
+  streams search results as CSV, JSON, or raw text; `logit` has no poll-driven source for it.
+  Splunk Cloud opens that port only by support ticket.
+  - **Consequence:** data already indexed in Splunk can't be pulled out through `logit`.
+  - **Revisit trigger:** a migration that needs historical data moved, not only new data teed.
+- **No listener for a forwarder's `[tcpout] sendCookedData = false` output.** Splunk Enterprise
+  10.4.3 writes each event's `_raw` followed by one LF, with no header, length, or metadata
+  (`tools/splunk-interop/README.md`, "What the run showed"). `logit` has no plain-lines TCP
+  listener; `syslog_in` would parse each line as a syslog message. The Datadog section's "No
+  plain-lines listener" entry is the same gap.
+  - **Consequence:** this output can't feed `logit`, and even a line listener would split an event
+    with an embedded newline into two, and receive no `host`, `source`, `sourcetype`, or `index`.
+  - **Workaround:** the heavy forwarder's `[syslog]` output, as above.
+  - **Revisit trigger:** a `lines_in` on the `TcpListener` driver, which would serve this and the
+    Datadog case ([plan §9](plans/splunk-relay.md#9-not-in-this-stack)).
+- **An Edge Processor's HEC destination pointed at `splunk_hec_in` is UNVERIFIED.** Splunk's docs
+  describe the HEC destination only for Splunk targets, with acknowledgment off on the destination
+  token. Edge Processor runs in Splunk Cloud and a Splunk Enterprise 10.x edition the
+  `splunk/splunk` image isn't, so W5 ran none
+  ([plan, "Settled by W5"](plans/splunk-relay.md#settled-by-w5-2026-09-25), item 3).
+  - **Consequence:** the one Splunk-side HEC sender that could tee a forwarder-fed Splunk into
+    `logit` is untested.
+  - **Revisit trigger:** access to an Edge Processor; record what it sends with
+    `script/record-fixtures`.
+- **No acknowledgment on Splunk Cloud.** Splunk Cloud Platform doesn't offer HEC indexer
+  acknowledgment, so `splunk_hec_out`'s `ack: true` counts each request delivered on its `200`,
+  counted `logit.output.acks{result="unsupported"}`.
+  - **Consequence:** delivery to Splunk Cloud ends at a `200`, which means received, not indexed.
+  - **Revisit trigger:** Splunk Cloud offers acknowledgment on HEC.
+- **HEC codes 21, 22, 24, and 25 aren't modeled, and the texts for 18 and up are from Splunk's
+  documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the four, so
+  `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it arrives
+  with a non-retryable status, and `splunk_hec_in` never answers one. The `script/splunk-interop`
+  run provoked no code 18 or above.
+  - **Consequence:** a rejection with one of these codes is counted under `other`, and the
+    diagnostic's body quote is what names it.
+  - **Revisit trigger:** a real Splunk answers one of them.
+- **`splunk_hec_out` treats codes 7, 12, 13, and 15 as permanent.** Each names an object in
+  `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
+  it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
+  `splunk_hec_out` never writes the shapes behind 12, 13, and 15, so in practice this is code 7,
+  an index the token isn't allowed to write.
+  - **Consequence:** one object with a disallowed `com.splunk.index` loses the objects after it in
+    its request and the rest of the batch.
+  - **Workaround:** keep every stamped index in the token's allowed list.
+  - **Revisit trigger:** a pipeline that mixes indexes a token can and can't write.
+- **What neither the recorded corpus nor the Splunk run exercised.** Each is implemented from the
+  exporter's source or Splunk's docs and covered by the codec's own tests:
+  - the exporter's `Summary` shape and a span link's `trace_state` member (telemetrygen writes
+    neither), and `otel.log.name`;
+  - Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`;
+  - a HEC client using `useACK` against `splunk_hec_in`;
+  - Splunk Cloud Platform, and any Splunk Enterprise release other than 10.4.3, including which
+    release raised `max_content_length` from 1,000,000 bytes;
+  - Splunk Observability Cloud through `fixtures/splunk-observability.yaml`, which no trial org
+    has received.
+  - **Consequence:** a difference here shows up in a deployment first, as a listener's
+    `rejected` counters or a sink's `requests.rejected`.
+  - **Revisit trigger:** re-record with `script/record-fixtures splunk` against another client or
+    version, or rerun `script/splunk-interop` against another release.
 
 ## syslog
 
@@ -1381,7 +1484,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [Admin endpoint, readiness, and release image](#admin-endpoint-readiness-and-release-image)), this
   is a deferred gap: `bind:` is required, so every `prometheus_out` is listening, and the payload is
   the full metric surface, which reveals far more than a lifecycle phase. Workaround:
-  `examples/prometheus-expose.yaml` binds `127.0.0.1`, and the field's doc comment says to keep it
+  `fixtures/prometheus-expose.yaml` binds `127.0.0.1`, and the field's doc comment says to keep it
   loopback or pod-local behind something with both. Server-side TLS would reuse `logit-inputs`'
   existing builder (`otlp_in`'s `tls:`); auth has no in-tree precedent on any listener, so it needs a
   decision on the kind (bearer, mTLS) before code.
@@ -1395,7 +1498,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   "`prometheus_out` has no TLS and no auth either"), for the same reason: auth has no in-tree precedent, so the kind (bearer,
   mTLS subject matching) needs deciding first. Until then, bind loopback or pod-local and front it
   with something that authenticates
-  ([`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml);
+  ([`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml);
   `docs/deploying.md`'s "Prometheus remote-write" section).
 - **1.0 remote-write typing depends on the metadata cache, which is bounded and therefore lapses**
   ([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "The receiver is stateless";
@@ -1843,7 +1946,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **A pathological Host header can truncate the syslog-bound JSON line -- but nginx's own header-size
   limit turns out to make that hard to actually trigger.** `$host` is unbounded and
   attacker-controlled behind a public IP, while the example's lean `log_format`
-  (`examples/nginx/nginx.conf`, originally `access_json_syslog`, now `access_semconv`) sizes its
+  (`fixtures/nginx/nginx.conf`, originally `access_json_syslog`, now `access_semconv`) sizes its
   fixed fields well under nginx's syslog message cap. Measured against nginx 1.31.4 (workstream F,
   `docs/plans/nginx-integration.md`): under default settings an oversized `Host` never reaches
   nginx's syslog writer. `large_client_header_buffers` (4 8k by default) rejects any request whose
@@ -1866,7 +1969,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
   The other two halves of the `$host` exposure are closed (2026-09-16, 2026-09-22). *Cardinality:*
   `nginx.conf` serves exactly two vhosts, but a junk `Host` used to become its own unbounded series
-  in `aggregate` and InfluxDB; `examples/nginx-to-influxdb.yaml`'s `bounded` component
+  in `aggregate` and InfluxDB; `fixtures/nginx-to-influxdb.yaml`'s `bounded` component
   (`keep_values`, `docs/adr/value-allowlist-cardinality-clamp.md`) now clamps it to the two real
   vhosts ahead of `aggregate`, folding anything else into one `other`-tagged series. It clamps
   `server.address` now, not `host`. *Length:* the lean format logs `$host` as `server.address`, and
