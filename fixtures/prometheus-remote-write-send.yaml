@@ -5,13 +5,13 @@
 # `PROMETHEUS_REMOTE_WRITE_AUTHORIZATION` in the environment.
 #
 # VictoriaMetrics takes remote-write too, but only `version: 1`: it answers a 2.0 request `204` and
-# stores nothing. examples/victoriametrics-remote-write.yaml is the config for it.
+# stores nothing. fixtures/victoriametrics-remote-write.yaml is the config for it.
 #
 # `statsd_in -> aggregate -> prometheus_out`, so this runs against the dev stack's statsd port with
 # nothing external on the ingress side. The `aggregate` is not optional: Prometheus counters are
 # cumulative, `prometheus_out` never accumulates a delta (a delta `Sum`/`Histogram` reaching it is
 # skipped and counted), and `temporality: cumulative` is the named stage that keeps the running
-# total, as in examples/prometheus-expose.yaml.
+# total, as in fixtures/prometheus-expose.yaml.
 components:
   app_metrics:
     type: statsd_in

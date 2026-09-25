@@ -21,7 +21,7 @@ conventions: `http.request.method`, `url.path`, `http.response.status_code`, `se
 server error; a bounded attribute set on the metric side.
 
 Today every operator has to do that themselves, on the server side, per server. A real nginx
-deployment adapted from `examples/nginx/nginx.conf` grew to roughly a hundred lines of `map`
+deployment adapted from `fixtures/nginx/nginx.conf` grew to roughly a hundred lines of `map`
 blocks to get there: one to rename each variable to its semconv name, one per string field to cap
 it to N printable-ASCII bytes (`$request_uri`, `$args`, `$http_user_agent`, `$http_referer`,
 `$http_traceparent`), one to turn nginx's `000` status into an integer `0` so the JSON line stays
@@ -171,7 +171,7 @@ printable-ASCII `map`s were defending against. Under `replace`, a failed parse w
 valid UTF-8 is retried on a `from_utf8_lossy` copy — failure path only, so a valid line's cost is
 unchanged — counted and diagnosed once. The default stays `reject`.
 
-**The repo's own configs move onto it.** `examples/nginx/nginx.conf` loses all three `map`s
+**The repo's own configs move onto it.** `fixtures/nginx/nginx.conf` loses all three `map`s
 (`trace_context`'s `mint_id: true` replaces the `$request_id`-prefix span-id trick, and a
 malformed inbound `traceparent` now reaches `trace_context` raw and is counted `invalid` instead
 of being blanked into `missing`); `demo/nginx/nginx.conf` keeps its propagation maps (it forwards

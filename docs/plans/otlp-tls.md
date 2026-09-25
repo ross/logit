@@ -73,7 +73,7 @@ handshake to every request.
    TLS-specific test across `logit-outputs`, `logit-inputs`, and the `logit-cli` round-trip suite.
 2. `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 3. `script/schema` — `schema/logit.schema.json` regenerated and committed.
-4. `script/validate` — every shipped config (`demo/logit.yaml`, `examples/*.yaml`) still resolves.
+4. `script/validate` — every shipped config (`demo/logit.yaml`, `fixtures/*.yaml`) still resolves.
 5. `cargo deny check` — advisories/bans/licenses/sources all pass; `cargo tree -i aws-lc-rs` finds
    nothing.
 6. Manual: `cargo run -p logit-cli -- graph demo/logit.yaml` still resolves (no `tls:` in the demo
