@@ -61,18 +61,10 @@ here, and the code that enforces it points at this ADR.
 
 ### Threat model
 
-The bar is accidental data: a large payload from a misconfigured or buggy sender, unexpected
-input from a producer `logit` has not seen before, a wedged peer, or a corrupt file. `logit` never
-listens on an untrusted network, so a malicious peer is not the bar. No accidental input may crash
-the process, make it allocate without bound, or corrupt what it relays.
-
-A problem that only crafted input can trigger, such as a compression-ratio bomb, a map sent with
-its keys in descending order, or millions of tiny objects under an unknown JSON key, is defended
-only when the defense is free: a branch, a counter, or a timeout wrapper, with no hot-path or
-complexity cost. Otherwise it is a documented non-goal (listed below). `docs/known-gaps.md`'s
-"Event model and interner" section already relies on the same premise for the never-evicting
-interner, and its revisit trigger (a listener that stops being private) applies to these rules
-too.
+The bar is accidental data: a misconfigured or buggy sender, an unexpected producer, a wedged
+peer, or a corrupt file. A problem only crafted input can trigger is defended only when the
+defense is free, and is otherwise a documented non-goal (listed below). The decision of record is
+[ADR `deployment-threat-model`](deployment-threat-model.md).
 
 ### Decoders
 

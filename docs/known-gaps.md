@@ -105,9 +105,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   names are interned, never values, so the usual cardinality explosion (host, request id, user
   agent, path) never touches it. What's left is a real metric name that never repeats: a user who
   embedded an id in a metric name. That namespace is user-controlled, not attacker-controlled,
-  because `logit`'s listeners are private by deployment shape ([OVERVIEW.md](OVERVIEW.md)); the
-  anti-pattern is well known; and `logit` isn't what breaks first. The metric store fails well
-  before (a million distinct measurement names is a million-plus series, against 94 MB here), and
+  because `logit`'s listeners are private by deployment shape
+  ([ADR `deployment-threat-model`](adr/deployment-threat-model.md)); the anti-pattern is well
+  known; and `logit` isn't what breaks first. The metric store fails well before (a million
+  distinct measurement names is a million-plus series, against 94 MB here), and
   even inside `logit`, `aggregate`'s window costs ~600 bytes per series *per window* against the
   interner's ~94 bytes once — ~6× harder, sooner, and already mitigated by putting `keep` in front
   of it.
@@ -147,7 +148,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     interns every dictionary string a `logit_in` peer sends before the rest of the batch
     validates, so its strings stay in the interner, including from a batch the decoder then
     rejects; not defended, per the threat model in
-    [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md). Nothing budgets dictionary
+    [ADR `deployment-threat-model`](adr/deployment-threat-model.md). Nothing budgets dictionary
     strings across frames. The per-frame bound is the dictionary entry cap and the frame size; the
     process-lifetime bound is the same premise as every other feeder: `logit_in`'s peers are other
     `logit` processes the operator runs.
@@ -331,8 +332,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   2026-09-25: 80,000 keys take 3.4 s in descending order against 20 ms ascending. Real maps are far
   too small for this to show ([`docs/design/data-shapes.md`](design/data-shapes.md)); only a map
   with tens of thousands of keys in the worst order pays it. A non-goal under
-  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model: the fix (collect,
-  then sort once) changes the ordinary decode path for a shape only crafted input produces.
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): the fix (collect, then sort
+  once) changes the ordinary decode path for a shape only crafted input produces.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
@@ -1295,7 +1296,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   2026-09-25 (debug build): a 4 MiB body of `{"":0}` objects under an unknown key peaks at about
   98 bytes of heap per input byte, and ordinary OTLP/JSON structure at about 16. No cap is added:
   the 98× shape needs crafted input, a non-goal under
-  [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s threat model. **Revisit:**
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:**
   profile it before OTLP/JSON sees production volume.
 - **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
   close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection

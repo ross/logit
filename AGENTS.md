@@ -724,6 +724,11 @@ not a style preference:
   0–6 attributes, parsed structured logs at 9 and up, spans across both), so a number that is right
   for one leg is wrong for another. Reach for it before picking a "representative" shape, and mind
   its own §7: none of it is production traffic.
+- **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
+  must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
+  input can trigger is defended only when the defense is free (a branch, a counter, a timeout
+  wrapper), and is otherwise a documented non-goal in `docs/known-gaps.md`
+  ([ADR `deployment-threat-model`](docs/adr/deployment-threat-model.md)).
 
 ## Where things live
 

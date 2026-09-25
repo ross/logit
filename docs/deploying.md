@@ -2050,6 +2050,16 @@ nothing TLS-specific beyond that. `docs/known-gaps.md` tracks two open items: **
 read once at startup, so a renewed certificate needs a restart**, not a live reload; and `otlp_out`
 has no `server_name` override for an endpoint reached by IP or through a proxy.
 
+### Trust boundary
+
+Keep every `logit` listener on a private network, and don't expose one to the internet or to
+peers you don't control. Each listener is built to survive accidental data, such as a
+misconfigured sender, a wedged peer, or a corrupt file, but not a malicious peer sending crafted
+input. Keeping untrusted peers out is your job: use network policy, TLS with `client_ca_file` so
+only peers with a certificate you issued can connect, or a proxy in front of the listener. See
+[ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps.md` for
+what isn't defended.
+
 ### Syslog over TLS (RFC 5425)
 
 `syslog_in`/`syslog_out` can speak TLS too: RFC 5425, syslog framed per RFC 6587 over TLS over TCP
