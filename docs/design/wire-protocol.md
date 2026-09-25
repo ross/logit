@@ -36,7 +36,10 @@ reserved discriminant that `write_frame` and `read_frame` both reject with
 
 A reader rejects a frame whose `uncompressed_len` exceeds 64 MiB (`MAX_SANE_UNCOMPRESSED_LEN`) as
 `Malformed` on the header alone, before the value sizes a decompression buffer. `write_frame`
-refuses such a payload too, so no writer emits a frame a reader rejects.
+refuses such a payload too, so no writer emits a frame a reader rejects. A reader bounds
+`compressed_len` by `frame::compressed_bound` of the payload bound, lz4's worst case
+(`n + n / 255 + 16`), not by the payload bound itself: an incompressible payload at the cap grows
+under lz4.
 
 ## Payload: dictionary-first batches
 
@@ -356,6 +359,25 @@ decision record.
   on the listener side), not when it decodes. A stalled downstream delays the ack, which stalls the
   sender's next frame. That is the protocol's backpressure, and it's why `logit_in` needs no
   receive-side queue the way a UDP listener does.
+- **Frame bounds.** `logit_in` checks a data frame's header before reading its body:
+  `uncompressed_len` against its `max_frame_bytes`, and `compressed_len` against
+  `frame::compressed_bound(max_frame_bytes)`. A frame over either is answered
+  `Reject{FRAME_TOO_LARGE}`, which `logit_out` treats as permanent. `logit_out` checks both its
+  payload and its compressed frame against the same two numbers before sending, so it never sends
+  a frame the listener refuses.
+- **The body is read once.** `logit_in` reads a frame's body into one buffer sized from the header,
+  after a copy of the header, and verifies it in place. Peak memory for a frame is one
+  `24 + compressed_len` buffer.
+- **`GOING_AWAY` means not forwarded.** `logit_in` writes every `Reject`, `GOING_AWAY` included,
+  before the frame it answers is forwarded; after forwarding, the only write is that frame's `Ack`.
+  A shutdown or idle close that finds a frame still in the socket buffer answers it `GOING_AWAY`
+  and drops it unread. So `logit_out` treats `GOING_AWAY` in place of an `Ack` as a clean fault
+  and resends the batch at any delivery posture. An EOF, reset, or ack timeout after a frame left
+  stays ambiguous: the batch may have been forwarded.
+- **Every listener write is bounded.** `logit_in` writes `HelloAck`, `Ack`, and every `Reject`
+  within `handshake_timeout`. A peer that stops reading its `Ack`s fills the listener's send
+  buffer; the stalled write ends the connection (`logit.proto.errors{reason="ack_write_stalled"}`)
+  instead of holding its connection slot and blocking shutdown. `idle_timeout` bounds reads only.
 - **Flow control: negotiated, not yet used.** `Hello`/`HelloAck` both carry `window`, but the sender
   keeps one frame outstanding (`docs/plans/native-transport.md`'s "In-flight" decision), and
   `LogitOutput`'s `SinkQueue` `peek`/`commit` holds that frame for retransmit. Credit-based flow

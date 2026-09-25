@@ -74,10 +74,11 @@ rejected connection instead of one write, bounded per-connection by the same han
 other code — `REJECT_INTERNAL` (the peer is at its connection cap) and `REJECT_GOING_AWAY` (the
 peer is shutting down), plus any code a future peer adds — is transient: `logit_out` classifies
 those `Fault::Clean` at the handshake (nothing written yet) and `Fault::Ambiguous` once a data
-frame has already left (the batch may or may not have landed). The `Ambiguous` case is genuinely
-reachable, not just theoretical: `serve_connection`'s per-frame `select!` only races shutdown
-against the frame *header* read, so it can take the shutdown arm with a header already readable —
-`GOING_AWAY` arrives in place of the `Ack` for a batch that may or may not have been forwarded.
+frame has already left, except `REJECT_GOING_AWAY`, which stays `Fault::Clean` there too.
+`serve_connection`'s per-frame `select!` races shutdown against the frame *header* read, so it can
+take the shutdown arm with a whole frame already readable, and `GOING_AWAY` then arrives in place
+of that frame's `Ack`. That frame was never forwarded: see the 2026-09-25 amendment "`GOING_AWAY`
+is never written for a forwarded frame".
 
 **Shutdown: `logit_in` overrides `Input::run_until_shutdown`.** Every spawned connection task holds
 its own `Fanout` clone (the cancel-by-drop shutdown mechanism [ADR
@@ -175,3 +176,41 @@ without changing a byte on the wire:
   peer, such as a stopped process or one whose receive buffer is full, can no longer hold a
   connection, and its permit, in a blocked write. A timed-out past-the-cap `Reject` is an error;
   the others end the connection and are counted.
+
+## Amendment: `GOING_AWAY` is never written for a forwarded frame, and `compressed_len` has its own bound (2026-09-25)
+
+**The invariant.** `logit_in` writes every `Reject`, `GOING_AWAY` included, before the frame it
+answers reaches `Fanout::send_relayed`: the past-the-cap `Reject`, the handshake's two, the
+loop-top and `select!` shutdown arms, an idle close, and `FRAME_TOO_LARGE`. After `send_relayed`,
+the only write is that frame's `Ack`. So `GOING_AWAY` in place of an `Ack` means the batch never
+landed. The Decision section above said such a batch "may or may not have been forwarded"; that was
+wrong. `logit_out` now classifies `REJECT_GOING_AWAY` after a data frame as `Fault::Clean`, which
+[ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s `is_retryable`
+retries at every delivery posture. Under the old `Fault::Ambiguous`, the default at-most-once
+posture dropped the batch: a test that raced a shutdown against each of 300 sends lost one
+batch this way. `a_frame_answered_with_going_away_is_never_forwarded` in
+`crates/logit-inputs/src/logit.rs` pins the invariant; a change that writes `GOING_AWAY` after
+`send_relayed` must move `logit_out` back to `Fault::Ambiguous`.
+
+`Fault::Ambiguous` stays for an EOF, a reset, or an ack timeout after the frame left. A full
+downstream inbox can park `send_relayed` past the sender's ack timeout, and the batch is then
+forwarded without an `Ack`. At most once delivers it once and at least once duplicates it, which
+is the posture contract.
+
+**A compressed bound.** `logit_in` used to bound `compressed_len` by `max_frame_bytes`, the same
+number as `uncompressed_len`, while `logit_out` bounded only the uncompressed payload. An
+incompressible payload within about 0.4% of the cap grows past it under lz4, so `logit_in`
+refused a frame `logit_out` considered in bounds. It also closed without a `Reject`, so the sender
+saw an EOF, classified it `Fault::Ambiguous`, and dropped the batch at the default posture. Now:
+
+- `frame::compressed_bound(n)` is lz4's worst case, `n + n / 255 + 16`, the formula
+  `MAX_SANE_COMPRESSED_LEN` already used. `logit_in` bounds `compressed_len` by
+  `compressed_bound(max_frame_bytes)`.
+- `logit_in` answers an over-bound header with `Reject{FRAME_TOO_LARGE}` before closing, so the
+  sender sees a permanent refusal instead of an EOF.
+- `logit_out` checks its compressed frame against the same bound before sending, and drops a batch
+  over it as `Fault::Permanent` with nothing written.
+
+**Write-stall accounting.** The bounded writes of the amendment above are counted under
+`logit.proto.errors{reason}`: `ack_write_stalled` for an `Ack` (the connection ends as an error),
+and `reject_write_stalled` for any `Reject` (the write is abandoned and the connection closes).

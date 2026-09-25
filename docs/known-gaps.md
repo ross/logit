@@ -670,6 +670,17 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment).
   **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum
   transfer rate, or a per-peer connection cap is worth the false positives.
+- **`logit_in`'s `idle_timeout` bounds reads only; a blocked write is bounded by
+  `handshake_timeout`.** `idle_timeout` can't reach a write that a peer has stopped reading, so
+  `logit_in` writes every `HelloAck`, `Ack`, and `Reject` (`GOING_AWAY` included) within
+  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded writes").
+  A peer that sends frames but never reads its `Ack`s is disconnected once the listener's send
+  buffer fills and one `Ack` write stalls for `handshake_timeout`
+  (`logit.proto.errors{reason="ack_write_stalled"}`). The cost is one knob covering two waits: an
+  operator who raises `handshake_timeout` for slow TLS handshakes also lengthens how long a wedged
+  peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps one
+  frame in flight, so at most one unread `Ack` sits in its receive buffer, even while it's paused.
+  A separate write timeout was not added. **Revisit trigger:** an operator who needs the two waits set apart.
 - **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener
   (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps
   concurrent connections and, per connection, concurrent streams (hyper's default of 200, pinned),

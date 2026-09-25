@@ -994,9 +994,11 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"}`
+- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag.
+  mismatch doesn't hide behind a generic "bad frame" tag. The two `_write_stalled` reasons count a
+  control write to a peer that stopped reading, abandoned after `handshake_timeout`: an `Ack` (the
+  connection ends) or a `Reject` (the connection was closing anyway).
 - `logit.input.connections` (gauge, sampled on every connect/disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count, the 1024-connection cap binding).
   `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in` on the shared driver record the same

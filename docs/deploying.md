@@ -2246,8 +2246,9 @@ that gets `Reject{code: REJECT_INTERNAL}` never classifies it `permanent`:
 
 Either way the sink reconnects on its own once the peer has capacity, with no operator action. To
 risk a duplicate instead of losing that batch, set `buffer.delivery: at_least_once` on the
-`logit_out` component. The same holds for `Reject{code: REJECT_GOING_AWAY}` during the peer's own
-shutdown.
+`logit_out` component. `Reject{code: REJECT_GOING_AWAY}`, from the peer's own shutdown or an idle
+close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
+even after a frame left, and the batch is resent under either posture.
 
 **What to watch.**
 
@@ -2257,8 +2258,10 @@ shutdown.
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
-  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`; any of these on a healthy
-  link points at a version-mismatched or misbehaving peer, not routine loss).
+  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`/`ack_write_stalled`/
+  `reject_write_stalled`; any of these on a healthy link points at a version-mismatched or
+  misbehaving peer, not routine loss. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  for `handshake_timeout`, and the connection was closed).
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.
 
