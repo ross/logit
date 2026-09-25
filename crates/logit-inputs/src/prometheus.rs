@@ -1614,7 +1614,7 @@ async fn write_response(
     if !events.is_empty() {
         // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
-        sink.send(EventBatch { resource, scope: None, events }).await;
+        sink.send_reserved(EventBatch { resource, scope: None, events }).await;
     }
     ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }

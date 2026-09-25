@@ -16,10 +16,12 @@
 //! connections by [`hyper::server::conn::http2::Builder`] directly, since gRPC is HTTP/2 only.
 //!
 //! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
-//! datagrams; TCP has no such escape hatch. A slow `sink.send(batch).await` blocks the handler,
-//! which stops reading that connection, which the client feels as its own write blocking. That
-//! is correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
-//! `docs/design/pipeline-graph.md`'s "Backpressure" section.
+//! datagrams; TCP has no such escape hatch. A slow `sink.send_reserved(batch).await` blocks the
+//! handler, which stops reading that connection, which the client feels as its own write
+//! blocking. That is correct for a reliable protocol (an OTLP exporter retries or buffers on its
+//! own timeout): `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up
+//! and closes cancels the handler mid-send; `Fanout::send_reserved` reserves every consumer before
+//! delivering to any, so the retry never lands twice on one branch of a fan-out.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -584,7 +586,7 @@ async fn handle_http(
     match result {
         Ok(batches) => {
             for batch in batches {
-                sink.send(batch).await;
+                sink.send_reserved(batch).await;
             }
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
@@ -701,7 +703,7 @@ async fn handle_grpc(
     match decoder.decode_signal(signal, payload) {
         Ok(batches) => {
             for batch in batches {
-                sink.send(batch).await;
+                sink.send_reserved(batch).await;
             }
             Ok(grpc_response(0, "", Some(export_response(0, ""))))
         }
