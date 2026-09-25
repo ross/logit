@@ -66,7 +66,7 @@ Four facts from the survey drive the shape of the decision:
    `SetMembers` as a count. `ExponentialHistogram` is skipped under both, as the exporter does.
    Summarization stays `aggregate`'s job upstream.
 
-5. **Acknowledgment is opt-in on the sink.** `ack: true` reads each response's `ackID` and polls
+5. **Acknowledgment is opt-in on the sink.** `ack: true` reads each response's `ackId` and polls
    `/services/collector/ack` until every id is `true` or `ack_timeout` (default 30 s) elapses, at
    which point the batch fails as `Fault::Ambiguous`: `write_loop` drops it under the default
    at-most-once posture and retries it under `buffer: { delivery: at_least_once }`. Off by
@@ -253,9 +253,9 @@ module doc describes the behavior; this list is the record of the choices.
   errors carry the status as `code` with these texts: `404` "Not Found", `405` "Method Not
   Allowed", `408` "Request Timeout", `413` "Request Entity Too Large", `415` "Unsupported Media
   Type". The rejection reasons beyond `datadog_in`'s are `query_token` and `no_data`.
-- **Decision 5, acknowledgment:** an `ackID` is drawn only on a `200`, never on a `503` or a
+- **Decision 5, acknowledgment:** an `ackId` is drawn only on a `200`, never on a `503` or a
   rejection, and a channel header or `?channel=` with an empty value names no channel. A body
-  whose every object the codec skips sends nothing and still answers `200`, with an `ackID` when
+  whose every object the codec skips sends nothing and still answers `200`, with an `ackId` when
   it named a channel.
 - **Decision 16:** no channel is required on any route, `/raw` and `/ack` included.
 
@@ -300,3 +300,62 @@ module doc describes the behavior; this list is the record of the choices.
 - **Decision 3, reuse:** `datadog_out`'s bounded, secret-scrubbing error-body read moves into
   `logit-outputs`' `crate::http` (`error_read_bytes`, `redacted_snippet`), shared by both sinks.
   The HTTP client is built on `Output::bind`, or by the first `send` when nothing called it.
+
+## Amendment: what W5's recorded traffic and the Splunk run settled (2026-09-25)
+
+W5 recorded four real HEC clients (the Collector contrib 0.161.0 `splunk_hec` exporter, Docker
+29.8.1's `splunk` log driver, SC4S 3.40.0, and splunk-library-javalogging 1.11.11) into
+`testdata/interop/splunk/`, and ran `splunk_hec_out` and `splunk_hec_in` against Splunk
+Enterprise 10.4.3 with `script/splunk-interop`. `testdata/interop/splunk/README.md` and
+`tools/splunk-interop/README.md` hold the evidence; `docs/plans/splunk-relay.md`'s "Settled by
+W5" section maps it to the survey's open items. By decision:
+
+- **Decision 2, the listener:** Docker's driver checks its endpoint with
+  `OPTIONS /services/collector/event/1.0` and starts no container without a `200`, and Splunk
+  answers `OPTIONS` on every HEC route `200`, empty, unauthenticated, with `Allow: POST,OPTIONS`
+  (`GET,HEAD,OPTIONS` on `/health`). `splunk_hec_in` answered `405`. **Changed:** it answers as
+  Splunk does, and its `405` carries the same `Allow`. Splunk's own `404` and `405` bodies are
+  `{"text":"The requested URL was not found on this server.","code":404}`; `splunk_hec_in` keeps
+  its per-status texts, which no client reads. The run provoked no code 18 or above, so those
+  texts are still readings of Splunk's documentation.
+- **Decision 2, gzip:** Splunk accepts `Content-Encoding: gzip` on `/event` and `/raw` and
+  answers `deflate` `415`, as `splunk_hec_in` does. `limits.conf [http_input]
+  max_content_length` is 838,860,800 bytes on 10.4.3, far above the sink's 2 MiB default.
+- **Decision 5, acknowledgment:** the key is `ackId`, not `ackID`, and ids count from 0 per
+  channel. `splunk_hec_out` looked for `ackID`, found none on a real `useACK` token, and counted
+  every request delivered without polling. **Changed:** both kinds read and write `ackId`. The
+  `hec-ack` leg then saw every request acknowledged within its window. A poll for an id on the
+  wrong channel answers `false`, not an error.
+- **Decision 12, `metric_type`:** Splunk gives it no meaning beyond a dimension (`mcatalog` lists
+  it, `mstats … by metric_type` groups by it), so carrying `Sum` versus `Gauge` in it loses
+  nothing Splunk would have used. The exporter's default form is one `metric_name:<n>` per object;
+  no recorded client writes the `metric_name`/`_value` pair, which Splunk still accepts. A metric
+  event with 1,000 dimensions is indexed whole.
+- **Decision 12, metric objects without `event`:** SC4S posts its own metrics with no `event`
+  key and every measurement a numeric string, and Splunk indexes that shape as a metric.
+  **Changed:** the decoder reads an object with no `event` whose `fields` carry a measurement as a
+  metric event, and a finite numeric string as a measurement; both leave in the exporter's form
+  (a permitted normalization in the codec's list).
+- **Decision 14, spans:** the recorded exporter writes the members in the `hecSpan` order the
+  encoder already used, but `kind` and `status.code` as the protobuf enum names
+  (`SPAN_KIND_SERVER`, `STATUS_CODE_UNSET`). **Changed:** the encoder writes those names; the
+  decoder already read both spellings. No recorded span has a link, so the link's `trace_state`
+  member is still from the exporter's source. The Collector's `splunk_hec` receiver keeps a
+  span object as a log with a `Map` body, as the alternative "Not decoding spans" assumed.
+- **Decision 16, leniency:** Splunk 10.4.3 is itself lenient in one case the decision said it
+  wasn't. An object with `fields` and no `event` is skipped with a `200` and the rest of the body
+  indexed. An object with neither is `400` code 12, a blank `event` code 13, each naming the
+  object in `invalid-event-number` with the objects before it indexed and none after; an
+  unknown envelope key answers `200` but indexes only the objects before it, or code 5 when it is
+  the only object. `splunk_hec_in` keeps every valid object in each case.
+- **Decision 18, code 6: confirmed.** `invalid-event-number` is the 0-based index of the object
+  that failed to parse; Splunk indexed every object before it and none from it on. Dropping
+  object `N` and resending `N+1` onward is what that answer calls for, so the rule stands.
+  Codes 12, 13, and 15 carry an `invalid-event-number` with the same meaning, and code 7 names
+  the object after the one with the disallowed index; the sink treats all four as permanent. A
+  real Splunk can't be made to answer `splunk_hec_out` code 6, since its bodies always parse.
+- **Decision 9, `[tcpout] sendCookedData = false`:** each event's `_raw` followed by one LF,
+  with no header, length, or metadata, so an event with an embedded newline arrives as two
+  lines. A raw-TCP line listener would read it as it reads any LF-framed stream, with that one
+  loss. Whether an Edge Processor's HEC destination delivers to a non-Splunk receiver stays
+  open: no container runs one.
