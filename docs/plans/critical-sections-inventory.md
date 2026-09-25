@@ -54,7 +54,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done** (#333); the rest of RT-03 is unreviewed |
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
-| 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → dos/w7): all eight input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
+| 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all eight input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | in-progress (dos/w4) |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
@@ -216,7 +216,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs` (`serve_connection`) | unreviewed |
-| [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → dos/w7 |
+| [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → #377 |
 | [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs` (`meminfo`/`listen_queue`) | findings → #282 |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs` (`sample_while`, `ReceiveBufferSampler`), `crates/logit-inputs/src/tcp.rs` (`AcceptQueueSampler`) | findings → #281, #282 |
 | [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | unreviewed |
@@ -237,7 +237,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-12](#rt-12--batchaccumulator-incremental-weight-tracking-and-the-resource-scope-key) | P1 | `BatchAccumulator`: incremental weight tracking and the `(resource, scope)` key | `crates/logit-pipeline/src/accumulator.rs` (`BatchAccumulator::absorb`) | unreviewed |
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
 | [WIRE-04](#wire-04--batch-framing-v1v2-and-the-mandatory-provenance-trailer) | P1 | Batch framing v1/v2 and the mandatory provenance trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_batch_v2`, `CODEC_NATIVE_V2`) | unreviewed |
-| [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → dos/w7 |
+| [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
 | [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | unreviewed |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
@@ -951,12 +951,12 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     racing shutdown, and only `EBADF`/`EINVAL`/`ENOTSOCK`/`EFAULT` or tokio's runtime-shutdown
     error ends the listener. Each counts `logit.input.accept.errors{reason}`.
     `a_resource_accept_error_backs_off_and_the_listener_keeps_serving` (seen to fail first) and
-    `script/unsafe-check`'s `tcp-accept-emfile`/`tcp-accept-ebadf` scenarios pin it (dos/w7).
+    `script/unsafe-check`'s `tcp-accept-emfile`/`tcp-accept-ebadf` scenarios pin it (#377).
   - *Medium confidence, telemetry only:* the live-connections gauge (the `fetch_add`/`fetch_sub` and their `telemetry.gauge` writes) publishes
     from the RMW's return value, but the `fetch_add` and the `gauge()` write are not atomic together,
     so two tasks can still interleave and leave a stale value published until the next transition.
     The comment claims this pattern avoids that; it narrows the window but does not close it.
-    **Holds, not reviewed further (dos/w7):** `LiveConnections::publish` keeps the same
+    **Holds, not reviewed further (#377):** `LiveConnections::publish` keeps the same
     RMW-then-write shape, so the stale window remains; it lasts until the next transition and
     touches only the gauge's reading, not a permit.
   - *Low confidence:* nothing bounds how long a connection task may outlive the accept loop after
@@ -4106,7 +4106,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     module doc of `crates/logit-inputs/src/logit.rs` and in the ADR), so the cap bounds served connections but not resource
     use under a TLS flood. **Documented trade-off, restated here as context.** The reject written
     to a past-the-cap connection is itself bounded by `handshake_timeout` (#372).
-  - **The accept loop ended on any `accept()` error (dos/w7).** `run_until_shutdown`'s
+  - **The accept loop ended on any `accept()` error (#377).** `run_until_shutdown`'s
     `accepted?` propagated every error tokio returns, and tokio 1.53.1 retries only `WouldBlock`.
     Measured: with `RLIMIT_NOFILE` lowered so the accepted socket could not get a descriptor,
     `run_until_shutdown` returned `Err("Too many open files (os error 24)")`, `run_input` failed,
