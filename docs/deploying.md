@@ -534,6 +534,10 @@ backpressure), but its accept queue has the same shape of problem:
   sees as a connect timeout or reset with nothing in `logit`'s logs to explain it. Sustained
   pressure here is usually connection churn (senders reconnecting per batch instead of holding one
   connection); fix it at the sender before raising `net.core.somaxconn`.
+- `logit.input.accept.errors{reason}` (count): an `accept()` that failed. A burst of file
+  descriptor exhaustion shows here as `reason="resource"` while the listener backs off 100 ms and
+  keeps accepting, not as a dead listener; raise the process's `nofile` limit if it recurs.
+  `reason="fatal"` means the listening socket itself failed, and ends the listener.
 
 ### `handshake_timeout` on a TCP listener
 

@@ -596,19 +596,25 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 |---|---|---|
 | `logit.input.connections` | gauge | connections holding a permit, sampled on every connect and disconnect. Published by a drop guard (`crates/logit-inputs/src/listener.rs`), so a connection task that panics still counts itself out |
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
+| `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
 | `logit.input.connections.closed{reason="idle"}` | count | an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"malformed"\|"truncated"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
-decoder that rejects a whole frame), and `connection_error` (I/O, a TLS handshake that failed or
+decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
 timed out, or a connection that sent no first byte inside `handshake_timeout` and so gave its
-permit back; never an idle close). These keys and the decoder's own `bad_line` throttle
-listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
+permit back; never an idle close), and `accept_error` (any `accept.errors` reason). These keys
+and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
 2026-09-14 amendment). A peer looping connect / bad frame / close is throttled like any other
 repeated failure instead of warning once per TCP handshake. No TCP listener has a TLS-specific
 metric: a handshake failure surfaces as `connection_error`.
+
+`logit.input.accept.errors{reason}` and the `accept_error` key are not the driver's alone. Every
+connection-oriented listener records them from one shared helper, on each of its accept loops:
+this driver's TCP and Unix sockets, `logit_in`, `otlp_in`, `prometheus_in`'s bind mode,
+`datadog_in`, and `datadog_trace_in`'s TCP and Unix sockets.
 
 There's no stream counterpart of `logit.input.reads`: a stream listener's reads aren't
 message-aligned, so a read count over a frame count wouldn't be a fill ratio of anything.

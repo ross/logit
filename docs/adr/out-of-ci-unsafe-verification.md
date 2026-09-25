@@ -195,3 +195,20 @@ and the separate cargo-home volume are unchanged. Fuzz builds get their own targ
 artifact in `logit_unsafe_check_target`. `MIRI_TARGETS` also gains the `HyperLogLog` fuzz
 regressions, because AddressSanitizer can't see the wrong-`Layout` deallocation that codec guards
 against and Miri can.
+
+## Amendment: accept-error inject scenarios (2026-09-25)
+
+ADR [`untrusted-input-bounds`](untrusted-input-bounds.md) makes every input accept loop classify an
+`accept()` error instead of propagating it. `script/unsafe-check`'s `INJECT_SCENARIOS` gains three
+`accept4` scenarios that force the classifier's branches on a real listener, because no in-process
+test can make `accept4` return `EBADF` on a working socket. They were run on the dev box with
+`--cap-add SYS_PTRACE` alone:
+
+| Scenario | Spec | Test | Observed |
+|---|---|---|---|
+| `tcp-accept-emfile` | `accept4:error=EMFILE:when=1` | `a_plaintext_connection_round_trips_a_decoded_frame` | Passes in 0.11 s. The strace shows the injected `accept4`, then a second `accept4` that returns the connection after the 100 ms backoff, then `EAGAIN` as the loop parks. |
+| `logit-accept-emfile` | `accept4:error=EMFILE:when=1` | `a_v2_clients_provenance_is_relayed_untouched` | Passes in 0.11 s, with the same three `accept4` calls on `logit_in`'s loop. |
+| `tcp-accept-ebadf` | `accept4:error=EBADF:when=1` | `a_plaintext_connection_round_trips_a_decoded_frame` | Fails in under 10 ms with `the fanout should not have closed`. The strace shows one injected `accept4` and no second: the listener returns the error and ends rather than retrying. |
+
+An `EMFILE` scenario that fails, or an `EBADF` scenario that shows repeated `accept4` calls, means
+the classification in `crates/logit-inputs/src/listener.rs` (`classify_accept_error`) regressed.
