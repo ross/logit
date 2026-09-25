@@ -59,6 +59,14 @@ INJECT_SCENARIOS=(
     # A seccomp refusal on the first call (quinn#1947, bun#42678). EXPECT: the test fails, and the
     # strace shows one `recvmmsg` and nothing after it, not a refused call retried at 100% CPU.
     "udp-seccomp-first-call|recvmmsg:error=ENOSYS:when=1|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
+    # fd exhaustion on the stream driver's first accept. EXPECT: the test passes, and the strace
+    # shows the injected `accept4`, one 100 ms backoff, and a second `accept4` that succeeds.
+    "tcp-accept-emfile|accept4:error=EMFILE:when=1|-p logit-inputs --lib a_plaintext_connection_round_trips_a_decoded_frame"
+    # The same on `logit_in`'s accept loop. EXPECT: the test passes.
+    "logit-accept-emfile|accept4:error=EMFILE:when=1|-p logit-inputs --lib a_v2_clients_provenance_is_relayed_untouched"
+    # A fatal errno on the listening socket. EXPECT: the test fails fast on its closed fanout, and
+    # the strace shows one injected `accept4` and no second: the listener ends, it does not spin.
+    "tcp-accept-ebadf|accept4:error=EBADF:when=1|-p logit-inputs --lib a_plaintext_connection_round_trips_a_decoded_frame"
 )
 
 build_image() {
