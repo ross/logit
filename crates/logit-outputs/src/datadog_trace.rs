@@ -26,7 +26,7 @@
 //! tls: {}                           # tunes an https:// endpoint
 //! ```
 //!
-//! Graph rule 66 validates the block.
+//! Graph rule 67 validates the block.
 //!
 //! ## Routes
 //!
@@ -56,7 +56,7 @@
 //!
 //! Headers are the operator's `headers:` with the protocol's `insert`ed over them, and every
 //! `datadog-*` or `x-datadog-*` name the operator set removed, so a protocol-owned name is never
-//! sent with an operator's value (rule 66 also rejects one at config time):
+//! sent with an operator's value (rule 67 also rejects one at config time):
 //!
 //! | Header | Value |
 //! |---|---|
@@ -166,7 +166,7 @@ pub const MAX_TRACES_PER_REQUEST: usize = 1_000;
 /// `rate_by_service`, a few bytes per service; reading it whole lets the connection be reused.
 const ACCEPTED_BODY_BYTES: usize = 64 * 1024;
 
-/// The `User-Agent` on every request. Reserved in config (rule 66).
+/// The `User-Agent` on every request. Reserved in config (rule 67).
 const USER_AGENT: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 
 const MSGPACK: &str = "application/msgpack";
@@ -466,7 +466,7 @@ impl DatadogTraceOutput {
     }
 
     /// The extra headers on every request (`headers:`). Fails on a name or value that isn't legal
-    /// HTTP, and on two names that collide once case is normalized; rule 66 rejects the
+    /// HTTP, and on two names that collide once case is normalized; rule 67 rejects the
     /// protocol's own names.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());

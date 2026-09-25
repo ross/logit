@@ -1,23 +1,21 @@
 # Pre-provisioned datasources, so `docker compose up` gives a working Grafana with no manual
-# setup. Matches demo/compose.yaml's service names and demo-token values. Separate from the dev
-# stack's deploy/grafana/provisioning/datasources/influxdb.yaml, because this stack is
-# self-contained.
+# setup. Matches demo/compose.yaml's service names. Separate from the dev stack's
+# deploy/grafana/provisioning/datasources/influxdb.yaml, because this stack is self-contained.
 apiVersion: 1
 
 datasources:
-  - name: InfluxDB
-    uid: influxdb
-    type: influxdb
+  # VictoriaMetrics serves the Prometheus query API, so Grafana's built-in `prometheus` type reads
+  # it with no plugin. Queries are PromQL; VictoriaMetrics also accepts its MetricsQL extensions.
+  - name: VictoriaMetrics
+    uid: victoriametrics
+    type: prometheus
     access: proxy
-    url: http://influxdb:8086
+    url: http://victoriametrics:8428
     isDefault: true
     jsonData:
-      version: Flux
-      organization: logit
-      defaultBucket: metrics
-      httpHeaderName1: Authorization
-    secureJsonData:
-      httpHeaderValue1: Token logit-demo-token
+      # demo/logit.yaml's `windowed` flushes every 10s. Grafana sizes `$__rate_interval` from this,
+      # so a `rate()` window always spans at least two samples.
+      timeInterval: 10s
 
   - name: Loki
     uid: loki

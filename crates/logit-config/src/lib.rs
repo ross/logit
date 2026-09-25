@@ -2047,6 +2047,15 @@ pub enum ComponentKind {
         #[serde(default)]
         #[schemars(with = "u8")]
         version: RemoteWriteVersion,
+        /// How each remote-write request body is compressed. `snappy`, the default, is the Snappy
+        /// block format both remote-write specs mandate, and every receiver accepts it. `zstd` is
+        /// the VictoriaMetrics remote write protocol: the same 1.0 request compressed with zstd
+        /// instead, which VictoriaMetrics, vmagent, and `logit`'s own `prometheus_in` accept and
+        /// Prometheus and Mimir reject. There is no negotiation and no fallback: a receiver that
+        /// rejects `zstd` fails every batch, so pick what the receiver accepts. `zstd` needs
+        /// `version: 1`. Sender mode only.
+        #[serde(default)]
+        compression: RemoteWriteCompression,
         /// Per-request timeout on the remote-write POST. Defaults to `10s`; `0s` is rejected.
         /// Sender mode only.
         #[serde(
@@ -2118,6 +2127,17 @@ impl From<RemoteWriteVersion> for u8 {
             RemoteWriteVersion::V2 => 2,
         }
     }
+}
+
+/// How `prometheus_out`'s `endpoint:` sender compresses a request body. Defaults to `snappy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWriteCompression {
+    /// Snappy block compression, what both remote-write specs mandate.
+    #[default]
+    Snappy,
+    /// zstd, the VictoriaMetrics remote write protocol. Remote-write 1.0 only.
+    Zstd,
 }
 
 /// `prometheus_out`'s `path` default. `pub` so graph validation can tell a set registry-mode
@@ -2291,7 +2311,10 @@ pub struct TailOptions {
     /// Where read offsets are persisted, so a restart resumes instead of replaying or skipping.
     /// Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every
     /// file as if newly discovered. A relative path resolves against the config file's
-    /// directory.
+    /// directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp`
+    /// beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is
+    /// another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every
+    /// file from its beginning, whatever `read_from` says.
     #[serde(default)]
     pub checkpoint_path: Option<String>,
     #[serde(default)]
@@ -2834,6 +2857,12 @@ impl JsonSchema for StdioTarget {
     }
 }
 
+/// The largest `rotate.max_files` graph validation accepts. It counts the active file, so 1000
+/// keeps 999 rotated files: about 2.7 years of daily files, or 41 days of hourly ones. Every
+/// rotation stats and renames each retained file, so a larger value makes each rotation slower
+/// without a use a count-based policy needs.
+pub const MAX_ROTATE_FILES: u32 = 1000;
+
 /// `file_out`'s rotation policy. At least one of `max_bytes`/`interval` must be set; a config
 /// that would never rotate is rejected (use `stdio_out` for an unrotated file). `max_files`
 /// counts every file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
@@ -2851,7 +2880,9 @@ pub struct RotateConfig {
     /// triggers a rotation.
     #[serde(default)]
     pub interval: Option<RotateInterval>,
-    /// Files to keep, active plus rotated. Defaults to `5`; `0` is rejected.
+    /// Files to keep, active plus rotated. Defaults to `5`. Must be between `1` and `1000`
+    /// (`MAX_ROTATE_FILES`): 1000 keeps 999 rotated files, about 2.7 years of daily files or 41
+    /// days of hourly ones.
     pub max_files: u32,
 }
 
@@ -5373,6 +5404,7 @@ mod tests {
                 max_series,
                 endpoint,
                 version,
+                compression,
                 timeout,
                 headers,
                 endpoint_tls,
@@ -5387,6 +5419,7 @@ mod tests {
                 assert_eq!(max_series, 100_000);
                 assert_eq!(endpoint, None, "registry mode sets no sender field");
                 assert_eq!(version, RemoteWriteVersion::V1);
+                assert_eq!(compression, RemoteWriteCompression::Snappy);
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
                 assert_eq!(endpoint_tls, TlsClientConfig::default());
@@ -5449,7 +5482,8 @@ mod tests {
     fn prometheus_out_reads_the_sender_mode_fields() {
         let component: Component = serde_json::from_str(
             r#"{"type": "prometheus_out", "sources": ["in"],
-                "endpoint": "https://mimir:8080/api/v1/push", "version": 2, "timeout": "30s",
+                "endpoint": "https://mimir:8080/api/v1/push", "version": 2, "compression": "zstd",
+                "timeout": "30s",
                 "headers": {"X-Scope-OrgID": "tenant-a"},
                 "endpoint_tls": {"ca_file": "ca.pem"}}"#,
         )
@@ -5459,6 +5493,7 @@ mod tests {
                 bind,
                 endpoint,
                 version,
+                compression,
                 timeout,
                 headers,
                 endpoint_tls,
@@ -5467,6 +5502,7 @@ mod tests {
                 assert_eq!(bind, None);
                 assert_eq!(endpoint.as_deref(), Some("https://mimir:8080/api/v1/push"));
                 assert_eq!(version, RemoteWriteVersion::V2);
+                assert_eq!(compression, RemoteWriteCompression::Zstd);
                 assert_eq!(timeout, Duration::from_secs(30));
                 assert_eq!(headers.get("X-Scope-OrgID").map(String::as_str), Some("tenant-a"));
                 assert_eq!(endpoint_tls.ca_file.as_deref(), Some("ca.pem"));

@@ -246,7 +246,7 @@ impl DatadogInput {
     }
 
     /// The `DD-API-KEY` values this listener accepts (`api_keys:` in config). Empty accepts any
-    /// request. Graph rule 62 rejects an empty entry.
+    /// request. Graph rule 63 rejects an empty entry.
     pub fn with_api_keys(mut self, api_keys: Vec<String>) -> Self {
         self.api_keys =
             api_keys.into_iter().map(|key| key.into_bytes().into_boxed_slice()).collect();

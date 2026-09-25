@@ -413,7 +413,7 @@ impl StatsdInput {
     ///
     /// Fails on a UDP listener: DTLS is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s
     /// Alternatives) and no statsd client speaks it. Fails on either Unix socket too, which is
-    /// always plaintext. Graph rules 43 and 64 are what an operator sees; this backstops a caller
+    /// always plaintext. Graph rules 43 and 65 are what an operator sees; this backstops a caller
     /// that skipped validation.
     pub fn with_tls(
         mut self,

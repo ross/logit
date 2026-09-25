@@ -19,7 +19,7 @@
 #
 # What goes out:
 #   - Logs to Loki (`loki_out`, OTLP/HTTP).
-#   - Metrics to InfluxDB (`influx_out`).
+#   - Metrics to VictoriaMetrics (`victoria_out`, `prometheus_out` sending remote-write).
 #   - Spans to Tempo (`tempo_out`, OTLP/gRPC): `logit`'s own internal spans, the spans haproxy and
 #     nginx get from their access lines (`docs/adr/trace-context-span-lifting.md`'s `span:` block),
 #     and the browser's spans from `browser_in`.
@@ -35,7 +35,7 @@
 #
 # Components exercised: syslog_in, tail_in, docker_in, otlp_in, set, json, lua, regex,
 # http_access, trace_context, kv_metrics, keep_signals, has_signal, keep, aggregate, internal,
-# influxdb_out, and otlp_out over both HTTP and gRPC.
+# prometheus_out (remote-write), and otlp_out over both HTTP and gRPC.
 #
 # Background: docs/plans/demo-stack.md, docs/plans/demo-tracing-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
@@ -99,7 +99,7 @@
 #                                    v                                                    |
 #                              windowed (aggregate)                                        |
 #                                    |                                                    |
-#   self (internal) --+-> self_windowed (aggregate) --> influx_out --> InfluxDB            |
+#   self (internal) --+-> self_windowed (aggregate) --> victoria_out --> VictoriaMetrics   |
 #                      |                                                                  |
 #                      +-> trace_only (has_signal) ---------------------------------> tempo_out (otlp_out, gRPC) --> tempo
 #
@@ -527,13 +527,14 @@ components:
   # ever in the name), so neither chain needs a `scale` stage (docs/adr/scale-transform.md's
   # 2026-09-22 amendment).
   #
-  # Both tiers share the `web.*` measurement names below and are told apart by the `service.name`
-  # tag `*_identity` stamped (Grafana panels filter on it). That's safe because `http_access` hands
-  # both the same quantity in the same unit. `web.bytes_sent` is the one name shared despite
-  # meaning slightly different things per tier: HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total
-  # bytes written to the client, headers included (`http.response.size`); nginx's
-  # `$body_bytes_sent` is body only (`http.response.body.size`). No panel compares the two tiers
-  # directly, so sharing the name is fine, just not exact.
+  # Both tiers share the `web.*` metric names below and are told apart by the `service.name`
+  # resource attribute `*_identity` stamped, which reaches VictoriaMetrics as the `service_name`
+  # label (Grafana panels filter on it). That's safe because `http_access` hands both the same
+  # quantity in the same unit. `web.bytes_sent` is the one name shared despite meaning slightly
+  # different things per tier: HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total bytes written to
+  # the client, headers included (`http.response.size`); nginx's `$body_bytes_sent` is body only
+  # (`http.response.body.size`). No panel compares the two tiers directly, so sharing the name is
+  # fine, just not exact.
   nginx_metrics:
     type: kv_metrics
     sources: [nginx_trace]
@@ -562,7 +563,7 @@ components:
     # A process-wide gauge (HAProxy's concurrent-connection count), not a per-request value. It
     # rides on this event's request/response tags like every other field here, so it lands as one
     # series per tag combination holding the last value seen each window. A panel over it should
-    # `|> group() |> last()` rather than plot the raw series.
+    # take `max(...)` across those series rather than plot each one.
     gauges:
       - name: web.connections_active
         field: conns_active
@@ -597,10 +598,17 @@ components:
         http.termination_state,
       ]
 
+  # `temporality: cumulative` because `victoria_out` below skips a delta `Sum`: remote-write
+  # carries running totals, so `web.requests`/`web.bytes_sent` arrive as `_total` counters that
+  # PromQL's `rate()` reads. A `Distribution` tumbles in either mode, so each window's
+  # `web.request_time` is that window's own sketch, which `victoria_out` renders as a summary
+  # (`web_request_time{quantile="0.5"|...|"0.99"}` plus `_count`). The dashboard's p50/p99 panels
+  # read those `quantile` series.
   windowed:
     type: aggregate
     sources: [trimmed]
     interval: 10s
+    temporality: cumulative
 
   # `logit` observing itself (docs/design/internal-telemetry.md, ADR `internal-telemetry-as-pipeline-events`);
   # the dashboard's `logit.*` panels come from here. `span_sample_rate` is `1.0` rather than its
@@ -613,18 +621,26 @@ components:
     interval: 10s
     span_sample_rate: 1.0
 
+  # Cumulative for the same reason as `windowed`: `self`'s counters are deltas.
   self_windowed:
     type: aggregate
     sources: [self]
     interval: 60s # `self`'s 10s divides evenly into it, as internal-telemetry.md's guidance asks
+    temporality: cumulative
 
-  influx_out:
-    type: influxdb_out
+  # Remote-write into VictoriaMetrics (docs/deploying.md's "VictoriaMetrics, VictoriaLogs, and
+  # VictoriaTraces"). `version: 1` is required: VictoriaMetrics answers a 2.0 request `204` and
+  # stores nothing. `compression: zstd` is the VictoriaMetrics remote write protocol vmagent sends
+  # by default; VictoriaMetrics also accepts Snappy. `self_windowed`'s span and log events carry no
+  # metric record, so this sink ignores them without a signal gate. Each series is labelled with
+  # its event attributes and resource attributes, names sanitized (`service.name` becomes
+  # `service_name`, `web.requests` becomes `web_requests_total`).
+  victoria_out:
+    type: prometheus_out
     sources: [windowed, self_windowed]
-    url: http://influxdb:8086
-    org: logit
-    bucket: metrics
-    token: !env INFLUXDB_TOKEN
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1
+    compression: zstd
 
   # `self` carries *all* of `logit`'s own telemetry, not just spans: every drain also carries this
   # process's `logit.*` metrics (Counter/Gauge/Distribution). It never mixes the two *on one
@@ -640,12 +656,12 @@ components:
   # metric point reaching `tempo_out` would fail with `grpc-status: 12` (UNIMPLEMENTED), and enough
   # consecutive failures trip `write_loop`'s ~60s sustained-permanent-failure guard
   # (`docs/adr/service-lifecycle-and-output-retry.md`, revised by
-  # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the InfluxDB
-  # metrics path down with it, not just Tempo. See `docs/known-gaps.md`'s "`otlp_out` aborts an
-  # entire batch's `send`..." entry for the full account. `access_spans` needs the same gate for
-  # the same reason, because `haproxy_trace`/`nginx_trace` produce metric-and-span-carrying
-  # batches, and so does `browser_spans`, even though `browser_in` only ever emits traces (see
-  # `browser_spans`'s comment above).
+  # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the
+  # VictoriaMetrics metrics path down with it, not just Tempo. See `docs/known-gaps.md`'s
+  # "`otlp_out` aborts an entire batch's `send`..." entry for the full account. `access_spans` needs
+  # the same gate for the same reason, because `haproxy_trace`/`nginx_trace` produce
+  # metric-and-span-carrying batches, and so does `browser_spans`, even though `browser_in` only
+  # ever emits traces (see `browser_spans`'s comment above).
   trace_only:
     type: has_signal
     sources: [self]

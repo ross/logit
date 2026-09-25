@@ -138,18 +138,19 @@ kind adds **at least one** suffix, so an expanded path can never collide with a 
 | Kind | Sub-paths |
 |---|---|
 | `Samples` (via `sketch()`) / `Distribution` | `.count`, `.sum`, `.q0_5`, `.q0_75`, `.q0_9`, `.q0_95`, `.q0_99` |
-| `Histogram` | `.count` (Σ buckets), `.sum`/`.min`/`.max` when `Some`, `.bucket_<b>` per bucket (own count, not cumulative — `metric.rs:209-218`) |
+| `Histogram` | `.count` (Σ buckets), `.sum`/`.min`/`.max` when `Some`, `.bucket_<b>` per bucket (own count, not cumulative — `Histogram`'s own doc comment in `metric.rs`) |
 | `ExponentialHistogram` | `.count`, `.sum`/`.min`/`.max` when `Some`, `.zero_count`; **no buckets** |
 | `Summary` | `.count`, `.sum`, `.q<q>` per its own quantiles |
 | `Set` | `.count` = `estimate()` |
 | `SetMembers` | `.count` = distinct member count |
 
-`Samples` goes through `logit_core::Samples::sketch()` (`crates/logit-core/src/metric.rs:192`);
+`Samples` goes through `logit_core::Samples::sketch()` (`crates/logit-core/src/metric.rs`);
 quantiles are `crate::otlp::metrics::DISTRIBUTION_QUANTILES`
-(`crates/logit-proto/src/otlp/metrics.rs:102`, already `pub(crate)`, reachable from
-`logit-proto/src/graphite/` exactly as `prometheus/mod.rs:143` already reaches it).
-`DdSketch::sum()` (`metric.rs:340`) is exact, so `.sum` is emitted for sketches under `expand` —
-Prometheus's own "a sketch has no sum" doc claim (`prometheus/mod.rs:81`) is stale and is left alone
+(`crates/logit-proto/src/otlp/metrics.rs`, already `pub(crate)`, reachable from
+`logit-proto/src/graphite/` exactly as `prometheus/mod.rs`'s own `use` of it already reaches it).
+`DdSketch::sum()` (`metric.rs`) is exact, so `.sum` is emitted for sketches under `expand` —
+Prometheus's own "a sketch has no sum" doc claim (the module doc's "Encode: events → families"
+table's `Distribution(sketch)` row in `prometheus/mod.rs`) is stale and is left alone
 here; noted as a follow-up in this plan's W4b closeout, not fixed by this effort. influxdb's
 `[0.5,0.9,0.99]` quantile set is left alone; Graphite's own `expand` uses the same
 `DISTRIBUTION_QUANTILES` set Prometheus uses, not influxdb's.
@@ -158,8 +159,8 @@ Number tokens format `f64` with `{}` and substitute `.` → `_` (`0.99 → q0_99
 `inf → bucket_inf`). This is **injective**: Rust's `Display` for `f64` emits only `-`, digits, and
 at most one `.`, so no two distinct finite values can format to the same string before the
 substitution, and the substitution itself (one character for one character, no merging) can't
-introduce a new collision. This is a materially different argument from
-`crates/logit-outputs/src/influxdb.rs:628-631`'s: that comment rejects *rounding* a quantile to a
+introduce a new collision. This is a materially different argument from `render_fields`'s doc
+comment in `crates/logit-outputs/src/influxdb.rs`: that comment rejects *rounding* a quantile to a
 fixed-width label (`0.991` and `0.994` both round to `p99` and collide), a lossy transform this
 codec never performs. Graphite forces the substitution not to avoid a collision like influxdb's,
 but because `.` is the wire's own hierarchy separator — the number itself is carried in full,
@@ -226,13 +227,15 @@ possibly-slow `Fanout::send`.
 `transport: tcp` has no such gap to paper over. TCP's own flow control **is** the backpressure: a
 slow `sink.send(batch).await` blocking the per-connection read loop stalls that connection's socket
 buffer, which the sending client feels directly as its own write blocking — the same argument
-`otlp_in`'s module doc already makes ("This is the first listener with real backpressure to its
-source... TCP... has no such escape hatch," `crates/logit-inputs/src/otlp.rs:18-24`) and the same
+`otlp_in`'s module doc made at the time ("This is the first listener with real backpressure to
+its source... TCP... has no such escape hatch"; today its "Backpressure reaches the client"
+paragraph, `crates/logit-inputs/src/otlp.rs`) and the same
 shape `logit_in`'s connection loop relies on. So `graphite_in`'s TCP half carries **no
 `ReceiveQueue`**: nothing between a connection's read buffer and its own `BatchAccumulator`/
 `Fanout::send` needs bounding beyond the connection cap already established by `logit_in`
-(`MAX_CONCURRENT_CONNECTIONS = 1024`, a semaphore, per-connection shutdown racing —
-`crates/logit-inputs/src/logit.rs:155-300`), which `graphite_in`'s TCP accept loop follows.
+(`MAX_CONCURRENT_CONNECTIONS = 1024`, a semaphore, per-connection shutdown racing — all in
+`LogitInput::run_until_shutdown`, `crates/logit-inputs/src/logit.rs`), which `graphite_in`'s TCP
+accept loop follows.
 
 No shared `logit_inputs::tcp` driver is extracted for this pair. There is exactly one existing TCP
 accept loop to generalize from — `otlp_in`'s, itself specialized to HTTP/1.1 and gRPC/h2c framing —
@@ -252,7 +255,7 @@ but sharing no code with either.
 `graphite_out.duplicate_safe() -> true`: Whisper (Carbon's on-disk storage) is last-write-wins per
 `(path, second)` — re-sending the same batch on retry overwrites the same slots with the same
 values, not a second, distinct data point. This is
-[`crates/logit-outputs/src/influxdb.rs:191-199`](../../crates/logit-outputs/src/influxdb.rs)'s
+[`InfluxDbOutput::duplicate_safe`'s doc comment](../../crates/logit-outputs/src/influxdb.rs)'s
 argument (an identical `(measurement, tag set, timestamp)` write is an idempotent overwrite, not a
 duplicate point) applied to Whisper instead of InfluxDB's own idempotent-write semantics, and makes
 `graphite_out` the **first non-HTTP sink with a real destination** to report `duplicate_safe: true`
@@ -361,8 +364,9 @@ hand after the fact; this pair starts with one list, not two):
   them; Whisper's 255-byte filesystem path-component limit is not enforced (no path truncation is
   done — Carbon's own wire format has no length bound); resource attributes becoming tags is a
   cross-protocol behavior, not a normalization this pair's fixed point relies on (a bare `graphite_in`
-  resource is always empty); Prometheus's stale "a sketch has no sum" doc claim
-  (`prometheus/mod.rs:81`), left uncorrected by this effort and noted as a follow-up in this plan's
+  resource is always empty); Prometheus's stale "a sketch has no sum" doc claim (the module doc's
+  "Encode: events → families" table's `Distribution(sketch)` row in `prometheus/mod.rs`), left
+  uncorrected by this effort and noted as a follow-up in this plan's
   W4b closeout; no shared `logit_inputs::tcp` driver yet, with the extraction trigger named above.
 - **The pickle reader is a new, meaningful security surface**: a parser for a format whose purpose
   is arbitrary object construction, fed straight from a socket. Its safety rests entirely on the
