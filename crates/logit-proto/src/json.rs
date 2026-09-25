@@ -125,22 +125,26 @@ pub(crate) fn write_value(out: &mut Vec<u8>, value: &Value) {
     }
 }
 
-/// A stack-safety bound on [`flatten_into`]'s recursion, the `flatten` transform's `MAX_DEPTH`. A
-/// value still nested at this depth is written whole, as its JSON text.
+/// A stack-safety bound on [`flatten_into`]'s recursion, the same bound as the `flatten`
+/// transform's `MAX_DEPTH`. A map still nested at this depth is written as its JSON text.
 pub(crate) const FLATTEN_MAX_DEPTH: usize = 32;
 
 /// Writes `value` into `out` under `prefix`, a nested `Map` expanded into dot-joined keys
-/// (`{"a":{"b":1}}` under `x` becomes `x.a.b = 1`), with the `flatten` transform's leaf rule:
+/// (`{"a":{"b":1}}` under `x` becomes `x.a.b = 1`), for a wire whose object is flat (HEC's
+/// `fields`):
 ///
 /// - a non-container value, an empty `Array`, or an `Array` of non-containers is a leaf, written
 ///   as-is;
 /// - an empty `Map` writes nothing;
-/// - an `Array` holding a `Map` or `Array` is written as its JSON text (`Str`), because a flat
-///   wire has nowhere to put an element's own keys;
+/// - an `Array` holding a `Map` or `Array` is written as its JSON text (`Str`);
 /// - a `Map` still nested at [`FLATTEN_MAX_DEPTH`] is written as its JSON text.
 ///
-/// A key collision is last write wins, as in `flatten`: `out` is an [`AttrMap`], so a later
-/// insert overwrites.
+/// It departs from the `flatten` transform in three places, each because a flat JSON object has
+/// nowhere to put the value `flatten` keeps: `flatten` writes an empty map back as a leaf (it never
+/// deletes an attribute), expands an array holding a container by index or leaves it whole rather
+/// than stringifying it, and writes a depth-capped map back whole rather than as text. A key
+/// collision is last write wins, as in `flatten`: `out` is an [`AttrMap`], so a later insert
+/// overwrites.
 pub(crate) fn flatten_into(prefix: &str, value: &Value, out: &mut AttrMap) {
     let mut path = String::from(prefix);
     flatten_at(&mut path, value, out, 0);

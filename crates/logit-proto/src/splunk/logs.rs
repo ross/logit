@@ -22,17 +22,17 @@
 //! | `message` `Map` / `Array` / number / `Bool` | `event` as JSON | -- |
 //! | `message` `Bytes` | `event` string, lossy UTF-8 | -- |
 //! | `message` `Timestamp` | `event` RFC 3339 string | -- |
-//! | `message` `Null`, `""`, or a non-finite `F64` | nothing: HEC rejects a blank `event` for the whole request (code 12 or 13) | `logit.output.events.skipped{reason="blank_event"}` |
+//! | `message` `Null`, an empty `Str` or `Bytes`, or a non-finite `F64` | nothing: HEC rejects a blank `event` for the whole request (code 12 or 13) | `logit.output.events.skipped{reason="blank_event"}` |
 //! | `severity`, when neither severity attribute is present | `otel.log.severity.text` (`Info`, …) and `.number` (the band's base, `9`, …) | -- |
 //! | either severity attribute | that attribute alone, verbatim | -- |
 //! | `event_name`, when no `otel.log.name` attribute | `otel.log.name` | -- |
 //! | `trace`, when neither a `trace_id` nor a `span_id` attribute is present | `trace_id` and, when the ref has one, `span_id`, lowercase hex; `flags` has no field | -- |
-//! | an attribute starting `metric_name`, or `_value`, on a log whose message is the string `metric` | dropped: it would turn the object into a metric event | `logit.output.tags.dropped{reason="reserved_key"}` |
+//! | on a log whose message (`Str` or `Bytes`) is the text `metric`: an attribute starting `metric_name:`, and `metric_name` and `_value` when both are present | dropped: the decoder would read the object as a metric event | `logit.output.tags.dropped{reason="reserved_key"}`, one per key |
 //!
 //! `body_format`, `observed_timestamp`, and `dropped_attributes_count` have no HEC field, and
 //! decode from the wire's shape (`Json` for an object or array, else `Raw`; `0`; `0`).
 
-use super::metrics::METRIC_EVENT;
+use super::metrics::{METRIC_EVENT, MULTI_METRIC_PREFIX, SINGLE_METRIC_NAME, SINGLE_METRIC_VALUE};
 use super::{
     begin_object, write_fields, BatchContext, ObjectMeta, SplunkDecoder, SplunkEncoder,
     ATTR_LOG_NAME, ATTR_SEVERITY_NUMBER, ATTR_SEVERITY_TEXT, ATTR_SPAN_ID, ATTR_TRACE_ID,
@@ -146,11 +146,15 @@ impl SplunkEncoder {
         event_index: usize,
         out: &mut MessageBuf<ObjectMeta>,
     ) {
+        // `Str` and `Bytes` both leave as a string (`value_text`), so both guards read that text.
+        let text = match &log.message {
+            Value::Str(_) | Value::Bytes(_) => Some(value_text(&log.message)),
+            _ => None,
+        };
         let blank = match &log.message {
             Value::Null => true,
-            Value::Str(s) => s.is_empty(),
             Value::F64(f) => !f.is_finite(),
-            _ => false,
+            _ => text.as_deref() == Some(""),
         };
         if blank {
             self.telemetry.count("logit.output.events.skipped", 1.0, &[("reason", "blank_event")]);
@@ -163,13 +167,18 @@ impl SplunkEncoder {
 
         let keys = &*KEYS;
         let mut fields = SplunkEncoder::object_fields(ctx.resource, event);
-        if log.message.as_str() == Some(METRIC_EVENT) {
+        if text.as_deref() == Some(METRIC_EVENT) {
+            // The keys `metrics::is_metric_fields` reads: any `metric_name:<n>`, and the
+            // `metric_name` + `_value` pair only when both are present.
+            let pair = fields.get(SINGLE_METRIC_NAME).is_some()
+                && fields.get(SINGLE_METRIC_VALUE).is_some();
             let reserved: Vec<Symbol> = fields
                 .iter()
                 .map(|(key, _)| key)
                 .filter(|key| {
                     let key = resolve(*key);
-                    key.starts_with("metric_name") || key == "_value"
+                    key.starts_with(MULTI_METRIC_PREFIX)
+                        || (pair && (key == SINGLE_METRIC_NAME || key == SINGLE_METRIC_VALUE))
                 })
                 .collect();
             self.reserved_key_dropped(reserved.len());
@@ -390,6 +399,79 @@ mod tests {
         );
         assert_eq!(
             counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            1.0
+        );
+    }
+
+    #[test]
+    fn only_the_decoders_metric_keys_are_reserved_on_a_metric_log() {
+        for fields in [
+            r#"{"metric_namespace":"prod","metric_name":"lone"}"#,
+            r#"{"_value":1,"metric_namespace":"prod"}"#,
+        ] {
+            let body = format!(r#"{{"time":0,"event":"metric","fields":{fields}}}"#);
+            let registry = Registry::new();
+            let batches = decode(&body);
+            assert!(batches[0].events[0].log.is_some(), "{fields}");
+            let mut out = MessageBuf::default();
+            encoder(&registry).encode_objects(&batches[0], &mut out);
+            let once: Vec<u8> = out.iter().flatten().copied().collect();
+            assert_eq!(decode(std::str::from_utf8(&once).unwrap()), batches, "{fields}");
+            assert_eq!(
+                counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+                0.0
+            );
+        }
+
+        // Both halves of the pair present on a model log: both dropped.
+        let registry = Registry::new();
+        let mut attrs = AttrMap::new();
+        attrs.insert("metric_name", Value::str("m"));
+        attrs.insert("_value", Value::I64(1));
+        attrs.insert("metric_namespace", Value::str("prod"));
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![Event::log(0, attrs, log_record(Value::str("metric"), BodyFormat::Raw))],
+        };
+        let mut out = MessageBuf::default();
+        encoder(&registry).encode_objects(&batch, &mut out);
+        assert_eq!(
+            out.iter().next().unwrap(),
+            br#"{"time":0,"event":"metric","fields":{"metric_namespace":"prod"}}"#
+        );
+        assert_eq!(
+            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            2.0
+        );
+    }
+
+    #[test]
+    fn a_bytes_message_gets_the_same_guards_as_a_str() {
+        let registry = Registry::new();
+        let mut attrs = AttrMap::new();
+        attrs.insert("metric_name:cpu", Value::F64(1.0));
+        let bytes = |b: &'static [u8]| {
+            log_record(Value::Bytes(bytes::Bytes::from_static(b)), BodyFormat::Raw)
+        };
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![
+                Event::log(0, attrs, bytes(b"metric")),
+                Event::log(0, AttrMap::new(), bytes(b"")),
+            ],
+        };
+        let mut out = MessageBuf::default();
+        encoder(&registry).encode_objects(&batch, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.iter().next().unwrap(), br#"{"time":0,"event":"metric"}"#);
+        assert_eq!(
+            counted(&registry, "logit.output.tags.dropped", ("reason", "reserved_key")),
+            1.0
+        );
+        assert_eq!(
+            counted(&registry, "logit.output.events.skipped", ("reason", "blank_event")),
             1.0
         );
     }

@@ -134,6 +134,19 @@ fn a_blank_or_missing_event_is_skipped_and_the_rest_delivered() {
 }
 
 #[test]
+fn uppercase_hex_ids_leave_lowercase() {
+    let body = br#"{"time":1,"event":"log","fields":{"trace_id":"0AF7651916CD43DD8448EB211C80319C","span_id":"B7AD6B7169203331"}}{"time":1,"event":{"trace_id":"4BF92F3577B34DA6A3CE929D0E0E4736","span_id":"00F067AA0BA902B7","parent_span_id":"B7AD6B7169203331","start_time":1,"end_time":2,"links":[{"trace_id":"0AF7651916CD43DD8448EB211C80319C","span_id":"B7AD6B7169203331","trace_state":""}]}}"#;
+    let d1 = assert_fixed_point(body);
+    assert!(d1[0].events[0].log.as_ref().unwrap().trace.is_some());
+    assert!(d1[0].events[1].span.is_some());
+    let e1 = String::from_utf8(encode(&d1)).unwrap();
+    assert!(e1.contains(r#""trace_id":"0af7651916cd43dd8448eb211c80319c""#), "{e1}");
+    assert!(e1.contains(r#""parent_span_id":"b7ad6b7169203331""#), "{e1}");
+    assert!(e1.contains(r#""span_id":"00f067aa0ba902b7""#), "{e1}");
+    assert!(!e1.chars().any(|c| ('A'..='F').contains(&c)), "{e1}");
+}
+
+#[test]
 fn raw_lines_relay_through_event() {
     let envelope = logit_proto::splunk::Envelope {
         host: Some("h".into()),

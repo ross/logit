@@ -44,14 +44,15 @@
 //! |---|---|---|
 //! | body empty, whitespace, or `[]` | `HecError` code 5 (`No data`) | -- |
 //! | object *i* not valid JSON, or not a JSON object | `HecError` code 6 with `invalid-event-number` *i*; nothing delivered | -- |
+//! | object *i*'s `event`, `fields`, or a carrier holding a number outside `f64`'s range (`1e400`) or nesting past 127 levels, which the model can't hold | the same `HecError` code 6 | -- |
 //! | a carrier `null` | absent | -- |
 //! | a carrier that isn't a string | its JSON text | `logit.input.events.degraded{reason="non_string_envelope"}` |
 //! | any other envelope key | dropped | `logit.input.events.degraded{reason="unknown_envelope_key"}` |
 //! | `time`: a number, or a string holding one | `Event::timestamp`, every digit kept ([`time::parse_hec_time`]); `0` is the epoch | -- |
 //! | `time` absent or `null` | `received_at` | -- |
-//! | `time` another type | `received_at` | `degraded{reason="bad_time"}` |
+//! | `time` another type, or a number or string that doesn't parse (`1e400`) | `received_at` | `degraded{reason="bad_time"}` |
 //! | `fields` not an object | ignored | `degraded{reason="bad_fields"}` |
-//! | `fields` object | event attributes (a span's: resource attributes), each value typed as [`crate::json`] converts it, a nested map flattened to dotted keys by `flatten`'s leaf rule | -- |
+//! | `fields` object | event attributes (a span's: resource attributes), each value typed as [`crate::json`] converts it, a nested map flattened to dotted keys by [`crate::json::flatten_into`] (an empty map dropped, an array holding a container as its JSON text) | -- |
 //! | objects with an equal resource | one batch, in first-appearance order | -- |
 //! | `event` absent or `null` | skipped; the rest delivered | `logit.input.events.skipped{reason="no_event"}` |
 //! | `event` `""` | skipped; the rest delivered | `skipped{reason="blank_event"}` |
@@ -74,7 +75,7 @@
 //! |---|---|---|
 //! | `Event::timestamp` (a span's: its start) | `time`, seconds with up to nine decimals ([`time::write_hec_time`]) | -- |
 //! | a carrier that isn't a `Str` | omitted | `logit.output.tags.dropped{reason="unrepresentable"}`, once per batch |
-//! | every other resource attribute, then every event attribute (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by `flatten`'s leaf rule (a span's event attributes go in its `attributes` instead) | -- |
+//! | every other resource attribute, then every event attribute (the event's winning on a key) | `fields`, a `Map` flattened to dotted keys by [`crate::json::flatten_into`] (a span's event attributes go in its `attributes` instead) | -- |
 //! | an event with no log, metric, or span | nothing | `logit.output.events.skipped{reason="no_payload"}` |
 //!
 //! [`logs`], [`metrics`], and [`spans`] each carry their own rows.
@@ -92,7 +93,8 @@
 //!    `time` is written with trailing zeros trimmed;
 //! 3. an absent `time` leaves as the receipt time, a non-string carrier as its JSON text, and a
 //!    span's `fields` key spelled like a carrier the envelope lacks as that carrier;
-//! 4. a nested `fields` value leaves flattened, by the [`crate::json::flatten_into`] rule;
+//! 4. `fields` leaves flat ([`crate::json::flatten_into`]): a nested map as dotted keys, an empty
+//!    map dropped, and an array holding a map or array as its JSON text;
 //! 5. a metric event's single-metric form (`metric_name` + `_value`) leaves in multi-metric form
 //!    (`metric_name:<n>`), its records in name order, and a metric object with no `metric_type`
 //!    leaves with `metric_type` `Gauge`, the OpenTelemetry exporter's form;
@@ -103,7 +105,9 @@
 //!    line leaves through `/event`;
 //! 8. an unknown envelope key, a `fields` that isn't an object, an event with no `event` or a
 //!    blank one, and a span's `fields` key spelled like a carrier the envelope also sets are
-//!    dropped and counted.
+//!    dropped and counted;
+//! 9. a hex id (a span's, parent's, or link's `trace_id`/`span_id`, and a log's `trace_id`/`span_id`
+//!    fields when they parse) is read in either case and leaves lowercase.
 //!
 //! The model-side losses (a resource attribute returning as an event attribute, `Sum`
 //! temporality, the multi-number kinds under `MultiValue`) are in [`metrics`], [`logs`], and
@@ -296,8 +300,13 @@ impl SplunkDecoder {
         received_at: i64,
     ) -> Result<Vec<EventBatch>, HecError> {
         let objects = split_objects(body)?;
+        let parsed = objects
+            .iter()
+            .enumerate()
+            .map(|(i, object)| ParsedObject::parse(object).ok_or_else(|| HecError::invalid_at(i)))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut groups = Groups::default();
-        for object in &objects {
+        for object in parsed {
             self.decode_object(object, received_at, &mut groups);
         }
         Ok(groups.into_batches())
@@ -323,30 +332,26 @@ impl SplunkDecoder {
         EventBatch { resource: Arc::new(envelope.to_resource()), scope: None, events }
     }
 
-    fn decode_object(&mut self, object: &Object<'_>, received_at: i64, groups: &mut Groups) {
-        let mut envelope = Envelope::default();
-        let mut timestamp = None;
-        let mut event = None;
-        let mut fields = None;
-        for (key, raw) in object {
-            match key.as_str() {
-                "time" => timestamp = self.read_time(raw),
-                "host" => envelope.host = self.read_carrier(raw),
-                "source" => envelope.source = self.read_carrier(raw),
-                "sourcetype" => envelope.sourcetype = self.read_carrier(raw),
-                "index" => envelope.index = self.read_carrier(raw),
-                "event" => event = Some(parse_raw(raw)),
-                "fields" => match parse_raw(raw) {
-                    Json::Object(map) => fields = Some(map),
-                    Json::Null => {}
-                    _ => self.degrade_event("bad_fields"),
-                },
-                _ => self.degrade_event("unknown_envelope_key"),
-            }
+    fn decode_object(&mut self, object: ParsedObject<'_>, received_at: i64, groups: &mut Groups) {
+        for _ in 0..object.unknown_keys {
+            self.degrade_event("unknown_envelope_key");
         }
-        let timestamp = timestamp.unwrap_or(received_at);
-        let fields = fields.unwrap_or_default();
-        let event = match event {
+        let envelope = Envelope {
+            host: self.read_carrier(object.host),
+            source: self.read_carrier(object.source),
+            sourcetype: self.read_carrier(object.sourcetype),
+            index: self.read_carrier(object.index),
+        };
+        let timestamp = object.time.and_then(|raw| self.read_time(raw)).unwrap_or(received_at);
+        let fields = match object.fields {
+            None | Some(Json::Null) => Map::new(),
+            Some(Json::Object(map)) => map,
+            Some(_) => {
+                self.degrade_event("bad_fields");
+                Map::new()
+            }
+        };
+        let event = match object.event {
             None | Some(Json::Null) => return self.skip_event("no_event"),
             Some(Json::String(s)) if s.is_empty() => return self.skip_event("blank_event"),
             Some(event) => event,
@@ -404,27 +409,25 @@ impl SplunkDecoder {
         resource
     }
 
+    /// `None` for `null`; an unparseable number or string, or any other type, is counted.
     fn read_time(&self, raw: &RawValue) -> Option<i64> {
         let text = raw.get();
-        match text.as_bytes().first() {
+        let nanos = match text.as_bytes().first() {
+            _ if text == "null" => return None,
             Some(b'-' | b'0'..=b'9') => time::parse_hec_time(text),
-            Some(b'"') => match parse_raw(raw) {
-                Json::String(s) => time::parse_hec_time(s.trim()).or_else(|| {
-                    self.degrade_event("bad_time");
-                    None
-                }),
-                _ => None,
-            },
-            _ if text == "null" => None,
-            _ => {
-                self.degrade_event("bad_time");
-                None
-            }
+            Some(b'"') => serde_json::from_str::<String>(text)
+                .ok()
+                .and_then(|s| time::parse_hec_time(s.trim())),
+            _ => None,
+        };
+        if nanos.is_none() {
+            self.degrade_event("bad_time");
         }
+        nanos
     }
 
-    fn read_carrier(&self, raw: &RawValue) -> Option<String> {
-        match parse_raw(raw) {
+    fn read_carrier(&self, value: Option<Json>) -> Option<String> {
+        match value? {
             Json::Null => None,
             Json::String(s) => Some(s),
             other => {
@@ -453,9 +456,50 @@ fn envelope_has(envelope: &Envelope, carrier: &str) -> bool {
     }
 }
 
-/// A `RawValue` is already valid JSON, so this can't fail.
-fn parse_raw(raw: &RawValue) -> Json {
-    serde_json::from_str(raw.get()).unwrap_or(Json::Null)
+/// One object's envelope members, parsed out of their `RawValue`s. `time` stays raw so its
+/// number text keeps every digit.
+struct ParsedObject<'a> {
+    time: Option<&'a RawValue>,
+    host: Option<Json>,
+    source: Option<Json>,
+    sourcetype: Option<Json>,
+    index: Option<Json>,
+    event: Option<Json>,
+    fields: Option<Json>,
+    unknown_keys: usize,
+}
+
+impl<'a> ParsedObject<'a> {
+    /// `None` when a member is syntactically valid JSON that `serde_json::Value` can't hold: a
+    /// number outside `f64`'s range (`1e400`), or nesting past `serde_json`'s recursion limit.
+    /// The object is unrepresentable, so the body is rejected as Splunk rejects invalid data.
+    fn parse(object: &Object<'a>) -> Option<Self> {
+        let parse = |raw: &RawValue| serde_json::from_str::<Json>(raw.get()).ok();
+        let mut parsed = ParsedObject {
+            time: None,
+            host: None,
+            source: None,
+            sourcetype: None,
+            index: None,
+            event: None,
+            fields: None,
+            unknown_keys: 0,
+        };
+        for (key, raw) in object {
+            let raw: &'a RawValue = raw;
+            match key.as_str() {
+                "time" => parsed.time = Some(raw),
+                "host" => parsed.host = Some(parse(raw)?),
+                "source" => parsed.source = Some(parse(raw)?),
+                "sourcetype" => parsed.sourcetype = Some(parse(raw)?),
+                "index" => parsed.index = Some(parse(raw)?),
+                "event" => parsed.event = Some(parse(raw)?),
+                "fields" => parsed.fields = Some(parse(raw)?),
+                _ => parsed.unknown_keys += 1,
+            }
+        }
+        Some(parsed)
+    }
 }
 
 /// Splits a body into its objects: a JSON array's elements, or concatenated top-level objects.
@@ -799,6 +843,33 @@ pub(crate) mod tests {
             err.body(),
             br#"{"text":"Invalid data format","code":6,"invalid-event-number":1}"#.to_vec()
         );
+    }
+
+    #[test]
+    fn a_member_the_model_cant_hold_rejects_the_body_with_its_index() {
+        let deep = format!(r#"{{"event":{}1{}}}"#, "[".repeat(130), "]".repeat(130));
+        let cases = [
+            (r#"{"event":"a"}{"event":"x","fields":{"a":1e400,"b":"keep"}}"#.to_string(), 1),
+            (r#"{"event":{"n":1e400}}"#.to_string(), 0),
+            (r#"{"event":"metric","fields":{"metric_name:x":1e400}}"#.to_string(), 0),
+            (r#"{"event":"x","host":1e400}"#.to_string(), 0),
+            (format!(r#"{{"event":"a"}}{{"event":"b"}}{deep}"#), 2),
+        ];
+        for (body, index) in cases {
+            let err = SplunkDecoder::new().decode_events(body.as_bytes(), 0).unwrap_err();
+            assert_eq!(err.status, HecStatus::INVALID_DATA_FORMAT, "{body}");
+            assert_eq!(err.invalid_event_number, Some(index), "{body}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_time_number_is_counted() {
+        let registry = Registry::new();
+        let batches = decoder(&registry)
+            .decode_events(br#"{"event":"a","time":1e400}{"event":"b","time":"x"}"#, RECEIVED_AT)
+            .unwrap();
+        assert!(batches[0].events.iter().all(|e| e.timestamp == RECEIVED_AT));
+        assert_eq!(counted(&registry, "logit.input.events.degraded", ("reason", "bad_time")), 2.0);
     }
 
     #[test]
