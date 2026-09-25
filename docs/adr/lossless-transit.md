@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-24
+updated: 2026-09-25
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -214,3 +214,15 @@ their permitted normalizations (a batch boundary per `TracerPayload`; `avg` reco
 Realized as of 2026-09-24: both pairs relay losslessly modulo the normalizations their codec's
 module doc lists; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s closing
 assessment.
+
+## Amendment: a ninth like pair (2026-09-25)
+
+`splunk_hec_in -> splunk_hec_out` (Splunk's HTTP Event Collector) is the ninth like-protocol pair
+in scope under this ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`, `collectd`,
+`graphite`, and the two Datadog pairs. See [ADR `splunk-hec-relay`](splunk-hec-relay.md) for the
+protocol, the OpenTelemetry exporter's attribute vocabulary it adopts in place of a `splunk.*`
+namespace, the metric and span mappings, and acknowledgment, and
+[`docs/plans/splunk-relay.md`](../plans/splunk-relay.md) for the workstreams closing it. Its
+permitted normalizations are listed in `crates/logit-proto/src/splunk/mod.rs`'s module doc (framing
+and batching by resource; number spelling; the single-metric form leaving as multi-metric, with
+`metric_type`; a nested `fields` value leaving flattened; `/raw` split into one event per line).

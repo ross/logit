@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-09-25
 ---
 
 # Enabling plan: Splunk — HEC in both directions, and Observability Cloud over OTLP
@@ -168,6 +168,9 @@ or TCP; no OTLP input appears in its docs or release notes.
 5. The maximum dimension count on a metric event.
 6. Whether the OTel `splunk_hec` receiver decodes the exporter's span events back to spans.
 7. The framing of `[tcpout] sendCookedData = false`.
+8. Which objects of a batch Splunk has indexed when it answers `400` code 6 with
+   `invalid-event-number: N`: `splunk_hec_out` assumes objects before `N` were indexed and resends
+   only those after it (ADR `splunk-hec-relay`, decision 18).
 
 ## Splunk's data against `Event`
 
@@ -247,7 +250,7 @@ amendment to `lossless-transit.md` lands with the ADR.
 - `splunk_hec_in` (W2): `bind:`, `bind_tls:`, an optional `tokens:` allowlist (empty = accept
   any, the shape the Datadog and New Relic plans give `api_keys:`), `max_request_bytes`
   (default 5 MiB, the OTel exporter's `max_event_size`, plus the 2 MiB default body), and the
-  `TcpListener`-style `max_connections`, `handshake_timeout`, and `idle_timeout`. Routes:
+  `TcpListener`-style `handshake_timeout` and `idle_timeout`. Routes:
   `/services/collector`, `/event`, `/event/1.0` (JSON, concatenated or array), `/raw` and
   `/raw/1.0` (lines), `/health` and `/health/1.0` (code 17), `/ack` (every asked id `true`,
   because a 2xx means delivered to the pipeline at-least-once, and a full pipeline answers 503
@@ -277,7 +280,7 @@ cap/`Content-Type` dispatch for the listener; `crate::http` in `logit-outputs` (
 `is_retryable_http_status`, `classify_reqwest_error`, `read_body_prefix`) and `otlp_out`'s
 `with_headers` and gzip for the sink; `write_loop`'s bounded retry with `Fault` classification;
 `TlsClientConfig`/`TlsServerConfig`; `graphite_out`'s `MultiValue` for §4; graph rules 55 and
-56 as the precedent for endpoint validation (new rules 62+).
+56 as the precedent for endpoint validation (new rules 69 and 70).
 
 ### 4. Multi-number kinds on a one-number wire (W3)
 
@@ -352,7 +355,7 @@ and ADR) precedes both because the pair test needs both halves of the codec.
 Landing order: W0 → W1 → W2 → W3 → W4 → W5 → W6, linear. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
-**Status (2026-09-24):** W0 open.
+**Status (2026-09-25):** W1 on `splunk/w1`; W2–W6 not started.
 
 ## Verification
 
