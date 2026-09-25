@@ -72,6 +72,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md) |
 | `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_in` | `crates/logit-inputs/src/datadog_trace.rs` | the Datadog Agent's APM API for dd-trace tracers (`/v0.3`–`/v0.7/traces` msgpack, `/v0.6/stats`, `/info`) over TCP and/or a Unix socket; keeps every span, `503` (a tracer's loss) when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
+| `splunk_hec_in` | `crates/logit-inputs/src/splunk.rs` | a stand-in for Splunk's HTTP Event Collector (HEC): `/event` JSON and `/raw` lines from any HEC client (Docker's `splunk` driver, Splunk's logging libraries, the OTel `splunk_hec` exporter, SC4S), gzip, an optional `tokens:` allowlist, `/ack` and `/health`, `503` code 9 when busy | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
@@ -93,6 +94,7 @@ Sinks live in `crates/logit-outputs`.
 | `otlp_out` | `crates/logit-outputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP and OTLP/gRPC | [ADR `otlp-tls-and-pooled-grpc-client`](docs/adr/otlp-tls-and-pooled-grpc-client.md) |
 | `datadog_out` | `crates/logit-outputs/src/datadog.rs` | Datadog's intake API: series, distribution points, sketches, service checks, events, logs, and Agent-processed APM traces and stats, one request per route; drops stale points and unprocessed traces, counted | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_out` | `crates/logit-outputs/src/datadog_trace.rs` | a Datadog Agent's APM API (traces and `/v0.6/stats`), v0.4 or v0.7, over TCP or the Agent's Unix socket, restoring the tracer's request headers | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
+| `splunk_hec_out` | `crates/logit-outputs/src/splunk.rs` | Splunk's HEC as `/event` JSON in the OTel `splunk_hec` exporter's shape: logs, metrics (`multi_value: skip \| expand`), and spans as events; envelope from resource attributes, gzip, size-capped bodies, a code-6 drop-and-resend, opt-in `ack:` | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `prometheus_out` | `crates/logit-outputs/src/prometheus.rs` | serves an exposition endpoint, or sends remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `collectd_out` | `crates/logit-outputs/src/collectd.rs` | collectd's binary `network` protocol | [ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md) |
 | `graphite_out` | `crates/logit-outputs/src/graphite.rs` | carbon plaintext and pickle | [ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md) |
@@ -209,12 +211,12 @@ Details an agent needs beyond the table:
 
 ### Lossless like-protocol relays
 
-Eight like-protocol pairs must each relay losslessly, modulo a named list of permitted
+Nine like-protocol pairs must each relay losslessly, modulo a named list of permitted
 normalizations ([ADR `lossless-transit`](docs/adr/lossless-transit.md); the rule itself is under
 [Design constraints that aren't optional](#design-constraints-that-arent-optional)).
 [docs/plans/lossless-transit.md](docs/plans/lossless-transit.md) has the closing assessment for
-the first three pairs, and [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) for the two
-Datadog pairs. What the model and codecs carry for them:
+the first three pairs, [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) for the two
+Datadog pairs, and [docs/plans/splunk-relay.md](docs/plans/splunk-relay.md) for the Splunk pair. What the model and codecs carry for them:
 
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
@@ -228,12 +230,15 @@ Datadog pairs. What the model and codecs carry for them:
   count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch` under
   `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
   sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
+- **Splunk**: the OTel `splunk_hec` exporter's vocabulary (`com.splunk.*` and `host.name` on the
+  resource, `otel.log.*` into typed log fields), `time` parsed without an `f64`, and the
+  exporter's span object decoded back to a `SpanRecord`.
 
 Residual debt lives in `docs/known-gaps.md`: post-sketch metric kinds at `statsd_out`;
 `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress timestamp only
 on a `|T`-marked line; and syslog's `event.timestamp` staying receipt time while the wire
-TIMESTAMP follows the precedence table. The Datadog pairs' residual debt is in the same file's
-"Datadog" section, listed by the closing assessment.
+TIMESTAMP follows the precedence table. The Datadog pairs' and the Splunk pair's residual debt is
+in the same file's "Datadog" and "Splunk" sections, each listed by its plan's closing assessment.
 
 Per pair:
 
@@ -340,6 +345,28 @@ Per pair:
   [docs/datadog.md](docs/datadog.md) is the operator-facing account of both pairs: the four
   topologies (direct, through a local Agent, and standing in for an Agent or for the intake),
   best practice in each direction, and the rules that lose data when missed.
+- **`splunk_hec_in -> splunk_hec_out`** (Splunk's HTTP Event Collector): `crates/logit-proto/src/splunk/`
+  is one codec whose `mod.rs` doc is the mapping table and permitted-normalization list, with
+  `logs`, `metrics`, and `spans` submodules. The vocabulary is the OTel Collector's `splunk_hec`
+  exporter's, not a `splunk.*` namespace, so `otlp_out` to a Splunk Collector and
+  `splunk_hec_out` put the same names in Splunk. `index`/`source`/`sourcetype`/`host` ride on the
+  resource, set upstream with `set`; a body decodes into one batch per distinct envelope.
+  Metrics are one number per name, so multi-number kinds follow `graphite_out`'s
+  `multi_value: skip | expand` (`logit_proto::MultiValue`, shared by both sinks), with
+  histograms and summaries in the exporter's `_bucket`/`le` and `<n>_<q>`/`qt` shape. Spans leave
+  as the exporter's JSON span object and are detected by shape on the way in. The encoder writes
+  one object per `MessageBuf` entry, so `splunk_hec_out` packs bodies under `max_body_bytes` and,
+  on a `400` code 6, drops the named object and resends the rest once by slicing. `ack: true` polls
+  `/ack` (never on Splunk Cloud); `splunk_hec_in` answers `/ack` every id `true`. Neither is
+  duplicate-safe. Verified against a recorded corpus of four real HEC clients and a Splunk
+  Enterprise 10.4.3 run
+  ([ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md),
+  [examples/splunk-hec-send.yaml](examples/splunk-hec-send.yaml),
+  [examples/splunk-hec-receive.yaml](examples/splunk-hec-receive.yaml),
+  [examples/splunk-hec-relay.yaml](examples/splunk-hec-relay.yaml)).
+  [docs/splunk.md](docs/splunk.md) is the operator-facing account: the topologies (direct over
+  HEC, through SC4S or the Splunk OTel Collector, standing in for HEC, and Observability Cloud
+  over `otlp_out`, unverified), which way to send, and the rules that lose data when missed.
 
 ### Listener I/O
 
@@ -498,7 +525,10 @@ the operator-facing account of all of this.
   [Where things live](#where-things-live).
 - **Splunk interop**: `script/splunk-interop` checks `splunk_hec_out` and `splunk_hec_in` against a
   real Splunk Enterprise container and probes it for HEC behavior; see
-  [tools/splunk-interop/README.md](tools/splunk-interop/README.md).
+  [tools/splunk-interop/README.md](tools/splunk-interop/README.md). The HEC corpus it replays is
+  `script/record-fixtures splunk` (producers `splunk-otel`, `splunk-docker`, `splunk-sc4s`,
+  `splunk-java`), committed under
+  [testdata/interop/splunk/](testdata/interop/splunk/README.md).
 
 ### Not yet built
 
@@ -527,7 +557,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, is denominated over events *delivered*, and takes `--verify` (a strict zero-drop self-check) / `--rate-scale` (moves the operating point without editing a spec) ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
 | `script/shape-survey [producer ...]` | Out-of-CI data-shape capture harness (`tools/shape-survey/`, [docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)) — drives real traffic through the `shape` component and summarizes what the events look like. Producers are discovered by globbing `tools/shape-survey/producers/*.sh`, one file each, six today: `interop` replays `testdata/interop/` and is the instrument's acceptance test (it must reproduce the statsd corpus's independently-counted numbers), `exporters` scrapes six official Prometheus exporters in default configuration through one `prometheus_in` per target (where `logit.shape.attributes` reads as labels per series and `logit.shape.batch.events` as series per scrape; cAdvisor is deliberately not among them — it needs `--privileged`), `applogs` runs eight real logging libraries at pinned versions in tiny HTTP apps through `tail_in` plus one auto-instrumented Django exporting OTLP straight to `otlp_in`, `oteldemo` runs the OpenTelemetry Demo at a pinned tag through its own Collector (~10 SDK languages at once, and ~20 GB of RAM), `hostagents` runs collectd and Telegraf in default configuration over five wires at once (collectd binary, carbon ×2, a scrape, OTLP/gRPC), and `demo` taps `demo/`'s own stack without modifying it. Each states its own representativeness line and its own caveats — `tools/shape-survey/README.md`'s "Producers" table has all six side by side. Every run is namespaced `shape-survey-<producer>-…`, so **two invocations can run concurrently** on one daemon (`SHAPE_SURVEY_SKIP_IMAGE=1` for the second). `tools/shape-survey/combine.py` folds several runs into one cross-producer table set. Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
 | `script/victoria-interop` | Out-of-CI interop harness (`tools/victoria-interop/`, [docs/plans/victoriametrics-interop.md](docs/plans/victoriametrics-interop.md)) — runs pinned VictoriaMetrics, VictoriaLogs, VictoriaTraces, and vmagent in compose beside one `logit` per leg (`tools/victoria-interop/logit-*.yaml`), queries each backend for what arrived, and prints one `PASS`/`GAP`/`FAIL` row per leg: remote-write 1.0 (Snappy and zstd) and 2.0, vmagent scraping `prometheus_out`, `influxdb_out`, `graphite_out`, `otlp_out` over HTTP and gRPC, `syslog_out`, `prometheus_in` scraping `/federate`, and vmagent remote-writing into `prometheus_in`. The plan's "Findings" section records a run. One compose project, `victoria-interop`, so one run at a time per daemon (`VICTORIA_INTEROP_SKIP_IMAGE=1` reuses the image). Runs on the host and drives docker, like `script/shape-survey`. Not part of `cibuild` |
-| `script/splunk-interop` | Out-of-CI interop harness (`tools/splunk-interop/`, [its README](tools/splunk-interop/README.md)) — runs a pinned Splunk Enterprise in compose beside one `logit` per leg (`tools/splunk-interop/logit-*.yaml`: logs, every metric kind, spans, `ack: true`, and the recorded `testdata/interop/splunk/` corpus relayed through `splunk_hec_in`), searches Splunk over REST for each, and probes Splunk directly (gzip, per-object error semantics, `metric_type`, dimensions, `OPTIONS`, acknowledgment, `[tcpout]` framing). Splunk needs several GB of RAM and a few minutes to start. One compose project, `splunk-interop`, so one run at a time per daemon (`SPLUNK_INTEROP_SKIP_IMAGE=1` reuses the image). Runs on the host and drives docker. Not part of `cibuild` |
+| `script/splunk-interop` | Out-of-CI interop harness (`tools/splunk-interop/`, [its README](tools/splunk-interop/README.md)) — runs a pinned Splunk Enterprise in compose beside one `logit` per leg (`tools/splunk-interop/logit-*.yaml`: logs, every metric kind, spans, `ack: true`, and the recorded `testdata/interop/splunk/` corpus relayed through `splunk_hec_in`), searches Splunk over REST for each, and probes Splunk directly (gzip, per-object error semantics, `metric_type`, dimensions, `OPTIONS`, acknowledgment, `[tcpout]` framing). Splunk needs several GB of RAM and a few minutes to start. One compose project, `splunk-interop`, so one run at a time per daemon (`SPLUNK_INTEROP_SKIP_IMAGE=1` reuses the image). The `hec-relay` leg replays `testdata/interop/splunk/`, which `script/record-fixtures splunk` records from four real HEC clients (the OTel `splunk_hec` exporter, Docker's `splunk` driver, SC4S, and Splunk's Java appender). Runs on the host and drives docker. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -679,7 +709,8 @@ not a style preference:
   non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
   prometheus_out`, `collectd_in -> collectd_out`, `graphite_in -> graphite_out`, `datadog_in ->
-  datadog_out`, and `datadog_trace_in -> datadog_trace_out` must each be a lossless relay**,
+  datadog_out`, `datadog_trace_in -> datadog_trace_out`, and `splunk_hec_in -> splunk_hec_out`
+  must each be a lossless relay**,
   modulo a named list of permitted normalizations (batching, tag reordering, a sink-configured
   dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
   decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
@@ -738,8 +769,8 @@ crates/
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
-  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
-  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), logit (logit_out), null_out (load-test discard sink)
+  logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, graphite, collectd, otlp, datadog (datadog_in), datadog_trace (datadog_trace_in), splunk (splunk_hec_in), prometheus, tail (tail_in/docker_in), logit (logit_in), internal (self-telemetry), generate_in (load-test event generator), shared udp/tcp/unix drivers
+  logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, otlp, prometheus, collectd, graphite, datadog (datadog_out), datadog_trace (datadog_trace_out), splunk (splunk_hec_out), logit (logit_out), null_out (load-test discard sink)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, has_attributes, drop_attributes, has_provenance, drop_provenance, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
