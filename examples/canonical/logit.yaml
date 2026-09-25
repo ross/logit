@@ -128,8 +128,9 @@ components:
     sources: [dogstatsd_in, nginx_series, otlp_grpc_in, otlp_http_in]
     signals: [metrics]
 
-  # `by_app` passes on only the syslog lines it didn't route to nginx. DogStatsD events arrive as
-  # logs.
+  # `by_app` passes on every syslog line except nginx's. Those arrive from the end of their branch
+  # instead, parsed and carrying their trace ids and service name, so a log line, its span, and
+  # its metrics line up in each backend. DogStatsD events arrive as logs.
   logs:
     type: keep_signals
     sources: [by_app, dogstatsd_in, nginx_metrics, otlp_grpc_in, otlp_http_in]
