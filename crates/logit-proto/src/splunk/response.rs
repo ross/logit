@@ -48,8 +48,9 @@ impl HecStatus {
         HecStatus { code: 16, http: 400, text: "Query string authorization is not enabled" };
     pub const HEALTHY: HecStatus = HecStatus { code: 17, http: 200, text: "HEC is healthy" };
     // Codes 18 and up: the codes and HTTP statuses are Splunk's documented ones; each `text` is
-    // the best reading of Splunk's documentation and is UNVERIFIED until W5 records a real
-    // Splunk's answer (`docs/plans/splunk-relay.md`, "Unverified, to be settled by W5").
+    // the best reading of Splunk's documentation. W5's run against a real Splunk provoked none of
+    // them, so the texts are still unverified (ADR `splunk-hec-relay`, "Amendment: what W5's
+    // recorded traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5").
     pub const UNHEALTHY_QUEUES_FULL: HecStatus =
         HecStatus { code: 18, http: 503, text: "HEC is unhealthy, queues are full" };
     pub const UNHEALTHY_ACK_UNAVAILABLE: HecStatus =

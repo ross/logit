@@ -20,7 +20,7 @@
 //! | `metric_type` any other value (the exporter's `Histogram`, `Summary`) | every record `Gauge`; the field stays an attribute, verbatim | -- |
 //! | every other field | an attribute, as the parent module's table says | -- |
 //! | `metric_name:` with an empty name | the record is skipped | `logit.input.metrics.skipped{reason="bad_name"}` |
-//! | a value that is neither a number nor one of the three strings | the record is skipped | `skipped{reason="bad_value"}` |
+//! | a value that is neither a number, one of the three strings, nor a string holding a finite number | the record is skipped | `skipped{reason="bad_value"}` |
 //! | the single-metric form naming a record the multi-metric form already carries | the multi-metric record wins | `skipped{reason="duplicate_name"}` |
 //! | `metric_name` without `_value`, `_value` without `metric_name`, or a non-string or empty `metric_name` | the pair is skipped | `skipped{reason="incomplete_single_metric"}` |
 //! | a metric event left with no record | the event is skipped | `logit.input.events.skipped{reason="no_metric"}` |
@@ -609,7 +609,9 @@ mod tests {
         assert_eq!(event.attributes.get("module"), Some(&Value::str("parser")));
         let relayed = encode(&batches);
         assert!(relayed.contains(r#""event":"metric""#), "{relayed}");
-        assert_eq!(decode(&relayed), batches);
+        let again = decode(&relayed);
+        assert_eq!(again, batches, "model fixed point");
+        assert_eq!(encode(&again), relayed, "wire fixed point");
     }
 
     #[test]

@@ -14,9 +14,10 @@
 # fixed), but metrics are HTTP-only per Splunk's docs, so this config uses OTLP/HTTP for both to
 # keep one `otlp_out`.
 #
-# This leg is unverified against a real Observability Cloud org (docs/plans/splunk-relay.md's
-# "Unverified, to be settled by W5" doesn't cover it directly, but no trial-org run has confirmed
-# either path): check the first batch lands in the org before relying on this in production.
+# This leg is unverified against a real Observability Cloud org: no trial-org run has confirmed
+# either path (docs/plans/splunk-relay.md's "Settled by W5" covers Splunk Enterprise over HEC,
+# not Observability Cloud). Check the first batch lands in the org before relying on this in
+# production.
 components:
   otlp_in:
     type: otlp_in

@@ -4,7 +4,7 @@
 Enterprise container, then probes that Splunk directly for what
 [`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
 one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a run; the
-plan's "Unverified, to be settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
+plan's "Settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
 the decisions it settled.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
