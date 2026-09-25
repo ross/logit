@@ -4,12 +4,23 @@
 //! later fields still decode. `Value` has no `Unknown` variant (`docs/design/data-model.md`), so an
 //! unrecognized tag decodes to [`Value::Null`], the "absent" sentinel data-model.md already uses
 //! for `""`/`"-"`.
+//!
+//! A payload is consumed whole: bytes after a scalar's value, an array's last item, or a map's
+//! last entry are `Malformed`, so decoding and re-encoding a valid payload reproduces it byte for
+//! byte.
+//!
+//! [`read_attr_map`] inserts each entry into `AttrMap`'s sorted storage as it reads it, which is
+//! quadratic for a large map whose keys arrive in descending symbol order. That is a documented
+//! non-goal: `docs/known-gaps.md`, "A native attribute map with keys in descending dictionary
+//! order inserts in quadratic time".
 
 use bytes::{Buf, Bytes, BytesMut};
-use logit_core::{AttrMap, Value};
+use logit_core::{AttrMap, Symbol, Value};
 
 use crate::native::dict::{Dict, DictBuilder};
-use crate::native::varint::{read_ivarint, read_u8, read_uvarint, write_ivarint, write_uvarint};
+use crate::native::varint::{
+    ensure_consumed, read_ivarint, read_u8, read_uvarint, write_ivarint, write_uvarint,
+};
 use crate::CodecError;
 
 const TAG_NULL: u8 = 0;
@@ -115,16 +126,16 @@ fn read_value_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Value, 
         )));
     }
     let mut payload = bytes.split_to(len);
-    match tag {
-        TAG_NULL => Ok(Value::Null),
+    let value = match tag {
+        TAG_NULL => Value::Null,
         TAG_BOOL => {
             if payload.is_empty() {
                 return Err(CodecError::Malformed("Bool value has no payload byte".to_string()));
             }
-            Ok(Value::Bool(payload.get_u8() != 0))
+            Value::Bool(payload.get_u8() != 0)
         }
-        TAG_I64 => Ok(Value::I64(read_ivarint(&mut payload)?)),
-        TAG_U64 => Ok(Value::U64(read_uvarint(&mut payload)?)),
+        TAG_I64 => Value::I64(read_ivarint(&mut payload)?),
+        TAG_U64 => Value::U64(read_uvarint(&mut payload)?),
         TAG_F64 => {
             if payload.len() != 8 {
                 return Err(CodecError::Malformed(format!(
@@ -134,28 +145,42 @@ fn read_value_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Value, 
             }
             let mut buf = [0u8; 8];
             payload.copy_to_slice(&mut buf);
-            Ok(Value::F64(f64::from_le_bytes(buf)))
+            Value::F64(f64::from_le_bytes(buf))
         }
-        TAG_BYTES => Ok(Value::Bytes(payload)),
+        // A `Bytes`/`Str` value is a slice of the frame's buffer: nothing to charge.
+        TAG_BYTES => return Ok(Value::Bytes(payload)),
         TAG_STR => {
             std::str::from_utf8(&payload)
                 .map_err(|e| CodecError::Malformed(format!("Str value not utf-8: {e}")))?;
-            Ok(Value::Str(payload))
+            return Ok(Value::Str(payload));
         }
-        TAG_TIMESTAMP => Ok(Value::Timestamp(read_ivarint(&mut payload)?)),
+        TAG_TIMESTAMP => Value::Timestamp(read_ivarint(&mut payload)?),
         TAG_ARRAY => {
             let count = read_uvarint(&mut payload)? as usize;
+            // An item is at least a tag and a length byte.
+            dict.budget().charge_list(
+                "array value",
+                count,
+                2,
+                payload.len(),
+                std::mem::size_of::<Value>(),
+            )?;
             let mut items = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
                 items.push(read_value_at(&mut payload, dict, depth + 1)?);
             }
-            Ok(Value::Array(items))
+            Value::Array(items)
         }
-        TAG_MAP => Ok(Value::Map(Box::new(read_attr_map_at(&mut payload, dict, depth + 1)?))),
+        TAG_MAP => {
+            dict.budget().charge(std::mem::size_of::<AttrMap>() as u64)?;
+            Value::Map(Box::new(read_attr_map_at(&mut payload, dict, depth + 1)?))
+        }
         // An unrecognized tag: the `len`-byte skip above already consumed it, so degrade to
         // Null (see the module doc).
-        _unknown => Ok(Value::Null),
-    }
+        _unknown => return Ok(Value::Null),
+    };
+    ensure_consumed(&payload, "value")?;
+    Ok(value)
 }
 
 pub fn write_attr_map(out: &mut BytesMut, dict: &mut DictBuilder, map: &AttrMap) {
@@ -172,6 +197,14 @@ pub fn read_attr_map(bytes: &mut Bytes, dict: &Dict) -> Result<AttrMap, CodecErr
 
 fn read_attr_map_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<AttrMap, CodecError> {
     let count = read_uvarint(bytes)? as usize;
+    // An entry is at least a key index, a value tag, and a value length byte.
+    dict.budget().charge_list(
+        "attribute map",
+        count,
+        3,
+        bytes.len(),
+        std::mem::size_of::<(Symbol, Value)>(),
+    )?;
     let mut map = AttrMap::new();
     for _ in 0..count {
         let idx = read_uvarint(bytes)? as u32;
@@ -185,6 +218,7 @@ fn read_attr_map_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Attr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::budget::DecodeBudget;
 
     fn dict_round_trip(value: &Value) -> Value {
         let mut builder = DictBuilder::default();
@@ -193,7 +227,8 @@ mod tests {
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
         let mut dict_bytes = dict_bytes.freeze();
-        let dict = Dict::read(&mut dict_bytes).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes, &budget).unwrap();
 
         let mut bytes = buf.freeze();
         let out = read_value(&mut bytes, &dict).unwrap();
@@ -243,7 +278,8 @@ mod tests {
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
         let mut dict_bytes = dict_bytes.freeze();
-        let dict = Dict::read(&mut dict_bytes).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes, &budget).unwrap();
 
         let mut bytes = buf.freeze();
         let out = read_attr_map(&mut bytes, &dict).unwrap();
@@ -263,7 +299,8 @@ mod tests {
         let mut bytes = buf.freeze();
         let mut empty_dict_bytes = BytesMut::new();
         write_uvarint(&mut empty_dict_bytes, 0);
-        let dict = Dict::read(&mut empty_dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut empty_dict_bytes.freeze(), &budget).unwrap();
         let unknown = read_value(&mut bytes, &dict).unwrap();
         assert_eq!(unknown, Value::Null);
         let known = read_value(&mut bytes, &dict).unwrap();
@@ -282,7 +319,8 @@ mod tests {
         write_value(&mut buf, &mut builder, &value);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
 
         let mut bytes = buf.freeze();
         assert!(matches!(read_value(&mut bytes, &dict), Err(CodecError::Malformed(_))));
@@ -301,10 +339,45 @@ mod tests {
         write_value(&mut buf, &mut builder, &value);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
 
         let mut bytes = buf.freeze();
         assert!(matches!(read_value(&mut bytes, &dict), Err(CodecError::Malformed(_))));
+    }
+
+    /// `TAG_MAP` adds a level and `read_attr_map_at` passes it through unchanged, so alternating
+    /// arrays and maps counts one level per nesting, not zero or two.
+    #[test]
+    fn alternating_arrays_and_maps_count_one_level_each() {
+        fn nest(levels: usize) -> Value {
+            let mut value = Value::I64(1);
+            for level in 0..levels {
+                value = if level % 2 == 0 {
+                    Value::Array(vec![value])
+                } else {
+                    let mut m = AttrMap::new();
+                    m.insert("n", value);
+                    Value::Map(Box::new(m))
+                };
+            }
+            value
+        }
+        let at_cap = nest(MAX_VALUE_DEPTH);
+        assert_eq!(dict_round_trip(&at_cap), at_cap);
+
+        let past_cap = nest(MAX_VALUE_DEPTH + 1);
+        let mut builder = DictBuilder::default();
+        let mut buf = BytesMut::new();
+        write_value(&mut buf, &mut builder, &past_cap);
+        let mut dict_bytes = BytesMut::new();
+        builder.write(&mut dict_bytes);
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
+        assert!(matches!(
+            read_value(&mut buf.freeze(), &dict),
+            Err(CodecError::Malformed(msg)) if msg.contains("nesting")
+        ));
     }
 
     #[test]

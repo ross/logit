@@ -474,13 +474,15 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             );
         }
 
+        // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
+        let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
         let (batch, provenance) = if negotiated.codec == native::CODEC_NATIVE_V2 {
-            native::decode_batch_v2(&mut payload).map_err(|err| {
+            native::decode_batch_v2(&mut payload, &budget).map_err(|err| {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
                 anyhow::Error::new(err).context("decoding a native v2 batch")
             })?
         } else {
-            let batch = native::decode_batch(&mut payload).map_err(|err| {
+            let batch = native::decode_batch(&mut payload, &budget).map_err(|err| {
                 telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
                 anyhow::Error::new(err).context("decoding a native batch")
             })?;

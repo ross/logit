@@ -18,7 +18,13 @@
 //!   a field tag it doesn't know. `logit` is pre-release, so that's hygiene against a torn write,
 //!   not version negotiation: growing a fixed enum (`Value`, `MetricKind`) is a straight reshape
 //!   of this module. [`value`] and [`record`] say what an unknown tag degrades to.
+//! - A payload is consumed whole: every length-carved section, field, and value rejects bytes its
+//!   reader left over (`varint::ensure_consumed`), so a payload decodes only if re-encoding it
+//!   reproduces it byte for byte.
+//! - Every decode is charged against a [`DecodeBudget`] (see [`budget`]), so a small payload
+//!   can't expand past a bounded multiple of the frame cap.
 
+pub mod budget;
 pub mod control;
 pub mod dict;
 pub mod record;
@@ -33,7 +39,9 @@ use logit_core::{Event, EventBatch, Provenance, Resource};
 
 use crate::frame::{read_frame, write_frame, Compression};
 use crate::native::dict::{Dict, DictBuilder};
-use crate::native::varint::{read_u8, read_uvarint, write_uvarint};
+use crate::native::varint::{ensure_consumed, read_u8, read_uvarint, write_uvarint};
+
+pub use crate::native::budget::{DecodeBudget, DEFAULT_DECODE_BUDGET};
 use crate::{CodecError, Decoder, Encoder};
 
 /// The frame header's `codec` byte for this payload format, without provenance.
@@ -98,12 +106,23 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
     out.freeze()
 }
 
-/// Bounds a declared event count before it sizes an allocation, like [`dict::Dict::read`]'s cap.
+/// A first, cheap check on a declared event count, like [`dict::Dict::read`]'s cap. The real
+/// bound is the [`DecodeBudget`]: at `size_of::<Event>()` a slot, this many events would need
+/// ~14 GiB, far past any budget.
 const MAX_SANE_EVENT_COUNT: usize = 16 * 1024 * 1024;
 
-/// The inverse of [`encode_batch`].
-pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
-    let dict = Dict::read(bytes)?;
+/// The inverse of [`encode_batch`], charging `budget` as it decodes. Bytes after the last event
+/// are `Malformed`.
+pub fn decode_batch(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<EventBatch, CodecError> {
+    let batch = decode_batch_body(bytes, budget)?;
+    ensure_consumed(bytes, "batch")?;
+    Ok(batch)
+}
+
+/// [`decode_batch`] without the end-of-payload check, which [`decode_batch_v2`] makes after its
+/// trailer instead.
+fn decode_batch_body(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<EventBatch, CodecError> {
+    let dict = Dict::read(bytes, budget)?;
 
     let resource_len = read_uvarint(bytes)? as usize;
     if bytes.len() < resource_len {
@@ -139,6 +158,8 @@ pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
             "batch declares {event_count} events, over the {MAX_SANE_EVENT_COUNT} sanity cap"
         )));
     }
+    // An event is at least its one-byte length prefix.
+    budget.charge_list("batch", event_count, 1, bytes.len(), std::mem::size_of::<Event>())?;
     let mut events = Vec::with_capacity(event_count.min(4096));
     for _ in 0..event_count {
         let body_len = read_uvarint(bytes)? as usize;
@@ -183,10 +204,14 @@ fn write_trailer_field(out: &mut BytesMut, tag: u8, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// The inverse of [`encode_batch_v2`]. A plain v1 payload fails here rather than decoding as
-/// "no provenance": [`decode_batch`] consumes all of it and the trailer-length read finds nothing.
-pub fn decode_batch_v2(bytes: &mut Bytes) -> Result<(EventBatch, Provenance), CodecError> {
-    let batch = decode_batch(bytes)?;
+/// The inverse of [`encode_batch_v2`], charging `budget` as it decodes. A plain v1 payload fails
+/// here rather than decoding as "no provenance": the batch consumes all of it and the
+/// trailer-length read finds nothing. Bytes after the trailer are `Malformed`.
+pub fn decode_batch_v2(
+    bytes: &mut Bytes,
+    budget: &DecodeBudget,
+) -> Result<(EventBatch, Provenance), CodecError> {
+    let batch = decode_batch_body(bytes, budget)?;
 
     let trailer_len = read_uvarint(bytes)? as usize;
     if bytes.len() < trailer_len {
@@ -220,6 +245,7 @@ pub fn decode_batch_v2(bytes: &mut Bytes) -> Result<(EventBatch, Provenance), Co
             _unknown => { /* skipped, not rejected: torn-write hygiene (module doc) */ }
         }
     }
+    ensure_consumed(bytes, "batch")?;
     Ok((batch, provenance))
 }
 
@@ -248,7 +274,7 @@ impl Encoder for NativeEncoder {
 }
 
 /// The [`Decoder`] for [`CODEC_NATIVE_V1`] frames. Ignores `received_at`: a native event keeps
-/// its original timestamp end to end.
+/// its original timestamp end to end. Decodes each frame under [`DEFAULT_DECODE_BUDGET`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeDecoder;
 
@@ -266,9 +292,15 @@ impl Decoder for NativeDecoder {
                 "frame codec byte {codec}, expected native v1 ({CODEC_NATIVE_V1})"
             )));
         }
-        let batch = decode_batch(&mut payload)?;
-        out.extend(batch.events);
-        Ok((batch.resource, batch.scope))
+        let EventBatch { resource, scope, events } =
+            decode_batch(&mut payload, &DecodeBudget::default())?;
+        // Moved, not copied, into an empty `out`, so each event is held once at peak.
+        if out.is_empty() {
+            *out = events;
+        } else {
+            out.extend(events);
+        }
+        Ok((resource, scope))
     }
 }
 
@@ -340,7 +372,7 @@ mod tests {
     fn encode_decode_batch_round_trips() {
         let batch = sample_batch();
         let payload = encode_batch(&batch);
-        let decoded = decode_batch(&mut payload.clone()).unwrap();
+        let decoded = decode_batch(&mut payload.clone(), &DecodeBudget::default()).unwrap();
 
         assert_eq!(decoded.resource.attributes, batch.resource.attributes);
         assert_eq!(decoded.events.len(), batch.events.len());
@@ -392,7 +424,7 @@ mod tests {
         let batch =
             EventBatch { resource: Arc::new(Resource::default()), scope: None, events: Vec::new() };
         let payload = encode_batch(&batch);
-        let decoded = decode_batch(&mut payload.clone()).unwrap();
+        let decoded = decode_batch(&mut payload.clone(), &DecodeBudget::default()).unwrap();
         assert!(decoded.events.is_empty());
         assert!(decoded.resource.attributes.is_empty());
         assert!(decoded.scope.is_none());
@@ -413,7 +445,7 @@ mod tests {
         batch.scope = Some(scope.clone());
 
         let payload = encode_batch(&batch);
-        let decoded = decode_batch(&mut payload.clone()).unwrap();
+        let decoded = decode_batch(&mut payload.clone(), &DecodeBudget::default()).unwrap();
         assert_eq!(decoded.scope.as_deref(), Some(&*scope));
     }
 
@@ -465,12 +497,12 @@ mod tests {
         // A file reader loops `read_frame` to find each frame boundary.
         let (codec_a, mut payload_a) = read_frame(&mut cursor).unwrap();
         assert_eq!(codec_a, CODEC_NATIVE_V1);
-        let decoded_a = decode_batch(&mut payload_a).unwrap();
+        let decoded_a = decode_batch(&mut payload_a, &DecodeBudget::default()).unwrap();
         assert_eq!(decoded_a.events.len(), batch_a.events.len());
 
         let (codec_b, mut payload_b) = read_frame(&mut cursor).unwrap();
         assert_eq!(codec_b, CODEC_NATIVE_V1);
-        let decoded_b = decode_batch(&mut payload_b).unwrap();
+        let decoded_b = decode_batch(&mut payload_b, &DecodeBudget::default()).unwrap();
         assert_eq!(decoded_b.events.len(), 1);
         assert!(cursor.is_empty(), "both frames should be fully consumed");
     }
@@ -487,7 +519,8 @@ mod tests {
         let batch = sample_batch();
         let provenance = sample_provenance();
         let mut payload = encode_batch_v2(&batch, provenance);
-        let (decoded, decoded_provenance) = decode_batch_v2(&mut payload).unwrap();
+        let (decoded, decoded_provenance) =
+            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
 
         assert_eq!(decoded.events.len(), batch.events.len());
         assert_eq!(decoded_provenance, provenance);
@@ -498,7 +531,8 @@ mod tests {
     fn encode_decode_batch_v2_round_trips_both_fields_absent() {
         let batch = sample_batch();
         let mut payload = encode_batch_v2(&batch, Provenance::default());
-        let (_decoded, provenance) = decode_batch_v2(&mut payload).unwrap();
+        let (_decoded, provenance) =
+            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
         assert_eq!(provenance, Provenance::default());
     }
 
@@ -518,7 +552,7 @@ mod tests {
         for len in 0..valid.len() {
             let mut truncated = valid.slice(0..len);
             assert!(
-                decode_batch_v2(&mut truncated).is_err(),
+                decode_batch_v2(&mut truncated, &DecodeBudget::default()).is_err(),
                 "a {len}-byte truncation of a valid v2 payload decoded successfully"
             );
         }
@@ -528,7 +562,7 @@ mod tests {
     #[test]
     fn decode_batch_v2_rejects_a_plain_v1_payload() {
         let mut v1_payload = encode_batch(&sample_batch());
-        assert!(decode_batch_v2(&mut v1_payload).is_err());
+        assert!(decode_batch_v2(&mut v1_payload, &DecodeBudget::default()).is_err());
     }
 
     /// An unrecognized trailer tag is skipped, not rejected.
@@ -547,7 +581,8 @@ mod tests {
         out.extend_from_slice(&trailer);
         let mut payload = out.freeze();
 
-        let (_decoded, provenance) = decode_batch_v2(&mut payload).unwrap();
+        let (_decoded, provenance) =
+            decode_batch_v2(&mut payload, &DecodeBudget::default()).unwrap();
         assert_eq!(provenance.origin_str(), Some("mod_test_skip_origin"));
     }
 }

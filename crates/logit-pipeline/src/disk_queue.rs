@@ -60,7 +60,7 @@ use crate::fault::{sites, Op, Point};
 use crate::fault_io;
 use crate::queue::{OverflowPolicy, SINK_QUEUE_METRICS};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
-use logit_proto::frame::{self, Compression, MAX_SANE_UNCOMPRESSED_LEN};
+use logit_proto::frame::{self, Compression};
 use logit_proto::native;
 use logit_proto::CodecError;
 
@@ -165,9 +165,14 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
     let mut rest = Bytes::copy_from_slice(&buf[CONTEXT_LEN..]);
     let before = rest.len();
     let (codec, mut payload) = frame::read_frame(&mut rest)?;
+    // No decode budget: `push` encoded this record from a batch that was already this size in
+    // memory, and a budget refusal here would discard a spooled batch as corrupt.
+    let budget = native::DecodeBudget::unlimited();
     let (batch, provenance) = match codec {
-        native::CODEC_NATIVE_V1 => (native::decode_batch(&mut payload)?, Provenance::default()),
-        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload)?,
+        native::CODEC_NATIVE_V1 => {
+            (native::decode_batch(&mut payload, &budget)?, Provenance::default())
+        }
+        native::CODEC_NATIVE_V2 => native::decode_batch_v2(&mut payload, &budget)?,
         other => {
             return Err(CodecError::Malformed(format!(
                 "disk record declares codec {other}, expected native v1 ({}) or v2 ({})",
@@ -852,14 +857,16 @@ impl DiskQueue {
         let (batch, ctx) = item;
 
         let payload = native::encode_batch_v2(&batch, ctx.provenance);
-        if payload.len() > MAX_SANE_UNCOMPRESSED_LEN as usize {
-            self.count_dropped("frame_too_large", batch.events.len() as u64);
-            return;
-        }
-        // `write_frame` fails only for `Compression::Zstd`, which `logit_config::Compression`
-        // (where `disk.compression` comes from) cannot express.
-        let framed = frame::write_frame(native::CODEC_NATIVE_V2, self.compression, &payload)
-            .expect("logit_config::Compression excludes Zstd; write_frame only fails for Zstd");
+        // `write_frame` fails for a payload over `MAX_SANE_UNCOMPRESSED_LEN` and for
+        // `Compression::Zstd`, which `logit_config::Compression` (where `disk.compression` comes
+        // from) cannot express, so a failure here is an oversize batch.
+        let framed = match frame::write_frame(native::CODEC_NATIVE_V2, self.compression, &payload) {
+            Ok(framed) => framed,
+            Err(_) => {
+                self.count_dropped("frame_too_large", batch.events.len() as u64);
+                return;
+            }
+        };
         let mut record = Vec::with_capacity(CONTEXT_LEN + framed.len());
         record.extend_from_slice(&encode_context(ctx.trace));
         record.extend_from_slice(&framed);
@@ -1828,6 +1835,7 @@ mod tests {
     use super::*;
     use crate::fault::{self, errno};
     use logit_core::{AttrMap, Event, Registry, Resource, Value};
+    use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 
     fn open(dir: PathBuf) -> DiskQueue {
         DiskQueue::open(config(dir), Telemetry::default(), Diagnostics::new("test")).unwrap()
@@ -3103,9 +3111,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `push` `expect`s `write_frame` to succeed: it fails only for `Compression::Zstd`, which no
-    /// `disk.compression` value maps to. The exhaustive match fails to compile if
-    /// `logit_config::Compression` gains a variant, so the new one gets checked here.
+    /// `push` counts any `write_frame` failure as an oversize batch, which holds only while every
+    /// `disk.compression` value encodes: `write_frame` fails for `Compression::Zstd`, which none
+    /// maps to. The exhaustive match fails to compile if `logit_config::Compression` gains a
+    /// variant, so the new one gets checked here.
     #[tokio::test]
     async fn every_configurable_disk_compression_is_encodable_by_write_frame() {
         for configured in [logit_config::Compression::None, logit_config::Compression::Lz4] {

@@ -20,9 +20,12 @@
 //! takes its boundary from its enclosing field; a list entry needs its own length prefix so the
 //! reader stops before its neighbor.
 
+use crate::native::budget::DecodeBudget;
 use crate::native::dict::{Dict, DictBuilder};
 use crate::native::value::{read_attr_map, read_value, write_attr_map, write_value};
-use crate::native::varint::{read_ivarint, read_u8, read_uvarint, write_ivarint, write_uvarint};
+use crate::native::varint::{
+    read_ivarint, read_u8, read_uvarint, trailing_bytes, write_ivarint, write_uvarint,
+};
 use crate::CodecError;
 use bytes::{Buf, Bytes, BytesMut};
 use logit_core::{
@@ -64,7 +67,11 @@ fn write_scalar_field(
 }
 
 /// Walks `body`'s fields, handing each `(tag, payload)` to `visit`. The payload is carved out
-/// before `visit` sees it, so a tag `visit` ignores is skipped with no further work.
+/// before `visit` sees it.
+///
+/// `visit` must consume all of a field's payload: bytes left after it returns are `Malformed`,
+/// so a reader that parses a prefix (a varint, one `Value`, a list) rejects what follows it. A
+/// visitor skips a tag it doesn't know by clearing the payload.
 fn for_each_field(
     body: &mut Bytes,
     mut visit: impl FnMut(u8, &mut Bytes) -> Result<(), CodecError>,
@@ -80,6 +87,9 @@ fn for_each_field(
         }
         let mut field = body.split_to(len);
         visit(tag, &mut field)?;
+        if !field.is_empty() {
+            return Err(trailing_bytes(&format!("field {tag}"), field.len()));
+        }
     }
     Ok(())
 }
@@ -130,12 +140,16 @@ impl ListSink<MetricRecord> for MetricList {
 /// `read_event` decodes metrics straight into the event's `MetricList` (a `SmallVec`), one
 /// allocation where collecting through a `Vec` would cost two. The
 /// `reserve` is capped at 4096 against a corrupt count, like every counted collection here.
+///
+/// Charges `budget` a `T` per entry up front; an entry is at least its one-byte length prefix.
 fn read_record_list_into<T>(
     bytes: &mut Bytes,
+    budget: &DecodeBudget,
     read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
     out: &mut impl ListSink<T>,
 ) -> Result<(), CodecError> {
     let count = read_uvarint(bytes)? as usize;
+    budget.charge_list("record list", count, 1, bytes.len(), std::mem::size_of::<T>())?;
     out.reserve(count.min(4096));
     for _ in 0..count {
         let len = read_uvarint(bytes)? as usize;
@@ -158,10 +172,11 @@ fn read_record_list_into<T>(
 /// [`read_record_list_into`] into a new `Vec`.
 fn read_record_list<T>(
     bytes: &mut Bytes,
+    budget: &DecodeBudget,
     read_one: impl Fn(&mut Bytes) -> Result<T, CodecError>,
 ) -> Result<Vec<T>, CodecError> {
     let mut items = Vec::new();
-    read_record_list_into(bytes, read_one, &mut items)?;
+    read_record_list_into(bytes, budget, read_one, &mut items)?;
     Ok(items)
 }
 
@@ -283,9 +298,13 @@ fn write_exponential_buckets(out: &mut BytesMut, (offset, counts): &(i32, Vec<u6
     }
 }
 
-fn read_exponential_buckets(bytes: &mut Bytes) -> Result<(i32, Vec<u64>), CodecError> {
+fn read_exponential_buckets(
+    bytes: &mut Bytes,
+    budget: &DecodeBudget,
+) -> Result<(i32, Vec<u64>), CodecError> {
     let offset = read_ivarint(bytes)? as i32;
     let count = read_uvarint(bytes)? as usize;
+    budget.charge_list("exponential buckets", count, 1, bytes.len(), std::mem::size_of::<u64>())?;
     let mut counts = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         counts.push(read_uvarint(bytes)?);
@@ -391,7 +410,9 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
     }
 }
 
-fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
+/// Charges `budget` each list element's in-memory size up front, and rejects a body with bytes
+/// after its last field. `Distribution` and `Set` hand the whole body to their blob decoders.
+fn read_metric_kind(bytes: &mut Bytes, budget: &DecodeBudget) -> Result<MetricKind, CodecError> {
     let kind_tag = read_u8(bytes)?;
     let len = read_uvarint(bytes)? as usize;
     if bytes.len() < len {
@@ -412,6 +433,7 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
         METRIC_GAUGE_DELTA => MetricKind::GaugeDelta(read_f64(&mut body)?),
         METRIC_SAMPLES => {
             let count = read_uvarint(&mut body)? as usize;
+            budget.charge_list("samples", count, 8, body.len(), std::mem::size_of::<f64>())?;
             let mut values = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
                 values.push(read_f64(&mut body)?);
@@ -422,12 +444,20 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             MetricKind::Samples(samples)
         }
         METRIC_DISTRIBUTION => {
-            let sketch = DdSketch::from_bytes(&body)
+            let sketch = DdSketch::from_bytes(&std::mem::take(&mut body))
                 .map_err(|e| CodecError::Malformed(format!("bad distribution blob: {e:?}")))?;
             MetricKind::Distribution(sketch)
         }
         METRIC_SET_MEMBERS => {
             let count = read_uvarint(&mut body)? as usize;
+            // A member is at least its one-byte length prefix.
+            budget.charge_list(
+                "set members",
+                count,
+                1,
+                body.len(),
+                std::mem::size_of::<Bytes>(),
+            )?;
             let mut members = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
                 let len = read_uvarint(&mut body)? as usize;
@@ -439,12 +469,15 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             MetricKind::SetMembers(members)
         }
         METRIC_SET => {
-            let hll = HyperLogLog::from_bytes(&body)
+            let hll = HyperLogLog::from_bytes(&std::mem::take(&mut body))
                 .map_err(|e| CodecError::Malformed(format!("bad set blob: {e}")))?;
             MetricKind::Set(hll)
         }
         METRIC_HISTOGRAM => {
             let count = read_uvarint(&mut body)? as usize;
+            // A bucket is an f64 bound and at least a one-byte count.
+            let size = std::mem::size_of::<(f64, u64)>();
+            budget.charge_list("histogram buckets", count, 9, body.len(), size)?;
             let mut buckets = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
                 let bound = read_f64(&mut body)?;
@@ -461,8 +494,8 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             let scale = read_ivarint(&mut body)? as i32;
             let zero_count = read_uvarint(&mut body)?;
             let zero_threshold = read_f64(&mut body)?;
-            let positive = read_exponential_buckets(&mut body)?;
-            let negative = read_exponential_buckets(&mut body)?;
+            let positive = read_exponential_buckets(&mut body, budget)?;
+            let negative = read_exponential_buckets(&mut body, budget)?;
             let temporality = temporality_from_tag(read_u8(&mut body)?)?;
             let count = read_uvarint(&mut body)?;
             let sum = read_option_f64(&mut body)?;
@@ -483,6 +516,8 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
         }
         METRIC_SUMMARY => {
             let count = read_uvarint(&mut body)? as usize;
+            let size = std::mem::size_of::<(f64, f64)>();
+            budget.charge_list("summary quantiles", count, 16, body.len(), size)?;
             let mut quantiles = Vec::with_capacity(count.min(4096));
             for _ in 0..count {
                 let q = read_f64(&mut body)?;
@@ -502,6 +537,9 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             )))
         }
     };
+    if !body.is_empty() {
+        return Err(trailing_bytes(&format!("metric kind {kind_tag}"), body.len()));
+    }
     Ok(kind)
 }
 
@@ -544,7 +582,7 @@ fn read_exemplar(bytes: &mut Bytes, dict: &Dict) -> Result<Exemplar, CodecError>
             EX_VALUE => value = read_exact_f64(field)?,
             EX_TRACE => trace = Some(read_trace_ref(field)?),
             EX_FILTERED_ATTRIBUTES => filtered_attributes = read_attr_map(field, dict)?,
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -600,10 +638,12 @@ pub fn read_metric_record(bytes: &mut Bytes, dict: &Dict) -> Result<MetricRecord
             MR_UNIT => unit = Some(read_symbol_field(field, dict)?),
             MR_DESCRIPTION => description = Some(read_symbol_field(field, dict)?),
             MR_START_TIMESTAMP => start_timestamp = read_exact_i64(field)?,
-            MR_EXEMPLARS => exemplars = read_record_list(field, |b| read_exemplar(b, dict))?,
+            MR_EXEMPLARS => {
+                exemplars = read_record_list(field, dict.budget(), |b| read_exemplar(b, dict))?
+            }
             MR_FLAGS => flags = read_exact_u32(field)?,
-            MR_KIND => kind = Some(read_metric_kind(field)?),
-            _unknown => {}
+            MR_KIND => kind = Some(read_metric_kind(field, dict.budget())?),
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -746,7 +786,7 @@ pub fn read_log_record(bytes: &mut Bytes, dict: &Dict) -> Result<LogRecord, Code
             LR_EVENT_NAME => event_name = Some(read_symbol_field(field, dict)?),
             LR_OBSERVED_TIMESTAMP => observed_timestamp = read_exact_i64(field)?,
             LR_DROPPED_ATTRIBUTES_COUNT => dropped_attributes_count = read_exact_u32(field)?,
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -835,7 +875,7 @@ fn read_span_event(bytes: &mut Bytes, dict: &Dict) -> Result<SpanEvent, CodecErr
             SE_NAME => name = Some(read_value(field, dict)?),
             SE_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             SE_DROPPED_ATTRIBUTES_COUNT => dropped_attributes_count = read_exact_u32(field)?,
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -896,9 +936,9 @@ fn read_span_link(bytes: &mut Bytes, dict: &Dict) -> Result<SpanLink, CodecError
             }
             SL_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             SL_FLAGS => flags = read_exact_u32(field)?,
-            SL_TRACE_STATE => trace_state = Some(field.clone()),
+            SL_TRACE_STATE => trace_state = Some(std::mem::take(field)),
             SL_DROPPED_ATTRIBUTES_COUNT => dropped_attributes_count = read_exact_u32(field)?,
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -943,12 +983,12 @@ fn read_span_ext(bytes: &mut Bytes) -> Result<SpanExt, CodecError> {
     let mut ext = SpanExt::default();
     for_each_field(bytes, |tag, field| {
         match tag {
-            SX_STATUS_MESSAGE => ext.status_message = Some(field.clone()),
-            SX_TRACE_STATE => ext.trace_state = Some(field.clone()),
+            SX_STATUS_MESSAGE => ext.status_message = Some(std::mem::take(field)),
+            SX_TRACE_STATE => ext.trace_state = Some(std::mem::take(field)),
             SX_DROPPED_ATTRIBUTES_COUNT => ext.dropped_attributes_count = read_exact_u32(field)?,
             SX_DROPPED_EVENTS_COUNT => ext.dropped_events_count = read_exact_u32(field)?,
             SX_DROPPED_LINKS_COUNT => ext.dropped_links_count = read_exact_u32(field)?,
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -1051,12 +1091,16 @@ pub fn read_span_record(bytes: &mut Bytes, dict: &Dict) -> Result<SpanRecord, Co
             SR_NAME => name = Some(read_value(field, dict)?),
             SR_KIND => kind = span_kind_from_tag(read_u8(field)?)?,
             SR_STATUS => status = span_status_from_tag(read_u8(field)?)?,
-            SR_EVENTS => events = read_record_list(field, |b| read_span_event(b, dict))?,
-            SR_LINKS => links = read_record_list(field, |b| read_span_link(b, dict))?,
+            SR_EVENTS => {
+                events = read_record_list(field, dict.budget(), |b| read_span_event(b, dict))?
+            }
+            SR_LINKS => {
+                links = read_record_list(field, dict.budget(), |b| read_span_link(b, dict))?
+            }
             SR_END_TIMESTAMP => end_timestamp = read_exact_i64(field)?,
             SR_FLAGS => flags = read_exact_u32(field)?,
             SR_EXT => ext = Some(Box::new(read_span_ext(field)?)),
-            _unknown => {}
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -1123,10 +1167,15 @@ pub fn read_event(body: &mut Bytes, dict: &Dict) -> Result<Event, CodecError> {
             FIELD_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             FIELD_LOG => log = Some(read_log_record(field, dict)?),
             FIELD_METRICS => {
-                read_record_list_into(field, |b| read_metric_record(b, dict), &mut metrics)?;
+                read_record_list_into(
+                    field,
+                    dict.budget(),
+                    |b| read_metric_record(b, dict),
+                    &mut metrics,
+                )?;
             }
             FIELD_SPAN => span = Some(read_span_record(field, dict)?),
-            _unknown => { /* skipped whole: torn-write hygiene (module doc) */ }
+            _unknown => field.clear(), // skipped whole: torn-write hygiene (module doc)
         }
         Ok(())
     })?;
@@ -1161,8 +1210,8 @@ pub fn read_resource(bytes: &mut Bytes, dict: &Dict) -> Result<logit_core::Resou
         match tag {
             RES_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             RES_DROPPED_ATTRIBUTES_COUNT => dropped_attributes_count = read_exact_u32(field)?,
-            RES_SCHEMA_URL => schema_url = Some(field.clone()),
-            _unknown => {}
+            RES_SCHEMA_URL => schema_url = Some(std::mem::take(field)),
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -1203,12 +1252,12 @@ pub fn read_scope(bytes: &mut Bytes, dict: &Dict) -> Result<logit_core::Scope, C
     let mut schema_url = None;
     for_each_field(bytes, |tag, field| {
         match tag {
-            SCOPE_NAME => name = field.clone(),
-            SCOPE_VERSION => version = field.clone(),
+            SCOPE_NAME => name = std::mem::take(field),
+            SCOPE_VERSION => version = std::mem::take(field),
             SCOPE_ATTRIBUTES => attributes = read_attr_map(field, dict)?,
             SCOPE_DROPPED_ATTRIBUTES_COUNT => dropped_attributes_count = read_exact_u32(field)?,
-            SCOPE_SCHEMA_URL => schema_url = Some(field.clone()),
-            _unknown => {}
+            SCOPE_SCHEMA_URL => schema_url = Some(std::mem::take(field)),
+            _unknown => field.clear(),
         }
         Ok(())
     })?;
@@ -1226,7 +1275,8 @@ mod tests {
         write_metric_record(&mut buf, &mut builder, record);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_metric_record(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
@@ -1359,7 +1409,8 @@ mod tests {
         write_log_record(&mut buf, &mut builder, &log);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_log_record(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
@@ -1382,7 +1433,8 @@ mod tests {
         write_log_record(&mut buf, &mut builder, &log);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_log_record(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
@@ -1405,7 +1457,8 @@ mod tests {
         write_log_record(&mut buf, &mut builder, &log);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_log_record(&mut bytes, &dict).unwrap();
         assert_eq!(out.severity, None);
@@ -1460,7 +1513,8 @@ mod tests {
         write_span_record(&mut buf, &mut builder, &span);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_span_record(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
@@ -1504,7 +1558,8 @@ mod tests {
         let body = write_event(&mut dict, &event);
         let mut dict_bytes = BytesMut::new();
         dict.write(&mut dict_bytes);
-        let decoded_dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let decoded_dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
 
         let mut body_bytes = body.freeze();
         let out = read_event(&mut body_bytes, &decoded_dict).unwrap();
@@ -1524,7 +1579,8 @@ mod tests {
         let body = write_event(&mut dict, &event);
         let mut dict_bytes = BytesMut::new();
         dict.write(&mut dict_bytes);
-        let decoded_dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let decoded_dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let out = read_event(&mut body.freeze(), &decoded_dict).unwrap();
         assert_eq!(out.timestamp, 42);
         assert!(out.attributes.is_empty());
@@ -1546,7 +1602,8 @@ mod tests {
 
         let mut dict_bytes = BytesMut::new();
         dict.write(&mut dict_bytes);
-        let decoded_dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let decoded_dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let out = read_event(&mut body.freeze(), &decoded_dict).unwrap();
 
         assert_eq!(out.timestamp, 7);
@@ -1566,7 +1623,8 @@ mod tests {
 
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_metric_record(&mut bytes, &dict).unwrap();
         assert_eq!(out, record);
@@ -1584,7 +1642,8 @@ mod tests {
 
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_span_record(&mut bytes, &dict).unwrap();
         assert_eq!(out, span);
@@ -1604,7 +1663,8 @@ mod tests {
         write_resource(&mut buf, &mut builder, &resource);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_resource(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
@@ -1627,7 +1687,8 @@ mod tests {
         write_scope(&mut buf, &mut builder, &scope);
         let mut dict_bytes = BytesMut::new();
         builder.write(&mut dict_bytes);
-        let dict = Dict::read(&mut dict_bytes.freeze()).unwrap();
+        let budget = DecodeBudget::unlimited();
+        let dict = Dict::read(&mut dict_bytes.freeze(), &budget).unwrap();
         let mut bytes = buf.freeze();
         let out = read_scope(&mut bytes, &dict).unwrap();
         assert!(bytes.is_empty());
