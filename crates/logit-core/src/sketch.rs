@@ -28,7 +28,10 @@
 //! [`DdSketch::from_bytes`] reads blobs from `logit_in` peers and the disk spool, and bounds what
 //! a blob can cost: the bin count by the blob's length, `bin_limit` by
 //! [`Mapping::MAX_BIN_LIMIT`] (store operations are linear in the store size and a cross-mapping
-//! merge quadratic, so that cap is their bound), and an Agent key by the Agent's key space. It
+//! merge quadratic, so that cap is their bound), and an Agent key by the Agent's key space. Every
+//! bin count, and the zero count, stays finite: a fold, merge, or collapse sums counts saturating
+//! at `f64::MAX`, so `to_bytes` is a fixed point across `from_bytes`, which drops a non-finite
+//! count. It
 //! takes the summary as written. A decoded `min > max` makes quantiles non-monotonic, an infinite
 //! or `NaN` `min`/`max` reaches [`DdSketch::quantile`]'s clamp unchanged, and a `count` of 0 over
 //! populated bins makes [`DdSketch::merge`] skip the sketch. None of these panics;
@@ -233,10 +236,13 @@ pub struct Bin {
 #[derive(Clone, PartialEq)]
 pub struct DdSketch {
     mapping: Mapping,
-    /// Ascending by key, one entry per key, every count positive.
+    /// Ascending by key, one entry per key, every count positive and finite: every sum of two
+    /// counts goes through `add_counts`, which saturates at `f64::MAX`, so a fold never writes an
+    /// `inf` bin that the next `from_bytes` would drop.
     positive: Vec<Bin>,
     /// Keys of `|v|` for negative values, same invariants.
     negative: Vec<Bin>,
+    /// Finite and non-negative, summed through `add_counts` like a bin's.
     zero_count: f64,
     count: f64,
     min: f64,
@@ -364,7 +370,7 @@ impl DdSketch {
     fn insert(&mut self, value: f64, count: f64) {
         let magnitude = value.abs();
         if self.mapping.is_zero(magnitude) {
-            self.zero_count += count;
+            self.zero_count = add_counts(self.zero_count, count);
             return;
         }
         let key = self.mapping.key(magnitude);
@@ -409,7 +415,7 @@ impl DdSketch {
                 insert_bin(&mut self.negative, rebin(bin.key), bin.count, self.mapping.bin_limit);
             }
         }
-        self.zero_count += other.zero_count;
+        self.zero_count = add_counts(self.zero_count, other.zero_count);
         self.count += other.count;
         self.sum += other.sum;
         if other.min < self.min {
@@ -633,7 +639,7 @@ const BYTES_VERSION: u8 = 1;
 /// dense store's policy.
 fn insert_bin(store: &mut Vec<Bin>, key: i32, count: f64, bin_limit: u32) {
     match store.binary_search_by(|b| b.key.cmp(&key)) {
-        Ok(i) => store[i].count += count,
+        Ok(i) => store[i].count = add_counts(store[i].count, count),
         Err(i) => {
             if store.capacity() == 0 {
                 store.reserve_exact(INITIAL_BINS);
@@ -650,8 +656,8 @@ fn collapse(store: &mut Vec<Bin>, bin_limit: u32) {
         return;
     }
     let remove = store.len() - limit;
-    let folded: f64 = store[..remove].iter().map(|b| b.count).sum();
-    store[remove].count += folded;
+    let folded = store[..remove].iter().fold(0.0, |sum, b| add_counts(sum, b.count));
+    store[remove].count = add_counts(store[remove].count, folded);
     store.drain(..remove);
 }
 
@@ -673,7 +679,7 @@ fn merge_bins(a: &[Bin], b: &[Bin], bin_limit: u32) -> Vec<Bin> {
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                out.push(Bin { key: a[i].key, count: a[i].count + b[j].count });
+                out.push(Bin { key: a[i].key, count: add_counts(a[i].count, b[j].count) });
                 i += 1;
                 j += 1;
             }
@@ -685,14 +691,21 @@ fn merge_bins(a: &[Bin], b: &[Bin], bin_limit: u32) -> Vec<Bin> {
     out
 }
 
-/// Sorts, folds repeated keys, drops empty or non-finite counts, and collapses.
+/// Sum of two finite, non-negative counts, saturating at `f64::MAX`. A count is a weight, so a
+/// saturated bin keeps its place in the rank walk and stays mergeable, where an `inf` one would
+/// be dropped on the next decode.
+fn add_counts(a: f64, b: f64) -> f64 {
+    (a + b).min(f64::MAX)
+}
+
+/// Drops empty or non-finite counts, sorts, folds repeated keys, and collapses.
 fn normalize_bins(mut bins: Vec<Bin>, bin_limit: u32) -> Vec<Bin> {
     bins.retain(|b| b.count.is_finite() && b.count > 0.0);
     bins.sort_by_key(|b| b.key);
     let mut out: Vec<Bin> = Vec::with_capacity(bins.len());
     for bin in bins {
         match out.last_mut() {
-            Some(last) if last.key == bin.key => last.count += bin.count,
+            Some(last) if last.key == bin.key => last.count = add_counts(last.count, bin.count),
             _ => out.push(bin),
         }
     }
@@ -1221,6 +1234,60 @@ mod tests {
         assert_eq!(at_cap.mapping().bin_limit(), Mapping::MAX_BIN_LIMIT);
         assert_eq!(Mapping::try_logarithmic(1.02, 0.5, Mapping::MAX_BIN_LIMIT + 1), None);
         assert_eq!(Mapping::logarithmic(1.02, 0.5, u32::MAX).bin_limit(), Mapping::MAX_BIN_LIMIT);
+    }
+
+    /// `mapping`'s empty-sketch blob with its positive store replaced by `bins`, each a raw
+    /// `(key delta, count)` pair, so repeated keys and counts reach `from_bytes` unnormalized.
+    fn blob_with_positive_bins(mapping: Mapping, bins: &[(i64, f64)]) -> Vec<u8> {
+        let mut blob = DdSketch::with_mapping(mapping).to_bytes();
+        // The empty sketch ends in two zero bin counts.
+        blob.truncate(blob.len() - 2);
+        write_uvarint(&mut blob, bins.len() as u64);
+        for &(delta, count) in bins {
+            write_uvarint(&mut blob, ((delta << 1) ^ (delta >> 63)) as u64);
+            blob.extend_from_slice(&count.to_le_bytes());
+        }
+        write_uvarint(&mut blob, 0);
+        blob
+    }
+
+    /// Decodes `blob`, then checks every bin is finite and `to_bytes` is a fixed point.
+    fn assert_round_trip_is_a_fixed_point(blob: &[u8]) -> DdSketch {
+        let once = DdSketch::from_bytes(blob).expect("decodes");
+        for bin in once.positive_bins() {
+            assert!(bin.count.is_finite() && bin.count > 0.0, "{bin:?}");
+        }
+        let bytes = once.to_bytes();
+        let twice = DdSketch::from_bytes(&bytes).expect("re-decodes");
+        assert_eq!(twice.to_bytes(), bytes);
+        assert_eq!(twice, once);
+        once
+    }
+
+    /// An Agent blob repeating one key with two `f64::MAX` counts: folding them saturates at
+    /// `f64::MAX` rather than writing an `inf` bin the next decode would drop.
+    #[test]
+    fn folding_two_finite_counts_never_produces_an_infinite_bin() {
+        let blob = blob_with_positive_bins(Mapping::agent(), &[(5, f64::MAX), (0, f64::MAX)]);
+        let sketch = assert_round_trip_is_a_fixed_point(&blob);
+        assert_eq!(sketch.positive_bins(), &[Bin { key: 5, count: f64::MAX }]);
+    }
+
+    /// Three huge bins under `bin_limit` 2: collapse folds the lowest into the next, and that
+    /// sum saturates too. A later merge and insert keep the bin finite.
+    #[test]
+    fn to_bytes_is_a_fixed_point_after_a_saturating_fold() {
+        let mapping = Mapping::logarithmic(1.02, 0.0, 2);
+        let blob = blob_with_positive_bins(mapping, &[(1, f64::MAX), (1, f64::MAX), (1, f64::MAX)]);
+        let mut sketch = assert_round_trip_is_a_fixed_point(&blob);
+        assert_eq!(
+            sketch.positive_bins(),
+            &[Bin { key: 2, count: f64::MAX }, Bin { key: 3, count: f64::MAX }]
+        );
+        let copy = sketch.clone();
+        sketch.merge(&copy);
+        sketch.add_count(mapping.representative(3), f64::MAX);
+        assert_round_trip_is_a_fixed_point(&sketch.to_bytes());
     }
 
     /// Two decoded sketches at the largest limit a blob can carry, under different mappings and
