@@ -31,9 +31,9 @@ pub const MAX_BIN_COUNT: u32 = 65535;
 /// The most `k`/`n` entries one encoded `Dogsketch` may carry. A bin's count splits into
 /// `ceil(count / MAX_BIN_COUNT)` entries, so without a cap a few KiB of sketch whose counts near
 /// `u32::MAX` (a sample-rate typo extrapolated through `aggregate`) expands to gigabytes. `2^20`
-/// is 128 entries per bin for a full Agent-mapped sketch (two stores of
-/// `Mapping::AGENT_BIN_LIMIT` bins plus the zero bin), a per-bin count of about 8.4 million, and
-/// 8 MiB of `k` and `n` in memory.
+/// leaves a full Agent-mapped sketch (two stores of `Mapping::AGENT_BIN_LIMIT` bins plus the zero
+/// bin, 8193 bins) 127 entries per bin, a per-bin count of about 8.3 million, and bounds `k` and
+/// `n` to 8 MiB in memory.
 pub const MAX_DOGSKETCH_ENTRIES: u64 = 1 << 20;
 
 impl DatadogDecoder {
@@ -218,12 +218,12 @@ impl DatadogEncoder {
     /// counted, for an empty sketch or one past [`MAX_DOGSKETCH_ENTRIES`].
     fn dogsketch(&mut self, sketch: &DdSketch, timestamp: i64) -> Option<Dogsketch> {
         let rebinned;
-        let sketch = if *sketch.mapping() == Mapping::agent() {
-            sketch
-        } else {
-            self.out_degraded("rebinned");
+        let is_rebinned = *sketch.mapping() != Mapping::agent();
+        let sketch = if is_rebinned {
             rebinned = rebin_to_agent(sketch);
             &rebinned
+        } else {
+            sketch
         };
         let entries: u64 = sketch
             .negative_bins()
@@ -243,6 +243,10 @@ impl DatadogEncoder {
                 ),
             );
             return None;
+        }
+        // After the cap, so a dropped sketch counts as skipped only.
+        if is_rebinned {
+            self.out_degraded("rebinned");
         }
         let mut k = Vec::new();
         let mut n = Vec::new();
@@ -504,6 +508,23 @@ mod tests {
         over.merge(&heavy(1, 1.0));
         assert!(e.encode_sketches(&batch_of(over)).is_none());
         assert!(reasons(&registry).contains(&"oversized_sketch".to_string()));
+    }
+
+    /// A logarithmic sketch dropped past the cap counts as skipped, not also as re-binned.
+    #[test]
+    fn a_dropped_logarithmic_sketch_is_not_counted_as_rebinned() {
+        let (_, mut e, registry) = with_registry();
+        let log = DdSketch::from_parts(
+            Mapping::logarithmic(1.02, 0.0, 2048),
+            (1..=256).map(|key| Bin { key, count: 4.0e9 }).collect(),
+            vec![],
+            0.0,
+            None,
+        );
+        assert!(e.encode_sketches(&batch_of(log)).is_none());
+        let r = reasons(&registry);
+        assert!(r.contains(&"oversized_sketch".to_string()), "{r:?}");
+        assert!(!r.contains(&"rebinned".to_string()), "{r:?}");
     }
 
     #[test]
