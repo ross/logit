@@ -97,15 +97,18 @@ impl AcceptErrorClass {
 ///
 /// | Class | errno | Portable `ErrorKind` |
 /// |---|---|---|
-/// | `Connection` | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | `ConnectionAborted`, `ConnectionReset`, `Interrupted`, `HostUnreachable`, `NetworkDown`, `NetworkUnreachable`, `PermissionDenied` |
+/// | `Connection` | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | `ConnectionAborted`, `ConnectionReset`, `Interrupted`, `HostUnreachable`, `NetworkDown`, `NetworkUnreachable` |
 /// | `Resource` | `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` | `OutOfMemory` |
 /// | `Fatal` | `EBADF`, `EINVAL`, `ENOTSOCK`, `EFAULT` | `InvalidInput`, and tokio's runtime-shutdown error |
-/// | `Other` | anything else | anything else |
+/// | `Other` | `EPERM`, `EACCES`, and anything else | `PermissionDenied`, and anything else |
 ///
 /// The `Connection` row follows `man 2 accept`: Linux passes a new socket's pending network errors
 /// (`ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`,
 /// `ENETUNREACH`) through `accept`, and a server should treat them like `EAGAIN` and retry.
-/// `EPERM` is a firewall rule refusing that one connection.
+///
+/// `EPERM` and `EACCES` back off rather than retry at once: a seccomp filter or an LSM denial
+/// (`security_socket_accept`) fails `accept4` without dequeuing the connection, so the socket stays
+/// readable and an immediate retry spins a core.
 ///
 /// tokio retries only `WouldBlock` inside `accept` and returns everything else, so every class
 /// here reaches the caller. The errno column applies on Linux only, where `libc` is a dependency;
@@ -118,8 +121,8 @@ pub(crate) fn classify_accept_error(err: &io::Error) -> AcceptErrorClass {
         | ErrorKind::Interrupted
         | ErrorKind::HostUnreachable
         | ErrorKind::NetworkDown
-        | ErrorKind::NetworkUnreachable
-        | ErrorKind::PermissionDenied => return AcceptErrorClass::Connection,
+        | ErrorKind::NetworkUnreachable => return AcceptErrorClass::Connection,
+        ErrorKind::PermissionDenied => return AcceptErrorClass::Other,
         ErrorKind::OutOfMemory => return AcceptErrorClass::Resource,
         ErrorKind::InvalidInput => return AcceptErrorClass::Fatal,
         _ => {}
@@ -133,7 +136,6 @@ pub(crate) fn classify_accept_error(err: &io::Error) -> AcceptErrorClass {
             libc::ECONNABORTED
             | libc::ECONNRESET
             | libc::EINTR
-            | libc::EPERM
             | libc::EPROTO
             | libc::EHOSTDOWN
             | libc::ENONET
@@ -252,7 +254,6 @@ mod tests {
             (libc::ECONNABORTED, Connection),
             (libc::ECONNRESET, Connection),
             (libc::EINTR, Connection),
-            (libc::EPERM, Connection),
             (libc::EPROTO, Connection),
             (libc::EHOSTDOWN, Connection),
             (libc::ENONET, Connection),
@@ -270,6 +271,8 @@ mod tests {
             (libc::ENOTSOCK, Fatal),
             (libc::EFAULT, Fatal),
             (libc::EIO, Other),
+            (libc::EPERM, Other),
+            (libc::EACCES, Other),
             (libc::ELOOP, Other),
         ];
         #[cfg(target_os = "linux")]
@@ -285,7 +288,7 @@ mod tests {
             (io::ErrorKind::HostUnreachable, Connection),
             (io::ErrorKind::NetworkDown, Connection),
             (io::ErrorKind::NetworkUnreachable, Connection),
-            (io::ErrorKind::PermissionDenied, Connection),
+            (io::ErrorKind::PermissionDenied, Other),
             (io::ErrorKind::OutOfMemory, Resource),
             (io::ErrorKind::InvalidInput, Fatal),
             (io::ErrorKind::TimedOut, Other),

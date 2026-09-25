@@ -135,10 +135,10 @@ defense is free, and is otherwise a documented non-goal (listed below). The deci
 
   | Class | errno | Action |
   |---|---|---|
-  | Connection | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPERM`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | Retry at once: the failure belongs to one connection. |
+  | Connection | `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EPROTO`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENOPROTOOPT`, `ENETDOWN`, `ENETUNREACH` | Retry at once: the failure belongs to one connection. |
   | Resource | `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM` | Back off 100 ms, then continue. |
   | Fatal | `EBADF`, `EINVAL`, `ENOTSOCK`, `EFAULT`, and tokio's runtime-shutdown error | Return the error: the listening socket itself is unusable. |
-  | Other | anything else | Back off 100 ms, then continue. |
+  | Other | `EPERM`, `EACCES`, and anything else | Back off 100 ms, then continue. A seccomp or LSM denial fails `accept4` without dequeuing the connection, so retrying `EPERM` or `EACCES` at once would spin a core. |
 
   100 ms is the backoff `prometheus_out`'s exposition server and the admin server already use.
   Every accept error counts `logit.input.accept.errors{reason}` and is diagnosed under the key

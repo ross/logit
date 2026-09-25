@@ -64,6 +64,9 @@ INJECT_SCENARIOS=(
     "tcp-accept-emfile|accept4:error=EMFILE:when=1|-p logit-inputs --lib a_plaintext_connection_round_trips_a_decoded_frame"
     # The same on `logit_in`'s accept loop. EXPECT: the test passes.
     "logit-accept-emfile|accept4:error=EMFILE:when=1|-p logit-inputs --lib a_v2_clients_provenance_is_relayed_untouched"
+    # A seccomp or LSM refusal, which leaves the connection queued. EXPECT: the test passes, and
+    # the strace shows the injected `accept4` and, after one 100 ms backoff, a second that succeeds.
+    "tcp-accept-eperm|accept4:error=EPERM:when=1|-p logit-inputs --lib a_plaintext_connection_round_trips_a_decoded_frame"
     # A fatal errno on the listening socket. EXPECT: the test fails fast on its closed fanout, and
     # the strace shows one injected `accept4` and no second: the listener ends, it does not spin.
     "tcp-accept-ebadf|accept4:error=EBADF:when=1|-p logit-inputs --lib a_plaintext_connection_round_trips_a_decoded_frame"
