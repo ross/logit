@@ -54,7 +54,7 @@ Ross directs merging.
 | WS | Branch | Content |
 |---|---|---|
 | W0 | `shapes/w0` | This plan; [`docs/design/data-shapes.md`](../design/data-shapes.md) skeleton and methodology |
-| W1 | `shapes/w1` | The `shape` component, ADR `shape-observer-component`, schema, allocation pins, `examples/shape-tap.yaml` |
+| W1 | `shapes/w1` | The `shape` component, ADR `shape-observer-component`, schema, allocation pins, `fixtures/shape-tap.yaml` |
 | W2 | `shapes/w2` | Capture harness (`script/shape-survey`, `tools/shape-survey/`); `shape` replayed over `testdata/interop/` as its acceptance test |
 | W3 | `shapes/w3` | The filled doc: desk rows, measured rows, synthesis; `memory.md`'s open question pointed at it |
 

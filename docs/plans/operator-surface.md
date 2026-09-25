@@ -169,7 +169,7 @@ shipped config (none set `admin`, so no behaviour change).
 `Event::log` with `severity: Warn`, attrs `component`/`kind`/`role`/`key`; `info!` is not
 captured at the default level; 257th pending log is dropped and counted; an unattributed
 `error!` lands under `internal`; `logs: off` installs no layer; a suppressed `warn_throttled`
-produces no log event (the throttle is upstream of `tracing`). **Done:** `examples/
+produces no log event (the throttle is upstream of `tracing`). **Done:** `fixtures/
 internal-telemetry.yaml` shows a log event reaching `stdio_out` when a malformed statsd line is
 sent.
 

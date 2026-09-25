@@ -202,7 +202,7 @@ W1 runs SigNoz from a compose file under `tmp/`, not committed: `signoz/signoz`,
 `signoz/signoz-otel-collector`, and ClickHouse at the pinned tags, with a `logit` container on the
 same network. Nothing SigNoz emits is a fixture (it emits nothing), so `script/record-fixtures`
 and `testdata/interop/` are untouched. The findings land in this plan, the ADR, and the example's
-comments. A committed compose file next to `examples/nginx/` is a possible W2 addition if the
+comments. A committed compose file next to `fixtures/nginx/` is a possible W2 addition if the
 findings make one worth keeping; the default is not to ship one.
 
 ## Workstreams
@@ -211,7 +211,7 @@ findings make one worth keeping; the default is not to ship one.
 |---|---|---|---|
 | W0 | This plan and its index row | S | — |
 | W1 | Verify against self-hosted SigNoz at the pinned tags: `otlp_out` over HTTP and gRPC with logs (`Str` and `Map` bodies, `event_name`, `observed_timestamp`), every metric kind `otlp_out` emits (a `Summary`, both `Histogram` temporalities, both `ExponentialHistogram` temporalities, a degraded `Samples`), and spans from `otlp_in`, `trace_context`, and `http_access`; read back through `/api/v5/query_range` and the UI; resolve every UNVERIFIED item and update this plan; ADR `signoz-over-otlp` and its `docs/adr/README.md` row; a `known-gaps.md` row if item 2 or 4 needs one | S | W0 |
-| W2 | `examples/signoz.yaml` (`statsd_in`, `syslog_in`, `otlp_in` → `set`, `json`, `aggregate` → `otlp_out` over gRPC to `signoz-otel-collector:4317`, with the shim from design item 2 if W1 called for it and the Cloud variant commented out); a "SigNoz" subsection in `docs/deploying.md`; `AGENTS.md`'s examples list; `SIGNOZ_INGESTION_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs`) if the example resolves it | S | W1 |
+| W2 | `fixtures/signoz.yaml` (`statsd_in`, `syslog_in`, `otlp_in` → `set`, `json`, `aggregate` → `otlp_out` over gRPC to `signoz-otel-collector:4317`, with the shim from design item 2 if W1 called for it and the Cloud variant commented out); a "SigNoz" subsection in `docs/deploying.md`; `AGENTS.md`'s examples list; `SIGNOZ_INGESTION_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs`) if the example resolves it | S | W1 |
 
 Landing order: W0 → W1 → W2, linear. Each PR is based on and targets its parent's branch and is
 brought up to date with `git merge origin/main`, never a rebase.
@@ -225,7 +225,7 @@ brought up to date with `git merge origin/main`, never a rebase.
   explorer; a span from `http_access` appears under its `service.name` in the APM views with its
   method and status; every UNVERIFIED item in this plan is resolved and the text updated;
   `type_sizes.rs` and `allocations.rs` unchanged (no model change).
-- W2: `examples/signoz.yaml` passes `logit validate` and, against the W1 harness, shows a statsd
+- W2: `fixtures/signoz.yaml` passes `logit validate` and, against the W1 harness, shows a statsd
   counter, a syslog line, and an OTLP span in SigNoz.
 - W0 (this PR) is documentation only: every relative link resolves and `docs/plans/README.md`
   gained a row.

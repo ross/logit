@@ -1,11 +1,12 @@
 # The nginx reference example (docs/plans/nginx-integration.md):
 # syslog_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> keep_values ->
-# aggregate -> influxdb_out, plus `stdio_out` taps, against the real nginx in examples/nginx/ in
+# aggregate -> influxdb_out, plus `stdio_out` taps, against the real nginx in fixtures/nginx/ in
 # the dev stack (`script/server`).
 #
 # This is a contributor-facing fixture, not the recommended starting point: compose.yaml's
 # `nginx` service and crates/logit-bench/src/fixtures.rs's NGINX_SYSLOG_LINE depend on
-# examples/nginx/ staying real. To see `logit` work, run `demo/` instead (`script/demo`).
+# fixtures/nginx/ staying real. To see `logit` work, run `demo/` instead (`script/demo`), or
+# start from `examples/`.
 #
 # Topology:
 #

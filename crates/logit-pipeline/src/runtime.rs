@@ -219,7 +219,7 @@ pub async fn run_with_telemetry(
     }
 
     // One `Fanout` per `target`, built before the spawn loop: `ids` is sorted, so a router can
-    // sort ahead of the targets it directs at (`examples/fan-out-central.yaml` does), and its
+    // sort ahead of the targets it directs at (`fixtures/fan-out-central.yaml` does), and its
     // spawn arm needs them built. Each carries the target's own id and telemetry handle, so
     // `Fanout::stamp` writes the target's id into `previous`
     // (`docs/adr/batch-provenance-on-delivered.md`) and the producer metrics (`batches.sent`,
