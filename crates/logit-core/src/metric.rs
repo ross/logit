@@ -620,8 +620,8 @@ const CE_ARRAY_MAX_CAPACITY: usize = 128;
 // Mirror upstream's `pub(crate)` `HyperLogLog::M` and `HLL_SLICE_LEN` for
 // `CardinalityEstimator<[u8]>`'s default `P = 12, W = 6`: `M = 1 << P` registers, and a slice of
 // `M * W / 32 + 3` words (zero-register count, harmonic sum, packed registers, one spare).
-// `hll_slice_len_matches_upstream_constant` recomputes the slice length from the formula;
-// an upgrade that changes `P`, `W`, or the layout must update these in lockstep.
+// `hll_slice_len_matches_what_upstream_serializes` checks the slice length against a blob
+// upstream wrote; an upgrade that changes `P`, `W`, or the layout must update these in lockstep.
 const CE_HLL_P: usize = 12;
 const CE_HLL_W: usize = 6;
 const CE_HLL_REGISTERS: usize = 1 << CE_HLL_P;
@@ -1331,12 +1331,102 @@ mod tests {
         }
     }
 
-    /// `CE_HLL_SLICE_LEN` matches upstream's formula at the default `P = 12, W = 6`.
+    /// `CE_HLL_SLICE_LEN` matches the members list upstream's own `Serialize` writes for an HLL
+    /// representation, and `CE_HLL_REGISTERS` the zero-register count of a fresh one.
     #[test]
-    fn hll_slice_len_matches_upstream_constant() {
-        const P: usize = 12;
-        const W: usize = 6;
-        let m = 1usize << P;
-        assert_eq!(CE_HLL_SLICE_LEN, m * W / 32 + 3);
+    fn hll_slice_len_matches_what_upstream_serializes() {
+        let bytes = hll_with(5000).to_bytes();
+        assert_eq!(bytes[0] & 0x3, CE_REPRESENTATION_HLL);
+        assert_eq!(bytes.len(), HLL_MEMBERS_OFFSET + CE_HLL_SLICE_LEN * 4);
+
+        let mut one = HyperLogLog::new();
+        for i in 0..200u32 {
+            one.insert(&i.to_le_bytes());
+        }
+        let zeros = hll_zero_register_count(&one.to_bytes()).expect("HLL representation");
+        assert!(zeros as usize <= CE_HLL_REGISTERS && zeros as usize > CE_HLL_REGISTERS - 200);
+    }
+
+    /// Pins the assumption `HllBytesReader`'s size hint rests on: serde_core 1.0.229's `Vec<T>`
+    /// visitor allocates `Vec::with_capacity(size_hint::cautious::<T>(seq.size_hint()))`, and
+    /// `cautious` caps that at 1 MiB (262,144 `u32`s), far above either representation's. So the
+    /// members `Vec` has the capacity upstream later frees: `len.next_power_of_two()` for the
+    /// array representation, `CE_HLL_SLICE_LEN` for HLL. A serde release that sizes the `Vec`
+    /// differently fails here before it can reinstate the `Layout` UB.
+    #[test]
+    fn a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees() {
+        use serde::Deserialize;
+        for n in [3u32, 4, 5, 7, 9, 17, 33, 65, 100, 127, 128, 5000] {
+            let bytes = hll_with(n).to_bytes();
+            let mut reader = HllBytesReader::new(&bytes);
+            let (data, members): (usize, Option<Vec<u32>>) =
+                Deserialize::deserialize(&mut reader).expect("valid blob");
+            let members = members.expect("array or HLL representation");
+            let expected = match (data & 0x3) as u8 {
+                CE_REPRESENTATION_ARRAY => members.len().next_power_of_two(),
+                CE_REPRESENTATION_HLL => CE_HLL_SLICE_LEN,
+                tag => panic!("{n} members: tag {tag}"),
+            };
+            assert_eq!(members.capacity(), expected, "{n} members");
+        }
+        let bytes = hll_with(5000).to_bytes();
+        let mut reader = HllBytesReader::new(&bytes);
+        let (_, members): (usize, Option<Vec<u32>>) =
+            Deserialize::deserialize(&mut reader).expect("valid blob");
+        assert_eq!(members.expect("HLL representation").capacity(), 771);
+    }
+
+    /// Set-union laws on `estimate`: idempotent, commutative, associative, and a merge of two
+    /// estimators estimates what one fed both populations does. Byte-level commutativity does not
+    /// hold (the array representation keeps insertion order), which `HyperLogLog`'s `PartialEq`
+    /// doc records; these compare estimates.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn members() -> impl Strategy<Value = Vec<u32>> {
+            prop_oneof![
+                prop::collection::vec(any::<u32>(), 0..4),
+                prop::collection::vec(any::<u32>(), 0..140),
+                prop::collection::vec(any::<u32>(), 100..3000),
+            ]
+        }
+
+        fn hll_of(members: &[u32]) -> HyperLogLog {
+            let mut hll = HyperLogLog::new();
+            for m in members {
+                hll.insert(&m.to_le_bytes());
+            }
+            hll
+        }
+
+        fn union(a: &HyperLogLog, b: &HyperLogLog) -> HyperLogLog {
+            let mut out = a.clone();
+            out.merge(b);
+            out
+        }
+
+        proptest! {
+            #[test]
+            fn hll_merge_is_idempotent_commutative_and_associative(
+                a in members(),
+                b in members(),
+                c in members(),
+            ) {
+                let (a, b, c) = (hll_of(&a), hll_of(&b), hll_of(&c));
+                prop_assert_eq!(union(&a, &a).estimate(), a.estimate());
+                prop_assert_eq!(union(&a, &b).estimate(), union(&b, &a).estimate());
+                prop_assert_eq!(
+                    union(&union(&a, &b), &c).estimate(),
+                    union(&a, &union(&b, &c)).estimate()
+                );
+            }
+
+            #[test]
+            fn hll_merge_estimates_what_inserting_both_does(a in members(), b in members()) {
+                let both: Vec<u32> = a.iter().chain(&b).copied().collect();
+                prop_assert_eq!(union(&hll_of(&a), &hll_of(&b)).estimate(), hll_of(&both).estimate());
+            }
+        }
     }
 }
