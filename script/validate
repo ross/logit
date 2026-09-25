@@ -23,6 +23,9 @@ export DD_API_KEY="${DD_API_KEY:-logit-dev-key}"
 # examples/splunk-observability.yaml's `headers:` map (the `X-SF-Token` an org sends to
 # Observability Cloud).
 export SPLUNK_OBSERVABILITY_TOKEN="${SPLUNK_OBSERVABILITY_TOKEN:-logit-dev-token}"
+# The HEC token examples/splunk-hec-*.yaml send (`splunk_hec_out`'s `token`) and accept
+# (`splunk_hec_in`'s `tokens:`).
+export SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-logit-dev-token}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"
