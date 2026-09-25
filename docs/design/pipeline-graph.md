@@ -641,9 +641,10 @@ this config actually do" for a graph that's hard to read from YAML.
   at a glance without the arity table.
 - It renders a `target` as a dashed box, and every router → target edge dashed, labeled with the
   `routes:` key that directs an event down it. A `lua`/`lua_file` `targets:` edge has no label,
-  because the script picks the destination with `event:to("..")`. These edges come from
-  `graph::target_edges`, which reads the raw `Config` too, so a router whose target id resolves to
-  nothing renders as a dangling dashed edge rather than blocking output
+  because the script picks the destination with `event:to("..")`. A targeting node's ordinary
+  edges to its consumers, which carry the events no target took, are labeled `[else]`. The target
+  edges come from `graph::target_edges`, which reads the raw `Config` too, so a router whose
+  target id resolves to nothing renders as a dangling dashed edge rather than blocking output
   ([ADR `target-components`](../adr/target-components.md)).
 - Every `!env` reference must still resolve ("Environment substitution" above). A missing variable
   fails the load before `render` is called, as with `run`/`validate`, even for a field this command
