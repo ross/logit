@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-20
+updated: 2026-09-24
 ---
 
 # Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive
@@ -248,3 +248,13 @@ above should not be quoted as a production expectation.
   disk-backed `Buffer<T>` implementation. `docs/design/wire-protocol.md`'s connection-protocol
   section and the two `docs/known-gaps.md` entries above are the next work this unblocks, not work
   this ADR does.
+
+## Amendment: zstd enters the workspace for remote-write, not the native frame (2026-09-24)
+
+[ADR `victoriametrics-interop`](victoriametrics-interop.md) adds `ruzstd`, pure Rust, as a
+dependency of `logit-proto` for Prometheus remote-write's `Content-Encoding: zstd`. That
+narrows the "`zstd` compression" alternative above without reversing it: the C `zstd` crate is
+still out, and `Compression::Zstd` in the native frame is still a reserved discriminant that
+`write_frame` and `read_frame` reject. `ruzstd`'s decoder is what changed since the alternative
+was written; its encoder reaches about libzstd level 1, which is enough for a remote-write body
+and not the "genuinely competitive" bar the native frame's revisit clause sets.

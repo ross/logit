@@ -83,7 +83,7 @@ has:
 - **Invalid names are skipped, not fatal.** An SD-ID or PARAM-NAME that fails `is_valid_sd_name`
   (RFC 5424 §6.3.2's `SD-NAME` grammar) causes the whole SD-ELEMENT (for an invalid SD-ID) or just
   that one param (for an invalid PARAM-NAME) to be dropped — counted in
-  [`EncodeStats::dropped_invalid_sd`] and reported via a throttled `invalid_structured_data`
+  [`EncodeStats::dropped_invalid_sd_name`] and reported via a throttled `invalid_structured_data`
   diagnostic, rather than corrupting the line with an unparseable element.
 - **RFC 3164 output never emits STRUCTURED-DATA.** 3164 has no such field; `syslog.sd` and the
   opt-in element below are both silently dropped on a `5424 -> 3164` relay. This is one of the
@@ -110,7 +110,7 @@ has:
   the sink emit two SD-ELEMENTs sharing one SD-ID, which §6.3.1 forbids and which `syslog_in`
   rejects outright. The encoder guards against it: when `structured_data.sd_id` already appears as
   a key of the event's own `syslog.sd`, the opt-in element is skipped for that event, counted under
-  `dropped_invalid_sd`, and reported through the throttled `invalid_structured_data` diagnostic
+  `dropped_sd_id_collision`, and reported through the throttled `invalid_structured_data` diagnostic
   naming the collision. The origin's element wins because it is real data; the opt-in element is
   a convenience the operator can rename.
 

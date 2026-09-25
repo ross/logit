@@ -1,0 +1,25 @@
+# Leg 5 of `script/victoria-interop`: `graphite_out` carbon plaintext over TCP, with attributes
+# as carbon `;tag=value` segments, into VictoriaMetrics's `-graphiteListenAddr`.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: graphite
+      metric:
+        name: vi_graphite_gauge
+        kind: gauge
+        value: 5
+
+  victoria_metrics:
+    type: graphite_out
+    sources: [gauge_gen]
+    endpoint: victoria-metrics:2003
+    transport: tcp
+    protocol: plaintext
+    tags: carbon
