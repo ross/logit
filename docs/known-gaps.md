@@ -143,6 +143,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     recommends `keep` in front of `otlp_in` specifically, beyond the general
     `aggregate`-cardinality recommendation
     [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) demonstrates.
+  - **`logit_in`'s native dictionary.** `crates/logit-proto/src/native/dict.rs`'s `Dict::read`
+    interns every dictionary string a `logit_in` peer sends before the rest of the batch
+    validates, so a frame that fails to decode after its dictionary still leaves its strings in the
+    interner, and nothing budgets dictionary strings across frames. The per-frame bound is the
+    dictionary entry cap and the frame size; the process-lifetime bound is the same premise as
+    every other feeder: `logit_in`'s peers are other `logit` processes the operator runs.
   - **`flatten` adds no new bound, by design** (`crates/logit-transforms/src/flatten.rs`,
     [ADR `flatten-transform`](adr/flatten-transform.md)). Its marginal exposure over
     `json`/`syslog_in`/`otlp_in`: path *combinations* of already-interned keys (a product, bounded by
@@ -632,6 +638,19 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   reconnect for the next request, never a lost response or batch. A silent peer can't exploit this:
   with nothing in flight the drop still happens at the end of the grace, and a stalled body is
   bounded by the per-frame stall timeout.
+
+- **A dribbled body holds a connection permit far longer than any one stall bound.** Every body
+  read is bounded per frame (per `read` on `logit_in`), not in total, so a peer that sends one byte
+  per frame, each slightly under the stall bound, keeps its request alive and its connection permit
+  held. On an HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
+  `datadog_trace_in`) that is up to `MAX_REQUEST_BYTES` times the stall bound per request; on
+  `logit_in` it is up to `max_frame_bytes` times the stall bound per frame. With enough
+  connections, such a peer can hold the connection cap. A documented cost of the per-frame design,
+  not a bug: a total body deadline was declined because a slow link sending a large legitimate
+  body looks the same ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md), [ADR
+  `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment). **Revisit
+  trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum transfer
+  rate, or a per-peer connection cap is worth the false positives.
 
 ## Cross-protocol mappings
 
@@ -1264,6 +1283,23 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
   raced a close; it counts `send_failed` lines but can't force the race.
+- **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener caps
+  concurrent connections and, per connection, concurrent streams (32), so its worst case is
+  `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 256 GiB for
+  `otlp_in`. The stream cap bounds one factor of that product, not the product. A budget over the
+  bytes held in request bodies across a listener (a semaphore acquired per body chunk) would bound
+  the product directly. Recorded as a follow-up, not built: it changes how every HTTP listener
+  reads a body ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives
+  considered"). **Revisit trigger:** a public listener, or an operator seeing memory pressure from
+  concurrent large requests.
+- **An OTLP timestamp or `U64` value past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
+  (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
+  and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX`, and a `Value::U64`
+  attribute past `i64::MAX` encodes as that value, through one helper. A saturated timestamp
+  relays as 2262-04-11T23:47:16.854775807Z, not the original. This is a permitted normalization
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
+  [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s closing assessment); no real
+  clock produces such a value.
 - ~~**`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON**~~ **Closed.** `otlp_in`
   (`crates/logit-inputs/src/otlp.rs`) accepts `Content-Type: application/json` alongside protobuf
   on the HTTP transport, through a hand-written dialect layer (`crates/logit-proto/src/otlp/json/`)
