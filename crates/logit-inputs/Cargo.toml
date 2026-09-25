@@ -26,6 +26,8 @@ http.workspace = true
 http-body-util.workspace = true
 # otlp_in's matching gzip request decode (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
+# datadog_in's zstd request decode (docs/adr/datadog-agent-and-intake-relay.md, decision 4).
+ruzstd.workspace = true
 # Listener TLS termination (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
 # `rustls-pki-types` build a `rustls::ServerConfig` from config-supplied PEM, and `tokio-rustls`'s
 # `TlsAcceptor` wraps each accepted `TcpStream` before the serving path sees it.

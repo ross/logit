@@ -1,0 +1,14 @@
+method: POST
+path: /api/v2/logs
+host: capture:8080
+user-agent: datadog-agent/7.83.3
+content-length: 326
+content-encoding: zstd
+content-type: application/json
+dd-api-key: logit-record
+dd-current-timestamp: 1790289645067
+dd-evp-origin: agent
+dd-evp-origin-version: 7.83.3
+dd-message-timestamp: 1790289641786
+dd-protocol: agent-json
+accept-encoding: gzip

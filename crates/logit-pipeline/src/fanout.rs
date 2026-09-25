@@ -16,7 +16,7 @@
 //! Every `Delivered` also carries a [`BatchContext`]: a [`TraceContext`]
 //! (`docs/adr/trace-context-propagation-on-delivered.md`) and a [`Provenance`], which node created
 //! the batch and which last handed it off (`docs/adr/batch-provenance-on-delivered.md`).
-//! `Fanout::send`/`send_blocking` record a listener's span around the send
+//! `Fanout::send`/`send_blocking`/`send_with_deadline` record a listener's span around the send
 //! (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). See
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for which node kinds
 //! propagate a parent and which mint a root, and its "Provenance propagation" section for the
@@ -118,6 +118,19 @@ impl Delivered {
         }
     }
 }
+
+/// [`Fanout::send_with_deadline`]'s deadline passed before every consumer had room for the
+/// batch, so no consumer received it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendTimeout;
+
+impl std::fmt::Display for SendTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not every consumer accepted the batch before the deadline; none received it")
+    }
+}
+
+impl std::error::Error for SendTimeout {}
 
 /// A node's outbound edges. Fan-in is N cloned `Sender`s feeding one inbox and needs nothing
 /// here. Fan-out moves the batch through a single-consumer edge and pays for an `Arc` only on a
@@ -223,6 +236,68 @@ impl Fanout {
     pub async fn send_with_own_context(&self, batch: EventBatch, ctx: BatchContext) {
         let ctx = self.stamp(ctx);
         self.deliver(batch, ctx).await;
+    }
+
+    /// [`Fanout::send`] with all-edges-or-nothing delivery under `deadline`: the call for a
+    /// listener that answers "busy" rather than blocking its client (`datadog_in`).
+    ///
+    /// Mints the root context, the Producer span, and the provenance stamp exactly as `send` does.
+    /// Then, before sending anything, it reserves a slot on every consumer's channel, all held at
+    /// once. If `deadline` passes first, it returns [`SendTimeout`] with nothing sent: the held
+    /// slots are released, no consumer receives the batch, `batches.sent`/`events.sent` are not
+    /// counted, and neither the span nor the `send.blocked.duration` sample is recorded. Once every
+    /// slot is held, the batch goes to every consumer (moved to one, shared as in `deliver` to
+    /// several), then counts as sent and finishes the span.
+    ///
+    /// A closed consumer is skipped and counted `events.dropped{reason="closed_consumer"}`, as in
+    /// `deliver`, but only once the batch actually goes out.
+    pub async fn send_with_deadline(
+        &self,
+        batch: EventBatch,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SendTimeout> {
+        let trace = TraceContext::new_root();
+        let mut span =
+            self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
+        span.events(batch.events.len() as u64);
+        let ctx = self.stamp(trace.into());
+        if self.consumers.is_empty() {
+            return Ok(());
+        }
+        let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        let reserve_all = async {
+            let mut permits = Vec::with_capacity(self.consumers.len());
+            for tx in &self.consumers {
+                // `Err` is a closed consumer: nothing to wait for, counted once the batch goes out.
+                permits.push(tx.reserve().await.ok());
+            }
+            permits
+        };
+        let Ok(permits) = tokio::time::timeout_at(deadline, reserve_all).await else {
+            // Dropping the partial `permits` inside the cancelled future releases every held slot.
+            timer.cancel();
+            span.cancel();
+            return Err(SendTimeout);
+        };
+        let n = batch.events.len();
+        if permits.len() == 1 {
+            match permits.into_iter().next().flatten() {
+                Some(permit) => permit.send(Delivered::Owned(batch, ctx)),
+                None => self.record_dropped_on_close(n),
+            }
+        } else {
+            let batch = Arc::new(batch);
+            for permit in permits {
+                match permit {
+                    Some(permit) => permit.send(Delivered::Shared(batch.clone(), ctx)),
+                    None => self.record_dropped_on_close(n),
+                }
+            }
+        }
+        self.record_send(n);
+        drop(timer);
+        span.finish();
+        Ok(())
     }
 
     /// `logit_in`'s send: [`Fanout::send`] (a fresh root and a listener span), stamped with
@@ -469,6 +544,124 @@ mod tests {
             Some(4.0),
             "every event in the batch should count as dropped, not just the batch"
         );
+    }
+
+    fn timing_count(events: &[logit_core::Event], name: &str) -> usize {
+        events
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .filter_map(|m| match &m.kind {
+                MetricKind::Distribution(d) if logit_core::interner::resolve(m.name) == name => {
+                    Some(d.count())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn in_ms(ms: u64) -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_millis(ms)
+    }
+
+    /// Asserts `events` hold no sent counts, no send span, and no `send.blocked.duration` sample:
+    /// what a timed-out `send_with_deadline` must leave behind.
+    fn assert_nothing_recorded_as_sent(events: &[logit_core::Event]) {
+        assert_eq!(counter_value(events, "logit.component.batches.sent"), None);
+        assert_eq!(counter_value(events, "logit.component.events.sent"), None);
+        assert!(events.iter().all(|e| e.span.is_none()), "no span for a send that didn't happen");
+        assert_eq!(timing_count(events, "logit.component.send.blocked.duration"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_to_one_consumer_with_room_delivers_and_counts_once() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry).with_component("dd_in");
+
+        fanout.send_with_deadline(batch(3), in_ms(100)).await.expect("room: should send");
+
+        let received = rx.recv().await.expect("should receive");
+        assert!(matches!(received, Delivered::Owned(..)), "one consumer gets the batch moved");
+        assert_eq!(received.provenance().origin_str(), Some("dd_in"));
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.sent"), Some(3.0));
+        let span = events.iter().find_map(|e| e.span.as_ref()).expect("a send span");
+        assert_eq!(span.span_id, received.context().span_id);
+        assert_eq!(timing_count(&events, "logit.component.send.blocked.duration"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_to_a_full_consumer_times_out_sending_and_counting_nothing() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill");
+        let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+        let result = fanout.send_with_deadline(batch(3), in_ms(100)).await;
+
+        assert_eq!(result, Err(SendTimeout));
+        let prefilled = rx.recv().await.expect("the prefilled batch");
+        assert_eq!(prefilled.batch_context(), BatchContext::default(), "only the prefill arrived");
+        assert!(rx.try_recv().is_err(), "the timed-out batch must never be enqueued");
+        assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    /// The all-or-nothing case: the first consumer had room, the second didn't, so the first's
+    /// reserved slot is released unused and neither receives the batch.
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_with_one_of_two_consumers_full_delivers_to_neither() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        tx_b.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill b");
+        let probe_a = tx_a.clone();
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        let result = fanout.send_with_deadline(batch(2), in_ms(100)).await;
+
+        assert_eq!(result, Err(SendTimeout));
+        assert!(rx_a.try_recv().is_err(), "a must not hold a batch the request was refused for");
+        assert_eq!(probe_a.capacity(), 1, "a's reserved slot must be released, not leaked");
+        rx_b.recv().await.expect("b's prefill");
+        assert!(rx_b.try_recv().is_err(), "b must not receive the timed-out batch either");
+        assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_to_two_consumers_with_room_shares_one_batch_and_counts_once() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        fanout.send_with_deadline(batch(2), in_ms(100)).await.expect("room: should send");
+
+        let a = rx_a.recv().await.expect("a should receive");
+        let b = rx_b.recv().await.expect("b should receive");
+        assert!(matches!(a, Delivered::Shared(..)) && matches!(b, Delivered::Shared(..)));
+        assert_eq!(a.batch_context(), b.batch_context(), "one fan-out is one emission");
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.events.sent"), Some(2.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_into_a_closed_consumer_counts_as_dropped_not_silent() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+        fanout.send_with_deadline(batch(4), in_ms(100)).await.expect("closed isn't a timeout");
+
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), Some(4.0));
     }
 
     /// `send` mints a fresh root every call.

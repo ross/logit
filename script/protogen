@@ -1,8 +1,8 @@
 #!/bin/bash
 # Usage: script/protogen
-# Regenerates crates/logit-proto/src/{otlp,prometheus}/generated/ from the vendored .proto files
-# in crates/logit-proto/proto/ (provenance in its README.md), using prost-build and protoc in a
-# throwaway image (tools/protogen/Dockerfile). Review the diff and commit it yourself.
+# Regenerates crates/logit-proto/src/{otlp,prometheus,datadog}/generated/ from the vendored
+# .proto files in crates/logit-proto/proto/ (provenance in its README.md), using prost-build and
+# protoc in a throwaway image (tools/protogen/Dockerfile). Review the diff and commit it yourself.
 #
 # Not part of script/cibuild: regeneration is a reviewed act, not a CI drift check, and protoc
 # stays out of the CI image (ADR `committed-pregenerated-otlp-protobuf`).
@@ -15,4 +15,4 @@ ${DOCKER} build -q -t logit-protogen -f tools/protogen/Dockerfile tools/protogen
 ${DOCKER} run --rm -v "${ROOT}:/work:z" -w /work logit-protogen \
     cargo run --quiet --manifest-path tools/protogen/Cargo.toml
 
-echo "Regenerated crates/logit-proto/src/{otlp,prometheus}/generated/ -- review the diff and commit it."
+echo "Regenerated crates/logit-proto/src/{otlp,prometheus,datadog}/generated/ -- review the diff and commit it."

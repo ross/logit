@@ -41,11 +41,28 @@ Superset of statsd's grammar: `<name>:<value>[:<value>...]|<type>|@<rate>|#<tag>
   `c:ci-<container-id>` / `c:in-<cgroup-inode>` for the same slot.
 - **Timestamp `|T<unix-seconds>`** (v1.3+): valid only on `c` and `g`. The receiving agent doesn't
   aggregate a timestamped point; it submits each as its own instant.
+- **External data `|e:<data>`** (v1.5+, Agent 7.57+): origin-detection data a client reads from its
+  environment, itself a comma-separated list (`it-<bool>,cn-<container-name>,pu-<pod-uid>`).
+- **Cardinality `|card:<none|low|orchestrator|high>`** (v1.6+, Agent 7.64+): the tag cardinality
+  the agent should enrich this point with.
 - **Events:** `_e{<title-utf8-len>,<text-utf8-len>}:<title>|<text>|d:<ts>|h:<host>|p:<priority>|t:<alert_type>|#<tags>`,
   plus `k:<aggregation_key>` and `s:<source_type_name>`. The format fixes only that `_e{...}:`
   leads and title/text follow the first `|`; the optional pipe-segments can come in any order.
 - **Service checks:** `_sc|<name>|<status 0-3: OK/WARNING/CRITICAL/UNKNOWN>|d:<ts>|h:<host>|#<tags>|m:<message>`.
   The message segment, if present, must be last, because its value can contain `|`.
+
+### Datadog intake (series and sketches)
+
+References: <https://docs.datadoghq.com/api/latest/metrics/>, the Datadog Agent's
+`pkg/serializer` and `agent-payload`'s `metrics/agent_payload.proto`.
+
+What an Agent sends Datadog after it has aggregated DogStatsD and its checks, and what
+`datadog_in` and `datadog_out` speak. A series (`/api/v2/series`, protobuf from an Agent or JSON;
+`/api/v1/series`, JSON) is a name, a `type` (`count`, `rate`, `gauge`, or unspecified), whole-second
+points, `interval`, `unit`, tags, and typed `resources`. Raw distribution values go to
+`/api/v1/distribution_points`; the Agent's own sketches go to `/api/beta/sketches` as DDSketch
+bins with a count, sum, min, and max, and no mapping parameters: a receiver has to assume the
+Agent's. `logit`'s mapping is `crates/logit-proto/src/datadog/mod.rs`'s "Metrics" section.
 
 ### OTLP metrics
 
@@ -231,34 +248,34 @@ datapoint and never writes it to Whisper.
 
 ### Metrics comparison matrix
 
-| Feature | statsd | DogStatsD | OTLP | Prometheus (exposition/OM) | Prom. remote-write | InfluxDB LP | collectd | Graphite |
-|---|---|---|---|---|---|---|---|---|
-| Counter/monotonic sum | `c` | `c` | `Sum{monotonic:true}` | `counter` | via `Sum` type | untyped field | `COUNTER`, `DERIVE` | untyped → `Gauge` (temporality/monotonicity dropped, `docs/adr/graphite-carbon-relay.md`) |
-| Gauge | `g` (absolute) | `g` | `Gauge` | `gauge` | via type | untyped field | `GAUGE` | untyped → `Gauge` |
-| Relative gauge delta | `+`/`-` on `g` | `+`/`-` on `g` | — | — | — | — | — | — |
-| Temporality (delta/cumulative) | — (implicit delta) | — | explicit field | cumulative only (`_bucket`) | cumulative only, same as exposition (a native histogram's `reset_hint` is the one exception) | — | — | — |
-| Timer/raw samples | `ms` (server-summarized) | `ms` | — | — | — | — | — | — |
-| Distribution (sketch) | — | `d` | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram (in `logit`: a `summary` of 5 fixed quantiles, as on exposition -- native histograms are skipped) | — | — | none natively; `multi_value: expand` → `.count`/`.sum`/`.q0_5`…`.q0_99` sub-paths, else dropped |
-| Set/cardinality | `s` | `s` | — | — | — | — | — | none natively; `expand` → `.count`, else dropped |
-| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | `Histogram` | `histogram` | `_bucket{le}`/`_sum`/`_count` flat series, exactly as on exposition (supported, 1.0 and 2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped |
-| Histogram sum/count/min/max | — | — | yes | `_sum`/`_count` (no min/max) | yes | — | — | `expand` only (see row above) |
-| Exponential/native histogram | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) -- **skipped by `logit` in both directions**, counted, deferred to a follow-up (`docs/known-gaps.md`) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped |
-| Summary (pre-computed quantiles) | — | — | `Summary` | `summary` | — | — | — | none natively; `expand` → `.count`/`.sum`/`.q<q>`, else dropped |
-| Exemplars | — | — | yes | OpenMetrics only | yes, both versions (`TimeSeries.exemplars`) | — | — | — |
-| Unit | — | — | `Metric.unit` | `# UNIT` (OM) | via metadata, both versions (1.0 `MetricMetadata.unit`, 2.0 inline `Metadata`) | — | — | — |
-| Description | — | — | `Metric.description` | `# HELP` | via metadata, both versions (1.0 `MetricMetadata.help`, 2.0 inline `Metadata`) | — | — | — |
-| Start time | — | — | `start_time_unix_nano` | — (`_created`, OM) | `Sample.start_timestamp` (2.0 only; `TimeSeries` field 6 is `reserved`, and 1.0 has no field at all) | — | — | — |
-| Point timestamp | — | `\|T` (c/g only) | `time_unix_nano` (ns) | ms | ms | configurable, ns default | s or 2⁻³⁰s | s |
-| Collection interval | — | — | — | — | — | — | `Interval`/`IntervalHR` per value list | — |
-| Sample rate | `@rate` | `@rate` (not g/s) | — | — | — | — | — | — |
-| Tags/labels | none | string k:v, bare | typed `AnyValue` attrs | string labels | string labels (interned, 2.0) | string tag values | identity parts only | `k=v`, string |
-| Resource/scope identity | — | — | `Resource`+`Scope` | job/instance labels (convention) | job/instance labels | tags (convention) | host/plugin parts | path prefix (convention) |
-| schema_url | — | — | yes | — | — | — | — | — |
-| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `collectd.severity`) | — |
-| Container id | — | `\|c:` | resource attrs | — | — | — | — | — |
-| Multi-value point | `a:1:2:3\|c` | yes | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line (expandable — `multi_value: expand` renders several dotted sub-paths) |
-| No-recorded-value / stale marker | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — |
-| Int vs. float value | float only | float only | `oneof{int,double}` | float only (text) | float | typed (`i`/`u`/float) | typed per value-type | float only |
+| Feature | statsd | DogStatsD | Datadog intake | OTLP | Prometheus (exposition/OM) | Prom. remote-write | InfluxDB LP | collectd | Graphite |
+|---|---|---|---|---|---|---|---|---|---|
+| Counter/monotonic sum | `c` | `c` | `count` (a delta over `interval`) | `Sum{monotonic:true}` | `counter` | via `Sum` type | untyped field | `COUNTER`, `DERIVE` | untyped → `Gauge` (temporality/monotonicity dropped, `docs/adr/graphite-carbon-relay.md`) |
+| Gauge | `g` (absolute) | `g` | `gauge` | `Gauge` | `gauge` | via type | untyped field | `GAUGE` | untyped → `Gauge` |
+| Relative gauge delta | `+`/`-` on `g` | `+`/`-` on `g` | — | — | — | — | — | — | — |
+| Temporality (delta/cumulative) | — (implicit delta) | — | — (implicit delta; a `rate` is per second) | explicit field | cumulative only (`_bucket`) | cumulative only, same as exposition (a native histogram's `reset_hint` is the one exception) | — | — | — |
+| Timer/raw samples | `ms` (server-summarized) | `ms` | distribution points (raw values) | — | — | — | — | — | — |
+| Distribution (sketch) | — | `d` | sketches: DDSketch bins, the mapping assumed, not on the wire | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram (in `logit`: a `summary` of 5 fixed quantiles, as on exposition -- native histograms are skipped) | — | — | none natively; `multi_value: expand` → `.count`/`.sum`/`.q0_5`…`.q0_99` sub-paths, else dropped |
+| Set/cardinality | `s` | `s` | — (an Agent sends `s` as a gauge) | — | — | — | — | — | none natively; `expand` → `.count`, else dropped |
+| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | — | `Histogram` | `histogram` | `_bucket{le}`/`_sum`/`_count` flat series, exactly as on exposition (supported, 1.0 and 2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped |
+| Histogram sum/count/min/max | — | — | a sketch's `cnt`/`sum`/`min`/`max` | yes | `_sum`/`_count` (no min/max) | yes | — | — | `expand` only (see row above) |
+| Exponential/native histogram | — | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) -- **skipped by `logit` in both directions**, counted, deferred to a follow-up (`docs/known-gaps.md`) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped |
+| Summary (pre-computed quantiles) | — | — | — | `Summary` | `summary` | — | — | — | none natively; `expand` → `.count`/`.sum`/`.q<q>`, else dropped |
+| Exemplars | — | — | — | yes | OpenMetrics only | yes, both versions (`TimeSeries.exemplars`) | — | — | — |
+| Unit | — | — | series `unit` | `Metric.unit` | `# UNIT` (OM) | via metadata, both versions (1.0 `MetricMetadata.unit`, 2.0 inline `Metadata`) | — | — | — |
+| Description | — | — | — | `Metric.description` | `# HELP` | via metadata, both versions (1.0 `MetricMetadata.help`, 2.0 inline `Metadata`) | — | — | — |
+| Start time | — | — | — | `start_time_unix_nano` | — (`_created`, OM) | `Sample.start_timestamp` (2.0 only; `TimeSeries` field 6 is `reserved`, and 1.0 has no field at all) | — | — | — |
+| Point timestamp | — | `\|T` (c/g only) | s, always | `time_unix_nano` (ns) | ms | ms | configurable, ns default | s or 2⁻³⁰s | s |
+| Collection interval | — | — | series `interval` | — | — | — | — | `Interval`/`IntervalHR` per value list | — |
+| Sample rate | `@rate` | `@rate` (not g/s) | — | — | — | — | — | — | — |
+| Tags/labels | none | string k:v, bare | string k:v, bare | typed `AnyValue` attrs | string labels | string labels (interned, 2.0) | string tag values | identity parts only | `k=v`, string |
+| Resource/scope identity | — | — | `resources` (`host`, `device`, others) | `Resource`+`Scope` | job/instance labels (convention) | job/instance labels | tags (convention) | host/plugin parts | path prefix (convention) |
+| schema_url | — | — | — | yes | — | — | — | — | — |
+| Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | `/intake/` or `/api/v1/events` / `/api/v1/check_run` (in `logit`: DogStatsD's carriers) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `collectd.severity`) | — |
+| Container id | — | `\|c:` | — | resource attrs | — | — | — | — | — |
+| Multi-value point | `a:1:2:3\|c` | yes | several points per series | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line (expandable — `multi_value: expand` renders several dotted sub-paths) |
+| No-recorded-value / stale marker | — | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — |
+| Int vs. float value | float only | float only | float only | `oneof{int,double}` | float only (text) | float | typed (`i`/`u`/float) | typed per value-type | float only |
 
 ## Logs
 
@@ -322,22 +339,34 @@ No spec, only a convention: a line of text and the file path it came from. Docke
 driver writes one JSON object per line,
 `{"log": "...", "stream": "stdout"|"stderr", "time": "<RFC3339Nano>"}`, which adds which of the container's two streams the line came from.
 
+### Datadog logs intake
+
+Reference: <https://docs.datadoghq.com/api/latest/logs/>.
+
+`/api/v2/logs` takes a JSON array of objects, from an Agent or any HTTP client. `message`,
+`status`, `timestamp`, `hostname`, `service`, `ddsource`, and `ddtags` are reserved; every other
+key is an attribute, nested objects included. There's no numeric severity, only `status` as free
+text. The intake links a log to a trace from attributes it detects by name: Datadog's decimal
+`dd.trace_id`/`dd.span_id`, or OTel's hex `trace_id`/`span_id`. `logit`'s mapping is
+`crates/logit-proto/src/datadog/mod.rs`'s "Decode: logs" and "Encode: events → logs, events,
+service checks" sections.
+
 ### Logs comparison matrix
 
-| Feature | RFC 3164 | RFC 5424 | OTLP | Docker json-file |
-|---|---|---|---|---|
-| Severity granularity | 8 levels (in PRI) | 8 levels (in PRI) | 24 levels (6 named bands) | — |
-| Facility | 24 values (in PRI) | 24 values (in PRI) | — | — |
-| Timestamp precision | second, no year/tz | up to µs, full RFC 3339 | ns | ns (RFC3339Nano) |
-| Observed vs. event time | — (one timestamp) | — (one timestamp) | both, distinct fields | — |
-| Hostname/app/proc/msgid identity | hostname, tag, pid (informal) | all four, formal, capped, nilable | — (would ride as attributes) | — |
-| Structured data | — | `[SD-ID PARAM="v"]`, repeatable | attributes (typed) | — |
-| Body type | free text | free text or arbitrary octets | text, bytes, or structured `AnyValue` | text or embedded JSON |
-| Trace correlation | — | — | `trace_id`/`span_id`/`flags` | — |
-| Event name (category, not message) | — | — | `event_name` | — |
-| Dropped-attribute accounting | — | — | `dropped_attributes_count` | — |
-| Framing/injection constraint | none (`\n` implicit line end) | octet-counting or `\n` framing (TCP) | length-prefixed (protobuf/gRPC framing) | `\n`-delimited JSON |
-| Max length | none specified (implementations vary) | none specified (implementations vary) | none | none |
+| Feature | RFC 3164 | RFC 5424 | OTLP | Docker json-file | Datadog |
+|---|---|---|---|---|---|
+| Severity granularity | 8 levels (in PRI) | 8 levels (in PRI) | 24 levels (6 named bands) | — | `status`, free text (in `logit`: mapped onto 6 levels, raw kept) |
+| Facility | 24 values (in PRI) | 24 values (in PRI) | — | — | — |
+| Timestamp precision | second, no year/tz | up to µs, full RFC 3339 | ns | ns (RFC3339Nano) | ms, or an RFC 3339 string |
+| Observed vs. event time | — (one timestamp) | — (one timestamp) | both, distinct fields | — | — (one `timestamp`) |
+| Hostname/app/proc/msgid identity | hostname, tag, pid (informal) | all four, formal, capped, nilable | — (would ride as attributes) | — | `hostname`, `service`, `ddsource` |
+| Structured data | — | `[SD-ID PARAM="v"]`, repeatable | attributes (typed) | — | any other key, nested JSON |
+| Body type | free text | free text or arbitrary octets | text, bytes, or structured `AnyValue` | text or embedded JSON | `message`, text |
+| Trace correlation | — | — | `trace_id`/`span_id`/`flags` | — | attributes: `dd.trace_id`/`dd.span_id` (decimal) or `trace_id`/`span_id` (hex), detected by the intake |
+| Event name (category, not message) | — | — | `event_name` | — | — |
+| Dropped-attribute accounting | — | — | `dropped_attributes_count` | — | — |
+| Framing/injection constraint | none (`\n` implicit line end) | octet-counting or `\n` framing (TCP) | length-prefixed (protobuf/gRPC framing) | `\n`-delimited JSON | a JSON array per HTTP request |
+| Max length | none specified (implementations vary) | none specified (implementations vary) | none | none | 1 MB per log (truncated, still accepted); 1,000 logs and 5 MB per request |
 
 ## Traces
 
@@ -363,6 +392,27 @@ status: Status{message, code: UNSET|OK|ERROR}}`.
   `dropped_attributes_count`; `Span` also tracks `dropped_events_count`/`dropped_links_count`.
 - Nests the same way as metrics and logs: `ResourceSpans{resource, schema_url, scope_spans: []ScopeSpans{scope, schema_url, spans}}`.
 
+### Datadog Agent APM protocol
+
+References: the Datadog Agent's `pkg/trace/api` (the tracer API), `pkg/trace/writer` (the intake
+client), and `agent-payload`'s `trace/*.proto`.
+
+Two hops, each its own wire. A tracer sends a local Agent msgpack on `:8126`: `/v0.4/traces` (an
+array of traces, each an array of span maps), `/v0.5/traces` (a string table and 12-element span
+arrays), or `/v0.7/traces` (one `TracerPayload`), plus its own client stats on `/v0.6/stats`. The
+Agent processes the spans and sends the intake a protobuf `AgentPayload` on `/api/v0.2/traces`
+and a msgpack `StatsPayload` on `/api/v0.2/stats`. Datadog derives no trace metrics from spans:
+the stats are the only source of a service's hits, errors, and latency.
+
+A span has `service`, `name`, `resource`, and `type` strings; uint64 `trace_id`, `span_id`, and
+`parent_id`; `start` and `duration` in ns; an `error` flag; `meta` (string to string), `metrics`
+(string to double), and `meta_struct` (string to bytes); and span links and events. A 128-bit
+trace id carries its high 64 bits as 16 hex characters in `meta["_dd.p.tid"]` on the first span
+of a chunk. A stats bucket groups hits, errors, and durations by service, name, resource, type,
+kind, and status code, with ok and error latency as DDSketch protobufs that carry their own
+mapping. `logit`'s mapping is `crates/logit-proto/src/datadog/mod.rs`'s "Traces" and "APM stats"
+sections.
+
 ### W3C Trace Context, Zipkin, Jaeger (reference only — not implemented as `logit` codecs)
 
 References: <https://www.w3.org/TR/trace-context/>, <https://zipkin.io/zipkin-api/>,
@@ -377,16 +427,16 @@ support the claim that OTLP is the superset among trace formats `logit` might br
 
 ### Traces comparison matrix
 
-| Feature | OTLP | W3C Trace Context (header only) | Zipkin | Jaeger |
-|---|---|---|---|---|
-| Trace/span id | 16/8 bytes | 16/8 bytes (hex in header) | 16 or 8 bytes, hex | 16 bytes, hex |
-| Parent reference | `parent_span_id` | (implicit: the incoming header) | `parentId` | `references` (CHILD_OF/FOLLOWS_FROM) |
-| trace_state (vendor extension) | yes | yes (`tracestate` header) | — | — |
-| Flags (sampled, remote-parent) | yes, both on span and on links | sampled bit only | — (`debug` annotation convention) | — |
-| Kind | 5 values | — | 4 values (client/server/producer/consumer) | tag convention |
-| Events (timestamped annotations) | yes, with own attrs + dropped count | — | `annotations` (timestamp+value only) | `logs` (timestamp + fields) |
-| Status + message | code + message | — | — (tag convention) | tag convention |
-| Dropped-attribute/event/link counts | yes, per sub-message | — | — | — |
+| Feature | OTLP | Datadog | W3C Trace Context (header only) | Zipkin | Jaeger |
+|---|---|---|---|---|---|
+| Trace/span id | 16/8 bytes | uint64 each; a 128-bit trace id's high half as `_dd.p.tid` (hex) in `meta` | 16/8 bytes (hex in header) | 16 or 8 bytes, hex | 16 bytes, hex |
+| Parent reference | `parent_span_id` | `parent_id` (0 = root) | (implicit: the incoming header) | `parentId` | `references` (CHILD_OF/FOLLOWS_FROM) |
+| trace_state (vendor extension) | yes | on span links only | yes (`tracestate` header) | — | — |
+| Flags (sampled, remote-parent) | yes, both on span and on links | on span links only; a trace chunk's sampling `priority` instead | sampled bit only | — (`debug` annotation convention) | — |
+| Kind | 5 values | `meta["span.kind"]` convention | — | 4 values (client/server/producer/consumer) | tag convention |
+| Events (timestamped annotations) | yes, with own attrs + dropped count | `span_events`, typed attrs, no dropped count | — | `annotations` (timestamp+value only) | `logs` (timestamp + fields) |
+| Status + message | code + message | `error` (int) + `meta` tag convention | — | — (tag convention) | tag convention |
+| Dropped-attribute/event/link counts | yes, per sub-message | — | — | — | — |
 
 ## Superset requirements
 
@@ -420,5 +470,5 @@ the residual debt, which `docs/known-gaps.md` tracks.
 12. Syslog structured data round-trips as structured data, not as discarded bytes.
 13. Syslog's 8-level severity, facility, and the sender's own origin timestamp all survive a relay,
     independent of the normalized `Severity`/receipt-time fields.
-14. DogStatsD's container id, `|T` timestamp, events, and service checks are representable, not
-    silently ignored.
+14. DogStatsD's container id, `|T` timestamp, `|e:` external data, `|card:` cardinality, events,
+    and service checks are representable, not silently ignored.

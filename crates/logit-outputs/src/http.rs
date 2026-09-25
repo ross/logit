@@ -8,10 +8,14 @@
 //! ambiguous, every other 4xx is permanent, only a connect failure is clean. Two copies of one
 //! table are two things to drift.
 //!
+//! [`split_encode`] is the request splitter `datadog_out` and `datadog_trace_out` share: both cut a
+//! batch into requests under a per-route entry count and body size.
+//!
 //! `influxdb.rs` keeps its own `status_class`/`classify_transport_error` pair (the same table
 //! today) and builds its own client, so [`build_client`]'s redirect policy doesn't reach it, a
 //! tracked gap in `docs/known-gaps.md`.
 
+use bytes::Bytes;
 use logit_pipeline::Fault;
 use std::time::Duration;
 
@@ -131,6 +135,87 @@ pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
     }
 }
 
+/// One route's request limits; `usize::MAX` is no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caps {
+    /// Entries per request, by [`split_encode`]'s weight.
+    pub entries: usize,
+    /// The body before compression.
+    pub raw_bytes: usize,
+    /// The body as sent.
+    pub wire_bytes: usize,
+}
+
+impl Caps {
+    pub const UNBOUNDED: Caps =
+        Caps { entries: usize::MAX, raw_bytes: usize::MAX, wire_bytes: usize::MAX };
+}
+
+/// One encoded request body, with whatever else the encoder reported about it (`meta`).
+#[derive(Debug)]
+pub(crate) struct Encoded<M = ()> {
+    /// As sent: compressed, when the route compresses.
+    pub body: Bytes,
+    /// Before compression.
+    pub raw_len: usize,
+    pub meta: M,
+}
+
+/// [`split_encode`]'s result: the requests to send, in order, and the items too big to send alone.
+#[derive(Debug)]
+pub(crate) struct Split<T, M = ()> {
+    pub requests: Vec<(Vec<T>, Encoded<M>)>,
+    /// Each with its encoded size (uncompressed, as sent).
+    pub oversize: Vec<(T, usize, usize)>,
+}
+
+/// Cuts `items` into requests under `caps`: by entry count first (`weight` per item; an item
+/// heavier than the cap goes alone), then, for a chunk whose encoded body is over a byte cap, by
+/// bisection and re-encoding down to one item, which is reported oversize if it still doesn't
+/// fit. A chunk `encode` returns `None` for sends nothing. Order is kept.
+pub(crate) fn split_encode<T: Copy, M>(
+    items: &[T],
+    caps: Caps,
+    weight: impl Fn(&T) -> usize,
+    mut encode: impl FnMut(&[T]) -> Option<Encoded<M>>,
+) -> Split<T, M> {
+    let mut split = Split { requests: Vec::new(), oversize: Vec::new() };
+    let mut start = 0;
+    let mut entries = 0usize;
+    for (i, item) in items.iter().enumerate() {
+        let w = weight(item);
+        if i > start && entries.saturating_add(w) > caps.entries {
+            fit(&items[start..i], caps, &mut encode, &mut split);
+            start = i;
+            entries = 0;
+        }
+        entries = entries.saturating_add(w);
+    }
+    if start < items.len() {
+        fit(&items[start..], caps, &mut encode, &mut split);
+    }
+    split
+}
+
+/// [`split_encode`]'s byte-cap half, for one count-capped chunk.
+fn fit<T: Copy, M, F: FnMut(&[T]) -> Option<Encoded<M>>>(
+    items: &[T],
+    caps: Caps,
+    encode: &mut F,
+    split: &mut Split<T, M>,
+) {
+    let Some(encoded) = encode(items) else { return };
+    if encoded.raw_len <= caps.raw_bytes && encoded.body.len() <= caps.wire_bytes {
+        split.requests.push((items.to_vec(), encoded));
+    } else if let [item] = items {
+        split.oversize.push((*item, encoded.raw_len, encoded.body.len()));
+    } else {
+        let mid = items.len() / 2;
+        fit(&items[..mid], caps, encode, split);
+        fit(&items[mid..], caps, encode, split);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +250,44 @@ mod tests {
         assert!(is_retryable_http_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE));
         assert!(!is_retryable_http_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    fn fake_encode(items: &[u32]) -> Option<Encoded> {
+        let raw_len: usize = items.iter().map(|&i| i as usize).sum();
+        Some(Encoded { body: Bytes::from(vec![0; raw_len / 2]), raw_len, meta: () })
+    }
+
+    fn chunks(split: &Split<u32>) -> Vec<Vec<u32>> {
+        split.requests.iter().map(|(items, _)| items.clone()).collect()
+    }
+
+    /// Entries fill a request up to the cap by weight; an item heavier than the cap goes alone.
+    #[test]
+    fn the_splitter_cuts_by_entry_count_first() {
+        let caps = Caps { entries: 5, ..Caps::UNBOUNDED };
+        let split = split_encode(&[2, 2, 2, 9, 1], caps, |&w| w as usize, fake_encode);
+        assert_eq!(chunks(&split), [vec![2, 2], vec![2], vec![9], vec![1]]);
+        assert!(split.oversize.is_empty());
+    }
+
+    /// Over a byte cap the chunk bisects, and one item still over it is reported, not sent.
+    #[test]
+    fn the_splitter_bisects_over_a_byte_cap_and_reports_a_lone_oversize_item() {
+        let caps = Caps { raw_bytes: 10, ..Caps::UNBOUNDED };
+        let split = split_encode(&[4, 4, 4, 30, 1], caps, |_| 1, fake_encode);
+        assert_eq!(chunks(&split), [vec![4, 4], vec![4], vec![1]]);
+        assert_eq!(split.oversize, [(30, 30, 15)]);
+
+        let caps = Caps { wire_bytes: 3, ..Caps::UNBOUNDED };
+        let split = split_encode(&[4, 4, 8], caps, |_| 1, fake_encode);
+        assert_eq!(chunks(&split), [vec![4], vec![4]]);
+        assert_eq!(split.oversize, [(8, 8, 4)]);
+    }
+
+    /// A chunk the encoder has nothing for sends nothing.
+    #[test]
+    fn the_splitter_skips_a_chunk_that_encodes_to_nothing() {
+        let split = split_encode(&[1, 2], Caps::UNBOUNDED, |_| 1, |_| None::<Encoded>);
+        assert!(split.requests.is_empty() && split.oversize.is_empty());
     }
 }

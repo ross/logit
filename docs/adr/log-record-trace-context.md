@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-18
+updated: 2026-09-24
 ---
 
 # `LogRecord` gains a native application trace/span reference
@@ -11,7 +11,8 @@ Accepted. Partially superseded on 2026-09-04 by
 `traceparent` string is a script's job" stance (`trace_context.rs`'s original doc comment, quoted
 below) is revisited there — `trace_context` now parses a `traceparent` header natively for its
 trace id and flags. Everything else here — `TraceRef`'s shape, the lenient-decode/strict-span-id
-asymmetry, the `trace` global vs. `event.log.trace_id` distinction — stands unchanged.
+asymmetry, the `trace` global vs. `event.log.trace_id` distinction — stands unchanged. Amended
+2026-09-24: `trace_context` reads Datadog's id formats under `format: datadog` (below).
 
 ## Context
 
@@ -122,3 +123,60 @@ script copying one onto the other (`event.log.trace_id = trace.trace_id`, stampi
 - Every `LogRecord { .. }` construction site in the tree (28 of them, 3 production) gained
   `trace: None` explicitly — no `Default` impl, no constructor, matching the existing
   `SpanRecord`-literal style everywhere else in this codebase.
+
+## Amendment: Datadog id formats (2026-09-24)
+
+A Datadog tracer's log injection writes `dd.trace_id` and `dd.span_id` into each log line as
+decimal uint64 strings, or `dd.trace_id` as 32 lowercase hex when the tracer generates 128-bit
+ids. A Datadog span carries a 128-bit id's high half separately, in `_dd.p.tid` (1 to 16 hex).
+`trace_context` accepted only 32-hex trace ids and 16-hex span ids, so a Datadog-instrumented
+application's logs never got a `TraceRef`
+([`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) §9).
+
+**`format:` selects the id grammar; nothing is inferred from the value.** `trace_context` gains
+`format: otel | datadog`, `otel` by default and unchanged. Under `datadog`:
+
+- `trace_id`, `span_id`, and `flags` default to `dd.trace_id`, `dd.span_id`, and no flags lookup.
+  An explicit name or `null` still overrides a default, under either format.
+- A trace id is a decimal uint64 (the low 64 bits, high half zero) or 32 hex. A span id is a
+  decimal uint64. 16 hex is not a Datadog form and is `invalid`.
+- An optional `trace_id_high` names an attribute holding the high 64 bits in `_dd.p.tid`'s form. It
+  applies only when the parsed trace id's high half is zero, so a 32-hex id's own high half always
+  wins. It's parsed whenever present, like `flags`: a bad value is `invalid` even when a 128-bit id
+  leaves it unused. It's consumed with the other ids unless `keep_source`. Graph rule 68 rejects it
+  under `format: otel`, where every trace id already has its high half.
+- `traceparent` is still honored, and `span.parent_id` stays 16 hex under either format: both are
+  W3C names, not Datadog ones.
+
+The one ambiguous input is a 16-digit all-digit string, valid as both 16 hex and a decimal uint64.
+It's hex under `otel` and decimal under `datadog`, and never guessed from the value: a heuristic
+(say, "digits only means decimal") would silently misread any OTel span id that happens to contain
+no `a`-`f`, about 1 in 1,800 of them, as a different id.
+
+**Integer values are accepted under `datadog` only.** A JSON logger that writes the id unquoted
+(`"dd.trace_id": 1234567890123456789`) reaches `trace_context` as a `U64` or `I64` after `json`.
+Under `datadog` that integer is the id; a float never is, since an `f64` can't hold a 64-bit id
+exactly. `otel` ids stay strings only, since a hex id has no integer form.
+
+**The parsers live in `logit_core::trace`** (`parse_trace_id_datadog`, `parse_span_id_datadog`,
+`parse_trace_id_high`, `trace_id_bytes`, `trace_id_halves`), shared with the Datadog trace codec in
+`logit_proto::datadog::traces`, so a Datadog id means one thing in a log and in a span.
+
+Consequences:
+
+- `datadog_out` writes a log's `TraceRef` as top-level `trace_id` (32 lowercase hex) and, when the
+  ref has one, `span_id` (16 lowercase hex): the OTel form Datadog's log intake detects. So the
+  default consumption in `trace_context` still correlates at Datadog, with no `keep_source`.
+- A log whose attributes already carry `trace_id` or `span_id` keeps them and gets no ids from its
+  `TraceRef`. `datadog_in` decodes neither key into a `TraceRef`, so an intake log relayed through
+  `datadog_in -> datadog_out` goes back out unchanged, and that pair's fixed point holds.
+
+Alternatives considered:
+
+- **One `parse_*_any` that accepts every form.** Rejected: it has to pick a reading for the
+  16-digit case, which is the guess this amendment rules out, and no caller needs all forms at
+  once.
+- **Auto-detecting `dd.trace_id` beside `trace.id` under one format.** Rejected for the same
+  reason, and because it would make which attribute won depend on what a line happened to carry.
+- **A separate `datadog_trace_context` kind.** Rejected: the lift, the skip reasons, the span block,
+  and the consumed-attribute rule are identical; only the id grammar differs.

@@ -1,0 +1,10 @@
+method: POST
+path: /intake/
+host: capture:8080
+user-agent: datadog-agent/7.83.3
+content-length: 172
+content-encoding: zstd
+content-type: application/json
+dd-agent-version: 7.83.3
+dd-api-key: logit-record
+accept-encoding: gzip

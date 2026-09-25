@@ -61,16 +61,18 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
 }
 
-/// `MetricKind`'s two largest variants, sized to match: `Distribution` niche-fills its tag inside
-/// `DDSketch`'s 176 bytes, and `SAMPLES_INLINE = 19` keeps `Samples` at 168 so its tag fits in the
-/// same envelope (`SAMPLES_INLINE`'s doc in `metric.rs`).
+/// `MetricKind`'s two largest variants, sized to match: `Distribution` inlines a `DdSketch`, now
+/// 128 bytes hand-rolled, down from a wrapped `sketches_ddsketch::DDSketch`'s 176, and
+/// `SAMPLES_INLINE = 19` keeps `Samples` at 168 -- still needing a real discriminant, since it
+/// doesn't niche the way `DdSketch` used to -- so `Samples` plus its tag is what now sizes
+/// `MetricKind` at 176 (`SAMPLES_INLINE`'s doc in `metric.rs`).
 #[test]
 fn metric_kind_is_sized_by_its_two_largest_variants() {
     assert_eq!(
         size_of::<DdSketch>(),
-        176,
-        "sketches_ddsketch::DDSketch inlined directly (no Box): two Stores (a Vec plus \
-         bookkeeping each) and a Config"
+        128,
+        "a Mapping (kind, gamma, gamma_ln, offset, bin_limit), two bin Vecs, and the f64 \
+         summary (zero_count, count, min, max, sum) plus the exact-stats flag"
     );
     assert_eq!(
         size_of::<Samples>(),
@@ -81,10 +83,9 @@ fn metric_kind_is_sized_by_its_two_largest_variants() {
     assert_eq!(
         size_of::<MetricKind>(),
         176,
-        "sized by the larger of its two big variants (Distribution's inlined DDSketch, at 176) \
-         plus room for a real discriminant that Samples's own 168-byte payload leaves inside that \
-         envelope -- every other variant (Sum/Gauge/GaugeDelta/SetMembers/Set/Histogram/\
-         ExponentialHistogram/Summary) is far smaller and pays the same 176 regardless"
+        "sized by its largest variant, Samples at 168, plus a real discriminant -- every other \
+         variant (Distribution's 128-byte DdSketch included, and Sum/Gauge/GaugeDelta/SetMembers/\
+         Set/Histogram/ExponentialHistogram/Summary) is smaller and pays the same 176 regardless"
     );
     assert_eq!(
         size_of::<MetricRecord>(),

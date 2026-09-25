@@ -1,0 +1,11 @@
+method: POST
+path: /api/v2/series
+host: capture:8080
+user-agent: datadog-agent/7.83.3
+content-length: 2953
+content-encoding: zstd
+content-type: application/x-protobuf
+dd-agent-payload: v5.0.207
+dd-agent-version: 7.83.3
+dd-api-key: logit-record
+accept-encoding: gzip
