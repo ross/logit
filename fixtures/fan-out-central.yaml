@@ -1,5 +1,5 @@
-# One connection, N streams: the central half. examples/fan-out-edge.yaml is the far side and
-# says how to run both together; examples/forwarder-central.yaml has the `logit_in` field
+# One connection, N streams: the central half. fixtures/fan-out-edge.yaml is the far side and
+# says how to run both together; fixtures/forwarder-central.yaml has the `logit_in` field
 # reference this file doesn't repeat.
 #
 # Topology (this file):
@@ -30,7 +30,7 @@ components:
     #                                         once per batch rather than once per event.
     #   by: {provenance: origin}          -- route on which listener the event arrived through:
     #     routes: {host_in: host_stream, app_in: app_stream}
-    #                                      -- reads examples/fan-out-edge.yaml's listener ids off
+    #                                      -- reads fixtures/fan-out-edge.yaml's listener ids off
     #                                         the wire, so the edge needs no `set`, at the cost of
     #                                         coupling this file to the edge's component ids.
 

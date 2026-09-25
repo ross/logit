@@ -7,7 +7,7 @@
 #                 ├─> traced (trace_context) ─> sampled (sample) ─> out (stdio_out)
 #   gen_flagged ──┘
 #
-#   logit run examples/sample-traces.yaml | grep -o 'trace_id=[0-9a-f]*' | sort | uniq -c
+#   logit run fixtures/sample-traces.yaml | grep -o 'trace_id=[0-9a-f]*' | sort | uniq -c
 #
 # prints the trace ids that survived and how many events each kept: about half of the ten, each
 # with all 100 of its events plus the flagged ones, and the same half every run, because the

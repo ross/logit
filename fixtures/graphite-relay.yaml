@@ -9,7 +9,7 @@
 # (`logit.output.metrics.skipped`) with a throttled diagnostic. Both protocols work in both
 # directions, and this sink's `protocol:`/`transport:` need not match `graphite_in`'s.
 #
-# No `aggregate`, unlike examples/statsd-to-graphite.yaml: a carbon datapoint already carries its
+# No `aggregate`, unlike fixtures/statsd-to-graphite.yaml: a carbon datapoint already carries its
 # own second. Add one only when you want to re-window.
 #
 # There is no `graphite.*` namespace: the dotted path is `MetricRecord.name`, so a `lua`/`set`

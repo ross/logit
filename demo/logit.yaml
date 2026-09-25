@@ -577,7 +577,7 @@ components:
   # `http.server.request.duration` plus `user_agent.class`, each bounded by `http_access` (a route
   # or class from config or a built-in table, a normalized method, an integer status).
   # `server.address` is the Host header, unclamped here because the traffic generator only ever
-  # sends one; `examples/nginx-to-influxdb.yaml`'s `bounded` is the worked `keep_values` clamp for
+  # sends one; `fixtures/nginx-to-influxdb.yaml`'s `bounded` is the worked `keep_values` clamp for
   # it. `http.termination_state` is HAProxy-only, so it's simply not a tag on nginx events, and a
   # field a tier doesn't log at all (nginx's line carries no `url.scheme`,
   # `network.protocol.version`, or user agent) is likewise just absent. The trace/span attributes

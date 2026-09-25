@@ -43,7 +43,7 @@ components:
 
   # collectd's `network` plugin on collectd's own default port: one event per value list, N metric
   # records in wire order for an N-data-source type. No `types_db:`: nothing downstream reads a
-  # data-source name, and the wire is unaffected by it either way (examples/collectd-relay.yaml).
+  # data-source name, and the wire is unaffected by it either way (fixtures/collectd-relay.yaml).
   collectd_network:
     type: collectd_in
     bind: 0.0.0.0:25826

@@ -1,5 +1,5 @@
 # statsd/DogStatsD in, a 10s aggregation window, Graphite/Carbon out: the cross-protocol
-# counterpart to examples/graphite-relay.yaml, for pointing a statsd-speaking fleet at a Carbon
+# counterpart to fixtures/graphite-relay.yaml, for pointing a statsd-speaking fleet at a Carbon
 # stack (docs/adr/graphite-carbon-relay.md). Change `endpoint` to your carbon receiver.
 #
 # `aggregate` does real work here: a carbon datapoint is one number, so a window of counter
@@ -43,4 +43,4 @@ components:
     # max_packet_bytes: "1432"   # udp only: one datagram's worth of packed lines
     # max_frame_bytes: "1MiB"    # one pickle frame, regardless of transport
     # connect_timeout: 5s        # tcp only
-    # buffer: (all defaults; examples/statsd-to-influxdb.yaml has the full block)
+    # buffer: (all defaults; fixtures/statsd-to-influxdb.yaml has the full block)

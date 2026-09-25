@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/validate
-# Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*.yaml,
-# perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml, and tools/victoria-interop/logit-*.yaml
+# Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/logit.yaml,
+# fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml, and tools/victoria-interop/logit-*.yaml
 # (that directory's other YAML is compose and vmagent config). Not part of script/cibuild;
 # script/test's `every_shipped_config_loads_and_validates` covers the same set.
 #
@@ -13,13 +13,14 @@ SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 export INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-logit-dev-token}"
-# examples/prometheus-remote-write-send.yaml's `headers:` map. The whole header value, `Bearer `
+# fixtures/prometheus-remote-write-send.yaml's `headers:` map. The whole header value, `Bearer `
 # prefix included: `!env` substitutes a field rather than interpolating into one.
 export PROMETHEUS_REMOTE_WRITE_AUTHORIZATION="${PROMETHEUS_REMOTE_WRITE_AUTHORIZATION:-Bearer logit-dev-token}"
-# examples/datadog-intake-standin.yaml's `api_keys:` list (the one key its Agents send as
-# `DD-API-KEY`) and examples/datadog-direct.yaml's `api_key`.
+# fixtures/datadog-intake-standin.yaml's `api_keys:` list (the one key its Agents send as
+# `DD-API-KEY`), fixtures/datadog-direct.yaml's `api_key`, and examples/canonical/logit.yaml's
+# `api_key` and `dd-api-key` header.
 export DD_API_KEY="${DD_API_KEY:-logit-dev-key}"
-# examples/splunk-observability.yaml's `headers:` map (the `X-SF-Token` an org sends to
+# fixtures/splunk-observability.yaml's `headers:` map (the `X-SF-Token` an org sends to
 # Observability Cloud).
 export SPLUNK_OBSERVABILITY_TOKEN="${SPLUNK_OBSERVABILITY_TOKEN:-logit-dev-token}"
 
@@ -31,8 +32,8 @@ fi
 cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
-for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml tools/shape-survey/configs/*.yaml \
-    tools/victoria-interop/logit-*.yaml; do
+for config in demo/logit.yaml examples/*/logit.yaml fixtures/*.yaml perf/scenarios/*.yaml \
+    tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done

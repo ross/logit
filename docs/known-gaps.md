@@ -142,7 +142,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     something other than a user's own naming mistake. Mitigation: [`docs/deploying.md`](deploying.md)
     recommends `keep` in front of `otlp_in` specifically, beyond the general
     `aggregate`-cardinality recommendation
-    [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) demonstrates.
+    [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) demonstrates.
   - **`flatten` adds no new bound, by design** (`crates/logit-transforms/src/flatten.rs`,
     [ADR `flatten-transform`](adr/flatten-transform.md)). Its marginal exposure over
     `json`/`syslog_in`/`otlp_in`: path *combinations* of already-interned keys (a product, bounded by
@@ -1321,7 +1321,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [Admin endpoint, readiness, and release image](#admin-endpoint-readiness-and-release-image)), this
   is a deferred gap: `bind:` is required, so every `prometheus_out` is listening, and the payload is
   the full metric surface, which reveals far more than a lifecycle phase. Workaround:
-  `examples/prometheus-expose.yaml` binds `127.0.0.1`, and the field's doc comment says to keep it
+  `fixtures/prometheus-expose.yaml` binds `127.0.0.1`, and the field's doc comment says to keep it
   loopback or pod-local behind something with both. Server-side TLS would reuse `logit-inputs`'
   existing builder (`otlp_in`'s `tls:`); auth has no in-tree precedent on any listener, so it needs a
   decision on the kind (bearer, mTLS) before code.
@@ -1335,7 +1335,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   "`prometheus_out` has no TLS and no auth either"), for the same reason: auth has no in-tree precedent, so the kind (bearer,
   mTLS subject matching) needs deciding first. Until then, bind loopback or pod-local and front it
   with something that authenticates
-  ([`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml);
+  ([`fixtures/prometheus-remote-write-receive.yaml`](../fixtures/prometheus-remote-write-receive.yaml);
   `docs/deploying.md`'s "Prometheus remote-write" section).
 - **1.0 remote-write typing depends on the metadata cache, which is bounded and therefore lapses**
   ([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "The receiver is stateless";
@@ -1783,7 +1783,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **A pathological Host header can truncate the syslog-bound JSON line -- but nginx's own header-size
   limit turns out to make that hard to actually trigger.** `$host` is unbounded and
   attacker-controlled behind a public IP, while the example's lean `log_format`
-  (`examples/nginx/nginx.conf`, originally `access_json_syslog`, now `access_semconv`) sizes its
+  (`fixtures/nginx/nginx.conf`, originally `access_json_syslog`, now `access_semconv`) sizes its
   fixed fields well under nginx's syslog message cap. Measured against nginx 1.31.4 (workstream F,
   `docs/plans/nginx-integration.md`): under default settings an oversized `Host` never reaches
   nginx's syslog writer. `large_client_header_buffers` (4 8k by default) rejects any request whose
@@ -1806,7 +1806,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
   The other two halves of the `$host` exposure are closed (2026-09-16, 2026-09-22). *Cardinality:*
   `nginx.conf` serves exactly two vhosts, but a junk `Host` used to become its own unbounded series
-  in `aggregate` and InfluxDB; `examples/nginx-to-influxdb.yaml`'s `bounded` component
+  in `aggregate` and InfluxDB; `fixtures/nginx-to-influxdb.yaml`'s `bounded` component
   (`keep_values`, `docs/adr/value-allowlist-cardinality-clamp.md`) now clamps it to the two real
   vhosts ahead of `aggregate`, folding anything else into one `other`-tagged series. It clamps
   `server.address` now, not `host`. *Length:* the lean format logs `$host` as `server.address`, and

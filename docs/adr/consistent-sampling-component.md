@@ -171,7 +171,7 @@ exists for the central-collector rates where per-event telemetry calls are the c
   future adoption knows what it is changing.
 - `sample` is a per-event decision and never looks at a batch, so a resource-keyed sampler keeps
   or drops every event of a resource — which is the point of keying on one.
-- [`examples/sample-traces.yaml`](../../examples/sample-traces.yaml) is the runnable shape:
+- [`fixtures/sample-traces.yaml`](../../fixtures/sample-traces.yaml) is the runnable shape:
   `generate_in` → `trace_context` → `sample` (`key: trace_id`, an `always_keep` flag) →
   `stdio_out`, so "the same traces survive on every run, every span of each" can be seen rather
   than trusted. `demo/` is unchanged: it keeps every trace on purpose.

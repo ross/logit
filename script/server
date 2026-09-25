@@ -1,14 +1,14 @@
 #!/bin/bash
 # Usage: script/server [config-file]
 # Starts the local InfluxDB, Grafana, and nginx stack and runs `logit run` against a config file
-# (default: examples/statsd-to-influxdb.yaml). examples/nginx-to-influxdb.yaml exercises the nginx
+# (default: fixtures/statsd-to-influxdb.yaml). fixtures/nginx-to-influxdb.yaml exercises the nginx
 # service.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-CONFIG="${1:-examples/statsd-to-influxdb.yaml}"
+CONFIG="${1:-fixtures/statsd-to-influxdb.yaml}"
 
 # Execs into the `up`-managed `dev` container, not through common.sh's `run`: compose applies the
 # `logit` network alias only to the `up` container, not to a `compose run` one. nginx resolves
