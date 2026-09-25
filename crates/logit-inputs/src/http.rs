@@ -1,9 +1,12 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
-//! `prometheus_in`'s remote-write receiver, `datadog_in`, and `datadog_trace_in`): the
-//! idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver that acts on it
-//! ([`drive_with_idle`]), and the bounded request-body read. The two Datadog listeners also share
-//! their request helpers here: `Content-Encoding` and `Content-Type` parsing, bounded
-//! decompression, Datadog's JSON response shapes, and the deadline-bounded delivery.
+//! `prometheus_in`'s remote-write receiver, `datadog_in`, and `datadog_trace_in`): the connection
+//! builders that pin hyper's HTTP/2 settings ([`auto_builder`], [`h2_builder`]), the idle-timeout
+//! tracker ([`Activity`], [`InFlight`]), the connection driver that acts on it
+//! ([`drive_with_idle`]), and the bounded request-body read ([`collect_with_stall_bound`], which
+//! holds one buffer per body however many reads it arrives in). All four listeners build and
+//! read through these. The two Datadog listeners also share their request helpers here:
+//! `Content-Encoding` and `Content-Type` parsing, bounded decompression, Datadog's JSON response
+//! shapes, and the deadline-bounded delivery.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -18,11 +21,56 @@
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
+use hyper::server::conn::http2;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::server::conn::auto;
 use logit_core::Telemetry;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+
+/// The most concurrent HTTP/2 streams one connection may open: hyper 1.11.1's own server default,
+/// pinned here so a hyper upgrade cannot move it.
+///
+/// A listener's worst case is `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 ×
+/// MAX_REQUEST_BYTES`: a compressed body and its decompressed copy on every stream of every
+/// connection. For `otlp_in` that is 1024 × 200 × 2 × 4 MiB = 1.6 TiB, a bound on what peers could
+/// make the process try to allocate, not a memory budget
+/// (`docs/adr/untrusted-input-bounds.md`'s "HTTP and gRPC listeners" section).
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 200;
+
+/// Stream resets a peer may cause before they are accepted, after which h2 sends `GOAWAY`: h2
+/// 0.4.19's `DEFAULT_REMOTE_RESET_STREAM_MAX`, which hyper applies when this is left unset. The
+/// rapid-reset (CVE-2023-44487) bound.
+const MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 20;
+
+/// The `SETTINGS_MAX_HEADER_LIST_SIZE` advertised: hyper 1.11.1's server default of 16 KiB.
+const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+
+/// The HTTP/1.1-and-h2c builder every `auto` listener serves through, with the h2 settings
+/// above set explicitly. `otlp_in`'s HTTP transport, `prometheus_in`'s receiver, `datadog_in`,
+/// and `datadog_trace_in` build here.
+pub(crate) fn auto_builder() -> auto::Builder<TokioExecutor> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http2()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_pending_accept_reset_streams(MAX_PENDING_ACCEPT_RESET_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+    builder
+}
+
+/// The HTTP/2-only builder, for `otlp_in`'s gRPC transport, with the same settings as
+/// [`auto_builder`].
+pub(crate) fn h2_builder() -> http2::Builder<TokioExecutor> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_pending_accept_reset_streams(MAX_PENDING_ACCEPT_RESET_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+    builder
+}
 
 /// One connection's idle state, shared between its service and [`drive_with_idle`].
 ///

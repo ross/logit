@@ -250,6 +250,8 @@
 //! streaming decode that stops one byte past the cap. So a compression bomb is rejected rather
 //! than inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
 //! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
+//! An HTTP/2 connection carries up to [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once, so
+//! the listener's worst case is the product [`MAX_CONCURRENT_CONNECTIONS`] states.
 //! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
 //! listener, its first byte on a plaintext one. None of the three is a config field: the first
 //! two are denial-of-service bounds rather than tuning knobs, and graph rule 45's
@@ -317,8 +319,7 @@ use http::{Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
@@ -770,10 +771,13 @@ impl Input for PrometheusInput {
 /// operator who hits this has a misconfigured sender.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`PrometheusReceiver`] serves at once, so [`MAX_REQUEST_BYTES`] bounds
-/// the listener's worst case rather than one connection's. The same 1024 as `otlp_in`,
-/// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
-/// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
+/// Bounds the connections [`PrometheusReceiver`] serves at once. The listener's worst case is this
+/// times [`crate::http::MAX_CONCURRENT_STREAMS`] (200 streams per HTTP/2 connection) times twice
+/// [`MAX_REQUEST_BYTES`] (a compressed body and its decompressed copy): 1024 × 200 × 2 × 4 MiB =
+/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget.
+/// The same 1024 as `otlp_in`, `logit_in` and `crate::tcp`'s listeners: no protocol reason to
+/// differ, and one figure for an operator to learn. A connection past the cap is **rejected, not
+/// queued**, as on those.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// How long a connection has, per pre-request phase, before this listener releases its
@@ -1365,7 +1369,7 @@ where
     });
     // Bound to a local: `auto::Connection` borrows its builder, so a temporary would not live long
     // enough to be held across `drive_with_idle`'s loop.
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
     drive_with_idle(
         conn,

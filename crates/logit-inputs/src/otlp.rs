@@ -132,9 +132,10 @@
 //!
 //! **Size and concurrency limits.** [`MAX_REQUEST_BYTES`] (4 MiB) matches the OTel collector's
 //! default `max_recv_msg_size`; a larger request is rejected (`413`/`grpc-status: 8`,
-//! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection;
-//! [`MAX_CONCURRENT_CONNECTIONS`] bounds how many are served at once, so the listener's worst-case
-//! memory is finite.
+//! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one request;
+//! [`crate::http::MAX_CONCURRENT_STREAMS`] bounds the requests on one HTTP/2 connection and
+//! [`MAX_CONCURRENT_CONNECTIONS`] how many connections are served at once, so the listener's
+//! worst-case memory is finite ([`MAX_CONCURRENT_CONNECTIONS`] has the product).
 //!
 //! **`partial_success` is always empty on a successful decode.** It exists to report which
 //! records in an accepted request were rejected, but `logit_proto::SignalDecoder::decode_signal`
@@ -156,8 +157,9 @@ use http_body_util::{Full, Limited};
 use http_body_util::BodyExt;
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+#[cfg(test)]
+use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::otlp::OtlpDecoder;
@@ -178,21 +180,23 @@ use tokio_rustls::TlsAcceptor;
 /// Matches the OTel collector's default `max_recv_msg_size`.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`Input::run`] serves at once. [`MAX_REQUEST_BYTES`] bounds one
-/// connection's worst case; this bounds how many there are: `1024 * MAX_REQUEST_BYTES` = 4 GiB in
-/// flight. The same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an
-/// OTLP listener to differ, and one figure for an operator to learn. Not operator-tunable; make it
-/// a config field if a deployment needs a different number.
+/// Bounds the connections [`Input::run`] serves at once. The listener's worst case is this times
+/// [`crate::http::MAX_CONCURRENT_STREAMS`] (200 streams per HTTP/2 connection) times twice
+/// [`MAX_REQUEST_BYTES`] (a compressed body and its inflated copy): 1024 × 200 × 2 × 4 MiB =
+/// 1.6 TiB, a bound on what peers could make the process try to allocate, not a memory budget. The
+/// same 1024 as `logit_in` and `crate::tcp`'s listeners: no protocol reason for an OTLP listener
+/// to differ, and one figure for an operator to learn. Not operator-tunable; make it a config
+/// field if a deployment needs a different number.
 ///
 /// **A connection past the cap is rejected, not queued** (this module's "Connection limit").
 /// `OtlpInput::with_max_connections` lowers it in tests.
 ///
-/// **The 4 GiB figure is the protobuf path's worst case, not JSON's.** An OTLP/JSON request is
-/// parsed into a `serde_json::Value` tree first, one `Map`/`Vec`/`String`/`Number` allocation per
-/// node, several times the source bytes for a nested OTLP payload, where `prost::Message::decode`
-/// builds the target structs directly. The bound still holds (a JSON body is capped at
-/// `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a finite multiple of 4 GiB,
-/// unmeasured; tracked in `docs/known-gaps.md`.
+/// **That figure is the protobuf path's worst case, not JSON's.** An OTLP/JSON request is parsed
+/// into a `serde_json::Value` tree first, one `Map`/`Vec`/`String`/`Number` allocation per node,
+/// several times the source bytes for a nested OTLP payload, where `prost::Message::decode` builds
+/// the target structs directly. The bound still holds (a JSON body is capped at
+/// `MAX_REQUEST_BYTES` before parsing), so the all-JSON worst case is a finite multiple of it;
+/// `docs/known-gaps.md`'s OTLP section has the measured multiple.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`OtlpInput::handshake_timeout`]: how long a connection has, per pre-request phase,
@@ -470,7 +474,7 @@ where
             });
             // Bound to a local: `auto::Connection` borrows its builder (`Connection<'a, ..>`), so
             // a temporary would not live long enough to be held across `drive_with_idle`'s loop.
-            let builder = auto::Builder::new(TokioExecutor::new());
+            let builder = crate::http::auto_builder();
             let conn = builder.serve_connection(io, svc);
             drive_with_idle(
                 conn,
@@ -496,8 +500,7 @@ where
                     }
                 }
             });
-            let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc);
+            let conn = crate::http::h2_builder().serve_connection(io, svc);
             drive_with_idle(
                 conn,
                 |conn| conn.graceful_shutdown(),

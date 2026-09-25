@@ -180,8 +180,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::{
@@ -210,6 +209,10 @@ const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
 /// socket together: the same 1024 as `datadog_in`, and the `connection_limit` `/info` reports.
+/// The listener's worst case is this times [`crate::http::MAX_CONCURRENT_STREAMS`] times twice
+/// [`MAX_REQUEST_BYTES`] (a compressed body and its decompressed copy): 1024 × 200 × 2 × 25 MiB,
+/// about 9.8 TiB, a bound on what peers could make the process try to allocate, not a memory
+/// budget.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogTraceInput::with_handshake_timeout`]: the same 5s as every other TCP
@@ -654,7 +657,7 @@ where
             }
         }
     });
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
     drive_with_idle(
         conn,
