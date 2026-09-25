@@ -154,6 +154,12 @@ this repo's own dev box needed `--cap-add SYS_PTRACE` alone, with no `seccomp=un
 Real output, wall-clock times, and any workarounds are recorded in the `libc/w0` PR description
 rather than duplicated here — this ADR is the decision record, not the run log.
 
+**Re-run at the remote-reachable crash/DoS stack's tip (2026-09-25, `d04a494`):** `miri` passed
+all six `MIRI_TARGETS` entries with their per-entry flags in 904 s (`parse_events` 20 tests,
+`batch_reader_helpers` 6, `reply_parsing` 4, `hyperloglog` 13, `hll_` 5, `sketch::tests` 27), and
+`inject-all` ran all seven `INJECT_SCENARIOS` in 116 s, each with the shape its EXPECT line
+states: four pass and three fail on their closed fanout after one injected call.
+
 ## Consequences
 
 - A new, throwaway, non-default image (`tools/unsafe-check/Dockerfile`) and script

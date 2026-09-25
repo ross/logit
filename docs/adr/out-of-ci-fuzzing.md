@@ -185,7 +185,7 @@ harness, not by CI.
 ### First campaign (2026-09-25)
 
 `script/unsafe-check fuzz-seed`, then `fuzz native_frame -- -max_total_time=30` as a smoke test,
-then `fuzz-all 120`, on the dev box, one target at a time, against `dos/w1`. Image
+then `fuzz-all 120`, on the dev box, one target at a time, against the harness's PR (#371). Image
 `logit-unsafe-check:local` with `nightly-2026-09-01` and `cargo-fuzz` 0.13.2. The smoke test ran
 448,354 inputs in 31 seconds with no crash.
 
@@ -219,8 +219,8 @@ itself:
   (4096). Under the fuzz build's debug assertions that panics with "attempt to subtract with
   overflow". A release build wraps and returns a meaningless estimate. The 3,097-byte reproducer
   doesn't minimize further, because the HLL representation's register array fills most of it. It
-  is committed as `fuzz/seeds/hll_bytes/regress-9a8fd57a`. The decoder fix is in `dos/w3` (#369);
-  until it lands, `hll_bytes` fails at startup on this seed (CORE-06).
+  is committed as `fuzz/seeds/hll_bytes/regress-9a8fd57a`. The decoder fix is #369
+  (CORE-06), and the seed decodes cleanly in the 1800 s campaign below.
 - **`native_batch_v1`/`v2`: an `oom` that no single input reproduces.** The failing allocation is
   16 MiB (`malloc(16777240)`), from `lasso`'s arena growing a bucket under
   `logit_core::interner::intern`, called from `Dict::read`. The process-wide interner never
@@ -243,5 +243,48 @@ Review of this harness found two more, each with its reproducer committed as a `
   into one infinite count after the non-finite filter has run, so `to_bytes` is not a fixed
   point and the oracle fires. It is committed as
   `fuzz/seeds/sketch_bytes/regress-bins-fold-to-inf`. The fix to the decoder's bin
-  normalization is in `dos/w3` (#369); until it lands, `sketch_bytes` fails at startup on this
-  seed (CORE-05).
+  normalization is #369 (CORE-05), and the seed decodes cleanly in the 1800 s campaign below.
+
+### Campaign at the stack tip (2026-09-25)
+
+Every target ran clean for 1,800 seconds at the tip of the remote-reachable crash/DoS stack
+(`d04a494`, plus the native batch targets' fix below), with the image rebuilt there. The three
+`regress-*` seeds under `hll_bytes`, `sketch_bytes`, and `native_control` decode cleanly; before
+#369, the first two made their targets fail at startup. `script/unsafe-check fuzz-seed` ran
+first and rewrote no committed seed.
+
+The targets ran four at a time, each with `script/unsafe-check fuzz <target> --
+-max_total_time=1800`, sharing one fuzz target volume, on a host that other work was also
+using. So the executions per second are lower than a quiet host gives, and they aren't
+comparable with the 120-second table. The columns mean what they do in that table, and the two
+fork-mode rows compute exec/s the same way.
+
+| Target | Seconds | Executions | exec/s | Corpus (inputs/size) | Result |
+|---|---|---|---|---|---|
+| `native_frame` | 1,801 | 15,134,144 | 8,403 | 331 / 1,559 KB | clean |
+| `native_batch_v1` | 1,840 | 63,473,912 | 34,497 | 996 / n/a | clean (fork mode) |
+| `native_batch_v2` | 1,841 | 52,680,656 | 28,615 | 904 / n/a | clean (fork mode) |
+| `native_control` | 1,801 | 65,362,641 | 36,292 | 295 / 38 KB | clean |
+| `sketch_bytes` | 1,801 | 57,217,550 | 31,769 | 539 / 951 KB | clean |
+| `sketch_merge` | 1,801 | 31,361,682 | 17,413 | 599 / 1,604 KB | clean |
+| `hll_bytes` | 1,801 | 231,861,975 | 128,740 | 106 / 24 KB | clean |
+| `otlp_proto` | 1,801 | 62,675,242 | 34,800 | 3,027 / 1,067 KB | clean |
+| `otlp_json` | 1,801 | 20,681,285 | 11,483 | 3,249 / 8,867 KB | clean |
+| `otlp_grpc` | 1,801 | 92,265,558 | 51,230 | 2,986 / 648 KB | clean |
+| `prom_decompress` | 1,801 | 11,262,266 | 6,253 | 1,100 / 285 KB | clean |
+| `prom_remote_write` | 1,801 | 24,410,001 | 13,553 | 2,677 / 2,187 KB | clean |
+
+Two things the campaign turned up about the harness, not the decoders:
+
+- **The native batch targets didn't build.** The decode budget (#370) added a `DecodeBudget`
+  argument to `decode_batch` and `decode_batch_v2`, and the two targets still passed one
+  argument. `fuzz/` is outside the cargo workspace, so `script/check` and CI never build it.
+  Both targets now decode under `DecodeBudget::default()`, the budget `NativeDecoder` gives a
+  frame under the default cap. "Consequences" already says so: run `fuzz-seed` and a short
+  `fuzz-all` after changing a decoder a target calls.
+- **A host suspend reads as a timeout.** The host suspended for about 2.8 hours during the last
+  four targets. On resume, libFuzzer counted the whole suspend against the input in flight and
+  reported `timeout-*` artifacts in `prom_decompress` and both batch targets, and a
+  10,315-second `slow-unit-*` in `prom_remote_write`. Each artifact runs in 1 ms on its own. The
+  four targets were rerun from their seeds, and the table has the rerun. Wrap a long campaign
+  in `systemd-inhibit --what=sleep:idle`.
