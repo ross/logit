@@ -1,0 +1,154 @@
+# The stack `script/splunk-interop` drives: a Splunk Enterprise container, a one-shot REST setup,
+# one `logit` per leg from the release image, a replay sidecar, and a raw TCP capture. See
+# README.md here for what each service and leg does.
+#
+# `script/splunk-interop` runs this under the compose project `splunk-interop` with an
+# `--env-file` it writes, which sets:
+#
+#   SPLUNK_INTEROP_OUT    the host run directory, mounted at /out where a service writes files
+#   SPLUNK_INTEROP_IMAGE  the `logit` release image tag
+#
+# Nothing binds a host port: the harness queries Splunk from a container on this network. No
+# `container_name`, so a second stack under another project name can't collide with this one.
+#
+# Every credential here is a fixed dummy for a throwaway container on a private network:
+#
+#   admin password   logit-splunk-interop
+#   default token    11111111-1111-1111-1111-111111111111  (`splunk_hec_token`, no ack)
+#   `ack` token      22222222-2222-2222-2222-222222222222  (`useACK=1`)
+#   `tcpout` token   44444444-4444-4444-4444-444444444444  (routed to the `rawcap` output group)
+
+name: splunk-interop
+
+networks:
+  default:
+    name: splunk-interop-net
+
+x-logit: &logit
+  image: ${SPLUNK_INTEROP_IMAGE:-logit:splunk-interop}
+  depends_on:
+    splunk-init:
+      condition: service_completed_successfully
+  # `run` only: the configs set `admin:` for the image's HEALTHCHECK.
+  entrypoint: ["logit", "run", "/config.yaml"]
+  command: []
+
+services:
+  splunk:
+    image: splunk/splunk:10.4.3
+    environment:
+      SPLUNK_START_ARGS: --accept-license
+      SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
+      SPLUNK_PASSWORD: logit-splunk-interop
+      # The default HEC token (`splunk_hec_token`), plain HTTP so `logit` needs no CA.
+      SPLUNK_HEC_TOKEN: 11111111-1111-1111-1111-111111111111
+      SPLUNK_HEC_SSL: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/services/collector/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
+
+  # Over REST as admin, before any leg starts: a metrics index `metrics` and an event index
+  # `osnix` (where SC4S files the recorded syslog lines the relay leg replays), both allowed on
+  # the default token; a second token `ack` with `useACK`; and the `[tcpout]` probe's output
+  # group `rawcap` (`sendCookedData=false`, pointed at the `rawcap` service) with a third token
+  # `tcpout` routed to it, so only what that token receives is forwarded. No `defaultGroup` is
+  # set: Splunk's own logs never leave.
+  splunk-init:
+    image: curlimages/curl:8.22.0
+    depends_on:
+      splunk:
+        condition: service_healthy
+      rawcap:
+        condition: service_started
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        api="https://splunk:8089"
+        http="$$api/servicesNS/nobody/splunk_httpinput/data/inputs/http"
+        post() {
+          label="$$1"; shift
+          curl -ksS --fail-with-body -u admin:logit-splunk-interop -o /dev/null -w "$$label: %{http_code}\n" "$$@"
+        }
+        # Compose can start a one-shot dependency again for each service that waits on it; the
+        # last step's token marks a finished setup.
+        if curl -ksf -o /dev/null -u admin:logit-splunk-interop "$$http/tcpout"; then
+          echo "already set up"; exit 0
+        fi
+        post "metrics index" "$$api/services/data/indexes" -d name=metrics -d datatype=metric
+        post "osnix index" "$$api/services/data/indexes" -d name=osnix
+        post "default token indexes" "$$http/splunk_hec_token" -d indexes=main,metrics,osnix -d index=main
+        post "ack token" "$$http" -d name=ack -d token=22222222-2222-2222-2222-222222222222 \
+          -d useACK=1 -d indexes=main,metrics -d index=main
+        # The `[tcpout]` probe. Splunk forwards every index, its own logs included, to its only
+        # output group whatever `defaultGroup` and the `forwardedindex` filters say (README.md's
+        # "What the run showed"), so `indexAndForward` keeps this instance indexing locally and
+        # check.py looks for its own markers in what `rawcap` receives. Both load on restart.
+        post "tcpout_probe index" "$$api/services/data/indexes" -d name=tcpout_probe
+        post "tcpout defaults" "$$api/servicesNS/nobody/system/configs/conf-outputs/tcpout" \
+          -d indexAndForward=true
+        # `dropEventsOnQueueFull`: were `rawcap` to stop reading, Splunk would otherwise block
+        # its whole pipeline, local indexing included, behind the full output queue.
+        post "rawcap output group" "$$api/servicesNS/nobody/system/configs/conf-outputs" \
+          -d name=tcpout:rawcap -d server=rawcap:9997 -d sendCookedData=false \
+          -d dropEventsOnQueueFull=5
+        post "tcpout token" "$$http" -d name=tcpout -d token=44444444-4444-4444-4444-444444444444 \
+          -d indexes=tcpout_probe -d index=tcpout_probe
+        post "restart" "$$api/services/server/control/restart" -X POST
+        sleep 10
+        i=0
+        until curl -fsS -o /dev/null http://splunk:8088/services/collector/health \
+          && curl -ksf -o /dev/null -u admin:logit-splunk-interop "$$api/services/server/info"; do
+          i=$$((i + 1)); [ "$$i" -lt 120 ] || { echo "splunk never came back"; exit 1; }
+          sleep 2
+        done
+        echo "splunk is back after the restart"
+
+  # The `[tcpout] sendCookedData=false` probe's receiver: tools/record-fixtures/raw_capture.py,
+  # writing each connection to /out/tcpout/ once it has been quiet for 5 s, then accepting the
+  # next. Splunk holds its connection open and reconnects when this one closes it, so a quiet
+  # period is what ends a file, and the listener stays up for the whole run.
+  rawcap:
+    image: python:3.12-slim
+    volumes:
+      - ../record-fixtures/raw_capture.py:/raw_capture.py:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
+    command: ["python3", "/raw_capture.py", "--proto", "tcp", "--port", "9997",
+              "--out-dir", "/out/tcpout", "--prefix", "tcpout", "--count", "100000",
+              "--timeout", "900", "--idle-timeout", "5"]
+
+  logit-hec-logs:
+    <<: *logit
+    volumes: ["./logit-hec-logs.yaml:/config.yaml:ro,z"]
+
+  logit-hec-metrics:
+    <<: *logit
+    volumes: ["./logit-hec-metrics.yaml:/config.yaml:ro,z"]
+
+  logit-hec-spans:
+    <<: *logit
+    volumes: ["./logit-hec-spans.yaml:/config.yaml:ro,z"]
+
+  logit-hec-ack:
+    <<: *logit
+    volumes:
+      - ./logit-hec-ack.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
+
+  logit-hec-relay:
+    <<: *logit
+    volumes: ["./logit-hec-relay.yaml:/config.yaml:ro,z"]
+
+  # One pass over testdata/interop/splunk/ into the relay leg's listener (replay.py), then exits.
+  replay:
+    image: python:3.12-slim
+    depends_on:
+      logit-hec-relay:
+        condition: service_healthy
+    volumes:
+      - ./replay.py:/replay.py:ro,z
+      - ../../testdata/interop/splunk:/captures:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
+    command: ["python3", "/replay.py", "/captures", "http://logit-hec-relay:8088"]

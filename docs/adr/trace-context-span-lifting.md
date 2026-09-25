@@ -87,7 +87,7 @@ there is a producer bug worth surfacing, not a value worth guessing at. The `_s`
 the one place a float is legitimate — it's what nginx's `$msec` and `$request_time` actually are
 — and a quoted decimal string in that form is parsed digit-by-digit
 (`logit_core::parse_decimal_nanos`), not through `f64`, so a producer that prints more significant
-digits than a float can hold (`"1725400000.123456789"`) still round-trips exactly. `examples/nginx`
+digits than a float can hold (`"1725400000.123456789"`) still round-trips exactly. `fixtures/nginx`
 and `demo/nginx` both quote `$msec`/`$request_time` in their `log_format` for exactly this reason
 — nginx's own JSON-escaping variable copier (`escape=json`) renders a quoted value as a JSON
 string, which then takes the exact path instead of the unquoted-number-into-`f64` one; an unquoted

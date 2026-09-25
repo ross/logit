@@ -1,0 +1,5 @@
+method: GET
+path: /services/collector/health
+host: capture:8088
+user-agent: Go-http-client/1.1
+accept-encoding: gzip

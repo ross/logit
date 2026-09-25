@@ -392,7 +392,7 @@ mod chained_pipeline_test {
         let resource = Arc::new(Resource::default());
 
         // A copy of `logit-bench`'s `HTTP_ACCESS_SEMCONV_LINE` (this crate can't depend on it),
-        // shaped as `examples/nginx/nginx.conf`'s `access_semconv` log_format. Hand-written, not
+        // shaped as `fixtures/nginx/nginx.conf`'s `access_semconv` log_format. Hand-written, not
         // captured.
         let raw = concat!(
             r#"{"http.request.method":"GET","#,
@@ -467,7 +467,7 @@ mod chained_pipeline_test {
         assert_eq!(event.attributes.get("user_agent.class"), Some(&Value::str("browser")));
         assert_eq!(event.attributes.get("network.protocol.version"), Some(&Value::str("1.1")));
 
-        // As `examples/nginx-to-influxdb.yaml`'s `nginx_trace`. `mint_id`, because the inbound
+        // As `fixtures/nginx-to-influxdb.yaml`'s `nginx_trace`. `mint_id`, because the inbound
         // `traceparent`'s span id is this span's parent, never its own.
         let mut trace = TraceContext::new(
             "trace.id".to_string(),

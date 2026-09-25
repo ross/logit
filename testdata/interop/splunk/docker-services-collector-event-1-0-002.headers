@@ -1,0 +1,5 @@
+method: OPTIONS
+path: /services/collector/event/1.0
+host: capture:8088
+user-agent: Go-http-client/1.1
+accept-encoding: gzip

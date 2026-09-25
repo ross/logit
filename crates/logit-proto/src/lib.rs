@@ -11,11 +11,13 @@ pub mod collectd;
 pub mod datadog;
 pub mod frame;
 pub mod graphite;
+pub mod json;
 pub mod msgbuf;
 pub mod msgpack;
 pub mod native;
 pub mod otlp;
 pub mod prometheus;
+pub mod splunk;
 
 pub use msgbuf::MessageBuf;
 
@@ -117,6 +119,19 @@ pub trait FramedEncoder {
     /// Anything else the encoder needs (a dialect, a size cap) is state set at construction,
     /// never a per-call argument.
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats;
+}
+
+/// What a sink does with a metric kind its one-number-per-point wire can't carry natively
+/// (`graphite_out`, `splunk_hec_out`). Each codec's module doc lists what `Expand` renders.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MultiValue {
+    /// Drop the record, counted `logit.output.metrics.skipped{metric_kind=…}`. The default, since
+    /// an expansion's naming convention is one the receiver may know nothing about.
+    #[default]
+    Skip,
+    /// Expand into the per-codec series its module doc lists, counted
+    /// `logit.output.metrics.degraded{metric_kind=…}` once per record.
+    Expand,
 }
 
 /// Which OTLP service a payload belongs to.

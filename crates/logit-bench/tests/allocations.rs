@@ -1734,7 +1734,7 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
 
 /// A `route` switching on `stream`, `host`/`app` each naming one of two targets --
 /// `fixtures::nginx_batch_alternating_stream`'s own split, and the ADR's headline
-/// central-collector shape (`examples/fan-out-central.yaml`).
+/// central-collector shape (`fixtures/fan-out-central.yaml`).
 fn route_by_stream() -> logit_transforms::Route {
     logit_transforms::Route::new(
         logit_config::RouteBy::Attribute("stream".to_string()),

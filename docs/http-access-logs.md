@@ -137,8 +137,8 @@ untouched. It never touches `event.log`, `event.metrics`, `event.span`, `event.t
 batch `Resource`. It never drops an event: a value that doesn't parse is left exactly as it arrived
 and counted, and every other field is still normalized.
 
-Working, shipped examples: [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf) with
-[`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml), and the demo's
+Working, shipped examples: [`fixtures/nginx/nginx.conf`](../fixtures/nginx/nginx.conf) with
+[`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml), and the demo's
 [`demo/nginx/nginx.conf`](../demo/nginx/nginx.conf) and
 [`demo/haproxy/haproxy.cfg`](../demo/haproxy/haproxy.cfg) with
 [`demo/logit.yaml`](../demo/logit.yaml).
@@ -1030,7 +1030,7 @@ access_keep:
 
 `user_agent.class` isn't in semconv's set, but when `http_access` derives it, its values come from
 the table, so adding it costs at most a handful of series per route. A class you send yourself is
-only as bounded as you made it. [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+only as bounded as you made it. [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml)
 runs this shape end to end.
 
 ## Cutover

@@ -3,7 +3,7 @@
 //! against the same workload.
 //!
 //! The core workload is the repo's own reference example's pre-`http_access` shape
-//! (`examples/nginx-to-influxdb.yaml` driving `examples/nginx/nginx.conf`, from back when the log
+//! (`fixtures/nginx-to-influxdb.yaml` driving `fixtures/nginx/nginx.conf`, from back when the log
 //! format was `access_json_syslog`): `syslog_in -> json -> kv_metrics -> keep -> aggregate ->
 //! influxdb_out`, with that era's metric specs and `keep` list, kept unchanged so the pinned
 //! allocation counts stay comparable. The current example differs: it inserts `http_access` and
@@ -44,14 +44,14 @@ use logit_transforms::{
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// One nginx access-log line in the shape `examples/nginx/nginx.conf`'s `access_json_syslog`
+/// One nginx access-log line in the shape `fixtures/nginx/nginx.conf`'s `access_json_syslog`
 /// format put on the wire, before that format was renamed `access_semconv` and the example gained
 /// `http_access`: RFC 3164, `<190>` (facility `local7`, severity `info`, nginx's defaults), a
 /// 15-byte timestamp, no hostname (`nohostname`), the `nginx_access` tag, and a JSON body of the
 /// six fields the pipeline's `kv_metrics` stage used to read directly (the current example's
 /// `nginx_metrics` reads different, semconv field names instead). Confirmed against a live nginx
 /// run when that format still existed (`docs/design/memory.md`'s "Fixtures" section), so
-/// `examples/nginx/`, which `compose.yaml`'s `nginx` service runs, still has to stay real.
+/// `fixtures/nginx/`, which `compose.yaml`'s `nginx` service runs, still has to stay real.
 /// `perf/scenarios/json-parse.yaml`'s template is still this line's JSON body.
 ///
 /// It exercises `syslog.rs`'s two-token header rule for a hostname-less line, and its body's
@@ -357,7 +357,7 @@ pub fn graphite_pickle_frame(datapoints: usize) -> Bytes {
     Bytes::from(out)
 }
 
-/// `skip_to_brace` off, matching `examples/nginx-to-influxdb.yaml`: the syslog decoder has already
+/// `skip_to_brace` off, matching `fixtures/nginx-to-influxdb.yaml`: the syslog decoder has already
 /// stripped the header, so the whole message is the JSON body.
 pub fn json_parser() -> JsonParser {
     JsonParser::new(false)
@@ -560,7 +560,7 @@ pub fn nginx_event_with_uppercase_host() -> Event {
     event
 }
 
-/// The `tap` component from [`examples/shape-tap.yaml`](../../../examples/shape-tap.yaml): every
+/// The `tap` component from [`fixtures/shape-tap.yaml`](../../../fixtures/shape-tap.yaml): every
 /// field at its default (`resource: drop`, both caps at 4096) plus a name, so the measured path is
 /// the one a real config builds, `tap` tag included (`docs/adr/shape-observer-component.md`).
 pub fn shape() -> Shape {
@@ -573,7 +573,7 @@ pub fn flatten() -> Flatten {
     Flatten::new(Fields::All, Fields::None, Arrays::Index)
 }
 
-/// A `sample` keyed on `trace_id` at `rate: 0.5`, `examples/sample-traces.yaml`'s shape, for
+/// A `sample` keyed on `trace_id` at `rate: 0.5`, `fixtures/sample-traces.yaml`'s shape, for
 /// `tests/allocations.rs`'s `sample_*` measurements. Seeded so the random draw a missing key falls
 /// back to is reproducible.
 pub fn sample_by_trace_id() -> Sample {
@@ -903,7 +903,7 @@ pub fn pino_http_event() -> Event {
     )
 }
 
-/// The Lua stage from `examples/statsd-to-influxdb.yaml`'s shape: reads one attribute, writes
+/// The Lua stage from `fixtures/statsd-to-influxdb.yaml`'s shape: reads one attribute, writes
 /// another, returns the event. Kept small so it measures the Rust/Lua boundary crossing per event,
 /// not a script's own logic. The baseline the other `LUA_*` scripts are measured over.
 pub const LUA_ENRICH_SCRIPT: &str = r#"
@@ -1975,7 +1975,7 @@ pub fn enriched_resource_batch() -> EventBatch {
 // http_access (docs/adr/http-access-normalization.md)
 // -------------------------------------------------------------------------------------------
 
-/// One nginx access line in the shape of `examples/nginx/nginx.conf`'s `access_semconv` format:
+/// One nginx access line in the shape of `fixtures/nginx/nginx.conf`'s `access_semconv` format:
 /// raw semconv attribute names and untouched values, mixing atomic and composite fields so most of
 /// `http_access`'s steps run at once. A raw `url.original` (composite), a string-encoded status
 /// beside bare-numeric sizes, an `_s`-suffixed duration already in its target unit, an upstream
