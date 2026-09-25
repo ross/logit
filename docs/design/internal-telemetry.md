@@ -944,6 +944,39 @@ appears in the message text only), `busy` (a `503`), `trace_count_mismatch` (an
 served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
 left out of the resource).
 
+##### `splunk_hec_in`
+
+`crates/logit-inputs/src/splunk.rs`, codec in `crates/logit-proto/src/splunk/`,
+[ADR `splunk-hec-relay`](../adr/splunk-hec-relay.md).
+
+**The connection metrics are `datadog_in`'s verbatim**, from the same accept loop and shared idle
+tracker: `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
+| `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
+| `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), or `malformed` (`400` code 6, a body the codec rejects whole, or an `/ack` body that isn't `{"acks":[…]}`) |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`. See below |
+
+**A busy request is not a lost one**, as on `datadog_in`: after 5 seconds without the pipeline
+taking a request's batches, the request gets `503` code 9 with `Retry-After: 1`, counted
+`class="busy"`, and every HEC client retries it. A `/event` body that carries several envelopes
+decodes to one batch per resource; a `503` after some of them were delivered makes the retry
+deliver those again, so a steady busy rate on multi-envelope clients means duplicates downstream
+(the module doc's "Backpressure" section).
+
+The codec's own counters (an object skipped for a missing or blank `event`, an unknown envelope
+key, a bad `time` or `fields`, a span that fell back to a log) are in the tables of
+`crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
+submodules, under this component's id.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
+rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
+and a token never appears at all), and `busy` (a `503`).
+
 ##### `tail_in` and `docker_in`
 
 `crates/logit-inputs/src/tail/driver.rs`, `docker.rs`: one shared `Tailer<D, F>` driver.

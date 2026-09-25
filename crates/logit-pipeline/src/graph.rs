@@ -201,6 +201,10 @@
 //!     `socket` (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 68. A `trace_context` `trace_id_high` under a `format` other than `datadog`, where no trace id
 //!     lacks its high half, or with an empty name (`docs/adr/log-record-trace-context.md`).
+//! 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has leading or
+//!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
+//!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
+//!     (`docs/adr/splunk-hec-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -262,6 +266,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | OtlpIn { .. }
         | DatadogIn { .. }
         | DatadogTraceIn { .. }
+        | SplunkHecIn { .. }
         | TailIn { .. }
         | DockerIn { .. }
         | LogitIn { .. }
@@ -326,6 +331,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpIn { .. } => "otlp_in",
         DatadogIn { .. } => "datadog_in",
         DatadogTraceIn { .. } => "datadog_trace_in",
+        SplunkHecIn { .. } => "splunk_hec_in",
         TailIn { .. } => "tail_in",
         DockerIn { .. } => "docker_in",
         LogitIn { .. } => "logit_in",
@@ -426,6 +432,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::OtlpIn { .. }
             | ComponentKind::DatadogIn { .. }
             | ComponentKind::DatadogTraceIn { .. }
+            | ComponentKind::SplunkHecIn { .. }
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
@@ -1924,8 +1931,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // first-byte read, or `Hello` read completes in zero time, so every connection would close on
     // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` (or a `transport: unix` `statsd_in`) has
     // no connection to hand shake, so a set value there is rejected (rule 33's shape). Only a
-    // non-default value counts as set, so the default stays legal under UDP. `otlp_in`, `datadog_in`, and `datadog_trace_in` get only the
-    // zero check: the budget also bounds a plaintext connection's first-byte wait
+    // non-default value counts as set, so the default stays legal under UDP. `otlp_in`,
+    // `datadog_in`, `datadog_trace_in`, and `splunk_hec_in` get only the zero check: the budget
+    // also bounds a plaintext connection's first-byte wait
     // (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout"), so it is live with or without
     // `tls:`.
     for (id, component) in &components {
@@ -1936,7 +1944,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             | ComponentKind::LogitIn { handshake_timeout, .. }
             | ComponentKind::OtlpIn { handshake_timeout, .. }
             | ComponentKind::DatadogIn { handshake_timeout, .. }
-            | ComponentKind::DatadogTraceIn { handshake_timeout, .. } => *handshake_timeout,
+            | ComponentKind::DatadogTraceIn { handshake_timeout, .. }
+            | ComponentKind::SplunkHecIn { handshake_timeout, .. } => *handshake_timeout,
             _ => continue,
         };
         if handshake_timeout.is_zero() {
@@ -1962,7 +1971,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // absence means "no idle timeout", so every `Some` is set: the UDP check rejects any value, and
     // the zero message says to omit the field. And `0s` is impossible because a connection is idle
     // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, `datadog_in`,
-    // `datadog_trace_in`, and `prometheus_in` have no datagram transport, so
+    // `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in` have no datagram transport, so
     // `datagram_transport_of` never names them; a scrape-mode `prometheus_in`'s value is rule 55's
     // wrong-mode check.
     for (id, component) in &components {
@@ -1974,6 +1983,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             | ComponentKind::OtlpIn { idle_timeout, .. }
             | ComponentKind::DatadogIn { idle_timeout, .. }
             | ComponentKind::DatadogTraceIn { idle_timeout, .. }
+            | ComponentKind::SplunkHecIn { idle_timeout, .. }
             | ComponentKind::PrometheusIn { idle_timeout, .. } => *idle_timeout,
             _ => continue,
         };
@@ -3078,6 +3088,43 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': a trace_context with an empty 'trace_id_high' field name \
                  could never match an attribute -- omit it to disable the lookup"
             );
+        }
+    }
+
+    // Rule 69: `splunk_hec_in` (`docs/adr/splunk-hec-relay.md`). An empty `bind` names no socket.
+    // An empty `tokens` entry could never match, since the listener reads an empty token as none;
+    // nor could one with leading or trailing whitespace, which the listener trims from the
+    // `Authorization` header, a typo `!env` makes easy with a token file's trailing newline. An
+    // empty list is the "accept any token" setting, not an error. A zero `max_request_bytes`
+    // would answer every request `413`. The timeouts are rules 45/53's.
+    for (id, component) in &components {
+        if let ComponentKind::SplunkHecIn { bind, tokens, max_request_bytes, .. } = &component.kind
+        {
+            if bind.trim().is_empty() {
+                anyhow::bail!(
+                    "component '{id}': splunk_hec_in 'bind' must not be empty -- give the \
+                     'host:port' to listen on"
+                );
+            }
+            if tokens.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "component '{id}': a splunk_hec_in 'tokens' entry must not be empty -- it \
+                     could never match a request's token; omit 'tokens' to accept any token"
+                );
+            }
+            if tokens.iter().any(|token| token.trim() != token) {
+                anyhow::bail!(
+                    "component '{id}': a splunk_hec_in 'tokens' entry has leading or trailing \
+                     whitespace, which the Authorization header can't carry, so it could never \
+                     match -- check the value (a token file's trailing newline, say)"
+                );
+            }
+            if *max_request_bytes == 0 {
+                anyhow::bail!(
+                    "component '{id}': splunk_hec_in 'max_request_bytes' must be greater than 0 \
+                     -- 0 would refuse every request"
+                );
+            }
         }
     }
 
@@ -5458,6 +5505,83 @@ mod tests {
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
+    // ---- rule 69: splunk_hec_in ------------------------------------------------------------
+
+    /// A `splunk_hec_in` with every optional field at its default, the shape rule 69 reads.
+    fn splunk_hec_in(bind: &str, tokens: Vec<&str>) -> ComponentKind {
+        ComponentKind::SplunkHecIn {
+            bind: bind.to_string(),
+            tls: None,
+            tokens: tokens.into_iter().map(String::from).collect(),
+            max_request_bytes: 5 * 1024 * 1024,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
+        }
+    }
+
+    #[test]
+    fn a_splunk_hec_in_with_or_without_tokens_resolves() {
+        for tokens in [vec![], vec!["11111111-2222-3333-4444-555555555555", "other"]] {
+            resolve(cfg(vec![
+                ("in", vec![], splunk_hec_in("0.0.0.0:8088", tokens)),
+                ("out", vec!["in"], sink()),
+            ]))
+            .expect("a splunk_hec_in with a bind and non-empty tokens (or none) is valid");
+        }
+    }
+
+    /// Rule 69: an empty `bind` names no socket.
+    #[test]
+    fn a_splunk_hec_in_with_an_empty_bind_is_rejected() {
+        let err = datadog_in_err(splunk_hec_in(" ", vec![]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("splunk_hec_in 'bind' must not be empty"), "got: {err}");
+    }
+
+    /// Rule 69: an empty token could never match; the message names the accept-any spelling.
+    #[test]
+    fn a_splunk_hec_in_with_an_empty_token_is_rejected() {
+        let err = datadog_in_err(splunk_hec_in("0.0.0.0:8088", vec!["good", ""]));
+        assert!(err.contains("'tokens' entry must not be empty"), "got: {err}");
+        assert!(err.contains("omit 'tokens'"), "got: {err}");
+    }
+
+    /// Rule 69: a whitespace-padded token never matches a trimmed header value.
+    #[test]
+    fn a_splunk_hec_in_token_with_surrounding_whitespace_is_rejected() {
+        let err = datadog_in_err(splunk_hec_in("0.0.0.0:8088", vec!["token\n"]));
+        assert!(err.contains("leading or trailing whitespace"), "got: {err}");
+    }
+
+    /// Rule 69: a zero cap would refuse every request.
+    #[test]
+    fn a_splunk_hec_in_with_a_zero_max_request_bytes_is_rejected() {
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { max_request_bytes, .. } = &mut kind {
+            *max_request_bytes = 0;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'max_request_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rules 45 and 53 cover `splunk_hec_in`'s two timeouts.
+    #[test]
+    fn a_splunk_hec_in_with_a_zero_handshake_or_idle_timeout_is_rejected() {
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { handshake_timeout, .. } = &mut kind {
+            *handshake_timeout = Duration::ZERO;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'handshake_timeout' must be greater than 0s"), "got: {err}");
+
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::ZERO);
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
     // ---- rule 66: datadog_out --------------------------------------------------------------
 
     /// A `datadog_out` with every optional field at its default, the shape rule 66 reads.
@@ -6457,6 +6581,8 @@ mod tests {
         assert_eq!(kind_name(&listener()), "statsd_in");
         assert_eq!(kind_name(&internal()), "internal");
         assert_eq!(kind_name(&sink()), "influxdb_out");
+        assert_eq!(kind_name(&splunk_hec_in("0.0.0.0:8088", vec![])), "splunk_hec_in");
+        assert_eq!(role(&splunk_hec_in("0.0.0.0:8088", vec![])), Role::Listener);
     }
 
     /// A valid router -> target config resolves (rules 47-51).

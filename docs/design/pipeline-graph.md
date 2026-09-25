@@ -364,6 +364,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     (including any `datadog-*`/`x-datadog-*`) or colliding header, or a bad `tls` (including any
     `tls` with `socket`).
 68. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
+69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
+    whitespace, or a `max_request_bytes` of `0`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

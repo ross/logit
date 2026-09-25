@@ -946,6 +946,57 @@ pub enum ComponentKind {
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
+    /// A stand-in for Splunk's HTTP Event Collector (HEC): what a HEC client's URL points at,
+    /// such as Docker's `splunk` log driver, Splunk's logging libraries, the OpenTelemetry
+    /// Collector's `splunk_hec` exporter, or Vector. Serves `/services/collector/event` (and
+    /// `/services/collector`) with concatenated or array JSON bodies, `/services/collector/raw`
+    /// with one log per line and `host`, `source`, `sourcetype`, and `index` from the query
+    /// string, `/services/collector/ack`, and `/services/collector/health`, answering Splunk's own
+    /// `{"text","code"}` bodies. Decompresses gzip; any other `Content-Encoding` gets `415`. A
+    /// request that names a channel gets an `ackID`, and `/ack` reports every id delivered. The
+    /// envelope's `host`, `source`, `sourcetype`, and `index` become the resource attributes
+    /// `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When
+    /// the pipeline can't take a request's data within 5s, the request gets `503` code 9 with
+    /// `Retry-After: 1`, and the client retries it; a request carrying several envelopes can then
+    /// deliver some of its events twice.
+    SplunkHecIn {
+        /// The `host:port` to listen on. Splunk's HEC port is `8088`.
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Splunk serves
+        /// HEC over HTTPS by default, so a client pointed at `https://` needs this.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// The HEC tokens this listener accepts, from each request's `Authorization: Splunk
+        /// <token>` header (or `Basic`, with the token as the password). A request with no token
+        /// gets `401`, and one with a token not listed gets `403`. Empty, the default, accepts
+        /// any request, whatever token it carries. Take each entry from the environment
+        /// (`!env SPLUNK_HEC_TOKEN`) rather than writing a token into the file. A token is never
+        /// kept on an event. A token sent in the query string (`?token=`) is always refused,
+        /// `400`. An empty entry, or one with leading or trailing whitespace, is rejected.
+        #[serde(default)]
+        tokens: Vec<String>,
+        /// Caps one request body, both as sent and after gzip decompression; a larger one gets
+        /// `413`. A byte-count string. Defaults to `"5MiB"`, the OpenTelemetry Collector
+        /// exporter's largest event, above its 2 MiB default request. `0` is rejected.
+        #[serde(default = "default_splunk_max_request_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_request_bytes: u64,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
+        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
+        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. HEC clients keep their connections open between batches, so set it well
+        /// above a client's flush interval if you set it at all. It also bounds a request body
+        /// that stalls mid-upload, answered `408`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+    },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
@@ -2521,6 +2572,11 @@ fn default_statsd_connect_timeout() -> Duration {
 /// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
 fn default_collectd_max_packet_bytes() -> u64 {
     1452
+}
+
+/// Mirrors `logit_inputs::splunk::DEFAULT_MAX_REQUEST_BYTES`, kept in sync by hand.
+fn default_splunk_max_request_bytes() -> u64 {
+    5 * 1024 * 1024
 }
 
 /// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES`, kept in sync by hand.
@@ -4946,6 +5002,39 @@ mod tests {
         assert!(matches!(
             component.kind,
             ComponentKind::DatadogTraceIn { bind: None, socket: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn splunk_hec_in_defaults_and_a_byte_count_cap() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "splunk_hec_in", "bind": "0.0.0.0:8088"}"#).unwrap();
+        match component.kind {
+            ComponentKind::SplunkHecIn {
+                bind,
+                tls,
+                tokens,
+                max_request_bytes,
+                handshake_timeout,
+                idle_timeout,
+            } => {
+                assert_eq!(bind, "0.0.0.0:8088");
+                assert_eq!(tls, None);
+                assert!(tokens.is_empty());
+                assert_eq!(max_request_bytes, 5 * 1024 * 1024);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None);
+            }
+            other => panic!("expected SplunkHecIn, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "splunk_hec_in", "bind": "0.0.0.0:8088", "tokens": ["t"],
+                "max_request_bytes": "800MiB"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::SplunkHecIn { max_request_bytes: 838_860_800, .. }
         ));
     }
 

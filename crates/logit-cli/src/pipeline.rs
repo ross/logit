@@ -27,6 +27,7 @@ use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
+use logit_inputs::splunk::SplunkHecInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
@@ -411,6 +412,21 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_api_keys(api_keys.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        SplunkHecIn { bind, tls, tokens, max_request_bytes, handshake_timeout, idle_timeout } => {
+            let mut input = SplunkHecInput::new(bind.clone())
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout)
+                .with_tokens(tokens.clone())
+                // Saturates on a 32-bit target: a cap past the address space is no cap.
+                .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX));
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
