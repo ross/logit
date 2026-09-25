@@ -171,7 +171,6 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
@@ -327,7 +326,7 @@ impl Input for OtlpInput {
         // `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so a per-connection clone is an `Arc`
         // clone, not a config rebuild.
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         // `crate::tcp`'s accept-queue gauges: `logit.input.accept_queue.depth`/`.utilization`,
@@ -353,15 +352,11 @@ impl Input for OtlpInput {
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let live_connections = Arc::clone(&live_connections);
+            let live_connections = live_connections.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
-
-                // Published from the read-modify-write's return value, not a separate `load`:
-                // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
-                // and a load would leave the stale one published until the next transition.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
+                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                let _live = live_connections.enter();
 
                 // The handshake runs here, after the permit, so it stalls only this connection.
                 let result = match tls_acceptor {
@@ -421,9 +416,6 @@ impl Input for OtlpInput {
                         }
                     }
                 };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // One connection's I/O error (a client disconnecting mid-request, a TLS preamble
                 // on a plaintext port) is not fatal to the listener; only `accept` failing is.

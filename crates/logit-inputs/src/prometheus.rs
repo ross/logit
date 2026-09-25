@@ -333,7 +333,6 @@ use logit_proto::prometheus::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -935,7 +934,7 @@ impl MetadataCache {
     /// what is left. Allocation-free; the seed is rebuilt only if something expired.
     fn sweep(&self, state: &mut CacheState, now: Instant, telemetry: &Telemetry) {
         #[cfg(test)]
-        self.sweeps.fetch_add(1, Ordering::Relaxed);
+        self.sweeps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ttl = self.ttl;
         let mut expired = 0u64;
         state.families.retain(|_, family| {
@@ -1199,7 +1198,7 @@ impl Input for PrometheusReceiver {
         // `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so a per-connection clone is an `Arc`
         // clone, not a config rebuild.
         let tls_acceptor = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         let metadata_cache = self.metadata_cache.clone();
@@ -1229,17 +1228,13 @@ impl Input for PrometheusReceiver {
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let live_connections = Arc::clone(&live_connections);
+            let live_connections = live_connections.clone();
             let resource = Arc::clone(&self.resource);
             let metadata_cache = metadata_cache.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
-
-                // Published from the read-modify-write's return value, not a separate `load`:
-                // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
-                // and a load would leave the stale one published until the next transition.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
+                                      // Counted out on drop, so a panicking handler brings the gauge back down too.
+                let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
                     // No first-byte peek on this arm: `acceptor.accept` already waits on this
@@ -1300,9 +1295,6 @@ impl Input for PrometheusReceiver {
                         }
                     }
                 };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // One connection's I/O error shouldn't be fatal to the listener or its siblings --
                 // only `TcpListener::accept` failing in `run`'s own loop is.

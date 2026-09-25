@@ -128,15 +128,13 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::CodecError;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -297,7 +295,7 @@ impl Input for DatadogInput {
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         let mut accept_queue =
@@ -324,15 +322,13 @@ impl Input for DatadogInput {
                 peer,
             });
             let mut diag = self.diag.clone();
-            let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let live_connections = Arc::clone(&live_connections);
+            let live_connections = live_connections.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
-                // From the read-modify-write's return value, as `otlp_in` publishes it.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
+                let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
                     Some(acceptor) => {
@@ -375,9 +371,6 @@ impl Input for DatadogInput {
                         }
                     }
                 };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 if let Err(err) = result {
                     diag.warn_throttled("connection_error", err);

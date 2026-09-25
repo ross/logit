@@ -196,7 +196,6 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -395,7 +394,7 @@ impl Input for DatadogTraceInput {
             telemetry: self.telemetry.clone(),
             diag: self.diag.clone(),
             connection_limit: Arc::new(Semaphore::new(self.max_connections)),
-            live_connections: AtomicI64::new(0),
+            live_connections: crate::listener::LiveConnections::new(self.telemetry.clone()),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             busy_after: self.busy_after,
@@ -439,7 +438,7 @@ struct AcceptContext {
     diag: Diagnostics,
     /// One cap across both listeners.
     connection_limit: Arc<Semaphore>,
-    live_connections: AtomicI64,
+    live_connections: crate::listener::LiveConnections,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     busy_after: Duration,
@@ -479,11 +478,9 @@ impl AcceptContext {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let _permit = permit; // released on drop
-            let live = this.live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-            this.telemetry.gauge("logit.input.connections", live as f64, &[]);
+            let live = this.live_connections.enter();
             let result = connection.await;
-            let live = this.live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-            this.telemetry.gauge("logit.input.connections", live as f64, &[]);
+            drop(live);
             if let Err(err) = result {
                 this.diag.clone().warn_throttled("connection_error", err);
             }

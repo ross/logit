@@ -99,7 +99,6 @@ use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -1185,7 +1184,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             // Built once: `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so cloning it per
             // connection is an `Arc` clone, not a config rebuild.
             tls_acceptor: self.tls.clone().map(TlsAcceptor::from),
-            live_connections: Arc::new(AtomicI64::new(0)),
+            live_connections: crate::listener::LiveConnections::new(self.telemetry.clone()),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             config: self.config,
@@ -1250,7 +1249,7 @@ enum Accepted {
 /// [`Self::spawn`]. One value so the TCP and Unix arms of the accept loop spawn identically.
 struct ConnectionSpawner<D> {
     tls_acceptor: Option<TlsAcceptor>,
-    live_connections: Arc<AtomicI64>,
+    live_connections: crate::listener::LiveConnections,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     config: TcpListenerConfig,
@@ -1277,7 +1276,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
         let telemetry = self.telemetry.clone();
         let tls_acceptor = self.tls_acceptor.clone();
         let conn_shutdown = self.shutdown.clone();
-        let live_connections = Arc::clone(&self.live_connections);
+        let live_connections = self.live_connections.clone();
         let decoder = self.decoder.clone();
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
@@ -1288,11 +1287,8 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
             // Held for as long as this task runs: a TLS accept that fails or times out gives
             // the permit back here.
             let _permit = permit;
-            // Published from the read-modify-write's return value, not a separate `load`:
-            // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
-            // and a load would publish the stale value until the next transition.
-            let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-            telemetry.gauge("logit.input.connections", live as f64, &[]);
+            // Counted out on drop, so a panic in the connection brings the gauge back down too.
+            let live = live_connections.enter();
 
             let result = match tls_acceptor {
                 Some(acceptor) => {
@@ -1337,8 +1333,7 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                 }
             };
 
-            let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-            telemetry.gauge("logit.input.connections", live as f64, &[]);
+            drop(live);
 
             // One connection's error (a peer vanishing mid-frame, a TLS accept that failed or
             // timed out) is never fatal to the listener or its siblings; only an accept failing
@@ -1709,6 +1704,7 @@ mod tests {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
