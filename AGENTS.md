@@ -450,13 +450,16 @@ the operator-facing account of all of this.
   than on every merge
   ([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)).
 
-### Demo and examples
+### Demo and fixtures
 
-- **`fixtures/`** is contributor-facing fixtures the dev stack (`script/server`) runs against. Keep
-  them real: other things in the repo depend on them (`compose.yaml`'s `nginx` service,
-  `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`).
-  [fixtures/nginx-to-influxdb.yaml](fixtures/nginx-to-influxdb.yaml) exercises the
-  syslog/InfluxDB side against a real nginx (`fixtures/nginx/`).
+- **`fixtures/`** holds contributor-facing configs, roughly one per component or topology, that
+  the dev stack (`script/server`) runs against. Keep them real: `compose.yaml`'s `nginx` service
+  builds `fixtures/nginx/`, and `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE` mirrors
+  `fixtures/nginx/nginx.conf`. [fixtures/nginx-to-influxdb.yaml](fixtures/nginx-to-influxdb.yaml)
+  exercises the syslog/InfluxDB side against that nginx. The directory shares only a name with
+  `crates/logit-bench/src/fixtures.rs` and `crates/logit-cli/tests/fixtures/`: those are test
+  inputs, bound by "Benchmark and test fixtures never depend on a running service"; a `fixtures/`
+  config may assume the dev stack's services.
 - **`demo/`** is the answer to "let me see this work" for anyone else: a self-contained
   `docker compose up` against the release image. Logs, metrics, and traces all flow through it
   end to end, into Loki, VictoriaMetrics, and Tempo respectively

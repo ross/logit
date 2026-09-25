@@ -91,7 +91,7 @@ For production use, including health probes, exit codes, buffering, TLS, and for
 
 A config is a flat graph of named components. Each component has a `type` and lists the
 components it reads from in `sources`. `logit graph <config>` prints the resolved graph in Graphviz
-DOT format. [fixtures/](examples) has a runnable config for most components.
+DOT format. [fixtures/](fixtures) has a small runnable config for most components.
 
 | Role | Types |
 |---|---|
@@ -208,7 +208,7 @@ crates/
   logit-bench       dev only: allocation-count tests and throughput benchmarks
   logit-perf        dev only: the load-test harness
 demo/               self-contained demo stack
-fixtures/           example configs, also used by the local test stack
+fixtures/           dev-stack configs, one per component or topology
 docs/               overview, deployment guide, ADRs, design docs, and plans
 perf/               load-test scenarios; results are gitignored
 schema/             generated JSON Schema for the config

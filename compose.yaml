@@ -18,7 +18,7 @@ services:
     environment:
       CARGO_HOME: /home/dev/.cargo
       CARGO_TARGET_DIR: /work/target
-      # Read by the examples' `token: !env INFLUXDB_TOKEN` (docs/adr/env-yaml-tag.md). Matches
+      # Read by the fixtures' `token: !env INFLUXDB_TOKEN` (docs/adr/env-yaml-tag.md). Matches
       # the token influxdb seeds itself with below; override from the host shell.
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-dev-token}
     networks:
@@ -57,7 +57,7 @@ services:
     depends_on: [influxdb]
     networks: [logit]
 
-  # The reference nginx example (fixtures/nginx/). Reaches `dev`'s syslog listener by its `logit`
+  # The nginx fixture (fixtures/nginx/). Reaches `dev`'s syslog listener by its `logit`
   # alias on the internal network, so UDP 5140 needs no `ports:` entry.
   nginx:
     build:

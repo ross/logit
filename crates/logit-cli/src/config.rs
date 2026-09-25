@@ -216,7 +216,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut configs = vec![root.join("demo/logit.yaml")];
         configs.extend(
-            std::fs::read_dir(root.join("examples"))
+            std::fs::read_dir(root.join("fixtures"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
@@ -253,7 +253,7 @@ mod tests {
         );
         configs.sort();
 
-        assert!(configs.len() > 1, "expected demo and example configs");
+        assert!(configs.len() > 1, "expected demo and fixture configs");
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
