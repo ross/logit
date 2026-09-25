@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/validate
 # Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*.yaml,
-# perf/scenarios/*.yaml, and tools/shape-survey/configs/*.yaml. Not part of script/cibuild;
+# perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml, and tools/victoria-interop/logit-*.yaml
+# (that directory's other YAML is compose and vmagent config). Not part of script/cibuild;
 # script/test's `every_shipped_config_loads_and_validates` covers the same set.
 #
 # The `!env` variables the configs need (ADR `env-yaml-tag`) are defaulted here, not in
@@ -24,7 +25,8 @@ fi
 cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
-for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml tools/shape-survey/configs/*.yaml; do
+for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml tools/shape-survey/configs/*.yaml \
+    tools/victoria-interop/logit-*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done

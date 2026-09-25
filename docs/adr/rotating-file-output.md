@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-08
+updated: 2026-09-24
 ---
 
 # `file_out`: a rotating file sink, sharing `stdio_out`'s implementation
@@ -161,7 +161,7 @@ which `StdioOutput` previously did not need:
 |---|---|
 | Flushing the active file before rotating | Fatal -- bubbles as `Err` |
 | Renaming the active file to its staging path (or truncating under `max_files: 1`) | `rotate_failure`, `RotateOutcome::NotRotated` -- nothing on disk touched, rotation state left unchanged so the next write retries safely |
-| Re-opening `path` after a committed rename (or truncate) | `Err`, classified `Fault::Clean` -- the active handle is dropped and rotation state reset regardless, and a later write self-heals via a lazy re-open |
+| Re-opening `path` after a committed rename | `Err`, classified `Fault::Clean` -- the active handle is dropped and rotation state reset regardless, and a later write self-heals via a lazy re-open |
 | Cascading/promoting a *retained* file | `retention_failure`, continue |
 
 A retention-cascade/promotion failure only risks losing history, not correctness, so it's reported
@@ -305,3 +305,48 @@ in this pass (see Alternatives). Retention is `max_files` alone -- no `max_age`,
   away. `RotationState::seed_period` and the `unix_seconds`/`now_unix` mtime-conversion path are
   new; `FileTarget::open` now calls both `open_active` (also new, shared with `rotate_inner`'s two
   re-open sites) and `seed_period`.
+
+## Amendment: `file_out` makes no durability promise (2026-09-24)
+
+"Retention: logrotate's own numbered-suffix cascade, commit-point first" above says an
+interrupted rotation loses nothing. That holds against a process crash, not a power loss.
+Nothing in `crates/logit-outputs/src/file.rs` fsyncs: not the active file after a write, not the
+`.rotating` staging file, and not the directory after the commit-point rename or a cascade rename.
+A rename is atomic against a process crash, but after a power loss the kernel may not have
+written the rename, the file's most recent data, or both.
+
+This is by design for a log-file sink. `file_out` writes for a human or a downstream tool to
+read, and an fsync per batch or per rotation would cost every deployment for a guarantee few of
+them need. A sink that must survive a power loss belongs behind `buffer.disk:`
+([ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)) with a destination that has its own
+durability. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
+records this as its decision 6, and `docs/known-gaps.md` lists it under "File, stdio, and InfluxDB
+sinks".
+
+## Amendment: a max_files ceiling and a symmetric truncate policy (2026-09-24)
+
+**`rotate.max_files` has a ceiling of 1000.** Graph rule 29 now also rejects a `max_files` above
+`logit_config::MAX_ROTATE_FILES` (1000). Before, only `0` was rejected, and each rotation's two
+`promote_staged` passes stat and rename every retained generation, so a `max_files` near
+`u32::MAX` turned one rotation into billions of syscalls inside `Output::send`. `max_files`
+counts the active file, so 1000 keeps 999 rotated files: about 2.7 years of daily files, or 41
+days of hourly ones.
+[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
+records the ceiling as its decision 9.
+
+**A failed `max_files: 1` truncate is `NotRotated`, as the failure-policy table already said.**
+The table above lists the truncate beside the commit-point rename: `rotate_failure`,
+`RotateOutcome::NotRotated`, rotation state unchanged. The code instead returned `Err` with
+`Fault::Clean`, and its "Re-opening" row said "(or truncate)". A failed truncate leaves the
+existing file and its flushed handle intact, just as a failed rename does, so the code now
+matches the table: the batch lands in the existing file, and the next write retries the
+truncate. Before, `StreamOutput::send` returned the error, so every batch failed until a
+truncate succeeded. The "(or truncate)" in the "Re-opening" row is removed.
+
+**Every filesystem mutation in rotation now runs behind `logit_pipeline::fault::check`**, per
+decision 8 of the durability ADR: the pre-rotation flush, the truncate, the commit-point rename,
+the re-open, and each retention unlink and rename, plus the ordinary write and flush. The
+`rotate_with` opener seam stays. A crash-matrix test freezes the process at each of those steps in
+turn and restarts it; after the restart no line is lost beyond retention and none is duplicated,
+which confirms "commit point first" against a process crash. The durability ADR's "Running it"
+section lists the tests.

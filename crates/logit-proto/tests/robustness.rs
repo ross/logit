@@ -1,7 +1,8 @@
 //! Mutation testing over every decoder that reads untrusted bytes off a socket:
 //! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`,
-//! `collectd::CollectdDecoder` (UDP datagrams are easy to spoof), and `graphite::GraphiteDecoder`
-//! in both protocols. Pickle is the highest-risk parser in the repo: a format built for arbitrary
+//! `collectd::CollectdDecoder` (UDP datagrams are easy to spoof), `graphite::GraphiteDecoder`
+//! in both protocols, and `prometheus::compression::decompress_bounded`, which inflates every
+//! remote-write body `prometheus_in` receives. Pickle is the highest-risk parser in the repo: a format built for arbitrary
 //! object construction, read from a socket. A network-facing decoder must pass this suite
 //! (`docs/plans/native-transport.md`).
 //!
@@ -22,6 +23,7 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
 use logit_proto::native::varint::write_uvarint;
 use logit_proto::native::{self, NativeDecoder};
+use logit_proto::prometheus::compression::{self, DecompressError, Encoding};
 use logit_proto::{Decoder, Encoder};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -715,4 +717,102 @@ fn control_message_dispatch_survives_every_single_byte_truncation_of_every_messa
             control::ControlMessage::decode(bytes).is_err()
         });
     }
+}
+
+// -- prometheus::compression::decompress_bounded -----------------------------------------------
+
+/// `prometheus_in`'s `MAX_REQUEST_BYTES`.
+const REMOTE_WRITE_CAP: usize = 4 * 1024 * 1024;
+
+/// A remote-write-sized body with some structure, so the compressed form has real blocks.
+fn remote_write_like_body() -> Vec<u8> {
+    (0..2000u32)
+        .flat_map(|i| format!("series_{}{{job=\"api\"}} {i}\n", i % 37).into_bytes())
+        .collect()
+}
+
+fn decompress_fails(encoding: Encoding, bytes: &Bytes) -> bool {
+    compression::decompress_bounded(encoding, bytes, REMOTE_WRITE_CAP).is_err()
+}
+
+/// A zstd frame header with an 8-byte content size and a window descriptor, no checksum.
+fn zstd_header_declaring(content_size: u64, window: u8) -> Vec<u8> {
+    let mut header = vec![0x28, 0xb5, 0x2f, 0xfd, 0xc0, window];
+    header.extend(content_size.to_le_bytes());
+    header
+}
+
+#[test]
+fn zstd_decompression_survives_every_single_byte_truncation() {
+    let valid = compression::compress(Encoding::Zstd, &remote_write_like_body()).unwrap();
+    assert_every_truncation_fails_cleanly(&valid, |bytes| decompress_fails(Encoding::Zstd, bytes));
+}
+
+#[test]
+fn snappy_decompression_survives_every_single_byte_truncation() {
+    let valid = compression::compress(Encoding::Snappy, &remote_write_like_body()).unwrap();
+    assert_every_truncation_never_panics(&valid, |bytes| decompress_fails(Encoding::Snappy, bytes));
+}
+
+#[test]
+fn both_decompressors_survive_seeded_bit_flips() {
+    for encoding in [Encoding::Zstd, Encoding::Snappy] {
+        let valid = compression::compress(encoding, &remote_write_like_body()).unwrap();
+        assert_bit_flips_never_panic(&valid, 3000, |bytes| !decompress_fails(encoding, bytes));
+    }
+}
+
+/// A content size of `u64::MAX` is refused on the header, allocating nothing like it.
+#[test]
+fn zstd_never_allocates_from_a_hostile_declared_content_size() {
+    let bad = zstd_header_declaring(u64::MAX, 0x50);
+    let mut result = None;
+    let peak = peak_live_bytes(|| {
+        result = Some(compression::decompress_bounded(Encoding::Zstd, &bad, REMOTE_WRITE_CAP));
+    });
+    assert!(
+        matches!(result, Some(Err(DecompressError::TooLarge { declared: Some(_), .. }))),
+        "{result:?}"
+    );
+    assert!(peak < 1024 * 1024, "peak live bytes {peak} suggests the content size was trusted");
+}
+
+/// A 2 TiB window, the largest the spec allows but one, is refused before it is allocated.
+#[test]
+fn zstd_never_allocates_a_hostile_window() {
+    let mut bad = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0xf8];
+    bad.extend([0u8; 16]);
+    let mut result = None;
+    let peak = peak_live_bytes(|| {
+        result = Some(compression::decompress_bounded(Encoding::Zstd, &bad, REMOTE_WRITE_CAP));
+    });
+    assert!(
+        matches!(result, Some(Err(DecompressError::TooLarge { declared: None, .. }))),
+        "{result:?}"
+    );
+    assert!(peak < 1024 * 1024, "peak live bytes {peak} suggests the window was allocated");
+}
+
+/// A frame with no declared size that would inflate to 128 MiB: the output stops just past the
+/// cap, so peak memory is a small multiple of the cap, not of what the frame describes.
+#[test]
+fn zstd_memory_is_bounded_by_the_cap_not_by_what_an_undeclared_frame_inflates_to() {
+    let block: u32 = 128 * 1024;
+    let blocks = 1024;
+    let mut bomb = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x50];
+    for i in 0..blocks {
+        let header = (block << 3) | (1 << 1) | u32::from(i + 1 == blocks);
+        bomb.extend(&header.to_le_bytes()[..3]);
+        bomb.push(0x41);
+    }
+    let mut result = None;
+    let peak = peak_live_bytes(|| {
+        result = Some(compression::decompress_bounded(Encoding::Zstd, &bomb, REMOTE_WRITE_CAP));
+    });
+    assert!(
+        matches!(result, Some(Err(DecompressError::TooLarge { declared: None, .. }))),
+        "{result:?}"
+    );
+    let bound = 4 * REMOTE_WRITE_CAP as i64;
+    assert!(peak < bound, "peak live bytes {peak} over {bound} for a {}-byte bomb", bomb.len());
 }
