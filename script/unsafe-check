@@ -18,8 +18,8 @@
 #
 # The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
 # cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
-# runs each for `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash, and
-# `fuzz-seed` rewrites the committed seeds.
+# runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
+# `fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
 #
 #   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
 #   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
@@ -333,6 +333,7 @@ cmd_fuzz_all() {
     out_dir="perf/results/fuzz/$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "${ROOT}/${out_dir}"
     local summary=()
+    local failed=0
     for entry in "${FUZZ_TARGETS[@]}"; do
         local target="${entry%%|*}"
         local log="${ROOT}/${out_dir}/${target}.log"
@@ -347,6 +348,7 @@ cmd_fuzz_all() {
         else
             local artifact
             artifact="$(grep -oE 'fuzz/artifacts/[^ ]+' "${log}" | tail -1 || true)"
+            failed=1
             summary+=("FAILED ${target} (exit ${status}): ${stats}")
             if [ -n "${artifact}" ]; then
                 summary+=("       minimize: script/unsafe-check fuzz-tmin ${target} ${artifact}")
@@ -356,6 +358,7 @@ cmd_fuzz_all() {
     echo
     echo "===== fuzz-all summary: ${seconds}s per target, logs in ${out_dir} ====="
     printf '%s\n' "${summary[@]}"
+    return "${failed}"
 }
 
 # A plain binary with no sanitizer, so it needs nothing the stable dev image lacks either.
@@ -391,8 +394,8 @@ force errno paths with `strace -e inject=`. `all` runs `miri` then `careful`.
 
 The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
 cargo-fuzz under ASan). `fuzz` runs one target from FUZZ_TARGETS for FUZZ_SECONDS, `fuzz-all`
-runs each for `seconds` (default 120) and prints a summary, `fuzz-tmin` minimizes a crash, and
-`fuzz-seed` rewrites the committed seeds.
+runs each for `seconds` (default 120), prints a summary, and exits 1 if any target failed,
+`fuzz-tmin` minimizes a crash, and `fuzz-seed` rewrites the committed seeds.
 
   UNSAFE_CHECK_TARGET_VOLUME       target volume; give each concurrently running checkout its own
   UNSAFE_CHECK_FUZZ_TARGET_VOLUME  the same, for the sanitizer builds `fuzz` makes
