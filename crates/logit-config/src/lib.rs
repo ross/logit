@@ -526,6 +526,27 @@ pub enum DatadogCompression {
     None,
 }
 
+/// How `splunk_hec_out` compresses its request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SplunkCompression {
+    /// gzip, what the OpenTelemetry exporter sends.
+    #[default]
+    Gzip,
+    /// Every body uncompressed.
+    None,
+}
+
+/// What `splunk_hec_out` does with a metric kind that carries more than one number: drop it,
+/// counted (`skip`, the default), or write one series per number (`expand`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SplunkMultiValue {
+    #[default]
+    Skip,
+    Expand,
+}
+
 /// Which of the Agent's tracer-API forms `datadog_trace_out` sends traces in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub enum DatadogTraceVersion {
@@ -1729,6 +1750,65 @@ pub enum ComponentKind {
         #[serde(default)]
         tls: TlsClientConfig,
     },
+    /// Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in
+    /// the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed
+    /// by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each
+    /// event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource
+    /// attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
+    /// `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed
+    /// field. A resent batch is indexed twice, so a failure Splunk may have partly applied (a
+    /// `5xx`, a timeout) drops the batch unless `buffer.delivery` is `at_least_once`.
+    SplunkHecOut {
+        /// The collector's base URL, ending in `/services/collector`:
+        /// `https://splunk.example.com:8088/services/collector`, or
+        /// `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. This
+        /// sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`,
+        /// `/ack`, `/health`) is rejected.
+        endpoint: String,
+        /// The HEC token, sent as `Authorization: Splunk <token>` and never logged. Take it from
+        /// the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing it into the file. An
+        /// empty token, or one with leading or trailing whitespace, is rejected.
+        token: String,
+        /// How request bodies are compressed: `gzip` (the default) or `none`.
+        #[serde(default)]
+        compression: SplunkCompression,
+        /// What to do with a metric kind that carries more than one number (a histogram, a
+        /// summary, a sketch, raw samples, a set), since a Splunk metric is one number per name.
+        /// `skip` (the default) drops the record, counted; `expand` writes the series the
+        /// OpenTelemetry exporter writes for a histogram or summary (`_sum`, `_count`,
+        /// `_bucket` with `le`, or a quantile with `qt`), and a count, sum, minimum, maximum, or
+        /// percentile series for the others, counted as degraded. An exponential histogram is
+        /// dropped under both.
+        #[serde(default)]
+        multi_value: SplunkMultiValue,
+        /// Waits for Splunk to confirm each request was indexed before a batch counts as
+        /// delivered, polling `/services/collector/ack`. Needs a token with indexer
+        /// acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't
+        /// acknowledge, each request counts as delivered on its `200`, and `logit` logs a
+        /// warning. Off by default.
+        #[serde(default)]
+        ack: bool,
+        /// How long to wait for every request of a batch to be acknowledged before retrying the
+        /// batch. Only with `ack: true`. Defaults to `30s`; `0s` is rejected.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        ack_timeout: Option<Duration>,
+        /// Timeout for one request. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_splunk_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no
+        /// verification. A non-default block with an `http://` endpoint is rejected.
+        #[serde(default)]
+        tls: TlsClientConfig,
+        /// Caps one request body before compression; a batch larger than this goes out as
+        /// several requests, and one event larger than this alone is dropped, counted. A
+        /// byte-count string. Defaults to `"2MiB"`, the OpenTelemetry exporter's default. `0` is
+        /// rejected.
+        #[serde(default = "default_splunk_max_body_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_body_bytes: u64,
+    },
     /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
     /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
     LogitOut {
@@ -2572,6 +2652,16 @@ fn default_statsd_connect_timeout() -> Duration {
 /// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
 fn default_collectd_max_packet_bytes() -> u64 {
     1452
+}
+
+/// `splunk_hec_out`'s default per-request `timeout:`.
+pub fn default_splunk_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+/// Mirrors `logit_outputs::splunk::DEFAULT_MAX_BODY_BYTES`, kept in sync by hand.
+pub fn default_splunk_max_body_bytes() -> u64 {
+    2 * 1024 * 1024
 }
 
 /// Mirrors `logit_inputs::splunk::DEFAULT_MAX_REQUEST_BYTES`, kept in sync by hand.
@@ -5036,6 +5126,62 @@ mod tests {
             component.kind,
             ComponentKind::SplunkHecIn { max_request_bytes: 838_860_800, .. }
         ));
+    }
+
+    #[test]
+    fn splunk_hec_out_defaults_and_a_byte_count_cap() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "splunk_hec_out", "endpoint": "https://splunk:8088/services/collector",
+                "token": "t"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SplunkHecOut {
+                endpoint,
+                token,
+                compression,
+                multi_value,
+                ack,
+                ack_timeout,
+                timeout,
+                tls,
+                max_body_bytes,
+            } => {
+                assert_eq!(endpoint, "https://splunk:8088/services/collector");
+                assert_eq!(token, "t");
+                assert_eq!(compression, SplunkCompression::Gzip);
+                assert_eq!(multi_value, SplunkMultiValue::Skip);
+                assert!(!ack);
+                assert_eq!(ack_timeout, None);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(tls.is_empty());
+                assert_eq!(max_body_bytes, 2 * 1024 * 1024);
+            }
+            other => panic!("expected SplunkHecOut, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "splunk_hec_out", "endpoint": "http://h/services/collector", "token": "t",
+                "compression": "none", "multi_value": "expand", "ack": true,
+                "ack_timeout": "1m", "max_body_bytes": "512KiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SplunkHecOut {
+                compression,
+                multi_value,
+                ack,
+                ack_timeout,
+                max_body_bytes,
+                ..
+            } => {
+                assert_eq!(compression, SplunkCompression::None);
+                assert_eq!(multi_value, SplunkMultiValue::Expand);
+                assert!(ack);
+                assert_eq!(ack_timeout, Some(Duration::from_secs(60)));
+                assert_eq!(max_body_bytes, 512 * 1024);
+            }
+            other => panic!("expected SplunkHecOut, got {other:?}"),
+        }
     }
 
     #[test]

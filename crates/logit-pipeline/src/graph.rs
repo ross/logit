@@ -205,6 +205,11 @@
 //!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
 //!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/splunk-hec-relay.md`).
+//! 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL or ends in a
+//!     HEC route (`/event`, `/event/1.0`, `/raw`, `/raw/1.0`, `/ack`, `/health`, `/health/1.0`)
+//!     rather than the `/services/collector` base, an empty `token` or one with leading or
+//!     trailing whitespace, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
+//!     `max_body_bytes` of `0`, or a `tls` failing rule 24's checks (`docs/adr/splunk-hec-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -304,6 +309,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | OtlpOut { .. }
         | DatadogOut { .. }
         | DatadogTraceOut { .. }
+        | SplunkHecOut { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -369,6 +375,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         OtlpOut { .. } => "otlp_out",
         DatadogOut { .. } => "datadog_out",
         DatadogTraceOut { .. } => "datadog_trace_out",
+        SplunkHecOut { .. } => "splunk_hec_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -467,6 +474,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::DatadogOut { .. }
             | ComponentKind::DatadogTraceOut { .. }
+            | ComponentKind::SplunkHecOut { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -602,6 +610,10 @@ const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
 /// unbalanced IPv6 `[`, a port past `u16::MAX`). `crates/logit-inputs/src/prometheus.rs` does the
 /// real parse, and keys an unparseable target's placeholder `Resource` by its configured index so
 /// two never collide.
+/// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
+const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
+    ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
+
 fn is_absolute_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
@@ -3128,6 +3140,99 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 70: `splunk_hec_out` (`docs/adr/splunk-hec-relay.md`). The sink appends `/event` and
+    // `/ack` to `endpoint`, so a URL already naming a route would post to
+    // `/services/collector/event/event`. The token gets rule 66's checks for the same reason:
+    // HTTP strips a header value's surrounding whitespace. An `ack_timeout` without `ack` would
+    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS.
+    for (id, component) in &components {
+        let ComponentKind::SplunkHecOut {
+            endpoint,
+            token,
+            ack,
+            ack_timeout,
+            timeout,
+            tls,
+            max_body_bytes,
+            ..
+        } = &component.kind
+        else {
+            continue;
+        };
+        if !is_absolute_http_url(endpoint) {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'endpoint' must be an absolute http:// or \
+                 https:// URL with a host, got {endpoint:?}"
+            );
+        }
+        let path = endpoint.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        let path = path.trim_end_matches('/');
+        if SPLUNK_HEC_ROUTE_SUFFIXES.iter().any(|suffix| path.ends_with(suffix)) {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'endpoint' ({endpoint:?}) names a HEC route -- \
+                 give the collector's base URL, ending in '/services/collector'; the sink appends \
+                 '/event' and '/ack' itself"
+            );
+        }
+        if token.is_empty() {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'token' must not be empty -- Splunk rejects \
+                 every request without one; take it from the environment with \
+                 !env SPLUNK_HEC_TOKEN"
+            );
+        }
+        if token.trim() != token {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'token' has leading or trailing whitespace, \
+                 which HTTP strips from the Authorization header -- check the value (a token \
+                 file's trailing newline, say)"
+            );
+        }
+        if timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'timeout: 0s' would fail every request before \
+                 it was sent"
+            );
+        }
+        match ack_timeout {
+            Some(_) if !*ack => anyhow::bail!(
+                "component '{id}': splunk_hec_out 'ack_timeout' is set without 'ack: true' -- it \
+                 bounds the wait for acknowledgment, so it would do nothing"
+            ),
+            Some(t) if t.is_zero() => anyhow::bail!(
+                "component '{id}': splunk_hec_out 'ack_timeout: 0s' would time out every batch \
+                 before its first poll"
+            ),
+            _ => {}
+        }
+        if *max_body_bytes == 0 {
+            anyhow::bail!(
+                "component '{id}': splunk_hec_out 'max_body_bytes' must be greater than 0 -- 0 \
+                 would drop every event as oversize"
+            );
+        }
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if !tls.is_empty() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
+                 'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block here \
+                 would have no effect"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -5582,6 +5687,166 @@ mod tests {
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
+    // ---- rule 70: splunk_hec_out -----------------------------------------------------------
+
+    /// A `splunk_hec_out` with every optional field at its default, the shape rule 70 reads.
+    fn splunk_hec_out(endpoint: &str) -> ComponentKind {
+        ComponentKind::SplunkHecOut {
+            endpoint: endpoint.to_string(),
+            token: "11111111-2222-3333-4444-555555555555".to_string(),
+            compression: logit_config::SplunkCompression::default(),
+            multi_value: logit_config::SplunkMultiValue::default(),
+            ack: false,
+            ack_timeout: None,
+            timeout: logit_config::default_splunk_timeout(),
+            tls: logit_config::TlsClientConfig::default(),
+            max_body_bytes: logit_config::default_splunk_max_body_bytes(),
+        }
+    }
+
+    /// Edits one field of a default `splunk_hec_out` on an `https://` base URL.
+    fn splunk_hec_out_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        let mut kind = splunk_hec_out("https://splunk:8088/services/collector");
+        edit(&mut kind);
+        kind
+    }
+
+    fn splunk_hec_out_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+    }
+
+    #[test]
+    fn a_splunk_hec_out_with_a_base_url_resolves() {
+        for endpoint in [
+            "https://splunk:8088/services/collector",
+            "https://splunk:8088/services/collector/",
+            "http://127.0.0.1:8088/services/collector",
+            "https://http-inputs-acme.splunkcloud.com/services/collector",
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], splunk_hec_out(endpoint)),
+            ]))
+            .unwrap_or_else(|err| panic!("{endpoint}: {err:#}"));
+        }
+        let kind = splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { ack, ack_timeout, tls, .. } = k {
+                *ack = true;
+                *ack_timeout = Some(Duration::from_secs(60));
+                tls.ca_file = Some("ca.pem".into());
+            }
+        });
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("ack with a timeout and a tls block on https:// are valid");
+    }
+
+    /// Rule 70: the endpoint is an absolute http(s) URL.
+    #[test]
+    fn a_splunk_hec_out_endpoint_that_isnt_an_absolute_url_is_rejected() {
+        for bad in ["splunk:8088/services/collector", "ftp://splunk/services/collector", "http://"]
+        {
+            let err = splunk_hec_out_err(splunk_hec_out(bad));
+            assert!(err.contains("'out'"), "{bad:?}: {err}");
+            assert!(err.contains("'endpoint' must be an absolute"), "{bad:?}: {err}");
+        }
+    }
+
+    /// Rule 70: the sink appends the route, so an endpoint naming one is a mistake.
+    #[test]
+    fn a_splunk_hec_out_endpoint_naming_a_route_is_rejected() {
+        for route in ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"]
+        {
+            for bad in [
+                format!("https://splunk:8088/services/collector{route}"),
+                format!("https://splunk:8088/services/collector{}/", route.to_uppercase()),
+            ] {
+                let err = splunk_hec_out_err(splunk_hec_out(&bad));
+                assert!(err.contains("names a HEC route"), "{bad:?}: {err}");
+                assert!(err.contains("'/services/collector'"), "{bad:?}: {err}");
+            }
+        }
+    }
+
+    /// Rule 70: the token must be sendable as-is, and is never quoted.
+    #[test]
+    fn a_splunk_hec_out_token_that_is_empty_or_padded_is_rejected() {
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { token, .. } = k {
+                token.clear();
+            }
+        }));
+        assert!(err.contains("'token' must not be empty"), "got: {err}");
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { token, .. } = k {
+                *token = "secret-token\n".into();
+            }
+        }));
+        assert!(err.contains("leading or trailing whitespace"), "got: {err}");
+        assert!(!err.contains("secret-token"), "the message never quotes the token: {err}");
+    }
+
+    #[test]
+    fn a_splunk_hec_out_with_a_zero_timeout_is_rejected() {
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { timeout, .. } = k {
+                *timeout = Duration::ZERO;
+            }
+        }));
+        assert!(err.contains("'timeout: 0s'"), "got: {err}");
+    }
+
+    /// Rule 70: `ack_timeout` only with `ack: true`, and never zero.
+    #[test]
+    fn a_splunk_hec_out_ack_timeout_without_ack_or_of_zero_is_rejected() {
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { ack_timeout, .. } = k {
+                *ack_timeout = Some(Duration::from_secs(30));
+            }
+        }));
+        assert!(err.contains("'ack_timeout' is set without 'ack: true'"), "got: {err}");
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { ack, ack_timeout, .. } = k {
+                *ack = true;
+                *ack_timeout = Some(Duration::ZERO);
+            }
+        }));
+        assert!(err.contains("'ack_timeout: 0s'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_splunk_hec_out_with_a_zero_max_body_bytes_is_rejected() {
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { max_body_bytes, .. } = k {
+                *max_body_bytes = 0;
+            }
+        }));
+        assert!(err.contains("'max_body_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
+    #[test]
+    fn a_splunk_hec_out_tls_block_that_cant_take_effect_is_rejected() {
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { tls, .. } = k {
+                tls.cert_file = Some("client.pem".into());
+            }
+        }));
+        assert!(err.contains("must both be set"), "got: {err}");
+        let err = splunk_hec_out_err(splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { tls, .. } = k {
+                tls.insecure_skip_verify = true;
+                tls.ca_file = Some("ca.pem".into());
+            }
+        }));
+        assert!(err.contains("can't both be set"), "got: {err}");
+        let mut kind = splunk_hec_out("http://splunk:8088/services/collector");
+        if let ComponentKind::SplunkHecOut { tls, .. } = &mut kind {
+            tls.insecure_skip_verify = true;
+        }
+        let err = splunk_hec_out_err(kind);
+        assert!(err.contains("isn't 'https://'"), "got: {err}");
+    }
+
     // ---- rule 66: datadog_out --------------------------------------------------------------
 
     /// A `datadog_out` with every optional field at its default, the shape rule 66 reads.
@@ -6583,6 +6848,9 @@ mod tests {
         assert_eq!(kind_name(&sink()), "influxdb_out");
         assert_eq!(kind_name(&splunk_hec_in("0.0.0.0:8088", vec![])), "splunk_hec_in");
         assert_eq!(role(&splunk_hec_in("0.0.0.0:8088", vec![])), Role::Listener);
+        let out = splunk_hec_out("https://splunk:8088/services/collector");
+        assert_eq!(kind_name(&out), "splunk_hec_out");
+        assert_eq!(role(&out), Role::Sink);
     }
 
     /// A valid router -> target config resolves (rules 47-51).

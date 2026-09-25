@@ -366,6 +366,10 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 68. A `trace_context` `trace_id_high` outside `format: datadog`, or an empty one.
 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has surrounding
     whitespace, or a `max_request_bytes` of `0`.
+70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL or ends in a HEC
+    route rather than the `/services/collector` base, an empty or whitespace-padded `token`,
+    `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a
+    bad `tls` (including any `tls` with an `http://` endpoint).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

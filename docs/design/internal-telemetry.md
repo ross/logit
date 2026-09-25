@@ -1564,6 +1564,34 @@ carrier doesn't count there, because the request header carries it.
 quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and
 `bad_header` (a tracer header left out because its attribute isn't a legal header value).
 
+##### `splunk_hec_out`
+
+`crates/logit-outputs/src/splunk.rs`, codec in `crates/logit-proto/src/splunk/`,
+[ADR `splunk-hec-relay`](../adr/splunk-hec-relay.md). Requests carry `route`: `event` for a
+`/services/collector/event` body, `ack` for an acknowledgment poll.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
+| `logit.output.request.duration{route}` | timing | one per request |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` code 6 named, which are assumed indexed |
+| `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent |
+| `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` code 6 named, dropped before the rest of its body is resent once |
+| `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
+| `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackID`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
+
+The codec's own counters (`logit.output.metrics.skipped` and `metrics.degraded` by `metric_kind`
+under `multi_value`, `metrics.normalized{reason="name_sanitized"}`, `tags.dropped`,
+`events.skipped`, `spans.degraded`) are in the tables of
+`crates/logit-proto/src/splunk/mod.rs`'s module doc and its `logs`, `metrics`, and `spans`
+submodules, under this component's id, and this sink doesn't repeat them.
+
+`Diagnostics` keys, each throttled: `token_rejected` (a `401` or `403`), `request_rejected` (any
+other non-retryable `4xx` or `3xx`, quoting 256 bytes of the body), `invalid_event` (an object
+dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsupported`, and
+`ack_timeout`. The token never appears in any of them.
+
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,

@@ -1958,6 +1958,86 @@
           }
         },
         {
+          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed field. A resent batch is indexed twice, so a failure Splunk may have partly applied (a `5xx`, a timeout) drops the batch unless `buffer.delivery` is `at_least_once`.",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "token",
+            "type"
+          ],
+          "properties": {
+            "ack": {
+              "description": "Waits for Splunk to confirm each request was indexed before a batch counts as delivered, polling `/services/collector/ack`. Needs a token with indexer acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't acknowledge, each request counts as delivered on its `200`, and `logit` logs a warning. Off by default.",
+              "default": false,
+              "type": "boolean"
+            },
+            "ack_timeout": {
+              "description": "How long to wait for every request of a batch to be acknowledged before retrying the batch. Only with `ack: true`. Defaults to `30s`; `0s` is rejected.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "compression": {
+              "description": "How request bodies are compressed: `gzip` (the default) or `none`.",
+              "default": "gzip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SplunkCompression"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "The collector's base URL, ending in `/services/collector`: `https://splunk.example.com:8088/services/collector`, or `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. This sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is rejected.",
+              "type": "string"
+            },
+            "max_body_bytes": {
+              "description": "Caps one request body before compression; a batch larger than this goes out as several requests, and one event larger than this alone is dropped, counted. A byte-count string. Defaults to `\"2MiB\"`, the OpenTelemetry exporter's default. `0` is rejected.",
+              "default": "2097152",
+              "type": "string"
+            },
+            "multi_value": {
+              "description": "What to do with a metric kind that carries more than one number (a histogram, a summary, a sketch, raw samples, a set), since a Splunk metric is one number per name. `skip` (the default) drops the record, counted; `expand` writes the series the OpenTelemetry exporter writes for a histogram or summary (`_sum`, `_count`, `_bucket` with `le`, or a quantile with `qt`), and a count, sum, minimum, maximum, or percentile series for the others, counted as degraded. An exponential histogram is dropped under both.",
+              "default": "skip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SplunkMultiValue"
+                }
+              ]
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for an `https://` endpoint: a private CA, a client certificate, or no verification. A non-default block with an `http://` endpoint is rejected.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "token": {
+              "description": "The HEC token, sent as `Authorization: Splunk <token>` and never logged. Take it from the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing it into the file. An empty token, or one with leading or trailing whitespace, is rejected.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "splunk_hec_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -3677,6 +3757,33 @@
         }
       },
       "additionalProperties": false
+    },
+    "SplunkCompression": {
+      "description": "How `splunk_hec_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "gzip, what the OpenTelemetry exporter sends.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "Every body uncompressed.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "SplunkMultiValue": {
+      "description": "What `splunk_hec_out` does with a metric kind that carries more than one number: drop it, counted (`skip`, the default), or write one series per number (`expand`).",
+      "type": "string",
+      "enum": [
+        "skip",
+        "expand"
+      ]
     },
     "StatsdFormat": {
       "description": "Which statsd dialect `statsd_out` emits. `dogstatsd` (the default) includes the tag segment.",
