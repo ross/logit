@@ -191,7 +191,7 @@ No ADR: nothing here is a new decision about `logit` itself, only about what the
 
 ## Verification, across the whole plan
 
-1. `script/validate` after every workstream; `examples/` untouched throughout.
+1. `script/validate` after every workstream; `fixtures/` untouched throughout.
 2. `script/demo up --build`, `script/demo logs -f logit` — one `stdio_out` block per tier per
    request.
 3. Pull a `/work` trace from Tempo's own API and confirm the expected span tree per workstream.

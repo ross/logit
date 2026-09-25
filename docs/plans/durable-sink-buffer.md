@@ -170,7 +170,7 @@ reopens with the backlog intact); the abandoned-inbox sweep appends to the spool
   `docs/known-gaps.md`: rewrite the durable-buffering entry to receive-side-only, note the
   power-loss window and the `Buffer<T>` trait's narrowed role; `docs/design/internal-telemetry.md`
   catalog rows; `docs/design/wire-protocol.md` "Buffering" section updated; `AGENTS.md` current
-  state; `examples/` — add a commented `disk:` block to `examples/statsd-to-influxdb.yaml`'s
+  state; `fixtures/` — add a commented `disk:` block to `fixtures/statsd-to-influxdb.yaml`'s
   existing commented `buffer:` reference block.
 
 ## Verification, across the whole plan

@@ -133,14 +133,14 @@ A `build_spec` arm plus `to_flatten_fields`/`to_flatten_arrays` beside `to_allow
 `docs/design/memory.md` (the allocation rows), `crates/logit-transforms/src/lib.rs` (crate doc +
 `mod`/`pub use`, alphabetical between `csv` and `json`), `AGENTS.md` (current-state paragraph,
 crate-layout line), `README.md`, `docs/known-gaps.md` (interner-growth entry, extending the
-existing `syslog.sd`/`json`/`otlp_in` bullet), `examples/nested-json-to-influxdb.yaml` (new
+existing `syslog.sd`/`json`/`otlp_in` bullet), `fixtures/nested-json-to-influxdb.yaml` (new
 example), `schema/logit.schema.json` (regenerated).
 
 ### The example (W2)
 
-New file `examples/nested-json-to-influxdb.yaml`: `tail_in -> json -> flatten -> keep ->
+New file `fixtures/nested-json-to-influxdb.yaml`: `tail_in -> json -> flatten -> keep ->
 kv_metrics -> aggregate -> influxdb_out` over a small nested-JSON fixture log (an
-`http: {method, status}` shape). New rather than folded into `examples/nginx-to-influxdb.yaml`
+`http: {method, status}` shape). New rather than folded into `fixtures/nginx-to-influxdb.yaml`
 because the point is demonstrating a *nested* source, which no shipped example currently has.
 Covered automatically by `every_shipped_config_loads_and_validates`
 (`crates/logit-cli/src/config.rs`) and `script/validate`.
@@ -151,7 +151,7 @@ Covered automatically by `every_shipped_config_loads_and_validates`
 |---|---|---|---|
 | W0 | **ADR and plan.** | `docs/adr/flatten-transform.md` (new, + row atop `docs/adr/README.md`); `docs/plans/flatten-transform.md` (new, + row atop `docs/plans/README.md`) | — |
 | W1 | **`flatten` — the component.** | `crates/logit-core/src/attrs.rs`; `crates/logit-config/src/lib.rs`; `crates/logit-pipeline/src/graph.rs`; `crates/logit-transforms/src/flatten.rs` (new); `crates/logit-transforms/src/lib.rs`; `crates/logit-cli/src/pipeline.rs`; `schema/logit.schema.json` | W0 |
-| W2 | **Docs, example, and the allocation pins.** | `examples/nested-json-to-influxdb.yaml` (new); `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `crates/logit-transforms/src/lib.rs` (`chained_pipeline_test`); `AGENTS.md`; `README.md`; `docs/known-gaps.md` | W1 |
+| W2 | **Docs, example, and the allocation pins.** | `fixtures/nested-json-to-influxdb.yaml` (new); `docs/design/pipeline-graph.md`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`; `crates/logit-bench/src/fixtures.rs`; `crates/logit-bench/tests/allocations.rs`; `crates/logit-transforms/src/lib.rs` (`chained_pipeline_test`); `AGENTS.md`; `README.md`; `docs/known-gaps.md` | W1 |
 
 Landing order: **W0 → W1 → W2**, strictly linear. Config, validation, transform, and registry are
 one PR because `build_spec`'s match is exhaustive — a variant added without its arm doesn't
@@ -195,10 +195,10 @@ green, `script/validate` clean, no `type_sizes.rs` change (this component adds n
 
 - `script/check` during the loop; `script/cibuild` before each PR.
 - `script/schema` after the W1 config change; commit the result.
-- `script/validate` over `demo/`, `examples/`, `perf/scenarios/`, `tools/shape-survey/configs/`.
+- `script/validate` over `demo/`, `fixtures/`, `perf/scenarios/`, `tools/shape-survey/configs/`.
 - Negative config check by hand: `attributes: none` + `resource: none`; `attributes: []`;
   `attributes: [""]`; `attributes: [http, http]`.
-- `logit graph examples/nested-json-to-influxdb.yaml` — `flat` renders as an ordinary transform
+- `logit graph fixtures/nested-json-to-influxdb.yaml` — `flat` renders as an ordinary transform
   node between `json` and `keep`.
 - Manual smoke through `script/server` against the new example: a nested JSON log line in, dotted
   tags visible in InfluxDB out — the actual point of the component, and not provable by unit tests
