@@ -832,8 +832,10 @@ impl FrameReadError {
 /// Parses `header_buf` and checks its declared lengths before reading the body:
 /// `uncompressed_len` against `max_frame_bytes` (capped at [`frame::MAX_SANE_UNCOMPRESSED_LEN`]),
 /// and `compressed_len` against [`frame::compressed_bound`] of that, since an incompressible
-/// payload at the cap grows under lz4. Then hands the whole frame to
-/// [`frame::read_frame_with_header`] for its CRC, decompression, and length checks.
+/// payload at the cap grows under lz4. Then reads the body into the frame's final buffer, after a
+/// copy of the header, and hands it to [`frame::read_frame_with_header`] for its CRC,
+/// decompression, and length checks. The body is held once: peak heap is one
+/// `HEADER_LEN + compressed_len` buffer.
 ///
 /// `stall` bounds each `read` of the body, not the body in total (module doc's "Idle timeout").
 /// It's the connection's `idle_timeout`; `None` (the handshake, test helpers) means unbounded.
@@ -862,33 +864,34 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     // A fill loop rather than `read_exact`, so each `read` carries the `stall` bound and a peer
     // that closed mid-body (`Ok(0)`, `Truncated`) stays distinct from one that stopped
     // (`Stalled`, an idle close).
-    let mut body = vec![0u8; header.compressed_len as usize];
-    let mut filled = 0usize;
-    while filled < body.len() {
+    let body_len = header.compressed_len as usize;
+    let mut full = BytesMut::zeroed(frame::HEADER_LEN + body_len);
+    full[..frame::HEADER_LEN].copy_from_slice(&header_buf);
+    let mut filled = frame::HEADER_LEN;
+    while filled < full.len() {
         let read = match stall {
             Some(stall) => {
-                match tokio::time::timeout(stall, stream.read(&mut body[filled..])).await {
+                match tokio::time::timeout(stall, stream.read(&mut full[filled..])).await {
                     Ok(read) => read,
                     Err(_elapsed) => return Err(FrameReadError::Stalled(stall)),
                 }
             }
-            None => stream.read(&mut body[filled..]).await,
+            None => stream.read(&mut full[filled..]).await,
         };
         let n = read.map_err(|e| {
             FrameReadError::Truncated(anyhow::Error::new(e).context("reading a frame body"))
         })?;
         if n == 0 {
             return Err(FrameReadError::Truncated(anyhow::anyhow!(
-                "connection closed mid-body ({filled}/{} bytes)",
-                body.len()
+                "connection closed mid-body ({}/{body_len} bytes)",
+                filled - frame::HEADER_LEN
             )));
         }
         filled += n;
     }
 
-    let mut full = BytesMut::with_capacity(frame::HEADER_LEN + body.len());
-    full.extend_from_slice(&header_buf);
-    full.extend_from_slice(&body);
+    // `read_frame_with_header` re-parses the header from the front of `full`, then splits the
+    // body off it for the CRC: the buffer must hold both.
     let mut full = full.freeze();
     match frame::read_frame_with_header(&mut full) {
         Ok((header, payload)) => Ok((header, payload)),
@@ -2318,5 +2321,106 @@ mod tests {
             Some(1.0)
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A frame's body is held once while it's read: one buffer of `HEADER_LEN + compressed_len`,
+    /// read into in place and handed to `frame::read_frame_with_header`, never a body `Vec`
+    /// copied next to the header.
+    #[tokio::test]
+    async fn a_frame_body_is_held_once_at_peak() {
+        const BODY: usize = 8 * 1024 * 1024;
+        let framed =
+            frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &vec![7u8; BODY])
+                .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(framed.len() + 1);
+        client.write_all(&framed).await.unwrap();
+        drop(framed);
+        let header = read_header(&mut server, None)
+            .await
+            .map_err(HeaderReadError::into_inner)
+            .unwrap()
+            .unwrap();
+
+        peak_alloc::reset();
+        let (header, payload) =
+            read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
+                .await
+                .map_err(FrameReadError::into_inner)
+                .unwrap();
+        let peak = peak_alloc::peak();
+        assert_eq!(payload.len(), BODY);
+        assert_eq!(header.compressed_len as usize, BODY);
+        assert!(
+            (BODY..BODY + BODY / 16).contains(&peak),
+            "peak live heap {peak} bytes for a {BODY}-byte body: the body is held more than once"
+        );
+    }
+
+    /// A per-thread peak-live-bytes counter over the system allocator, installed as this test
+    /// binary's global allocator. Thread-local, so a `current_thread` test measures only itself.
+    mod peak_alloc {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// `try_with`: an allocation during thread-local teardown is served but not counted.
+        fn grow(bytes: usize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        fn shrink(bytes: usize) {
+            let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(bytes)));
+        }
+
+        pub(super) fn reset() {
+            LIVE.with(|live| live.set(0));
+            PEAK.with(|peak| peak.set(0));
+        }
+
+        pub(super) fn peak() -> usize {
+            PEAK.with(Cell::get)
+        }
+
+        struct Counting;
+
+        // SAFETY: every method forwards to `System` with the caller's arguments unchanged and
+        // only updates thread-local counters around the call.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                grow(layout.size());
+                // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract for `layout`.
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                grow(layout.size());
+                // SAFETY: as `alloc`.
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                shrink(layout.size());
+                // SAFETY: `ptr` came from this allocator, which is `System`, with `layout`.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                if new_size >= layout.size() {
+                    grow(new_size - layout.size());
+                } else {
+                    shrink(layout.size() - new_size);
+                }
+                // SAFETY: as `dealloc`, and the caller upholds `realloc`'s size contract.
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
     }
 }
