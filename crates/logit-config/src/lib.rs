@@ -1204,14 +1204,17 @@ pub enum ComponentKind {
         /// running total alive across the window boundary. Defaults to `5`. `0` disables
         /// retention (every series is drained every window) and is rejected together with
         /// `temporality: cumulative`, which would otherwise emit each window's delta labelled as
-        /// a cumulative total.
+        /// a cumulative total. Counts flushes, not wall time: a flush delayed past its interval
+        /// still counts once.
         #[serde(default = "default_series_retention")]
         series_retention: u32,
         /// A hard cap on how many series may be retained across this component's window at once;
         /// a cardinality guard, not a tuning knob. `series_retention` alone bounds only how long
         /// one series survives, so a stream of never-repeating series names would otherwise hold
-        /// unboundedly many. Defaults to `10000`. Least-recently-updated series are evicted first.
-        /// Must be at least `1` under `temporality: cumulative`.
+        /// unboundedly many. Defaults to `10000`. The most idle series are evicted first, and among
+        /// equally idle ones the most recently created, so a series updated every window outlives
+        /// one-off series. Must be at least `1` while `series_retention` is above `0`: set
+        /// `series_retention: 0` to disable retention instead.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
@@ -1225,7 +1228,8 @@ pub enum ComponentKind {
         distributions: Distributions,
         /// A hard cap on how many raw values one series may retain in one window before
         /// `distributions: samples` falls back to sketching what it holds; a memory guard, not a
-        /// tuning knob. Defaults to `1000`. Meaningless under `distributions: sketch`.
+        /// tuning knob. Defaults to `1000`, and must be at least `1`. Meaningless under
+        /// `distributions: sketch`.
         #[serde(default = "default_max_samples_per_series")]
         max_samples_per_series: usize,
         /// Whether a raw set-members series (statsd `s`) absorbs into this window as a
@@ -1237,7 +1241,7 @@ pub enum ComponentKind {
         sets: Sets,
         /// A hard cap on how many distinct members one series may retain in one window before
         /// `sets: members` falls back to an estimate; a memory guard, not a tuning knob. Defaults
-        /// to `1000`. Meaningless under `sets: estimate`.
+        /// to `1000`, and must be at least `1`. Meaningless under `sets: estimate`.
         #[serde(default = "default_max_set_members_per_series")]
         max_set_members_per_series: usize,
     },
