@@ -627,8 +627,9 @@ Two identities hold for every `aggregate`:
 
 - **Records:** `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every
   metric record `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`,
-  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`. `absorbed` is
-  `logit.transform.metrics.absorbed`, and each reason is
+  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
+  [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)'s "Transforms",
+  "`aggregate`" table. `absorbed` is `logit.transform.metrics.absorbed`, and each reason is
   `logit.transform.metrics.passed_through{reason}`, totaled per `process` call: one count per
   reason per event, carrying the number of records. The stream asserts this identity from
   telemetry.

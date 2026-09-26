@@ -62,12 +62,12 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
-| 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`); each becomes one `Option`-returning function, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm | XFORM-02, XFORM-03 | fixed (agg/w2): `opener_for` and `Accumulator::retained_kind`, each pinned by a table test over every kind and mode |
+| 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`); each becomes one `Option`-returning function, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm | XFORM-02, XFORM-03 | XFORM-02 half **Done**: findings → #405 (`opener_for` and `Accumulator::retained_kind`, each pinned by a table test over every kind and mode) |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
 | 21 | A `NaN` resource attribute opens a new `ResourceGroup` per metric, because `group_for` uses `Resource`'s derived `PartialEq` while `SeriesKey` and `scope_key_eq` compare floats bitwise: a quadratic scan, and every such metric emitted unaggregated | XFORM-01 | **Done**: findings → #402 (`group_for` compares resources bitwise, with an `Arc::ptr_eq` fast path) |
 | 22 | Cardinality-cap ties among equally idle series fall in `HashMap` order, so a series updated every window is evicted at random once active series exceed `max_retained_series`; a cumulative series then restarts with a new `start_timestamp`. The fix breaks ties by a per-`Aggregator` monotonic open sequence number, newest evicted first | XFORM-03 | in-progress (agg/w3) |
-| 23 | A cumulative histogram's `min`/`max` fold (`fold_extreme`) keeps whichever side has a value, so a series can emit `min > max` when windows disagree on which extremes they carry | XFORM-02 | fixed (agg/w2): `min`/`max` follow the `sum` rule, and a zero-count record is ignored |
-| 24 | A non-finite delta `Sum` (a statsd `1e308\|c\|@0.5` extrapolates to infinity) merges into a cumulative total and stays in it for the series' life | XFORM-02 | fixed (agg/w2): passes through, counted `passed_through{reason="non_finite"}` |
+| 23 | A cumulative histogram's `min`/`max` fold (`fold_extreme`) keeps whichever side has a value, so a series can emit `min > max` when windows disagree on which extremes they carry | XFORM-02 | **Done**: findings → #405 (`min`/`max` follow the `sum` rule, and a zero-count record is ignored) |
+| 24 | A non-finite delta `Sum` (a statsd `1e308\|c\|@0.5` extrapolates to infinity) merges into a cumulative total and stays in it for the series' life | XFORM-02 | **Done**: findings → #405 (passes through, counted `passed_through{reason="non_finite"}`) |
 
 Repo-wide gaps that cut across entries:
 
@@ -218,7 +218,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-15](#core-15--scriptworker-vm-lifecycle-the-luajit-sandbox-and-return-value-validation) | P0 | `ScriptWorker`: VM lifecycle, the LuaJIT sandbox, and return-value validation | `crates/logit-script/src/lib.rs` (`sandbox_libs`, `remove_unsandboxed_base_globals`, `ScriptWorker`) | findings → #391 |
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | findings → #388 |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
-| [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings (agg/w2) |
+| [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | in-progress (agg/w3) |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | unreviewed |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | unreviewed |
@@ -269,7 +269,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
 | [CORE-02](#core-02--keycache-hand-rolled-cursor-scan-memo-in-front-of-the-interner) | P1 | `KeyCache`: hand-rolled cursor-scan memo in front of the interner | `crates/logit-core/src/interner.rs` (`KeyCache::get_or_intern`) | unreviewed |
 | [CORE-03](#core-03--attrmap-sorted-inline-smallvec-and-the-resourceevent-merge-join) | P1 | `AttrMap`: sorted inline `SmallVec` and the resource⊕event merge-join | `crates/logit-core/src/attrs.rs` (`AttrMap`, `merged`) | unreviewed |
-| [CORE-07](#core-07--samples-attacker-influenced-sample-rate-extrapolation) | P1 | `Samples`: attacker-influenced sample-rate extrapolation | `crates/logit-core/src/metric.rs` (`Samples`, `Samples::weight`, `Samples::sketch`) | findings (agg/w2) |
+| [CORE-07](#core-07--samples-attacker-influenced-sample-rate-extrapolation) | P1 | `Samples`: attacker-influenced sample-rate extrapolation | `crates/logit-core/src/metric.rs` (`Samples`, `Samples::weight`, `Samples::sketch`) | findings → #405 |
 | [CORE-08](#core-08--telemetry-component-buffers-locks-bounded-caps-and-drop-accounting) | P1 | Telemetry component buffers: locks, bounded caps, and drop accounting | `crates/logit-core/src/telemetry.rs` (`ComponentBuffer`, `Registry`, `MAX_KEYS_PER_COMPONENT`) | unreviewed |
 | [CORE-09](#core-09--telemetrylayer-capturing-tracing-back-into-the-pipeline-feedback-loop-and-field-extraction) | P1 | `TelemetryLayer`: capturing `tracing` back into the pipeline (feedback loop and field extraction) | `crates/logit-core/src/telemetry.rs` (`TelemetryLayer`, `Layer::on_event`) | unreviewed |
 | [CORE-10](#core-10--deterministic-span-sampling-and-spanguard-span-minting) | P1 | Deterministic span sampling and `SpanGuard` span minting | `crates/logit-core/src/telemetry.rs` (`trace_is_sampled`, `Telemetry::span`, `SpanGuard`) | unreviewed |
@@ -6062,8 +6062,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   153/137, 100 groups 978/877, 1000 groups 8,860/8,600. The scan dominates from 100 groups on.
 
 ### XFORM-02 — Aggregate: per-event merge dispatch (`process`)
-- **Location:** `aggregate.rs` (`Aggregator::process`; the `Accumulator` enum and
-  `passes_through`; `Accumulator::new_for`/`into_kind`/`kind_for_retained`)
+- **Location:** `aggregate.rs` (`Aggregator::process`; the `Accumulator` enum, `opener_for`,
+  `Opener::open`, `Accumulator::into_kind`/`retained_kind`)
 - **What it does:** The main per-event hot path: for every metric on an event, decides whether it
   passes through untouched (cumulative `Sum`, `ExponentialHistogram`, `Summary`, and a
   mode-dependent `Histogram`), opens or reuses a series accumulator, and merges by kind (`Sum`
@@ -6078,13 +6078,11 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   (every merge-vs-pass-through decision either double-counts, silently drops, or correctly
   forwards a metric -- there is no middle state).
 - **Invariants to verify:**
-  - `passes_through` and `Accumulator::new_for`'s `unreachable!` arm
-    **must stay in exact sync**. `passes_through`'s doc says "`process` and
-    `Accumulator::new_for`'s `unreachable!` arm both depend on this answer; a disagreement is a
-    runtime panic", and the comment above `kind_for_retained`'s `unreachable!` arm says the same of
-    the retention pair: "Must agree with `flush`'s `retain` predicate." A mismatch is an
-    `unreachable!()` panic at runtime, not a compile error. Any future `MetricKind`
-    addition or `temporality` mode addition must update both.
+  - Pass-through is decided by one `Option`-returning function, `opener_for` (`None` forwards
+    the record), and `Opener::open` is total, with no `unreachable!` arm: a new `MetricKind` or
+    mode is a compile error in `opener_for`'s match, not a runtime panic. The table test
+    `opener_for_is_none_iff_process_forwards_the_record` pins the answer for every kind and
+    mode.
   - A `GaugeDelta` never advances `Accumulator::Gauge.at` (the `MetricKind::GaugeDelta` merge arm in `process`, `note the ..`) --
     verify this stays true even as merge arms are edited; the module explicitly calls out that
     mixing delta-in-arrival-order with absolute-by-LWW is only well-defined because of this.
@@ -6151,9 +6149,11 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   emitted-and-retained, idle-and-retained, idle-evicted, or cardinality-evicted -- never
   double-counted, never lost silently).
 - **Invariants to verify:**
-  - The `retain` predicate in `flush` must exactly match `kind_for_retained`'s
-    `unreachable!` set -- same paired-exhaustiveness hazard as
-    `passes_through`/`new_for`.
+  - Retention is decided by one `Option`-returning function, `Accumulator::retained_kind`
+    (`None` means the series doesn't survive), asked only of a series updated this window and
+    only when `series_retention > 0`; there is no `unreachable!` arm. The table test
+    `retained_kind_is_some_iff_the_series_survives_a_flush` pins it for every accumulator,
+    temporality, and retention.
   - A retained Gauge's `at` is reset to `i64::MIN` on retention (the `Accumulator::Gauge { at, .. }`
     write in `flush`'s retained branch) so a
     later, earlier-timestamped absolute gauge in the next window is still accepted -- verify this
@@ -6194,7 +6194,7 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
 ### XFORM-04 — Aggregate: cumulative temporality and counter-reset semantics
 - **Location:** `aggregate.rs` (module doc), `aggregate.rs` (`Aggregator::process`'s Sum/Histogram
   merge under cumulative), `aggregate.rs` (`start_timestamp` stamping on retained records in
-  `Aggregator::flush`, and `Accumulator::kind_for_retained`), `aggregate.rs` (module doc's
+  `Aggregator::flush`, and `Accumulator::retained_kind`), `aggregate.rs` (module doc's
   saturating bucket-count paragraph)
 - **What it does:** Under `temporality: cumulative`, a delta Sum/Histogram's accumulator survives
   flushes and keeps summing; the emitted record is stamped `start_timestamp = SeriesState::first_seen`,
@@ -6507,11 +6507,10 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   stateless-per-event and either delegate hard safety properties to a well-behaved crate (`regex`,
   `serde_json`'s recursion guard) or operate over small, operator-authored config, not
   attacker/producer-scaled data.
-- **The "kept in sync by comment, not by the compiler" pairs are the crate's sharpest edge:**
-  `passes_through` <-> `Accumulator::new_for`'s `unreachable!` arm, and `flush`'s `retain`
-  predicate <-> `kind_for_retained`'s `unreachable!` arm. Both are called out explicitly in the
-  source comments as needing to move together; a future verifier should specifically check any
-  diff touching either half of either pair.
+- **`aggregate`'s pass-through and retention decisions are each one `Option`-returning
+  function:** `opener_for` and `Accumulator::retained_kind`, with no `unreachable!` arm and a
+  table test each over every kind and mode (lead 19, #405). A future verifier should check that a
+  new `MetricKind` or mode is added to both functions' matches and to both tables.
 - **Untrusted-input parsing (`json`, `csv`, `logfmt`/`kv`) is uniformly hand-rolled for
   performance** (avoiding intermediate allocations/trees) rather than for lack of a suitable
   crate, and each one is already allocation-count-pinned by `crates/logit-bench/tests/
