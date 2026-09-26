@@ -195,9 +195,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs` (`roll_read_cursor`, `advance_read_cursor`) | findings → #333, #337 |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs` (`run_output`, `finish_and_flush`) | findings → #333 |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs` (`run_with_telemetry`) | unreviewed |
-| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | findings → #PRNUM |
-| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | findings → #PRNUM (lead 11 fixed in #333) |
-| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | findings → #PRNUM |
+| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | findings → #404 |
+| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | findings → #404 (lead 11 fixed in #333) |
+| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | findings → #404 |
 | [RT-11](#rt-11--lua-node-hosting-os-thread-two-oneshot-handshake-catch_unwind-handleblock_on) | P0 | Lua node hosting: OS thread, two-oneshot handshake, `catch_unwind`, `Handle::block_on` | `runtime.rs` (`run_lua`, `watch_lua_thread`, `run_lua_loop`) | findings → #386 |
 | [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → #370 |
 | [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → #370 |
@@ -2985,7 +2985,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `batches.dropped{reason="shutdown"}`.
 - **Priority:** **P0** — this is the drain-ordering machinery for the whole process; wrong here means silent
   loss or a hang at every shutdown.
-- **Verified (drain/w2, #PRNUM):** Both concerns were real. `count_shutdown_drop` is now the one site
+- **Verified (drain/w2, #404):** Both concerns were real. `count_shutdown_drop` is now the one site
   that counts `dropped{reason="shutdown"}` and feeds `drain complete`, and
   `drain_complete_reports_every_batch_dropped_for_shutdown_including_those_finish_drops` checks the logged
   total against the telemetry sum through a full run (a `max_memory` Lua revoke is checked the same way).
@@ -3054,7 +3054,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Lead 11 fixed in #333** (verified under DISK-09): `drain_inbox` records the batch it is pushing in an
   `in_hand` slot that the sweep takes first, so a cancelled `push` under `overflow: block` no longer loses it
   uncounted. The rest of this entry is unreviewed, and its description of `drain_inbox` predates #333.
-- **Verified (drain/w2, #PRNUM):** The `received` gap was real and is fixed: the sweep counts
+- **Verified (drain/w2, #404):** The `received` gap was real and is fixed: the sweep counts
   `received` for every batch it takes from the inbox, not for `in_hand`, which `drain_inbox` already counted.
   A second loss turned up: `run_output` never closed `inbox`, so a producer parked on the full channel sent
   into the capacity the sweep freed while `finish_and_flush` awaited, and that batch died with the
@@ -3131,7 +3131,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   the reservation state; review of whether a grace-cancelled `send` should be recorded as `Ambiguous`.
 - **Priority:** **P0** — every batch a sink ever emits goes through here, the drop decision is made here, and
   the classification plumbing is custom.
-- **Verified (drain/w2, #PRNUM):** The grace-cut send is now `Fault::Ambiguous`, decided by
+- **Verified (drain/w2, #404):** The grace-cut send is now `Fault::Ambiguous`, decided by
   `is_retryable`: the span is tagged `fault=ambiguous`, and at-most-once commits the batch and counts it
   `dropped{reason="shutdown"}`. A `sending` flag set only across the `send` await tells a cut-off send from a
   grace landing in backoff or before the deliver arm ran; the deliver `select!` is `biased`, so a send
