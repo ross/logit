@@ -973,11 +973,11 @@ and the accept-queue gauges.
 | `logit.input.ack_channels.evicted` | count | channels evicted, least recently used first, once `max_ack_channels` are held |
 
 **A busy request is not a lost one**, as on `datadog_in`: after 5 seconds without the pipeline
-taking a request's batches, the request gets `503` code 9 with `Retry-After: 1`, counted
-`class="busy"`, and every HEC client retries it. A `/event` body that carries several envelopes
-decodes to one batch per resource; a `503` after some of them were delivered makes the retry
-deliver those again, so a steady busy rate on multi-envelope clients means duplicates downstream
-(the module doc's "Backpressure" section). From a busy answer until a later request's data is
+taking a request's first batch, the request gets `503` code 9 with `Retry-After: 1`, counted
+`class="busy"`, with nothing of it delivered, and every HEC client retries it. A `/event` body
+that carries several envelopes decodes to one batch per resource; once the first is delivered,
+the rest wait without a deadline and the request gets `200`, so `logit.input.request.duration` can
+run past 5 seconds while `busy` stays flat (the module doc's "Backpressure" section). From a busy answer until a later request's data is
 taken, for at most 5 seconds, `/health` answers `503` code 18, counted
 `logit.input.requests{route="health", class="busy"}`.
 

@@ -1821,12 +1821,13 @@ recently, and the most recent `max_pending_acks` ids per channel; an id either b
 answers `false`, counted `logit.input.acks.dropped{reason}`. Raise `max_ack_channels` when more
 clients than that send a channel at once. Neither the channel nor the id enters an event.
 
-**A full pipeline gets `503`.** When the pipeline doesn't take a request's batches within 5
+**A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and the batches not yet delivered
-`logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9. A body with several
-envelopes can have delivered some of its batches before the deadline, and the retry delivers
-those again. From that answer until a later request's data is taken, for at most 5 seconds,
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
+Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
+decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
+without a deadline and the request gets `200`, so a retry never repeats part of a body. From that
+answer until a later request's data is taken, for at most 5 seconds,
 `/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
 Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
 

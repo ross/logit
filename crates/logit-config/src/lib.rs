@@ -979,10 +979,10 @@ pub enum ComponentKind {
     /// it, as a Splunk token with indexer acknowledgment does, and needs a channel. The envelope's
     /// `host`, `source`, `sourcetype`, and `index` become the resource attributes `host.name`,
     /// `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When the pipeline
-    /// can't take a request's data within 5s, the request gets `503` code 9 with `Retry-After: 1`,
-    /// and the client retries it; a request carrying several envelopes can then deliver some of
-    /// its events twice. After such an answer, `/health` answers `503` code 18 for 5s, or until
-    /// a later request is taken.
+    /// can't start taking a request's data within 5s, the request gets `503` code 9 with
+    /// `Retry-After: 1`, nothing of it is delivered, and the client retries it; once part of a
+    /// request is taken, the rest waits for the pipeline and the request gets `200`. After a
+    /// `503`, `/health` answers `503` code 18 for 5s, or until a later request is taken.
     SplunkHecIn {
         /// The `host:port` to listen on. Splunk's HEC port is `8088`.
         bind: String,

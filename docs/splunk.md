@@ -159,14 +159,16 @@ resends the rest. The 2 MiB default sits under it.
 `splunk_hec_in` caps a request at `max_request_bytes` (5 MiB by default), both as sent and after
 gzip decompression, and answers `413` past it. Raise it if a client sends larger bodies.
 
-### A `503` defers a client's data, and can duplicate some of it
+### A `503` defers a client's data
 
-When the pipeline doesn't take a request's events within 5 seconds, `splunk_hec_in` answers `503`
-code 9 with `Retry-After: 1` rather than holding the connection, counted
-`logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9, so this defers delivery
-rather than losing it. A `/event` body that carries several envelopes decodes into one batch per
-envelope, though, and a `503` after some of them were delivered makes the retry deliver those
-again. Give the sinks behind `splunk_hec_in` a `buffer:` large enough to absorb a stall.
+When the pipeline doesn't take a request's first batch within 5 seconds, `splunk_hec_in` answers
+`503` code 9 with `Retry-After: 1` rather than holding the connection, counted
+`logit.input.batches.dropped{reason="busy"}`. As on Splunk, that answer means nothing of the body
+was taken, and HEC clients retry a code 9, so this defers delivery rather than losing it. A
+`/event` body that carries several envelopes decodes into one batch per envelope; once the first
+is delivered, the listener waits for the pipeline to take the rest, however long that is, and
+answers `200`, so a retry never repeats part of a body. Give the sinks behind `splunk_hec_in` a
+`buffer:` large enough to absorb a stall.
 
 `splunk_hec_out` isn't duplicate-safe either: Splunk indexes a resent event twice, and one batch
 can be several requests. The default posture is at-most-once, so a `5xx` or a timeout drops the

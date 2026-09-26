@@ -411,7 +411,8 @@ Both runs gave the same `useACK` behavior: ids count from 0 per channel, a poll 
 issued on that channel and indexed `true`, the same id `false` once it has answered `true`, and an
 id never issued on that channel `false`. `splunk_hec_in` answered every polled id `true` on any
 channel, and `/health` always `200`, so a client that checks id continuity, polls the wrong
-channel, or reads `/health` as a queue signal saw something Splunk never answers.
+channel, or reads `/health` as a queue signal saw something Splunk never answers. And its `503`
+code 9 could follow a partial delivery, where Splunk's means nothing was taken.
 `crates/logit-inputs/src/splunk.rs`'s module doc describes the behavior; this list is the record
 of the choices. By decision:
 
@@ -441,6 +442,15 @@ of the choices. By decision:
   require none, and a request without one is answered as a token without `useACK` answers it.
   Answering every id `false` without a channel was rejected: a client would poll until its
   timeout instead of reading its mistake.
+- **Decision 3, the bounded wait:** amended. The consequence that a `503` can follow a partial
+  delivery of a multi-resource request no longer holds. Only a body's first batch waits under the
+  5 s deadline; once it is delivered, the remaining batches are delivered without one (on a
+  detached task, so a closing client doesn't split a batch across consumers) and the request gets
+  `200`. A `503` code 9 then always means nothing of the body was taken, as on Splunk, which is
+  what lets `splunk_hec_out` resend a body answered code 9 before any acceptance without
+  duplicating it. The cost is that a stall after the first batch holds the request open with no
+  bound; the rejected alternative, answering `200` only for the delivered prefix, has no HEC answer
+  to carry it.
 - **Decision 2, `/health`:** amended. While the listener is refusing posts, `/health` and
   `/health/1.0` answer `503` `{"text":"HEC is unhealthy, queues are full","code":18}`, Splunk's
   documented answer for a full queue, which a load balancer or a sink's health check reads as

@@ -493,9 +493,9 @@ Each is proven by a test suite and by real traffic:
 - **Listener fidelity** (2026-09-26): `splunk_hec_in` issues `ackId`s from 0 per channel and
   answers each `true` once on its own channel, as both runs' `useACK` tokens did, within
   `max_ack_channels` and `max_pending_acks` bounds; `/ack` without a channel is code 10; and
-  `/health` answers `503` code 18 while posts are answered code 9. `splunk_hec_in_round_trip.rs`
-  and `splunk_pair_round_trip.rs` drive both (ADR amendment "faithful listener acks and a busy
-  /health").
+  `/health` answers `503` code 18 while posts are answered code 9, and code 9 now means nothing
+  of the body was delivered. `splunk_hec_in_round_trip.rs` and `splunk_pair_round_trip.rs` drive
+  them (ADR amendment "faithful listener acks and a busy /health").
 
 What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section, one entry
 each:

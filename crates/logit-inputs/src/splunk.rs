@@ -82,18 +82,21 @@
 //!
 //! # Backpressure: a bounded wait, then `503`
 //!
-//! As on `datadog_in` ([`crate::datadog`]'s "Backpressure" section): the request's batches are
-//! sent in order under one deadline, [`BUSY_AFTER`] from the start of delivery, each reaching every
-//! downstream consumer or none. When the deadline passes, the request is answered `503`
-//! `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
-//! `logit.input.requests{class="busy"}`, and the batches not yet delivered are counted
+//! A `503` code 9 means nothing of the body was taken, as on Splunk, so a client (and
+//! `splunk_hec_out`) may resend it whole. The request's first batch is sent under a deadline,
+//! [`BUSY_AFTER`] from the start of delivery, reaching every downstream consumer or none
+//! ([`crate::datadog`]'s "Backpressure" section has the mechanism). When the deadline passes, the
+//! request is answered `503` `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
+//! `logit.input.requests{class="busy"}`, and every batch of the body is counted
 //! `logit.input.batches.dropped{reason="busy"}`. Every HEC client retries a code 9.
 //!
-//! **A `503` after partial delivery duplicates.** A `/event` body carrying several envelopes
-//! decodes to one batch per resource. If the deadline passes after some of them were delivered,
-//! the client's retry sends the whole body again, and the batches already delivered are delivered
-//! twice. Splunk indexes a resent event twice as well; the timed-out batch itself reaches no
-//! consumer.
+//! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
+//! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
+//! delivered would make the client's retry deliver it twice. So the remaining batches go through
+//! [`deliver_detached`], which waits until the pipeline takes them, however long that is, and the
+//! request is answered `200`; `idle_timeout` doesn't close a connection with a request in flight. A client that closes the
+//! connection while it waits still gets every batch delivered; it saw no answer, so its retry
+//! duplicates the body, the ordinary at-least-once outcome.
 //!
 //! # Telemetry
 //!
@@ -114,8 +117,8 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_with_idle, is_length_limit, json_response, matches_any_key,
-    now_nanos, Activity, BodyReadError, DecompressError, Encoding,
+    deliver_detached, deliver_with_deadline, drive_with_idle, is_length_limit, json_response,
+    matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
 };
 use crate::Input;
 use base64::Engine as _;
@@ -921,11 +924,17 @@ async fn respond(
     };
 
     if !batches.is_empty() {
-        if let Err(not_sent) = deliver_with_deadline(&shared.sink, batches, shared.busy_after).await
-        {
+        // Only the first batch waits under the deadline: once one is delivered, a `503` would
+        // tell the client nothing was taken, and its retry would deliver that batch twice.
+        let total = batches.len();
+        let mut batches = batches.into_iter();
+        let first: Vec<EventBatch> = batches.by_ref().take(1).collect();
+        if deliver_with_deadline(&shared.sink, first, shared.busy_after).await.is_ok() {
+            deliver_detached(&shared.sink, batches.collect()).await;
+        } else {
             shared.telemetry.count(
                 "logit.input.batches.dropped",
-                not_sent as f64,
+                total as f64,
                 &[("reason", "busy")],
             );
             shared.diag.clone().warn_throttled(

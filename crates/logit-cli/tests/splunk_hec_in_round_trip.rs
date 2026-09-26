@@ -277,6 +277,51 @@ async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     assert_eq!(recv(&mut rx).await, expected[0]);
 }
 
+/// A `503` code 9 means nothing of the body was taken. A three-batch body behind a full one-slot
+/// channel: when the slot frees before the deadline, the first batch goes in, the rest wait past
+/// `TEST_BUSY_AFTER` for the consumer, and the answer is `200` with every batch delivered once.
+/// When the slot never frees, the answer is `503` with none of the body delivered.
+#[tokio::test]
+async fn a_multi_batch_body_is_answered_503_only_when_none_of_it_was_delivered() {
+    let (expected, body) = fixed_point_case(OTEL_EXPORTER_BODY.as_bytes());
+    assert_eq!(expected.len(), 3);
+    let (filler, filler_body) = fixed_point_case(br#"{"time":1,"host":"h","event":"x"}"#);
+    let path = "/services/collector/event";
+
+    // The slot frees after the first batch's wait began, and the rest past the deadline.
+    let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
+    let (status, _) = post(addr, path, &filler_body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "the filler takes the one slot");
+    let request = tokio::spawn(async move { post(addr, path, &body, false, None).await });
+    tokio::time::sleep(TEST_BUSY_AFTER / 4).await;
+    assert_eq!(recv(&mut rx).await, filler[0]);
+    tokio::time::sleep(TEST_BUSY_AFTER * 2).await;
+    for batch in &expected {
+        assert_eq!(&recv(&mut rx).await, batch);
+    }
+    let (status, text) = request.await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+    assert_eq!(text, r#"{"text":"Success","code":0}"#);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+        "every batch once"
+    );
+
+    // The slot never frees: nothing of the body is delivered.
+    let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
+    let (_, body) = fixed_point_case(OTEL_EXPORTER_BODY.as_bytes());
+    let (status, _) = post(addr, path, &filler_body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, text) = post(addr, path, &body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(text, r#"{"text":"Server is busy","code":9}"#);
+    assert_eq!(recv(&mut rx).await, filler[0]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+        "a 503'd body delivers nothing"
+    );
+}
+
 /// A wrong token is refused with Splunk's `403` code 4 and delivers nothing.
 #[tokio::test]
 async fn a_wrong_token_is_403_code_4() {
