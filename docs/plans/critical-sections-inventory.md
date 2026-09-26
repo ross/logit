@@ -3380,13 +3380,13 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     the Lua thread parks in `blocking_send` until the downstream closes its receiver. That does happen
     (`run_output` drops `inbox` when it returns), so it unblocks — but the ordering is implicit and unargued in
     the code, and `run_with_telemetry`'s join loop waits on `watch_lua_thread` for it. Medium confidence this is
-    fine; low confidence it is *guaranteed* for every downstream node kind.~~ **Verified (luab/w3):** a parked
+    fine; low confidence it is *guaranteed* for every downstream node kind.~~ **Verified 2026-09-26 (#386):** a parked
     send is outside the heartbeat's busy window, so it is never read as a stall or a wedge, and a sink's own
     `shutdown_grace` unparks it: `a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok`
     drives a `Block` store under a sink whose `send` never completes and shows the run ending `Ok`, the node
     `Finished`, and no `script_stalled`.
   - ~~A load failure returning `Startup` (the `ready_rx` error arms) leaves *earlier* Lua threads detached (see the
-    startup entry).~~ **Answered (luab/w3):** the early return drops every `Sender` into the earlier thread's
+    startup entry).~~ **Answered 2026-09-26 (#386):** the early return drops every `Sender` into the earlier thread's
     inbox, so its `blocking_recv` returns `None` and it exits on its own;
     `a_later_script_failing_to_load_returns_startup_promptly` pins the prompt `Startup` naming the later script.
   - `run_lua_loop`'s `configured_interval.expect(..)` mirrors `run_transform`'s and panics if `configured_interval`
@@ -3414,7 +3414,8 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   and the paused-time watcher tests `watch_lua_thread_maps_each_outcome`,
   `a_busy_heartbeat_that_stops_advancing_is_stalled_and_resumes`, `an_idle_heartbeat_is_never_stalled`,
   `a_wedged_node_after_shutdown_has_its_io_revoked_and_fails`,
-  `a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick`.
+  `a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick`,
+  `a_permit_reserved_before_revocation_is_drained_and_counted`.
 - **Suggested verification approach:** targeted review of the thread-lifecycle state machine (every exit path
   × every oneshot); a shutdown-under-load test with a Lua node feeding a wedged sink; confirm the runtime cannot
   be dropped while a Lua thread is inside `block_on`.

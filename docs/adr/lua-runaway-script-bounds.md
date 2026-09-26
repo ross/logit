@@ -198,7 +198,8 @@ Filled in as each workstream lands.
   `an_interval_tick_runs_flush_through_the_elapsed_branch`, and the paused-time watcher tests
   `watch_lua_thread_maps_each_outcome`, `a_busy_heartbeat_that_stops_advancing_is_stalled_and_resumes`,
   `an_idle_heartbeat_is_never_stalled`, `a_wedged_node_after_shutdown_has_its_io_revoked_and_fails`,
-  `a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick`;
+  `a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick`,
+  `a_permit_reserved_before_revocation_is_drained_and_counted`;
   `readiness.rs`'s `has_stalled_node_reflects_any_stalled_component`; `admin.rs`'s
   `readyz_wire_matches_the_spec_table` and `a_stalled_node_turns_ready_into_stalled_and_back`;
   `heartbeat.rs`'s `enter_tick_leave_keep_the_busy_bit_and_advance`. RT-11 findings; CORE-15's time
