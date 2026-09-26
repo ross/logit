@@ -470,9 +470,12 @@ per file, so under a backlog a checkpoint lands at least once per chunk.
 json-file entries, each a complete line on disk. `DockerDecoder` holds the fragments until the
 closing one arrives, and `LineSplitter` holds nothing for them, so an interval checkpoint covered
 them before any event existed for them. A crash before the closing fragment then lost the head of
-the message. `TailDecoder::held_bytes` reports those bytes and `Tailer::write_checkpoint` subtracts
-them, as it subtracts the splitter's partial line. The persisted offset covers only bytes whose
-events have been emitted or absorbed into an accumulator the write flushes first.
+the message. The driver now records the file offset of the oldest line the decoder still holds
+(`TailDecoder::holds_entry`), and `Tailer::write_checkpoint` persists the smaller of that offset and
+the splitter's line boundary. It's an offset rather than a held byte count, because a line the
+decoder rejects or the splitter drops as oversized can follow the held lines, and subtracting a
+count would then land inside them. The persisted offset covers only bytes whose events have been
+emitted or absorbed into an accumulator the write flushes first.
 
 **A file's close dirties the checkpoint instead of writing it.** "Checkpoints" says the checkpoint
 is written "unconditionally on a file's own close". The code never did that, and a close didn't

@@ -1711,9 +1711,13 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset`, which passed
   before the change). Two ways the checkpoint could get ahead of delivery were real. `docker_in`'s
   held fragments of an entry over 16 KiB are line-complete, so `pending_bytes()` excluded nothing
-  and an interval checkpoint covered them; `TailDecoder::held_bytes` now reports them and
-  `write_checkpoint` subtracts them (`an_interval_checkpoint_never_covers_a_held_fragment_line`,
-  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`). `reap_drained`
+  and an interval checkpoint covered them. The driver now records the offset of the oldest held
+  line (`TailDecoder::holds_entry`), and `write_checkpoint` persists the smaller of it and the
+  splitter's line boundary, so a rejected or oversized line after the held run can't move the
+  checkpoint into it (`an_interval_checkpoint_never_covers_a_held_fragment_line`,
+  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`,
+  `a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run`,
+  `an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start`). `reap_drained`
   never dirtied the store, so a reaped inode's entry outlived it on disk and a reused inode could
   resume past its first bytes; a reap now dirties it
   (`a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it`). The
