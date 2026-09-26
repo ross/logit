@@ -943,6 +943,7 @@ dependencies = [
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
+ "logit-script",
  "logit-transforms",
  "prost",
  "reqwest",
