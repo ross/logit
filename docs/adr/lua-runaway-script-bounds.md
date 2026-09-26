@@ -259,7 +259,22 @@ Filled in as each workstream lands.
   (`event_new_of_to_table_is_a_fixed_point_over_generated_events`,
   `a_fixed_point_event_survives_two_round_trips`). Both self-reference tests aborted the test
   process before the cap existed.
-- `luab/w2` (CORE-16, CORE-15 sandbox half): pending.
+- `luab/w2` (CORE-16, CORE-15 sandbox half): #388. `crates/logit-script/src/lib.rs`'s
+  `the_global_table_is_exactly_the_allowlist` and `print_writes_to_the_self_log_not_stdout`;
+  `crates/logit-script/src/lifetime_tests.rs`'s six
+  `a_stashed_{event,attributes,log,span,metrics,metric}_fails_clearly_in_the_next_process_and_in_flush`
+  tests, `returning_the_same_event_twice_in_one_table_is_an_error_and_emits_nothing`,
+  `returning_a_table_holding_an_aliased_event_invalidates_the_alias`,
+  `returning_the_original_after_clone_leaves_the_clone_usable_in_flush`,
+  `returning_a_sub_handle_is_the_contract_error`,
+  `returning_a_non_userdata_in_a_table_is_the_contract_error`,
+  `stashed_resource_scope_trace_and_provenance_read_the_fresh_root_in_flush`,
+  `stashed_resource_and_scope_read_the_next_batchs_values`,
+  `reading_every_sub_proxy_then_returning_keeps_the_no_clone_path`,
+  `ten_thousand_dropped_events_that_touched_every_sub_proxy_keep_memory_flat` (Lua heap and Rust
+  live bytes, the latter through a counting allocator local to the test module), and
+  `a_script_error_traceback_names_the_script_not_a_rust_file`. The allowlist, `print`, both
+  contract-error tests, and the traceback test failed before the change.
 - `luab/w3` (RT-11, CORE-15 limits half): pending.
 - `luab/w4` (CORE-15 close, `max_memory`): pending.
 - `luab/w5` (CORE-19 close, docs): pending.
