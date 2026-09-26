@@ -134,7 +134,7 @@ use logit_proto::splunk::response::{
     encode_ack_reply, encode_http_error, encode_status, encode_success, parse_ack_request,
 };
 use logit_proto::splunk::{Envelope, HecError, HecStatus, SplunkDecoder};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -557,7 +557,11 @@ impl AckLedger {
     /// Answers one poll: each id `true` once if it is pending on `channel`, else `false`. A
     /// repeated id is answered at its first position only. An unknown channel is not created.
     fn poll(&self, channel: &[u8], ids: &[u64]) -> Vec<(u64, bool)> {
-        let mut answered: Vec<(u64, bool)> = Vec::with_capacity(ids.len());
+        // Deduplicated before the lock, which every connection's issue also takes: the locked
+        // section is one `take` per distinct id.
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut answered: Vec<(u64, bool)> =
+            ids.iter().filter(|&&id| seen.insert(id)).map(|&id| (id, false)).collect();
         let mut state = self.lock();
         state.clock += 1;
         let clock = state.clock;
@@ -565,12 +569,10 @@ impl AckLedger {
         if let Some(acks) = acks.as_deref_mut() {
             acks.last_used = clock;
         }
-        for &id in ids {
-            if answered.iter().any(|&(seen, _)| seen == id) {
-                continue;
+        if let Some(acks) = acks {
+            for (id, acked) in &mut answered {
+                *acked = acks.take(*id);
             }
-            let acked = acks.as_deref_mut().is_some_and(|acks| acks.take(id));
-            answered.push((id, acked));
         }
         answered
     }
@@ -930,6 +932,9 @@ async fn respond(
         let mut batches = batches.into_iter();
         let first: Vec<EventBatch> = batches.by_ref().take(1).collect();
         if deliver_with_deadline(&shared.sink, first, shared.busy_after).await.is_ok() {
+            // Only a delivery clears a busy `/health`: a body the codec skipped whole says
+            // nothing about the pipeline.
+            shared.health.mark_accepted();
             deliver_detached(&shared.sink, batches.collect()).await;
         } else {
             shared.telemetry.count(
@@ -951,7 +956,6 @@ async fn respond(
             return (name, BUSY, response);
         }
     }
-    shared.health.mark_accepted();
     let ack_id = channel.map(|channel| issue_ack_id(shared, &channel));
     (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
 }
@@ -1506,6 +1510,12 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "busy: {response}");
         assert_eq!(body_of(&response), r#"{"text":"HEC is unhealthy, queues are full","code":18}"#);
 
+        // A body the codec skips whole answers `200` but delivers nothing, so it doesn't clear it.
+        let response = post_raw(&addr, path, "", br#"{"host":"h","event":""}"#).await;
+        assert_eq!(body_of(&response), SUCCESS, "{response}");
+        let response = request_raw(&addr, "GET", health, "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "still busy: {response}");
+
         recv_batch(&mut rx).await;
         assert!(rx.try_recv().is_err(), "the 503'd batch was never delivered");
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
@@ -1522,7 +1532,8 @@ mod tests {
         );
 
         let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(2.0));
+        // The `503` post and the two busy `/health` answers.
+        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(3.0));
         assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
     }
 
@@ -1885,6 +1896,27 @@ mod tests {
         assert_eq!(ledger.poll(b"b", &[0, 1]), [(0, false), (1, false)]);
         assert_eq!(ledger.poll(b"a", &[0]), [(0, true)]);
         assert_eq!(ledger.issue(b"b").0, 0, "an evicted channel starts over at 0");
+    }
+
+    /// A large poll of repeated ids answers each distinct id once, in the order first asked.
+    #[test]
+    fn a_large_poll_with_repeated_ids_answers_each_id_once_in_order() {
+        let ledger = AckLedger::new(4, 1_000_000);
+        for _ in 0..1_000 {
+            ledger.issue(b"a");
+        }
+        let ids: Vec<u64> = (0..700_000u64).map(|i| (i * 7919) % 2_000).collect();
+        let started = Instant::now();
+        let answered = ledger.poll(b"a", &ids);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let mut seen = HashSet::new();
+        let first_seen: Vec<u64> = ids.iter().copied().filter(|&id| seen.insert(id)).collect();
+        assert_eq!(first_seen.len(), 2_000);
+        let order: Vec<u64> = answered.iter().map(|&(id, _)| id).collect();
+        assert_eq!(order, first_seen);
+        for &(id, acked) in &answered {
+            assert_eq!(acked, id < 1_000, "{id}");
+        }
     }
 
     #[test]
