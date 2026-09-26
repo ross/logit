@@ -848,16 +848,29 @@ impl ModelConfig {
     }
 }
 
-/// Every mode, and retention bounds including those rule 39 rejects: a test filters them with
-/// [`ModelConfig::valid`].
+/// Every mode, and every retention bound rule 39 accepts ([`ModelConfig::valid`]): cumulative
+/// draws retention from 1, and retention above 0 draws the cap from 1. Generated, not filtered, so
+/// a deep run can't exhaust proptest's global reject budget.
 fn model_config() -> impl Strategy<Value = ModelConfig> {
     (
         prop_oneof![Just(AggregateTemporality::Delta), Just(AggregateTemporality::Cumulative)],
         prop::option::of(1..=8usize),
         prop::option::of(1..=6usize),
-        0..=3u32,
-        0..=5usize,
     )
+        .prop_flat_map(|(temporality, samples_cap, members_cap)| {
+            let least = u32::from(temporality == AggregateTemporality::Cumulative);
+            (Just(temporality), Just(samples_cap), Just(members_cap), least..=3u32)
+        })
+        .prop_flat_map(|(temporality, samples_cap, members_cap, retention)| {
+            let least = usize::from(retention > 0);
+            (
+                Just(temporality),
+                Just(samples_cap),
+                Just(members_cap),
+                Just(retention),
+                least..=5usize,
+            )
+        })
         .prop_map(
             |(temporality, samples_cap, members_cap, series_retention, max_retained_series)| {
                 ModelConfig {
@@ -1858,6 +1871,35 @@ fn laws_input() -> impl Strategy<Value = (ModelConfig, Vec<KindSpec>)> {
     })
 }
 
+/// [`ModelConfig::valid`] agrees with graph rule 39 over every bound `model_config` could draw,
+/// and `model_config` draws only valid configs.
+#[test]
+fn model_config_validity_matches_rule_39() {
+    use proptest::strategy::ValueTree;
+    for temporality in [AggregateTemporality::Delta, AggregateTemporality::Cumulative] {
+        for series_retention in 0..=3u32 {
+            for max_retained_series in 0..=5usize {
+                let config = ModelConfig {
+                    temporality,
+                    samples_cap: None,
+                    members_cap: None,
+                    series_retention,
+                    max_retained_series,
+                };
+                let cumulative = temporality == AggregateTemporality::Cumulative;
+                let rule_39 = !(cumulative && (series_retention == 0 || max_retained_series == 0))
+                    && !(series_retention > 0 && max_retained_series == 0);
+                assert_eq!(config.valid(), rule_39, "{config:?}");
+            }
+        }
+    }
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    for _ in 0..512 {
+        let config = model_config().new_tree(&mut runner).expect("a config").current();
+        assert!(config.valid(), "{config:?}");
+    }
+}
+
 /// Ten distinct contexts on one series in one window: the model and the aggregator both keep the
 /// first eight as links and count two dropped.
 #[test]
@@ -1901,7 +1943,6 @@ proptest! {
         config in model_config(),
         ops in prop::collection::vec(model_op(), 1..=60),
     ) {
-        prop_assume!(config.valid());
         run_model(config, &ops)?;
     }
 }

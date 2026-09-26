@@ -2768,6 +2768,10 @@ mod tests {
     /// series before them, so `churn`'s group comes first in `groups`, and every later window feeds
     /// the one-off series before the stable ones.
     ///
+    /// The warm-up is what lets the stable series survive: newest first protects a series that has
+    /// survived one flush. Without it, stable series fed after the churn are the newest in every
+    /// window (`a_stable_series_arriving_after_the_churn_is_evicted_every_flush`).
+    ///
     /// Checks at every flush: at most 100 series held, every eviction counted, one group per
     /// resource, and under `Cumulative` an unchanged `start_timestamp` on every stable series.
     fn cap_soak(
@@ -2868,6 +2872,47 @@ mod tests {
                 },
             })
             .collect()
+    }
+
+    /// The tie-break's limit: with no warm-up and the stable series fed after the churn in every
+    /// window, each flush re-creates them newest and evicts them all, counted `state="active"`.
+    #[test]
+    fn a_stable_series_arriving_after_the_churn_is_evicted_every_flush() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("soak", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(3, SOAK_CAP)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        for w in 0..20 {
+            let ts = w as i64 * 1_000 + 1;
+            for j in 0..SOAK_FRESH {
+                let id = format!("{w}-{j}");
+                let event =
+                    metric_event_with_tags("fresh", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                feed(&mut agg, &resource, event);
+            }
+            for i in 0..SOAK_STABLE {
+                let id = i.to_string();
+                let event =
+                    metric_event_with_tags("stable", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                feed(&mut agg, &resource, event);
+            }
+            agg.flush(ts + 999);
+            let stable_kept = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .filter(|k| logit_core::interner::resolve(k.name) == "stable")
+                .count();
+            assert_eq!(stable_kept, 0, "flush {w}");
+            let drained = registry.drain(0);
+            assert_eq!(
+                evicted_cardinality(&drained, "active"),
+                (SOAK_STABLE + SOAK_FRESH - SOAK_CAP) as f64,
+                "flush {w}"
+            );
+        }
     }
 
     fn soak_gauge(i: usize) -> MetricKind {

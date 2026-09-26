@@ -1212,9 +1212,14 @@ pub enum ComponentKind {
         /// a cardinality guard, not a tuning knob. `series_retention` alone bounds only how long
         /// one series survives, so a stream of never-repeating series names would otherwise hold
         /// unboundedly many. Defaults to `10000`. The most idle series are evicted first, and among
-        /// equally idle ones the most recently created, so a series updated every window outlives
-        /// one-off series. Must be at least `1` while `series_retention` is above `0`: set
-        /// `series_retention: 0` to disable retention instead.
+        /// equally idle ones the most recently created, so a series that has survived one flush
+        /// outlives one-off series created after it. A series that arrives after the one-off
+        /// series in every window is the newest every time and is evicted at every flush; a
+        /// `logit.transform.series.evicted{reason="cardinality", state="active"}` count at every
+        /// flush means more series are active than the cap holds, so raise this or bound
+        /// cardinality upstream with `keep` or `keep_values`. Must be at least `1` while
+        /// `series_retention` is above `0`: set `series_retention: 0` to disable retention
+        /// instead.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
         /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
@@ -2640,8 +2645,9 @@ pub enum AggregateTemporality {
     #[default]
     Delta,
     /// A `Sum`/`Histogram` accumulator survives the flush and keeps summing, so every window
-    /// emits the running total since the series was first seen, stamped with that first-seen
-    /// time as its start timestamp. Required by `prometheus_out`, which skips delta records.
+    /// emits the running total since the series was first seen, stamped with the series' start
+    /// time: when it was first seen, clamped into the window it opened in. Required by
+    /// `prometheus_out`, which skips delta records.
     /// A running total lives only as long as `series_retention` and `max_retained_series` keep
     /// its series, so both must be at least `1`.
     Cumulative,
