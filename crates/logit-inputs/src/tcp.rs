@@ -27,6 +27,9 @@
 //! whose counts every clone shares. One decoder behind a lock would serialize every connection's
 //! decode against every other's.
 //!
+//! **Cancellation.** Every `select!` and `timeout` here, from the accept loop to `read_step`, is a
+//! row of `docs/design/pipeline-graph.md`'s "Cancellation points" table.
+//!
 //! **No receive queue.** Unlike the UDP driver, there is no [`crate::udp::ReceiveQueue`] here and
 //! no `receive.max_datagrams`/`max_bytes`/`overflow` to configure. TCP's own flow control *is* the
 //! queue: a connection whose downstream has stalled stops being read, the kernel window closes,
@@ -820,14 +823,8 @@ impl AcceptQueueSampler {
                 self.tick = None;
                 return listener.accept().await;
             }
-            // Timer arm first, matching `crate::udp::sample_while`, but for uniformity rather than
-            // need. There the work arm is one long-lived `read_loop` future, so an arm behind it
-            // is silenced by tokio's coop budget for a whole overload. Here the loop returns to
-            // the synchronous `sample_once` on every accepted connection, so a backed-up queue is
-            // sampled per connection anyway, and an idle `accept()` parks with budget to spare,
-            // so the timer fires normally. Either ordering is correct for this loop; one rule for
-            // both samplers is one thing for an edit to preserve. The cost is a due tick taken
-            // ahead of a ready connection: one extra loop turn per tick, never a lost connection.
+            // Timer arm first, matching `crate::udp::sample_while`: see
+            // `docs/design/pipeline-graph.md`'s "Cancellation points".
             let tick = self.tick.get_or_insert_with(|| Box::pin(tokio::time::sleep(interval)));
             tokio::select! {
                 biased;
@@ -1196,10 +1193,9 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             shutdown: shutdown.clone(),
             decoder: self.decoder.clone(),
         };
-        // `accept_queue.accept(&listener)` has `listener.accept()`'s cancellation safety against
-        // the `shutdown` arm, plus the kernel accept-queue gauges (`AcceptQueueSampler`). A Unix
-        // listener has no such gauges (this module's "A Unix stream socket runs on the same
-        // loop"); `UnixListener::accept` is cancellation-safe on its own.
+        // A Unix listener has no accept-queue gauges (this module's "A Unix stream socket runs on
+        // the same loop"). Both accepts race `shutdown`: see
+        // `docs/design/pipeline-graph.md`'s "Cancellation points".
         let mut accept_queue = AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
         loop {
@@ -1216,8 +1212,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             let accepted = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    // `biased`, absorb first: the error is counted before shutdown can win, and a
-                    // stopping listener doesn't wait out the backoff.
+                    // `biased`, absorb first: see `docs/design/pipeline-graph.md`'s
+                    // "Cancellation points".
                     tokio::select! {
                         biased;
                         absorbed = crate::listener::absorb_accept_error(
