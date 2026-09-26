@@ -38,6 +38,7 @@
 //! `event.span` is read-only (`crate::proxy`'s `SpanProxy`).
 
 use crate::heartbeat::Heartbeat;
+use crate::memory::MemoryCap;
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_to_value, prefixed_error, validated_sequence_len};
 use bytes::Bytes;
@@ -137,16 +138,21 @@ const CONSTRUCTIBLE_KINDS: &str =
 ///
 /// `heartbeat` is the worker's `ScriptWorker::heartbeat` cell, read the same way: each call ticks
 /// it, so a `flush()` constructing many events reads as progress to the runtime's stall watcher.
+///
+/// `memory` is the worker's `max_memory` state, checked on every call before anything is built
+/// (`crate::memory` has the invariant).
 pub(crate) fn install(
     lua: &Lua,
     targets: Rc<RefCell<Rc<TargetTable>>>,
     heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
+    memory: Rc<MemoryCap>,
 ) -> mlua::Result<()> {
     let table = lua.create_table()?;
-    let new = lua.create_function(move |_, arg: LuaValue| {
+    let new = lua.create_function(move |lua, arg: LuaValue| {
         if let Some(heartbeat) = heartbeat.borrow().as_ref() {
             heartbeat.tick();
         }
+        memory.check(lua)?;
         let LuaValue::Table(t) = arg else {
             return Err(runtime_error(format!(
                 "Event.new(t) takes a table, got {}",

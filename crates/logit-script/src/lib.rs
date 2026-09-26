@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 mod construct;
 mod heartbeat;
+mod memory;
 mod print;
 mod provenance;
 mod proxy;
@@ -28,6 +29,7 @@ mod value;
 mod lifetime_tests;
 
 pub use heartbeat::Heartbeat;
+pub use memory::GcVerdict;
 pub use proxy::EventProxy;
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +104,8 @@ pub struct ScriptWorker {
     /// The runtime's progress counter, set by [`ScriptWorker::with_heartbeat`]. A cell for the
     /// reason `targets` is one: `Event.new` is installed in `new` and reads it per call.
     heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
+    /// `max_memory` and its in-call trip, shared with `Event.new` (see `crate::memory`).
+    memory: Rc<memory::MemoryCap>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -149,7 +153,8 @@ impl ScriptWorker {
         // (`docs/design/lua-api.md` says so).
         let targets = Rc::new(RefCell::new(proxy::TargetTable::empty()));
         let heartbeat = Rc::new(RefCell::new(None));
-        construct::install(&lua, targets.clone(), heartbeat.clone())?;
+        let memory = Rc::new(memory::MemoryCap::default());
+        construct::install(&lua, targets.clone(), heartbeat.clone(), memory.clone())?;
         // The `=` prefix makes the chunk name literal, so an error reads `script:4: ..`; mlua's
         // default name is the Rust caller's source location.
         lua.load(source).set_name("=script").exec()?;
@@ -172,6 +177,7 @@ impl ScriptWorker {
             provenance_state,
             targets,
             heartbeat,
+            memory,
             _not_send_sync: PhantomData,
         })
     }
@@ -286,6 +292,46 @@ impl ScriptWorker {
     /// across `flush()` calls.
     pub fn used_memory(&self) -> usize {
         self.lua.used_memory()
+    }
+
+    /// Sets the `max_memory` cap `Event.new` checks inside a call; `None` (the default) turns the
+    /// check off. The post-call verdict is the caller's, through
+    /// [`ScriptWorker::collect_until_under`] (see `crate::memory`).
+    pub fn set_memory_cap(&self, cap: Option<usize>) {
+        self.memory.set(cap);
+    }
+
+    /// Clears `Event.new`'s over-cap trip. The runtime calls it after each `process()` and
+    /// `flush()` call, so a trip lasts for the rest of the call that set it and no longer.
+    pub fn reset_memory_trip(&self) {
+        self.memory.reset_trip();
+    }
+
+    /// Runs full garbage collections, each after [`ScriptWorker::expire_registry_values`], while
+    /// the VM holds more than `cap` bytes and the previous pass freed at least an eighth of what
+    /// it started from, up to `max_passes`. No pass runs when the VM is already at or under `cap`.
+    ///
+    /// Several passes because one LuaJIT cycle can't reach the live size: it halves the string
+    /// table per cycle, and frees a finalized userdata only on the cycle after it was found dead.
+    /// The eighth stops early on a VM whose excess is live, where more passes free nothing.
+    pub fn collect_until_under(
+        &self,
+        cap: usize,
+        max_passes: usize,
+    ) -> Result<GcVerdict, ScriptError> {
+        let mut used = self.lua.used_memory();
+        let mut passes = 0;
+        while used > cap && passes < max_passes {
+            self.lua.expire_registry_values();
+            self.lua.gc_collect()?;
+            passes += 1;
+            let before = used;
+            used = self.lua.used_memory();
+            if before.saturating_sub(used) < before / 8 {
+                break;
+            }
+        }
+        Ok(GcVerdict { used, passes })
     }
 
     /// Runs this worker's `process(event)` once.
