@@ -225,9 +225,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → #377 |
 | [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs` (`meminfo`/`listen_queue`) | findings → #282 |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs` (`sample_while`, `ReceiveBufferSampler`), `crates/logit-inputs/src/tcp.rs` (`AcceptQueueSampler`) | findings → #281, #282 |
-| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #PRNUM |
+| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #408 |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs` (`InotifyWatcher`, `parse_events`) | findings → #283 |
-| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #PRNUM |
+| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #408 |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | unreviewed |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
@@ -1705,7 +1705,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`driver.rs`), `a_partial_entry_is_emitted_on_close_rather_than_lost` (`docker.rs`).
 - **Priority:** P1 — correct in the tested paths; the untested interaction is an abort during a
   blocked final send.
-- **Verified (drain/w4, #PRNUM):** The close → flush → checkpoint ordering held: a final flush
+- **Verified (drain/w4, #408):** The close → flush → checkpoint ordering held: a final flush
   parked on a full downstream and cut by the grace backstop leaves the last interval checkpoint in
   place, so the restart duplicates and never skips
   (`a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset`, which passed
@@ -1873,7 +1873,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   test that drives a long drain and asserts the checkpoint tick still lands.
 - **Priority:** P1 — correctness of the loop shape is well argued; the residual risk is timer
   starvation and cancel-safety of the hand-rolled wake future.
-- **Verified (drain/w4, #PRNUM):** Timer starvation was real. `drain` looped while any file made
+- **Verified (drain/w4, #408):** Timer starvation was real. `drain` looped while any file made
   progress, so a backlog against a slow downstream ran no poll, flush, or checkpoint tick until it
   was done, and a grace-cut shutdown then replayed the whole backlog read so far. `drain` now takes
   the earliest deadline and returns `DrainEnd::TimerDue` after a completed pass that finds it past,
