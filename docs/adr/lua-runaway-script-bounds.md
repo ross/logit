@@ -249,6 +249,7 @@ Filled in as each workstream lands.
   `a_self_referencing_array_is_the_depth_error`,
   `an_array_tables_index_metamethod_never_fires_during_conversion`,
   `a_metamethod_that_writes_back_into_the_event_never_runs_during_an_attribute_write`,
+  `a_bad_key_inside_a_nested_attribute_table_names_the_attribute`,
   `a_resource_and_a_scope_attribute_write_get_the_same_cap`); `construct.rs`'s
   `event_new_with_a_cyclic_attribute_table_is_a_clear_error`,
   `event_new_with_a_nested_metatable_array_reads_raw`, and
