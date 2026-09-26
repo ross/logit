@@ -480,3 +480,7 @@ at_most_once`, `write_loop` will commit that batch off the spool and count it
 `batches.dropped{reason="shutdown"}`, because the destination may have taken it and the posture
 forbids a duplicate. A restart won't replay it. Under `at_least_once` the batch stays at the
 spool's head and a restart replays it, as today. `SinkStore::finish` still drops nothing.
+
+The same ADR's decision 9 has `run_output` close its inbox before the sweep. Today a send can land
+in the channel after the sweep's last `try_recv` and be lost uncounted, so the claim in "Shutdown"
+above that stragglers are bounded by the channel's capacity holds only once that change lands.

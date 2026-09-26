@@ -210,6 +210,8 @@ reasons:
   elsewhere bounds to the shutdown path only (see "Cancellation of `push_many`" below). Sampling has
   to run *alongside* whatever `read_loop` is doing, never race it.
 
+  *(Amended 2026-09-26: this remainder will be counted `reason="shutdown"`. See "Amendment: shutdown remainders are counted" at the end of this record.)*
+
   *(Corrected 2026-09-21: this bullet originally made the same claim about the **recv** arm —
   "adding a timer arm to either would cancel an in-flight `recv_from`… silently dropping the very
   datagram the sampler exists to observe" — and that half is wrong. It also contradicted the code's
@@ -709,6 +711,7 @@ ahead of evidence this same plan is about to produce.
 - **Counting `push_many`'s cancelled remainder as a drop.** Rejected — would need re-acquiring the
   queue's lock from inside a `Drop` impl to shave an already-bounded, already-accepted,
   shutdown-path-only loss from "uncounted" to "counted"; not worth the poisoning/ordering hazard.
+  *(Amended 2026-09-26: this remainder will be counted `reason="shutdown"`. See "Amendment: shutdown remainders are counted" at the end of this record.)*
 - **N synthetic copies of one statsd line as the perf load, instead of a calibrated traffic model.**
   Rejected — Ross's explicit direction: real statsd traffic varies in type mix, name length, tag
   cardinality, and datagram packing in ways that change which half of the pipeline is the
@@ -892,6 +895,8 @@ bounded by `read_batch`, shutdown path only) and false of the **recv** arm. And 
 comment said `async_io` has "one `.await`"; it has two, and the second can genuinely return
 `Pending` on coop exhaustion. Neither weakens the guarantee — both awaits are pre-syscall — but a
 reader checking either statement against tokio would have found a discrepancy.
+
+*(Amended 2026-09-26: this remainder will be counted `reason="shutdown"`. See "Amendment: shutdown remainders are counted" at the end of this record.)*
 
 ### The coop-budget argument, and exactly what a tokio bump must re-check
 
@@ -1153,15 +1158,18 @@ arm). Tracked in [`docs/known-gaps.md`](../known-gaps.md).
 
 "Cancellation of `push_many`" above leaves two shutdown losses uncounted: the remainder a cancelled
 `push_many` drops, and the datagrams `decode_loop` popped but didn't decode. It argues that
-counting either needs the queue lock from a `Drop` impl. That premise is wrong. The undrained
-datagrams are still in the caller's `Drain`, so counting them needs no queue state, and
-`Telemetry::count` takes only its own buffer's lock, never the queue's.
+counting either needs the queue lock from a `Drop` impl. For these two, that premise is wrong.
+The undrained datagrams are still in the caller's `Drain`, so counting them needs no queue state,
+and `Telemetry::count` takes only its own buffer's lock, never the queue's.
 
 Under [ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
 decision 4, both remainders will be counted `logit.component.datagrams.dropped` and
 `logit.component.bytes.dropped{reason="shutdown"}`, through a `CountedDrain` wrapper that counts
-what it never yielded when it drops. The same decision counts the datagrams still in the
-`ReceiveQueue` when the grace backstop drops the listener. The bound this section states still
+what it never yielded when it drops. The same decision adds two more. `read_loop`'s shutdown arm
+will count a batch that `push_many` was never polled for, which stays whole in `read_loop`'s
+`Vec`. And a guard in `drive` will count the datagrams still in the `ReceiveQueue` when the grace
+backstop drops the listener. That guard does take the queue lock, through `commit()`, but only
+after both halves' futures are gone, when nothing else holds the queue. The bound this section states still
 holds; only "uncounted" changes. The events a grace-dropped listener had already decoded, in the
 `BatchAccumulator` or parked in `emit`'s `Fanout::send`, stay uncounted, as that ADR's decision 1
 names.
