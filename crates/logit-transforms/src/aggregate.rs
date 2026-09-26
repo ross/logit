@@ -177,8 +177,8 @@ pub struct Aggregator {
     series_retention: u32,
     /// Cap on retained series across all resource groups: a cardinality guard, not a tuning knob.
     /// `series_retention` bounds how long one series survives; this bounds how many can be retained
-    /// at once, against a stream of never-repeating series names. Evicts least-recently-updated
-    /// first. Meaningless while `series_retention` is `0`.
+    /// at once, against a stream of never-repeating series names. Evicts the most idle first, then
+    /// the newest among equally idle series. Meaningless while `series_retention` is `0`.
     max_retained_series: usize,
     /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
     /// total that survives the flush.
@@ -197,6 +197,9 @@ pub struct Aggregator {
     /// a value that never changes within one batch (`Transform::observe_batch_context`'s doc makes
     /// the same argument). `None` until the first batch arrives.
     current_scope: Option<Arc<Scope>>,
+    /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
+    /// series this `Aggregator` has held, across groups and flushes.
+    next_open_seq: u64,
 }
 
 /// Keyed by `(resource, scope)` value, not `Arc` identity (as `group_for` does for resource): two
@@ -217,6 +220,10 @@ struct SeriesState {
     /// incremented for a retained series; compared against `Aggregator::series_retention` at flush
     /// to decide eviction.
     idle_windows: u32,
+    /// This series' place in the order the `Aggregator` opened series, from
+    /// `Aggregator::next_open_seq`. The cardinality cap evicts the highest first among equally idle
+    /// series, so a series updated every window outlives one-off series opened after it.
+    open_seq: u64,
     /// Unix-nanos timestamp of the first event absorbed into this series, emitted as
     /// `MetricRecord::start_timestamp` on every cumulative-mode `Sum`/`Histogram` flush. A series
     /// evicted and re-created gets a fresh `SeriesState` and so a fresh value: that's the restart
@@ -451,6 +458,7 @@ impl Aggregator {
             sets: Sets::default(),
             max_set_members_per_series: 1000,
             current_scope: None,
+            next_open_seq: 0,
         }
     }
 
@@ -592,6 +600,7 @@ impl Aggregator {
                 unit: record.unit,
                 attributes: event.attributes.clone(),
             };
+            let open_seq = self.next_open_seq;
             let group = self.group_for(resource, &scope);
             let entry = group.series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
@@ -602,6 +611,7 @@ impl Aggregator {
                 accumulator: opener.open(),
                 contexts: ContributingContexts::default(),
                 idle_windows: 0,
+                open_seq,
                 first_seen: event.timestamp,
                 updated_this_window: false,
                 description: record.description,
@@ -927,6 +937,9 @@ impl Aggregator {
                 }
                 event.metrics.push(record);
             }
+            if was_vacant {
+                self.next_open_seq += 1;
+            }
         }
         tally.report(&self.telemetry);
 
@@ -1061,16 +1074,28 @@ impl Aggregator {
             }
         }
 
-        // Cardinality cap, evicting the most idle first. Without it, C never-repeating series
-        // names per window would hold C * series_retention series indefinitely.
-        let mut evicted_cardinality: u64 = 0;
+        // Cardinality cap, evicting the most idle first and the newest among equally idle. Without
+        // it, C never-repeating series names per window would hold C * series_retention series
+        // indefinitely. Newest first keeps a series updated every window ahead of the one-off
+        // series opened after it. `open_seq` is unique, so the key is total and an unstable sort
+        // gives one order.
+        let mut evicted_active: u64 = 0;
+        let mut evicted_cardinality_idle: u64 = 0;
         if survivors.len() > self.max_retained_series {
             let excess = survivors.len() - self.max_retained_series;
-            // Stable, so ties among equally idle series evict deterministically.
-            survivors.sort_by_key(|(_, _, state)| std::cmp::Reverse(state.idle_windows));
-            survivors.drain(0..excess);
-            evicted_cardinality = excess as u64;
+            survivors.sort_unstable_by_key(|(_, _, state)| {
+                (std::cmp::Reverse(state.idle_windows), std::cmp::Reverse(state.open_seq))
+            });
+            for (_, _, state) in survivors.drain(0..excess) {
+                // An updated survivor left the loop above with `idle_windows == 0`.
+                if state.idle_windows == 0 {
+                    evicted_active += 1;
+                } else {
+                    evicted_cardinality_idle += 1;
+                }
+            }
         }
+        let evicted_cardinality = evicted_active + evicted_cardinality_idle;
 
         // Survivors go back to their group; a group left empty is dropped.
         for (gi, key, state) in survivors {
@@ -1092,12 +1117,18 @@ impl Aggregator {
                 &[("reason", "idle")],
             );
         }
+        // Split by whether the series was updated this window: an active one was emitted this
+        // flush and is then lost, the loss worth alerting on.
+        for (state, n) in [("active", evicted_active), ("idle", evicted_cardinality_idle)] {
+            if n > 0 {
+                self.telemetry.count(
+                    "logit.transform.series.evicted",
+                    n as f64,
+                    &[("reason", "cardinality"), ("state", state)],
+                );
+            }
+        }
         if evicted_cardinality > 0 {
-            self.telemetry.count(
-                "logit.transform.series.evicted",
-                evicted_cardinality as f64,
-                &[("reason", "cardinality")],
-            );
             // Warned: a later gauge delta against an evicted series resolves against 0.0, and an
             // evicted cumulative series restarts from zero with a new `start_timestamp`.
             self.diag.warn_throttled(
@@ -1656,6 +1687,7 @@ mod tests {
                         accumulator: accumulator(variant),
                         contexts: ContributingContexts::default(),
                         idle_windows: 0,
+                        open_seq: 0,
                         first_seen: 0,
                         updated_this_window: true,
                         description: None,
@@ -2333,18 +2365,20 @@ mod tests {
         counter_with_tag(events, "logit.component.diagnostics", "key", key)
     }
 
+    /// The total over every point carrying `tag_value` under `tag`, which may also carry other
+    /// tags (`series.evicted{reason="cardinality"}` splits by `state`), or `None` without one.
     fn counter_with_tag(events: &[Event], name: &str, tag: &str, tag_value: &str) -> Option<f64> {
-        events.iter().find_map(|e| {
-            if e.attributes.get(tag).and_then(|v| v.as_str()) != Some(tag_value) {
-                return None;
-            }
-            e.metrics.iter().find_map(|m| match &m.kind {
+        events
+            .iter()
+            .filter(|e| e.attributes.get(tag).and_then(|v| v.as_str()) == Some(tag_value))
+            .flat_map(|e| &e.metrics)
+            .filter_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if logit_core::interner::resolve(m.name) == name => {
                     Some(sum.value)
                 }
                 _ => None,
             })
-        })
+            .reduce(|a, b| a + b)
     }
 
     #[test]
@@ -2581,6 +2615,239 @@ mod tests {
             })
         });
         assert_eq!(evicted_cardinality, Some(1.0), "exactly one series should exceed the cap");
+    }
+
+    /// `logit.transform.series.evicted{reason="cardinality", state}`'s value in drained telemetry,
+    /// or 0.
+    fn evicted_cardinality(events: &[Event], state: &str) -> f64 {
+        events
+            .iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cardinality")
+                    && e.attributes.get("state").and_then(|v| v.as_str()) == Some(state)
+            })
+            .flat_map(|e| &e.metrics)
+            .filter_map(|m| match &m.kind {
+                MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.series.evicted" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn series_count(agg: &Aggregator) -> usize {
+        agg.groups.iter().map(|g| g.series.len()).sum()
+    }
+
+    /// Among equally idle series the newest goes first, and an idle series before an active one.
+    #[test]
+    fn the_cardinality_cap_evicts_the_most_idle_then_the_newest() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(5, 2)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        let names = |agg: &Aggregator| {
+            let mut names: Vec<&str> = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .map(|k| logit_core::interner::resolve(k.name))
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        feed(&mut agg, &resource, metric_event("a", MetricKind::Gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("b", MetricKind::Gauge(1.0), 0));
+        agg.flush(100);
+        registry.drain(0);
+
+        // `a` and `b` are idle for one flush and `c` is active: one of the idle pair goes, the
+        // newer.
+        feed(&mut agg, &resource, metric_event("c", MetricKind::Gauge(1.0), 150));
+        agg.flush(200);
+        assert_eq!(names(&agg), ["a", "c"]);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "idle"), 1.0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 0.0);
+
+        // All three active: the newest goes.
+        for name in ["d", "c", "a"] {
+            feed(&mut agg, &resource, metric_event(name, MetricKind::Gauge(1.0), 250));
+        }
+        agg.flush(300);
+        assert_eq!(names(&agg), ["a", "c"]);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "idle"), 0.0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 1.0);
+    }
+
+    /// One flush of [`cap_soak`].
+    #[derive(Debug, PartialEq)]
+    struct SoakFlush {
+        stable_kept: usize,
+        evicted_active: f64,
+        evicted_idle: f64,
+    }
+
+    const SOAK_STABLE: usize = 20;
+    const SOAK_FRESH: usize = 1000;
+    const SOAK_CAP: usize = 100;
+
+    /// Runs 20 windows of 20 stable series, updated every window, and 1000 one-off series against
+    /// `series_retention: 3` and `max_retained_series: 100`, and returns what each flush evicted.
+    /// A warm-up window opens the stable series first; with `churn_first` it opens one one-off
+    /// series before them, so `churn`'s group comes first in `groups`, and every later window feeds
+    /// the one-off series before the stable ones.
+    ///
+    /// Checks at every flush: at most 100 series held, every eviction counted, one group per
+    /// resource, and under `Cumulative` an unchanged `start_timestamp` on every stable series.
+    fn cap_soak(
+        kind: fn(usize) -> MetricKind,
+        temporality: AggregateTemporality,
+        stable: &Arc<Resource>,
+        churn: &Arc<Resource>,
+        churn_first: bool,
+    ) -> Vec<SoakFlush> {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("soak", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(temporality)
+            .with_series_retention(3, SOAK_CAP)
+            .with_telemetry(telemetry);
+        let groups = if Arc::ptr_eq(stable, churn) { 1 } else { 2 };
+        let feed_stable = |agg: &mut Aggregator, ts: i64| {
+            for i in 0..SOAK_STABLE {
+                let id = i.to_string();
+                let event = metric_event_with_tags("stable", kind(i), ts, &[("id", &id)]);
+                assert!(feed(agg, stable, event).is_none());
+            }
+        };
+        let feed_churn = |agg: &mut Aggregator, w: usize, n: usize, ts: i64| {
+            for j in 0..n {
+                let id = format!("{w}-{j}");
+                let event = metric_event_with_tags("fresh", kind(j), ts, &[("id", &id)]);
+                assert!(feed(agg, churn, event).is_none());
+            }
+        };
+
+        if churn_first {
+            feed_churn(&mut agg, 0, 1, 1);
+        }
+        feed_stable(&mut agg, 1);
+        agg.flush(1_000);
+        registry.drain(0);
+
+        let mut flushes = Vec::new();
+        for w in 1..=20 {
+            let ts = w as i64 * 1_000 + 1;
+            if churn_first {
+                feed_churn(&mut agg, w, SOAK_FRESH, ts);
+                feed_stable(&mut agg, ts);
+            } else {
+                feed_stable(&mut agg, ts);
+                feed_churn(&mut agg, w, SOAK_FRESH, ts);
+            }
+            let before = series_count(&agg);
+            let flushed = agg.flush(ts + 999);
+            let after = series_count(&agg);
+            let drained = registry.drain(0);
+
+            assert!(after <= SOAK_CAP, "flush {w} holds {after} series");
+            let evicted_active = evicted_cardinality(&drained, "active");
+            let evicted_idle = evicted_cardinality(&drained, "idle");
+            let evicted_total = evicted_count(&drained, "cardinality").unwrap_or(0.0);
+            let evicted_ttl = evicted_count(&drained, "idle").unwrap_or(0.0);
+            // Every series here is retainable, so the only exits are the two evictions.
+            assert_eq!(
+                evicted_total + evicted_ttl,
+                (before - after) as f64,
+                "flush {w}: every series that left is counted"
+            );
+            assert_eq!(agg.groups.len(), groups, "flush {w}");
+            if temporality == AggregateTemporality::Cumulative {
+                for (_, _, events) in &flushed {
+                    for (event, _) in events {
+                        if logit_core::interner::resolve(event.metrics[0].name) == "stable" {
+                            assert_eq!(start_timestamp_of(event), 1, "flush {w}: {event:?}");
+                        }
+                    }
+                }
+            }
+            let stable_kept = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .filter(|k| logit_core::interner::resolve(k.name) == "stable")
+                .count();
+            flushes.push(SoakFlush { stable_kept, evicted_active, evicted_idle });
+        }
+        flushes
+    }
+
+    /// What every soak flush evicts once the tie-break holds: the one-off series left idle by the
+    /// previous flush (80, or the warm-up's one), then the newest active ones down to the cap.
+    fn soak_expected(churn_first: bool) -> Vec<SoakFlush> {
+        let kept_fresh = (SOAK_CAP - SOAK_STABLE) as f64;
+        (1..=20)
+            .map(|w| SoakFlush {
+                stable_kept: SOAK_STABLE,
+                evicted_active: (SOAK_STABLE + SOAK_FRESH - SOAK_CAP) as f64,
+                evicted_idle: match w {
+                    1 if churn_first => 1.0,
+                    1 => 0.0,
+                    _ => kept_fresh,
+                },
+            })
+            .collect()
+    }
+
+    fn soak_gauge(i: usize) -> MetricKind {
+        MetricKind::Gauge(i as f64)
+    }
+
+    fn soak_counter(_: usize) -> MetricKind {
+        MetricKind::counter(1.0)
+    }
+
+    /// A series updated every window survives a cap that one-off series overflow every window.
+    #[test]
+    fn stable_series_survive_a_cardinality_cap_soak() {
+        let resource = default_resource();
+        let flushes =
+            cap_soak(soak_gauge, AggregateTemporality::Delta, &resource, &resource, false);
+        assert_eq!(flushes, soak_expected(false));
+    }
+
+    /// The same soak under `temporality: cumulative`: stable counters keep their start time.
+    #[test]
+    fn stable_cumulative_series_keep_their_start_time_through_a_cap_soak() {
+        let resource = default_resource();
+        let flushes =
+            cap_soak(soak_counter, AggregateTemporality::Cumulative, &resource, &resource, false);
+        assert_eq!(flushes, soak_expected(false));
+    }
+
+    /// The cap is global across groups: stable series in one group survive churn in another,
+    /// whichever group `groups` holds first.
+    #[test]
+    fn stable_series_in_one_group_survive_churn_in_another() {
+        let resource = |host: &str| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("host", host);
+            Arc::new(Resource { attributes, ..Default::default() })
+        };
+        let (a, b) = (resource("a"), resource("b"));
+        for churn_first in [false, true] {
+            let flushes = cap_soak(soak_gauge, AggregateTemporality::Delta, &a, &b, churn_first);
+            assert_eq!(flushes, soak_expected(churn_first), "churn_first: {churn_first}");
+        }
     }
 
     /// A retained gauge's contributing contexts still reset at every flush.
