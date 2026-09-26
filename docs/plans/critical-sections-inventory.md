@@ -30,7 +30,7 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
   re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
   which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, and the shared
-  queue and shutdown (#401, #403, #404, #406, #408, and `drain/w5`), which closed NET-02, NET-03,
+  queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
   clean. The rest of the
   list is `unreviewed`. The index's **Status** column is the source of truth.
@@ -109,7 +109,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    CODEC-16, CODEC-17. Mostly fuzz targets + size/depth caps; highest severity, most mechanical.
 2. **Durability (done, #322–#337)** — DISK-01..06, DISK-09, DISK-13, TAIL-05, DISK-10. One crash-injection harness
    serves all of it; settle the fsync policy (tmp file + directory) once for spool *and* checkpoints.
-3. **Shared queue + shutdown (done, #401, #403, #404, #406, #408, and `drain/w5`)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
+3. **Shared queue + shutdown (done, #401, #403, #404, #406, #408, #409)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
    A multi-thread randomized stress harness, a sequential proptest, and tokio-source pins for the
    queues (incl. the `peek`/`commit` head reservation), then a cancellation-safety audit of every
    `select!`, recorded as `docs/design/pipeline-graph.md`'s "Cancellation points" table.
