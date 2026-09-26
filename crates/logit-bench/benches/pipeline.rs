@@ -193,9 +193,13 @@ fn aggregate_absorb(bencher: Bencher) {
 /// One gauge absorbed with `groups` resource groups already open, each event under the next
 /// resource in rotation: what `group_for`'s linear scan over groups costs as the count grows
 /// (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section). Every group is
-/// opened before timing starts, so each sample scans a list of fixed length, on average half of
-/// it before the match.
-#[divan::bench(args = [1, 100, 1000])]
+/// opened before timing starts, so the list has a fixed length.
+///
+/// The cost of one event depends on its resource's position in that list, so `sample_size` is a
+/// multiple of every argument: each sample covers whole rotations and averages over every
+/// position. With divan's adaptive sample size, a sample could cover only the cheap front of the
+/// list.
+#[divan::bench(args = [1, 100, 1000], sample_count = 100, sample_size = 1000)]
 fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
     let resources = fixtures::resources_for_groups(groups);
     let prototype = fixtures::gauge_event_after_keep();
