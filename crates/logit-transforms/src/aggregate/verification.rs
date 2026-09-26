@@ -2193,11 +2193,9 @@ fn held_contexts(agg: &Aggregator) -> Vec<(usize, Vec<TraceContext>, u64)> {
 proptest! {
     #![proptest_config(config(256))]
 
-    /// XFORM-05: over two windows of random batches, each series links the first eight distinct
-    /// contexts its merged records carried and counts every other observation as dropped. A
-    /// context re-observed on a series that links it, and a context on a kind-conflicted record,
-    /// count nothing, and no series sees another's contexts. A flush empties every series' set,
-    /// retained ones included.
+    /// XFORM-05: over two windows of random batches, every series' held contexts, emitted links,
+    /// and `links.dropped` count match [`ref_links`] per series, and a flush empties every set.
+    /// The rules are `ContributingContexts` and `ContributingContexts::observe`.
     #[test]
     fn contributing_contexts_cap_per_series_and_count_only_new_and_full(
         windows in (1..=3usize).prop_flat_map(|n| prop::collection::vec(cap_window(n), 2)),
