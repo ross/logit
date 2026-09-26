@@ -817,7 +817,7 @@ enum Delivery {
 /// otherwise go unenforced until that attempt gave up. A timeout is `Fault::Ambiguous` (the
 /// destination may have received the request), never `Permanent`.
 ///
-/// `sending` is `true` only while an `output.send` call is in flight: set just before the
+/// `sending` is `true` only while an `output.send` call is in flight: set immediately before the
 /// attempt's await and cleared as soon as it returns, before classification and before any
 /// backoff sleep. So when [`write_loop`] drops this future for the shutdown grace, `true` means
 /// `send` was polled at least once and hadn't completed. Neither of the other ways the grace can
@@ -1627,8 +1627,8 @@ fn run_lua(
     // Dropped here, after a return or a panic alike, so the downstream cascade is underway
     // before `done_tx` reports. `None` already if the watcher revoked it. A loop that failed the
     // node left its inbox open with batches still queued, so those are swept and counted, as
-    // the watcher's revocation counts them. Counted `reason="shutdown"` although no signal
-    // preceded it: the node's failure is what starts the drain.
+    // the watcher's revocation counts them. Counted `reason="shutdown"` whether or not a signal
+    // came first: the node is leaving the graph, and its failure starts the drain if none has.
     let leftover = lock_io(&io).take();
     let failed = matches!(outcome, Ok(Err(_)));
     match leftover {
