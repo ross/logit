@@ -399,7 +399,59 @@ coop-budget test.
 
 ### `drain/w3`: UDP read and decode loops (NET-02, NET-03)
 
-Filled in by `drain/w3`.
+`drain/w3` lands decision 4 in `crates/logit-inputs/src/udp.rs`: every UDP shutdown remainder is
+counted `datagrams.dropped`/`bytes.dropped{reason="shutdown"}`, so the per-listener datagram
+contract in decision 1 holds on every exit. Three guards do the counting:
+
+- `ReadHalf` owns `read_loop`'s batch and queue. Its `Drop` counts what the batch still holds and
+  closes the queue, which covers the never-polled `push_many`, a `break Err`, and the read future
+  dropped at the coop-budget yield between its read and its push. That yield is reachable under
+  `receive.shutdown_grace: 0s`.
+- `decode_loop` iterates its popped batch through a `CountedDrain`.
+- `ResidualOnDrop`, declared in `UdpListener::drive` before both halves, closes the queue and
+  counts what it holds through the new one-lock `BoundedQueue::take_all`. It makes no telemetry
+  call on an empty queue.
+
+Each guard logs a `warn` naming the count when it's nonzero, because `internal`'s final drain has
+already run by then. `docs/known-gaps.md` records that gap and the event-level losses decision 1
+names.
+
+`decode_loop` and `tcp.rs`'s `serve_connection` now re-read the clock after an interval `emit`.
+Before, an `emit` parked past the next deadline left that deadline already due, and the next pop
+batch or read flushed again at once. The udp and tcp rows of `docs/design/pipeline-graph.md`'s
+"Cancellation points" table land with it.
+
+Tests in `udp.rs`, on real time unless noted:
+
+- `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue` now checks that the
+  datagrams read equal those queued plus those counted dropped, in datagrams and bytes.
+- `a_read_loop_whose_push_many_was_never_polled_before_shutdown_counts_its_whole_batch` runs
+  `read_loop` with shutdown already set until a trial reads a batch and never polls the push, and
+  checks the contract on every trial.
+- `a_read_loop_dropped_mid_iteration_counts_what_its_batch_held_and_closes_the_queue` leaves the
+  read one unit of coop budget, so the push `select!` yields with the batch full, then drops it.
+- `read_loop_closes_the_queue_even_when_its_future_is_dropped` (paused) drops a parked read.
+- `a_decode_loop_dropped_mid_batch_counts_every_popped_but_undecoded_datagram` (paused) counts
+  datagrams 3 to 5, with their bytes, after the second `emit` parks.
+- `a_udp_listener_cancelled_by_the_grace_backstop_counts_what_its_queue_still_held` wedges a
+  listener behind an unread consumer and a `Block` queue, cuts it off after the signal, and checks
+  the contract.
+- `a_zero_shutdown_grace_never_breaks_the_datagram_contract` reproduces `run_input`'s `select!`
+  at a grace of 0 over 50 iterations with varied traffic and timing.
+- `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` (paused)
+  checks that no interval flush follows a resumed `emit` at the same instant.
+  `tcp.rs`'s `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_read` does the
+  same over an in-memory duplex stream.
+- `a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers` (paused) pins the partial fan-out
+  gap.
+
+`queue.rs` adds
+`take_all_removes_everything_in_order_with_one_gauge_update_and_clears_a_reservation`.
+
+Each guard and the clock fix was checked against its removal. Dropping `ReadHalf`'s count fails
+the never-polled, dropped-mid-iteration, and grace-0 tests. Dropping `ResidualOnDrop`'s count
+fails the grace-backstop and grace-0 tests. Relabeling `decode_loop`'s drain fails the decode
+test, and reading the clock before the `emit` fails both interval tests.
 
 ### `drain/w4`: tail shutdown and timers (TAIL-06, TAIL-08)
 

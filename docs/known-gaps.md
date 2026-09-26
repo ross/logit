@@ -84,7 +84,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   normally (`logit_pipeline::run_with_shutdown`, `crates/logit-pipeline/src/runtime.rs`), triggering
   the same close-time flush a listener's natural completion has, so the aggregation window is
   protected. The in-flight loss is accepted: cancelling a listener's `run` future drops whatever it
-  was mid-`recv_from`/decode on, and UDP is lossy by contract already.
+  was mid-`recv_from`/decode on, and UDP is lossy by contract already. A UDP listener counts those
+  datagrams as `datagrams.dropped{reason="shutdown"}`; the events it had already decoded are the
+  uncounted remainder under [UDP intake](#udp-intake).
 
   ~~`Output` still has no close/flush hook of its own.~~ **Closed**
   ([ADR `buffered-sink-delivery`](adr/buffered-sink-delivery.md)): `Output` gains
@@ -578,6 +580,24 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   exactly the deployments where it matters, such as a host agent sharing a netns with everything
   else on the box. If wanted, they belong in a process-level scope beside `logit.process.*`, which
   `internal` already samples, not on any listener.
+- **Events a UDP listener has already decoded are lost uncounted when the grace backstop drops
+  it.** Every datagram reconciles at shutdown: `logit.input.datagrams` equals the
+  `receive.latency` sample count plus `datagrams.dropped` under every reason, `shutdown` included
+  ([ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
+  decision 1). Past that point the unit is events, and two event-level losses stay uncounted when
+  `run_input`'s backstop drops a listener still draining after `receive.shutdown_grace`:
+  - The events in the `BatchAccumulator` and the batch parked in `emit`'s `Fanout::send`. Their
+    datagrams already count as decoded, so the datagram contract still holds, but no event-level
+    counter records them.
+  - A batch cut off partway through `Fanout::deliver`. It sends to each consumer in turn, so a
+    drop mid-fan-out reaches a prefix of the consumers. The batch still counts as
+    `batches.sent` and `receive.flushed`, never as a drop, and the consumers after the prefix never
+    see it. `a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers`
+    (`crates/logit-inputs/src/udp.rs`) pins this.
+
+  Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
+  need an event-level drop counter on the accumulator and a per-consumer delivery record in
+  `Fanout`, for a loss the grace already bounds.
 - ~~**No visibility into the kernel's own UDP receive-buffer drops.**~~ **Closed** (ADR
   [`udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
   A listener's `ReceiveQueue` ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md); see
@@ -2427,6 +2447,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `Diagnostics::error`) is bounded only by `MAX_LOGS_PER_COMPONENT`'s bound-and-drop. Not built:
   nothing shipped needs it, and the throttle already covers the hot path (a malformed line, a parse
   failure).
+- **Shutdown-time counts never reach an exported pipeline.** `internal`'s `run_until_shutdown`
+  does its final drain the moment the shutdown signal fires. Every count recorded after that is
+  left in the component buffers: the UDP listeners' `datagrams.dropped`/`bytes.dropped{reason=
+  "shutdown"}`
+  ([ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
+  decision 4), and the drops a sink or Lua node counts during the drain. They reach a test
+  `Registry` but no `otlp_out` or `prometheus_out`. What an operator sees is the self-log: each
+  UDP guard that counts a nonzero remainder logs a `warn` naming the listener and the count, and
+  `drain complete` logs the sinks' total. Exporting them would need `internal` to drain once more
+  after every other node has stopped, into a pipeline that has itself already stopped.
 - ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
   name: every message is prefixed with its component's id, and a message that can fire once per
