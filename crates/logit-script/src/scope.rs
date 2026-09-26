@@ -14,7 +14,9 @@
 //! down before the event is handed back. `scope` lives for the worker's lifetime, so [`install`]
 //! creates the sub-userdata once and [`ScopeProxy`] holds its `RegistryKey`.
 
-use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
+use crate::value::{
+    attribute_error, attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua,
+};
 use bytes::Bytes;
 use logit_core::Scope;
 use mlua::{Lua, MetaMethod, RegistryKey, UserData, UserDataMethods, Value as LuaValue};
@@ -259,7 +261,7 @@ impl UserData for ScopeAttrsProxy {
             |_, this, (key, value): (mlua::String, LuaValue)| {
                 let key = key.to_str()?;
                 // Same no-op check and borrow ordering as `crate::proxy::AttrsProxy::__newindex`:
-                // the borrow must be released before `lua_to_value`, which can re-enter Lua.
+                // conversion reads raw and runs no metamethod; the borrow is still released first.
                 let is_noop = {
                     let state = this.0.borrow();
                     let existing = match &state.modified {
@@ -271,7 +273,8 @@ impl UserData for ScopeAttrsProxy {
                 if is_noop {
                     return Ok(());
                 }
-                let value = lua_to_scope_value(value)?;
+                let value = lua_to_scope_value(value)
+                    .map_err(|err| attribute_error("scope.attributes", key, err))?;
                 let mut state = this.0.borrow_mut();
                 ensure_modified(&mut state);
                 state

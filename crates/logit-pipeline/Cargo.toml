@@ -41,3 +41,5 @@ libc.workspace = true
 # doesn't carry over, though a `--workspace` build's feature unification hides that.
 tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
+# The `max_memory` runtime tests capture the self-log a Lua node's own OS thread writes.
+tracing-subscriber.workspace = true

@@ -497,8 +497,8 @@ def endpoint_row(label, url):
     health = base + "/services/collector/health"
     parsed = urllib.parse.urlsplit(base)
     status, _, body = request("GET", health)
-    with_token, _, _ = request("GET", health, None, {"Authorization": f"Splunk {TOKEN}"})
-    facts = [f"/health without a token -> {status} {body[:120]!r}, with the token -> {with_token}"]
+    # probe_health_token has the token cases.
+    facts = [f"/health without a token -> {status} {body[:120]!r}"]
     if parsed.scheme != "https":
         return (f"endpoint {label}", "INFO", "plain http; " + facts[0])
     try:
@@ -608,6 +608,161 @@ def probe_code6():
     return rows
 
 
+def probe_health_token():
+    rows = []
+    for path in ("/services/collector/health", "/services/collector/health/1.0"):
+        answers = []
+        for label, token in (("no token", None), ("the token", TOKEN), ("a bogus token", str(uuid.uuid4()))):
+            headers = {"Authorization": f"Splunk {token}"} if token else {}
+            status, _, body = request("GET", HEC + path, None, headers)
+            answers.append(f"{label} -> {status} {body[:120]!r}")
+        rows.append((f"GET {path}", "INFO", "; ".join(answers)))
+    return rows
+
+
+#: `event` values that carry nothing: (as written in the row, the value).
+EMPTY_EVENTS = [("{}", {}), ("[]", []), ('" "', " "), ("null", None), ("0", 0), ("false", False)]
+
+
+def probe_empty_event_object():
+    m = f"{RUN}-empty"
+    replies = []
+    for i, (label, value) in enumerate(EMPTY_EVENTS):
+        # The marker rides in `source`: the `event` has no room for one.
+        body = objects({"event": value, "source": f"{m}{i}"})
+        replies.append((label, f"{m}{i}", hec("/services/collector/event", body)))
+    rows = try_search(f'search index=main source="{m}*" | table source _raw', lambda r: len(r) >= len(EMPTY_EVENTS))
+    stored = {} if rows == NOT_SEARCHED else {r.get("source"): r.get("_raw") for r in rows}
+    out = []
+    for label, source, (status, text) in replies:
+        if rows == NOT_SEARCHED:
+            seen = rows
+        else:
+            seen = f"indexed, _raw {stored[source]!r}" if source in stored else "not indexed"
+        out.append((f"`event: {label}`", "INFO", f"{status} {text}; {seen}"))
+    return out
+
+
+def probe_time_forms():
+    m = f"{RUN}-tf"
+    now = int(time.time()) - 60
+    # Written as JSON text, so a float with nanosecond digits reaches Splunk as written.
+    cases = [
+        ("an integer in seconds", str(now)),
+        ("an integer in milliseconds", f"{now}123"),
+        ("an integer in nanoseconds", f"{now}123456789"),
+        ("a decimal string", f'"{now}.123456789"'),
+        ("a float with nanosecond digits", f"{now}.123456789"),
+    ]
+    replies = [(label, value, hec("/services/collector/event", f'{{"event": "{m}-{i}", "time": {value}}}'.encode()))
+               for i, (label, value) in enumerate(cases)]
+    rows = try_search(f'search index=main "{m}" | eval e=printf("%.9f", _time),'
+                      ' s=strftime(_time, "%Y-%m-%dT%H:%M:%S.%9N") | table _raw e s',
+                      lambda r: len(r) >= len(cases))
+    stored = {} if rows == NOT_SEARCHED else {r.get("_raw"): r for r in rows}
+    out = []
+    for i, (label, value, (status, text)) in enumerate(replies):
+        row = stored.get(f"{m}-{i}")
+        if rows == NOT_SEARCHED:
+            seen = rows
+        else:
+            seen = f"_time {row.get('e')} ({row.get('s')})" if row else "not indexed"
+        out.append((f"`time` as {label}", "INFO", f"`time: {value}` -> {status} {text}; {seen}"))
+    return out
+
+
+def probe_envelope_carryover():
+    m = f"{RUN}-env"
+    then = int(time.time()) - 3600
+    envelope = {"host": "probe-carry-host", "index": "osnix", "source": "probe-carry-source",
+                "sourcetype": "probe:carry", "time": then}
+    first = hec("/services/collector/event", objects({"event": f"{m}-first0", **envelope},
+                                                     {"event": f"{m}-first1"}, {"event": f"{m}-first2"}))
+    last = hec("/services/collector/event", objects({"event": f"{m}-last0"}, {"event": f"{m}-last1"},
+                                                    {"event": f"{m}-last2", **envelope}))
+    rows = try_search(f'search (index=main OR index=osnix) "{m}" | eval e=_time'
+                      ' | table _raw index host source sourcetype e', lambda r: len(r) >= 6)
+    stored = {} if rows == NOT_SEARCHED else {r.get("_raw"): r for r in rows}
+
+    def landed(marker):
+        row = stored.get(marker)
+        if not row:
+            return f"object {marker[-1]} not indexed"
+        at = "the envelope's" if int(float(row.get("e") or 0)) == then else "not the envelope's"
+        return (f"object {marker[-1]} -> index={row.get('index')} host={row.get('host')} "
+                f"source={row.get('source')} sourcetype={row.get('sourcetype')} _time {at}")
+
+    out = []
+    for label, case, (status, text) in (("object 0", "first", first), ("object 2", "last", last)):
+        seen = rows if rows == NOT_SEARCHED else "; ".join(landed(f"{m}-{case}{i}") for i in range(3))
+        out.append((f"envelope on {label} of 3 only", "INFO", f"{status} {text}; {seen}"))
+    return out
+
+
+#: `/raw` bodies under a sourcetype with no props: (label, body from its marker).
+RAW_BODIES = [
+    ("three LF-terminated lines", lambda m: f"{m}-1 one\n{m}-2 two\n{m}-3 three\n"),
+    ("three CRLF-terminated lines", lambda m: f"{m}-1 one\r\n{m}-2 two\r\n{m}-3 three\r\n"),
+    ("three lines, no trailing newline", lambda m: f"{m}-1 one\n{m}-2 two\n{m}-3 three"),
+    ("three lines, the second indented", lambda m: f"{m}-1 one\n    {m}-2 continued\n{m}-3 three\n"),
+]
+
+
+def probe_raw_merging():
+    m = f"{RUN}-rm"
+    replies = []
+    for i, (label, body) in enumerate(RAW_BODIES):
+        source = f"{m}{i}"
+        query = urllib.parse.urlencode({"sourcetype": "logit:rawmerge", "source": source})
+        replies.append((label, source, hec(f"/services/collector/raw?{query}", body(source).encode())))
+    sources = {source for _, source, _ in replies}
+    rows = try_search(f'search index=main source="{m}*" | table source _raw',
+                      lambda r: {row.get("source") for row in r} >= sources)
+    out = []
+    for label, source, (status, text) in replies:
+        if rows == NOT_SEARCHED:
+            seen = rows
+        else:
+            raws = sorted(row.get("_raw", "") for row in rows if row.get("source") == source)
+            seen = f"{len(raws)} event(s), _raw {raws}"
+        out.append((f"/raw with {label}", "INFO", f"{status} {text}; {seen}"))
+    return out
+
+
+def probe_event_vs_raw_props():
+    label = "`logit:ta` props on /raw and /event"
+    if not LOCAL:
+        return [(label, "SKIP", "cloud mode: the `logit:ta` props and transforms are the local stack's")]
+    m = f"{RUN}-ta"
+    stamp = int(time.time()) - 2 * 86400
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(stamp))
+    line = lambda case: f"ts={ts} route=probe {m}-{case}"
+    replies = [
+        ("/raw?sourcetype=logit:ta", "raw",
+         hec("/services/collector/raw?sourcetype=logit:ta", (line("raw") + "\n").encode())),
+        ("/event, sourcetype logit:ta", "event",
+         hec("/services/collector/event", objects({"event": line("event"), "sourcetype": "logit:ta"}))),
+        ("/event?auto_extract_timestamp=true, sourcetype logit:ta", "auto",
+         hec("/services/collector/event?auto_extract_timestamp=true",
+             objects({"event": line("auto"), "sourcetype": "logit:ta"}))),
+    ]
+    rows = try_search(f'search (index=main OR index=tcpout_probe) "{m}" | eval e=_time'
+                      ' | table _raw index sourcetype e', lambda r: len(r) >= len(replies), 60)
+    parts = []
+    for route, case, (status, text) in replies:
+        if rows == NOT_SEARCHED:
+            parts.append(f"{route} -> {status} {text}, {rows}")
+            continue
+        row = next((r for r in rows if r.get("_raw", "").endswith(f"{m}-{case}")), None)
+        if row is None:
+            parts.append(f"{route} -> {status} {text}, not indexed")
+            continue
+        at = "the line's ts" if int(float(row.get("e") or 0)) == stamp else "not the line's ts"
+        parts.append(f"{route} -> {status}, index={row.get('index')} sourcetype={row.get('sourcetype')} "
+                     f"_time {at}")
+    return [(label, "INFO", "; ".join(parts))]
+
+
 def probe_metrics():
     rows = []
     m = f"{RUN}-mt"
@@ -661,27 +816,55 @@ def probe_http():
     return rows
 
 
-def probe_ack():
+def ack_poll(channel, ids):
+    """One `/ack` poll on the ack token: (status, reply text, {id: bool})."""
+    status, text = hec("/services/collector/ack", json.dumps({"acks": ids}).encode(), token=ACK_TOKEN,
+                       headers={"X-Splunk-Request-Channel": channel})
+    try:
+        acks = json.loads(text).get("acks", {})
+    except (ValueError, AttributeError):
+        acks = {}
+    return status, text, acks
+
+
+def poll_until(channel, ids, want, timeout=60):
+    """Polls `ids` on `channel` until every id in `want` has answered `true` once, or `timeout`:
+    (the ids that ever answered `true`, the last reply, seconds taken). Splunk may forget an id
+    once it has answered `true`, so the ids are collected across polls."""
+    seen, started = set(), time.monotonic()
+    while True:
+        _, text, acks = ack_poll(channel, ids)
+        seen |= {int(k) for k, v in acks.items() if v is True}
+        took = time.monotonic() - started
+        if want <= seen or took > timeout:
+            return sorted(seen), text, took
+        time.sleep(0.5)
+
+
+def probe_ack_ids():
     if not ACK_TOKEN:
         return [("useACK answers", "SKIP", "no SPLUNK_INTEROP_ACK_TOKEN")]
-    channel = str(uuid.uuid4())
-    headers = {"X-Splunk-Request-Channel": channel}
-    no_channel = hec("/services/collector/event", objects({"event": f"{RUN}-ack-a"}), token=ACK_TOKEN)
-    first = hec("/services/collector/event", objects({"event": f"{RUN}-ack-b"}), token=ACK_TOKEN, headers=headers)
-    second = hec("/services/collector/event", objects({"event": f"{RUN}-ack-c"}), token=ACK_TOKEN, headers=headers)
-    ack_id = json.loads(first[1]).get("ackId")
-    started, reply = time.monotonic(), ""
-    while time.monotonic() - started < 60:
-        _, reply = hec("/services/collector/ack", json.dumps({"acks": [ack_id]}).encode(), token=ACK_TOKEN, headers=headers)
-        if "true" in reply:
-            break
-        time.sleep(1)
-    took = time.monotonic() - started
-    other = hec("/services/collector/ack", json.dumps({"acks": [ack_id]}).encode(), token=ACK_TOKEN,
-                headers={"X-Splunk-Request-Channel": str(uuid.uuid4())})
-    return [("useACK answers", "INFO",
-             f"no channel -> {no_channel[0]} {no_channel[1]}; a new channel's first two -> {first[1]}, {second[1]}; "
-             f"poll -> {reply} after {took:.1f}s; the same id on another channel -> {other[0]} {other[1]}")]
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def post(marker, channel):
+        headers = {"X-Splunk-Request-Channel": channel} if channel else None
+        return hec("/services/collector/event", objects({"event": f"{RUN}-{marker}"}), token=ACK_TOKEN,
+                   headers=headers)
+
+    no_channel = post("ack-none", None)
+    a0, a1, b0 = post("ack-a0", a)[1], post("ack-a1", a)[1], post("ack-b0", b)[1]
+    a_true, a_last, a_took = poll_until(a, [0, 1, 5], {0, 1})
+    _, a_again, _ = ack_poll(a, [0, 1])
+    b_true, b_last, _ = poll_until(b, [0, 1], {0}, timeout=30)
+    _, fresh, _ = ack_poll(str(uuid.uuid4()), [0])
+    return [
+        ("useACK without a channel", "INFO", f"{no_channel[0]} {no_channel[1]}"),
+        ("useACK ids", "INFO", f"channel A's two posts -> {a0}, {a1}; channel B's one -> {b0}"),
+        ("useACK polls", "INFO",
+         f"A polling [0, 1, 5]: ids ever true {a_true} within {a_took:.1f}s, last reply {a_last}; "
+         f"A polling [0, 1] again after both were true -> {a_again}; B polling [0, 1]: ids ever true "
+         f"{b_true}, last reply {b_last}; a new channel polling [0] -> {fresh}"),
+    ]
 
 
 def probe_tcpout():
@@ -708,8 +891,9 @@ def probe_tcpout():
              f"{other} other LF-terminated lines (Splunk's own logs)")]
 
 
-PROBES = [probe_version, probe_endpoint, probe_body_cap, probe_gzip, probe_code6, probe_metrics, probe_http,
-          probe_ack, probe_tcpout]
+PROBES = [probe_version, probe_endpoint, probe_health_token, probe_body_cap, probe_gzip, probe_code6,
+          probe_empty_event_object, probe_time_forms, probe_envelope_carryover, probe_raw_merging,
+          probe_event_vs_raw_props, probe_metrics, probe_http, probe_ack_ids, probe_tcpout]
 
 
 # ---- main ---------------------------------------------------------------------------------------

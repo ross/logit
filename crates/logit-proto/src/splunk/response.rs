@@ -9,6 +9,13 @@ use crate::json::{write_str, JsonObject};
 use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
+/// The largest request body, before compression, that Splunk Cloud Platform is known to accept:
+/// 5 MiB. A 10.5.2605.9 trial stack indexed a 5,242,881-byte body and answered one of 6,000,000
+/// bytes with `400` `{"text":"Invalid data format","code":6,"invalid-event-number":0}`, not
+/// `413` (`docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)", item 6). Splunk
+/// Enterprise 10.4.3's `max_content_length` is 838,860,800 bytes, so the cap is Cloud's alone.
+pub const SPLUNK_CLOUD_BODY_CAP: usize = 5 * 1024 * 1024;
+
 /// One HEC status: the body's `code`, the HTTP status Splunk sends it with, and its `text`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HecStatus {

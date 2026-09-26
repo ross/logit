@@ -66,7 +66,8 @@ services:
   # the default token; a second token `ack` with `useACK`; and the `[tcpout]` probe's output
   # group `rawcap` (`sendCookedData=false`, pointed at the `rawcap` service) with a third token
   # `tcpout` routed to it, so only what that token receives is forwarded. No `defaultGroup` is
-  # set: Splunk's own logs never leave.
+  # set: Splunk's own logs never leave. Also a sourcetype `logit:ta` with index-time props and
+  # transforms for check.py's `/event`-against-`/raw` probe.
   splunk-init:
     image: curlimages/curl:8.22.0
     depends_on:
@@ -105,6 +106,22 @@ services:
         post "rawcap output group" "$$api/servicesNS/nobody/system/configs/conf-outputs" \
           -d name=tcpout:rawcap -d server=rawcap:9997 -d sendCookedData=false \
           -d dropEventsOnQueueFull=5
+        # check.py's probe_event_vs_raw_props: a TA-style sourcetype `logit:ta` whose index-time
+        # props take `_time` from a `ts=` prefix, route a `route=probe` line to `tcpout_probe`, and
+        # rename the sourcetype, to show which of them `/event` skips. These load on the restart too.
+        conf="$$api/servicesNS/nobody/system/configs"
+        post "logit:ta index transform" "$$conf/conf-transforms" --data-urlencode name=logit_ta_route \
+          --data-urlencode "REGEX=route=probe" --data-urlencode DEST_KEY=_MetaData:Index \
+          --data-urlencode FORMAT=tcpout_probe
+        post "logit:ta sourcetype transform" "$$conf/conf-transforms" --data-urlencode name=logit_ta_rename \
+          --data-urlencode "REGEX=route=probe" --data-urlencode DEST_KEY=MetaData:Sourcetype \
+          --data-urlencode FORMAT=sourcetype::logit:ta:renamed
+        post "logit:ta props" "$$conf/conf-props" --data-urlencode name=logit:ta \
+          --data-urlencode SHOULD_LINEMERGE=false --data-urlencode TZ=UTC \
+          --data-urlencode "TIME_PREFIX=^ts=" --data-urlencode "TIME_FORMAT=%Y-%m-%dT%H:%M:%S" \
+          --data-urlencode MAX_TIMESTAMP_LOOKAHEAD=19 \
+          --data-urlencode TRANSFORMS-route=logit_ta_route \
+          --data-urlencode TRANSFORMS-rename=logit_ta_rename
         post "tcpout token" "$$http" -d name=tcpout -d token=44444444-4444-4444-4444-444444444444 \
           -d indexes=tcpout_probe -d index=tcpout_probe
         post "restart" "$$api/services/server/control/restart" -X POST

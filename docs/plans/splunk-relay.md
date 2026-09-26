@@ -77,7 +77,7 @@ through the `splunk_hec` exporter.
 
 | Endpoint | Body and limits | Notes |
 |---|---|---|
-| `POST /services/collector/event` (also `/services/collector`, `/event/1.0`) | JSON envelope: `time` (epoch seconds, decimals allowed), `host`, `source`, `sourcetype`, `index`, `event` (any JSON), `fields` (a flat object; nesting is rejected). A batch is concatenated objects or a JSON array, each carrying its own metadata. Header `Authorization: Splunk <token>`. `Content-Encoding: gzip` accepted, and `deflate` answered `415` (Splunk 10.4.3, W5; the OTel exporter gzips every body and Vector offers gzip, zlib, zstd, and snappy) | `index` must be one the token allows. `fields` are indexed fields, searchable without extraction. `limits.conf [http_input] max_content_length` caps a request (1,000,000 bytes on old releases; 838,860,800, 800 MiB, on 10.4.3; which release changed it is still open); over it returns 413 |
+| `POST /services/collector/event` (also `/services/collector`, `/event/1.0`) | JSON envelope: `time` (epoch seconds, decimals allowed), `host`, `source`, `sourcetype`, `index`, `event` (any JSON), `fields` (a flat object; nesting is rejected). A batch is concatenated objects or a JSON array, each carrying its own metadata. Header `Authorization: Splunk <token>`. `Content-Encoding: gzip` accepted, and `deflate` answered `415` (Splunk 10.4.3, W5; the OTel exporter gzips every body and Vector offers gzip, zlib, zstd, and snappy) | `index` must be one the token allows. `fields` are indexed fields, searchable without extraction. `limits.conf [http_input] max_content_length` caps a request (1,000,000 bytes on old releases; 838,860,800, 800 MiB, on 10.4.3; which release changed it is still open); over it returns 413, except on Splunk Cloud, which answers code 6 naming object 0 (the Cloud run, item 6) |
 | `POST /services/collector/raw` | Raw bytes; metadata as query parameters (`host`, `source`, `sourcetype`, `index`); requires a channel GUID (`X-Splunk-Request-Channel` header or `?channel=`); line breaking follows the sourcetype's `props.conf` | What SC4S and the Docker driver's `raw` format use |
 | `POST /services/collector/ack` | `{"acks":[<ackId>…]}` → `{"acks":{"<ackId>":true|false}}` | Only with `useACK=true` on the token, which makes every `/event` and `/raw` POST return `{"text":"Success","code":0,"ackId":N}` (the key is `ackId`; ids count from 0 per channel) and require a channel (code 10 without one). `true` means replicated to the configured replication factor, not fully indexed. Splunk's docs say Splunk Cloud supports HEC acknowledgment only on its Kinesis Firehose path; a Splunk Cloud 10.5.2605.9 trial stack offered and honored it, and answers code 28 without a channel (["Settled by the Cloud run"](#settled-by-the-cloud-run-2026-09-26)) |
 | `GET /services/collector/health` | `{"text":"HEC is healthy","code":17}` | Also `/health/1.0`; the OTel exporter probes it at startup and can send heartbeats |
@@ -228,8 +228,9 @@ showed"). ADR `splunk-hec-relay`'s Cloud amendment records what each changed.
 6. **The body cap is between 5,242,881 and 6,000,000 bytes, and over it the answer is `400` code
    6 naming object 0, not `413`.** Bodies up to 5,242,881 bytes uncompressed, and 2,000,000
    gzipped, were accepted and indexed. `splunk_hec_out`'s 2 MiB `max_body_bytes` default sits
-   under the cap. A `max_body_bytes` above it turns the body's first object into an
-   `invalid_event` drop and resends the rest, the right outcome only for one huge object.
+   under the cap. `splunk_hec_out` reads a code 6 naming object 0 of a body over 5,242,880 bytes
+   as this answer: it splits the body in two once, or drops a lone object as `oversize`, and
+   warns at startup about a `max_body_bytes` above the cap.
 7. **Everything else matches 10.4.3**: gzip accepted and `deflate` `415`; the prefix semantics
    of codes 6, 7, 12, 13, and 15; the lenient cases; `OPTIONS`; the `404` and `405` bodies;
    `/raw` without a channel; 200 and 1,000 dimensions; both metric forms; `metric_type` a
@@ -510,7 +511,11 @@ each:
 - HEC codes 21, 22, 24, and 25 unmodeled; code 28 modeled from Splunk Cloud; no code 18 through
   27 seen from a real Splunk.
 - Codes 7, 12, 13, and 15 permanent in `splunk_hec_out`, where only code 6 drops one object.
-- Splunk Cloud's body cap, between 5.2 and 6 MB, answered with code 6 rather than `413`.
+- Splunk Cloud's body cap, between 5.2 and 6 MB, answered with code 6 rather than `413`:
+  `splunk_hec_out` reads a code 6 at object 0 on a body over 5 MiB as oversize and splits the
+  body once, and warns at startup about a `max_body_bytes` above it; the exact cap is unbisected.
+  A busy Splunk (`429`, `503` code 9) is retried before any body is accepted, ignoring
+  `Retry-After`.
 - What neither the corpus nor the runs exercised: the exporter's `Summary` and a link's
   `trace_state`, Vector's HEC sinks, a `useACK` client against `splunk_hec_in`, a paid Splunk
   Cloud stack's `http-inputs-` endpoint and its certificate, Splunk Enterprise releases other

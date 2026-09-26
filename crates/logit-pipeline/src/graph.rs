@@ -211,6 +211,8 @@
 //!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
 //!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
 //!     (`docs/adr/splunk-hec-relay.md`).
+//! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
+//!     (`docs/adr/lua-runaway-script-bounds.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -225,6 +227,7 @@ use logit_config::{
     ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
+use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -607,6 +610,20 @@ const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
 /// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
 const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
     ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
+
+/// Rule 70's startup warning for a `splunk_hec_out` `max_body_bytes` above
+/// [`SPLUNK_CLOUD_BODY_CAP`], or `None` at or under it.
+fn splunk_cloud_body_cap_warning(id: &str, max_body_bytes: u64) -> Option<String> {
+    (max_body_bytes > SPLUNK_CLOUD_BODY_CAP as u64).then(|| {
+        format!(
+            "component '{id}': splunk_hec_out 'max_body_bytes' ({max_body_bytes}) is above \
+             {SPLUNK_CLOUD_BODY_CAP} bytes, a bound at or below Splunk Cloud's observed cap (a \
+             5,242,881-byte body accepted, 6,000,000 refused) -- a Splunk Cloud stack may refuse \
+             a larger body, which the sink then resends as two requests or drops; Splunk \
+             Enterprise allows up to 800 MiB"
+        )
+    })
+}
 
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
@@ -3146,7 +3163,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // `/services/collector/event/event`, and one with a query or fragment would bury the route
     // inside it. The token gets rule 66's checks for the same reason:
     // HTTP strips a header value's surrounding whitespace. An `ack_timeout` without `ack` would
-    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS.
+    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS. A `max_body_bytes` over
+    // Splunk Cloud's cap is a warning, not an error: Splunk Enterprise's cap is 800 MiB.
     for (id, component) in &components {
         let ComponentKind::SplunkHecOut {
             endpoint,
@@ -3220,6 +3238,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  would drop every event as oversize"
             );
         }
+        if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
+            tracing::warn!("{warning}");
+        }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
                 "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
@@ -3238,6 +3259,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': 'tls' is set, but 'endpoint' ({endpoint:?}) isn't \
                  'https://' -- TLS is selected by the endpoint's scheme, so a 'tls:' block here \
                  would have no effect"
+            );
+        }
+    }
+
+    // Rule 71: a `lua`/`lua_file` `max_memory` of `0` (`docs/adr/lua-runaway-script-bounds.md`).
+    // `human_bytes` parses `"0"`, and an empty VM already holds more than that, so the node
+    // would fail on its first batch.
+    for (id, component) in &components {
+        if let ComponentKind::Lua { max_memory: Some(0), .. }
+        | ComponentKind::LuaFile { max_memory: Some(0), .. } = &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': 'max_memory' must be greater than 0 -- a Lua VM holds more \
+                 than that before its first event; omit 'max_memory' for no limit"
             );
         }
     }
@@ -3652,7 +3687,7 @@ mod tests {
     }
 
     fn lua() -> ComponentKind {
-        ComponentKind::Lua { script: "".to_string(), interval: None }
+        ComponentKind::Lua { script: "".to_string(), interval: None, max_memory: None }
     }
 
     fn json() -> ComponentKind {
@@ -5843,6 +5878,25 @@ mod tests {
             }
         }));
         assert!(err.contains("'max_body_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 70: a `max_body_bytes` above Splunk Cloud's cap resolves, with a warning; at the cap
+    /// there is none.
+    #[test]
+    fn a_splunk_hec_out_max_body_bytes_over_the_cloud_cap_warns() {
+        let cap = SPLUNK_CLOUD_BODY_CAP as u64;
+        let warning = splunk_cloud_body_cap_warning("out", cap + 1).expect("above the cap");
+        assert!(warning.contains("component 'out'"), "{warning}");
+        assert!(warning.contains("5242880 bytes"), "{warning}");
+        assert_eq!(splunk_cloud_body_cap_warning("out", cap), None);
+        assert_eq!(splunk_cloud_body_cap_warning("out", 2 * 1024 * 1024), None);
+        let kind = splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { max_body_bytes, .. } = k {
+                *max_body_bytes = 800 * 1024 * 1024;
+            }
+        });
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
@@ -11039,5 +11093,45 @@ mod tests {
         }
         let err = expect_err(cfg(vec![("in", vec![], zero), ("out", vec!["in"], sink())]));
         assert!(err.contains("must be greater than 0s"), "got: {err}");
+    }
+
+    // ---- rule 71: lua / lua_file max_memory ------------------------------------------------
+
+    fn lua_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
+        ComponentKind::Lua { script: String::new(), interval: None, max_memory }
+    }
+
+    fn lua_file_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
+        ComponentKind::LuaFile { lua_file: "x.lua".to_string(), interval: None, max_memory }
+    }
+
+    /// Rule 71: an empty VM already holds more than `0` bytes.
+    #[test]
+    fn a_lua_max_memory_of_zero_is_rejected() {
+        for kind in [lua_with_max_memory(Some(0)), lua_file_with_max_memory(Some(0))] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("script", vec!["in"], kind),
+                ("out", vec!["script"], sink()),
+            ]));
+            assert!(err.contains("'script'"), "got: {err}");
+            assert!(err.contains("'max_memory' must be greater than 0"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_lua_max_memory_validates() {
+        for kind in [
+            lua_with_max_memory(None),
+            lua_with_max_memory(Some(1)),
+            lua_file_with_max_memory(Some(4 * 1024 * 1024)),
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("script", vec!["in"], kind),
+                ("out", vec!["script"], sink()),
+            ]))
+            .expect("an unset or nonzero max_memory is valid");
+        }
     }
 }
