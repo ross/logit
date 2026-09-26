@@ -437,7 +437,7 @@ attributes each, past `AttrMap`'s 8-slot inline capacity), retained across a sec
 `aggregate_flush_cumulative_sums` runs the same 100 series, spilled maps, and steady-state second
 flush with `temporality: cumulative` `Sum` series (that ADR's cumulative amendment), and measures
 the same **209**. That equality is the finding: a retained `Sum` reports through the same
-copy-then-keep path a retained gauge does (`Accumulator::kind_for_retained`, `Copy` fields on both),
+copy-then-keep path a retained gauge does (`Accumulator::retained_kind`, `Copy` fields on both),
 so cumulative counters cost a flush nothing beyond gauge retention. A cumulative `Histogram` would
 add a bucket-`Vec` clone per series per flush, but no wire producer emits one yet, so there is
 nothing honest to fixture it from.

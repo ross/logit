@@ -11,7 +11,9 @@
 //! A cumulative `Sum`, `ExponentialHistogram`, and `Summary` have no merge rule here and pass
 //! through untouched rather than being dropped. Pass-through is per *metric*, not per *event*: this
 //! stage absorbs every mergeable metric off an event and forwards what's left (the unmergeable
-//! metrics, plus any log or span).
+//! metrics, plus any log or span). Two functions decide by kind, each alone: [`opener_for`] whether
+//! a record merges and what a new series opens with, and [`Accumulator::retained_kind`] whether a
+//! series survives a flush.
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -251,22 +253,89 @@ enum Accumulator {
     SetMembers(Vec<Bytes>),
 }
 
-/// Whether `kind` has no merge rule in this stage and must be forwarded untouched.
+/// The accumulator a new series opens with, decided from the record that opens it without building
+/// anything: [`opener_for`] runs on every merged record, and only a vacant series calls
+/// [`Opener::open`]. Borrows a `Histogram` record so the decision doesn't clone its bucket `Vec`.
+#[derive(Clone, Copy)]
+enum Opener<'k> {
+    Sum {
+        monotonic: bool,
+    },
+    Gauge,
+    Distribution,
+    /// `sample_rate` comes from the opening record, or the first merge would look like a
+    /// `rate_mismatch` against a made-up default.
+    RawSamples {
+        sample_rate: f64,
+    },
+    Set,
+    RawSetMembers,
+    Histogram(&'k logit_core::Histogram),
+}
+
+/// How a record of `kind` opens a series under this stage's modes, or `None` when the kind has no
+/// merge rule here and the record is forwarded untouched. The one place pass-through is decided.
 ///
-/// `process` and `Accumulator::new_for`'s `unreachable!` arm both depend on this answer; a
-/// disagreement is a runtime panic. Mode-dependent for `Histogram` only: a delta one merges under
-/// [`AggregateTemporality::Cumulative`] and passes through under `Delta`. A cumulative `Histogram`
-/// passes through in both modes, as a cumulative `Sum` does: re-accumulating a running total
-/// double-counts it.
-fn passes_through(kind: &MetricKind, temporality: AggregateTemporality) -> bool {
+/// A cumulative `Sum` passes through in both modes: re-accumulating a running total double-counts
+/// it. `Histogram` is mode-dependent: a delta one merges under
+/// [`AggregateTemporality::Cumulative`] and passes through under `Delta`, and a cumulative one
+/// passes through in both, as a cumulative `Sum` does. `distributions`/`sets` pick the opened shape
+/// for `Samples`/`SetMembers`: raw only when the mode asks for it. An already-summarized
+/// `Distribution`/`Set` opens summarized in any mode.
+fn opener_for(
+    kind: &MetricKind,
+    distributions: Distributions,
+    sets: Sets,
+    temporality: AggregateTemporality,
+) -> Option<Opener<'_>> {
     match kind {
-        MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
-        | MetricKind::ExponentialHistogram(_)
-        | MetricKind::Summary(_) => true,
-        MetricKind::Histogram(h) => {
-            h.temporality == Temporality::Cumulative || temporality == AggregateTemporality::Delta
+        MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
+            Some(Opener::Sum { monotonic: *monotonic })
         }
-        _ => false,
+        MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. }) => None,
+        // `Gauge` and `GaugeDelta` share one accumulator: two ways to update one running value,
+        // not a kind conflict (`docs/adr/relative-gauge-adjustments.md`).
+        MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => Some(Opener::Gauge),
+        MetricKind::Distribution(_) => Some(Opener::Distribution),
+        MetricKind::Samples(s) => Some(match distributions {
+            Distributions::Sketch => Opener::Distribution,
+            Distributions::Samples => Opener::RawSamples { sample_rate: s.sample_rate },
+        }),
+        MetricKind::Set(_) => Some(Opener::Set),
+        MetricKind::SetMembers(_) => Some(match sets {
+            Sets::Estimate => Opener::Set,
+            Sets::Members => Opener::RawSetMembers,
+        }),
+        MetricKind::Histogram(h) => (h.temporality == Temporality::Delta
+            && temporality == AggregateTemporality::Cumulative)
+            .then_some(Opener::Histogram(h)),
+        MetricKind::ExponentialHistogram(_) | MetricKind::Summary(_) => None,
+    }
+}
+
+impl Opener<'_> {
+    /// The empty accumulator; `process` merges the opening record into it right after.
+    fn open(self) -> Accumulator {
+        match self {
+            Opener::Sum { monotonic } => Accumulator::Sum { total: 0.0, monotonic },
+            Opener::Gauge => Accumulator::Gauge { value: 0.0, at: i64::MIN },
+            Opener::Distribution => Accumulator::Distribution(logit_core::DdSketch::new()),
+            Opener::RawSamples { sample_rate } => {
+                Accumulator::Samples(Samples { values: SmallVec::new(), sample_rate })
+            }
+            Opener::Set => Accumulator::Set(logit_core::HyperLogLog::new()),
+            Opener::RawSetMembers => Accumulator::SetMembers(Vec::new()),
+            // This record's bounds with zero counts. `sum` starts `Some(0.0)` when the record has
+            // one, so the both-sides-or-`None` merge rule keeps it on the first merge. Stamped
+            // `Cumulative`: that's the only shape it's emitted as.
+            Opener::Histogram(h) => Accumulator::Histogram(logit_core::Histogram {
+                buckets: h.buckets.iter().map(|(bound, _)| (*bound, 0)).collect(),
+                temporality: Temporality::Cumulative,
+                sum: h.sum.map(|_| 0.0),
+                min: None,
+                max: None,
+            }),
+        }
     }
 }
 
@@ -423,12 +492,10 @@ impl Aggregator {
                 continue;
             }
 
-            // No merge rule: leave it on the event. Must agree with `Accumulator::new_for`'s
-            // `unreachable!` arm (see `passes_through`).
-            if passes_through(&record.kind, temporality) {
+            let Some(opener) = opener_for(&record.kind, distributions, sets, temporality) else {
                 event.metrics.push(record);
                 continue;
-            }
+            };
 
             let key = SeriesKey {
                 name: record.name,
@@ -442,7 +509,7 @@ impl Aggregator {
             // `GaugeDelta` uses it.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
             let state = entry.or_insert_with(|| SeriesState {
-                accumulator: Accumulator::new_for(&record.kind, distributions, sets, temporality),
+                accumulator: opener.open(),
                 contexts: ContributingContexts::default(),
                 idle_windows: 0,
                 first_seen: event.timestamp,
@@ -808,29 +875,21 @@ impl Aggregator {
             // At most one event per series, and exactly one each on the default path.
             let mut events = Vec::with_capacity(series.len());
             for (key, mut state) in series {
-                // A gauge's value is sticky by protocol; a cumulative `Sum`/`Histogram`'s running
-                // total is what the mode emits. `Distribution`/`Samples`/`Set`/`SetMembers` never
-                // survive: each window's summary is self-contained.
-                let retain = self.series_retention > 0
-                    && match &state.accumulator {
-                        Accumulator::Gauge { .. } => true,
-                        Accumulator::Sum { .. } | Accumulator::Histogram(_) => {
-                            self.temporality == AggregateTemporality::Cumulative
-                        }
-                        _ => false,
-                    };
                 if state.updated_this_window {
                     let (links, dropped) = std::mem::take(&mut state.contexts).into_links();
                     total_dropped_links += dropped;
 
-                    if retain {
-                        // Read without consuming the accumulator (one bucket-`Vec` clone for a
-                        // `Histogram`, free otherwise). `key.attributes` is cloned only on this
-                        // path because `key` goes back into the map.
-                        let mut record = MetricRecord::new(
-                            key.name,
-                            state.accumulator.kind_for_retained(self.temporality),
-                        );
+                    // Asked only of an updated series: an idle one is here because it was
+                    // retained, and asking would clone a `Histogram`'s buckets for nothing.
+                    let retained = if self.series_retention > 0 {
+                        state.accumulator.retained_kind(self.temporality)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = retained {
+                        // `key.attributes` is cloned only on this path because `key` goes back
+                        // into the map.
+                        let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
                         // The reset signal (`SeriesState::first_seen`). A `Gauge` has no start
                         // time and keeps `0`, OTLP's "unknown".
@@ -958,62 +1017,6 @@ impl Transform for Aggregator {
 }
 
 impl Accumulator {
-    /// The empty accumulator a new series of `kind` opens with; `process` merges the record into
-    /// it right after. Panics on a kind [`passes_through`] should have filtered out.
-    ///
-    /// `distributions`/`sets` pick the opened shape for `Samples`/`SetMembers`: raw only when the
-    /// mode asks for it. An already-summarized `Distribution`/`Set` opens summarized in any mode.
-    fn new_for(
-        kind: &MetricKind,
-        distributions: Distributions,
-        sets: Sets,
-        temporality: AggregateTemporality,
-    ) -> Self {
-        match kind {
-            MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
-                Accumulator::Sum { total: 0.0, monotonic: *monotonic }
-            }
-            // `Gauge` and `GaugeDelta` share one accumulator: two ways to update one running
-            // value, not a kind conflict (`docs/adr/relative-gauge-adjustments.md`).
-            MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
-                Accumulator::Gauge { value: 0.0, at: i64::MIN }
-            }
-            MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
-            // `sample_rate` comes from this record, or the first merge would look like a
-            // `rate_mismatch` against a made-up default.
-            MetricKind::Samples(s) => match distributions {
-                Distributions::Sketch => Accumulator::Distribution(logit_core::DdSketch::new()),
-                Distributions::Samples => Accumulator::Samples(Samples {
-                    values: SmallVec::new(),
-                    sample_rate: s.sample_rate,
-                }),
-            },
-            MetricKind::Set(_) => Accumulator::Set(logit_core::HyperLogLog::new()),
-            MetricKind::SetMembers(_) => match sets {
-                Sets::Estimate => Accumulator::Set(logit_core::HyperLogLog::new()),
-                Sets::Members => Accumulator::SetMembers(Vec::new()),
-            },
-            // This record's bounds with zero counts. `sum` starts `Some(0.0)` when the record has
-            // one, so the both-sides-or-`None` merge rule keeps it on the first merge. Stamped
-            // `Cumulative`: that's the only shape it's emitted as.
-            MetricKind::Histogram(h) if temporality == AggregateTemporality::Cumulative => {
-                Accumulator::Histogram(logit_core::Histogram {
-                    buckets: h.buckets.iter().map(|(bound, _)| (*bound, 0)).collect(),
-                    temporality: Temporality::Cumulative,
-                    sum: h.sum.map(|_| 0.0),
-                    min: None,
-                    max: None,
-                })
-            }
-            MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
-            | MetricKind::Histogram(_)
-            | MetricKind::ExponentialHistogram(_)
-            | MetricKind::Summary(_) => {
-                unreachable!("process() never creates an accumulator for a pass-through kind")
-            }
-        }
-    }
-
     /// Consumes this accumulator into the `MetricKind` a tumbling flush emits. A `Sum` is labeled
     /// with the stage's mode, not the (always delta) records that fed it.
     fn into_kind(self, temporality: AggregateTemporality) -> MetricKind {
@@ -1032,30 +1035,38 @@ impl Accumulator {
         }
     }
 
-    /// [`Accumulator::into_kind`]'s non-consuming twin, for a retained series: emits a copy of the
-    /// running value. One bucket-`Vec` clone for a `Histogram`, free otherwise.
-    fn kind_for_retained(&self, temporality: AggregateTemporality) -> MetricKind {
+    /// What a series holding this accumulator emits when it survives the flush, or `None` when it
+    /// doesn't survive (the one place retention by kind is decided). `flush` asks only when
+    /// `series_retention > 0`.
+    ///
+    /// A gauge's value is sticky by protocol, and a cumulative `Sum`/`Histogram`'s running total
+    /// is what that mode emits. `Distribution`/`Samples`/`Set`/`SetMembers` never survive: each
+    /// window's summary is self-contained. Reads without consuming: one bucket-`Vec` clone for a
+    /// `Histogram`, free otherwise.
+    fn retained_kind(&self, temporality: AggregateTemporality) -> Option<MetricKind> {
+        let cumulative = temporality == AggregateTemporality::Cumulative;
         match self {
-            Accumulator::Gauge { value, .. } => MetricKind::Gauge(*value),
-            Accumulator::Sum { total, monotonic } => MetricKind::Sum(Sum {
+            Accumulator::Gauge { value, .. } => Some(MetricKind::Gauge(*value)),
+            Accumulator::Sum { total, monotonic } if cumulative => Some(MetricKind::Sum(Sum {
                 value: *total,
                 temporality: record_temporality(temporality),
                 monotonic: *monotonic,
-            }),
-            Accumulator::Histogram(histogram) => MetricKind::Histogram(histogram.clone()),
-            // Must agree with `flush`'s `retain` predicate.
-            Accumulator::Distribution(_)
+            })),
+            Accumulator::Histogram(histogram) if cumulative => {
+                Some(MetricKind::Histogram(histogram.clone()))
+            }
+            Accumulator::Sum { .. }
+            | Accumulator::Histogram(_)
+            | Accumulator::Distribution(_)
             | Accumulator::Samples(_)
             | Accumulator::Set(_)
-            | Accumulator::SetMembers(_) => {
-                unreachable!("flush() only ever retains a Gauge, or a cumulative Sum/Histogram")
-            }
+            | Accumulator::SetMembers(_) => None,
         }
     }
 }
 
 /// The `logit_core::Temporality` a flushed record carries under a stage mode; one mapping so
-/// `into_kind` and `kind_for_retained` can't disagree.
+/// `into_kind` and `retained_kind` can't disagree.
 fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     match temporality {
         AggregateTemporality::Delta => Temporality::Delta,
@@ -1407,6 +1418,140 @@ mod tests {
             );
         }
         assert!(agg.flush(100).is_empty());
+    }
+
+    /// One record of every `MetricKind` variant, in both temporalities where the kind carries one.
+    fn every_kind() -> Vec<MetricKind> {
+        let histogram = |temporality| {
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(1.0, 1), (f64::INFINITY, 0)],
+                temporality,
+                sum: Some(0.5),
+                min: Some(0.5),
+                max: Some(0.5),
+            })
+        };
+        let exp_histogram = |temporality| {
+            MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: (0, vec![1]),
+                negative: (0, vec![]),
+                temporality,
+                count: 1,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        };
+        let mut hll = logit_core::HyperLogLog::new();
+        hll.insert(b"a");
+        let sum = |temporality| MetricKind::Sum(Sum { value: 1.0, temporality, monotonic: true });
+        vec![
+            sum(Temporality::Delta),
+            sum(Temporality::Cumulative),
+            MetricKind::Gauge(1.0),
+            MetricKind::GaugeDelta(1.0),
+            MetricKind::Samples(Samples::new([1.0])),
+            MetricKind::Distribution(Samples::new([1.0]).sketch()),
+            MetricKind::SetMembers(vec![Bytes::from_static(b"a")]),
+            MetricKind::Set(hll),
+            histogram(Temporality::Delta),
+            histogram(Temporality::Cumulative),
+            exp_histogram(Temporality::Delta),
+            exp_histogram(Temporality::Cumulative),
+            MetricKind::Summary(logit_core::Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+            }),
+        ]
+    }
+
+    fn every_mode() -> Vec<(AggregateTemporality, Distributions, Sets)> {
+        let mut modes = Vec::new();
+        for t in [AggregateTemporality::Delta, AggregateTemporality::Cumulative] {
+            for d in [Distributions::Sketch, Distributions::Samples] {
+                for s in [Sets::Estimate, Sets::Members] {
+                    modes.push((t, d, s));
+                }
+            }
+        }
+        modes
+    }
+
+    #[test]
+    fn opener_for_is_none_iff_process_forwards_the_record() {
+        let resource = default_resource();
+        for kind in every_kind() {
+            for (t, d, s) in every_mode() {
+                let mut agg = Aggregator::new(Duration::from_secs(10))
+                    .with_temporality(t)
+                    .with_distributions(d, 1000)
+                    .with_sets(s, 1000);
+                let passes = opener_for(&kind, d, s, t).is_none();
+                let forwarded = feed(&mut agg, &resource, metric_event("m", kind.clone(), 0));
+                assert_eq!(forwarded.is_some(), passes, "{kind:?} under {t:?}/{d:?}/{s:?}");
+                assert_eq!(agg.groups.len(), usize::from(!passes), "{kind:?} under {t:?}");
+            }
+        }
+    }
+
+    /// One accumulator of every `Accumulator` variant.
+    fn accumulator(variant: usize) -> Accumulator {
+        match variant {
+            0 => Accumulator::Sum { total: 1.0, monotonic: true },
+            1 => Accumulator::Histogram(logit_core::Histogram {
+                buckets: vec![(1.0, 1)],
+                temporality: Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
+            2 => Accumulator::Gauge { value: 1.0, at: 0 },
+            3 => Accumulator::Distribution(Samples::new([1.0]).sketch()),
+            4 => Accumulator::Samples(Samples::new([1.0])),
+            5 => Accumulator::Set(logit_core::HyperLogLog::new()),
+            _ => Accumulator::SetMembers(vec![Bytes::from_static(b"a")]),
+        }
+    }
+
+    #[test]
+    fn retained_kind_is_some_iff_the_series_survives_a_flush() {
+        for variant in 0..7 {
+            for (t, _, _) in every_mode() {
+                for retention in [0, 1, 3] {
+                    let mut agg = Aggregator::new(Duration::from_secs(10))
+                        .with_temporality(t)
+                        .with_series_retention(retention, 10);
+                    let retained = accumulator(variant).retained_kind(t).is_some();
+                    let key =
+                        SeriesKey { name: intern("m"), unit: None, attributes: AttrMap::new() };
+                    let state = SeriesState {
+                        accumulator: accumulator(variant),
+                        contexts: ContributingContexts::default(),
+                        idle_windows: 0,
+                        first_seen: 0,
+                        updated_this_window: true,
+                    };
+                    agg.groups.push(ResourceGroup {
+                        resource: default_resource(),
+                        scope: None,
+                        series: HashMap::from([(key, state)]),
+                    });
+
+                    let emitted = flush_events(&mut agg, 10);
+                    assert_eq!(emitted.len(), 1, "an updated series emits once");
+                    let survived = agg.groups.iter().map(|g| g.series.len()).sum::<usize>();
+                    assert_eq!(
+                        survived,
+                        usize::from(retention > 0 && retained),
+                        "variant {variant} under {t:?}, retention {retention}"
+                    );
+                }
+            }
+        }
     }
 
     /// A `Samples` metric is absorbed, not passed through.

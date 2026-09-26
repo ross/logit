@@ -1404,7 +1404,7 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
 // -- `collectd_in -> aggregate -> collectd_out` --------------------------------------------------------
 
 /// COUNTER and DERIVE decode to a cumulative `Sum`, which `aggregate` forwards untouched
-/// (`passes_through`: re-accumulating a running total would double-count it), so the datagram is
+/// (`opener_for`: re-accumulating a running total would double-count it), so the datagram is
 /// byte-identical to the one with no `aggregate`. ABSOLUTE (a delta `Sum`) and GAUGE are absorbed
 /// and re-stamped with the flush clock, which is why `fixtures/collectd-relay.yaml` has no
 /// `aggregate`.
