@@ -6290,7 +6290,9 @@ fixed:
 - A `NaN` resource attribute opened a group per metric, every such metric emitted unaggregated,
   and `-0.0`/`0.0` resources merged (lead 21, #402).
 - Cap ties among equally idle series fell in `HashMap` order, so stable series were evicted at
-  random (lead 22, #407).
+  random (lead 22, #407). Newest first has a limit: a stable series whose records arrive after
+  the churn in every window is re-created, and evicted, every flush;
+  `series.evicted{reason="cardinality", state="active"}` at every flush is the signal.
 - A cumulative histogram could emit `min > max` (lead 23, #405).
 - A non-finite delta `Sum` stayed in a cumulative total for the series' life (lead 24, #405).
 - A re-created cumulative series took its start time from the source clock (lead 25, #407).
@@ -6309,7 +6311,8 @@ It also measured the `groups` scan: 137 ns per absorbed event at 1 group, 877 ns
 a hashed group index are the candidates, decided by a measurement on the perf VM in its own
 change); `DdSketch::merge` returning early on a sketch whose count and zero count are both 0,
 dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved; and
-`series_retention` counting flushes, not wall time.
+`series_retention` counting flushes, not wall time. The tie-break limit above is stated in ADR
+`aggregation-window-semantics`'s "Cardinality-cap tie-break".
 
 ### XFORM-06 — json.rs: zero-copy JSON-into-attributes parsing
 - **Location:** `json.rs` (`JsonParser::process`), `json.rs` (`borrowed_str_bytes`),
