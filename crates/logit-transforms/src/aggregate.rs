@@ -516,10 +516,10 @@ impl Aggregator {
     /// Selects what a flushed `Sum`/`Histogram` means (see this module's "Temporality" section).
     /// Defaults to `Delta`.
     ///
-    /// `Cumulative` is only useful with both `with_series_retention` bounds non-zero: a running
-    /// total that can't survive a flush is this window's delta labeled `Cumulative`. Graph
-    /// validation rejects that combination (`crates/logit-pipeline/src/graph.rs`, rule 39); this
-    /// builder doesn't check it.
+    /// `Cumulative` needs both `with_series_retention` bounds non-zero: a running total that can't
+    /// survive a flush is this window's delta labeled `Cumulative`. Graph validation rejects that
+    /// combination (`crates/logit-pipeline/src/graph.rs`, rule 39); this builder doesn't check it,
+    /// and `flush` asserts it in debug builds.
     pub fn with_temporality(mut self, temporality: AggregateTemporality) -> Self {
         self.temporality = temporality;
         self
@@ -1001,6 +1001,11 @@ impl Aggregator {
     /// `Sum`/`Histogram` under `temporality: cumulative`) survives into the next window when
     /// `series_retention > 0`, subject to `max_retained_series`.
     pub fn flush(&mut self, now: i64) -> FlushOutput {
+        debug_assert!(
+            self.temporality == AggregateTemporality::Delta
+                || (self.series_retention > 0 && self.max_retained_series > 0),
+            "temporality: cumulative without both retention bounds, which graph rule 39 rejects"
+        );
         // Sampled before any series is touched: the peak-of-window value. `SeriesKey` includes the
         // event's whole attribute set, so an unpruned high-cardinality attribute shows up here
         // first (`crate::keep`'s module doc warns about this).
@@ -1707,6 +1712,9 @@ mod tests {
         for variant in 0..7 {
             for (t, _, _) in every_mode() {
                 for retention in [0, 1, 3] {
+                    if retention == 0 && t == AggregateTemporality::Cumulative {
+                        continue; // rule 39 rejects it, and `flush` asserts so
+                    }
                     let mut agg = Aggregator::new(Duration::from_secs(10))
                         .with_temporality(t)
                         .with_series_retention(retention, 10);
@@ -2509,9 +2517,9 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
         feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        assert_eq!(agg.flush(100).len(), 1, "window 1: emits, idle_windows resets to 0");
-        assert!(agg.flush(200).is_empty(), "window 2: idle_windows -> 1, still under retention 2");
-        assert!(agg.flush(300).is_empty(), "window 3: idle_windows -> 2, now evicted");
+        assert_eq!(agg.flush(100).len(), 1, "flush 1: emits, idle_windows resets to 0");
+        assert!(agg.flush(200).is_empty(), "flush 2: idle_windows -> 1, still under retention 2");
+        assert!(agg.flush(300).is_empty(), "flush 3: idle_windows -> 2, now evicted");
 
         feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
         let flushed = flush_events(&mut agg, 400);
@@ -2533,6 +2541,36 @@ mod tests {
             })
         });
         assert_eq!(unseeded, Some(1.0), "the post-eviction delta should count as unseeded");
+    }
+
+    /// With `series_retention: N`, a series survives N idle flushes after the one that emitted it
+    /// and is evicted, counted `idle`, at the flush that closes the Nth.
+    #[test]
+    fn a_series_survives_series_retention_idle_flushes() {
+        for retention in 1..=3u32 {
+            let registry = logit_core::Registry::new();
+            let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+            let mut agg = Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(retention, 100)
+                .with_telemetry(telemetry);
+            let resource = default_resource();
+            feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+            assert_eq!(agg.flush(100).len(), 1);
+            for idle in 1..=retention {
+                assert!(agg.flush(100 + i64::from(idle) * 100).is_empty());
+                let held = series_count(&agg);
+                let evicted = evicted_count(&registry.drain(0), "idle");
+                if idle < retention {
+                    assert_eq!((held, evicted), (1, None), "retention {retention}, idle {idle}");
+                } else {
+                    assert_eq!(
+                        (held, evicted),
+                        (0, Some(1.0)),
+                        "retention {retention}, idle {idle}"
+                    );
+                }
+            }
+        }
     }
 
     /// `series_retention: 0` retains nothing across flushes.
@@ -2862,6 +2900,28 @@ mod tests {
         let flushes =
             cap_soak(soak_counter, AggregateTemporality::Cumulative, &resource, &resource, false);
         assert_eq!(flushes, soak_expected(false));
+    }
+
+    /// Many one-off resources in one window open as many groups, and the flush drops every group
+    /// with nothing retained.
+    #[test]
+    fn a_flush_drops_every_group_without_a_retained_series() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(3, 100)
+            .with_telemetry(telemetry);
+        for i in 0..2000 {
+            let mut attributes = AttrMap::new();
+            attributes.insert("host", i.to_string().as_str());
+            let resource = Arc::new(Resource { attributes, ..Default::default() });
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        }
+        assert_eq!(agg.groups.len(), 2000);
+        assert_eq!(agg.flush(1_000).len(), 2000);
+        assert!(agg.groups.is_empty(), "a delta counter is never retained");
+        let drained = registry.drain(0);
+        assert_eq!(gauge_value(&drained, "logit.transform.resource.groups"), Some(2000.0));
     }
 
     /// The cap is global across groups: stable series in one group survive churn in another,
@@ -3755,9 +3815,9 @@ mod tests {
         let resource = default_resource();
 
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(5.0), 100));
-        assert_eq!(agg.flush(1_000).len(), 1, "window 1: emits 5, idle_windows resets to 0");
-        assert!(agg.flush(2_000).is_empty(), "window 2: idle_windows -> 1, still under retention");
-        assert!(agg.flush(3_000).is_empty(), "window 3: idle_windows -> 2, now evicted");
+        assert_eq!(agg.flush(1_000).len(), 1, "flush 1: emits 5, idle_windows resets to 0");
+        assert!(agg.flush(2_000).is_empty(), "flush 2: idle_windows -> 1, still under retention");
+        assert!(agg.flush(3_000).is_empty(), "flush 3: idle_windows -> 2, now evicted");
 
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
         let flushed = flush_events(&mut agg, 4_000);
