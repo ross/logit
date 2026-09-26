@@ -271,8 +271,9 @@ the way out and needs the switch §4 describes.
 
 **Direct over HEC.** For: one hop, works wherever HTTPS does, the same wire on Enterprise and
 Cloud, indexed `fields` without a props/transforms stage, and `logit` is already the host
-collector. Against: no acknowledgment on Splunk Cloud, so delivery there is best-effort past a
-2xx; per-token index allowlists to keep in step; the sourcetype and its `props.conf` still
+collector. Against: acknowledgment on Splunk Cloud depends on the stack (Splunk documents it
+only for Firehose, a trial stack honored it), so delivery to a stack without it is best-effort
+past a 2xx; per-token index allowlists to keep in step; the sourcetype and its `props.conf` still
 decide timestamp and line-breaking for `/raw`, so `/event` with an explicit `time` is the path
 `splunk_hec_out` takes.
 

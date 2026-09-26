@@ -1769,9 +1769,12 @@ pub enum ComponentKind {
     SplunkHecOut {
         /// The collector's base URL, ending in `/services/collector`:
         /// `https://splunk.example.com:8088/services/collector`, or
-        /// `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. This
-        /// sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`,
-        /// `/ack`, `/health`) is rejected.
+        /// `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A
+        /// Splunk Cloud trial stack serves HEC at
+        /// `https://<stack>.splunkcloud.com:8088/services/collector` instead, with a self-signed
+        /// certificate that needs `tls: {insecure_skip_verify: true}`. This sink appends `/event`
+        /// and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is
+        /// rejected.
         endpoint: String,
         /// The HEC token, sent as `Authorization: Splunk <token>` and never logged. Take it from
         /// the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing it into the file. An

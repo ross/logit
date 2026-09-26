@@ -1850,9 +1850,12 @@ components:
 ```
 
 **The endpoint.** The base URL, ending in `/services/collector`; the sink appends `/event` and
-`/ack`, so a URL ending in a route is a `logit validate` error. On Splunk Cloud it's
-`https://http-inputs-<stack>.splunkcloud.com/services/collector`. `tls:` tunes an `https://`
-endpoint, such as a `ca_file` for Splunk Enterprise's default self-signed certificate.
+`/ack`, so a URL ending in a route is a `logit validate` error. Splunk documents
+`https://http-inputs-<stack>.splunkcloud.com/services/collector` for Splunk Cloud; a trial stack
+serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead. `tls:` tunes an
+`https://` endpoint, such as a `ca_file` for Splunk Enterprise's default self-signed certificate.
+A Splunk Cloud trial stack presents that same certificate, whose name doesn't match the host, so
+it needs `tls: {insecure_skip_verify: true}`.
 
 **Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
 them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
@@ -1883,8 +1886,10 @@ drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts dupl
 
 **Acknowledgment.** With `ack: true`, the sink polls `/services/collector/ack` after the last body
 of a batch is accepted, until Splunk confirms every request or `ack_timeout` (30s by default)
-passes, which fails the batch as ambiguous. It needs a token with indexer acknowledgment on;
-Splunk Cloud offers none. Against a token without it, each request counts as delivered on its
+passes, which fails the batch as ambiguous. It needs a token with indexer acknowledgment on.
+Splunk Enterprise offers it; Splunk documents it on Splunk Cloud only for the Firehose path, but a
+Splunk Cloud trial stack offered it and acknowledged the sink's requests, so check the token
+settings on your stack. Against a token without it, each request counts as delivered on its
 `200`, counted `logit.output.acks{result="unsupported"}` with an `ack_unsupported` warning.
 
 **What to watch.** `logit.output.requests{route, class}` (`route` is `event` or `ack`),

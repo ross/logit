@@ -357,9 +357,9 @@ Per pair:
   as the exporter's JSON span object and are detected by shape on the way in. The encoder writes
   one object per `MessageBuf` entry, so `splunk_hec_out` packs bodies under `max_body_bytes` and,
   on a `400` code 6, drops the named object and resends the rest once by slicing. `ack: true` polls
-  `/ack` (never on Splunk Cloud); `splunk_hec_in` answers `/ack` every id `true`. Neither is
-  duplicate-safe. Verified against a recorded corpus of four real HEC clients and a Splunk
-  Enterprise 10.4.3 run
+  `/ack` (some Splunk Cloud stacks don't offer it); `splunk_hec_in` answers `/ack` every id
+  `true`. Neither is duplicate-safe. Verified against a recorded corpus of four real HEC clients
+  and a Splunk Enterprise 10.4.3 run
   ([ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md),
   [fixtures/splunk-hec-send.yaml](fixtures/splunk-hec-send.yaml),
   [fixtures/splunk-hec-receive.yaml](fixtures/splunk-hec-receive.yaml),
