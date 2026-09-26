@@ -386,8 +386,11 @@ impl Aggregator {
     /// touches window state.
     ///
     /// Grouped by `(resource, scope)` value, not `Arc` identity: two inputs that each build an
-    /// empty `Resource` describe the same origin and aggregate together. One input's batches share
-    /// one `Arc` in practice, so the common case is one group found by a linear scan.
+    /// empty `Resource` describe the same origin and aggregate together. The lookup is a linear
+    /// scan that compares every earlier group before it reaches the match. `statsd_in` holds one
+    /// `Arc<Resource>` per listener, so its match is an `Arc::ptr_eq` hit in `resource_key_eq`.
+    /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
+    /// resource write one per batch, so each of those pays a full field compare at the match too.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
@@ -750,7 +753,7 @@ impl Aggregator {
         if let Some(i) = self
             .groups
             .iter()
-            .position(|g| g.resource.as_ref() == resource.as_ref() && scope_key_eq(&g.scope, scope))
+            .position(|g| resource_key_eq(&g.resource, resource) && scope_key_eq(&g.scope, scope))
         {
             &mut self.groups[i]
         } else {
@@ -1097,6 +1100,19 @@ impl Hash for SeriesKey {
     }
 }
 
+/// Field-wise equality for a `group_for` resource key, comparing `Value::F64` bitwise, the rule
+/// `SeriesKey` and [`scope_key_eq`] follow. `Resource`'s derived `PartialEq` judges a `NaN`
+/// attribute unequal to itself, even through one `Arc`, which would open a new `ResourceGroup` per
+/// metric carrying it; and it judges `-0.0` equal to `0.0`, which series identity keeps apart.
+///
+/// `Arc::ptr_eq` first: an input that reuses one `Arc<Resource>` skips the field walk.
+fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
+    Arc::ptr_eq(a, b)
+        || (a.schema_url == b.schema_url
+            && a.dropped_attributes_count == b.dropped_attributes_count
+            && attr_map_key_eq(&a.attributes, &b.attributes))
+}
+
 /// Field-wise equality for a `group_for` scope key, comparing `Value::F64` bitwise. `Scope`'s
 /// derived `PartialEq` judges a `NaN` attribute unequal to itself, which would open a new
 /// `ResourceGroup` per event carrying it (the failure `SeriesKey` avoids the same way).
@@ -1118,8 +1134,9 @@ fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     }
 }
 
-/// `AttrMap` equality with bitwise floats, for [`scope_key_eq`]. `AttrMap::iter()` yields `Symbol`
-/// order, so a length check plus a zipped walk is order-independent.
+/// `AttrMap` equality with bitwise floats, for [`resource_key_eq`] and [`scope_key_eq`].
+/// `AttrMap::iter()` yields `Symbol` order, so a length check plus a zipped walk is
+/// order-independent.
 fn attr_map_key_eq(a: &AttrMap, b: &AttrMap) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
@@ -2818,6 +2835,89 @@ mod tests {
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
     }
 
+    fn resource_with_attr(key: &str, value: Value) -> Arc<Resource> {
+        let mut attributes = AttrMap::new();
+        attributes.insert(key, value);
+        Arc::new(Resource { attributes, ..Resource::default() })
+    }
+
+    /// A `NaN` resource attribute through one `Arc` is one group across records and windows, so a
+    /// cumulative `Sum` keeps its running total instead of restarting per record.
+    #[test]
+    fn a_nan_resource_attribute_through_one_arc_is_one_group_across_windows() {
+        let mut agg = cumulative_agg();
+        let resource = resource_with_attr("temp", Value::F64(f64::NAN));
+
+        for ts in 0..10 {
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+        }
+        assert_eq!(agg.groups.len(), 1, "ten records under one NaN-bearing Arc");
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1.len(), 1);
+        assert_eq!(sum_of(&flushed[0].1[0]).value, 10.0);
+
+        for ts in 100..105 {
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+        }
+        assert_eq!(agg.groups.len(), 1, "the retained series' group is found again");
+        let flushed = flush_events(&mut agg, 200);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1.len(), 1);
+        let second = &flushed[0].1[0];
+        assert_eq!(sum_of(second).value, 15.0, "the running total carries across the window");
+        assert_eq!(start_timestamp_of(second), 0);
+    }
+
+    /// Two `Arc`s with equal content, a `NaN` attribute included, are one group.
+    #[test]
+    fn resources_with_a_nan_attribute_but_distinct_arcs_fold_into_one_group() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let a = resource_with_attr("temp", Value::F64(f64::NAN));
+        let b = resource_with_attr("temp", Value::F64(f64::NAN));
+        assert!(!Arc::ptr_eq(&a, &b), "test setup: must be distinct Arcs");
+
+        feed(&mut agg, &a, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(2.0), 1));
+        assert_eq!(agg.groups.len(), 1);
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(counter_value(kind_of(&flushed[0].1[0])), 3.0);
+    }
+
+    /// `-0.0` and `0.0` are distinct resources, as they are distinct series attributes.
+    #[test]
+    fn resources_differing_only_in_the_sign_of_zero_are_two_groups() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let negative = resource_with_attr("host", Value::F64(-0.0));
+        let positive = resource_with_attr("host", Value::F64(0.0));
+
+        feed(&mut agg, &negative, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &positive, metric_event("hits", MetricKind::counter(1.0), 1));
+        assert_eq!(agg.groups.len(), 2);
+        assert_eq!(flush_events(&mut agg, 100).len(), 2);
+    }
+
+    /// `schema_url` and `dropped_attributes_count` are part of a resource's identity.
+    #[test]
+    fn resources_differing_only_in_schema_url_or_dropped_count_are_distinct_groups() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let plain = Arc::new(Resource::default());
+        let with_schema = Arc::new(Resource {
+            schema_url: Some(Bytes::from_static(b"https://opentelemetry.io/schemas/1.26.0")),
+            ..Resource::default()
+        });
+        let with_dropped =
+            Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+
+        for (ts, resource) in [&plain, &with_schema, &with_dropped].into_iter().enumerate() {
+            feed(&mut agg, resource, metric_event("hits", MetricKind::counter(1.0), ts as i64));
+        }
+        assert_eq!(agg.groups.len(), 3);
+        assert_eq!(flush_events(&mut agg, 100).len(), 3);
+    }
+
     // -- `temporality: cumulative` -------------------------------------------------------------
 
     /// `cumulative` mode with both retention bounds set, the only combination rule 39 allows.
@@ -3197,3 +3297,6 @@ mod tests {
         assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
     }
 }
+
+#[cfg(test)]
+mod verification;

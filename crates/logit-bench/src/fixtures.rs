@@ -696,6 +696,49 @@ pub fn aggregator() -> Aggregator {
     Aggregator::new(Duration::from_secs(10))
 }
 
+/// `count` distinct resources, one `Arc` each, the way an `otlp_in` gateway sees one SDK instance
+/// per `ResourceMetrics` (`benches/pipeline.rs`'s `aggregate_absorb_with_groups`). Hand-written
+/// from OTel resource semantic conventions, not captured: 12 string attributes, the first four
+/// shared by every resource and the other eight unique to it. Every resource interns its keys in
+/// the same order, so the shared four sort first and an unequal compare walks them before it
+/// finds a difference.
+pub fn resources_for_groups(count: usize) -> Vec<Arc<Resource>> {
+    (0..count)
+        .map(|i| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("service.namespace", Value::str("shop"));
+            attributes.insert("deployment.environment", Value::str("production"));
+            attributes.insert("cloud.provider", Value::str("aws"));
+            attributes.insert("cloud.region", Value::str("us-east-1"));
+            attributes.insert("service.name", Value::str(format!("checkout-{}", i % 7)));
+            attributes.insert("service.instance.id", Value::str(format!("instance-{i:06}")));
+            attributes.insert("host.name", Value::str(format!("ip-10-0-{}-{}", i / 250, i % 250)));
+            attributes.insert("host.id", Value::str(format!("i-0a1b2c3d4e{i:06x}")));
+            attributes.insert("k8s.node.name", Value::str(format!("node-{}", i % 40)));
+            attributes.insert("k8s.pod.name", Value::str(format!("checkout-7d9f8-{i:05}")));
+            attributes
+                .insert("k8s.pod.uid", Value::str(format!("5f1c2a9e-0000-4000-8000-{i:012}")));
+            attributes.insert("container.id", Value::str(format!("{i:064x}")));
+            Arc::new(Resource { attributes, ..Resource::default() })
+        })
+        .collect()
+}
+
+/// [`nginx_event`] after [`keep`], its four metrics replaced by one `Gauge`: hand-written, not a
+/// shape a pipeline stage emits. A gauge is the cheapest merge `aggregate` has (no sketch, no
+/// allocation), so what varies across `aggregate_absorb_with_groups`'s arguments is the group
+/// scan.
+pub fn gauge_event_after_keep() -> Event {
+    let mut event = nginx_event();
+    assert!(keep().process(&resource(), &mut event), "keep forwards");
+    event.metrics.clear();
+    event.metrics.push(MetricRecord::new(
+        logit_core::interner::intern("nginx.connections.active"),
+        MetricKind::Gauge(3.0),
+    ));
+    event
+}
+
 /// [`aggregator`] with cross-flush series retention, a path the default (`series_retention: 0`)
 /// never takes (`tests/allocations.rs`'s `aggregate_flush_retained_gauges`).
 pub fn aggregator_with_series_retention(retention: u32, max_retained: usize) -> Aggregator {

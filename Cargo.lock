@@ -1130,6 +1130,7 @@ dependencies = [
  "logit-config",
  "logit-core",
  "logit-pipeline",
+ "proptest",
  "regex",
  "serde",
  "serde_json",
