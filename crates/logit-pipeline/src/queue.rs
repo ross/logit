@@ -528,6 +528,25 @@ impl<T: Queued> BoundedQueue<T> {
         }
     }
 
+    /// Removes every queued item under one lock and returns them in FIFO order, clearing any head
+    /// reservation. For a shutdown residual drain: it never waits and wakes nobody, so it is safe
+    /// from a `Drop` only when no other future of this queue is still alive. An empty queue returns
+    /// an empty `Vec` (no allocation) and makes no telemetry call; otherwise the gauges update once.
+    pub fn take_all(&self) -> Vec<T> {
+        let (items, len, weight) = {
+            let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut items = Vec::new();
+            while let Some(item) = inner.commit() {
+                items.push(item);
+            }
+            (items, inner.len(), inner.weight())
+        };
+        if !items.is_empty() {
+            self.update_gauges(len, weight);
+        }
+        items
+    }
+
     /// Marks the queue closed: once it is also empty, `peek`/`pop`/`pop_many` return `None`/`0`.
     /// Wakes every waiter on both `Notify`s, so no consumer or blocked `push` hangs.
     ///
@@ -1118,6 +1137,31 @@ mod tests {
         assert_eq!(q.commit().expect("should commit").units, 2, "units=1 should have been evicted");
         assert_eq!(q.commit().expect("should commit").units, 3);
         assert!(q.commit().is_none());
+    }
+
+    /// `take_all` empties the queue in FIFO order with one gauge update, clears a `peek`
+    /// reservation, and on an empty queue updates no gauge at all.
+    #[tokio::test]
+    async fn take_all_removes_everything_in_order_with_one_gauge_update_and_clears_a_reservation() {
+        let q = test_queue(2, u64::MAX, OverflowPolicy::DropOldest);
+        assert!(q.take_all().is_empty());
+        assert_eq!(q.gauge_updates(), 0, "an empty take_all must not touch telemetry");
+
+        q.push(TestItem { weight: 1, units: 1 }).await;
+        q.push(TestItem { weight: 1, units: 2 }).await;
+        q.peek().await.expect("should peek units=1"); // reserves the head
+        let before = q.gauge_updates();
+        let taken: Vec<u64> = q.take_all().into_iter().map(|item| item.units).collect();
+        assert_eq!(taken, vec![1, 2]);
+        assert_eq!(q.gauge_updates(), before + 1, "one gauge update for the whole drain");
+
+        // No reservation left standing: at capacity, a third push evicts the oldest. A stale
+        // reservation would protect units=3 and evict units=4 instead.
+        q.push(TestItem { weight: 1, units: 3 }).await;
+        q.push(TestItem { weight: 1, units: 4 }).await;
+        q.push(TestItem { weight: 1, units: 5 }).await;
+        let taken: Vec<u64> = q.take_all().into_iter().map(|item| item.units).collect();
+        assert_eq!(taken, vec![4, 5]);
     }
 
     // -- `push_many` / `pop_many`: one lock and one gauge update per batch, per-item admission. --

@@ -29,7 +29,9 @@ use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
-use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
+use logit_pipeline::{
+    BoundedQueue, CountedDrain, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued,
+};
 use logit_proto::Decoder;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -439,6 +441,13 @@ impl<D: Decoder + Send> UdpListener<D> {
             &RECEIVE_QUEUE_METRICS,
             self.telemetry.clone(),
         ));
+        // Declared before `read` and `decode`, so it drops after both of their futures: locals
+        // drop in reverse order.
+        let _residual = ResidualOnDrop {
+            queue: Arc::clone(&queue),
+            telemetry: &self.telemetry,
+            diag: &self.diag,
+        };
 
         let mut read = Box::pin(read_loop_sampled(
             socket,
@@ -464,7 +473,8 @@ impl<D: Decoder + Send> UdpListener<D> {
         // flushes its accumulator.
         //
         // The `Option` guards the one case `select!` can't rule out: `decode` finishing first.
-        // Only `read_loop` closes `queue`, so today that can't happen, but polling `decode` again
+        // Only `read_loop` closes `queue` while `drive` runs (the residual guard closes it again on
+        // the way out), so today that can't happen, but polling `decode` again
         // after it resolved would be the double-poll hazard `docs/adr/decoupled-listener-io.md`
         // calls out; that branch awaits `read` instead.
         let already_finished = tokio::select! {
@@ -477,6 +487,33 @@ impl<D: Decoder + Send> UdpListener<D> {
                 result
             }
             None => read.await,
+        }
+    }
+}
+
+/// Counts what a UDP listener's [`ReceiveQueue`] still holds once both halves are gone, as
+/// `logit.component.datagrams.dropped`/`bytes.dropped{reason="shutdown"}`, and closes the queue.
+/// On a normal return `decode_loop` has drained the queue and this counts nothing; it counts only
+/// when `run_input`'s grace backstop drops [`UdpListener::drive`] with datagrams still queued.
+///
+/// Takes the queue lock from `Drop`, which is safe here: by the time this drops, the `read` and
+/// `decode` futures, the queue's only other users, are gone; no lock site holds the mutex across
+/// an await; and every lock site swallows poisoning. Silent and lock-only when the queue is empty.
+struct ResidualOnDrop<'a> {
+    queue: Arc<ReceiveQueue>,
+    telemetry: &'a Telemetry,
+    diag: &'a Diagnostics,
+}
+
+impl Drop for ResidualOnDrop<'_> {
+    fn drop(&mut self) {
+        self.queue.close();
+        let dropped = count_shutdown_drops(self.queue.take_all().into_iter(), self.telemetry);
+        if dropped > 0 {
+            self.diag.warn(format_args!(
+                "{dropped} datagram(s) still in the receive queue when this listener was stopped \
+                 at its shutdown grace, undecoded"
+            ));
         }
     }
 }
@@ -693,9 +730,10 @@ fn report_receive_buffer(
 /// differs from a sink queue's `block`); only an operator's `overflow: block` stops reading.
 ///
 /// Races every read and every push against `shutdown`, so shutdown stops this loop at once rather
-/// than when the next datagram arrives or (under `block`) downstream makes room. Cancelling a
-/// blocked `push_many` drops what the reader was holding, uncounted: at most `read_batch`
-/// datagrams, the loss ADR `udp-intake-batching-and-socket-visibility` names.
+/// than when the next datagram arrives or (under `block`) downstream makes room. What the loop
+/// holds when it stops is counted, never lost silently: a cancelled `push_many` counts its own
+/// remainder (`logit_pipeline::CountedDrain`), and [`ReadHalf`] counts a batch `push_many` never
+/// took, both as `logit.component.datagrams.dropped{reason="shutdown"}`.
 ///
 /// **Telemetry is per batch, not per datagram.** One [`BatchReader::read_batch`] call is one
 /// `logit.input.reads`, one `logit.input.datagrams` of however many it returned, one
@@ -705,8 +743,9 @@ fn report_receive_buffer(
 /// batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
 /// mutex, which `decode_loop` contends for from the other side of the same component.
 ///
-/// Closes `queue` on every exit path (shutdown or a fatal socket error), which is how
-/// `decode_loop`'s `pop_many` sees "closed and empty" and returns.
+/// Closes `queue` on every exit: a return, a fatal socket error, or this future being dropped
+/// ([`ReadHalf`]'s `Drop`). That is how `decode_loop`'s `pop_many` sees "closed and empty" and
+/// returns.
 ///
 /// A `read_batch` above the queue's `max_datagrams` is legal: `push_many` evicts or blocks per
 /// policy, per item, as `push` would, so rejecting it would only refuse a working config.
@@ -714,37 +753,93 @@ async fn read_loop<S: DatagramSocket>(
     socket: &S,
     queue: Arc<ReceiveQueue>,
     telemetry: Telemetry,
+    diag: Diagnostics,
     mut shutdown: watch::Receiver<bool>,
     read_batch: usize,
 ) -> anyhow::Result<()> {
     let mut reader = BatchReader::new(read_batch);
-    // Reused and cleared each iteration: `push_many` drains it, so its capacity survives and the
-    // steady state allocates only the one right-sized copy per datagram.
-    let mut batch: Vec<Datagram> = Vec::with_capacity(read_batch);
-    let result = loop {
-        batch.clear();
+    // `batch` is reused and cleared each iteration: `push_many` drains it, so its capacity
+    // survives and the steady state allocates only the one right-sized copy per datagram.
+    let mut half = ReadHalf {
+        queue: &queue,
+        batch: Vec::with_capacity(read_batch),
+        telemetry: &telemetry,
+        diag: &diag,
+    };
+    loop {
+        half.batch.clear();
         let read = tokio::select! {
-            read = reader.read_batch(socket, &mut batch) => read,
-            _ = shutdown.wait_for(|&due| due) => break Ok(()),
+            read = reader.read_batch(socket, &mut half.batch) => read,
+            _ = shutdown.wait_for(|&due| due) => return Ok(()),
         };
         if let Err(err) = read {
-            break Err(describe_read_failure(socket, err));
+            return Err(describe_read_failure(socket, err));
         }
-        let bytes: usize = batch.iter().map(|datagram| datagram.bytes.len()).sum();
+        let bytes: usize = half.batch.iter().map(|datagram| datagram.bytes.len()).sum();
         telemetry.count("logit.input.reads", 1.0, &[]);
-        telemetry.count("logit.input.datagrams", batch.len() as f64, &[]);
+        telemetry.count("logit.input.datagrams", half.batch.len() as f64, &[]);
         telemetry.count("logit.input.datagram.bytes", bytes as f64, &[]);
         let truncated = reader.truncated();
         if truncated > 0 {
             telemetry.count("logit.input.datagrams.truncated", truncated as f64, &[]);
         }
+        // Unbiased, and `wait_for` is `Ready` on its first poll once shutdown is set, so about
+        // half the time `push_many` is never polled and `half.batch` is still full on return.
         tokio::select! {
-            () = queue.push_many(&mut batch) => {}
-            _ = shutdown.wait_for(|&due| due) => break Ok(()),
+            () = queue.push_many(&mut half.batch) => {}
+            _ = shutdown.wait_for(|&due| due) => return Ok(()),
         }
-    };
-    queue.close();
-    result
+    }
+}
+
+/// [`read_loop`]'s batch and queue, so that every way out of the loop counts what the batch holds
+/// and closes the queue: a return, and the future being dropped. The drop case is reachable: under
+/// `receive.shutdown_grace: 0s`, `run_input`'s backstop can drop the read future while it yields
+/// to the coop budget between the read and the push, with the batch full.
+///
+/// Disjoint from `push_many`'s own count: a `push_many` that was polled leaves the `Vec` empty
+/// (its `CountedDrain` took every item), and one that was never polled took nothing. A datagram in
+/// `batch` has already been counted in `logit.input.datagrams`, since the counts above run before
+/// any await.
+///
+/// No allocation and no telemetry call when `batch` is empty, as it is on every exit that follows
+/// a completed push.
+struct ReadHalf<'a> {
+    queue: &'a ReceiveQueue,
+    batch: Vec<Datagram>,
+    telemetry: &'a Telemetry,
+    diag: &'a Diagnostics,
+}
+
+impl Drop for ReadHalf<'_> {
+    fn drop(&mut self) {
+        let dropped = count_shutdown_drops(self.batch.drain(..), self.telemetry);
+        if dropped > 0 {
+            self.diag.warn(format_args!(
+                "{dropped} datagram(s) read off the socket but never queued when this listener \
+                 stopped"
+            ));
+        }
+        self.queue.close();
+    }
+}
+
+/// Counts `datagrams` as `logit.component.datagrams.dropped` and their payload bytes as
+/// `logit.component.bytes.dropped`, both `reason="shutdown"` (the `units` of
+/// [`RECEIVE_QUEUE_METRICS`]). Returns how many; makes no telemetry call for none.
+fn count_shutdown_drops(datagrams: impl Iterator<Item = Datagram>, telemetry: &Telemetry) -> u64 {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for datagram in datagrams {
+        count += 1;
+        bytes = bytes.saturating_add(datagram.units());
+    }
+    if count > 0 {
+        let tags = [("reason", "shutdown")];
+        telemetry.count(RECEIVE_QUEUE_METRICS.items_dropped, count as f64, &tags);
+        telemetry.count(RECEIVE_QUEUE_METRICS.units_dropped, bytes as f64, &tags);
+    }
+    count
 }
 
 /// The syscall [`BatchReader::read_batch`] makes, named in the fatal error [`read_loop`] stops on.
@@ -1310,8 +1405,8 @@ async fn read_loop_sampled<S: DatagramSocket>(
     shutdown: watch::Receiver<bool>,
     read_batch: usize,
 ) -> anyhow::Result<()> {
-    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
-    let read = read_loop(socket, queue, telemetry, shutdown, read_batch);
+    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag.clone());
+    let read = read_loop(socket, queue, telemetry, diag, shutdown, read_batch);
     sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
 }
 
@@ -1350,8 +1445,10 @@ async fn read_loop_sampled<S: DatagramSocket>(
 /// lands on time.
 ///
 /// Not part of why the budget drains: a `WouldBlock` `async_io` (see 2), and
-/// `watch::Receiver::wait_for`, `read_loop`'s other arm, which has no coop call on its path. The
-/// read side's successful `recvmmsg` is.
+/// `watch::Receiver::wait_for`, `read_loop`'s other arm. `wait_for` is wrapped in
+/// `cooperative(..)` (`sync/watch.rs`), whose `Coop::poll` (`task/coop/mod.rs`) runs
+/// `poll_proceed` first: a `Pending` restores the budget, and only a `Ready`, which ends the loop,
+/// spends one unit. The read side's successful `recvmmsg` is what drains it.
 ///
 /// Measured on a release build, eight senders flooding one listener for 10 s at about 90% kernel
 /// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
@@ -1499,9 +1596,13 @@ impl ReceiveBufferSampler {
 /// datagram**: it says whether event timestamps are trustworthy under load, and a per-batch figure
 /// would lose the resolution it exists to report.
 ///
-/// Dropping this future mid-batch (the grace backstop) discards up to `read_batch`
-/// popped-but-undecoded datagrams, uncounted, on the shutdown path only: the decode-side twin of
-/// the `push_many` cancellation ADR `udp-intake-batching-and-socket-visibility` names.
+/// Dropping this future mid-batch (the grace backstop, while an `emit` is parked on a full
+/// downstream) discards up to `pop_batch` popped-but-undecoded datagrams. They're counted
+/// `logit.component.datagrams.dropped`/`bytes.dropped{reason="shutdown"}` through a
+/// `logit_pipeline::CountedDrain`, and logged once (see [`Undecoded`]). The datagram whose `emit`
+/// is parked was already yielded and decoded, so it's never counted twice. A panic unwinding
+/// through the drain would also count the rest as `shutdown`, since shutdown is the only
+/// production canceller.
 ///
 /// Owns `sink` (the `Fanout`): dropping this future closes every downstream inbox, the shutdown
 /// cascade in `docs/adr/service-lifecycle-and-output-retry.md`.
@@ -1525,6 +1626,8 @@ async fn decode_loop<D: Decoder + Send>(
     // Drained (not replaced) by each `pop_many`, so its capacity survives and the steady state
     // allocates nothing.
     let mut popped: Vec<Datagram> = Vec::new();
+    // A clone for `Undecoded` to borrow, since `diag` itself is borrowed mutably below.
+    let remainder_diag = diag.clone();
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
@@ -1538,9 +1641,16 @@ async fn decode_loop<D: Decoder + Send>(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                if let Some(batch) = accumulator.take() {
-                    emit(&sink, &telemetry, batch, FlushReason::Interval).await;
-                }
+                let now_instant = match accumulator.take() {
+                    Some(batch) => {
+                        emit(&sink, &telemetry, batch, FlushReason::Interval).await;
+                        // Re-read: an `emit` parked on a full downstream past the next deadline
+                        // would otherwise leave that deadline already due, and every pop batch
+                        // after it would flush on `Interval`.
+                        tokio::time::Instant::now()
+                    }
+                    None => now_instant,
+                };
                 next_flush = Some(BatchAccumulator::next_deadline(
                     deadline,
                     now_instant,
@@ -1574,7 +1684,12 @@ async fn decode_loop<D: Decoder + Send>(
 
         // Drained, not iterated by reference: `decode_into` takes each `Bytes` by value, and each
         // is freed as it's consumed rather than at the end of the batch. FIFO order is preserved.
-        for datagram in popped.drain(..) {
+        let undecoded = Undecoded {
+            drain: CountedDrain::new(&mut popped, &telemetry, &RECEIVE_QUEUE_METRICS, "shutdown"),
+            left: count,
+            diag: &remainder_diag,
+        };
+        for datagram in undecoded {
             let latency_nanos = (now_nanos() - datagram.received_at).max(0) as u64;
             telemetry.timing(
                 "logit.component.receive.latency",
@@ -1597,6 +1712,39 @@ async fn decode_loop<D: Decoder + Send>(
                     diag.warn_throttled("bad_datagram", err);
                 }
             }
+        }
+    }
+}
+
+/// [`decode_loop`]'s popped batch: a `CountedDrain` that also logs, when dropped with datagrams
+/// never yielded, how many it counted. The telemetry count is the drain's; this adds the self-log
+/// line, since `internal`'s final drain has already run by the time the grace backstop drops the
+/// loop.
+struct Undecoded<'a> {
+    drain: CountedDrain<'a, Datagram>,
+    /// Datagrams not yet yielded.
+    left: usize,
+    diag: &'a Diagnostics,
+}
+
+impl Iterator for Undecoded<'_> {
+    type Item = Datagram;
+
+    fn next(&mut self) -> Option<Datagram> {
+        let datagram = self.drain.next()?;
+        self.left -= 1;
+        Some(datagram)
+    }
+}
+
+impl Drop for Undecoded<'_> {
+    fn drop(&mut self) {
+        if self.left > 0 {
+            self.diag.warn(format_args!(
+                "{} datagram(s) taken off the receive queue but not decoded when this listener \
+                 was stopped at its shutdown grace",
+                self.left
+            ));
         }
     }
 }
@@ -1682,11 +1830,17 @@ mod tests {
         (Fanout::new(vec![tx]), rx)
     }
 
-    fn test_queue(overflow: OverflowPolicy, max_datagrams: usize) -> Arc<ReceiveQueue> {
+    /// A receive queue emitting into `telemetry`: a `Registry`'s handle for a test that reads the
+    /// queue's drop counts, since a default handle records nothing.
+    fn test_queue(
+        overflow: OverflowPolicy,
+        max_datagrams: usize,
+        telemetry: &Telemetry,
+    ) -> Arc<ReceiveQueue> {
         Arc::new(BoundedQueue::with_metrics(
             QueueConfig { max_items: max_datagrams, max_weight: u64::MAX, overflow },
             &RECEIVE_QUEUE_METRICS,
-            Telemetry::default(),
+            telemetry.clone(),
         ))
     }
 
@@ -1703,7 +1857,7 @@ mod tests {
     async fn the_reader_keeps_reading_while_the_downstream_fanout_is_never_drained() {
         let socket = bind_ephemeral().await;
         let addr = socket.local_addr().unwrap();
-        let queue = test_queue(OverflowPolicy::DropOldest, 4);
+        let queue = test_queue(OverflowPolicy::DropOldest, 4, &Telemetry::default());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, _rx) = recording_fanout(1);
         let telemetry = Telemetry::default();
@@ -1714,6 +1868,7 @@ mod tests {
                 &socket,
                 Arc::clone(&queue),
                 telemetry.clone(),
+                Diagnostics::default(),
                 shutdown_rx.clone(),
                 TEST_POP_BATCH,
             );
@@ -1862,7 +2017,7 @@ mod tests {
     #[tokio::test]
     async fn a_backlog_queued_before_shutdown_is_still_decoded_and_delivered() {
         let socket = bind_ephemeral().await;
-        let queue = test_queue(OverflowPolicy::DropOldest, 100);
+        let queue = test_queue(OverflowPolicy::DropOldest, 100, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, mut rx) = recording_fanout(100);
         let telemetry = Telemetry::default();
@@ -1879,7 +2034,14 @@ mod tests {
 
         // `join!`, not `spawn`: both loops terminate here, and nothing need be `'static`.
         let (read_result, ()) = tokio::join!(
-            read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, TEST_POP_BATCH),
+            read_loop(
+                &socket,
+                Arc::clone(&queue),
+                telemetry.clone(),
+                Diagnostics::default(),
+                shutdown_rx,
+                TEST_POP_BATCH
+            ),
             decode_loop(
                 &mut decoder,
                 Arc::clone(&queue),
@@ -1912,7 +2074,7 @@ mod tests {
         const BACKLOG: usize = TEST_POP_BATCH * 3 + 7;
 
         let socket = bind_ephemeral().await;
-        let queue = test_queue(OverflowPolicy::DropOldest, BACKLOG * 2);
+        let queue = test_queue(OverflowPolicy::DropOldest, BACKLOG * 2, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, mut rx) = recording_fanout(BACKLOG * 2);
         let telemetry = Telemetry::default();
@@ -1926,7 +2088,14 @@ mod tests {
         shutdown_tx.send(true).expect("receiver should still be alive");
 
         let (read_result, ()) = tokio::join!(
-            read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, TEST_POP_BATCH),
+            read_loop(
+                &socket,
+                Arc::clone(&queue),
+                telemetry.clone(),
+                Diagnostics::default(),
+                shutdown_rx,
+                TEST_POP_BATCH
+            ),
             decode_loop(
                 &mut decoder,
                 Arc::clone(&queue),
@@ -1960,7 +2129,7 @@ mod tests {
     async fn a_malformed_datagram_is_skipped_without_stopping_the_decode_loop() {
         let socket = bind_ephemeral().await;
         let addr = socket.local_addr().unwrap();
-        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        let queue = test_queue(OverflowPolicy::DropOldest, 10, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, mut rx) = recording_fanout(10);
         let telemetry = Telemetry::default();
@@ -1976,7 +2145,14 @@ mod tests {
         };
 
         let (read_result, (), ()) = tokio::join!(
-            read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, TEST_POP_BATCH),
+            read_loop(
+                &socket,
+                Arc::clone(&queue),
+                telemetry.clone(),
+                Diagnostics::default(),
+                shutdown_rx,
+                TEST_POP_BATCH
+            ),
             decode_loop(
                 &mut decoder,
                 Arc::clone(&queue),
@@ -2399,7 +2575,7 @@ mod tests {
         let addr = socket.local_addr().expect("a bound socket has an address");
         // Depth 1 under `block`, nothing popping: the reader parks in `queue.push` for good, the
         // state this wrapper exists to keep sampling through.
-        let queue = test_queue(OverflowPolicy::Block, 1);
+        let queue = test_queue(OverflowPolicy::Block, 1, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let sampled = read_loop_sampled(
@@ -2463,7 +2639,7 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_sampler_still_reads_and_closes_the_queue() {
         let socket = bind_ephemeral().await;
-        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        let queue = test_queue(OverflowPolicy::DropOldest, 10, &Telemetry::default());
         // Already signalled, so `read_loop` returns on its first poll.
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         let sampler = ReceiveBufferSampler {
@@ -2480,6 +2656,7 @@ mod tests {
                 &socket,
                 Arc::clone(&queue),
                 Telemetry::default(),
+                Diagnostics::default(),
                 shutdown_rx,
                 TEST_POP_BATCH,
             ),
@@ -2940,7 +3117,7 @@ mod tests {
         let (socket, _group) =
             bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
-        let queue = test_queue(OverflowPolicy::DropOldest, payloads.len() * 2);
+        let queue = test_queue(OverflowPolicy::DropOldest, payloads.len() * 2, &telemetry);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (fanout, mut rx) = recording_fanout(8);
         let mut decoder = TestDecoder::new();
@@ -2973,7 +3150,14 @@ mod tests {
         };
 
         let (read_result, (), received) = tokio::join!(
-            read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, read_batch),
+            read_loop(
+                &socket,
+                Arc::clone(&queue),
+                telemetry.clone(),
+                Diagnostics::default(),
+                shutdown_rx,
+                read_batch
+            ),
             decode_loop(
                 &mut decoder,
                 Arc::clone(&queue),
@@ -3091,7 +3275,7 @@ mod tests {
         let (socket, _group) =
             bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
-        let queue = test_queue(OverflowPolicy::DropOldest, BURST * 2);
+        let queue = test_queue(OverflowPolicy::DropOldest, BURST * 2, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let sender = bind_ephemeral().await;
@@ -3100,7 +3284,14 @@ mod tests {
         }
 
         // Pop until the whole burst is out; the data is the synchronization.
-        let read = read_loop(&socket, Arc::clone(&queue), telemetry, shutdown_rx, 64);
+        let read = read_loop(
+            &socket,
+            Arc::clone(&queue),
+            telemetry,
+            Diagnostics::default(),
+            shutdown_rx,
+            64,
+        );
         tokio::pin!(read);
         let mut stamps: Vec<i64> = Vec::with_capacity(BURST);
         while stamps.len() < BURST {
@@ -3163,9 +3354,16 @@ mod tests {
             return;
         }
 
-        let queue = test_queue(OverflowPolicy::DropOldest, 8);
+        let queue = test_queue(OverflowPolicy::DropOldest, 8, &Telemetry::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let read = read_loop(&socket, Arc::clone(&queue), telemetry, shutdown_rx, 64);
+        let read = read_loop(
+            &socket,
+            Arc::clone(&queue),
+            telemetry,
+            Diagnostics::default(),
+            shutdown_rx,
+            64,
+        );
         tokio::pin!(read);
         let datagram = tokio::select! {
             _ = &mut read => panic!("the read loop must not finish before shutdown"),
@@ -3233,11 +3431,18 @@ mod tests {
         let socket = tokio::net::UdpSocket::from_std(not_a_socket)
             .expect("tokio registers any pollable non-blocking descriptor");
 
-        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        let queue = test_queue(OverflowPolicy::DropOldest, 10, &Telemetry::default());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let err = tokio::time::timeout(
             Duration::from_secs(5),
-            read_loop(&socket, Arc::clone(&queue), Telemetry::default(), shutdown_rx, 64),
+            read_loop(
+                &socket,
+                Arc::clone(&queue),
+                Telemetry::default(),
+                Diagnostics::default(),
+                shutdown_rx,
+                64,
+            ),
         )
         .await
         .expect("a fatal read error must end the loop, not hang it")
@@ -3302,8 +3507,9 @@ mod tests {
         );
     }
 
-    /// Shutdown during a blocked `push_many` exits promptly and closes the queue; the rest of the
-    /// batch is the bounded loss ADR `udp-intake-batching-and-socket-visibility` names.
+    /// Shutdown during a blocked `push_many` exits promptly and closes the queue, and the rest of
+    /// the batch is counted `datagrams.dropped{reason="shutdown"}`: every datagram read is either
+    /// queued or counted, in datagrams and in bytes.
     ///
     /// No sleep: the `Block` queue of 4 is pre-filled to 3, so the read half places one datagram
     /// and parks. The loop polls until `logit.input.reads` shows a batch was read (bounded, so a
@@ -3316,7 +3522,7 @@ mod tests {
         let (socket, _group) =
             bind_socket("127.0.0.1:0", Some(1024 * 1024), &telemetry, &mut diag).await.unwrap();
         let addr = socket.local_addr().expect("a bound socket has an address");
-        let queue = test_queue(OverflowPolicy::Block, 4);
+        let queue = test_queue(OverflowPolicy::Block, 4, &telemetry);
         for i in 0..3u32 {
             queue.push(Datagram { bytes: Bytes::from(format!("pre-{i}")), received_at: 0 }).await;
         }
@@ -3328,21 +3534,31 @@ mod tests {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let read = read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx, 64);
+        let read = read_loop(
+            &socket,
+            Arc::clone(&queue),
+            telemetry.clone(),
+            Diagnostics::default(),
+            shutdown_rx,
+            64,
+        );
         tokio::pin!(read);
 
-        let mut reads = 0.0;
+        let mut events = Vec::new();
         for _ in 0..10_000 {
             tokio::select! {
                 _ = &mut read => panic!("the read loop must not finish before shutdown"),
                 () = tokio::task::yield_now() => {}
             }
-            reads += counter(&registry.drain(0), "logit.input.reads");
-            if reads > 0.0 {
+            events.extend(registry.drain(0));
+            if counter(&events, "logit.input.reads") > 0.0 {
                 break;
             }
         }
-        assert!(reads > 0.0, "the read half never got a batch off the socket -- test premise");
+        assert!(
+            counter(&events, "logit.input.reads") > 0.0,
+            "the read half never got a batch off the socket -- test premise"
+        );
 
         shutdown_tx.send(true).expect("receiver should still be alive");
         tokio::time::timeout(Duration::from_secs(5), read)
@@ -3350,18 +3566,28 @@ mod tests {
             .expect("a blocked push_many must be cancelled by shutdown, not waited out")
             .expect("should shut down without error");
 
-        let mut drained = 0;
-        while queue.pop().await.is_some() {
-            drained += 1;
+        let mut placed = Vec::new();
+        while let Some(datagram) = queue.pop().await {
+            if !datagram.bytes.starts_with(b"pre-") {
+                placed.push(datagram);
+            }
         }
-        assert_eq!(
-            drained, 4,
-            "the three pre-filled datagrams plus the one the read half managed to place -- the \
-             rest of its batch is the bounded, uncounted shutdown loss the ADR names"
-        );
+        assert_eq!(placed.len(), 1, "the read half placed one datagram before the queue was full");
         assert!(
             queue.pop().await.is_none(),
             "the queue must be closed on the way out -- that is what lets decode_loop finish"
+        );
+
+        events.extend(registry.drain(0));
+        let placed_bytes: u64 = placed.iter().map(|datagram| datagram.bytes.len() as u64).sum();
+        let read = counter(&events, "logit.input.datagrams");
+        let dropped = shutdown_drops(&events);
+        assert!(dropped.0 > 0.0, "the rest of the batch must be counted, got {dropped:?}");
+        assert_eq!(read, placed.len() as f64 + dropped.0, "datagrams read = queued + dropped");
+        assert_eq!(
+            counter(&events, "logit.input.datagram.bytes"),
+            placed_bytes as f64 + dropped.1,
+            "bytes read = bytes queued + bytes dropped"
         );
     }
 
@@ -3435,5 +3661,556 @@ mod tests {
             .expect_err("the only candidate is already occupied -- must fail, not hang or panic");
         assert!(!err.to_string().is_empty());
         drop(occupied);
+    }
+
+    // -- shutdown accounting (ADR `shutdown-accounting-and-cancellation-safety`, decision 4) ----
+
+    /// Every counter point named `name` tagged `reason=reason`, summed.
+    fn counter_with_reason(events: &[Event], name: &str, reason: &str) -> f64 {
+        let tagged: Vec<Event> = events
+            .iter()
+            .filter(|event| {
+                event.attributes.get("reason").and_then(|value| value.as_str()) == Some(reason)
+            })
+            .cloned()
+            .collect();
+        counter(&tagged, name)
+    }
+
+    /// `(datagrams, bytes)` counted `datagrams.dropped`/`bytes.dropped{reason="shutdown"}`.
+    fn shutdown_drops(events: &[Event]) -> (f64, f64) {
+        (
+            counter_with_reason(events, RECEIVE_QUEUE_METRICS.items_dropped, "shutdown"),
+            counter_with_reason(events, RECEIVE_QUEUE_METRICS.units_dropped, "shutdown"),
+        )
+    }
+
+    /// Samples in `logit.component.receive.latency`: one per datagram yielded to the decoder.
+    fn latency_samples(events: &[Event]) -> f64 {
+        events
+            .iter()
+            .flat_map(|event| &event.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.receive.latency")
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Distribution(sketch) => sketch.count() as f64,
+                other => panic!("receive.latency must be a timing, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// The per-listener contract: every datagram read was yielded to the decoder (one
+    /// `receive.latency` sample each) or counted dropped under some reason, and the same in
+    /// bytes, against `decoded_bytes` from a [`CountingDecoder`].
+    fn assert_datagram_contract(events: &[Event], decoded_bytes: u64, context: &str) {
+        let read = counter(events, "logit.input.datagrams");
+        let decoded = latency_samples(events);
+        let dropped = counter(events, RECEIVE_QUEUE_METRICS.items_dropped);
+        assert_eq!(
+            read,
+            decoded + dropped,
+            "{context}: {read} datagram(s) read, {decoded} decoded, {dropped} dropped"
+        );
+        let read_bytes = counter(events, "logit.input.datagram.bytes");
+        let dropped_bytes = counter(events, RECEIVE_QUEUE_METRICS.units_dropped);
+        assert_eq!(
+            read_bytes,
+            decoded_bytes as f64 + dropped_bytes,
+            "{context}: {read_bytes} byte(s) read, {decoded_bytes} decoded, {dropped_bytes} dropped"
+        );
+    }
+
+    /// [`TestDecoder`], also summing the bytes of every datagram it's handed, rejected or not.
+    struct CountingDecoder {
+        inner: TestDecoder,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl CountingDecoder {
+        fn new(bytes: &Arc<std::sync::atomic::AtomicU64>) -> Self {
+            Self { inner: TestDecoder::new(), bytes: Arc::clone(bytes) }
+        }
+    }
+
+    impl Decoder for CountingDecoder {
+        fn decode_into(
+            &mut self,
+            bytes: Bytes,
+            received_at: i64,
+            out: &mut Vec<Event>,
+        ) -> Result<(Arc<Resource>, Option<Arc<logit_core::Scope>>), CodecError> {
+            self.bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.inner.decode_into(bytes, received_at, out)
+        }
+    }
+
+    /// A listener over an ephemeral port whose telemetry lands in `registry` and whose decoder sums
+    /// decoded bytes into `decoded_bytes`: a `Block` queue, one event per send, no flush timer.
+    async fn accounting_listener(
+        registry: &logit_core::Registry,
+        decoded_bytes: &Arc<std::sync::atomic::AtomicU64>,
+        max_datagrams: usize,
+        read_batch: usize,
+    ) -> (UdpListener<CountingDecoder>, std::net::SocketAddr) {
+        let mut listener = UdpListener::new(
+            "127.0.0.1:0",
+            CountingDecoder::new(decoded_bytes),
+            UdpListenerConfig {
+                max_datagrams,
+                read_batch,
+                overflow: OverflowPolicy::Block,
+                batch_max_events: 1,
+                batch_flush_interval: Duration::ZERO,
+                receive_buffer_bytes: Some(1024 * 1024),
+                ..UdpListenerConfig::default()
+            },
+        )
+        .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("bind() leaves a real address behind");
+        (listener, addr)
+    }
+
+    /// A `read_loop` that reads a batch and then loses the unbiased push-or-shutdown race without
+    /// ever polling `push_many` counts the whole batch as `shutdown` drops.
+    ///
+    /// Shutdown is already set, so `select!`'s random branch order gives each trial one of three
+    /// outcomes: no read, a read whose batch is queued, or a read whose `push_many` is never
+    /// polled. Every trial must satisfy "read = queued + dropped"; trials repeat until the third
+    /// outcome shows up (about 1 in 4 each), bounded so a regression fails.
+    #[tokio::test]
+    async fn a_read_loop_whose_push_many_was_never_polled_before_shutdown_counts_its_whole_batch() {
+        const DATAGRAMS: usize = 8;
+        let mut seen = false;
+        for trial in 0..400 {
+            let registry = logit_core::Registry::new();
+            let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+            let socket = bind_ephemeral().await;
+            let addr = socket.local_addr().unwrap();
+            let sender = bind_ephemeral().await;
+            for i in 0..DATAGRAMS {
+                sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("loopback send");
+            }
+            // Readiness known before the race, so the read arm can win it on its first poll.
+            socket.readable().await.expect("the datagrams are already in the socket");
+            let queue = test_queue(OverflowPolicy::DropOldest, 64, &telemetry);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                read_loop(
+                    &socket,
+                    Arc::clone(&queue),
+                    telemetry.clone(),
+                    Diagnostics::default(),
+                    shutdown_rx,
+                    64,
+                ),
+            )
+            .await
+            .expect("shutdown is already set, so the loop returns at once")
+            .expect("no read error on a loopback socket");
+
+            let queued = queue.take_all();
+            assert!(queue.pop().await.is_none(), "trial {trial}: the queue must be closed");
+            let queued_bytes: u64 = queued.iter().map(|datagram| datagram.bytes.len() as u64).sum();
+            let events = registry.drain(0);
+            let read = counter(&events, "logit.input.datagrams");
+            let dropped = shutdown_drops(&events);
+            assert_eq!(
+                read,
+                queued.len() as f64 + dropped.0,
+                "trial {trial}: read = queued + dropped"
+            );
+            assert_eq!(
+                counter(&events, "logit.input.datagram.bytes"),
+                queued_bytes as f64 + dropped.1,
+                "trial {trial}: bytes read = bytes queued + bytes dropped"
+            );
+            if read > 0.0 && queued.is_empty() {
+                assert_eq!(dropped.0, read, "trial {trial}: a never-polled push drops its batch");
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "no trial read a batch and then left push_many unpolled in 400 tries");
+    }
+
+    /// A `read_loop` future dropped between its read and its push, with the batch still in hand,
+    /// counts that batch as `shutdown` drops and closes the queue.
+    ///
+    /// The drop point is the coop-budget check in front of the push `select!`: each poll here
+    /// leaves the read one unit of budget, so a successful read spends the last unit and the push
+    /// `select!` yields before polling any arm. That's the state `run_input`'s backstop can drop
+    /// under `receive.shutdown_grace: 0s`.
+    #[tokio::test]
+    async fn a_read_loop_dropped_mid_iteration_counts_what_its_batch_held_and_closes_the_queue() {
+        use std::task::Poll;
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let socket = bind_ephemeral().await;
+        let addr = socket.local_addr().unwrap();
+        let sender = bind_ephemeral().await;
+        for i in 0..5u32 {
+            sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("loopback send");
+        }
+        let queue = test_queue(OverflowPolicy::DropOldest, 64, &telemetry);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut read = Box::pin(read_loop(
+            &socket,
+            Arc::clone(&queue),
+            telemetry.clone(),
+            Diagnostics::default(),
+            shutdown_rx,
+            64,
+        ));
+
+        let mut events = Vec::new();
+        for _ in 0..1_000 {
+            // A fresh poll of this task starts with the whole 128-unit budget.
+            tokio::task::yield_now().await;
+            let pending = std::future::poll_fn(|cx| {
+                for _ in 0..127 {
+                    let burn = std::pin::pin!(tokio::task::consume_budget());
+                    assert!(burn.poll(cx).is_ready(), "a fresh task poll has 128 units of budget");
+                }
+                Poll::Ready(read.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(pending, "the read loop must not finish before shutdown");
+            events.extend(registry.drain(0));
+            if counter(&events, "logit.input.reads") > 0.0 {
+                break;
+            }
+        }
+        let read_datagrams = counter(&events, "logit.input.datagrams");
+        let read_bytes = counter(&events, "logit.input.datagram.bytes");
+        assert!(read_datagrams > 0.0, "the read half never got a batch off the socket -- premise");
+
+        drop(read);
+        events.extend(registry.drain(0));
+        assert_eq!(
+            shutdown_drops(&events),
+            (read_datagrams, read_bytes),
+            "the push select! had no budget, so the whole batch was still in hand"
+        );
+        let mut out = Vec::new();
+        let popped = tokio::time::timeout(Duration::from_secs(1), queue.pop_many(&mut out, 1))
+            .await
+            .expect("a closed, empty queue answers at once");
+        assert_eq!(popped, 0, "nothing was queued and the queue is closed");
+    }
+
+    /// A `read_loop` future dropped while parked on its read still closes the queue, so a decode
+    /// loop sharing it sees "closed and empty" rather than waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn read_loop_closes_the_queue_even_when_its_future_is_dropped() {
+        use std::task::Poll;
+
+        let socket = bind_ephemeral().await;
+        let queue = test_queue(OverflowPolicy::DropOldest, 4, &Telemetry::default());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut read = Box::pin(read_loop(
+            &socket,
+            Arc::clone(&queue),
+            Telemetry::default(),
+            Diagnostics::default(),
+            shutdown_rx,
+            64,
+        ));
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "nothing was sent and shutdown isn't set, so the read parks");
+        drop(read);
+
+        let mut out = Vec::new();
+        let popped = tokio::time::timeout(Duration::from_secs(1), queue.pop_many(&mut out, 1))
+            .await
+            .expect("a closed, empty queue answers at once");
+        assert_eq!(popped, 0);
+    }
+
+    /// `decode_loop` dropped while its second `emit` is parked counts the three datagrams it
+    /// popped but never decoded, with their own bytes, and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn a_decode_loop_dropped_mid_batch_counts_every_popped_but_undecoded_datagram() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let queue = test_queue(OverflowPolicy::Block, 5, &telemetry);
+        for payload in ["a", "bb", "ccc", "dddd", "eeeee"] {
+            queue
+                .push(Datagram { bytes: Bytes::from_static(payload.as_bytes()), received_at: 0 })
+                .await;
+        }
+        let (fanout, mut rx) = recording_fanout(1);
+        let mut decoder = TestDecoder::new();
+        let mut decode = Box::pin(decode_loop(
+            &mut decoder,
+            Arc::clone(&queue),
+            fanout,
+            BatchingConfig {
+                max_events: 1,
+                max_bytes: u64::MAX,
+                flush_interval: Duration::ZERO,
+                pop_batch: 5,
+            },
+            telemetry.clone(),
+            Diagnostics::default(),
+        ));
+        tokio::time::timeout(Duration::from_millis(10), &mut decode)
+            .await
+            .expect_err("the second emit parks on the full, unread consumer");
+        let mut events = registry.drain(0);
+        assert_eq!(
+            latency_samples(&events),
+            2.0,
+            "two datagrams decoded: the one delivered and the one whose emit is parked"
+        );
+
+        drop(decode);
+        events.extend(registry.drain(0));
+        assert_eq!(
+            shutdown_drops(&events),
+            (3.0, 12.0),
+            "datagrams 3 to 5 (3 + 4 + 5 bytes); the parked one was decoded and isn't counted"
+        );
+        let first = unwrap_batch(rx.try_recv().expect("the first emit landed"));
+        assert_eq!(payload(&first.events[0]), "a");
+        assert!(queue.take_all().is_empty(), "all five were popped in one batch");
+    }
+
+    /// A listener whose downstream is wedged, cut off by a grace backstop after shutdown, counts
+    /// everything it still held: the read half's remainder, the decode half's undecoded batch,
+    /// and the receive queue's residual. The datagram contract holds.
+    #[tokio::test]
+    async fn a_udp_listener_cancelled_by_the_grace_backstop_counts_what_its_queue_still_held() {
+        let registry = logit_core::Registry::new();
+        let decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (mut listener, addr) = accounting_listener(&registry, &decoded_bytes, 16, 64).await;
+        let (fanout, _rx) = recording_fanout(1); // never read
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut run = Box::pin(listener.run_until_shutdown(fanout, shutdown_rx));
+
+        let sender = bind_ephemeral().await;
+        for i in 0..100u32 {
+            sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("loopback send");
+        }
+        // Run until the decode half is parked on the unread consumer (two decoded: one
+        // delivered, one parked) and the read half has read more than the queue holds.
+        let mut events = Vec::new();
+        let give_up = tokio::time::Instant::now() + Duration::from_secs(10);
+        while latency_samples(&events) < 2.0 || counter(&events, "logit.input.datagrams") < 20.0 {
+            tokio::select! {
+                result = &mut run => panic!("the listener must not finish before shutdown: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            events.extend(registry.drain(0));
+            assert!(tokio::time::Instant::now() < give_up, "the listener never wedged");
+        }
+        // A little longer, so the read half refills the queue behind the parked decode half.
+        tokio::select! {
+            result = &mut run => panic!("the listener must not finish before shutdown: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        tokio::time::timeout(Duration::from_millis(200), &mut run).await.expect_err(
+            "the decode half is parked on the unread consumer; only the backstop ends it",
+        );
+        drop(run);
+
+        events.extend(registry.drain(0));
+        assert!(shutdown_drops(&events).0 > 0.0, "the backstop dropped queued datagrams");
+        assert_datagram_contract(
+            &events,
+            decoded_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            "grace backstop",
+        );
+    }
+
+    /// Under `receive.shutdown_grace: 0s`, `run_input`'s backstop drops the listener at an
+    /// arbitrary point after the signal. Wherever that lands, every datagram read is decoded or
+    /// counted. `run_input` is private to `logit_pipeline`, so this reproduces its `select!`:
+    /// biased, input first, the backstop `unconstrained`.
+    #[tokio::test]
+    async fn a_zero_shutdown_grace_never_breaks_the_datagram_contract() {
+        for iteration in 0..50usize {
+            let registry = logit_core::Registry::new();
+            let decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (mut listener, addr) = accounting_listener(&registry, &decoded_bytes, 4, 8).await;
+            let (fanout, _rx) = recording_fanout(1); // never read
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut backstop = shutdown_rx.clone();
+
+            let run = async {
+                tokio::select! {
+                    biased;
+                    result = listener.run_until_shutdown(fanout, shutdown_rx) => result,
+                    () = tokio::task::unconstrained(async move {
+                        let _ = backstop.wait_for(|&due| due).await;
+                        tokio::time::sleep(Duration::ZERO).await;
+                    }) => Ok(()),
+                }
+            };
+            // Varies how much traffic and how many scheduler turns precede the signal, so the
+            // drop lands in a different place from one iteration to the next.
+            let driver = async {
+                let sender = bind_ephemeral().await;
+                for i in 0..(iteration % 20 + 1) {
+                    sender.send_to(format!("msg-{i}").as_bytes(), addr).await.expect("send");
+                }
+                for _ in 0..(iteration % 7) {
+                    tokio::task::yield_now().await;
+                }
+                shutdown_tx.send(true).expect("receiver should still be alive");
+            };
+            let (result, ()) = tokio::join!(run, driver);
+            result.expect("should shut down without error");
+
+            let events = registry.drain(0);
+            assert_datagram_contract(
+                &events,
+                decoded_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                &format!("iteration {iteration}"),
+            );
+        }
+    }
+
+    /// An interval `emit` that parks on a full downstream past the next deadline doesn't leave that
+    /// deadline already due: the pop batch after it resumes must not flush again at the same
+    /// instant.
+    ///
+    /// The consumer takes one `Delivered` every five intervals. Each window, the first flush fills
+    /// the one-slot channel and the next parks; the receive resumes it. A next deadline computed
+    /// from a clock reading taken before the parked `emit` would already be past, so the next pop
+    /// batch would flush at once and park again.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch() {
+        const INTERVAL: Duration = Duration::from_millis(100);
+        const CYCLES: usize = 20;
+
+        fn interval_flushes(events: &[Event]) -> f64 {
+            counter_with_reason(events, "logit.component.receive.flushed", "interval")
+        }
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let queue = test_queue(OverflowPolicy::DropOldest, 1024, &telemetry);
+        let (fanout, mut rx) = recording_fanout(1);
+        let decode = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            let telemetry = telemetry.clone();
+            async move {
+                let mut decoder = TestDecoder::new();
+                decode_loop(
+                    &mut decoder,
+                    queue,
+                    fanout,
+                    BatchingConfig {
+                        max_events: 10_000,
+                        max_bytes: u64::MAX,
+                        flush_interval: INTERVAL,
+                        pop_batch: 1,
+                    },
+                    telemetry,
+                    Diagnostics::default(),
+                )
+                .await;
+            }
+        });
+        let push = |i: usize| {
+            queue.push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: 0 })
+        };
+
+        let start = tokio::time::Instant::now();
+        let mut events = Vec::new();
+        let mut sent = 0usize;
+        // Off the deadline grid, so a push never shares an instant with a flush.
+        tokio::time::sleep(INTERVAL / 2).await;
+        for cycle in 0..CYCLES {
+            for _ in 0..5 {
+                push(sent).await;
+                sent += 1;
+                tokio::time::sleep(INTERVAL).await;
+            }
+            events.extend(registry.drain(0));
+            let before = interval_flushes(&events);
+
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a flush filled the channel during the window")
+                .expect("the decode loop owns the fanout and is still running");
+            push(sent).await;
+            sent += 1;
+            // No clock advance: this task stays runnable, so the paused clock stands still.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            events.extend(registry.drain(0));
+            assert_eq!(
+                interval_flushes(&events),
+                before,
+                "cycle {cycle}: the resumed emit must not be followed by another interval flush \
+                 at the same instant"
+            );
+        }
+
+        let intervals = (start.elapsed().as_nanos() / INTERVAL.as_nanos()) as f64;
+        assert!(
+            interval_flushes(&events) <= intervals + CYCLES as f64 + 1.0,
+            "{} interval flushes over {intervals} intervals and {CYCLES} resumed emits",
+            interval_flushes(&events)
+        );
+        decode.abort();
+    }
+
+    /// A batch whose fan-out is cut off mid-`Fanout::deliver` reaches a prefix of the consumers,
+    /// and is counted `sent` and `receive.flushed` but never dropped. This pins the gap
+    /// `docs/known-gaps.md` records for the grace backstop.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let queue = test_queue(OverflowPolicy::DropOldest, 4, &telemetry);
+        queue.push(Datagram { bytes: Bytes::from_static(b"only"), received_at: 0 }).await;
+
+        let (first_tx, mut first_rx) = mpsc::channel(8);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        // Fill the second consumer, so the fan-out parks on it after sending to the first.
+        let filler =
+            EventBatch { resource: Arc::new(Resource::default()), scope: None, events: Vec::new() };
+        Fanout::new(vec![second_tx.clone()]).send(filler).await;
+        let fanout = Fanout::new(vec![first_tx, second_tx]).with_telemetry(telemetry.clone());
+
+        let mut decoder = TestDecoder::new();
+        let mut decode = Box::pin(decode_loop(
+            &mut decoder,
+            Arc::clone(&queue),
+            fanout,
+            BatchingConfig {
+                max_events: 1,
+                max_bytes: u64::MAX,
+                flush_interval: Duration::ZERO,
+                pop_batch: 4,
+            },
+            telemetry.clone(),
+            Diagnostics::default(),
+        ));
+        tokio::time::timeout(Duration::from_millis(10), &mut decode)
+            .await
+            .expect_err("the fan-out parks on the full second consumer");
+        drop(decode);
+
+        let first = unwrap_batch(first_rx.try_recv().expect("the first consumer got the batch"));
+        assert_eq!(payload(&first.events[0]), "only");
+        let filler = unwrap_batch(second_rx.try_recv().expect("the filler is still there"));
+        assert!(filler.events.is_empty());
+        assert!(second_rx.try_recv().is_err(), "the second consumer never got the batch");
+
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, "logit.component.batches.sent"), 1.0);
+        assert_eq!(counter(&events, "logit.component.receive.flushed"), 1.0);
+        assert_eq!(counter(&events, "logit.component.events.dropped"), 0.0);
+        assert_eq!(shutdown_drops(&events), (0.0, 0.0), "the datagram was decoded, not dropped");
     }
 }

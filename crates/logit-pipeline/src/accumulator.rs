@@ -216,7 +216,6 @@ fn scope_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use logit_core::{AttrMap, Event, Value};

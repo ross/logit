@@ -1380,10 +1380,13 @@ enum ReadStep {
 /// wins), which lets both this race and [`serve_connection`]'s deadline timeout drop it mid-await
 /// without losing stream bytes.
 ///
-/// `shutdown.changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the combined future
-/// `!Send`, and `tokio::spawn`ing this connection's task requires `Send`. The caller's explicit
-/// `*shutdown.borrow()` check covers what `changed()` alone cannot: shutdown having fired before
-/// this loop iteration began. `crate::logit`'s `serve_connection` follows the same discipline.
+/// `shutdown.changed()` plus the caller's explicit `*shutdown.borrow()` check, which covers what
+/// `changed()` alone cannot: shutdown having fired before this loop iteration began. `wait_for`
+/// would also compile here, because its `Ref` is only returned, never held across an await inside
+/// `wait_for`, and this `select!`'s arms don't await. The pair matches `crate::logit`'s
+/// `serve_connection`, whose shutdown arm does await (`going_away`): there a `Ref` that `select!`
+/// kept alive through the arm body would make the future `!Send`, and `tokio::spawn` requires
+/// `Send`.
 async fn read_step<S: AsyncRead + Unpin + Send>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -1456,12 +1459,17 @@ where
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
+                let mut now_instant = now_instant;
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Interval).await;
                     // Stamped after the send returns, so time blocked on a full downstream is
                     // not counted against the peer. A tick with nothing to emit never gets here:
                     // this process's own timer must not keep a silent connection alive.
                     last_progress = tokio::time::Instant::now();
+                    // Re-read for the same reason: an `emit` parked past the next deadline would
+                    // otherwise leave it already due, and every read after it would flush on
+                    // `Interval`.
+                    now_instant = last_progress;
                 }
                 next_flush = Some(BatchAccumulator::next_deadline(
                     deadline,
