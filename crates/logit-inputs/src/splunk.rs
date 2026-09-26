@@ -34,8 +34,9 @@
 //!
 //! **Channels and acknowledgment.** A request that names a channel (the `X-Splunk-Request-Channel`
 //! header, or `?channel=`) is answered with an `ackId`, drawn from one per-listener counter that
-//! starts at 1, as is a `400` code 6 after which objects were delivered (step 7); a request
-//! without one gets no `ackId`, as from a token without `useACK`. `/ack`
+//! starts at 1, as is a `400` code 6 naming an object past the first whose prefix passed the
+//! bounded wait, delivered or all skipped (step 7); a request without one gets no `ackId`, as from
+//! a token without `useACK`. `/ack`
 //! answers every id it is asked about `true`: a `200` already means the data reached the pipeline,
 //! and a pipeline that can't take it answers `503` instead. No channel is ever required, and
 //! neither the channel nor the id enters an event.
@@ -1287,8 +1288,8 @@ mod tests {
         );
     }
 
-    /// A syntax error in any object rejects the whole body, naming that object's index, and
-    /// delivers nothing; so does a number the model can't hold.
+    /// A syntax error in an object, or a number the model can't hold, is `400` code 6 naming that
+    /// object's index; the objects before it are delivered, and none from it on.
     #[tokio::test]
     async fn a_malformed_body_is_400_code_6_with_the_first_bad_index() {
         let (addr, mut rx) = start_default().await;
