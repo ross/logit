@@ -60,23 +60,40 @@
 //! | Outcome | Result |
 //! |---|---|
 //! | 2xx | `Ok` (then acknowledgment, below, under `ack: true`) |
-//! | `400` code 6 naming an object of the body (`invalid-event-number` in range) | that object dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second code 6 is [`Fault::Permanent`] |
-//! | 408, 429, any 5xx | [`Fault::Ambiguous`] |
+//! | `400` code 6 naming an object of the body (`invalid-event-number` in range), except the row below | that object dropped, counted `records.dropped{reason="invalid_event"}` with a throttled `invalid_event` diagnostic, and the rest resent once ([`after_invalid_event`]); a second code 6 is [`Fault::Permanent`] |
+//! | `400` code 6 naming object 0 of a body over [`SPLUNK_CLOUD_BODY_CAP`] before compression | Splunk Cloud's answer to an oversize body: a body of several objects is split in two and each half sent, with a throttled `oversize` diagnostic; a half answered so again is [`Fault::Permanent`]. A body of one object is dropped, counted `records.dropped{reason="oversize"}` |
+//! | 429, or 503 with code 9 or no HEC body, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
+//! | the same after one was | [`Fault::Ambiguous`] |
+//! | 408, any other 5xx | [`Fault::Ambiguous`] |
 //! | 401, 403 | [`Fault::Permanent`], with a throttled `token_rejected` diagnostic |
 //! | any other 3xx or 4xx (a code 6 with no or an out-of-range number included) | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
 //! | connect failure, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
 //! | connect failure after one was (a 2xx, or a code 6 whose objects ahead count as delivered) | [`Fault::Ambiguous`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
-//! Splunk Cloud answers a body over its own size cap with `400` code 6 naming object 0, not
-//! `413`, so a `max_body_bytes` above the receiver's cap turns a valid first object into an
-//! `invalid_event` drop and a resend of the rest. The default sits under Cloud's observed cap
-//! (`docs/splunk.md`, "Size caps").
+//! `Clean` means Splunk didn't take the body. A connect failure, a `429` (codes 26 and 27), and a
+//! `503` code 9 ("Server is busy") each say so ([`is_busy`]); a `500` code 8 may have indexed, and
+//! a `408`, a timeout, or another `5xx` says nothing either way. `Clean` holds only while nothing
+//! of the batch has reached Splunk: `write_loop` retries `Clean` under every posture, and a retry
+//! re-sends the bodies already indexed, so once one was accepted each of these is `Ambiguous`
+//! instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
 //!
-//! A connect failure is `Clean` only while nothing of the batch has reached Splunk:
-//! `write_loop` retries `Clean` under every posture, and a retry re-sends the bodies already
-//! indexed, so once one was accepted every later transport failure is `Ambiguous` instead
-//! ([`after_delivery`]).
+//! One receiver breaks the "didn't take the body" reading: a `logit` `splunk_hec_in` older than
+//! the fix that finishes a body once its first batch is delivered answers `503` code 9 after
+//! delivering part of a multi-resource body, so a relay into one can deliver that part twice
+//! (`docs/known-gaps.md`, "Splunk"). Splunk itself refuses before indexing.
+//!
+//! A drop leaves `sent_any` unset when nothing ahead of the dropped object was indexed (a code 6
+//! at object 0, or a lone object over Splunk Cloud's cap), so a busy answer later in the same
+//! `send` is still `Clean` and the whole batch is retried: a busy retry re-sends and re-counts a
+//! dropped object in `records.dropped`; the record is never delivered twice. Marking the drop
+//! as a delivery instead would make that busy answer `Ambiguous` and drop the rest of the batch
+//! under the default posture.
+//!
+//! The code-6-at-object-0 test for an oversize body stands because Splunk Cloud answers a body
+//! over its cap that way, not with `413`, and an object that can't be parsed at the head of a
+//! body that large is far less likely than the cap. A body at or under the cap keeps the
+//! drop-one rule.
 //!
 //! Every non-2xx other than 408, 429, and 5xx is counted `logit.output.requests.rejected{code}`,
 //! `code` being the body's HEC code when Splunk documents it ([`code_tag`]), else `other`.
@@ -127,7 +144,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{Fault, Output};
 use logit_proto::splunk::response::{
-    encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus,
+    encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus, SPLUNK_CLOUD_BODY_CAP,
 };
 use logit_proto::splunk::{ObjectMeta, SplunkEncoder};
 use logit_proto::{MessageBuf, MultiValue};
@@ -203,6 +220,34 @@ enum AckPoll {
     Retry,
 }
 
+/// What one body's send settled, when it didn't fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyOutcome {
+    /// Accepted, or the objects left after a code-6 drop were.
+    Done,
+    /// Splunk Cloud answered it as over its cap, and it holds more than one object.
+    OverCloudCap,
+}
+
+/// A body's length before compression: its objects concatenated with no separator.
+fn body_len(objects: &[Object<'_>]) -> usize {
+    objects.iter().map(|(bytes, _)| bytes.len()).sum()
+}
+
+/// Where to cut a body of two or more objects in two: after the first object at which half its
+/// bytes are reached, and never at either end.
+fn split_point(objects: &[Object<'_>]) -> usize {
+    let total = body_len(objects);
+    let mut bytes = 0;
+    for (i, (object, _)) in objects.iter().enumerate() {
+        bytes += object.len();
+        if bytes * 2 >= total {
+            return (i + 1).clamp(1, objects.len() - 1);
+        }
+    }
+    objects.len() - 1
+}
+
 /// Which objects of a body to resend after Splunk answered `400` code 6 with
 /// `invalid-event-number` `n`: the object to drop, and the range of objects to send again, or
 /// `None` when `n` names no object of the body. It assumes Splunk indexed every object before
@@ -212,6 +257,19 @@ enum AckPoll {
 fn after_invalid_event(objects: usize, n: u64) -> Option<(usize, Range<usize>)> {
     let n = usize::try_from(n).ok().filter(|&n| n < objects)?;
     Some((n, n + 1..objects))
+}
+
+/// Whether a `/event` answer says Splunk didn't take the body: any `429` (codes 26 and 27), or a
+/// `503` that is code 9 ("Server is busy") or carries no HEC body. It is [`Fault::Clean`], and
+/// [`after_delivery`] makes it `Ambiguous` once a body of the `send` was accepted. A `500` code 8
+/// may have indexed, and a `408`, `502`, `504`, or other `503` says nothing either way, so those
+/// stay `Ambiguous`.
+fn is_busy(status: u16, reply: Option<&HecReply>) -> bool {
+    match status {
+        429 => true,
+        503 => reply.is_none_or(|reply| reply.code == HecStatus::SERVER_BUSY.code),
+        _ => false,
+    }
 }
 
 /// A failure of a later request in a `send` that already had a body accepted: a `Clean` fault
@@ -494,7 +552,8 @@ impl SplunkHecOutput {
         let reply = parse_reply(body.as_bytes());
         let snippet = redacted_snippet(&body, &self.token);
         let fault = match status.as_u16() {
-            408 | 429 | 500..=599 => Fault::Ambiguous,
+            code if is_busy(code, reply.as_ref()) => Fault::Clean,
+            408 | 500..=599 => Fault::Ambiguous,
             code => {
                 self.telemetry.count(REQUESTS_REJECTED, 1.0, &[("code", code_tag(reply.as_ref()))]);
                 if let (400, Some(HecReply { code: 6, invalid_event_number: Some(n), .. })) =
@@ -546,23 +605,57 @@ impl SplunkHecOutput {
         );
     }
 
-    /// One body, and its code-6 resend (module doc's "Faults" table). `sent_any` says whether an
-    /// earlier request of this `send` was accepted, and is set once one of these is.
+    /// One body, split in two when Splunk Cloud answers it as over its cap, and each half's
+    /// code-6 resend (module doc's "Faults" table). `sent_any` says whether an earlier request of
+    /// this `send` was accepted, and is set once one of these is.
     async fn send_body(
         &mut self,
         objects: &[Object<'_>],
         ack_ids: &mut Vec<u64>,
         sent_any: &mut bool,
     ) -> anyhow::Result<()> {
+        if self.send_once(objects, ack_ids, sent_any, true).await? == BodyOutcome::OverCloudCap {
+            let mid = split_point(objects);
+            self.diag.warn_throttled(
+                "oversize",
+                format_args!(
+                    "Splunk refused a request of {} bytes as invalid (code 6) at object 0, its \
+                     answer to a body over Splunk Cloud's {SPLUNK_CLOUD_BODY_CAP}-byte cap; \
+                     resent it as two requests -- lower 'max_body_bytes' to \
+                     {SPLUNK_CLOUD_BODY_CAP} or less",
+                    body_len(objects)
+                ),
+            );
+            for half in [&objects[..mid], &objects[mid..]] {
+                self.send_once(half, ack_ids, sent_any, false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One body and its code-6 resend. A code 6 naming object 0 of a body over
+    /// [`SPLUNK_CLOUD_BODY_CAP`] is Splunk Cloud's oversize answer, not a bad object: a lone
+    /// object is dropped as `oversize`; several are [`BodyOutcome::OverCloudCap`] for the caller
+    /// to split when `may_split`, and [`Fault::Permanent`] otherwise.
+    async fn send_once(
+        &mut self,
+        objects: &[Object<'_>],
+        ack_ids: &mut Vec<u64>,
+        sent_any: &mut bool,
+        may_split: bool,
+    ) -> anyhow::Result<BodyOutcome> {
         let reply = self.post_event(objects).await.map_err(|err| after_delivery(err, *sent_any))?;
         let n = match reply {
             EventReply::Accepted { ack_id } => {
                 *sent_any = true;
                 self.keep_ack_id(ack_id, ack_ids);
-                return Ok(());
+                return Ok(BodyOutcome::Done);
             }
             EventReply::InvalidEvent { n } => n,
         };
+        if n == 0 && body_len(objects) > SPLUNK_CLOUD_BODY_CAP {
+            return self.over_cloud_cap(objects, may_split);
+        }
         let Some((bad, rest)) = after_invalid_event(objects.len(), n) else {
             let message = format!(
                 "Splunk rejected a request of {} objects as invalid (code 6) at object {n}, \
@@ -588,7 +681,7 @@ impl SplunkHecOutput {
             ),
         );
         if rest.is_empty() {
-            return Ok(());
+            return Ok(BodyOutcome::Done);
         }
         let reply =
             self.post_event(&objects[rest]).await.map_err(|err| after_delivery(err, *sent_any))?;
@@ -596,7 +689,7 @@ impl SplunkHecOutput {
             EventReply::Accepted { ack_id } => {
                 *sent_any = true;
                 self.keep_ack_id(ack_id, ack_ids);
-                Ok(())
+                Ok(BodyOutcome::Done)
             }
             EventReply::InvalidEvent { n } => Err(anyhow::anyhow!(
                 "splunk_hec_out: Splunk rejected the resend after a dropped invalid object as \
@@ -604,6 +697,40 @@ impl SplunkHecOutput {
             ))
             .map_err(|err| err.context(Fault::Permanent)),
         }
+    }
+
+    /// Splunk Cloud's oversize answer to `objects` (`send_once`).
+    fn over_cloud_cap(
+        &mut self,
+        objects: &[Object<'_>],
+        may_split: bool,
+    ) -> anyhow::Result<BodyOutcome> {
+        let bytes = body_len(objects);
+        if let [(_, records)] = objects {
+            self.telemetry.count(RECORDS_DROPPED, *records as f64, &[("reason", "oversize")]);
+            self.diag.warn_throttled(
+                "oversize",
+                format_args!(
+                    "Splunk refused one HEC object of {bytes} bytes as invalid (code 6), its \
+                     answer to a body over Splunk Cloud's {SPLUNK_CLOUD_BODY_CAP}-byte cap; \
+                     dropped it"
+                ),
+            );
+            return Ok(BodyOutcome::Done);
+        }
+        if may_split {
+            return Ok(BodyOutcome::OverCloudCap);
+        }
+        let message = format!(
+            "Splunk refused half of a split request, {bytes} bytes in {} objects, as invalid \
+             (code 6) at object 0, its answer to a body over Splunk Cloud's \
+             {SPLUNK_CLOUD_BODY_CAP}-byte cap -- lower 'max_body_bytes' to \
+             {SPLUNK_CLOUD_BODY_CAP} or less",
+            objects.len()
+        );
+        self.diag.warn_throttled("oversize", &message);
+        Err(anyhow::anyhow!("splunk_hec_out: {message}"))
+            .map_err(|err| err.context(Fault::Permanent))
     }
 
     /// One `/ack` poll for `pending`.
@@ -1046,8 +1173,23 @@ mod tests {
 
     #[tokio::test]
     async fn each_response_class_maps_to_its_fault() {
-        for status in [408, 429, 500, 503] {
-            assert_eq!(fault_for(status, "").await, Fault::Ambiguous, "{status}");
+        let body = |code| String::from_utf8(encode_status_body(code, None)).unwrap();
+        // Nothing of the `send` accepted yet: a busy answer says Splunk didn't take the body.
+        for (status, body) in
+            [(429, String::new()), (429, body(26)), (503, body(9)), (503, "".into())]
+        {
+            assert_eq!(fault_for(status, &body).await, Fault::Clean, "{status} {body}");
+        }
+        // Answers that may have indexed, or say nothing either way.
+        for (status, body) in [
+            (408, String::new()),
+            (500, String::new()),
+            (500, body(8)),
+            (502, String::new()),
+            (503, body(18)),
+            (504, String::new()),
+        ] {
+            assert_eq!(fault_for(status, &body).await, Fault::Ambiguous, "{status} {body}");
         }
         for status in [301, 400, 401, 403, 404, 413] {
             assert_eq!(fault_for(status, "").await, Fault::Permanent, "{status}");
@@ -1158,6 +1300,152 @@ mod tests {
         assert_eq!(after_invalid_event(4, 3), Some((3, 4..4)));
         assert_eq!(after_invalid_event(4, 4), None);
         assert_eq!(after_invalid_event(4, u64::MAX), None);
+    }
+
+    /// A busy answer after an earlier body of the `send` was accepted is ambiguous: a `Clean`
+    /// retry would index that body twice.
+    #[tokio::test]
+    async fn a_busy_answer_after_an_accepted_body_is_ambiguous() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (addr, log) = collector(move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                success()
+            } else {
+                (503, String::from_utf8(encode_status_body(9, None)).unwrap())
+            }
+        })
+        .await;
+        let mut out = sink(addr).with_max_body_bytes(300);
+        let err = out.send(&logs(10)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 2, "one body accepted, then a busy answer");
+    }
+
+    // ---- Splunk Cloud's oversize answer ------------------------------------------------------
+
+    /// A collector answering as Splunk Cloud does: code 6 naming object 0 for a body over its
+    /// cap, and success otherwise.
+    async fn cloud_capped() -> (SocketAddr, Log) {
+        collector(|_, body| {
+            if body.len() > SPLUNK_CLOUD_BODY_CAP {
+                (400, String::from_utf8(encode_status_body(6, Some(0))).unwrap())
+            } else {
+                success()
+            }
+        })
+        .await
+    }
+
+    /// A sink whose `max_body_bytes` lets a body past Splunk Cloud's cap, uncompressed to keep
+    /// the large bodies cheap.
+    fn over_cap_sink(addr: SocketAddr) -> (Arc<Registry>, SplunkHecOutput) {
+        let (registry, out) = metered(addr);
+        let out = out
+            .with_max_body_bytes(16 * 1024 * 1024)
+            .with_compression(SplunkCompression::None)
+            .with_diagnostics(Diagnostics::new("splunk"));
+        (registry, out)
+    }
+
+    /// Log events of `bytes` bytes each, told apart by their first character.
+    fn large_logs(sizes: &[usize]) -> EventBatch {
+        batch(
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| log_event(&format!("{i}{}", "x".repeat(*n))))
+                .collect(),
+        )
+    }
+
+    /// A body of two objects over the cap is split, and both halves are delivered.
+    #[tokio::test]
+    async fn a_code_6_at_object_0_over_the_cloud_cap_splits_the_body() {
+        let (addr, log) = cloud_capped().await;
+        let (registry, mut out) = over_cap_sink(addr);
+        out.send(&large_logs(&[3_000_000, 3_000_000])).await.expect("both halves accepted");
+
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3, "the whole body, then each half");
+        assert!(captured[0].body.len() > SPLUNK_CLOUD_BODY_CAP);
+        assert_eq!(captured[1].decode()[0].events.len(), 1);
+        assert_eq!(captured[2].decode()[0].events.len(), 1);
+        let first = |c: &Captured| messages(&c.decode())[0].chars().next().unwrap();
+        assert_eq!((first(&captured[1]), first(&captured[2])), ('0', '1'));
+        let points = registry.drain(0);
+        assert_eq!(total(&points, RECORDS, &[]), 2.0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[]), 0.0);
+        assert_eq!(out.diag.occurrences("oversize"), 1);
+        assert_eq!(out.diag.occurrences("invalid_event"), 0);
+    }
+
+    /// One object over the cap is dropped as oversize, not as an invalid event.
+    #[tokio::test]
+    async fn a_code_6_at_object_0_over_the_cloud_cap_drops_a_lone_object_as_oversize() {
+        let (addr, log) = cloud_capped().await;
+        let (registry, mut out) = over_cap_sink(addr);
+        out.send(&large_logs(&[6_000_000])).await.expect("the drop is counted, not a fault");
+
+        assert_eq!(log.lock().unwrap().len(), 1, "nothing resent");
+        let points = registry.drain(0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "oversize")]), 1.0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "invalid_event")]), 0.0);
+        assert_eq!(total(&points, RECORDS, &[]), 0.0);
+    }
+
+    /// A half still over the cap after the one split is permanent.
+    #[tokio::test]
+    async fn a_half_still_over_the_cloud_cap_is_permanent() {
+        let (addr, log) = cloud_capped().await;
+        let (_registry, mut out) = over_cap_sink(addr);
+        let err = out.send(&large_logs(&[3_000_000, 3_000_000, 3_000_000])).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 2, "the whole body, then the first half only");
+    }
+
+    /// A code 6 naming object 0 of a body at or under the cap keeps the drop-one rule.
+    #[tokio::test]
+    async fn a_code_6_at_object_0_under_the_cloud_cap_drops_that_object() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let (addr, log) = collector(move |_, _| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                (400, String::from_utf8(encode_status_body(6, Some(0))).unwrap())
+            } else {
+                success()
+            }
+        })
+        .await;
+        let (registry, out) = metered(addr);
+        let mut out = out.with_diagnostics(Diagnostics::new("splunk"));
+        out.send(&logs(3)).await.expect("the resend is accepted");
+
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(messages(&captured[1].decode()), ["line 1", "line 2"]);
+        let points = registry.drain(0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "invalid_event")]), 1.0);
+        assert_eq!(total(&points, RECORDS_DROPPED, &[("reason", "oversize")]), 0.0);
+        assert_eq!(out.diag.occurrences("oversize"), 0);
+    }
+
+    #[test]
+    fn a_body_splits_at_half_its_bytes_and_never_at_an_end() {
+        let objects = |sizes: &[usize]| -> Vec<(Vec<u8>, usize)> {
+            sizes.iter().map(|n| (vec![b'x'; *n], 1)).collect()
+        };
+        for (sizes, mid) in [
+            (&[3, 3][..], 1),
+            (&[1, 1, 1, 1][..], 2),
+            (&[10, 1, 1][..], 1),
+            (&[1, 1, 10][..], 2),
+            (&[3, 3, 3][..], 2),
+        ] {
+            let owned = objects(sizes);
+            let borrowed: Vec<Object<'_>> = owned.iter().map(|(b, r)| (b.as_slice(), *r)).collect();
+            assert_eq!(split_point(&borrowed), mid, "{sizes:?}");
+        }
     }
 
     /// The first failing body aborts the ones after it.

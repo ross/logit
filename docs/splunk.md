@@ -151,8 +151,12 @@ before compression). An event larger than that alone is dropped, counted
 older releases 1,000,000. Splunk documents `413` for a body over it (the run didn't send
 one), and `splunk_hec_out` doesn't retry a `413`. A Splunk Cloud 10.5.2605.9 trial stack accepted
 bodies up to 5,242,881 bytes and refused 6,000,000 and above with `400` code 6 naming object 0,
-not `413`. Over that cap, `splunk_hec_out` drops the body's first object as `invalid_event` and
-resends the rest. The 2 MiB default sits under it.
+not `413`. `splunk_hec_out` reads a code 6 naming the first object of a body over 5 MiB
+(5,242,880 bytes) as that answer: it splits the body in two and sends each half, and a half
+refused the same way fails the batch; a body of one object is dropped, counted
+`logit.output.records.dropped{reason="oversize"}`. The 2 MiB default sits under the cap, and a
+`max_body_bytes` above 5 MiB logs a warning at startup, so against Splunk Cloud keep it at or
+under `5MiB`.
 
 `splunk_hec_in` caps a request at `max_request_bytes` (5 MiB by default), both as sent and after
 gzip decompression, and answers `413` past it. Raise it if a client sends larger bodies.
@@ -167,8 +171,12 @@ envelope, though, and a `503` after some of them were delivered makes the retry 
 again. Give the sinks behind `splunk_hec_in` a `buffer:` large enough to absorb a stall.
 
 `splunk_hec_out` isn't duplicate-safe either: Splunk indexes a resent event twice, and one batch
-can be several requests. The default posture is at-most-once, so a `5xx` or a timeout drops the
-batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
+can be several requests. The default posture is at-most-once, so a `500`, a `408`, or a timeout
+drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates. A busy
+Splunk is the exception: a `429`, or a `503` code 9, says Splunk didn't take the body, so while
+no body of the batch has been accepted the sink retries the batch under either posture, on the
+runtime's backoff. It ignores a `Retry-After` header. The same answer after an earlier body of the
+batch was accepted is treated like a `500`, since a retry would resend that body.
 
 ### One malformed event costs only itself
 

@@ -225,6 +225,7 @@ use logit_config::{
     ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
+use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -607,6 +608,20 @@ const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
 /// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
 const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
     ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
+
+/// Rule 70's startup warning for a `splunk_hec_out` `max_body_bytes` above
+/// [`SPLUNK_CLOUD_BODY_CAP`], or `None` at or under it.
+fn splunk_cloud_body_cap_warning(id: &str, max_body_bytes: u64) -> Option<String> {
+    (max_body_bytes > SPLUNK_CLOUD_BODY_CAP as u64).then(|| {
+        format!(
+            "component '{id}': splunk_hec_out 'max_body_bytes' ({max_body_bytes}) is above \
+             {SPLUNK_CLOUD_BODY_CAP} bytes, a bound at or below Splunk Cloud's observed cap (a \
+             5,242,881-byte body accepted, 6,000,000 refused) -- a Splunk Cloud stack may refuse \
+             a larger body, which the sink then resends as two requests or drops; Splunk \
+             Enterprise allows up to 800 MiB"
+        )
+    })
+}
 
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
@@ -3146,7 +3161,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // `/services/collector/event/event`, and one with a query or fragment would bury the route
     // inside it. The token gets rule 66's checks for the same reason:
     // HTTP strips a header value's surrounding whitespace. An `ack_timeout` without `ack` would
-    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS.
+    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS. A `max_body_bytes` over
+    // Splunk Cloud's cap is a warning, not an error: Splunk Enterprise's cap is 800 MiB.
     for (id, component) in &components {
         let ComponentKind::SplunkHecOut {
             endpoint,
@@ -3219,6 +3235,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': splunk_hec_out 'max_body_bytes' must be greater than 0 -- 0 \
                  would drop every event as oversize"
             );
+        }
+        if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
+            tracing::warn!("{warning}");
         }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
@@ -5843,6 +5862,25 @@ mod tests {
             }
         }));
         assert!(err.contains("'max_body_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 70: a `max_body_bytes` above Splunk Cloud's cap resolves, with a warning; at the cap
+    /// there is none.
+    #[test]
+    fn a_splunk_hec_out_max_body_bytes_over_the_cloud_cap_warns() {
+        let cap = SPLUNK_CLOUD_BODY_CAP as u64;
+        let warning = splunk_cloud_body_cap_warning("out", cap + 1).expect("above the cap");
+        assert!(warning.contains("component 'out'"), "{warning}");
+        assert!(warning.contains("5242880 bytes"), "{warning}");
+        assert_eq!(splunk_cloud_body_cap_warning("out", cap), None);
+        assert_eq!(splunk_cloud_body_cap_warning("out", 2 * 1024 * 1024), None);
+        let kind = splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { max_body_bytes, .. } = k {
+                *max_body_bytes = 800 * 1024 * 1024;
+            }
+        });
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.

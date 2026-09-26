@@ -404,3 +404,30 @@ the Cloud run" section maps it item by item. By decision:
   enabling one takes Splunk's support or account team, so whether an Edge Processor's HEC
   destination delivers to a non-Splunk receiver stays open. Ingest Processor sends only to Splunk
   indexes, S3, and Observability Cloud, so it has no destination that reaches `logit`.
+
+## Amendment: busy answers before acceptance, and an oversize code 6 (2026-09-26)
+
+Two answers the sink misread under its default at-most-once posture. By decision:
+
+- **Decision 2, faults across requests (the sink amendment's bullet):** a `429` (codes 26 and 27), or a `503` that is code 9
+  ("Server is busy") or carries no HEC body, is now `Fault::Clean` until a `/event` request of the
+  `send` is accepted, and `Fault::Ambiguous` after, the rule a connect failure already follows.
+  The criterion is "not taken": each of these says Splunk refused the body before indexing
+  anything, so a retry can't duplicate it, where it used to be `Ambiguous` and dropped a batch
+  Splunk never took. A `408`, a `500` (code 8 may have indexed), a `502`, a `504`, and any other
+  `503` stay `Ambiguous` in both positions. One receiver is an exception to "refused before
+  indexing": `splunk_hec_in` answered `503` code 9 after delivering part of a multi-resource
+  body until `splunk/listener-fidelity`, so a relay into a `logit` older than that can deliver
+  the part twice. `Retry-After` is ignored: `write_loop`'s retry loop
+  has no seam for a server-supplied delay, and building one is out of scope
+  (`docs/known-gaps.md`, "Splunk").
+- **Decision 18, code 6:** a code 6 naming object 0 of a body over
+  `logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP` (5,242,880 bytes, before compression) is
+  read as Splunk Cloud's oversize answer, not a bad object 0. A body of several objects is split
+  in two at half its bytes and each half sent, one level only: a half answered the same way is
+  `Fault::Permanent`. A body of one object is dropped, counted
+  `records.dropped{reason="oversize"}` with the `oversize` diagnostic. A code 6 naming object 0
+  of a body at or under the cap keeps the drop-one rule. Rule 70 accepts a `max_body_bytes` above
+  the cap, since Splunk Enterprise allows 800 MiB, and logs a startup warning naming Cloud's cap.
+  Rejected: capping `max_body_bytes` at 5 MiB in rule 70, which would refuse a valid Enterprise
+  configuration.

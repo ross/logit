@@ -1246,16 +1246,39 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Consequence:** a rejection with one of these codes is counted under `other`, and the
     diagnostic's body quote is what names it.
   - **Revisit trigger:** a real Splunk answers one of them.
-- **Splunk Cloud answers an oversize body with code 6, not `413`.** The 10.5.2605.9 trial stack
-  accepted bodies up to 5,242,881 bytes and answered 6,000,000 and above with `400`
-  `{"text":"Invalid data format","code":6,"invalid-event-number":0}`. `splunk_hec_out` can't tell
-  that from object 0 failing to parse, so a `max_body_bytes` above the receiver's cap drops a valid
-  first object, counted `records.dropped{reason="invalid_event"}` rather than `oversize`, and
-  resends the rest.
-  - **Consequence:** none at the 2 MiB default, which sits under Cloud's observed cap; a raised
-    `max_body_bytes` loses one object per oversize body.
-  - **Workaround:** keep `max_body_bytes` at or under 5 MiB against Splunk Cloud.
-  - **Revisit trigger:** a Splunk Cloud stack whose cap is under 2 MiB.
+- **Splunk Cloud's oversize answer is inferred from the body's size.** The 10.5.2605.9 trial
+  stack accepted bodies up to 5,242,881 bytes and answered 6,000,000 and above with `400`
+  `{"text":"Invalid data format","code":6,"invalid-event-number":0}`, not `413`, and that reply
+  says nothing a malformed object 0 wouldn't. `splunk_hec_out` reads it as oversize only when the
+  body is over 5,242,880 bytes before compression: it splits the body in two once, or drops a lone
+  object counted `records.dropped{reason="oversize"}`, and a half refused the same way fails the
+  batch. Rule 70 warns at startup about a `max_body_bytes` above that.
+  - **Consequence:** a stack whose cap is under 5 MiB gets the drop-one-object rule on an
+    oversize body, losing a valid object. The split cuts at an object boundary, so a body that one
+    split can't bring under the cap fails the batch, which any `max_body_bytes` above the cap
+    allows (objects of 0.1, 5.3, and 0.1 MB leave a 5.4 MB first half). A busy answer later in the
+    same batch retries it whole, re-sending the dropped object and counting it in
+    `records.dropped` again on each retry; the record is never delivered twice. The exact cap
+    between 5,242,881 and 6,000,000 bytes wasn't bisected.
+  - **Workaround:** keep `max_body_bytes` at or under 5 MiB against Splunk Cloud, as the startup
+    warning says; the 2 MiB default is.
+  - **Revisit trigger:** a Splunk Cloud stack whose cap is under 5 MiB, or one that answers
+    `413`.
+- **`splunk_hec_out` ignores `Retry-After`.** A busy answer (`429`, or `503` code 9) before any
+  body of the batch was accepted is retried on `write_loop`'s own backoff (200 ms doubling to
+  `buffer.retry_max_delay`), whatever delay Splunk asks for; the runtime's retry loop has no seam
+  for a server-supplied delay.
+  - **Consequence:** a retry can come sooner than Splunk asked, drawing another busy answer, until
+    the batch's retry budget runs out.
+  - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
+    `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
+- **`splunk_hec_out` retries a `503` code 9 as "not taken", which a `logit` receiver may not
+  honor.** Splunk refuses a busy request before indexing it, but `splunk_hec_in` answered `503`
+  code 9 after delivering part of a multi-resource body until `splunk/listener-fidelity`.
+  - **Consequence:** a `splunk_hec_out -> splunk_hec_in` relay into a `logit` older than that
+    fix can deliver part of a body twice under the default at-most-once posture.
+  - **Revisit trigger:** `splunk/listener-fidelity` landing, after which only a relay into an
+    older `logit` is affected.
 - **`splunk_hec_out` treats codes 7, 12, 13, and 15 as permanent.** Each names an object in
   `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
   it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
