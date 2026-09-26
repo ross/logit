@@ -1372,17 +1372,12 @@ enum ReadStep {
 
 /// One read step, raced against `shutdown`.
 ///
-/// `AsyncReadExt::read_buf` is cancellation-safe (no bytes are consumed if another `select!` arm
-/// wins), which lets both this race and [`serve_connection`]'s deadline timeout drop it mid-await
-/// without losing stream bytes.
+/// Unbiased: see `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
-/// `shutdown.changed()` plus the caller's explicit `*shutdown.borrow()` check, which covers what
-/// `changed()` alone cannot: shutdown having fired before this loop iteration began. `wait_for`
-/// would also compile here, because its `Ref` is only returned, never held across an await inside
-/// `wait_for`, and this `select!`'s arms don't await. The pair matches `crate::logit`'s
-/// `serve_connection`, whose shutdown arm does await (`going_away`): there a `Ref` that `select!`
-/// kept alive through the arm body would make the future `!Send`, and `tokio::spawn` requires
-/// `Send`.
+/// `shutdown.changed()` needs the caller's `*shutdown.borrow()` check for a shutdown that fired
+/// before the iteration. `wait_for` would compile here, since these arms don't await; `changed()`
+/// matches `crate::logit`'s `serve_connection`, whose shutdown arm awaits, where a `Ref` kept alive
+/// by `select!` would make the future `!Send`.
 async fn read_step<S: AsyncRead + Unpin + Send>(
     stream: &mut S,
     buf: &mut BytesMut,

@@ -172,6 +172,12 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      permit has reached `Done` and forwards nothing.
    - `macros/select.rs`: `select!` returns on the first branch that is `Ready` and drops the rest.
    - `sync/watch.rs`: `wait_for`'s behavior when its future is dropped and re-created.
+   - Coop budgeting, which
+     `a_read_loop_dropped_mid_iteration_counts_what_its_batch_held_and_closes_the_queue` relies on
+     to leave a read one unit: the 128-unit initial budget (`task/coop/mod.rs`), `select!`'s
+     `poll_budget_available` check before polling any arm (`macros/select.rs`), `async_io`'s
+     `poll_proceed`/`made_progress` (`runtime/io/registration.rs`), and
+     `tokio::task::consume_budget` spending one unit per call.
 6. **Grace races prefer the node's own outcome, and a grace arm can't be starved.**
    - `run_input`'s `select!` will be `biased`, with the input's arm first, so a listener's `Err`
      that is ready in the same poll as the backstop is returned, not discarded.

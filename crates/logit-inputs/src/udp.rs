@@ -462,17 +462,12 @@ impl<D: Decoder + Send> UdpListener<D> {
             self.diag.clone(),
         ));
 
-        // Only `read` can finish on its own (a fatal socket error, or `shutdown`), and either way
-        // it closes `queue` first (`read_loop`'s doc; `read_loop_sampled` forwards its result
-        // unchanged). That lets `decode`'s `pop_many` see "closed and empty" and return, so once
-        // `read` is done, `decode` is driven to completion: it drains what `read` queued and
-        // flushes its accumulator.
+        // Unbiased; the loser is awaited to the end, never dropped: see
+        // `docs/design/pipeline-graph.md`'s "Cancellation points".
         //
-        // The `Option` guards the one case `select!` can't rule out: `decode` finishing first.
-        // Only `read_loop` closes `queue` while `drive` runs (the residual guard closes it again on
-        // the way out), so today that can't happen, but polling `decode` again
-        // after it resolved would be the double-poll hazard `docs/adr/decoupled-listener-io.md`
-        // calls out; that branch awaits `read` instead.
+        // The `Option` guards `decode` finishing first, which can't happen while only `read_loop`
+        // closes `queue`. Polling `decode` again after it resolved would be the double-poll hazard
+        // `docs/adr/decoupled-listener-io.md` calls out, so that branch awaits `read` instead.
         let already_finished = tokio::select! {
             result = &mut read => Some(result),
             () = &mut decode => None,
@@ -726,10 +721,8 @@ fn report_receive_buffer(
 /// differs from a sink queue's `block`); only an operator's `overflow: block` stops reading.
 ///
 /// Races every read and every push against `shutdown`, so shutdown stops this loop at once rather
-/// than when the next datagram arrives or (under `block`) downstream makes room. What the loop
-/// holds when it stops is counted, never lost silently: a cancelled `push_many` counts its own
-/// remainder (`logit_pipeline::CountedDrain`), and [`ReadHalf`] counts a batch `push_many` never
-/// took, both as `logit.component.datagrams.dropped{reason="shutdown"}`.
+/// than when the next datagram arrives or (under `block`) downstream makes room. Both `select!`s
+/// are unbiased: see `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
 /// **Telemetry is per batch, not per datagram.** One [`BatchReader::read_batch`] call is one
 /// `logit.input.reads`, one `logit.input.datagrams` of however many it returned, one
@@ -739,9 +732,8 @@ fn report_receive_buffer(
 /// batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
 /// mutex, which `decode_loop` contends for from the other side of the same component.
 ///
-/// Closes `queue` on every exit: a return, a fatal socket error, or this future being dropped
-/// ([`ReadHalf`]'s `Drop`). That is how `decode_loop`'s `pop_many` sees "closed and empty" and
-/// returns.
+/// [`ReadHalf`] closes `queue` on every exit, dropped future included: the only signal
+/// `decode_loop` has that nothing more will arrive.
 ///
 /// A `read_batch` above the queue's `max_datagrams` is legal: `push_many` evicts or blocks per
 /// policy, per item, as `push` would, so rejecting it would only refuse a working config.
@@ -779,8 +771,7 @@ async fn read_loop<S: DatagramSocket>(
         if truncated > 0 {
             telemetry.count("logit.input.datagrams.truncated", truncated as f64, &[]);
         }
-        // Unbiased, and `wait_for` is `Ready` on its first poll once shutdown is set, so about
-        // half the time `push_many` is never polled and `half.batch` is still full on return.
+        // Unbiased: `half.batch` may still be full on return (see [`ReadHalf`]).
         tokio::select! {
             () = queue.push_many(&mut half.batch) => {}
             _ = shutdown.wait_for(|&due| due) => return Ok(()),
@@ -788,10 +779,9 @@ async fn read_loop<S: DatagramSocket>(
     }
 }
 
-/// [`read_loop`]'s batch and queue, so that every way out of the loop counts what the batch holds
-/// and closes the queue: a return, and the future being dropped. The drop case is reachable: under
-/// `receive.shutdown_grace: 0s`, `run_input`'s backstop can drop the read future while it yields
-/// to the coop budget between the read and the push, with the batch full.
+/// [`read_loop`]'s batch and queue, so that every way out of the loop, a return or the future
+/// being dropped, counts what the batch still holds as `datagrams.dropped{reason="shutdown"}` and
+/// closes the queue.
 ///
 /// Disjoint from `push_many`'s own count: a `push_many` that was polled leaves the `Vec` empty
 /// (its `CountedDrain` took every item), and one that was never polled took nothing. A datagram in
@@ -1440,11 +1430,10 @@ async fn read_loop_sampled<S: DatagramSocket>(
 /// the budget to zero. The sleep is registered with the timer driver on every poll and the tick
 /// lands on time.
 ///
-/// Not part of why the budget drains: a `WouldBlock` `async_io` (see 2), and
-/// `watch::Receiver::wait_for`, `read_loop`'s other arm. `wait_for` is wrapped in
-/// `cooperative(..)` (`sync/watch.rs`), whose `Coop::poll` (`task/coop/mod.rs`) runs
-/// `poll_proceed` first: a `Pending` restores the budget, and only a `Ready`, which ends the loop,
-/// spends one unit. The read side's successful `recvmmsg` is what drains it.
+/// Not part of why the budget drains: a `WouldBlock` `async_io` (see 2), and `read_loop`'s
+/// `wait_for`, whose `cooperative(..)` wrapper spends a unit only on the `Ready` that ends the loop.
+/// Successful `recvmmsg` calls drain it. Arms and what a losing one drops: see
+/// `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
 /// Measured on a release build, eight senders flooding one listener for 10 s at about 90% kernel
 /// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
@@ -1592,13 +1581,9 @@ impl ReceiveBufferSampler {
 /// datagram**: it says whether event timestamps are trustworthy under load, and a per-batch figure
 /// would lose the resolution it exists to report.
 ///
-/// Dropping this future mid-batch (the grace backstop, while an `emit` is parked on a full
-/// downstream) discards up to `pop_batch` popped-but-undecoded datagrams. They're counted
-/// `logit.component.datagrams.dropped`/`bytes.dropped{reason="shutdown"}` through a
-/// `logit_pipeline::CountedDrain`, and logged once (see [`Undecoded`]). The datagram whose `emit`
-/// is parked was already yielded and decoded, so it's never counted twice. A panic unwinding
-/// through the drain would also count the rest as `shutdown`, since shutdown is the only
-/// production canceller.
+/// The popped batch is iterated through [`Undecoded`], which counts what a drop mid-batch leaves
+/// undecoded (`docs/design/pipeline-graph.md`'s "Cancellation points"). A panic unwinding through it would count
+/// the rest as `shutdown` too, since shutdown is the only production canceller.
 ///
 /// Owns `sink` (the `Fanout`): dropping this future closes every downstream inbox, the shutdown
 /// cascade in `docs/adr/service-lifecycle-and-output-retry.md`.
