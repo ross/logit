@@ -962,18 +962,25 @@ and the accept-queue gauges.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy` (a `503`: code 9 on a post, code 18 on `/health`); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
-| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), or `malformed` (`400` code 6: a `/event` object the codec can't parse, after the objects before it were delivered, or an `/ack` body that isn't `{"acks":[…]}`) |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), `malformed` (`400` code 6: a `/event` object the codec can't parse, after the objects before it were delivered, or an `/ack` body that isn't `{"acks":[…]}`), or `no_channel` (`400` code 10, an `/ack` request that names no channel) |
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`. See below |
+| `logit.input.acks.issued` | count | `ackId`s issued, one per `200`, or code 6 after a delivered prefix, to a request that names a channel |
+| `logit.input.acks.polled{result}` | count | ids asked about on `/ack`: `acked` (answered `true`), or `unknown` (answered `false`: already reported, never issued on that channel, or dropped) |
+| `logit.input.acks.dropped{reason}` | count | ids issued and never reported: `expired` (more than `max_pending_acks` newer ids issued on the channel) or `evicted` (with its channel) |
+| `logit.input.ack_channels.evicted` | count | channels evicted, least recently used first, once `max_ack_channels` are held |
 
 **A busy request is not a lost one**, as on `datadog_in`: after 5 seconds without the pipeline
-taking a request's batches, the request gets `503` code 9 with `Retry-After: 1`, counted
-`class="busy"`, and every HEC client retries it. A `/event` body that carries several envelopes
-decodes to one batch per resource; a `503` after some of them were delivered makes the retry
-deliver those again, so a steady busy rate on multi-envelope clients means duplicates downstream
-(the module doc's "Backpressure" section).
+taking a request's first batch, the request gets `503` code 9 with `Retry-After: 1`, counted
+`class="busy"`, with nothing of it delivered, and every HEC client retries it. A `/event` body
+that carries several envelopes decodes to one batch per resource; once the first is delivered,
+the rest wait without a deadline and the request gets `200` (or, for a body cut short, its code
+6), so `logit.input.request.duration` can run past 5 seconds while `busy` stays flat (the module
+doc's "Backpressure" section). From a busy answer until a later request's data is taken, for at
+most 5 seconds, `/health` answers `503` code 18, counted
+`logit.input.requests{route="health", class="busy"}`.
 
 The codec's own counters (an object skipped for a missing or blank `event`, an unknown envelope
 key, a bad `time` or `fields`, a span that fell back to a log) are in the tables of

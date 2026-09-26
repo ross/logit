@@ -21,8 +21,8 @@
 //! |---|---|---|
 //! | `POST /services/collector`, `/services/collector/event`, `/services/collector/event/1.0` | `decode_events`: concatenated objects or an array, one batch per resource | `200` `{"text":"Success","code":0}`, plus `"ackId":N` with a channel |
 //! | `POST /services/collector/raw`, `/services/collector/raw/1.0` | `decode_raw`: one log per line, the envelope from the query string's `host`, `source`, `sourcetype`, and `index` | as `/event` |
-//! | `POST /services/collector/ack` | `{"acks":[<id>,…]}` | `200` `{"acks":{"<id>":true,…}}` |
-//! | `GET`/`HEAD /services/collector/health`, `/services/collector/health/1.0` | none; no authentication | `200` `{"text":"HEC is healthy","code":17}` |
+//! | `POST /services/collector/ack` | `{"acks":[<id>,…]}`, with a channel | `200` `{"acks":{"<id>":true,…}}`, each id per "Channels and acknowledgment" below |
+//! | `GET`/`HEAD /services/collector/health`, `/services/collector/health/1.0` | none; no authentication | `200` `{"text":"HEC is healthy","code":17}`, or `503` code 18 while busy (below) |
 //! | `OPTIONS` on a path above | none; no authentication | `200`, empty, `Allow: POST,OPTIONS` (`GET,HEAD,OPTIONS` on `/health`), as Splunk answers; Docker's `splunk` log driver won't start a container without it |
 //! | another method on a path above | none | `405` + that `Allow`, `{"text":"Method Not Allowed","code":405}` |
 //! | any other path | none | `404` `{"text":"Not Found","code":404}` |
@@ -32,14 +32,28 @@
 //! Splunk answers without a HEC code (`404`, `405`, `408`, `413`, `415`) carries the HTTP status
 //! as its `code`.
 //!
-//! **Channels and acknowledgment.** A request that names a channel (the `X-Splunk-Request-Channel`
-//! header, or `?channel=`) is answered with an `ackId`, drawn from one per-listener counter that
-//! starts at 1, as is a `400` code 6 naming an object past the first whose prefix passed the
-//! bounded wait, delivered or all skipped (step 7); a request without one gets no `ackId`, as from
-//! a token without `useACK`. `/ack`
-//! answers every id it is asked about `true`: a `200` already means the data reached the pipeline,
-//! and a pipeline that can't take it answers `503` instead. No channel is ever required, and
-//! neither the channel nor the id enters an event.
+//! **Channels and acknowledgment.** A `/event` or `/raw` request that names a channel (the
+//! `X-Splunk-Request-Channel` header, else `?channel=`; an empty value names none) is answered
+//! with an `ackId` drawn from that channel's own counter, which starts at 0, as a Splunk `useACK`
+//! token answers. A request without one gets no `ackId`, as from a token without `useACK`, and
+//! is never refused for it. An id is issued only once the data reached the pipeline, so
+//! "indexed" here is "accepted", not "delivered by a sink": on a `200`, and on a `400` code 6
+//! naming an object past the first whose prefix was delivered or skipped whole (step 8), as
+//! Splunk answers with a channel.
+//!
+//! `/ack` needs a channel (`400` code 10 without one, Splunk's answer) and reads it as Splunk
+//! does: an id issued on that channel and not yet reported is `true` once and forgotten, so a
+//! second poll for it is `false`; any other id is `false`, an id from another channel included. A
+//! repeated id in one poll is answered once. [`AckLedger`] holds the state, bounded for
+//! accidental data: `max_ack_channels` channels, the least recently used evicted past it with its
+//! ids, and per channel an issue window of `max_pending_acks` ids, the oldest expiring as a new one
+//! is issued. A client that names a channel and never polls (`splunk_hec_out` with `ack: false`)
+//! costs one bit per request up to that window. Neither the channel nor the id enters an event.
+//!
+//! **Health.** `/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`
+//! while the pipeline is refusing posts: the most recent `/event` or `/raw` request to reach
+//! delivery was answered `503` code 9, less than [`HEALTH_BUSY_WINDOW`] ago. Otherwise it is `200`
+//! code 17. It never checks a token, as on Splunk.
 //!
 //! # Request handling
 //!
@@ -57,34 +71,39 @@
 //!    listener settled"; [`authenticate`] and [`respond`] implement them.
 //! 4. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`: `deflate` and `zstd`
 //!    included, which Splunk doesn't accept either.
-//! 5. **Body.** A body that stops arriving mid-upload gets `408` and the connection closes, when
+//! 5. **Channel.** An `/ack` request that names no channel is `400` code 10.
+//! 6. **Body.** A body that stops arriving mid-upload gets `408` and the connection closes, when
 //!    `idle_timeout` is set. The gzip output is capped at `max_request_bytes` too (`413` past it),
 //!    and a stream that doesn't decompress is `400` code 6 with no `invalid-event-number`,
 //!    delivering nothing: decompression yields no output short of the whole stream.
-//! 6. **Decode.** An empty body is `400` code 5. A `/event` body that isn't HEC JSON is the
+//! 7. **Decode.** An empty body is `400` code 5. A `/event` body that isn't HEC JSON is the
 //!    codec's [`HecError`]: code 6 with `invalid-event-number` naming the first bad object `N`.
 //!    As Splunk does, the objects before `N` are kept and go on to delivery, and none from `N` on;
 //!    `N` = 0 is answered here with nothing delivered and no `ackId`. A `/raw` body with no
 //!    non-empty line is code 5. A malformed `/ack` body is code 6.
-//! 7. **Delivery**, bounded (below), then the route's `200`, or for a body cut short at object
+//! 8. **Delivery**, bounded (below), then the route's `200`, or for a body cut short at object
 //!    `N` > 0, the same `400` code 6 naming `N`, with the `ackId` a `200` would have carried. A
 //!    body whose every kept object the codec skipped (no `event`) sends nothing and still answers
 //!    as if it had.
 //!
 //! # Backpressure: a bounded wait, then `503`
 //!
-//! As on `datadog_in` ([`crate::datadog`]'s "Backpressure" section): the request's batches are
-//! sent in order under one deadline, [`BUSY_AFTER`] from the start of delivery, each reaching every
-//! downstream consumer or none. When the deadline passes, the request is answered `503`
-//! `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
-//! `logit.input.requests{class="busy"}`, and the batches not yet delivered are counted
+//! A `503` code 9 means nothing of the body was taken, as on Splunk, so a client (and
+//! `splunk_hec_out`) may resend it whole. The request's first batch is sent under a deadline,
+//! [`BUSY_AFTER`] from the start of delivery, reaching every downstream consumer or none
+//! ([`crate::datadog`]'s "Backpressure" section has the mechanism). When the deadline passes, the
+//! request is answered `503` `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
+//! `logit.input.requests{class="busy"}`, and every batch of the body is counted
 //! `logit.input.batches.dropped{reason="busy"}`. Every HEC client retries a code 9.
 //!
-//! **A `503` after partial delivery duplicates.** A `/event` body carrying several envelopes
-//! decodes to one batch per resource. If the deadline passes after some of them were delivered,
-//! the client's retry sends the whole body again, and the batches already delivered are delivered
-//! twice. Splunk indexes a resent event twice as well; the timed-out batch itself reaches no
-//! consumer.
+//! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
+//! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
+//! delivered would make the client's retry deliver it twice. So the remaining batches go through
+//! [`deliver_detached`], which waits until the pipeline takes them, however long that is, and the
+//! request is answered (`200`, or a prefix's code 6); `idle_timeout` doesn't close a connection
+//! with a request in flight. A client that closes the connection while it waits still gets every
+//! batch delivered; it saw no answer, so its retry duplicates the body, the ordinary at-least-once
+//! outcome.
 //!
 //! # Telemetry
 //!
@@ -93,18 +112,22 @@
 //! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the body
 //! size as sent, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
 //! `unknown_route`, `method`, `oversize`, `query_token`, `auth`, `encoding`,
-//! `malformed_encoding`, `no_data`, `malformed`, `stalled`, or `body_read` (a body that failed for a
-//! reason other than its size, such as a client disconnecting mid-upload). A code 6 that follows a
-//! delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects are counted where
-//! any delivered batch's are, on the listener's fanout edge.
-//! `logit.input.batches.dropped{reason="busy"}` counts the batches a `503` left undelivered. The
+//! `malformed_encoding`, `no_data`, `malformed`, `no_channel`, `stalled`, or `body_read` (a body
+//! that failed for a reason other than its size, such as a client disconnecting mid-upload). A code
+//! 6 that follows a delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects
+//! are counted where any delivered batch's are, on the listener's fanout edge.
+//! `logit.input.batches.dropped{reason="busy"}` counts the batches a `503` left undelivered.
+//! Acknowledgment: `logit.input.acks.issued`, `logit.input.acks.polled{result}` (`acked`, or
+//! `unknown` for an id not pending on the polled channel), `logit.input.acks.dropped{reason}`
+//! (`expired` past `max_pending_acks`, `evicted` with its channel), and
+//! `logit.input.ack_channels.evicted`. A `503` `/health` is counted `class="busy"`. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s
 //! `splunk_hec_in` section is the operator-facing account.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_with_idle, is_length_limit, json_response, matches_any_key,
-    now_nanos, Activity, BodyReadError, DecompressError, Encoding,
+    deliver_detached, deliver_with_deadline, drive_with_idle, is_length_limit, json_response,
+    matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
 };
 use crate::Input;
 use base64::Engine as _;
@@ -120,6 +143,7 @@ use logit_proto::splunk::response::{
     encode_ack_reply, encode_http_error, encode_status, encode_success, parse_ack_request,
 };
 use logit_proto::splunk::{Envelope, HecError, HecStatus, SplunkDecoder};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,6 +173,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 9 (this module's "Backpressure" section), `datadog_in`'s bound.
 const BUSY_AFTER: Duration = Duration::from_secs(5);
 
+/// How long after a request is answered `503` code 9 `/health` answers `503` code 18, unless a
+/// later request reaches the pipeline first (this module's "Health").
+pub const HEALTH_BUSY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Default for [`SplunkHecInput::with_max_ack_channels`], mirrored by hand in
+/// `logit_config::default_splunk_max_ack_channels`.
+pub const DEFAULT_MAX_ACK_CHANNELS: usize = 256;
+
+/// Default for [`SplunkHecInput::with_max_pending_acks`]: Splunk's own per-channel default,
+/// `max_number_of_acked_requests_pending_query_per_ack_channel`. Mirrored by hand in
+/// `logit_config::default_splunk_max_pending_acks`.
+pub const DEFAULT_MAX_PENDING_ACKS: usize = 1_000_000;
+
 /// The header a HEC client names its channel in.
 const CHANNEL_HEADER: &str = "x-splunk-request-channel";
 
@@ -172,8 +209,9 @@ pub struct SplunkHecInput {
     max_request_bytes: usize,
     max_connections: usize,
     busy_after: Duration,
-    /// The next `ackId`, shared by every connection of this listener.
-    next_ack_id: Arc<AtomicU64>,
+    health_busy_window: Duration,
+    max_ack_channels: usize,
+    max_pending_acks: usize,
 }
 
 impl SplunkHecInput {
@@ -190,7 +228,9 @@ impl SplunkHecInput {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
             busy_after: BUSY_AFTER,
-            next_ack_id: Arc::new(AtomicU64::new(1)),
+            health_busy_window: HEALTH_BUSY_WINDOW,
+            max_ack_channels: DEFAULT_MAX_ACK_CHANNELS,
+            max_pending_acks: DEFAULT_MAX_PENDING_ACKS,
         }
     }
 
@@ -264,6 +304,27 @@ impl SplunkHecInput {
         self.busy_after = d;
         self
     }
+
+    /// Overrides [`HEALTH_BUSY_WINDOW`]. Not a config field: a test/tuning hook, as
+    /// [`Self::with_busy_after`] is.
+    pub fn with_health_busy_window(mut self, d: Duration) -> Self {
+        self.health_busy_window = d;
+        self
+    }
+
+    /// Overrides [`DEFAULT_MAX_ACK_CHANNELS`], how many channels' acknowledgment state this
+    /// listener keeps (`max_ack_channels:` in config). Graph rule 69 rejects `0`.
+    pub fn with_max_ack_channels(mut self, max_ack_channels: usize) -> Self {
+        self.max_ack_channels = max_ack_channels;
+        self
+    }
+
+    /// Overrides [`DEFAULT_MAX_PENDING_ACKS`], how many of a channel's most recent ids stay
+    /// answerable (`max_pending_acks:` in config). Graph rule 69 rejects `0`.
+    pub fn with_max_pending_acks(mut self, max_pending_acks: usize) -> Self {
+        self.max_pending_acks = max_pending_acks;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -293,6 +354,8 @@ impl Input for SplunkHecInput {
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
+        let acks = Arc::new(AckLedger::new(self.max_ack_channels, self.max_pending_acks));
+        let health = Arc::new(BusyHealth::new(self.health_busy_window));
         loop {
             let (stream, peer) = match accept_queue.accept(&listener).await {
                 Ok(accepted) => accepted,
@@ -320,7 +383,8 @@ impl Input for SplunkHecInput {
                 tokens: Arc::clone(&self.tokens),
                 max_request_bytes: self.max_request_bytes,
                 busy_after: self.busy_after,
-                next_ack_id: Arc::clone(&self.next_ack_id),
+                acks: Arc::clone(&acks),
+                health: Arc::clone(&health),
                 peer,
             });
             let mut diag = self.diag.clone();
@@ -390,9 +454,219 @@ struct Shared {
     tokens: Arc<[Box<[u8]>]>,
     max_request_bytes: usize,
     busy_after: Duration,
-    next_ack_id: Arc<AtomicU64>,
+    /// Shared by every connection of one run.
+    acks: Arc<AckLedger>,
+    /// Shared by every connection of one run.
+    health: Arc<BusyHealth>,
     /// For rejection diagnostics' message text only, never a tag.
     peer: SocketAddr,
+}
+
+/// What `/health` reads: when a request was last answered `503` code 9 (this module's "Health").
+struct BusyHealth {
+    epoch: Instant,
+    /// Nanoseconds from `epoch` to the last busy answer, plus one; `0` when a request reached the
+    /// pipeline since, or none has been busy.
+    busy_at: AtomicU64,
+    window: Duration,
+}
+
+impl BusyHealth {
+    fn new(window: Duration) -> Self {
+        Self { epoch: Instant::now(), busy_at: AtomicU64::new(0), window }
+    }
+
+    fn mark_busy(&self) {
+        let at = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.busy_at.store(at + 1, Ordering::Relaxed);
+    }
+
+    fn mark_accepted(&self) {
+        self.busy_at.store(0, Ordering::Relaxed);
+    }
+
+    fn is_busy(&self) -> bool {
+        match self.busy_at.load(Ordering::Relaxed) {
+            0 => false,
+            at => {
+                let since = self.epoch.elapsed().saturating_sub(Duration::from_nanos(at - 1));
+                since < self.window
+            }
+        }
+    }
+}
+
+/// Every channel's acknowledgment state (this module's "Channels and acknowledgment"). One lock:
+/// each call is a hash lookup and a few word operations, and an eviction scan over at most
+/// `max_channels` entries only when a new channel arrives at the cap.
+struct AckLedger {
+    state: std::sync::Mutex<LedgerState>,
+    max_channels: usize,
+    max_pending: u64,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    channels: HashMap<Box<[u8]>, ChannelAcks>,
+    /// Bumped on every issue or poll; a channel's `last_used` orders eviction.
+    clock: u64,
+}
+
+/// What one [`AckLedger::issue`] dropped, counted by the caller outside the lock.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Dropped {
+    expired: u64,
+    evicted_channels: u64,
+    evicted_ids: u64,
+}
+
+impl AckLedger {
+    fn new(max_channels: usize, max_pending: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(LedgerState::default()),
+            max_channels: max_channels.max(1),
+            max_pending: u64::try_from(max_pending).unwrap_or(u64::MAX).max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        // A panic mid-update leaves at worst one channel's window inconsistent, which answers
+        // `false` for an id it should have answered `true`; not worth failing every request for.
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Issues `channel`'s next id, creating the channel (and evicting the least recently used one
+    /// at the cap) when it is new.
+    fn issue(&self, channel: &[u8]) -> (u64, Dropped) {
+        let mut dropped = Dropped::default();
+        let mut state = self.lock();
+        state.clock += 1;
+        let clock = state.clock;
+        if !state.channels.contains_key(channel) {
+            if state.channels.len() >= self.max_channels {
+                let oldest = state
+                    .channels
+                    .iter()
+                    .min_by_key(|(_, acks)| acks.last_used)
+                    .map(|(key, _)| key.clone());
+                if let Some(evicted) = oldest.and_then(|key| state.channels.remove(&key)) {
+                    dropped.evicted_channels += 1;
+                    dropped.evicted_ids += evicted.pending_count();
+                }
+            }
+            state.channels.insert(channel.into(), ChannelAcks::default());
+        }
+        let acks = state.channels.get_mut(channel).expect("inserted above");
+        acks.last_used = clock;
+        let (id, expired) = acks.issue(self.max_pending);
+        dropped.expired = expired;
+        (id, dropped)
+    }
+
+    /// Answers one poll: each id `true` once if it is pending on `channel`, else `false`. A
+    /// repeated id is answered at its first position only. An unknown channel is not created.
+    fn poll(&self, channel: &[u8], ids: &[u64]) -> Vec<(u64, bool)> {
+        // Deduplicated before the lock, which every connection's issue also takes: the locked
+        // section is one `take` per distinct id.
+        let mut seen = HashSet::with_capacity(ids.len());
+        let mut answered: Vec<(u64, bool)> =
+            ids.iter().filter(|&&id| seen.insert(id)).map(|&id| (id, false)).collect();
+        let mut state = self.lock();
+        state.clock += 1;
+        let clock = state.clock;
+        let mut acks = state.channels.get_mut(channel);
+        if let Some(acks) = acks.as_deref_mut() {
+            acks.last_used = clock;
+        }
+        if let Some(acks) = acks {
+            for (id, acked) in &mut answered {
+                *acked = acks.take(*id);
+            }
+        }
+        answered
+    }
+}
+
+/// One channel's issued ids as a bit window: bit `i` of `pending` is id `base + i`, set while that
+/// id is issued and not yet answered `true`. Ids are issued in order, so the window only grows at
+/// its end; words that hold no pending id are popped from its front, and ids more than the cap
+/// behind `next_id` expire. A client polling in order keeps one or two words.
+#[derive(Debug, Default)]
+struct ChannelAcks {
+    next_id: u64,
+    base: u64,
+    pending: VecDeque<u64>,
+    last_used: u64,
+}
+
+impl ChannelAcks {
+    /// Issues the next id, then expires every id more than `max_pending` behind it. Returns the id
+    /// and how many pending ids expired.
+    fn issue(&mut self, max_pending: u64) -> (u64, u64) {
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.pending.is_empty() {
+            self.base = id;
+        }
+        let offset = id - self.base;
+        let word = usize::try_from(offset / 64).expect("the window is capped in memory");
+        if word == self.pending.len() {
+            self.pending.push_back(0);
+        }
+        self.pending[word] |= 1 << (offset % 64);
+        let expired = self.expire_below(self.next_id.saturating_sub(max_pending));
+        (id, expired)
+    }
+
+    /// Clears `id` and returns `true` when it was pending.
+    fn take(&mut self, id: u64) -> bool {
+        let Some(offset) = id.checked_sub(self.base) else { return false };
+        let Some(word) = usize::try_from(offset / 64).ok().and_then(|w| self.pending.get_mut(w))
+        else {
+            return false;
+        };
+        let bit = 1u64 << (offset % 64);
+        if *word & bit == 0 {
+            return false;
+        }
+        *word &= !bit;
+        self.trim();
+        true
+    }
+
+    /// Clears every id below `floor`, returning how many were pending.
+    fn expire_below(&mut self, floor: u64) -> u64 {
+        let mut expired = 0;
+        while self.base < floor {
+            let Some(front) = self.pending.front_mut() else { break };
+            let span = floor - self.base;
+            if span >= 64 {
+                expired += u64::from(front.count_ones());
+                self.pending.pop_front();
+                self.base += 64;
+            } else {
+                let mask = (1u64 << span) - 1;
+                expired += u64::from((*front & mask).count_ones());
+                *front &= !mask;
+                break;
+            }
+        }
+        self.trim();
+        expired
+    }
+
+    /// Pops leading words with no pending id that lie wholly below `next_id`, so no later id can
+    /// land in them.
+    fn trim(&mut self) {
+        while self.pending.front() == Some(&0) && self.base + 64 <= self.next_id {
+            self.pending.pop_front();
+            self.base += 64;
+        }
+    }
+
+    fn pending_count(&self) -> u64 {
+        self.pending.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
 }
 
 /// Serves one accepted (and, with TLS on, handshaken) connection to completion: `datadog_in`'s,
@@ -535,7 +809,11 @@ async fn respond(
         return (name, REJECTED, reject(shared, "method", None, response));
     }
     if route == Route::Health {
-        return (name, OK, hec_response(HecStatus::HEALTHY));
+        return if shared.health.is_busy() {
+            (name, BUSY, hec_response(HecStatus::UNHEALTHY_QUEUES_FULL))
+        } else {
+            (name, OK, hec_response(HecStatus::HEALTHY))
+        };
     }
     let cap = shared.max_request_bytes;
     if declared_length(req.headers()).is_some_and(|len| len > cap as u64) {
@@ -561,7 +839,14 @@ async fn respond(
             return (name, REJECTED, reject(shared, "encoding", Some(message), response));
         }
     };
-    let channel = query.channel || has_channel_header(req.headers());
+    let channel: Option<Box<[u8]>> = channel_header(req.headers())
+        .map(Box::from)
+        .or_else(|| query.channel.map(|c| c.into_bytes().into_boxed_slice()));
+    if route == Route::Ack && channel.is_none() {
+        let message = "an /ack request that names no channel";
+        let response = hec_response(HecStatus::CHANNEL_MISSING);
+        return (name, REJECTED, reject(shared, "no_channel", Some(message), response));
+    }
 
     let body = match collect_with_stall_bound(Limited::new(req.into_body(), cap), stall).await {
         Ok(body) => body,
@@ -606,7 +891,16 @@ async fn respond(
     if route == Route::Ack {
         return match parse_ack_request(&body) {
             Some(ids) => {
-                let acks: Vec<(u64, bool)> = ids.into_iter().map(|id| (id, true)).collect();
+                let channel =
+                    channel.as_deref().expect("an /ack without a channel is refused above");
+                let acks = shared.acks.poll(channel, &ids);
+                let acked = acks.iter().filter(|&&(_, acked)| acked).count();
+                for (result, n) in [("acked", acked), ("unknown", acks.len() - acked)] {
+                    if n > 0 {
+                        let tags = [("result", result)];
+                        shared.telemetry.count("logit.input.acks.polled", n as f64, &tags);
+                    }
+                }
                 (name, OK, json_response(StatusCode::OK, Bytes::from(encode_ack_reply(&acks))))
             }
             None => {
@@ -650,11 +944,20 @@ async fn respond(
     };
 
     if !batches.is_empty() {
-        if let Err(not_sent) = deliver_with_deadline(&shared.sink, batches, shared.busy_after).await
-        {
+        // Only the first batch waits under the deadline: once one is delivered, a `503` would
+        // tell the client nothing was taken, and its retry would deliver that batch twice.
+        let total = batches.len();
+        let mut batches = batches.into_iter();
+        let first: Vec<EventBatch> = batches.by_ref().take(1).collect();
+        if deliver_with_deadline(&shared.sink, first, shared.busy_after).await.is_ok() {
+            // Only a delivery clears a busy `/health`: a body the codec skipped whole says
+            // nothing about the pipeline.
+            shared.health.mark_accepted();
+            deliver_detached(&shared.sink, batches.collect()).await;
+        } else {
             shared.telemetry.count(
                 "logit.input.batches.dropped",
-                not_sent as f64,
+                total as f64,
                 &[("reason", "busy")],
             );
             shared.diag.clone().warn_throttled(
@@ -665,16 +968,33 @@ async fn respond(
                     shared.peer, shared.busy_after
                 ),
             );
+            shared.health.mark_busy();
             let mut response = hec_response(HecStatus::SERVER_BUSY);
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
             return (name, BUSY, response);
         }
     }
-    let ack_id = channel.then(|| shared.next_ack_id.fetch_add(1, Ordering::Relaxed));
+    // Drawn once from the channel's ledger, for a `200` or a delivered prefix's code 6 alike.
+    let ack_id = channel.map(|channel| issue_ack_id(shared, &channel));
     if let Some(err) = invalid {
         return (name, REJECTED, reject_hec_error(shared, &err, ack_id));
     }
     (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
+}
+
+/// Issues `channel`'s next `ackId` and counts it, with anything the ledger's bounds dropped.
+fn issue_ack_id(shared: &Shared, channel: &[u8]) -> u64 {
+    let (id, dropped) = shared.acks.issue(channel);
+    let t = &shared.telemetry;
+    t.count("logit.input.acks.issued", 1.0, &[]);
+    if dropped.expired > 0 {
+        t.count("logit.input.acks.dropped", dropped.expired as f64, &[("reason", "expired")]);
+    }
+    if dropped.evicted_channels > 0 {
+        t.count("logit.input.ack_channels.evicted", dropped.evicted_channels as f64, &[]);
+        t.count("logit.input.acks.dropped", dropped.evicted_ids as f64, &[("reason", "evicted")]);
+    }
+    id
 }
 
 /// Counts one rejection under `reason` and, with a `message`, reports it through the throttled
@@ -765,16 +1085,18 @@ fn authenticate(tokens: &[Box<[u8]>], headers: &HeaderMap) -> Result<(), HecStat
     }
 }
 
-fn has_channel_header(headers: &HeaderMap) -> bool {
-    headers.get(CHANNEL_HEADER).is_some_and(|v| !v.as_bytes().trim_ascii().is_empty())
+/// The channel header's value, trimmed, when it names one.
+fn channel_header(headers: &HeaderMap) -> Option<&[u8]> {
+    let value = headers.get(CHANNEL_HEADER)?.as_bytes().trim_ascii();
+    (!value.is_empty()).then_some(value)
 }
 
-/// What this listener reads from a query string: `/raw`'s envelope, whether a channel was named,
-/// and whether a token was sent there. The first occurrence of each key wins.
+/// What this listener reads from a query string: `/raw`'s envelope, the channel, and whether a
+/// token was sent there. The first occurrence of each key wins, and an empty `channel` names none.
 #[derive(Debug, Default, PartialEq)]
 struct Query {
     envelope: Envelope,
-    channel: bool,
+    channel: Option<String>,
     token: bool,
 }
 
@@ -789,7 +1111,9 @@ impl Query {
                 "sourcetype" => &mut out.envelope.sourcetype,
                 "index" => &mut out.envelope.index,
                 "channel" => {
-                    out.channel |= !value.is_empty();
+                    if out.channel.is_none() && !value.is_empty() {
+                        out.channel = Some(value.into_owned());
+                    }
                     continue;
                 }
                 "token" => {
@@ -966,16 +1290,18 @@ mod tests {
         let (addr, mut rx) = start_default().await;
         let path = "/services/collector/event";
         let channel = "X-Splunk-Request-Channel: 0f3c2a1e-7d4b-4c55-9a1d-3b0e8d6f2c10\r\n";
+        // Each channel counts from 0 on its own; the header wins over `?channel=`.
         let cases = [
-            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":1}"#),
+            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":0}"#),
             (path.to_string(), "", SUCCESS),
-            (format!("{path}?channel=abc"), "", r#"{"text":"Success","code":0,"ackId":2}"#),
+            (format!("{path}?channel=abc"), "", r#"{"text":"Success","code":0,"ackId":0}"#),
             (
                 "/services/collector/raw?channel=abc".to_string(),
                 "",
-                r#"{"text":"Success","code":0,"ackId":3}"#,
+                r#"{"text":"Success","code":0,"ackId":1}"#,
             ),
-            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":4}"#),
+            (path.to_string(), channel, r#"{"text":"Success","code":0,"ackId":1}"#),
+            (format!("{path}?channel=abc"), channel, r#"{"text":"Success","code":0,"ackId":2}"#),
         ];
         for (path, headers, expected) in cases {
             let response = post_raw(&addr, &path, headers, ONE_EVENT).await;
@@ -984,15 +1310,80 @@ mod tests {
         }
     }
 
+    /// Splunk's `useACK` semantics: an id issued on the polled channel is `true` once, and every
+    /// other id `false`, including one from another channel.
     #[tokio::test]
-    async fn ack_answers_every_asked_id_true() {
-        let (addr, _rx) = start_default().await;
-        let response = post_raw(&addr, "/services/collector/ack", "", br#"{"acks":[3,1,2]}"#).await;
+    async fn ack_answers_an_issued_id_true_once_and_any_other_false() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let (addr, mut rx) =
+            start(SplunkHecInput::new("127.0.0.1:0").with_telemetry(telemetry), 16).await;
+        let (a, b) = ("X-Splunk-Request-Channel: a\r\n", "X-Splunk-Request-Channel: b\r\n");
+        for (headers, id) in [(a, 0), (a, 1), (b, 0)] {
+            let response = post_raw(&addr, "/services/collector/event", headers, ONE_EVENT).await;
+            let expected = format!(r#"{{"text":"Success","code":0,"ackId":{id}}}"#);
+            assert_eq!(body_of(&response), expected);
+            recv_batch(&mut rx).await;
+        }
+        let ack = "/services/collector/ack";
+        let response = post_raw(&addr, ack, a, br#"{"acks":[0,1,5,1]}"#).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert_eq!(body_of(&response), r#"{"acks":{"3":true,"1":true,"2":true}}"#);
-        let response = post_raw(&addr, "/services/collector/ack", "", br#"{"acks":"x"}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":true,"1":true,"5":false}}"#);
+        let response = post_raw(&addr, ack, a, br#"{"acks":[0,1]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":false,"1":false}}"#, "true only once");
+        let response = post_raw(&addr, &format!("{ack}?channel=new"), "", br#"{"acks":[0]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":false}}"#, "never issued on this channel");
+        let response = post_raw(&addr, ack, b, br#"{"acks":[0]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":true}}"#, "b's own id 0");
+
+        let response = post_raw(&addr, ack, a, br#"{"acks":"x"}"#).await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert_eq!(body_of(&response), r#"{"text":"Invalid data format","code":6}"#);
+        let response = post_raw(&addr, ack, "", br#"{"acks":[0]}"#).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(body_of(&response), r#"{"text":"Data channel is missing","code":10}"#);
+
+        let events = registry.drain(0);
+        assert_eq!(sum_of(&events, "logit.input.acks.issued", ("", "")), Some(3.0));
+        assert_eq!(sum_of(&events, "logit.input.acks.polled", ("result", "acked")), Some(3.0));
+        assert_eq!(sum_of(&events, "logit.input.acks.polled", ("result", "unknown")), Some(4.0));
+        assert_eq!(
+            sum_of(&events, "logit.input.requests.rejected", ("reason", "no_channel")),
+            Some(1.0)
+        );
+    }
+
+    /// Past `max_ack_channels`, the least recently used channel is evicted with its ids; past
+    /// `max_pending_acks`, a channel's oldest id expires.
+    #[tokio::test]
+    async fn the_ack_bounds_evict_the_oldest_channel_and_expire_the_oldest_id() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let input = SplunkHecInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry)
+            .with_max_ack_channels(2)
+            .with_max_pending_acks(2);
+        let (addr, mut rx) = start(input, 16).await;
+        let event = "/services/collector/event";
+        for channel in ["a", "b", "a", "a", "c"] {
+            let headers = format!("X-Splunk-Request-Channel: {channel}\r\n");
+            post_raw(&addr, event, &headers, ONE_EVENT).await;
+            recv_batch(&mut rx).await;
+        }
+        // `a` issued 0, 1, 2 with a window of 2, so 0 expired; `c` evicted `b`, the least
+        // recently used, with its id 0.
+        let ack = "/services/collector/ack";
+        let a = "X-Splunk-Request-Channel: a\r\n";
+        let response = post_raw(&addr, ack, a, br#"{"acks":[0,1,2]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":false,"1":true,"2":true}}"#);
+        let b = "X-Splunk-Request-Channel: b\r\n";
+        let response = post_raw(&addr, ack, b, br#"{"acks":[0]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":false}}"#);
+
+        let events = registry.drain(0);
+        assert_eq!(sum_of(&events, "logit.input.ack_channels.evicted", ("", "")), Some(1.0));
+        assert_eq!(sum_of(&events, "logit.input.acks.dropped", ("reason", "evicted")), Some(1.0));
+        assert_eq!(sum_of(&events, "logit.input.acks.dropped", ("reason", "expired")), Some(1.0));
     }
 
     /// `/health` answers on `GET` and `HEAD` with no token, even when tokens are configured.
@@ -1134,8 +1525,12 @@ mod tests {
         let path = "/services/collector/event";
         let channel = "X-Splunk-Request-Channel: c\r\n";
 
+        let health = "/services/collector/health";
+        let response = request_raw(&addr, "GET", health, "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "idle: {response}");
+
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
-        assert_eq!(body_of(&response), r#"{"text":"Success","code":0,"ackId":1}"#);
+        assert_eq!(body_of(&response), r#"{"text":"Success","code":0,"ackId":0}"#);
         let started = Instant::now();
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -1143,18 +1538,34 @@ mod tests {
         assert_eq!(body_of(&response), r#"{"text":"Server is busy","code":9}"#);
         assert!(started.elapsed() >= Duration::from_millis(200));
 
+        let response = request_raw(&addr, "GET", health, "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "busy: {response}");
+        assert_eq!(body_of(&response), r#"{"text":"HEC is unhealthy, queues are full","code":18}"#);
+
+        // A body the codec skips whole answers `200` but delivers nothing, so it doesn't clear it.
+        let response = post_raw(&addr, path, "", br#"{"host":"h","event":""}"#).await;
+        assert_eq!(body_of(&response), SUCCESS, "{response}");
+        let response = request_raw(&addr, "GET", health, "", b"").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "still busy: {response}");
+
         recv_batch(&mut rx).await;
         assert!(rx.try_recv().is_err(), "the 503'd batch was never delivered");
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
         assert_eq!(
             body_of(&response),
-            r#"{"text":"Success","code":0,"ackId":2}"#,
+            r#"{"text":"Success","code":0,"ackId":1}"#,
             "a 503 draws no ackId"
         );
         recv_batch(&mut rx).await;
+        let response = request_raw(&addr, "GET", health, "", b"").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "a later accepted post clears it: {response}"
+        );
 
         let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(1.0));
+        // The `503` post and the two busy `/health` answers.
+        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(3.0));
         assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
     }
 
@@ -1370,8 +1781,9 @@ mod tests {
         );
     }
 
-    /// With a channel, a code 6 after a delivered prefix carries the `ackId` a `200` would; one
-    /// naming object 0 delivers nothing and draws none. A prefix the pipeline doesn't take in time
+    /// With a channel, a code 6 after a delivered prefix carries the `ackId` a `200` would, drawn
+    /// from the channel's ledger and answered `true` by `/ack`; one naming object 0 delivers
+    /// nothing and draws none. A prefix the pipeline doesn't take in time
     /// is a `503` with no `ackId`, as for a whole body.
     #[tokio::test]
     async fn a_code_6_after_a_prefix_draws_an_ack_id_and_waits_like_a_whole_body() {
@@ -1384,7 +1796,7 @@ mod tests {
         let response = post_raw(&addr, path, channel, cut_short).await;
         assert_eq!(
             body_of(&response),
-            r#"{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":1}"#
+            r#"{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":0}"#
         );
         let response = post_raw(&addr, path, channel, br#"{"event":"#).await;
         assert_eq!(
@@ -1402,9 +1814,13 @@ mod tests {
         let response = post_raw(&addr, path, channel, ONE_EVENT).await;
         assert_eq!(
             body_of(&response),
-            r#"{"text":"Success","code":0,"ackId":2}"#,
+            r#"{"text":"Success","code":0,"ackId":1}"#,
             "neither the object-0 code 6 nor the 503 drew an id"
         );
+        // The prefix's id is in the channel's ledger as a `200`'s is.
+        let response =
+            post_raw(&addr, "/services/collector/ack", channel, br#"{"acks":[0,1,2]}"#).await;
+        assert_eq!(body_of(&response), r#"{"acks":{"0":true,"1":true,"2":false}}"#);
     }
 
     /// A gzip stream cut off after its first object decompresses to nothing, so the body is
@@ -1432,7 +1848,7 @@ mod tests {
             ("/services/collector/event", b"[]"),
             ("/services/collector/raw", b""),
             ("/services/collector/raw", b"\r\n\n"),
-            ("/services/collector/ack", b""),
+            ("/services/collector/ack?channel=c", b""),
         ] {
             let response = post_raw(&addr, path, "", body).await;
             assert!(response.starts_with("HTTP/1.1 400"), "{path} {body:?}: {response}");
@@ -1566,6 +1982,101 @@ mod tests {
         assert_eq!(input.handshake_timeout, Duration::from_secs(5));
         assert_eq!(input.max_request_bytes, 5 * 1024 * 1024);
         assert_eq!(input.max_connections, 1024);
+        assert_eq!(input.health_busy_window, Duration::from_secs(5));
+        assert_eq!(input.max_ack_channels, 256);
+        assert_eq!(input.max_pending_acks, 1_000_000);
+    }
+
+    #[test]
+    fn a_channel_window_answers_each_issued_id_once() {
+        let mut acks = ChannelAcks::default();
+        for expected in 0..200 {
+            assert_eq!(acks.issue(1_000), (expected, 0));
+        }
+        assert!(!acks.take(200), "not issued yet");
+        assert!(acks.take(130));
+        assert!(!acks.take(130), "already answered");
+        for id in 0..130 {
+            assert!(acks.take(id), "{id}");
+        }
+        assert_eq!(acks.base, 128, "words wholly answered are popped");
+        assert_eq!(acks.pending_count(), 69);
+        for id in 131..200 {
+            assert!(acks.take(id));
+        }
+        assert_eq!(acks.pending_count(), 0);
+        assert_eq!(acks.pending.len(), 1, "the word holding next_id stays");
+        assert_eq!(acks.issue(1_000), (200, 0));
+        assert!(acks.take(200));
+    }
+
+    #[test]
+    fn a_channel_window_expires_the_oldest_id_past_its_cap() {
+        let mut acks = ChannelAcks::default();
+        let mut expired = 0;
+        for _ in 0..300 {
+            expired += acks.issue(100).1;
+        }
+        assert_eq!(expired, 200);
+        assert_eq!(acks.pending_count(), 100);
+        assert!(!acks.take(199), "expired");
+        assert!(acks.take(200));
+        assert!(acks.take(299));
+        // An id answered before it would expire isn't counted when the window passes it.
+        let mut acks = ChannelAcks::default();
+        acks.issue(1);
+        assert!(acks.take(0));
+        assert_eq!(acks.issue(1), (1, 0));
+        assert_eq!(acks.issue(1), (2, 1));
+    }
+
+    #[test]
+    fn the_ledger_evicts_the_least_recently_used_channel() {
+        let ledger = AckLedger::new(2, 10);
+        assert_eq!(ledger.issue(b"a"), (0, Dropped::default()));
+        assert_eq!(ledger.issue(b"b").0, 0);
+        assert_eq!(ledger.issue(b"b").0, 1);
+        assert_eq!(ledger.poll(b"a", &[7]), [(7, false)], "a poll touches a");
+        let (id, dropped) = ledger.issue(b"c");
+        assert_eq!(id, 0);
+        assert_eq!(dropped, Dropped { expired: 0, evicted_channels: 1, evicted_ids: 2 });
+        assert_eq!(ledger.poll(b"b", &[0, 1]), [(0, false), (1, false)]);
+        assert_eq!(ledger.poll(b"a", &[0]), [(0, true)]);
+        assert_eq!(ledger.issue(b"b").0, 0, "an evicted channel starts over at 0");
+    }
+
+    /// A large poll of repeated ids answers each distinct id once, in the order first asked.
+    #[test]
+    fn a_large_poll_with_repeated_ids_answers_each_id_once_in_order() {
+        let ledger = AckLedger::new(4, 1_000_000);
+        for _ in 0..1_000 {
+            ledger.issue(b"a");
+        }
+        let ids: Vec<u64> = (0..700_000u64).map(|i| (i * 7919) % 2_000).collect();
+        let started = Instant::now();
+        let answered = ledger.poll(b"a", &ids);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        let mut seen = HashSet::new();
+        let first_seen: Vec<u64> = ids.iter().copied().filter(|&id| seen.insert(id)).collect();
+        assert_eq!(first_seen.len(), 2_000);
+        let order: Vec<u64> = answered.iter().map(|&(id, _)| id).collect();
+        assert_eq!(order, first_seen);
+        for &(id, acked) in &answered {
+            assert_eq!(acked, id < 1_000, "{id}");
+        }
+    }
+
+    #[test]
+    fn health_is_busy_only_within_its_window() {
+        let health = BusyHealth::new(Duration::from_millis(50));
+        assert!(!health.is_busy());
+        health.mark_busy();
+        assert!(health.is_busy());
+        health.mark_accepted();
+        assert!(!health.is_busy());
+        health.mark_busy();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!health.is_busy(), "past the window");
     }
 
     #[test]
@@ -1585,9 +2096,11 @@ mod tests {
         assert_eq!(q.envelope.host.as_deref(), Some("a b"));
         assert_eq!(q.envelope.index.as_deref(), Some("main"));
         assert_eq!(q.envelope.source, None);
-        assert!(!q.channel, "an empty channel names none");
+        assert_eq!(q.channel, None, "an empty channel names none");
         assert!(q.token, "a bare token key is still a query-string token");
         assert_eq!(Query::parse(None), Query::default());
+        let q = Query::parse(Some("channel=&channel=x%2Dy&channel=z"));
+        assert_eq!(q.channel.as_deref(), Some("x-y"), "the first non-empty channel");
     }
 
     /// The value of `metric`'s `Sum` in a drained snapshot, restricted to the point carrying

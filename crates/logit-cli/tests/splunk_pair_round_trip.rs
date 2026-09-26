@@ -5,8 +5,8 @@
 //! (`crates/logit-proto/tests/splunk_fixed_point.rs`), and `splunk_hec_out` re-encoding it gives
 //! the same batch back through `splunk_hec_in`. What this file adds over the codec tests is both
 //! HTTP hops: the `/event` route, gzip, the token check, body splitting, the channel and
-//! acknowledgment exchange, which the listener answers for every id, and a code 6's drop and
-//! resend.
+//! acknowledgment exchange, which the listener answers per channel as a `useACK` token does, and a
+//! code 6's drop and resend.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -148,27 +148,48 @@ async fn a_split_batch_arrives_in_order() {
     assert_nothing_delivered(&mut rx).await;
 }
 
-/// Under `ack: true` the sink polls `/ack` with the listener's ids, which it answers `true`.
-#[tokio::test]
-async fn ack_true_is_acknowledged_by_the_listener() {
-    let (addr, mut rx) = listener().await;
-    let registry = Registry::new();
-    let mut out = sink(addr, &registry).with_ack(true, Duration::from_secs(10));
-    let batch = logs();
-    out.send(&batch).await.expect("acknowledged");
-    assert_eq!(recv(&mut rx).await, batch);
-
-    let acked: f64 = registry
-        .drain(0)
+/// The `Sum` total of `name` in `events`, over points whose `key` tag is `value`.
+fn sum_tagged(events: &[Event], name: &str, key: &str, value: &str) -> f64 {
+    events
         .iter()
-        .filter(|e| e.attributes.get("result").and_then(Value::as_str) == Some("acked"))
+        .filter(|e| e.attributes.get(key).and_then(Value::as_str) == Some(value))
         .flat_map(|e| e.metrics.iter())
+        .filter(|m| logit_core::interner::resolve(m.name) == name)
         .map(|m| match &m.kind {
             MetricKind::Sum(s) => s.value,
             _ => 0.0,
         })
-        .sum();
-    assert_eq!(acked, 1.0);
+        .sum()
+}
+
+/// Under `ack: true` the sink polls `/ack` on its channel with the ids the listener issued on
+/// it, and every request is acknowledged once: a one-body batch, then a batch split across
+/// several bodies, whose ids the sink polls together.
+#[tokio::test]
+async fn ack_true_is_acknowledged_by_the_listener() {
+    let (addr, mut rx) = listener().await;
+    let registry = Registry::new();
+    let mut out =
+        sink(addr, &registry).with_ack(true, Duration::from_secs(10)).with_max_body_bytes(1_000);
+    let batch = logs();
+    out.send(&batch).await.expect("acknowledged");
+    assert_eq!(recv(&mut rx).await, batch);
+
+    let mut split = logs();
+    let template = split.events[0].clone();
+    split.events = (0..20).map(|_| template.clone()).collect();
+    out.send(&split).await.expect("acknowledged");
+    let mut delivered = Vec::new();
+    while delivered.len() < split.events.len() {
+        delivered.extend(recv(&mut rx).await.events);
+    }
+    assert_eq!(delivered, split.events);
+
+    let events = registry.drain(0);
+    let posted = sum_tagged(&events, "logit.output.requests", "route", "event");
+    assert!(posted > 2.0, "the second batch took several bodies: {posted}");
+    assert_eq!(sum_tagged(&events, "logit.output.acks", "result", "acked"), posted);
+    assert_eq!(sum_tagged(&events, "logit.output.acks", "result", "timeout"), 0.0);
 }
 
 /// A token the listener doesn't list is refused permanently, and nothing is delivered.

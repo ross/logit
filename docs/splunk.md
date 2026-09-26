@@ -140,7 +140,9 @@ A token with `useACK` on answers `400` to any request without a `X-Splunk-Reques
 code 10 on Splunk Enterprise, and code 28 on Splunk Cloud, whose text adds that several indexers
 need sticky-session load balancing. `splunk_hec_out` sends one per-sink channel on every request
 whether `ack` is on or not, so it works against both token kinds. If you put another HEC client in
-front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires no channel on any route.
+front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires a channel only on
+`/ack`. It issues ids from 0 per channel and answers a poll as a `useACK` token does: an id issued
+on that channel `true` once, then `false`, and any other id `false`.
 
 ### Size caps
 
@@ -161,14 +163,16 @@ under `5MiB`.
 `splunk_hec_in` caps a request at `max_request_bytes` (5 MiB by default), both as sent and after
 gzip decompression, and answers `413` past it. Raise it if a client sends larger bodies.
 
-### A `503` defers a client's data, and can duplicate some of it
+### A `503` defers a client's data
 
-When the pipeline doesn't take a request's events within 5 seconds, `splunk_hec_in` answers `503`
-code 9 with `Retry-After: 1` rather than holding the connection, counted
-`logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9, so this defers delivery
-rather than losing it. A `/event` body that carries several envelopes decodes into one batch per
-envelope, though, and a `503` after some of them were delivered makes the retry deliver those
-again. Give the sinks behind `splunk_hec_in` a `buffer:` large enough to absorb a stall.
+When the pipeline doesn't take a request's first batch within 5 seconds, `splunk_hec_in` answers
+`503` code 9 with `Retry-After: 1` rather than holding the connection, counted
+`logit.input.batches.dropped{reason="busy"}`. As on Splunk, that answer means nothing of the body
+was taken, and HEC clients retry a code 9, so this defers delivery rather than losing it. A
+`/event` body that carries several envelopes decodes into one batch per envelope; once the first
+is delivered, the listener waits for the pipeline to take the rest, however long that is, and
+answers `200`, so a retry never repeats part of a body. Give the sinks behind `splunk_hec_in` a
+`buffer:` large enough to absorb a stall.
 
 `splunk_hec_out` isn't duplicate-safe either: Splunk indexes a resent event twice, and one batch
 can be several requests. The default posture is at-most-once, so a `500`, a `408`, or a timeout
@@ -236,7 +240,9 @@ event, and both reject a token with leading or trailing whitespace at startup.
   presents that same default certificate (`CN=SplunkServerDefaultCert`), whose name doesn't match
   the host, so it needs `tls: {insecure_skip_verify: true}`. Whether a paid stack presents a
   public certificate isn't verified. `/services/collector/health` answers without a token, so it
-  can check the endpoint before a token is set up.
+  can check the endpoint before a token is set up. `splunk_hec_in` answers it the same way, and
+  `503` code 18 for up to 5 seconds after refusing a post as busy, which is Splunk's documented
+  answer for a full queue.
 
 ## What's verified
 

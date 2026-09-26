@@ -1236,10 +1236,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     received, not indexed.
   - **Revisit trigger:** a customer stack that refuses acknowledgment, or Splunk documenting it
     for HEC on Splunk Cloud.
+- **`splunk_hec_in` keeps acknowledgment state within fixed bounds, not Splunk's.** It keeps
+  `max_ack_channels` channels (default 256), evicting the least recently used, and per channel an
+  issue window of the most recent `max_pending_acks` ids (default 1,000,000). Splunk's
+  `max_number_of_acked_requests_pending_query_per_ack_channel` caps ids outstanding, so an id
+  answered in the middle frees a slot there; here the window moves with every id issued, so an
+  unpolled id expires after that many newer ones whatever was answered in between. The bounds are
+  for accidental data under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): a client that sends a channel
+  and never polls, or many short-lived channels.
+  - **Consequence:** an id on an evicted channel, or one that expired, answers `false`, and a
+    client polling for it times out, counted `logit.input.acks.dropped{reason}`.
+    `splunk_hec_out` then fails the batch `Ambiguous`, and resends it under at-least-once.
+  - **Workaround:** raise `max_ack_channels` above the number of clients that send a channel at
+    once.
+  - **Revisit trigger:** a client that relies on Splunk's outstanding-id count, or channel churn
+    that evicts live channels.
 - **HEC codes 21, 22, 24, and 25 aren't modeled, and the texts for 18 through 27 are from
   Splunk's documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the
   four, so `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it
-  arrives with a non-retryable status, and `splunk_hec_in` never answers one. Code 28, Splunk
+  arrives with a non-retryable status, and `splunk_hec_in` never answers one. `splunk_hec_in`'s
+  busy `/health` answers code 18 with the documented text. Code 28, Splunk
   Cloud's answer to a `useACK` request without a channel, is modeled from Splunk Cloud
   10.5.2605.9's verbatim reply. Neither `script/splunk-interop` run provoked a code 18 through
   27.
@@ -1293,7 +1310,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - the exporter's `Summary` shape and a span link's `trace_state` member (telemetrygen writes
     neither), and `otel.log.name`;
   - Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`;
-  - a HEC client using `useACK` against `splunk_hec_in`;
+  - a third-party HEC client using `useACK` against `splunk_hec_in`, whose per-channel ids and
+    polls the round-trip tests drive only with `splunk_hec_out` and hand-written requests;
   - any Splunk Enterprise release other than 10.4.3, including which release raised
     `max_content_length` from 1,000,000 bytes;
   - a paid Splunk Cloud Platform stack's `http-inputs-<stack>` endpoint and its certificate: the
