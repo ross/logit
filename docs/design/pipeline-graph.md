@@ -370,6 +370,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
     `max_body_bytes` of `0`, or a bad `tls` (including any `tls` with an `http://` endpoint).
+71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

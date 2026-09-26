@@ -124,6 +124,36 @@ sources, found:
    without waiting for it to return: a Lua error naming `max_memory` ends such a call there, as a
    counted script error, ahead of the post-call check that then decides the node's fate. Off by
    default; `0` is rejected by config validation.
+
+   **Amended 2026-09-26 (`luab/w4`), after a refuter pass measured the first design:**
+   - *The verdict is a collection loop, not one collection.* One LuaJIT full cycle halves the
+     string table and frees a finalized userdata only on the cycle after, so a million transient
+     strings over 100 KiB of live data read 48.8 MB, then 4.2, 1.1, 0.3, 0.1, and 0.05 MB across
+     successive cycles. The verdict runs `expire_registry_values` then a full collection while the
+     VM is over the cap and the previous pass freed at least an eighth of what it started from, at
+     most eight passes (`ScriptWorker::collect_until_under`). A collection that itself errors fails
+     the node with its message.
+   - *It is rate-limited, counted, and runs after the send.* A cap under about twice the working
+     set forced a full collection on every batch, 76% of one measured run. Forced verdicts run at
+     most once per second, or ten times the last one's duration if longer, and count as
+     `logit.script.vm.gc.forced` with a `.gc.duration` timing. An over-cap reading inside that
+     window is skipped and the verdict deferred to the window's end, which the loop wakes for even
+     with no batch arriving. The check runs after the batch's or `flush()`'s send, with the
+     heartbeat idle, so the batch that crossed the cap reaches downstream rather than vanishing
+     uncounted; the batches still in the node's inbox are counted as a revoked inbox's are. A
+     memory failure is a returned error, not a panic, so it logs `memory_limit_exceeded` and never
+     `thread_panicked`.
+   - *The in-call check runs on every `Event.new` and is sticky.* Reading the VM's byte count is a
+     field read, so every call compares; over the cap, a collection runs at most once per 1024
+     calls, and one that leaves the VM still over trips a flag under which every later `Event.new`
+     raises until the runtime clears it after the call. Without the flag,
+     `pcall(Event.new, ..)` swallowed each error: 200,000 wrapped constructions reached 29 MB
+     against a 4 MiB cap.
+   - *Residual: the cap bounds the Lua VM heap only.* A retained event costs the VM about 149
+     bytes while its payload stays in the Rust heap (10,000 retained 1 KiB events: 1.5 MB of VM,
+     about 10 MB of Rust). Size the cap at least twice the script's steady working set, read from
+     `logit.script.vm.memory`. A script that hoards events rather than Lua values is visible in
+     process RSS, not bounded by this cap; `docs/known-gaps.md`'s Lua entry records it.
 4. **A depth cap on Lua-to-Rust table conversion.** `MAX_TABLE_DEPTH = 128`, local to
    `logit-script`, matches native's `MAX_VALUE_DEPTH` so a value a script builds always decodes on
    a `logit_in` peer. A table nested past that depth is a clear conversion error, naming the
@@ -319,5 +349,22 @@ Filled in as each workstream lands.
   `readyz_wire_matches_the_spec_table` and `a_stalled_node_turns_ready_into_stalled_and_back`;
   `heartbeat.rs`'s `enter_tick_leave_keep_the_busy_bit_and_advance`. RT-11 findings; CORE-15's time
   half addended.
-- `luab/w4` (CORE-15 close, `max_memory`): pending.
+- `luab/w4` (CORE-15 close, `max_memory`): #391. `lua`/`lua_file` `max_memory` and graph
+  rule 71, pinned by `crates/logit-config`'s `lua_max_memory_parses_a_byte_count_string` and
+  `lua_file_max_memory_is_optional`, `graph.rs`'s `a_lua_max_memory_of_zero_is_rejected` and
+  `a_lua_max_memory_validates`, and `logit-cli`'s
+  `build_spec_carries_max_memory_into_the_lua_runtime_config`; `crates/logit-script/src/memory.rs`'s
+  `collect_until_under_keeps_collecting_while_a_pass_frees_enough`,
+  `collect_until_under_stops_once_a_pass_frees_little`,
+  `a_retaining_event_new_loop_trips_the_in_call_check`,
+  `a_pcall_wrapped_event_new_loop_stays_tripped`, `a_discarding_event_new_loop_never_trips`, and
+  `with_no_cap_event_new_never_checks_memory`; `runtime.rs`'s
+  `a_lua_node_over_max_memory_fails_the_run_as_runtime_naming_it`,
+  `garbage_over_max_memory_is_collected_before_the_node_is_failed`,
+  `max_memory_is_checked_after_flush_too`, `a_memory_verdict_is_rate_limited`,
+  `a_skipped_verdict_runs_once_the_window_ends_with_no_batch_arriving`, and
+  `thread_outcome_reports_a_panic_payload_as_a_message`. Each new test failed first against a
+  mutation of the behavior it pins (no verdict, no collection before it, no rate limit, no
+  sticky trip, one pass only, no inbox sweep, a memory failure logged as a panic). CORE-15
+  findings.
 - `luab/w5` (CORE-19 close, docs): pending.

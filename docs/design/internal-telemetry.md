@@ -423,8 +423,9 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
+| `logit.script.vm.gc.forced` / `.gc.duration` | count / timing | `run_lua`, per `max_memory` verdict: the full collections forced by a VM over its cap, rate-limited to about one a second. A steady count means the cap sits too close to the working set |
 
-The last two rows are Lua-specific (recorded in `run_lua`, not shared with
+The last four rows are Lua-specific (recorded in `run_lua`, not shared with
 `run_transform`/`run_output`), because only a Lua node has a VM to sample or a script return value
 to classify. Every other row applies uniformly across component kinds.
 
@@ -443,6 +444,12 @@ Events it produced after its channels were revoked count as
 `events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
 inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under
 its own id, as a sink's abandoned inbox does.
+
+**A node over its `max_memory` logs `memory_limit_exceeded`** through `Diagnostics::error`, which
+counts nothing, naming the bytes held, the collections run, and the cap, then fails the run like
+a wedge, with an error naming the node. The batch that crossed the cap has already been sent; the
+batches still waiting in its inbox count as `batches.dropped`/`events.dropped{reason="shutdown"}`
+under its own id. A memory failure is not a panic, so it never logs `thread_panicked`.
 
 **`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
 `Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
@@ -1352,7 +1359,9 @@ layer 2). Uniquely, a script can also call a **script-facing** `telemetry` globa
 [Metrics from Lua scripts](#metrics-from-lua-scripts) and `docs/design/lua-api.md`.
 
 The runtime's stall watcher adds the `script_stalled` (`warn_throttled`, so counted in
-`logit.component.diagnostics{key}`) and `script_resumed` (`info`) diagnostic keys; see layer 2's
+`logit.component.diagnostics{key}`) and `script_resumed` (`info`) diagnostic keys, and
+`max_memory` adds `memory_limit_exceeded` (`error`) and the `logit.script.vm.gc.forced` count and
+`.gc.duration` timing; see layer 2's
 [receive and processing side](#receive-and-processing-side-the-node-loops).
 
 A script's `print(...)` is a self-log line, never stdout: `print: <arguments, tab-joined>` at

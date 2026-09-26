@@ -2137,14 +2137,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   instead of silently meaning "no `flush()`". Both are documented in
   [lua-api.md](design/lua-api.md); [memory.md](design/memory.md)'s recommendations have the full
   write-up.
-- **A script has no time bound, and its memory bound will be opt-in.** No instruction or time
+- **A script has no time bound, and its memory bound is opt-in.** No instruction or time
   hook is used, by design: LuaJIT's compiled traces skip a count hook unless the runtime is built
   with `LUAJIT_ENABLE_CHECKHOOK`, so a hook would be both slow and unreliable ([ADR
   `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md)). What bounds a script instead:
   the table-depth cap and raw table reads (`luab/w1`), `newproxy`'s removal (`luab/w2`), and the
   stall heartbeat with progress-based wedge detection (`luab/w3`): a script inside one call with no
   progress for 10 s reads `stalled`, and one still stuck 2 s into shutdown has its channels revoked
-  and fails the run. Its memory stays unbounded until `max_memory` (`luab/w4`). Each Lua thread
+  and fails the run. Its memory is bounded only when the component sets `max_memory` (`luab/w4`):
+  a VM still over the cap after full garbage collections fails the node, exit code 2. Each Lua
+  thread
   runs on an 8 MiB stack (virtual, committed on touch), so pure-Lua recursion through C frames
   (`string.gsub` callbacks a few hundred deep) doesn't abort the process. Standing residuals that
   remain once every workstream has landed, under
@@ -2155,7 +2157,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   frames can still abort the process past the larger stack; and a loop that keeps calling
   `Event.new` advances the stall heartbeat and is never caught as a stall, since telling it from a
   large `flush()` would need a time limit, so only its memory-retaining form is bounded, by
-  `max_memory`.
+  `max_memory`. And `max_memory` bounds the Lua VM heap only: a retained event costs the VM about
+  150 bytes while its payload stays in the Rust heap (10k retained 1 KiB events: 1.5 MB of VM,
+  about 10 MB of Rust), so a script that hoards events shows in process RSS long before it trips
+  the cap. A cap under about twice the working set forces a full
+  collection on most batches; the verdict is rate-limited to one a second, so that costs latency,
+  not a failure.
 
 ## Internal telemetry and self-logging
 
