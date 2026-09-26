@@ -1967,7 +1967,7 @@
           ],
           "properties": {
             "ack": {
-              "description": "Waits for Splunk to confirm each request was indexed before a batch counts as delivered, polling `/services/collector/ack`. Needs a token with indexer acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't acknowledge, each request counts as delivered on its `200`, and `logit` logs a warning. Off by default.",
+              "description": "Waits for Splunk to confirm each request was indexed before a batch counts as delivered, polling `/services/collector/ack`. Needs a token with indexer acknowledgment enabled, which some Splunk Cloud stacks don't offer. With a token that doesn't acknowledge, each request counts as delivered on its `200`, and `logit` logs a warning. Off by default.",
               "default": false,
               "type": "boolean"
             },

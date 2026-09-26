@@ -1215,24 +1215,47 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   describe the HEC destination only for Splunk targets, with acknowledgment off on the destination
   token. Edge Processor runs in Splunk Cloud and a Splunk Enterprise 10.x edition the
   `splunk/splunk` image isn't, so W5 ran none
-  ([plan, "Settled by W5"](plans/splunk-relay.md#settled-by-w5-2026-09-25), item 3).
+  ([plan, "Settled by W5"](plans/splunk-relay.md#settled-by-w5-2026-09-25), item 3). The Splunk
+  Cloud trial stack has none provisioned either: enabling it takes Splunk's support or account
+  team
+  ([plan, "Settled by the Cloud run"](plans/splunk-relay.md#settled-by-the-cloud-run-2026-09-26),
+  item 8). Ingest Processor sends only to Splunk indexes, S3, and Observability Cloud, so it has no
+  destination that reaches `logit`.
   - **Consequence:** the one Splunk-side HEC sender that could tee a forwarder-fed Splunk into
     `logit` is untested.
   - **Revisit trigger:** access to an Edge Processor; record what it sends with
     `script/record-fixtures`.
-- **No acknowledgment on Splunk Cloud.** Splunk Cloud Platform doesn't offer HEC indexer
-  acknowledgment, so `splunk_hec_out`'s `ack: true` counts each request delivered on its `200`,
-  counted `logit.output.acks{result="unsupported"}`.
-  - **Consequence:** delivery to Splunk Cloud ends at a `200`, which means received, not indexed.
-  - **Revisit trigger:** Splunk Cloud offers acknowledgment on HEC.
-- **HEC codes 21, 22, 24, and 25 aren't modeled, and the texts for 18 and up are from Splunk's
-  documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the four, so
-  `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it arrives
-  with a non-retryable status, and `splunk_hec_in` never answers one. The `script/splunk-interop`
-  run provoked no code 18 or above.
+- **Acknowledgment on Splunk Cloud depends on the stack.** Splunk documents HEC indexer
+  acknowledgment on Splunk Cloud Platform only for its Firehose path, but the 10.5.2605.9 trial
+  stack offered it on its tokens and acknowledged `splunk_hec_out`'s requests with none timed out
+  ([plan, "Settled by the Cloud run"](plans/splunk-relay.md#settled-by-the-cloud-run-2026-09-26),
+  item 3). A customer stack may differ, so `ack: true` stays opt-in; against a token that doesn't
+  acknowledge, each request counts delivered on its `200`, counted
+  `logit.output.acks{result="unsupported"}`.
+  - **Consequence:** on a stack without acknowledgment, delivery ends at a `200`, which means
+    received, not indexed.
+  - **Revisit trigger:** a customer stack that refuses acknowledgment, or Splunk documenting it
+    for HEC on Splunk Cloud.
+- **HEC codes 21, 22, 24, and 25 aren't modeled, and the texts for 18 through 27 are from
+  Splunk's documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the
+  four, so `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it
+  arrives with a non-retryable status, and `splunk_hec_in` never answers one. Code 28, Splunk
+  Cloud's answer to a `useACK` request without a channel, is modeled from Splunk Cloud
+  10.5.2605.9's verbatim reply. Neither `script/splunk-interop` run provoked a code 18 through
+  27.
   - **Consequence:** a rejection with one of these codes is counted under `other`, and the
     diagnostic's body quote is what names it.
   - **Revisit trigger:** a real Splunk answers one of them.
+- **Splunk Cloud answers an oversize body with code 6, not `413`.** The 10.5.2605.9 trial stack
+  accepted bodies up to 5,242,881 bytes and answered 6,000,000 and above with `400`
+  `{"text":"Invalid data format","code":6,"invalid-event-number":0}`. `splunk_hec_out` can't tell
+  that from object 0 failing to parse, so a `max_body_bytes` above the receiver's cap drops a valid
+  first object, counted `records.dropped{reason="invalid_event"}` rather than `oversize`, and
+  resends the rest.
+  - **Consequence:** none at the 2 MiB default, which sits under Cloud's observed cap; a raised
+    `max_body_bytes` loses one object per oversize body.
+  - **Workaround:** keep `max_body_bytes` at or under 5 MiB against Splunk Cloud.
+  - **Revisit trigger:** a Splunk Cloud stack whose cap is under 2 MiB.
 - **`splunk_hec_out` treats codes 7, 12, 13, and 15 as permanent.** Each names an object in
   `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
   it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
@@ -1242,14 +1265,17 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     its request and the rest of the batch.
   - **Workaround:** keep every stamped index in the token's allowed list.
   - **Revisit trigger:** a pipeline that mixes indexes a token can and can't write.
-- **What neither the recorded corpus nor the Splunk run exercised.** Each is implemented from the
+- **What neither the recorded corpus nor the Splunk runs exercised.** Each is implemented from the
   exporter's source or Splunk's docs and covered by the codec's own tests:
   - the exporter's `Summary` shape and a span link's `trace_state` member (telemetrygen writes
     neither), and `otel.log.name`;
   - Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`;
   - a HEC client using `useACK` against `splunk_hec_in`;
-  - Splunk Cloud Platform, and any Splunk Enterprise release other than 10.4.3, including which
-    release raised `max_content_length` from 1,000,000 bytes;
+  - any Splunk Enterprise release other than 10.4.3, including which release raised
+    `max_content_length` from 1,000,000 bytes;
+  - a paid Splunk Cloud Platform stack's `http-inputs-<stack>` endpoint and its certificate: the
+    runs exercised Splunk Cloud Platform 10.5.2605.9 on a trial stack, whose HEC is
+    `<stack>.splunkcloud.com:8088` with Splunk's default self-signed certificate;
   - Splunk Observability Cloud through `fixtures/splunk-observability.yaml`, which no trial org
     has received.
   - **Consequence:** a difference here shows up in a deployment first, as a listener's

@@ -67,8 +67,8 @@ signal both ways**: Splunk indexes both copies.
 
 Sending directly costs you:
 
-- acknowledgment on Splunk Cloud, which doesn't offer it, so delivery there ends at a `200`
-  ([below](#acknowledgment-is-off-by-default-and-unavailable-on-splunk-cloud));
+- acknowledgment on a Splunk Cloud stack that doesn't offer it, where delivery ends at a `200`
+  ([below](#acknowledgment-is-off-by-default-and-your-splunk-cloud-stack-may-not-offer-it));
 - per-token index allowlists to keep in step with the `index` you stamp;
 - one number per metric name, so histograms, summaries, and sketches need
   [`multi_value: expand`](#multi-number-metrics-are-dropped-unless-you-set-multi_value-expand).
@@ -122,22 +122,25 @@ resource and event attribute goes out as an indexed field in `fields`, flattened
 
 `splunk_hec_in` puts the same four values on the resource, so a relay keeps them.
 
-### Acknowledgment is off by default, and unavailable on Splunk Cloud
+### Acknowledgment is off by default, and your Splunk Cloud stack may not offer it
 
 A `200` from HEC means received, not indexed. `ack: true` makes `splunk_hec_out` poll
 `/services/collector/ack` until Splunk confirms every request of a batch, or fails the batch after
-`ack_timeout` (30s by default). It needs a token with indexer acknowledgment (`useACK`) on, which
-Splunk Enterprise offers and Splunk Cloud doesn't. Against a token without it, each request counts
-as delivered on its `200`, counted `logit.output.acks{result="unsupported"}` with a warning, so
-turning `ack` on against Splunk Cloud changes nothing but that counter.
+`ack_timeout` (30s by default). It needs a token with indexer acknowledgment (`useACK`) on.
+Splunk Enterprise offers it. Splunk documents it on Splunk Cloud only for the Firehose path, but a
+Splunk Cloud 10.5.2605.9 trial stack offered "Enable indexer acknowledgment" on its tokens and
+acknowledged `splunk_hec_out`'s requests with none timed out, so check the token settings on
+your stack. Against a token without it, each request counts as delivered on its `200`, counted
+`logit.output.acks{result="unsupported"}` with a warning, so turning `ack` on against a stack
+that doesn't offer it changes nothing but that counter.
 
 ### A `useACK` token needs a channel on every request
 
-A token with `useACK` on answers `400` code 10 to any request without a
-`X-Splunk-Request-Channel` header. `splunk_hec_out` sends one per-sink channel on every request
+A token with `useACK` on answers `400` to any request without a `X-Splunk-Request-Channel` header:
+code 10 on Splunk Enterprise, and code 28 on Splunk Cloud, whose text adds that several indexers
+need sticky-session load balancing. `splunk_hec_out` sends one per-sink channel on every request
 whether `ack` is on or not, so it works against both token kinds. If you put another HEC client in
-front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires no channel on any
-route.
+front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires no channel on any route.
 
 ### Size caps
 
@@ -146,7 +149,10 @@ before compression). An event larger than that alone is dropped, counted
 `logit.output.records.dropped{reason="oversize"}`. Keep `max_body_bytes` under the receiver's
 `limits.conf [http_input] max_content_length`: Splunk Enterprise 10.4.3 allows 838,860,800 bytes,
 older releases 1,000,000. Splunk documents `413` for a body over it (the run didn't send
-one), and `splunk_hec_out` doesn't retry a `413`.
+one), and `splunk_hec_out` doesn't retry a `413`. A Splunk Cloud 10.5.2605.9 trial stack accepted
+bodies up to 5,242,881 bytes and refused 6,000,000 and above with `400` code 6 naming object 0,
+not `413`. Over that cap, `splunk_hec_out` drops the body's first object as `invalid_event` and
+resends the rest. The 2 MiB default sits under it.
 
 `splunk_hec_in` caps a request at `max_request_bytes` (5 MiB by default), both as sent and after
 gzip decompression, and answers `413` past it. Raise it if a client sends larger bodies.
@@ -209,9 +215,14 @@ event, and both reject a token with leading or trailing whitespace at startup.
   before binding beyond loopback. Splunk serves HEC over HTTPS by default, so a client configured
   with an `https://` URL needs `tls:` on the listener.
 - **`splunk_hec_out`'s `endpoint`** is the base URL ending in `/services/collector`: `:8088` on
-  Enterprise, `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A
-  Splunk Enterprise HEC with its default self-signed certificate needs `tls: {ca_file: ...}`
-  naming that CA.
+  Enterprise. Splunk documents `https://http-inputs-<stack>.splunkcloud.com/services/collector`
+  for Splunk Cloud; on a trial stack that name doesn't resolve, and HEC is
+  `https://<stack>.splunkcloud.com:8088/services/collector`. A Splunk Enterprise HEC with its
+  default self-signed certificate needs `tls: {ca_file: ...}` naming that CA. The trial stack
+  presents that same default certificate (`CN=SplunkServerDefaultCert`), whose name doesn't match
+  the host, so it needs `tls: {insecure_skip_verify: true}`. Whether a paid stack presents a
+  public certificate isn't verified. `/services/collector/health` answers without a token, so it
+  can check the endpoint before a token is set up.
 
 ## What's verified
 
@@ -234,7 +245,15 @@ decodes and gets a `2xx` from `splunk_hec_in`, including the Docker driver's `OP
 - probes settled what Splunk does with gzip and per-object-invalid bodies, read its
   `max_content_length` from `limits.conf` over REST, and settled `metric_type`, 1,000 dimensions, `OPTIONS`, and acknowledgment.
 
+It ran the same legs and probes against a Splunk Cloud Platform 10.5.2605.9 trial stack
+(`SPLUNK_INTEROP_TARGET=cloud`). A trial has no REST API, so each leg's arrival was confirmed by
+searching in Splunk Web. Every leg landed as on 10.4.3, acknowledgment included, and the probes
+found the endpoint, certificate, channel, and body-cap differences above. Edge Processor isn't
+provisioned on the trial stack, and Ingest Processor has no destination that reaches `logit`: it
+sends to Splunk indexes, S3, and Observability Cloud.
+
 Not verified: the Observability Cloud leg (`fixtures/splunk-observability.yaml`), since no trial
-org was run; Splunk Cloud; Vector's HEC sinks and an Edge Processor as clients; and any Splunk
-release other than 10.4.3. `docs/known-gaps.md`'s "Splunk" section lists everything else that
-isn't built or isn't verified.
+org was run; a paid Splunk Cloud stack's `http-inputs-` endpoint and its certificate; Vector's HEC
+sinks and an Edge Processor as clients; and any Splunk Enterprise release other than 10.4.3.
+`docs/known-gaps.md`'s "Splunk" section lists everything else that isn't built or isn't
+verified.

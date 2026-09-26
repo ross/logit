@@ -47,10 +47,11 @@ impl HecStatus {
     pub const QUERY_STRING_AUTH_DISABLED: HecStatus =
         HecStatus { code: 16, http: 400, text: "Query string authorization is not enabled" };
     pub const HEALTHY: HecStatus = HecStatus { code: 17, http: 200, text: "HEC is healthy" };
-    // Codes 18 and up: the codes and HTTP statuses are Splunk's documented ones; each `text` is
-    // the best reading of Splunk's documentation. W5's run against a real Splunk provoked none of
-    // them, so the texts are still unverified (ADR `splunk-hec-relay`, "Amendment: what W5's
-    // recorded traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5").
+    // Codes 18 through 27: the codes and HTTP statuses are Splunk's documented ones; each `text`
+    // is the best reading of Splunk's documentation. No run against a real Splunk has provoked
+    // one, so the texts are unverified (ADR `splunk-hec-relay`, "Amendment: what W5's recorded
+    // traffic and the Splunk run settled"; `docs/plans/splunk-relay.md`, "Settled by W5"). Codes
+    // 21, 22, 24, and 25 aren't modeled.
     pub const UNHEALTHY_QUEUES_FULL: HecStatus =
         HecStatus { code: 18, http: 503, text: "HEC is unhealthy, queues are full" };
     pub const UNHEALTHY_ACK_UNAVAILABLE: HecStatus =
@@ -66,9 +67,18 @@ impl HecStatus {
         HecStatus { code: 26, http: 429, text: "Queue at capacity" };
     pub const PERFORMANCE_LIMIT_REACHED: HecStatus =
         HecStatus { code: 27, http: 429, text: "Performance limit reached" };
+    /// Splunk Cloud Platform's answer to a request without a channel on a `useACK` token, where
+    /// Splunk Enterprise answers code 10. The text is verbatim from Splunk Cloud 10.5.2605.9
+    /// (`docs/plans/splunk-relay.md`, "Settled by the Cloud run (2026-09-26)").
+    pub const CHANNEL_MISSING_STICKY_LB: HecStatus = HecStatus {
+        code: 28,
+        http: 400,
+        text: "Data channel is missing. If you have multiple indexers, sticky session load \
+               balancers must be provisioned and client requests must be routed accordingly.",
+    };
 
     /// Every status above, in code order.
-    pub const ALL: [HecStatus; 24] = [
+    pub const ALL: [HecStatus; 25] = [
         Self::SUCCESS,
         Self::TOKEN_DISABLED,
         Self::TOKEN_REQUIRED,
@@ -93,6 +103,7 @@ impl HecStatus {
         Self::SHUTTING_DOWN,
         Self::QUEUE_AT_CAPACITY,
         Self::PERFORMANCE_LIMIT_REACHED,
+        Self::CHANNEL_MISSING_STICKY_LB,
     ];
 
     /// The status with body code `code`, when it is one of [`HecStatus::ALL`].
@@ -233,6 +244,16 @@ mod tests {
             r#"{"text":"Invalid data format","code":6,"invalid-event-number":2}"#
         );
         assert_eq!(text(encode_http_error(404, "Not Found")), r#"{"text":"Not Found","code":404}"#);
+    }
+
+    /// Splunk Cloud 10.5.2605.9's answer to a `useACK` token's request without a channel.
+    #[test]
+    fn code_28_is_splunk_clouds_channel_missing_body() {
+        let cloud = r#"{"text":"Data channel is missing. If you have multiple indexers, sticky session load balancers must be provisioned and client requests must be routed accordingly.","code":28}"#;
+        assert_eq!(text(encode_status(HecStatus::CHANNEL_MISSING_STICKY_LB)), cloud);
+        let reply = parse_reply(cloud.as_bytes()).expect("parses");
+        assert_eq!(HecStatus::from_code(reply.code), Some(HecStatus::CHANNEL_MISSING_STICKY_LB));
+        assert_eq!(HecStatus::CHANNEL_MISSING_STICKY_LB.http, 400);
     }
 
     #[test]

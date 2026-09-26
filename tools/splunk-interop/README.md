@@ -4,9 +4,9 @@
 Enterprise container, or a Splunk Cloud stack in [Splunk Cloud mode](#splunk-cloud-mode), then
 probes that Splunk directly for what
 [`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
-one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a run; the
-plan's "Settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
-the decisions it settled.
+one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a Splunk
+Enterprise run and a Splunk Cloud run; the plan's "Settled by W5" and "Settled by the Cloud run"
+sections and ADR `splunk-hec-relay`'s two amendments carry the decisions they settled.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/victoria-interop` and `script/record-fixtures`. It isn't part of `script/cibuild`, and no
@@ -109,7 +109,7 @@ is `FAIL`, with the request counts by class (`network_error` included), the drop
 reason, the batches dropped, and the retries in its detail. The row carries the SPL that would
 confirm arrival. `search.spl` collects those
 queries and the probes', each under a `# <leg or probe>` comment, for a search pass by hand or in
-a browser afterward: run each over all time, adding `index_earliest` set to the epoch in the
+a browser afterward: run each over all time, adding `_index_earliest` set to the epoch in the
 file's header to a `search` query, since the relay leg's events carry their recorded timestamps.
 The probes still post and record what the stack answered, with `not searched` where they would
 have checked indexing. `max_content_length` needs the REST API and is `SKIP`; `[tcpout]` needs
@@ -145,6 +145,8 @@ stack a crashed run left behind.
 
 ## What the run showed
 
+### Splunk Enterprise 10.4.3 (2026-09-25)
+
 A run on 2026-09-25 against `splunk/splunk:10.4.3` (build `4174a2deda5d`), `logit` built from
 this branch, `SPLUNK_INTEROP_WINDOW=60`. Every leg passed; the probe rows are what Splunk
 answered. The recording of the `[tcpout]` capture is described but not committed: see its row.
@@ -172,3 +174,45 @@ answered. The recording of the `[tcpout]` capture is described but not committed
 | `/raw` without a channel | On a token without `useACK`: `200` |
 | `useACK` | No channel: `400` code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1` (the key is `ackId`, ids count from 0 per channel). The id polled `true` within about a second; the same id polled on another channel: `false` |
 | `[tcpout] sendCookedData=false` | Each event's `_raw` followed by one LF, nothing else: no header, no length, no metadata. An event with an embedded newline arrives as two lines; a JSON `event` as its JSON text; a `/raw` body's lines one each. Splunk forwarded its own logs from every index too, whatever `defaultGroup` (unset) and the `forwardedindex` filters (tried: only `tcpout_probe`) said, so the capture isn't committed: it is mostly Splunk's `_internal` and `_introspection` data |
+
+### Splunk Cloud Platform 10.5.2605.9 (2026-09-26)
+
+Two runs on 2026-09-26 with `SPLUNK_INTEROP_TARGET=cloud` against a Splunk Cloud Platform trial
+stack (stack name redacted), which Splunk Web reports as `Splunk 10.5.2605.9`, `logit` built from
+this branch, `SPLUNK_INTEROP_HEC_INSECURE=true`, and an ack token. A trial has no REST API (`:8089`
+times out), so the runs searched nothing (`SPLUNK_INTEROP_SEARCH=none`) and every leg's row was
+`SENT`: every `/event` request answered `2xx`, nothing dropped, and no ack `timeout` or
+`unsupported`. Arrival was confirmed afterward by searching in Splunk Web with `search.spl`'s
+queries. The tables record the second run: its counts come from a search bounded to what it indexed
+(`_index_earliest` set to the run's start), and the field-level detail from the same search over the
+first run's data. The two runs' probes answered identically. What Splunk held matched the 10.4.3 run
+in every leg.
+
+| Leg | Result | What Splunk held |
+|---|---|---|
+| `hec-logs` | PASS | 100 events, host `splunk-interop-logit`, source `splunk-interop`, `otel.log.severity.text` `Warn` and `.number` `13`, `detail.stage` `mint`, `detail.ok` `true`, and `leg` `hec-logs`, all as indexed fields (`stats` groups by them) |
+| `hec-metrics` | PASS | 21 series `splunk_interop.*` with `metric_type` `Gauge`, `Histogram`, `Sum`, and `Summary`; the histogram's buckets `le` `0.1`=1, `1`=4, `10`=9, `+Inf`=10, and `` `histperc(0.5, c, le)` `` answers 2.8 |
+| `hec-spans` | PASS | 100 span objects with `trace_id`, `span_id`, `name` `splunk-interop-span`, `kind` `SPAN_KIND_SERVER`, `status.code` `STATUS_CODE_ERROR`, `status.message` `boom`, `start_time`, `end_time`, `events{}.name` `retry`, and `service.name` `splunk-interop-spans` |
+| `hec-ack` | PASS | 97 events indexed; the sink counted `acked=78 timeout=0 unsupported=0` over 117 `/ack` polls |
+| `hec-relay` | PASS | Every producer: the Docker driver's events, the Java appender's 9 (`java:json`, `java:raw`, and `java:text`, 3 each), SC4S's 3 lines (`nix:syslog`, index `osnix`) and 4 own events, and the exporter's 3 logs and 6 spans; in the first run, the exporter's metrics `gen` (`Gauge` and `Sum`), `gen_bucket`, `gen_count`, and `gen_sum` |
+
+| Probe | Splunk Cloud 10.5.2605.9's answer |
+|---|---|
+| endpoint | `https://<stack>.splunkcloud.com:8088/services/collector`; the `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for this stack. With verification on: `certificate verify failed: self-signed certificate in certificate chain`; subject `commonName=SplunkServerDefaultCert, organizationName=SplunkUser`, issuer `organizationName=Splunk, commonName=SplunkCommonCA`. `/health` without a token: `200` `{"text":"HEC is healthy","code":17}` |
+| body cap | 999,000, 1,000,001, 1,048,577, and 2,000,000 bytes uncompressed, and 2,000,000 bytes gzipped (incompressible, 1,514,967 bytes on the wire, and compressible, 2,009): each `200` and indexed. Posted by hand: 3 MB, 5 MB, and 5,242,881 bytes `200`; 6 MB, and 7, 8, 12, and 20 MB, `400` `{"text":"Invalid data format","code":6,"invalid-event-number":0}`, not `413`. The cap is between 5,242,881 and 6,000,000 bytes |
+| gzip | `Content-Encoding: gzip` on `/event` and `/raw`: `200`, indexed. `deflate`: `415` with an HTML body |
+| code 6 and other per-object errors | As on 10.4.3: codes 6, 7, 12, 13, and 15 name the same object, and the objects before it are the ones indexed |
+| lenient cases | As on 10.4.3, `400` code 5 `No data` included |
+| metric forms | Both `200` and stored as metrics |
+| `metric_type` | `200`, stored as a dimension |
+| dimensions | 200 and 1,000 dimensions: `200`, all of them stored (201 and 1,001 with the probe's own) |
+| `OPTIONS` | As on 10.4.3 |
+| HTTP errors | As on 10.4.3: `404` for an unknown path, `405` for `GET` on `/event`, both with the `404` body |
+| `/raw` without a channel | On a token without `useACK`: `200`, indexed |
+| `Set-Cookie` | None on an `/event` reply |
+| `useACK` | The token settings offer "Enable indexer acknowledgment". No channel: `400` `{"text":"Data channel is missing. If you have multiple indexers, sticky session load balancers must be provisioned and client requests must be routed accordingly.","code":28}`, where 10.4.3 answers code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1`. The id polled `true` after 1.3 s; the same id polled on another channel: `200` `{"acks":{"0":false}}` |
+| `max_content_length` | SKIP: no REST API |
+| `[tcpout] sendCookedData=false` | SKIP: cloud mode has no `rawcap` receiver or output group |
+
+Neither Edge Processor nor Ingest Processor is provisioned on the trial stack: Data Management
+shows only a link to request it, which takes a support case or the account team.

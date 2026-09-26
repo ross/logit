@@ -1791,9 +1791,9 @@ pub enum ComponentKind {
         multi_value: SplunkMultiValue,
         /// Waits for Splunk to confirm each request was indexed before a batch counts as
         /// delivered, polling `/services/collector/ack`. Needs a token with indexer
-        /// acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't
-        /// acknowledge, each request counts as delivered on its `200`, and `logit` logs a
-        /// warning. Off by default.
+        /// acknowledgment enabled, which some Splunk Cloud stacks don't offer. With a token
+        /// that doesn't acknowledge, each request counts as delivered on its `200`, and `logit`
+        /// logs a warning. Off by default.
         #[serde(default)]
         ack: bool,
         /// How long to wait for every request of a batch to be acknowledged. Past it the batch
