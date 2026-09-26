@@ -3168,7 +3168,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once`,
   `a_send_that_completes_in_the_same_wake_as_the_grace_deadline_is_counted_delivered`, and
   `a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish`; the benign reservation is
-  argued at the `ShutdownExpired` arm.
+  argued at the `ShutdownExpired` arm. A deadline already past never starts a send: `deliver_with_retry`
+  checks it before every attempt (`a_batch_queued_behind_a_send_that_completes_at_the_grace_deadline_is_not_started_and_stays_uncommitted`,
+  `a_backoff_ending_at_the_grace_deadline_does_not_start_another_attempt`).
 
 ---
 

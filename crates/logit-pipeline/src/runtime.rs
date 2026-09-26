@@ -474,10 +474,8 @@ pub async fn run_with_telemetry(
 /// an override still working at the deadline is cancelled by drop, a loss now bounded by
 /// `shutdown_grace`.
 ///
-/// `biased`, input arm first: a listener result ready in the same wake as the backstop (an `Err`
-/// returned at the grace deadline) is returned, not discarded. The backstop runs `unconstrained`
-/// so an input that spends its whole coop budget on every poll can't keep the deadline from
-/// firing. See `docs/design/pipeline-graph.md`'s "Cancellation points".
+/// `biased`, input arm first; `unconstrained` backstop: see `docs/design/pipeline-graph.md`'s
+/// "Cancellation points".
 async fn run_input(
     id: String,
     mut input: Box<dyn Input + Send>,
@@ -485,13 +483,13 @@ async fn run_input(
     mut shutdown: watch::Receiver<bool>,
     shutdown_grace: Duration,
 ) -> anyhow::Result<()> {
-    let mut deadline: Option<tokio::time::Instant> = None;
+    let deadline = std::sync::OnceLock::new();
     tokio::select! {
         biased;
         result = input.run_until_shutdown(fanout, shutdown.clone())
             => result.with_context(|| format!("component '{id}'")),
         () = tokio::task::unconstrained(
-            shutdown_grace_expired(&mut shutdown, &mut deadline, shutdown_grace),
+            shutdown_grace_expired(&mut shutdown, &deadline, shutdown_grace),
         ) => Ok(()),
     }
 }
@@ -806,6 +804,9 @@ enum Delivery {
         fault: Fault,
         explicit_permanent: bool,
     },
+    /// The shutdown grace deadline had passed before an attempt, so none was started. The
+    /// batch never left the process; the caller leaves it uncommitted and counts nothing.
+    GraceExpired,
 }
 
 /// Attempts to deliver `batch` via `output.send`, retrying per `posture`/[`is_retryable`] until
@@ -817,23 +818,32 @@ enum Delivery {
 /// otherwise go unenforced until that attempt gave up. A timeout is `Fault::Ambiguous` (the
 /// destination may have received the request), never `Permanent`.
 ///
+/// Before every attempt, the first and each one after a backoff, a `grace_deadline` already
+/// anchored and reached returns [`Delivery::GraceExpired`] with no send started. [`write_loop`]
+/// polls this future before its grace arm, so without the check a send started on a deadline
+/// already past would be cut off on its first poll and read as ambiguous.
+///
 /// `sending` is `true` only while an `output.send` call is in flight: set immediately before the
 /// attempt's await and cleared as soon as it returns, before classification and before any
 /// backoff sleep. So when [`write_loop`] drops this future for the shutdown grace, `true` means
-/// `send` was polled at least once and hadn't completed. Neither of the other ways the grace can
-/// win is a send in flight: a `select!` that never polled this future because the grace was
-/// already due, and a grace that lands during a backoff sleep.
+/// `send` was polled at least once and hadn't completed. A grace that lands during a backoff
+/// sleep leaves it `false`.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
     batch: &EventBatch,
     posture: DeliveryPosture,
     retry: &RetryConfig,
     telemetry: &Telemetry,
+    grace_deadline: &std::sync::OnceLock<tokio::time::Instant>,
     sending: &mut bool,
 ) -> Delivery {
     let deadline = tokio::time::Instant::now() + retry.total_budget;
     let mut attempt: u32 = 0;
     loop {
+        if grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due) {
+            return Delivery::GraceExpired;
+        }
         attempt += 1;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let timer = telemetry.timer("logit.component.send.duration");
@@ -896,22 +906,27 @@ fn fault_tag(fault: Fault) -> &'static str {
 ///
 /// The deadline is anchored at that first poll after the signal, not at the signal instant.
 /// Every caller runs this under `tokio::task::unconstrained` in a `select!` it re-polls on each
-/// wake, which keeps that poll within one scheduling of the signal. `deadline` persists across
-/// calls (one per `write_loop` iteration), so the window is not reset per batch. It's set
+/// wake, which keeps that poll within a few wakes of the signal: a `select!` polls no arm once
+/// the task's coop budget is spent, and `write_loop` runs inside `run_output`'s unbiased
+/// `select!` with `drain_inbox`, which is polled first on half the wakes and can spend it.
+///
+/// `deadline` persists across calls (one per `write_loop` iteration), so the window is not reset
+/// per batch, and `deliver_with_retry` reads it to start no attempt past it. It's set
 /// synchronously when `wait_for` resolves, so a call dropped after that poll (one that loses a
 /// `select!` race) keeps the anchor and the next call waits out the remainder. A call never
 /// polled after the signal anchors nothing. Cancellation-safe.
 async fn shutdown_grace_expired(
     shutdown: &mut watch::Receiver<bool>,
-    deadline: &mut Option<tokio::time::Instant>,
+    deadline: &std::sync::OnceLock<tokio::time::Instant>,
     grace: Duration,
 ) {
-    if deadline.is_none() {
+    if deadline.get().is_none() {
         // An error means the sender is gone; treat it as shutdown firing rather than hang.
         let _ = shutdown.wait_for(|&due| due).await;
-        *deadline = Some(tokio::time::Instant::now() + grace);
+        let _ = deadline.set(tokio::time::Instant::now() + grace);
     }
-    tokio::time::sleep_until(deadline.expect("just set above if it was None")).await;
+    let due = *deadline.get().expect("set above if it was unset");
+    tokio::time::sleep_until(due).await;
 }
 
 /// Finalizes what `store` still holds, counting and logging anything dropped, then calls
@@ -979,7 +994,9 @@ async fn write_loop(
 
     let mut last_success: Option<tokio::time::Instant> = None;
     let mut permanent_streak_since: Option<tokio::time::Instant> = None;
-    let mut shutdown_deadline: Option<tokio::time::Instant> = None;
+    // A `OnceLock`, not an `Option`: the grace arm sets it while `deliver_with_retry`, in the
+    // same `select!`, reads it.
+    let shutdown_deadline = std::sync::OnceLock::new();
     // Turns a stream of `send_failed` warnings into two edge events: `degraded` on the first
     // failure, `recovered` on the next success.
     let mut degraded = false;
@@ -993,10 +1010,7 @@ async fn write_loop(
             Closed,
             ShutdownExpired,
         }
-        // Unbiased: `peek` reserves the head only in the poll that returns it, so whichever arm
-        // wins, nothing is left reserved here. `unconstrained` on the grace arm: `Sleep` and
-        // `wait_for` spend the task's coop budget, and a sibling that exhausts it on every poll
-        // would otherwise defer the deadline indefinitely. See `docs/design/pipeline-graph.md`'s
+        // Unbiased; `unconstrained` grace arm: see `docs/design/pipeline-graph.md`'s
         // "Cancellation points".
         let next = tokio::select! {
             batch = store.peek() => match batch {
@@ -1005,7 +1019,7 @@ async fn write_loop(
             },
             () = tokio::task::unconstrained(shutdown_grace_expired(
                 &mut shutdown,
-                &mut shutdown_deadline,
+                &shutdown_deadline,
                 write_config.shutdown_grace,
             )) => NextBatch::ShutdownExpired,
         };
@@ -1037,8 +1051,8 @@ async fn write_loop(
             ShutdownExpired,
         }
         let mut sending = false;
-        // `biased`, deliver arm first: a send that completed in the same wake as the grace
-        // deadline is counted delivered, not cut off as ambiguous.
+        // `biased`, deliver arm first; `unconstrained` grace arm: see
+        // `docs/design/pipeline-graph.md`'s "Cancellation points".
         let step = tokio::select! {
             biased;
             outcome = deliver_with_retry(
@@ -1047,11 +1061,12 @@ async fn write_loop(
                 posture,
                 &write_config.retry,
                 &telemetry,
+                &shutdown_deadline,
                 &mut sending,
             ) => DeliverStep::Outcome(outcome),
             () = tokio::task::unconstrained(shutdown_grace_expired(
                 &mut shutdown,
-                &mut shutdown_deadline,
+                &shutdown_deadline,
                 write_config.shutdown_grace,
             )) => DeliverStep::ShutdownExpired,
         };
@@ -1083,6 +1098,9 @@ async fn write_loop(
         };
 
         match outcome {
+            // No attempt started: left uncommitted for `finish_and_flush`, like a grace expiry
+            // between batches.
+            Delivery::GraceExpired => return Ok(()),
             Delivery::Delivered => {
                 store.commit();
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
@@ -5640,15 +5658,21 @@ mod tests {
                         "{at}: batches.delivered agrees with the sink's own count"
                     );
                     // A disk sink drops for shutdown only a send the grace cut off, and only
-                    // under at-most-once.
+                    // under at-most-once. On `GraceExpiry`, each attempt is a 10 ms send and a
+                    // 10 ms backoff from the first push, and the deadline lands 105 ms in,
+                    // during the send started at 100 ms.
                     if disk {
-                        match (path, posture) {
-                            (ExitPath::GraceCutsInFlightSend, DeliveryPosture::AtMostOnce) => {
-                                assert_eq!(shutdown, 1.0, "{at}")
-                            }
-                            (_, DeliveryPosture::AtMostOnce) => assert!(shutdown <= 1.0, "{at}"),
-                            (_, DeliveryPosture::AtLeastOnce) => assert_eq!(shutdown, 0.0, "{at}"),
-                        }
+                        let cut_off = match path {
+                            ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => 1.0,
+                            ExitPath::DrainFirst
+                            | ExitPath::PermanentError
+                            | ExitPath::ClosedAndEmpty => 0.0,
+                        };
+                        let expected = match posture {
+                            DeliveryPosture::AtMostOnce => cut_off,
+                            DeliveryPosture::AtLeastOnce => 0.0,
+                        };
+                        assert_eq!(shutdown, expected, "{at}");
                     }
                     match path {
                         ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
@@ -6009,6 +6033,152 @@ mod tests {
         }
     }
 
+    /// Resolves its first send at `first_at` (failing it with `Fault::Clean` when `first_fails`),
+    /// and never completes a later one, so a later attempt that starts is visible as a cut-off
+    /// send.
+    struct FirstThenNeverOutput {
+        first_at: tokio::time::Instant,
+        first_fails: bool,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for FirstThenNeverOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            if self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep_until(self.first_at).await;
+            match self.first_fails {
+                true => Err(anyhow::anyhow!("simulated clean failure")).context(Fault::Clean),
+                false => Ok(()),
+            }
+        }
+    }
+
+    /// Runs `run_output` under at-most-once with shutdown already signalled, so the grace
+    /// deadline is anchored at its first poll, sends `batches` batches, and waits for it to end.
+    async fn run_with_grace_anchored_at_start(
+        output: FirstThenNeverOutput,
+        store_config: SinkStoreConfig,
+        retry: RetryConfig,
+        grace: Duration,
+        batches: u64,
+    ) -> Vec<Event> {
+        let registry = Registry::with_span_sampling(1.0);
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(true);
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(output),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            store_config,
+            WriteLoopConfig {
+                retry,
+                shutdown_grace: grace,
+                delivery_override: Some(DeliveryPosture::AtMostOnce),
+            },
+            shutdown_rx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        for value in 1..=batches {
+            inbox_tx.send(counter_batch(value as f64)).await.unwrap();
+        }
+        drop(inbox_tx);
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output ends within its grace")
+            .expect("the task must not panic")
+            .expect("grace expiry is not a failure");
+        drop(shutdown_tx);
+        registry.drain(0)
+    }
+
+    /// The first send completes in the grace deadline's wake. The second batch then either loses
+    /// `NextBatch` to the grace arm or enters the deliver step with the deadline already past;
+    /// either way no send starts, so under at-most-once it's neither cut off nor committed.
+    /// Repeated because `NextBatch` is unbiased: each route is taken about half the time.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_queued_behind_a_send_that_completes_at_the_grace_deadline_is_not_started_and_stays_uncommitted(
+    ) {
+        let grace = Duration::from_millis(100);
+        for iteration in 0..16 {
+            for disk in [false, true] {
+                let at = format!("iteration {iteration}, disk={disk}");
+                let dir = crate::disk_queue::test_support::scratch_dir("queued-behind-deadline");
+                let store_config = match disk {
+                    true => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+                    false => SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                };
+                let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let output = FirstThenNeverOutput {
+                    first_at: tokio::time::Instant::now() + grace,
+                    first_fails: false,
+                    attempts: Arc::clone(&attempts),
+                };
+                let events = run_with_grace_anchored_at_start(
+                    output,
+                    store_config,
+                    fast_retry_config(),
+                    grace,
+                    2,
+                )
+                .await;
+
+                assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "{at}");
+                assert_eq!(
+                    counter_sum(&events, "out", "logit.component.batches.delivered", None),
+                    1.0,
+                    "{at}"
+                );
+                assert!(deliver_fault_tags(&events).is_empty(), "{at}: nothing was cut off");
+                if disk {
+                    assert_eq!(batches_dropped(&events, "shutdown"), 0.0, "{at}");
+                    assert_eq!(reopen_and_drain(&dir).await, vec![2.0], "{at}: batch 2 replays");
+                } else {
+                    // `finish`'s count, the only one: batch 2 was never committed by the cut.
+                    assert_eq!(batches_dropped(&events, "shutdown"), 1.0, "{at}");
+                }
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+    }
+
+    /// A clean failure's backoff ends at the grace deadline, in the same wake as the grace arm.
+    /// The deliver arm is polled first, and the pre-attempt check keeps it from starting a second
+    /// attempt that the grace would then read as cut off.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_ending_at_the_grace_deadline_does_not_start_another_attempt() {
+        let grace = Duration::from_millis(100);
+        let dir = crate::disk_queue::test_support::scratch_dir("backoff-at-deadline");
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let output = FirstThenNeverOutput {
+            first_at: tokio::time::Instant::now(),
+            first_fails: true,
+            attempts: Arc::clone(&attempts),
+        };
+        let retry = RetryConfig {
+            total_budget: Duration::from_secs(3600),
+            base_delay: grace,
+            max_delay: grace,
+        };
+        let events = run_with_grace_anchored_at_start(
+            output,
+            SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+            retry,
+            grace,
+            1,
+        )
+        .await;
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "no second attempt");
+        assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
+        assert!(deliver_fault_tags(&events).is_empty(), "nothing was cut off");
+        assert_eq!(reopen_and_drain(&dir).await, vec![1.0], "the batch replays");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The `batches_dropped` field of the last `drain complete` line in the global capture.
     fn logged_drain_complete_batches_dropped() -> Option<u64> {
         let text = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
@@ -6301,14 +6471,14 @@ mod tests {
     async fn a_shutdown_grace_expired_call_polled_after_the_signal_then_dropped_keeps_its_anchor() {
         let grace = Duration::from_secs(1);
         let (shutdown_tx, mut shutdown) = watch::channel(false);
-        let mut deadline = None;
+        let deadline = std::sync::OnceLock::new();
         shutdown_tx.send(true).unwrap();
         let first_poll = tokio::time::Instant::now();
-        assert!(poll_once(shutdown_grace_expired(&mut shutdown, &mut deadline, grace)).is_pending());
-        assert_eq!(deadline, Some(first_poll + grace));
+        assert!(poll_once(shutdown_grace_expired(&mut shutdown, &deadline, grace)).is_pending());
+        assert_eq!(deadline.get(), Some(&(first_poll + grace)));
 
         tokio::time::advance(Duration::from_millis(400)).await;
-        shutdown_grace_expired(&mut shutdown, &mut deadline, grace).await;
+        shutdown_grace_expired(&mut shutdown, &deadline, grace).await;
         assert_eq!(tokio::time::Instant::now(), first_poll + grace);
     }
 
@@ -6318,19 +6488,18 @@ mod tests {
     async fn a_shutdown_grace_expired_call_never_polled_after_the_signal_anchors_nothing() {
         let grace = Duration::from_secs(1);
         let (shutdown_tx, mut shutdown) = watch::channel(false);
-        let mut deadline = None;
+        let deadline = std::sync::OnceLock::new();
         {
-            let mut call =
-                std::pin::pin!(shutdown_grace_expired(&mut shutdown, &mut deadline, grace));
+            let mut call = std::pin::pin!(shutdown_grace_expired(&mut shutdown, &deadline, grace));
             let waker = std::task::Waker::noop();
             assert!(call.as_mut().poll(&mut std::task::Context::from_waker(waker)).is_pending());
             shutdown_tx.send(true).unwrap();
             tokio::time::advance(Duration::from_millis(400)).await;
         }
-        assert_eq!(deadline, None, "no poll saw the signal");
+        assert_eq!(deadline.get(), None, "no poll saw the signal");
 
         let polled = tokio::time::Instant::now();
-        shutdown_grace_expired(&mut shutdown, &mut deadline, grace).await;
+        shutdown_grace_expired(&mut shutdown, &deadline, grace).await;
         assert_eq!(tokio::time::Instant::now(), polled + grace);
     }
 
