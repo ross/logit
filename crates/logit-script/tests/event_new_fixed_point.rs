@@ -23,14 +23,24 @@ const MAX_EXACT: i64 = 1 << 53;
 
 /// A finite number a script reads back unchanged. mlua 0.9.9's LuaJIT conversion
 /// (`Lua::pop_value`/`stack_value`) truncates toward zero with `num_traits::cast` and keeps the
-/// integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52` collapses to
-/// `0` (`1 - 2^-53` doesn't); those magnitudes are left out here.
+/// integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52` (and `-0.0`)
+/// collapse to `0`; `1 - 2^-53` doesn't. The generator excludes those by construction, shrinking
+/// included: every value is mapped through [`outside_the_collapse`].
 fn finite() -> impl Strategy<Value = f64> {
-    prop_oneof![
-        Just(0.0),
-        -1000.0f64..1000.0,
-        prop::num::f64::NORMAL.prop_map(|f| if f.abs() < f64::EPSILON { f.recip() } else { f }),
-    ]
+    prop_oneof![Just(0.0), -1000.0f64..1000.0, prop::num::f64::NORMAL]
+        .prop_map(outside_the_collapse)
+}
+
+/// `-0.0` becomes `0.0`, and a nonzero magnitude below `f64::EPSILON` (2^-52) becomes `±1.0`.
+/// Not the reciprocal: a subnormal's reciprocal is infinite.
+fn outside_the_collapse(f: f64) -> f64 {
+    if f == 0.0 {
+        0.0
+    } else if f.abs() < f64::EPSILON {
+        f.signum()
+    } else {
+        f
+    }
 }
 
 /// A count, boundary values first: 2^53 is the last one a Lua number holds, `i64::MAX + 1` the
