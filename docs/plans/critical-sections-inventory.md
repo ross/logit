@@ -24,16 +24,17 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-26, at `drain/w5`'s head):** 44 of 135
-  entries done (27 P0, 16 P1, 1 P2): 40 with findings and four reviewed clean. The five finished
+- **Progress (2026-09-26, at `agg/w4`'s head):** 50 of 135
+  entries done (29 P0, 19 P1, 2 P2): 46 with findings and four reviewed clean. The six finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
   re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
-  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, and the shared
+  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, the shared
   queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
-  clean. The rest of the
-  list is `unreviewed`. The index's **Status** column is the source of truth.
+  clean, and aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
+  with findings. The rest of the list is `unreviewed`. The index's **Status** column is the
+  source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three
