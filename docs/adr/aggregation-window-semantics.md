@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-15
+updated: 2026-09-26
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -364,6 +364,8 @@ ADR's original "Per-kind merge" rule already drew for `Counter`), `Histogram`,
 `Accumulator::new_for`'s `unreachable!` arm are kept in sync by comment, deliberately, the same
 "kept in sync... a mismatch between the two is a runtime panic, not a compile error" shape this
 codebase already uses elsewhere for exactly this kind of paired exhaustiveness.
+The "series identity, merge laws, and accounting" amendment below replaces the pair with one
+function.
 
 See `crates/logit-transforms/src/aggregate.rs`'s `process`/`flush`/`Accumulator` for the
 implementation, and its test module for the shapes this amendment adds coverage for:
@@ -468,7 +470,8 @@ counted, is the minimum that lets a total cross a boundary at all) and `max_reta
   predicate is therefore mode-dependent for that one kind — it moved from an inline `matches!` to the
   `passes_through` free function precisely so the two places that must agree about it (that check and
   `Accumulator::new_for`'s `unreachable!` arm) can call the same code instead of restating the same
-  list twice.
+  list twice. The "series identity, merge laws, and accounting" amendment below goes further, to
+  one `Option`-returning `opener_for` with no `unreachable!` arm.
 - An **incoming cumulative `Sum`** is still pass-through in *both* modes. `aggregate` re-summing an
   already-running total would double-count it, and nothing about the stage's output mode changes what
   an input record means. The same holds for an incoming cumulative `Histogram`.
@@ -513,3 +516,142 @@ test module for the shapes this amendment adds coverage for:
 `crates/logit-bench/tests/allocations.rs`' `aggregate_flush_cumulative_sums` (a retained cumulative
 `Sum` costs a flush exactly what a retained gauge does -- 209 allocations for 100 spilled-attribute
 series, `docs/design/memory.md`).
+
+## Amendment: series identity, merge laws, and accounting as a stated contract (2026-09-26)
+
+The amendments above each settled one behavior and left its neighbors implicit. What makes two
+records one series, which merges are order-independent, and how every absorbed record and every
+held series is accounted for were decided only in code and tests, and
+[`docs/design/data-model.md`](../design/data-model.md) stated none of it. The `agg` verification
+stream (`docs/plans/critical-sections-inventory.md`'s cluster 8) tests `aggregate` against a
+reference model, and a model needs a stated contract to check against. This amendment is that
+contract. Where the code doesn't meet it yet, the entry names the workstream that closes the gap.
+
+### Series identity
+
+**A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
+`SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
+`hash_value`, and the rules are:
+
+- `F64` compares by bit pattern (`f64::to_bits`). `NaN` equals itself, so a `NaN`-tagged record
+  joins its series instead of opening a new one per event. `-0.0` and `0.0` are two series.
+- Numeric variants are distinct: `I64(1)`, `U64(1)`, and `F64(1.0)` are three series. The variant
+  a tag arrives as depends on the decoder. A JSON integer decodes as `U64`, an OTLP integer
+  attribute as `I64`, and an OTLP relay of a `U64` above `i64::MAX` arrives as `F64`. The same
+  logical tag reaching one `aggregate` from two of these paths is two series.
+- `Array` is order-sensitive: `[a, b]` and `[b, a]` are two series.
+- `Map` compares by its sorted keys, so insertion order doesn't matter, and its values follow
+  these same rules recursively.
+- `Str` and `Bytes` are distinct, even over identical bytes.
+- The attribute set as a whole is order-independent: `AttrMap::iter()` yields keys in `Symbol`
+  order, whatever order they were inserted in.
+
+**Resource and scope grouping use the same rule.** Scope already does: `scope_key_eq` compares
+attributes through `value_key_eq`. Resource doesn't yet: `group_for` compares resources with
+`Resource`'s derived `PartialEq`, so a `NaN` resource attribute never equals itself, even through
+the same `Arc`. Every metric carrying such a resource opens a new `ResourceGroup`, lengthens
+`group_for`'s scan, and is emitted unaggregated at the flush. An OTLP double resource attribute
+reaches this path. `agg/w1` makes `group_for` compare `Arc::ptr_eq` first and then bitwise, as
+`scope_key_eq` does.
+
+### Merge laws
+
+These are the laws the stream verifies, and the contract a future change to a merge arm has to
+keep:
+
+- **Per-window order independence.** For every mergeable kind, absorbing one window's records in
+  any order emits the same value.
+- **Associativity through a relay.** In `temporality: delta`, two `aggregate` stages in series
+  (the first absorbs `a` and `b` and flushes, the second absorbs that output and `c`) emit what
+  one stage absorbing `a`, `b`, and `c` emits. Cumulative mode is excluded: a flushed cumulative
+  record passes through a downstream `aggregate` by design.
+- **`Sum`** is exact for two operands, because `f64` addition commutes. For three or more it
+  agrees within `f64` rounding, because it doesn't associate.
+- **Sketches** (`Distribution`, and `Samples` under `distributions: sketch`) are bin-exact: bin
+  counts, `count()`, `min`, and `max` match, and `sum` agrees within rounding.
+- **Sets** (`Set`, and `SetMembers` under either `sets:` mode) are an exact union.
+
+Some outcomes depend on order by design, and the stream pins them as examples rather than laws:
+
+- Two `Gauge` records with equal source timestamps: the later arrival wins (`event.timestamp >=
+  at`).
+- A `Gauge` interleaved with `GaugeDelta`s: a delta applies in arrival order and never advances
+  `at` ([ADR `relative-gauge-adjustments`](relative-gauge-adjustments.md)).
+- A `Histogram` bucket-bounds mismatch or a kind conflict: the first arrival opens the series and
+  keeps it, and the later record passes through.
+
+### Accounting identities
+
+Two identities hold for every `aggregate`, and the stream asserts both from telemetry:
+
+- `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every metric record
+  `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`, `kind_conflict`, and
+  `histogram_bounds_mismatch`. Today only
+  `logit.transform.metrics.passed_through{reason="no_recorded_value"}` exists. `agg/w2` adds the
+  other three reasons and a
+  `logit.transform.metrics.absorbed` counter. Until then a kind conflict or bounds mismatch is
+  countable only through `logit.component.diagnostics{key}`, and a pass-through kind isn't
+  counted at all.
+- `series_before_flush == emitted_tumbling + retained + evicted{idle} + evicted{cardinality}`,
+  where `series_before_flush` is every series held when `Aggregator::flush` starts
+  (`logit.transform.series.active` plus `logit.transform.series.retained`), `emitted_tumbling`
+  counts series emitted and removed, `retained` counts the series the flush keeps, and the two
+  evicted terms are `logit.transform.series.evicted{reason}`.
+
+### One function per decision
+
+Pass-through and retention are each decided today by two pieces of code kept in agreement by
+comment: `passes_through` and `Accumulator::new_for`'s `unreachable!` arm, and `flush`'s `retain`
+predicate and `kind_for_retained`'s `unreachable!` arm. A disagreement is a runtime panic, not a
+compile error. `agg/w2` replaces each pair with one `Option`-returning function:
+
+- `opener_for(..) -> Option<Opener>`: `None` means pass through, and `Opener::open` is total. The
+  opener borrows the incoming record, so deciding doesn't build an accumulator (a histogram's
+  bucket `Vec`) on every merge.
+- `Accumulator::retained_kind(&self, temporality) -> Option<MetricKind>`: `None` means the series
+  doesn't survive the flush. `flush` calls it only when `series_retention > 0`.
+
+The change moves no behavior and no allocation pin.
+
+### Cardinality-cap tie-break
+
+When survivors exceed `max_retained_series`, the cap evicts the most idle series first. Among
+equally idle series, the order today is `HashMap` iteration order, which is arbitrary. So once
+active series exceed the cap, a long-lived series updated every window can lose to a one-off
+series, and a cumulative series evicted this way restarts with a new `start_timestamp`. `agg/w3`
+breaks the tie by newest first: survivors sort by `(idle_windows descending, first_seen
+descending)`, so a stable series outlives a burst of fresh ones.
+
+### `description` and exemplars
+
+A series will keep its first record's `description` and emit it (`agg/w2`). Today every emitted
+record has none. `description` is an interned `Option<Symbol>`, so carrying it costs no
+allocation.
+
+Exemplars are dropped, and stay dropped. An exemplar is a single observation, and a summarized
+window has no per-observation data to attach it to. `aggregate` is the stage whose stated purpose
+is to summarize, so this falls under [ADR `lossless-transit`](lossless-transit.md)'s "Decision"
+rule that summarization is opt-in and named.
+
+### The groups bound
+
+`max_retained_series` bounds series, not groups. The number of distinct `(resource, scope)`
+groups within one window is unbounded, and `group_for` scans them linearly with a full resource
+compare on every absorbed metric. A realistic count reaches the thousands (an `otlp_in` gateway,
+or `prometheus_in` with a resource per scrape target). `agg/w1` measures absorb cost at 1, 100,
+and 1000 groups. Any cache, index, or cap is decided by that number, in its own change with its
+own allocation pins.
+
+### Start time after a cap eviction
+
+A series re-created after an eviction takes `first_seen` from the timestamp of the event that
+re-opens it, which is the source's clock. The previous point it emitted carries the flush clock.
+So a re-created cumulative series' `start_timestamp` can precede the timestamp of the last point
+of the series it replaces. A consumer still sees a changed `start_timestamp` and re-bases, which
+is the reset signal the cumulative amendment above relies on, but it can't assume the new start
+is later than the old point.
+
+See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
+`group_for`, and `Aggregator::flush` for the code this amendment describes, and
+`docs/plans/critical-sections-inventory.md`'s XFORM-01 to XFORM-05 and CORE-07 entries for what
+each workstream verifies.

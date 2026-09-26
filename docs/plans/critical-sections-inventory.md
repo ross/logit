@@ -62,8 +62,10 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
-| 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`) | XFORM-02, XFORM-03 | open |
+| 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`) | XFORM-02, XFORM-03 | in-progress (agg/w2): one `Option`-returning function per decision, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
+| 21 | A `NaN` resource attribute opens a new `ResourceGroup` per metric, because `group_for` uses `Resource`'s derived `PartialEq` while `SeriesKey` and `scope_key_eq` compare floats bitwise: a quadratic scan, and every such metric emitted unaggregated | XFORM-01 | in-progress (agg/w1) |
+| 22 | Cardinality-cap ties among equally idle series fall in `HashMap` order, so a series updated every window is evicted at random once active series exceed `max_retained_series`; a cumulative series then restarts with a new `start_timestamp` | XFORM-03 | in-progress (agg/w3) |
 
 Repo-wide gaps that cut across entries:
 
@@ -102,8 +104,9 @@ Entries that share a mechanism and should be verified together, in suggested ord
    then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
 7. **Lua boundary (done, #383, #385, #388, #386, #391, #392)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
    borrow, a proxy held past its scope, infinite loop, deep/huge table.
-8. **Aggregate** — XFORM-01..04, CORE-07. Proptest against a naive reference aggregator, merge
-   laws (associativity/commutativity) for every mergeable kind, cardinality-cap soak.
+8. **Aggregate (in progress, agg/w0–w4)** — XFORM-01..05, CORE-07. Proptest against a naive
+   reference aggregator, merge laws (associativity/commutativity) for every mergeable kind,
+   cardinality-cap soak.
 9. **Untrusted-input parsers** — NET-08, CODEC-01..03/05/07/10/12/13, XFORM-06/08. One fuzz target
    each; differential tests against reference implementations to inform committed fixtures.
 10. Everything else P1, then P2.
@@ -213,8 +216,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-15](#core-15--scriptworker-vm-lifecycle-the-luajit-sandbox-and-return-value-validation) | P0 | `ScriptWorker`: VM lifecycle, the LuaJIT sandbox, and return-value validation | `crates/logit-script/src/lib.rs` (`sandbox_libs`, `remove_unsandboxed_base_globals`, `ScriptWorker`) | findings → #391 |
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | findings → #388 |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
-| [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | unreviewed |
-| [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | unreviewed |
+| [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | in-progress (agg/w2) |
+| [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | in-progress (agg/w3) |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | unreviewed |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | unreviewed |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | unreviewed |
@@ -264,15 +267,15 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-01](#core-01--process-wide-symbol-interner-unbounded-growth-and-per-call-shard-contention) | P1 | Process-wide symbol interner: unbounded growth and per-call shard contention | `crates/logit-core/src/interner.rs` (`INTERNER`, `intern`, `resolve`, `lookup`) | unreviewed |
 | [CORE-02](#core-02--keycache-hand-rolled-cursor-scan-memo-in-front-of-the-interner) | P1 | `KeyCache`: hand-rolled cursor-scan memo in front of the interner | `crates/logit-core/src/interner.rs` (`KeyCache::get_or_intern`) | unreviewed |
 | [CORE-03](#core-03--attrmap-sorted-inline-smallvec-and-the-resourceevent-merge-join) | P1 | `AttrMap`: sorted inline `SmallVec` and the resource⊕event merge-join | `crates/logit-core/src/attrs.rs` (`AttrMap`, `merged`) | unreviewed |
-| [CORE-07](#core-07--samples-attacker-influenced-sample-rate-extrapolation) | P1 | `Samples`: attacker-influenced sample-rate extrapolation | `crates/logit-core/src/metric.rs` (`Samples`, `Samples::weight`, `Samples::sketch`) | unreviewed |
+| [CORE-07](#core-07--samples-attacker-influenced-sample-rate-extrapolation) | P1 | `Samples`: attacker-influenced sample-rate extrapolation | `crates/logit-core/src/metric.rs` (`Samples`, `Samples::weight`, `Samples::sketch`) | in-progress (agg/w2) |
 | [CORE-08](#core-08--telemetry-component-buffers-locks-bounded-caps-and-drop-accounting) | P1 | Telemetry component buffers: locks, bounded caps, and drop accounting | `crates/logit-core/src/telemetry.rs` (`ComponentBuffer`, `Registry`, `MAX_KEYS_PER_COMPONENT`) | unreviewed |
 | [CORE-09](#core-09--telemetrylayer-capturing-tracing-back-into-the-pipeline-feedback-loop-and-field-extraction) | P1 | `TelemetryLayer`: capturing `tracing` back into the pipeline (feedback loop and field extraction) | `crates/logit-core/src/telemetry.rs` (`TelemetryLayer`, `Layer::on_event`) | unreviewed |
 | [CORE-10](#core-10--deterministic-span-sampling-and-spanguard-span-minting) | P1 | Deterministic span sampling and `SpanGuard` span minting | `crates/logit-core/src/telemetry.rs` (`trace_is_sampled`, `Telemetry::span`, `SpanGuard`) | unreviewed |
 | [CORE-12](#core-12--hand-rolled-rfc-3339-formattingparsing-and-exact-decimal-to-nanos) | P1 | Hand-rolled RFC 3339 formatting/parsing and exact decimal-to-nanos | `crates/logit-core/src/time.rs` (`format_rfc3339_utc`, `parse_rfc3339_to_nanos`, `parse_decimal_nanos`) | unreviewed |
 | [CORE-18](#core-18--eventnewt-building-a-whole-event-from-an-untrusted-shape-lua-table) | P1 | `Event.new(t)`: building a whole `Event` from an untrusted-shape Lua table | `crates/logit-script/src/construct.rs` (`event_from_table`, `metric_from_table`, the `*_KEYS` allowlists) | findings → #385 |
 | [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | reviewed @d80f616 |
-| [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | unreviewed |
-| [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | unreviewed |
+| [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | in-progress (agg/w1) |
+| [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | in-progress (agg/w3) |
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
@@ -304,7 +307,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-13](#core-13--diagnostics-shared-power-of-two-throttle-and-its-telemetry-mirror) | P2 | `Diagnostics`: shared power-of-two throttle and its telemetry mirror | `crates/logit-core/src/diag.rs` (`Diagnostics`, `Diagnostics::warn_throttled`) | unreviewed |
 | [CORE-14](#core-14--template-the-name-parser-and-per-event-renderer) | P2 | `template`: the `{name}` parser and per-event renderer | `crates/logit-core/src/template.rs` (`parse`, `Template::compile`, `Compiled::render`) | unreviewed |
 | [CORE-20](#core-20--countingalloc-the-dev-only-counting-global-allocator) | P2 | `CountingAlloc`: the dev-only counting global allocator | `crates/logit-bench/src/alloc.rs` (`CountingAlloc`, `measure`) | unreviewed |
-| [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | unreviewed |
+| [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | in-progress (agg/w4) |
 | [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-transforms/src/csv.rs` (`split_row`, `unescape`) | unreviewed |
 | [XFORM-10](#xform-10--regexrs-capture-group-extraction) | P2 | regex.rs: capture-group extraction | `crates/logit-transforms/src/regex.rs` (`RegexParser::new`, `process`) | unreviewed |
 | [XFORM-11](#xform-11--small-filtermutate-transforms-combined) | P2 | Small filter/mutate transforms (combined) | `crates/logit-transforms/src/keep.rs` | unreviewed |
@@ -6014,6 +6017,9 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   - `Array` order-sensitivity is intentional (tests confirm two arrays differing only in element
     order stay distinct series) -- verify this matches `docs/design/data-model.md`'s stated
     semantics, not just this module's own tests.
+    `data-model.md` stated none of this before the `agg` stream; ADR
+    `aggregation-window-semantics`'s "Amendment: series identity, merge laws, and accounting as a
+    stated contract (2026-09-26)" now does, and `data-model.md` points at it.
   - `group_for`'s linear scan is fine only because distinct `(resource, scope)` pairs per
     `Aggregator` are small in practice; there is no cap on `self.groups.len()` itself (only on
     retained *series*), so a source that mints many distinct resources could grow `self.groups`
@@ -6054,8 +6060,11 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   forwards a metric -- there is no middle state).
 - **Invariants to verify:**
   - `passes_through` and `Accumulator::new_for`'s `unreachable!` arm
-    **must stay in exact sync** -- the module doc says so explicitly and
-    a mismatch is a `unreachable!()` panic at runtime, not a compile error. Any future `MetricKind`
+    **must stay in exact sync**. `passes_through`'s doc says "`process` and
+    `Accumulator::new_for`'s `unreachable!` arm both depend on this answer; a disagreement is a
+    runtime panic", and the comment above `kind_for_retained`'s `unreachable!` arm says the same of
+    the retention pair: "Must agree with `flush`'s `retain` predicate." A mismatch is an
+    `unreachable!()` panic at runtime, not a compile error. Any future `MetricKind`
     addition or `temporality` mode addition must update both.
   - A `GaugeDelta` never advances `Accumulator::Gauge.at` (the `MetricKind::GaugeDelta` merge arm in `process`, `note the ..`) --
     verify this stays true even as merge arms are edited; the module explicitly calls out that
