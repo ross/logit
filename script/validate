@@ -27,6 +27,12 @@ export SPLUNK_OBSERVABILITY_TOKEN="${SPLUNK_OBSERVABILITY_TOKEN:-logit-dev-token
 # The HEC token fixtures/splunk-hec-*.yaml send (`splunk_hec_out`'s `token`) and accept
 # (`splunk_hec_in`'s `tokens:`).
 export SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-logit-dev-token}"
+# tools/splunk-interop/logit-*.yaml's `splunk_hec_out` target, which script/splunk-interop points
+# at a local Splunk or Splunk Cloud.
+export SPLUNK_INTEROP_HEC_URL="${SPLUNK_INTEROP_HEC_URL:-http://splunk:8088/services/collector}"
+export SPLUNK_INTEROP_HEC_TOKEN="${SPLUNK_INTEROP_HEC_TOKEN:-logit-dev-token}"
+export SPLUNK_INTEROP_ACK_TOKEN="${SPLUNK_INTEROP_ACK_TOKEN:-logit-dev-token}"
+export SPLUNK_INTEROP_HEC_INSECURE="${SPLUNK_INTEROP_HEC_INSECURE:-false}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

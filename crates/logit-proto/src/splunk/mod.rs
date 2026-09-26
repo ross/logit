@@ -16,9 +16,11 @@
 //! (concatenated objects or a JSON array) and returns one [`EventBatch`] per distinct resource, in
 //! first-appearance order, wire order kept within each. It isn't a [`crate::Decoder`]: one request
 //! carries several resources. A body that isn't HEC JSON is a [`HecError`] carrying the status
-//! and, for a syntax error, the index of the first bad object, so the listener answers what Splunk
-//! would and delivers nothing. [`SplunkDecoder::decode_raw`] takes a `/raw` body and the
-//! [`Envelope`] the listener read from the query string.
+//! and, for a syntax error, the index of the first bad object. The listener calls
+//! [`SplunkDecoder::decode_events_prefix`] instead, which also returns the batches of the objects
+//! before that index, so it delivers what Splunk would index and answers what Splunk would.
+//! [`SplunkDecoder::decode_raw`] takes a `/raw` body and the [`Envelope`] the listener read from
+//! the query string.
 //!
 //! [`SplunkEncoder::encode_objects`] writes one HEC JSON object per entry of a
 //! [`MessageBuf<ObjectMeta>`](crate::MessageBuf), in batch order, and never fails: every loss is
@@ -43,7 +45,7 @@
 //! | Wire | Model | Counter |
 //! |---|---|---|
 //! | body empty, whitespace, or `[]` | `HecError` code 5 (`No data`) | -- |
-//! | object *i* not valid JSON, or not a JSON object | `HecError` code 6 with `invalid-event-number` *i*; nothing delivered | -- |
+//! | object *i* not valid JSON, or not a JSON object | `HecError` code 6 with `invalid-event-number` *i*; objects before *i* decoded by `decode_events_prefix`, none by `decode_events` | -- |
 //! | object *i*'s `event`, `fields`, or a carrier holding a number outside `f64`'s range (`1e400`) or nesting past 127 levels, which the model can't hold | the same `HecError` code 6 | -- |
 //! | a carrier `null` | absent | -- |
 //! | a carrier that isn't a string | its JSON text | `logit.input.events.degraded{reason="non_string_envelope"}` |
@@ -252,11 +254,28 @@ impl HecError {
 
     /// The response body Splunk sends for this error.
     pub fn body(&self) -> Vec<u8> {
+        self.body_with_ack(None)
+    }
+
+    /// [`HecError::body`] with `ack_id` after `invalid-event-number`, when the error names an
+    /// object; a body without one never carries an `ackId`.
+    pub fn body_with_ack(&self, ack_id: Option<u64>) -> Vec<u8> {
         match self.invalid_event_number {
-            Some(n) => response::encode_invalid_event(self.status, n),
+            Some(n) => response::encode_invalid_event_acked(self.status, n, ack_id),
             None => response::encode_status(self.status),
         }
     }
+}
+
+/// What [`SplunkDecoder::decode_events_prefix`] made of a body.
+#[derive(Debug)]
+pub struct DecodedPrefix {
+    /// The batches the objects before `error`'s (all of them, without one) decode to, one per
+    /// distinct resource; empty when the decoder skipped every one of them.
+    pub batches: Vec<EventBatch>,
+    /// Why decoding stopped: code 6 naming the first object that failed, or code 5 for a body
+    /// with none.
+    pub error: Option<HecError>,
 }
 
 /// What one [`SplunkEncoder::encode_objects`] entry carries beyond its bytes.
@@ -296,24 +315,40 @@ impl SplunkDecoder {
         self
     }
 
-    /// Decodes one `/services/collector/event` body into one batch per distinct resource. Every
-    /// object is parsed before any is decoded, so a syntax error anywhere rejects the whole body.
+    /// Decodes one `/services/collector/event` body into one batch per distinct resource, or
+    /// rejects it whole: every object is parsed before any is decoded, so a syntax error anywhere
+    /// yields the error and no batch. [`SplunkDecoder::decode_events_prefix`] is the listener's
+    /// form.
     pub fn decode_events(
         &mut self,
         body: &[u8],
         received_at: i64,
     ) -> Result<Vec<EventBatch>, HecError> {
-        let objects = split_objects(body)?;
-        let parsed = objects
-            .iter()
-            .enumerate()
-            .map(|(i, object)| ParsedObject::parse(object).ok_or_else(|| HecError::invalid_at(i)))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (parsed, error) = parse_objects(body);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(self.decode_parsed(parsed, received_at))
+    }
+
+    /// Decodes the objects of one `/services/collector/event` body up to the first that fails,
+    /// which is what Splunk indexes: the batches objects `0..N` decode to, and the [`HecError`]
+    /// naming object `N` when there is one. Nothing from object `N` on is decoded or counted.
+    pub fn decode_events_prefix(&mut self, body: &[u8], received_at: i64) -> DecodedPrefix {
+        let (parsed, error) = parse_objects(body);
+        DecodedPrefix { batches: self.decode_parsed(parsed, received_at), error }
+    }
+
+    fn decode_parsed(
+        &mut self,
+        parsed: Vec<ParsedObject<'_>>,
+        received_at: i64,
+    ) -> Vec<EventBatch> {
         let mut groups = Groups::default();
         for object in parsed {
             self.decode_object(object, received_at, &mut groups);
         }
-        Ok(groups.into_batches())
+        groups.into_batches()
     }
 
     /// Decodes one `/raw` body: one log event per line, all under `envelope`'s resource.
@@ -514,33 +549,64 @@ impl<'a> ParsedObject<'a> {
     }
 }
 
-/// Splits a body into its objects: a JSON array's elements, or concatenated top-level objects.
-fn split_objects(body: &[u8]) -> Result<Vec<Object<'_>>, HecError> {
-    let start = body.iter().position(|b| !b.is_ascii_whitespace()).ok_or_else(HecError::no_data)?;
+/// Parses a body's objects in order up to the first that fails: the parsed ones, and the error
+/// naming the failed object's index. A body with no object is code 5.
+fn parse_objects(body: &[u8]) -> (Vec<ParsedObject<'_>>, Option<HecError>) {
+    let (objects, mut error) = split_objects(body);
+    let mut parsed = Vec::with_capacity(objects.len());
+    for (i, object) in objects.iter().enumerate() {
+        match ParsedObject::parse(object) {
+            Some(object) => parsed.push(object),
+            None => {
+                error = Some(HecError::invalid_at(i));
+                break;
+            }
+        }
+    }
+    (parsed, error)
+}
+
+/// Splits a body into its objects, a JSON array's elements or concatenated top-level objects,
+/// up to the first that isn't a valid JSON object: the objects before it, and the error naming
+/// its index.
+fn split_objects(body: &[u8]) -> (Vec<Object<'_>>, Option<HecError>) {
+    let Some(start) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return (Vec::new(), Some(HecError::no_data()));
+    };
     let body = &body[start..];
-    let objects = if body[0] == b'[' {
-        serde_json::from_slice::<Vec<Object<'_>>>(body)
-            .map_err(|_| HecError::invalid_at(first_bad_element(body)))?
+    let (objects, error) = if body[0] == b'[' {
+        match serde_json::from_slice::<Vec<Object<'_>>>(body) {
+            Ok(objects) => (objects, None),
+            Err(_) => array_prefix(body),
+        }
     } else {
         let mut objects = Vec::new();
+        let mut error = None;
         for (i, item) in
             serde_json::Deserializer::from_slice(body).into_iter::<Object<'_>>().enumerate()
         {
-            objects.push(item.map_err(|_| HecError::invalid_at(i))?);
+            match item {
+                Ok(object) => objects.push(object),
+                Err(_) => {
+                    error = Some(HecError::invalid_at(i));
+                    break;
+                }
+            }
         }
-        objects
+        (objects, error)
     };
-    if objects.is_empty() {
-        return Err(HecError::no_data());
+    if objects.is_empty() && error.is_none() {
+        return (objects, Some(HecError::no_data()));
     }
-    Ok(objects)
+    (objects, error)
 }
 
-/// The index of the first element of a JSON array body (which failed to parse as a whole) that
-/// isn't a valid object: a scan for the array's top-level commas, tracking strings and nesting,
-/// then a parse of each element. When every element parses, the fault is in the array's own
-/// syntax after the last one (a missing `]`, trailing bytes), and the index is the element count.
-fn first_bad_element(body: &[u8]) -> usize {
+/// The elements of a JSON array body (which failed to parse as a whole) before the first that
+/// isn't a valid object, and the error naming that element: a scan for the array's top-level
+/// commas, tracking strings and nesting, then a parse of each element. When every element
+/// parses, the fault is in the array's own syntax after the last one (a missing `]`, trailing
+/// bytes), and the index is the element count.
+fn array_prefix(body: &[u8]) -> (Vec<Object<'_>>, Option<HecError>) {
     let mut elements = Vec::new();
     let (mut depth, mut in_string, mut escaped, mut from) = (0usize, false, false, 1usize);
     let mut closed = false;
@@ -575,13 +641,16 @@ fn first_bad_element(body: &[u8]) -> usize {
     if !closed {
         elements.push(&body[from.min(body.len())..]);
     }
-    for (i, element) in elements.iter().enumerate() {
-        if serde_json::from_slice::<Object<'_>>(element).is_err() {
+    let mut objects = Vec::with_capacity(elements.len());
+    for element in elements {
+        match serde_json::from_slice::<Object<'_>>(element) {
+            Ok(object) => objects.push(object),
             // `[]` scans as one empty element; an empty element anywhere else is a stray comma.
-            return i;
+            Err(_) => break,
         }
     }
-    elements.len()
+    let index = objects.len();
+    (objects, Some(HecError::invalid_at(index)))
 }
 
 /// Decoded events grouped by resource, in first-appearance order.
@@ -854,6 +923,58 @@ pub(crate) mod tests {
         assert_eq!(
             err.body(),
             br#"{"text":"Invalid data format","code":6,"invalid-event-number":1}"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn the_prefix_form_decodes_the_objects_before_the_error_and_names_the_same_index() {
+        let deep = format!(r#"{{"event":{}1{}}}"#, "[".repeat(130), "]".repeat(130));
+        let cases = [
+            (r#"{"event":"a"}{"event":"b""#.to_string(), 1),
+            (r#"{"event":"a"}{"event":"b"}x"#.to_string(), 2),
+            (r#"{"event":"a"} 7 {"event":"b"}"#.to_string(), 1),
+            (r#"[{"event":"a"},{"event":"b",},{"event":"c"}]"#.to_string(), 1),
+            (r#"[{"event":"a,]"},{"event":"b"}"#.to_string(), 2),
+            (r#"[{"event":"a"}] {"#.to_string(), 1),
+            (r#"not json"#.to_string(), 0),
+            (r#"{"event":"a"}{"event":"x","fields":{"a":1e400}}"#.to_string(), 1),
+            (format!(r#"{{"event":"a"}}{{"event":"b"}}{deep}"#), 2),
+        ];
+        for (body, index) in cases {
+            let strict = SplunkDecoder::new().decode_events(body.as_bytes(), 0).unwrap_err();
+            let prefix = SplunkDecoder::new().decode_events_prefix(body.as_bytes(), 0);
+            assert_eq!(prefix.error, Some(strict), "{body}");
+            assert_eq!(strict.invalid_event_number, Some(index as u64), "{body}");
+            let events: usize = prefix.batches.iter().map(|b| b.events.len()).sum();
+            assert_eq!(events, index, "{body}");
+        }
+
+        let whole = r#"{"event":"a","host":"h1"}{"event":"b","host":"h2"}"#;
+        let prefix = SplunkDecoder::new().decode_events_prefix(whole.as_bytes(), RECEIVED_AT);
+        assert_eq!(prefix.error, None);
+        assert_eq!(prefix.batches, decode(whole));
+        for body in ["", " \n", "[]"] {
+            let prefix = SplunkDecoder::new().decode_events_prefix(body.as_bytes(), 0);
+            assert!(prefix.batches.is_empty(), "{body:?}");
+            assert_eq!(prefix.error.map(|e| e.status), Some(HecStatus::NO_DATA), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn the_prefix_form_groups_by_resource_and_counts_only_what_it_decoded() {
+        let registry = Registry::new();
+        let body = concat!(
+            r#"{"event":"a","host":"h1"}{"event":"b","host":"h2"}{"event":"","host":"h1"}"#,
+            r#"{"event":"c","host":"h1"{"event":"","host":"h1"}"#,
+        );
+        let prefix = decoder(&registry).decode_events_prefix(body.as_bytes(), RECEIVED_AT);
+        assert_eq!(prefix.error.and_then(|e| e.invalid_event_number), Some(3));
+        let hosts: Vec<usize> = prefix.batches.iter().map(|b| b.events.len()).collect();
+        assert_eq!(hosts, [1, 1], "h1's a, then h2's b; the blank object skipped");
+        assert_eq!(
+            counted(&registry, "logit.input.events.skipped", ("reason", "blank_event")),
+            1.0,
+            "the blank object after the error isn't decoded"
         );
     }
 

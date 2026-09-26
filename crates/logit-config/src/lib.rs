@@ -974,12 +974,15 @@ pub enum ComponentKind {
     /// with one log per line and `host`, `source`, `sourcetype`, and `index` from the query
     /// string, `/services/collector/ack`, and `/services/collector/health`, answering Splunk's own
     /// `{"text","code"}` bodies. Decompresses gzip; any other `Content-Encoding` gets `415`. A
-    /// request that names a channel gets an `ackId`, and `/ack` reports every id delivered. The
-    /// envelope's `host`, `source`, `sourcetype`, and `index` become the resource attributes
-    /// `host.name`, `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When
-    /// the pipeline can't take a request's data within 5s, the request gets `503` code 9 with
-    /// `Retry-After: 1`, and the client retries it; a request carrying several envelopes can then
-    /// deliver some of its events twice.
+    /// request that names a channel gets an `ackId`, counted from 0 per channel, once the
+    /// pipeline has taken its data; `/ack` reports each id `true` once on the channel that issued
+    /// it, as a Splunk token with indexer acknowledgment does, and needs a channel. The envelope's
+    /// `host`, `source`, `sourcetype`, and `index` become the resource attributes `host.name`,
+    /// `com.splunk.source`, `com.splunk.sourcetype`, and `com.splunk.index`. When the pipeline
+    /// can't start taking a request's data within 5s, the request gets `503` code 9 with
+    /// `Retry-After: 1`, nothing of it is delivered, and the client retries it; once part of a
+    /// request is taken, the rest waits for the pipeline and the request gets `200`. After a
+    /// `503`, `/health` answers `503` code 18 for 5s, or until a later request is taken.
     SplunkHecIn {
         /// The `host:port` to listen on. Splunk's HEC port is `8088`.
         bind: String,
@@ -1002,6 +1005,17 @@ pub enum ComponentKind {
         #[serde(default = "default_splunk_max_request_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_request_bytes: u64,
+        /// How many channels' acknowledgment state this listener keeps. A new channel past it
+        /// evicts the channel used least recently, and polls for that channel's ids then answer
+        /// `false`. Defaults to `256`; raise it when more clients than that send a channel at
+        /// once. `0` is rejected.
+        #[serde(default = "default_splunk_max_ack_channels")]
+        max_ack_channels: usize,
+        /// How many of a channel's most recent ids stay answerable on `/ack`; an older id answers
+        /// `false`. Defaults to `1000000`, Splunk's own per-channel default. A client that sends a
+        /// channel and never polls holds one bit per request up to this many. `0` is rejected.
+        #[serde(default = "default_splunk_max_pending_acks")]
+        max_pending_acks: usize,
         /// How long one connection has, per pre-request phase, before this listener closes it
         /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
         /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
@@ -1785,9 +1799,12 @@ pub enum ComponentKind {
     SplunkHecOut {
         /// The collector's base URL, ending in `/services/collector`:
         /// `https://splunk.example.com:8088/services/collector`, or
-        /// `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. This
-        /// sink appends `/event` and `/ack` itself, so a URL ending in a route (`/event`, `/raw`,
-        /// `/ack`, `/health`) is rejected.
+        /// `https://http-inputs-<stack>.splunkcloud.com/services/collector` on Splunk Cloud. A
+        /// Splunk Cloud trial stack serves HEC at
+        /// `https://<stack>.splunkcloud.com:8088/services/collector` instead, with a self-signed
+        /// certificate that needs `tls: {insecure_skip_verify: true}`. This sink appends `/event`
+        /// and `/ack` itself, so a URL ending in a route (`/event`, `/raw`, `/ack`, `/health`) is
+        /// rejected.
         endpoint: String,
         /// The HEC token, sent as `Authorization: Splunk <token>` and never logged. Take it from
         /// the environment (`!env SPLUNK_HEC_TOKEN`) rather than writing it into the file. An
@@ -1807,9 +1824,9 @@ pub enum ComponentKind {
         multi_value: SplunkMultiValue,
         /// Waits for Splunk to confirm each request was indexed before a batch counts as
         /// delivered, polling `/services/collector/ack`. Needs a token with indexer
-        /// acknowledgment enabled; Splunk Cloud doesn't offer it. With a token that doesn't
-        /// acknowledge, each request counts as delivered on its `200`, and `logit` logs a
-        /// warning. Off by default.
+        /// acknowledgment enabled, which some Splunk Cloud stacks don't offer. With a token
+        /// that doesn't acknowledge, each request counts as delivered on its `200`, and `logit`
+        /// logs a warning. Off by default.
         #[serde(default)]
         ack: bool,
         /// How long to wait for every request of a batch to be acknowledged. Past it the batch
@@ -1830,7 +1847,8 @@ pub enum ComponentKind {
         /// Caps one request body before compression; a batch larger than this goes out as
         /// several requests, and one event larger than this alone is dropped, counted. A
         /// byte-count string. Defaults to `"2MiB"`, the OpenTelemetry exporter's default. `0` is
-        /// rejected.
+        /// rejected. Splunk Cloud refuses a body over `"5MiB"`, so a larger value logs a warning
+        /// at startup; Splunk Enterprise accepts up to 800 MiB.
         #[serde(default = "default_splunk_max_body_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_body_bytes: u64,
@@ -2693,6 +2711,16 @@ pub fn default_splunk_max_body_bytes() -> u64 {
 /// Mirrors `logit_inputs::splunk::DEFAULT_MAX_REQUEST_BYTES`, kept in sync by hand.
 fn default_splunk_max_request_bytes() -> u64 {
     5 * 1024 * 1024
+}
+
+/// Mirrors `logit_inputs::splunk::DEFAULT_MAX_ACK_CHANNELS`, kept in sync by hand.
+fn default_splunk_max_ack_channels() -> usize {
+    256
+}
+
+/// Mirrors `logit_inputs::splunk::DEFAULT_MAX_PENDING_ACKS`, kept in sync by hand.
+fn default_splunk_max_pending_acks() -> usize {
+    1_000_000
 }
 
 /// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES`, kept in sync by hand.
@@ -5171,6 +5199,8 @@ mod tests {
                 tls,
                 tokens,
                 max_request_bytes,
+                max_ack_channels,
+                max_pending_acks,
                 handshake_timeout,
                 idle_timeout,
             } => {
@@ -5178,6 +5208,8 @@ mod tests {
                 assert_eq!(tls, None);
                 assert!(tokens.is_empty());
                 assert_eq!(max_request_bytes, 5 * 1024 * 1024);
+                assert_eq!(max_ack_channels, 256);
+                assert_eq!(max_pending_acks, 1_000_000);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(idle_timeout, None);
             }

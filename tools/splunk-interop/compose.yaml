@@ -8,6 +8,11 @@
 #   SPLUNK_INTEROP_OUT    the host run directory, mounted at /out where a service writes files
 #   SPLUNK_INTEROP_IMAGE  the `logit` release image tag
 #
+# The legs' `splunk_hec_out` target comes from `x-logit`'s `environment:`, which defaults to the
+# local `splunk` service below. In Splunk Cloud mode the script passes the operator's env file as
+# a second `--env-file`, which overrides those defaults, and starts only the `logit-*` legs and
+# `replay` with `--no-deps`: `splunk`, `splunk-init`, and `rawcap` never start.
+#
 # Nothing binds a host port: the harness queries Splunk from a container on this network. No
 # `container_name`, so a second stack under another project name can't collide with this one.
 #
@@ -24,8 +29,14 @@ networks:
   default:
     name: splunk-interop-net
 
+# Every leg writes its sink's telemetry to /out/<leg>-telemetry.log, which check.py reads.
 x-logit: &logit
   image: ${SPLUNK_INTEROP_IMAGE:-logit:splunk-interop}
+  environment:
+    SPLUNK_INTEROP_HEC_URL: ${SPLUNK_INTEROP_HEC_URL:-http://splunk:8088/services/collector}
+    SPLUNK_INTEROP_HEC_TOKEN: ${SPLUNK_INTEROP_HEC_TOKEN:-11111111-1111-1111-1111-111111111111}
+    SPLUNK_INTEROP_ACK_TOKEN: ${SPLUNK_INTEROP_ACK_TOKEN:-22222222-2222-2222-2222-222222222222}
+    SPLUNK_INTEROP_HEC_INSECURE: ${SPLUNK_INTEROP_HEC_INSECURE:-false}
   depends_on:
     splunk-init:
       condition: service_completed_successfully
@@ -55,7 +66,8 @@ services:
   # the default token; a second token `ack` with `useACK`; and the `[tcpout]` probe's output
   # group `rawcap` (`sendCookedData=false`, pointed at the `rawcap` service) with a third token
   # `tcpout` routed to it, so only what that token receives is forwarded. No `defaultGroup` is
-  # set: Splunk's own logs never leave.
+  # set: Splunk's own logs never leave. Also a sourcetype `logit:ta` with index-time props and
+  # transforms for check.py's `/event`-against-`/raw` probe.
   splunk-init:
     image: curlimages/curl:8.22.0
     depends_on:
@@ -94,6 +106,22 @@ services:
         post "rawcap output group" "$$api/servicesNS/nobody/system/configs/conf-outputs" \
           -d name=tcpout:rawcap -d server=rawcap:9997 -d sendCookedData=false \
           -d dropEventsOnQueueFull=5
+        # check.py's probe_event_vs_raw_props: a TA-style sourcetype `logit:ta` whose index-time
+        # props take `_time` from a `ts=` prefix, route a `route=probe` line to `tcpout_probe`, and
+        # rename the sourcetype, to show which of them `/event` skips. These load on the restart too.
+        conf="$$api/servicesNS/nobody/system/configs"
+        post "logit:ta index transform" "$$conf/conf-transforms" --data-urlencode name=logit_ta_route \
+          --data-urlencode "REGEX=route=probe" --data-urlencode DEST_KEY=_MetaData:Index \
+          --data-urlencode FORMAT=tcpout_probe
+        post "logit:ta sourcetype transform" "$$conf/conf-transforms" --data-urlencode name=logit_ta_rename \
+          --data-urlencode "REGEX=route=probe" --data-urlencode DEST_KEY=MetaData:Sourcetype \
+          --data-urlencode FORMAT=sourcetype::logit:ta:renamed
+        post "logit:ta props" "$$conf/conf-props" --data-urlencode name=logit:ta \
+          --data-urlencode SHOULD_LINEMERGE=false --data-urlencode TZ=UTC \
+          --data-urlencode "TIME_PREFIX=^ts=" --data-urlencode "TIME_FORMAT=%Y-%m-%dT%H:%M:%S" \
+          --data-urlencode MAX_TIMESTAMP_LOOKAHEAD=19 \
+          --data-urlencode TRANSFORMS-route=logit_ta_route \
+          --data-urlencode TRANSFORMS-rename=logit_ta_rename
         post "tcpout token" "$$http" -d name=tcpout -d token=44444444-4444-4444-4444-444444444444 \
           -d indexes=tcpout_probe -d index=tcpout_probe
         post "restart" "$$api/services/server/control/restart" -X POST
@@ -121,15 +149,21 @@ services:
 
   logit-hec-logs:
     <<: *logit
-    volumes: ["./logit-hec-logs.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-logs.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-metrics:
     <<: *logit
-    volumes: ["./logit-hec-metrics.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-metrics.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-spans:
     <<: *logit
-    volumes: ["./logit-hec-spans.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-spans.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-ack:
     <<: *logit
@@ -139,7 +173,9 @@ services:
 
   logit-hec-relay:
     <<: *logit
-    volumes: ["./logit-hec-relay.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-relay.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   # One pass over testdata/interop/splunk/ into the relay leg's listener (replay.py), then exits.
   replay:

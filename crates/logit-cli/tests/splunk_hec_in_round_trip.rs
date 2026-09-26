@@ -6,8 +6,9 @@
 //! themselves one decode of a hand-written HEC body, so they are on the codec's fixed point
 //! (`crates/logit-proto/tests/splunk_fixed_point.rs`): decoding the encoder's output gives the
 //! encoder's input back, whole-`EventBatch` equal. What this file adds is the HTTP hop: routing,
-//! authentication, `Content-Encoding`, the channel and `ackId`, and delivery to the `Fanout`. It
-//! also covers the busy contract (`crates/logit-inputs/src/splunk.rs`'s "Backpressure" section).
+//! authentication, `Content-Encoding`, per-channel `ackId`s and `/ack`, and delivery to the `Fanout`. It
+//! also covers the busy contract and the `/health` it drives (`crates/logit-inputs/src/splunk.rs`'s
+//! "Backpressure" and "Health" sections).
 
 use logit_core::EventBatch;
 use logit_inputs::splunk::SplunkHecInput;
@@ -25,6 +26,10 @@ const RECEIVED_AT: i64 = 1_699_000_000_000_000_000;
 /// [`SplunkHecInput::with_busy_after`]'s test/tuning hook, so it doesn't wait out the real 5s
 /// default.
 const TEST_BUSY_AFTER: Duration = Duration::from_millis(200);
+
+/// How long `/health` stays `503` after a busy answer in the busy test, via
+/// [`SplunkHecInput::with_health_busy_window`], short so the test sees it lapse.
+const TEST_HEALTH_WINDOW: Duration = Duration::from_millis(500);
 
 const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -53,7 +58,8 @@ async fn start_with_busy_after(
 ) -> (SocketAddr, mpsc::Receiver<logit_pipeline::Delivered>) {
     let mut input = SplunkHecInput::new("127.0.0.1:0")
         .with_tokens(vec![TOKEN.to_string()])
-        .with_busy_after(busy_after);
+        .with_busy_after(busy_after)
+        .with_health_busy_window(TEST_HEALTH_WINDOW);
     input.bind().await.expect("binding splunk_hec_in");
     let addr = input.local_addr().expect("bind() leaves an address");
     let (tx, rx) = mpsc::channel(capacity);
@@ -170,22 +176,38 @@ async fn raw_delivers_one_log_per_line_under_the_query_envelope() {
     assert_eq!(delivered, expected);
 }
 
-/// A client with a channel gets an `ackId` per request, and `/ack` reports each one delivered.
+/// Polls `/ack` on `channel` for `ids`, returning the reply body.
+async fn poll(addr: SocketAddr, channel: &str, ids: &str) -> String {
+    let body = format!(r#"{{"acks":[{ids}]}}"#);
+    let (status, text) =
+        post(addr, "/services/collector/ack", body.as_bytes(), false, Some(channel)).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+    text
+}
+
+/// Splunk's `useACK` semantics: ids count from 0 per channel, and a poll answers an id issued on
+/// that channel `true` once, then `false`, and any other id `false`.
 #[tokio::test]
-async fn a_channel_draws_ack_ids_that_ack_reports_true() {
+async fn ack_ids_count_per_channel_and_answer_true_once() {
     let (addr, mut rx) = start(16).await;
     let (_, body) = fixed_point_case(br#"{"time":1,"event":"x"}"#);
-    let channel = Some("0f3c2a1e-7d4b-4c55-9a1d-3b0e8d6f2c10");
-    let (_, first) = post(addr, "/services/collector/event", &body, false, channel).await;
-    let (_, second) = post(addr, "/services/collector/event", &body, true, channel).await;
-    assert_eq!(first, r#"{"text":"Success","code":0,"ackId":1}"#);
-    assert_eq!(second, r#"{"text":"Success","code":0,"ackId":2}"#);
-    recv(&mut rx).await;
-    recv(&mut rx).await;
-    let (status, acks) =
-        post(addr, "/services/collector/ack", br#"{"acks":[1,2]}"#, false, channel).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(acks, r#"{"acks":{"1":true,"2":true}}"#);
+    let (a, b) = ("0f3c2a1e-7d4b-4c55-9a1d-3b0e8d6f2c10", "5b7e0c1d-2a3f-4e6b-8c9d-0e1f2a3b4c5d");
+    for (channel, gzipped, id) in [(a, false, 0), (a, true, 1), (b, false, 0)] {
+        let (_, text) =
+            post(addr, "/services/collector/event", &body, gzipped, Some(channel)).await;
+        assert_eq!(text, format!(r#"{{"text":"Success","code":0,"ackId":{id}}}"#));
+        recv(&mut rx).await;
+    }
+    assert_eq!(poll(addr, a, "0,1,5").await, r#"{"acks":{"0":true,"1":true,"5":false}}"#);
+    assert_eq!(poll(addr, a, "0,1").await, r#"{"acks":{"0":false,"1":false}}"#);
+    let fresh = "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a";
+    assert_eq!(poll(addr, fresh, "0").await, r#"{"acks":{"0":false}}"#);
+    assert_eq!(poll(addr, b, "0").await, r#"{"acks":{"0":true}}"#);
+
+    let (status, text) =
+        post(addr, "/services/collector/ack", br#"{"acks":[0]}"#, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(text, r#"{"text":"Data channel is missing","code":10}"#);
 }
 
 /// The OpenTelemetry exporter's startup probe: `GET /services/collector/health`, no token.
@@ -201,15 +223,27 @@ async fn health_answers_without_a_token() {
     assert_eq!(response.text().await.unwrap(), r#"{"text":"HEC is healthy","code":17}"#);
 }
 
+/// `GET /services/collector/health/1.0` with no token: the status and body.
+async fn health(addr: SocketAddr) -> (u16, String) {
+    let response = client()
+        .get(format!("http://{addr}/services/collector/health/1.0"))
+        .send()
+        .await
+        .expect("the request reaches splunk_hec_in");
+    (response.status().as_u16(), response.text().await.unwrap_or_default())
+}
+
 /// The busy contract: a one-slot channel with a parked consumer takes the first request's batch;
 /// the second request's send waits out `TEST_BUSY_AFTER` and is answered `503` code 9 with
-/// `Retry-After`, delivering nothing. Once the consumer drains, the client's retry succeeds.
+/// `Retry-After`, delivering nothing. `/health` answers `503` code 18 from then until
+/// `TEST_HEALTH_WINDOW` has passed. Once the consumer drains, the client's retry succeeds.
 #[tokio::test]
 async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
     let (expected, body) = fixed_point_case(br#"{"time":1,"host":"h","event":"x"}"#);
     let path = "/services/collector/event";
 
+    assert_eq!(health(addr).await, (200, r#"{"text":"HEC is healthy","code":17}"#.into()));
     let (status, _) = post(addr, path, &body, false, None).await;
     assert_eq!(status, reqwest::StatusCode::OK, "the first batch fills the one slot");
 
@@ -227,6 +261,10 @@ async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     assert!(elapsed >= TEST_BUSY_AFTER, "answered after the bound, not before: {elapsed:?}");
     assert!(elapsed < Duration::from_secs(2), "answered promptly: {elapsed:?}");
     assert_eq!(response.text().await.unwrap(), r#"{"text":"Server is busy","code":9}"#);
+    let unhealthy = r#"{"text":"HEC is unhealthy, queues are full","code":18}"#;
+    assert_eq!(health(addr).await, (503, unhealthy.into()), "while posts answer 503");
+    tokio::time::sleep(TEST_HEALTH_WINDOW).await;
+    assert_eq!(health(addr).await.0, 200, "healthy once the window has passed");
 
     assert_eq!(recv(&mut rx).await, expected[0]);
     assert!(
@@ -237,6 +275,97 @@ async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     let (status, _) = post(addr, path, &body, true, None).await;
     assert_eq!(status, reqwest::StatusCode::OK, "the client's retry succeeds");
     assert_eq!(recv(&mut rx).await, expected[0]);
+}
+
+/// A body with a syntax error delivers the objects before the bad one, as Splunk indexes them,
+/// and answers `400` code 6 naming it: after object 0, the first object; in object 0, nothing;
+/// after the last object's closing brace, all three, naming 3.
+#[tokio::test]
+async fn a_code_6_delivers_the_objects_before_the_one_it_names() {
+    let (addr, mut rx) = start(16).await;
+    let (expected, _) = fixed_point_case(
+        br#"{"time":1,"host":"h","event":"a"}{"time":2,"host":"h","event":"b"}{"time":3,"host":"h","event":"c"}"#,
+    );
+    let objects: Vec<Vec<u8>> = expected[0]
+        .events
+        .iter()
+        .map(|event| {
+            let batch = EventBatch { events: vec![event.clone()], ..expected[0].clone() };
+            SplunkEncoder::new().encode(&batch).expect("encode never fails").to_vec()
+        })
+        .collect();
+    let bad: &[u8] = br#"{"time":9,"host":"h","event":"#;
+    let [a, b, c] = [&objects[0][..], &objects[1][..], &objects[2][..]];
+    let path = "/services/collector/event";
+
+    for (parts, index, delivered) in
+        [(vec![a, bad, c], 1, 1), (vec![bad, b, c], 0, 0), (vec![a, b, c, b"}"], 3, 3)]
+    {
+        let body = parts.concat();
+        for gzipped in [false, true] {
+            let (status, text) = post(addr, path, &body, gzipped, None).await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    r#"{{"text":"Invalid data format","code":6,"invalid-event-number":{index}}}"#
+                )
+            );
+            if delivered > 0 {
+                let batch = recv(&mut rx).await;
+                assert_eq!(batch.events, expected[0].events[..delivered], "index {index}");
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
+                "nothing from object {index} on"
+            );
+        }
+    }
+}
+
+/// A `503` code 9 means nothing of the body was taken. A three-batch body behind a full one-slot
+/// channel: when the slot frees before the deadline, the first batch goes in, the rest wait past
+/// `TEST_BUSY_AFTER` for the consumer, and the answer is `200` with every batch delivered once.
+/// When the slot never frees, the answer is `503` with none of the body delivered.
+#[tokio::test]
+async fn a_multi_batch_body_is_answered_503_only_when_none_of_it_was_delivered() {
+    let (expected, body) = fixed_point_case(OTEL_EXPORTER_BODY.as_bytes());
+    assert_eq!(expected.len(), 3);
+    let (filler, filler_body) = fixed_point_case(br#"{"time":1,"host":"h","event":"x"}"#);
+    let path = "/services/collector/event";
+
+    // The slot frees after the first batch's wait began, and the rest past the deadline.
+    let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
+    let (status, _) = post(addr, path, &filler_body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "the filler takes the one slot");
+    let request = tokio::spawn(async move { post(addr, path, &body, false, None).await });
+    tokio::time::sleep(TEST_BUSY_AFTER / 4).await;
+    assert_eq!(recv(&mut rx).await, filler[0]);
+    tokio::time::sleep(TEST_BUSY_AFTER * 2).await;
+    for batch in &expected {
+        assert_eq!(&recv(&mut rx).await, batch);
+    }
+    let (status, text) = request.await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{text}");
+    assert_eq!(text, r#"{"text":"Success","code":0}"#);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+        "every batch once"
+    );
+
+    // The slot never frees: nothing of the body is delivered.
+    let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
+    let (_, body) = fixed_point_case(OTEL_EXPORTER_BODY.as_bytes());
+    let (status, _) = post(addr, path, &filler_body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, text) = post(addr, path, &body, false, None).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(text, r#"{"text":"Server is busy","code":9}"#);
+    assert_eq!(recv(&mut rx).await, filler[0]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+        "a 503'd body delivers nothing"
+    );
 }
 
 /// A wrong token is refused with Splunk's `403` code 4 and delivers nothing.

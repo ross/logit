@@ -273,6 +273,15 @@ mod tests {
                 "DD_API_KEY" => Some("logit-test-key".to_string()),
                 "SPLUNK_OBSERVABILITY_TOKEN" => Some("logit-test-token".to_string()),
                 "SPLUNK_HEC_TOKEN" => Some("logit-test-token".to_string()),
+                // `script/splunk-interop`'s legs, which take their target from the environment
+                // so one config serves a local Splunk and Splunk Cloud.
+                "SPLUNK_INTEROP_HEC_URL" => {
+                    Some("http://splunk:8088/services/collector".to_string())
+                }
+                "SPLUNK_INTEROP_HEC_TOKEN" | "SPLUNK_INTEROP_ACK_TOKEN" => {
+                    Some("logit-test-token".to_string())
+                }
+                "SPLUNK_INTEROP_HEC_INSECURE" => Some("false".to_string()),
                 // The whole header value, `Bearer ` included: `!env` substitutes a field, it
                 // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {

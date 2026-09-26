@@ -1796,6 +1796,8 @@ components:
     bind: 127.0.0.1:8088
     tokens: [!env SPLUNK_HEC_TOKEN]   # empty or absent accepts any token
     # max_request_bytes: 5MiB         # the default; as sent and after gzip
+    # max_ack_channels: 256           # the default; channels whose ack ids are kept
+    # max_pending_acks: 1000000       # the default; ids per channel still answerable
     # idle_timeout: 120s              # off by default
 ```
 
@@ -1803,7 +1805,8 @@ components:
 objects, concatenated or in an array, each carrying its own envelope; the body decodes into one
 batch per distinct envelope. `/services/collector/raw` and `/raw/1.0` take one log per line, with
 `host`, `source`, `sourcetype`, and `index` from the query string. `/services/collector/health`
-answers `{"text":"HEC is healthy","code":17}` without authentication, and `OPTIONS` on any route
+answers `{"text":"HEC is healthy","code":17}` without authentication (`503` code 18 while the
+pipeline is refusing posts, below), and `OPTIONS` on any route
 answers `200` as Splunk does, which Docker's driver requires before it starts a container. Any
 other path gets `404`, and a known path with the wrong method `405`. Every answer is Splunk's own
 `{"text","code"}` body, so a client's error handling reads it as it reads Splunk's.
@@ -1816,7 +1819,10 @@ anything else to a log. An object with no `event` and no measurement, or a blank
 skipped and counted, and every valid object in the body is delivered. Splunk Enterprise 10.4.3
 skips an object with `fields` and no `event` and answers `200`, but answers an object with neither
 `400` code 12 and a blank `event` `400` code 13, indexing the objects before it and none after.
-`crates/logit-proto/src/splunk/mod.rs`'s module doc has every mapping.
+An object that isn't valid JSON is answered as Splunk answers it: the objects before it are
+delivered, and `400` code 6 names it in `invalid-event-number`, so a client that resends only the
+objects after it loses nothing else. `crates/logit-proto/src/splunk/mod.rs`'s module doc has
+every mapping.
 
 **Authentication.** With `tokens` set, a request needs `Authorization: Splunk <token>` (or
 `Basic` with the token as the password) naming one of them: none gets `401`, an unlisted one
@@ -1828,17 +1834,26 @@ the network in the clear, and because a client configured with an `https://` URL
 **Compression.** Identity or `gzip`; any other `Content-Encoding`, `deflate` included, gets `415`,
 as Splunk answers.
 
-**Channels and acknowledgment.** No channel is required on any route. A request that names one
-(`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, and `/ack` answers every
-id asked about `true`, because a `200` already means the data reached the pipeline. Neither the
-channel nor the id enters an event.
+**Channels and acknowledgment.** `/event` and `/raw` never require a channel. A request that
+names one (`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, or in a code 6
+that followed delivered objects, counted from 0 per channel as a Splunk `useACK` token counts
+them. `/ack` needs a channel (`400` code 10 without one) and answers an id issued on that channel
+`true` once, since the id already means the data reached the pipeline, and any other id `false`:
+one already reported, one never issued, or one from another channel. The listener keeps
+`max_ack_channels` channels, evicting the one used least recently, and the most recent
+`max_pending_acks` ids per channel; an id either bound drops answers `false`, counted
+`logit.input.acks.dropped{reason}`. Raise `max_ack_channels` when more clients than that send a
+channel at once. Neither the channel nor the id enters an event.
 
-**A full pipeline gets `503`.** When the pipeline doesn't take a request's batches within 5
+**A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and the batches not yet delivered
-`logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9. A body with several
-envelopes can have delivered some of its batches before the deadline, and the retry delivers
-those again.
+`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
+Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
+decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
+without a deadline and the request gets `200`, so a retry never repeats part of a body. From that
+answer until a later request's data is taken, for at most 5 seconds,
+`/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
+Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token
@@ -1870,9 +1885,12 @@ components:
 ```
 
 **The endpoint.** The base URL, ending in `/services/collector`; the sink appends `/event` and
-`/ack`, so a URL ending in a route is a `logit validate` error. On Splunk Cloud it's
-`https://http-inputs-<stack>.splunkcloud.com/services/collector`. `tls:` tunes an `https://`
-endpoint, such as a `ca_file` for Splunk Enterprise's default self-signed certificate.
+`/ack`, so a URL ending in a route is a `logit validate` error. Splunk documents
+`https://http-inputs-<stack>.splunkcloud.com/services/collector` for Splunk Cloud; a trial stack
+serves HEC at `https://<stack>.splunkcloud.com:8088/services/collector` instead. `tls:` tunes an
+`https://` endpoint, such as a `ca_file` for Splunk Enterprise's default self-signed certificate.
+A Splunk Cloud trial stack presents that same certificate, whose name doesn't match the host, so
+it needs `tls: {insecure_skip_verify: true}`.
 
 **Index, source, sourcetype, and host come from the resource.** There are no per-sink fields for
 them: the sink reads `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
@@ -1890,21 +1908,30 @@ no trace store: they're searchable events, not a trace view.
 
 **Requests.** A batch is cut into bodies of at most `max_body_bytes` before compression, sent in
 order. An object larger than the cap alone is dropped, counted
-`logit.output.records.dropped{reason="oversize"}`. Every request carries one per-sink
+`logit.output.records.dropped{reason="oversize"}`. Splunk Cloud refuses a body over 5 MiB, so a
+`max_body_bytes` above 5 MiB logs a warning at startup. Every request carries one per-sink
 `X-Splunk-Request-Channel`, which a `useACK` token requires and any other token ignores.
 
-**Delivery.** `408`, `429`, `5xx`, and timeouts are retryable; `401` and `403` are permanent, with
-a `token_rejected` warning; any other `4xx`, `413` included, is permanent and counted
-`logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the object
-Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of that body
-once. The first failing request stops the rest of the batch, and the sink isn't duplicate-safe,
-since Splunk indexes a resent event twice. So the default posture is at-most-once, and a `5xx`
-drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
+**Delivery.** A `429`, or a `503` code 9 ("Server is busy"), means Splunk didn't take the body:
+before any body of the batch was accepted, the batch is retried under every posture, with the
+runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
+answer after a body was accepted are retryable only under `at_least_once`; `401` and `403` are
+permanent, with a `token_rejected` warning; any other `4xx`, `413` included, is permanent and
+counted `logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the
+object Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of
+that body once. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
+answer instead: the sink splits the body in two and sends each half, or drops a lone object,
+counted `records.dropped{reason="oversize"}`. The first failing request stops the rest of the
+batch, and the sink isn't duplicate-safe, since Splunk indexes a resent event twice. So the default
+posture is at-most-once, and a `500` drops the batch; `buffer: {delivery: at_least_once}` retries
+it and accepts duplicates.
 
 **Acknowledgment.** With `ack: true`, the sink polls `/services/collector/ack` after the last body
 of a batch is accepted, until Splunk confirms every request or `ack_timeout` (30s by default)
-passes, which fails the batch as ambiguous. It needs a token with indexer acknowledgment on;
-Splunk Cloud offers none. Against a token without it, each request counts as delivered on its
+passes, which fails the batch as ambiguous. It needs a token with indexer acknowledgment on.
+Splunk Enterprise offers it; Splunk documents it on Splunk Cloud only for the Firehose path, but a
+Splunk Cloud trial stack offered it and acknowledged the sink's requests, so check the token
+settings on your stack. Against a token without it, each request counts as delivered on its
 `200`, counted `logit.output.acks{result="unsupported"}` with an `ack_unsupported` warning.
 
 **What to watch.** `logit.output.requests{route, class}` (`route` is `event` or `ack`),
