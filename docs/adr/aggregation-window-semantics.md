@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-15
+updated: 2026-09-26
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -364,6 +364,8 @@ ADR's original "Per-kind merge" rule already drew for `Counter`), `Histogram`,
 `Accumulator::new_for`'s `unreachable!` arm are kept in sync by comment, deliberately, the same
 "kept in sync... a mismatch between the two is a runtime panic, not a compile error" shape this
 codebase already uses elsewhere for exactly this kind of paired exhaustiveness.
+The "series identity, merge laws, and accounting" amendment below replaces the pair with one
+function.
 
 See `crates/logit-transforms/src/aggregate.rs`'s `process`/`flush`/`Accumulator` for the
 implementation, and its test module for the shapes this amendment adds coverage for:
@@ -468,7 +470,8 @@ counted, is the minimum that lets a total cross a boundary at all) and `max_reta
   predicate is therefore mode-dependent for that one kind — it moved from an inline `matches!` to the
   `passes_through` free function precisely so the two places that must agree about it (that check and
   `Accumulator::new_for`'s `unreachable!` arm) can call the same code instead of restating the same
-  list twice.
+  list twice. The "series identity, merge laws, and accounting" amendment below goes further, to
+  one `Option`-returning `opener_for` with no `unreachable!` arm.
 - An **incoming cumulative `Sum`** is still pass-through in *both* modes. `aggregate` re-summing an
   already-running total would double-count it, and nothing about the stage's output mode changes what
   an input record means. The same holds for an incoming cumulative `Histogram`.
@@ -513,3 +516,222 @@ test module for the shapes this amendment adds coverage for:
 `crates/logit-bench/tests/allocations.rs`' `aggregate_flush_cumulative_sums` (a retained cumulative
 `Sum` costs a flush exactly what a retained gauge does -- 209 allocations for 100 spilled-attribute
 series, `docs/design/memory.md`).
+
+## Amendment: series identity, merge laws, and accounting as a stated contract (2026-09-26)
+
+The amendments above each settled one behavior and left its neighbors implicit. What makes two
+records one series, which merges are order-independent, and how every absorbed record and every
+held series is accounted for were decided only in code and tests, and
+[`docs/design/data-model.md`](../design/data-model.md) stated none of it. The `agg` verification
+stream (`docs/plans/critical-sections-inventory.md`'s cluster 8) tests `aggregate` against a
+reference model, and a model needs a stated contract to check against. This amendment is that
+contract. Where the code doesn't meet it yet, the entry names the workstream that closes the gap.
+
+### Series identity
+
+**A series is `(name, unit, attribute set)`, compared structurally, not by IEEE-754 `==`.**
+`SeriesKey`'s `PartialEq` and `Hash` walk the attribute set through `value_key_eq` and
+`hash_value`, and the rules are:
+
+- `F64` compares by bit pattern (`f64::to_bits`). `NaN` equals itself, so a `NaN`-tagged record
+  joins its series instead of opening a new one per event. `-0.0` and `0.0` are two series.
+- Numeric variants are distinct: `I64(1)`, `U64(1)`, and `F64(1.0)` are three series. The variant
+  a tag arrives as depends on the decoder. The `json` transform decodes a non-negative integer as
+  `U64` and a negative one as `I64`, an OTLP integer attribute decodes as `I64`, and an OTLP relay
+  of a `U64` above `i64::MAX` arrives as `F64`. The same logical tag reaching one `aggregate` from
+  two of these paths is two series.
+- `Array` is order-sensitive: `[a, b]` and `[b, a]` are two series.
+- `Map` compares by its sorted keys, so insertion order doesn't matter, and its values follow
+  these same rules recursively.
+- `Str` and `Bytes` are distinct, even over identical bytes.
+- The attribute set as a whole is order-independent: `AttrMap::iter()` yields keys in `Symbol`
+  order, whatever order they were inserted in.
+
+**Resource and scope grouping use the same rule.** Scope already does: `scope_key_eq` compares
+attributes through `value_key_eq`. Resource doesn't yet: `group_for` compares resources with
+`Resource`'s derived `PartialEq`, so a `NaN` resource attribute never equals itself, even through
+the same `Arc`. Every metric carrying such a resource opens a new `ResourceGroup`, lengthens
+`group_for`'s scan, and is emitted unaggregated at the flush. An OTLP double resource attribute
+reaches this path. `agg/w1` makes `group_for` compare `Arc::ptr_eq` first and then bitwise, as
+`scope_key_eq` does.
+
+### Merge laws
+
+These are the laws the stream verifies, and the contract a future change to a merge arm has to
+keep. Each is an equality of the emitted value, compared per kind as listed, never of the
+accumulator's bytes.
+
+- **Per-window order independence.** Absorbing one window's records in any order emits an equal
+  value:
+  - `Sum`: bit-equal for two records, because `f64` addition commutes; within `f64` rounding for
+    three or more, because it doesn't associate.
+  - `Histogram` (cumulative mode): bucket counts equal (saturating add). `sum` is bit-equal for
+    two records and within `f64` rounding for three or more, because the accumulator starts at
+    `Some(0.0)` and adds one record at a time. `min`, `max`, and a `None` `sum` follow the fold
+    rules below.
+  - Sketches (`Distribution`, and `Samples` under `distributions: sketch`), when every record
+    shares one `DdSketch` mapping: bin counts, `count()`, `min`, and `max` equal, and `sum`
+    within rounding.
+  - `Samples` under `distributions: samples`, below `max_samples_per_series`: equal `values` as a
+    multiset.
+  - `Set`, and `SetMembers` under `sets: estimate`: `estimate()` equals the estimate of inserting
+    every member once. That is exact below the HyperLogLog's small-set threshold and within the
+    HyperLogLog's error bound above it. Two `Set`s are never compared by their bytes, which depend
+    on insertion order.
+  - `SetMembers` under `sets: members`, below `max_set_members_per_series`: equal members as a
+    set. Past the cap the series converts to a `Set`, and the `Set` rule applies.
+- **Associativity through a relay.** In `temporality: delta`, two `aggregate` stages in series
+  (the first absorbs `a` and `b` and flushes, the second absorbs that output and `c`) emit a value
+  equal, by the rules above, to what one stage absorbing `a`, `b`, and `c` emits. Two cases are
+  excluded or limited:
+  - Cumulative mode: a flushed cumulative record passes through a downstream `aggregate` by
+    design.
+  - `Gauge`: `flush` stamps its output with the flush clock, so the downstream stage's
+    last-write-wins compares the relayed value at the first stage's `now` against `c`'s source
+    timestamp. A relay of gauges agrees with one stage when every upstream source timestamp is at
+    or below the first stage's flush `now` and every later record's is at or above it.
+  - `GaugeDelta` is excluded outright. A delta follows arrival order and never advances `at`, and
+    the first stage re-emits it as an absolute `Gauge` stamped `now`, which the downstream stage
+    then orders by timestamp.
+
+Some outcomes depend on order by design, and the stream pins them as examples rather than laws:
+
+- Two `Gauge` records with equal source timestamps: the later arrival wins (`event.timestamp >=
+  at`).
+- A `Gauge` interleaved with `GaugeDelta`s: a delta applies in arrival order and never advances
+  `at` ([ADR `relative-gauge-adjustments`](relative-gauge-adjustments.md)).
+- A `Histogram` bucket-bounds mismatch or a kind conflict: the first arrival opens the series and
+  keeps it, and the later record passes through.
+- A `Sum` keeps the first record's `monotonic` flag.
+- `Samples` under `distributions: samples` emits `values` in arrival order, and `SetMembers` under
+  `sets: members` emits members in insertion order.
+- Sketches with different mappings: a sketch opened empty adopts the first record's mapping, and
+  `DdSketch::merge` re-bins a later record with a different mapping into it, within a bounded
+  error. Both `Mapping::agent` and `Mapping::logarithmic` (Datadog APM stats) reach `aggregate`,
+  so which one a series ends up in depends on arrival order.
+
+**A cumulative histogram's `min` and `max` will follow `sum`'s rule (`agg/w2`).** A contributing
+record that has observations but no `min` (or `max`) makes the accumulated one `None`, and a
+record whose buckets total zero is ignored for the fold. Today `fold_extreme` keeps whichever side
+has a value, so a series can emit a `min` from one window and a `max` from another with
+`min > max`.
+
+**A non-finite delta `Sum` will pass through (`agg/w2`).** A delta `Sum` whose value is `NaN` or
+±infinity is forwarded unmerged and counted `passed_through{reason="non_finite"}`, so a
+cumulative total stays finite. Today it merges: a statsd `1e308|c|@0.5` extrapolates to infinity,
+and in cumulative mode that infinity stays in the series' total for as long as the series lives.
+
+### Accounting identities
+
+Two identities hold for every `aggregate`:
+
+- **Records:** `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every
+  metric record `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`,
+  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`. Today only
+  `logit.transform.metrics.passed_through{reason="no_recorded_value"}` exists. `agg/w2` adds the
+  other reasons and a `logit.transform.metrics.absorbed` counter, each totaled per `process` call:
+  one count per reason per event, carrying the number of records. Until then a kind conflict or
+  bounds mismatch is countable only through `logit.component.diagnostics{key}`, and a
+  pass-through kind isn't counted at all. The stream asserts this identity from telemetry.
+- **Series:** `series_at_flush_start == emitted_and_removed + kept + evicted{idle} +
+  evicted{cardinality}`. The terms partition the series, each counted once:
+  - `series_at_flush_start` is `logit.transform.series.active` plus
+    `logit.transform.series.retained`, both sampled before `Aggregator::flush` touches its state.
+  - `emitted_and_removed` counts series updated this window whose retention answer is `None`:
+    emitted, then dropped.
+  - `kept` counts the series still held after the cap.
+  - `evicted{idle}` and `evicted{cardinality}` are `logit.transform.series.evicted{reason}`. A
+    series updated this window that the cap then evicts is emitted, and counted only in
+    `evicted{cardinality}`.
+
+  No counter exists for `emitted_and_removed` or `kept`, so the stream asserts this identity from
+  the aggregator's own state in tests. `agg/w3` tags `series.evicted{reason="cardinality"}` with
+  `state="active"|"idle"`, so evicting a series updated this window is visible in telemetry.
+
+**Sample-rate reporting.** `logit.transform.samples.weight_clamped` fires today when a record's
+weight equals `Samples::MAX_WEIGHT`, so a legitimate `@0.001` rate and a record with empty
+`values` both report as clamped, and a clamp on a record held in a raw `Samples` accumulator is
+never reported. `agg/w2` moves the predicate to `Samples::is_clamped` (rounded `1/sample_rate`
+above `MAX_WEIGHT`, with non-empty `values`) and reports a held record's clamp when the series
+falls back to a sketch. Under `distributions: samples`, a `NaN` `sample_rate` mismatches itself
+(`!=`), so a series' first record falls back; `agg/w2` compares rates by bit pattern. Only the
+native decoder can produce a `NaN` rate.
+
+### One function per decision
+
+Pass-through and retention are each decided today by two pieces of code kept in agreement by
+comment: `passes_through` and `Accumulator::new_for`'s `unreachable!` arm, and `flush`'s `retain`
+predicate and `kind_for_retained`'s `unreachable!` arm. A disagreement is a runtime panic, not a
+compile error. `agg/w2` replaces each pair with one `Option`-returning function:
+
+- `opener_for(..) -> Option<Opener>`: `None` means pass through, and `Opener::open` is total. The
+  opener borrows the incoming record, so deciding doesn't build an accumulator (a histogram's
+  bucket `Vec`) on every merge.
+- `Accumulator::retained_kind(&self, temporality) -> Option<MetricKind>`: `None` means the series
+  doesn't survive the flush. `flush` calls it only when `series_retention > 0`.
+
+The change moves no behavior and no allocation pin.
+
+### Raw-mode caps
+
+`SetMembers` under `sets: members` checks `max_set_members_per_series` after unioning the whole
+incoming record, so one record's own size costs O(n²) `contains` compares and transient memory
+bounded only by that record. `agg/w2` stops the union at the cap and streams the rest of the
+record into the HyperLogLog.
+
+`agg/w3` tightens the config rules so every cap can hold something:
+
+- `series_retention > 0` requires `max_retained_series >= 1` in either temporality. Today delta
+  mode accepts `max_retained_series: 0`, and every retained series is then evicted at every flush,
+  with a warning.
+- `max_samples_per_series` and `max_set_members_per_series` must each be at least 1.
+
+### Cardinality-cap tie-break
+
+When survivors exceed `max_retained_series`, the cap evicts the most idle series first. Among
+equally idle series, the order today is `HashMap` iteration order, which is arbitrary. So once
+active series exceed the cap, a long-lived series updated every window can lose to a one-off
+series, and a cumulative series evicted this way restarts with a new `start_timestamp`.
+
+`agg/w3` breaks the tie by newest first, using a monotonic sequence number each `Aggregator`
+assigns to a series when it opens it. Survivors sort by `(idle windows descending, open sequence
+descending)`, and because the key is unique, an unstable sort gives one order. `first_seen` isn't
+the key: source timestamps tie within one statsd datagram, and a backfilled series with an old
+source timestamp would outrank a stable one.
+
+### `description` and exemplars
+
+A series will keep its first record's `description` and emit it (`agg/w2`). Today every emitted
+record has none. `description` is an interned `Option<Symbol>`, so carrying it costs no
+allocation.
+
+Exemplars are dropped, and stay dropped. An exemplar is a single observation, and a summarized
+window has no per-observation data to attach it to. `aggregate` is the stage whose stated purpose
+is to summarize, so this falls under [ADR `lossless-transit`](lossless-transit.md)'s "Decision"
+rule that summarization is opt-in and named.
+
+### The groups bound
+
+`max_retained_series` bounds series, not groups. The number of distinct `(resource, scope)`
+groups within one window is unbounded, and `group_for` scans them linearly with a full resource
+compare on every absorbed metric. A realistic count reaches the thousands (an `otlp_in` gateway,
+or `prometheus_in` with a resource per scrape target). `agg/w1` measures absorb cost at 1, 100,
+and 1000 groups. Any cache, index, or cap is decided by that number, in its own change with its
+own allocation pins.
+
+### Start time after a cap eviction
+
+**A re-created series' start time will lie between its previous incarnation's last point and its
+own first point (`agg/w3`).** `first_seen` becomes `max(event.timestamp, start of the window the
+series opened in)`, and a flushed `Sum` or `Histogram` carries `start_timestamp =
+min(first_seen, now)`. `Aggregator` keeps no window-start clock today, so `agg/w3` adds a field
+that records each flush's `now` as the next window's start; in the first window, before any
+flush, `first_seen` falls back to the event timestamp. Both bounds come from clocks the stage
+already sees, so this costs no syscall. Today `first_seen` is the re-opening event's source
+timestamp, and the previous point carries the flush clock, so a consumer can see a new start
+earlier than the old point it replaces.
+
+See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
+`group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and
+`docs/plans/critical-sections-inventory.md`'s XFORM-01 to XFORM-05 and CORE-07 entries for what
+each workstream verifies.

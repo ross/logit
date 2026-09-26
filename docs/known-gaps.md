@@ -2032,6 +2032,32 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   about is only half visible: a 20-attribute resource of short enums reads the same as one of long
   ARNs and a nested label map.
 
+## `aggregate`
+
+- **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
+  survives a flush; within a window every distinct `(name, unit, attribute set)` opens a series,
+  and memory grows with that count until the flush drains it. The bound is upstream: a `keep`
+  ahead of `aggregate` limits which attributes reach it, and `keep_values` limits the values one
+  attribute can take. `logit.transform.series.active` shows the peak each window.
+- **Nothing bounds how many `(resource, scope)` groups one window holds, and `group_for` scans them
+  linearly on every absorbed metric.** An `otlp_in` gateway or a `prometheus_in` with a resource
+  per scrape target can present thousands of distinct resources, so absorb cost can grow with the
+  group count. Pending `agg/w1`'s measurement at 1, 100, and 1000 groups; a cache, index, or cap
+  lands only if that number warrants it. `logit.transform.resource.groups` shows the count.
+- **`aggregate` drops every exemplar on the records it absorbs.** An exemplar is one observation,
+  and a summarized window has no per-observation data to attach it to. `aggregate` is the stage
+  that summarizes by stated purpose, so the loss falls under
+  [ADR `lossless-transit`](adr/lossless-transit.md)'s "summarization is opt-in and named" rule.
+  To keep exemplars, route the records around `aggregate`. See
+  [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s "Amendment: series
+  identity, merge laws, and accounting as a stated contract (2026-09-26)".
+- **A cumulative series re-created after a cap eviction can report a `start_timestamp` earlier
+  than the last point it emitted.** The new `first_seen` comes from the re-opening event's source
+  timestamp, while the previous point carries the flush clock. The start time still changes, so a
+  consumer still sees the reset and re-bases; it can't assume the new start is later than the old
+  point. The amendment cited above settles the fix (`agg/w3`): the start will be clamped between
+  the window the series opened in and the flush that emits it.
+
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 
 - **`http_access` has no per-server presets** (2026-09-22). It never learns a server's native
