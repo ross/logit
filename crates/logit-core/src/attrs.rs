@@ -283,4 +283,97 @@ mod tests {
             .collect();
         assert_eq!(collect(&resource, &event), expected);
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeMap;
+
+        /// Unique to this test, and interned in reverse name order by the first case, so `Symbol`
+        /// order is the reverse of name order.
+        const KEYS: [&str; 6] = [
+            "attrs_prop_a",
+            "attrs_prop_b",
+            "attrs_prop_c",
+            "attrs_prop_d",
+            "attrs_prop_e",
+            "attrs_prop_f",
+        ];
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Insert(usize, i64),
+            InsertSym(usize, i64),
+            Remove(usize),
+            RemoveSym(usize),
+            Clear,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let key = 0..KEYS.len();
+            prop_oneof![
+                4 => (key.clone(), any::<i64>()).prop_map(|(k, v)| Op::Insert(k, v)),
+                4 => (key.clone(), any::<i64>()).prop_map(|(k, v)| Op::InsertSym(k, v)),
+                2 => key.clone().prop_map(Op::Remove),
+                2 => key.prop_map(Op::RemoveSym),
+                1 => Just(Op::Clear),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Every mutation keeps `iter()` strictly ascending by `Symbol` and agrees with a
+            /// `BTreeMap` keyed by `Symbol` on `len`, `iter`, `get`, `get_sym`, and what `remove`
+            /// returns. `aggregate`'s `SeriesKey` relies on that order for a zipped walk.
+            #[test]
+            fn random_edits_keep_symbol_order_and_match_a_btreemap(
+                ops in prop::collection::vec(op(), 0..64),
+            ) {
+                let mut symbols: Vec<Symbol> = KEYS.iter().rev().map(|k| intern(k)).collect();
+                symbols.reverse();
+                let mut map = AttrMap::new();
+                let mut model: BTreeMap<Symbol, i64> = BTreeMap::new();
+
+                for op in ops {
+                    match op {
+                        Op::Insert(k, v) => {
+                            map.insert(KEYS[k], v);
+                            model.insert(symbols[k], v);
+                        }
+                        Op::InsertSym(k, v) => {
+                            map.insert_sym(symbols[k], v);
+                            model.insert(symbols[k], v);
+                        }
+                        Op::Remove(k) => {
+                            let expected = model.remove(&symbols[k]).map(Value::I64);
+                            prop_assert_eq!(map.remove(KEYS[k]), expected);
+                        }
+                        Op::RemoveSym(k) => {
+                            let expected = model.remove(&symbols[k]).map(Value::I64);
+                            prop_assert_eq!(map.remove_sym(symbols[k]), expected);
+                        }
+                        Op::Clear => {
+                            map.clear();
+                            model.clear();
+                        }
+                    }
+
+                    let keys: Vec<Symbol> = map.iter().map(|(k, _)| k).collect();
+                    prop_assert!(keys.windows(2).all(|w| w[0] < w[1]), "not sorted: {:?}", keys);
+                    let actual: Vec<(Symbol, Value)> =
+                        map.iter().map(|(k, v)| (k, v.clone())).collect();
+                    let expected: Vec<(Symbol, Value)> =
+                        model.iter().map(|(k, v)| (*k, Value::I64(*v))).collect();
+                    prop_assert_eq!(actual, expected);
+                    prop_assert_eq!(map.len(), model.len());
+                    for (k, name) in KEYS.iter().enumerate() {
+                        let expected = model.get(&symbols[k]).map(|v| Value::I64(*v));
+                        prop_assert_eq!(map.get(name), expected.as_ref());
+                        prop_assert_eq!(map.get_sym(symbols[k]), expected.as_ref());
+                    }
+                }
+            }
+        }
+    }
 }
