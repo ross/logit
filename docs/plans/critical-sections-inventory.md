@@ -107,7 +107,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
 7. **Lua boundary (done, #383, #385, #388, #386, #391, #392)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
    borrow, a proxy held past its scope, infinite loop, deep/huge table.
-8. **Aggregate (in progress, agg/w0–w4)** — XFORM-01..05, CORE-07. Proptest against a naive
+8. **Aggregate (done, #400, #402, #405, #407, agg/w4)** — XFORM-01..05, CORE-07. Proptest against a naive
    reference aggregator, merge laws (associativity/commutativity) for every mergeable kind,
    cardinality-cap soak.
 9. **Untrusted-input parsers** — NET-08, CODEC-01..03/05/07/10/12/13, XFORM-06/08. One fuzz target
@@ -310,7 +310,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-13](#core-13--diagnostics-shared-power-of-two-throttle-and-its-telemetry-mirror) | P2 | `Diagnostics`: shared power-of-two throttle and its telemetry mirror | `crates/logit-core/src/diag.rs` (`Diagnostics`, `Diagnostics::warn_throttled`) | unreviewed |
 | [CORE-14](#core-14--template-the-name-parser-and-per-event-renderer) | P2 | `template`: the `{name}` parser and per-event renderer | `crates/logit-core/src/template.rs` (`parse`, `Template::compile`, `Compiled::render`) | unreviewed |
 | [CORE-20](#core-20--countingalloc-the-dev-only-counting-global-allocator) | P2 | `CountingAlloc`: the dev-only counting global allocator | `crates/logit-bench/src/alloc.rs` (`CountingAlloc`, `measure`) | unreviewed |
-| [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | in-progress (agg/w4) |
+| [XFORM-05](#xform-05--aggregate-contributing-context-span-link-bookkeeping) | P2 | Aggregate: contributing-context span-link bookkeeping | `crates/logit-transforms/src/aggregate.rs` (`ContributingContexts`) | findings → agg/w4 |
 | [XFORM-07](#xform-07--csvrs-hand-rolled-rfc-4180-row-splitter) | P2 | csv.rs: hand-rolled RFC 4180 row splitter | `crates/logit-transforms/src/csv.rs` (`split_row`, `unescape`) | unreviewed |
 | [XFORM-10](#xform-10--regexrs-capture-group-extraction) | P2 | regex.rs: capture-group extraction | `crates/logit-transforms/src/regex.rs` (`RegexParser::new`, `process`) | unreviewed |
 | [XFORM-11](#xform-11--small-filtermutate-transforms-combined) | P2 | Small filter/mutate transforms (combined) | `crates/logit-transforms/src/keep.rs` | unreviewed |
@@ -6272,6 +6272,44 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
 - **Suggested verification approach:** code review only; low complexity, already covered.
 - **Priority:** P2 -- small, bounded, already tested; a bug here loses trace-link fidelity, not
   metric data.
+- **Verification (agg/w4):** `aggregate/verification.rs`'s
+  `contributing_contexts_cap_per_series_and_count_only_new_and_full` (256 cases) drives up to
+  three series over two windows from a pool of 12 contexts against a reference: each series links
+  the first eight distinct contexts of its merged records in order; a context it already links, a
+  kind-conflicted record, and another series' contexts count nothing; and a flush empties every
+  set, retained series included. Counting a re-observed linked context, or observing a context
+  before the merge check, fails it. A dropped context seen again is counted again, as
+  `ComponentBuffer::upsert` does, and `docs/design/internal-telemetry.md` now says so. Found and
+  fixed: `logit.transform.links.dropped` shared `reason="cardinality"` with
+  `series.evicted{reason="cardinality"}` although the configured series cap plays no part; the
+  reason is now `contexts`.
+
+**Stream close-out (cluster 8, `agg`).** Beyond what the survey listed, the stream found and
+fixed:
+
+- A `NaN` resource attribute opened a group per metric, every such metric emitted unaggregated,
+  and `-0.0`/`0.0` resources merged (lead 21, #402).
+- Cap ties among equally idle series fell in `HashMap` order, so stable series were evicted at
+  random (lead 22, #407).
+- A cumulative histogram could emit `min > max` (lead 23, #405).
+- A non-finite delta `Sum` stayed in a cumulative total for the series' life (lead 24, #405).
+- A re-created cumulative series took its start time from the source clock (lead 25, #407).
+- A legitimate `@0.001` sample rate, and a record with no values, were reported as clamped
+  (#405).
+- A `NaN` sample rate mismatched itself under `distributions: samples` (#405).
+- `SetMembers` checked its cap after the full union, O(n²) in one record's size (#405).
+- Five diagnostic strings carried runs of spaces (#405).
+- Emitted records lost the series' `description` (#405).
+- Absorbed and most passed-through records had no counter (#405).
+- `links.dropped` shared a tag value with an unrelated cap (agg/w4).
+
+It also measured the `groups` scan: 137 ns per absorbed event at 1 group, 877 ns at 100, and
+8.6 µs at 1000, dominated by the scan from about 100 groups (#402). Open, each in
+`docs/known-gaps.md`'s `aggregate` section: the groups scan (a per-batch `Arc::ptr_eq` cache and
+a hashed group index are the candidates, decided by a measurement on the perf VM in its own
+change); `DdSketch::merge` returning early on a sketch whose count and zero count are both 0,
+dropping its bins; a `GaugeDelta` on a kind conflict reaching a sink unresolved; and
+`series_retention` counting flushes, not wall time.
 
 ### XFORM-06 — json.rs: zero-copy JSON-into-attributes parsing
 - **Location:** `json.rs` (`JsonParser::process`), `json.rs` (`borrowed_str_bytes`),

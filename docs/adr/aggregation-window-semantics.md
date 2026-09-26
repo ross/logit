@@ -727,8 +727,9 @@ or `prometheus_in` with a resource per scrape target).
 `crates/logit-bench`'s `aggregate_absorb_with_groups` measures it, one gauge per event with the
 resource rotating per event, on one core: about 137 ns per event at 1 group, 877 ns at 100, and
 8.6 µs at 1000. The scan dominates from 100 groups on, at about 7.5 ns per group compared. The
-`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. A cache,
-index, or cap is a separate decision, in its own change with its own allocation pins.
+`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. The
+candidates are a per-batch `Arc::ptr_eq` cache and a hashed group index. A measurement on the perf
+VM decides, in its own change with its own allocation pins.
 
 ### Start time after a cap eviction
 
