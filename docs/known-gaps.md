@@ -2042,8 +2042,19 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **Nothing bounds how many `(resource, scope)` groups one window holds, and `group_for` scans them
   linearly on every absorbed metric.** An `otlp_in` gateway or a `prometheus_in` with a resource
   per scrape target can present thousands of distinct resources, so absorb cost can grow with the
-  group count. Pending `agg/w1`'s measurement at 1, 100, and 1000 groups; a cache, index, or cap
-  lands only if that number warrants it. `logit.transform.resource.groups` shows the count.
+  group count. Measured with `crates/logit-bench`'s `aggregate_absorb_with_groups` (one gauge per
+  event, resources rotating, one core): about 140 ns per event at 1 group, 880 ns at 100, and
+  8.6 µs at 1000, so the scan dominates from 100 groups on. A cache, index, or cap lands in its
+  own change. `logit.transform.resource.groups` shows the count.
+- **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
+  render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
+  non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, a `scale`d one `F64`)
+  can send `prometheus_out`, `influxdb_out`, or `graphite_out` two or three samples under one
+  label set in one window. `-0.0` and `0.0` are two series as well, but those sinks render them `-0` and `0`,
+  so they stay apart downstream. To merge the variants, convert the tag to one type in a `lua`
+  stage ahead of `aggregate`. See
+  [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s "Amendment: series
+  identity, merge laws, and accounting as a stated contract (2026-09-26)", "Series identity".
 - **`aggregate` drops every exemplar on the records it absorbs.** An exemplar is one observation,
   and a summarized window has no per-observation data to attach it to. `aggregate` is the stage
   that summarizes by stated purpose, so the loss falls under

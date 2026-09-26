@@ -6043,6 +6043,15 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
 - **Priority:** P1 -- wrong here silently fragments or wrongly merges series (a correctness bug,
   not a crash), and the logic is entirely custom, but it's well-reasoned and already has targeted
   tests for the known-tricky cases (NaN, ordering, arrays).
+- **Verification (agg/w1):** `aggregate/verification.rs` checks `SeriesKey` equality and hashing
+  against a structural reference that doesn't call `value_key_eq` (NaN payloads, signed zero,
+  numeric variants, `Str`/`Bytes`, nested `Array`/`Map`, shuffled insertion order), the series
+  partition `Aggregator` flushes, and `groups` against bitwise `(resource, scope)` classes;
+  `attrs.rs` checks `AttrMap` stays `Symbol`-sorted under random edits. Found N1 (lead 21):
+  `group_for` used `Resource`'s derived `PartialEq`, so a `NaN` resource attribute opened a group
+  per metric and `-0.0`/`0.0` resources merged; fixed with `resource_key_eq` (`Arc::ptr_eq`, then
+  bitwise). `aggregate_absorb_with_groups`, one core, ns per event before/after the fix: 1 group
+  153/137, 100 groups 978/877, 1000 groups 8,860/8,600. The scan dominates from 100 groups on.
 
 ### XFORM-02 — Aggregate: per-event merge dispatch (`process`)
 - **Location:** `aggregate.rs` (`Aggregator::process`; the `Accumulator` enum and
