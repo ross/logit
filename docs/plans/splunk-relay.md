@@ -490,6 +490,12 @@ Each is proven by a test suite and by real traffic:
   trial stack, every leg `PASS` by a search in Splunk Web. It showed acknowledgment working,
   added code 28, and found Cloud's body cap
   (["Settled by the Cloud run"](#settled-by-the-cloud-run-2026-09-26)).
+- **Listener fidelity** (2026-09-26): `splunk_hec_in` issues `ackId`s from 0 per channel and
+  answers each `true` once on its own channel, as both runs' `useACK` tokens did, within
+  `max_ack_channels` and `max_pending_acks` bounds; `/ack` without a channel is code 10; and
+  `/health` answers `503` code 18 while posts are answered code 9. `splunk_hec_in_round_trip.rs`
+  and `splunk_pair_round_trip.rs` drive both (ADR amendment "faithful listener acks and a busy
+  /health").
 
 What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section, one entry
 each:
@@ -505,11 +511,14 @@ each:
 - HEC codes 21, 22, 24, and 25 unmodeled; code 28 modeled from Splunk Cloud; no code 18 through
   27 seen from a real Splunk.
 - Codes 7, 12, 13, and 15 permanent in `splunk_hec_out`, where only code 6 drops one object.
+- `splunk_hec_in`'s acknowledgment bounds: an issue window per channel rather than Splunk's
+  outstanding-id count, and least-recently-used channel eviction.
 - Splunk Cloud's body cap, between 5.2 and 6 MB, answered with code 6 rather than `413`.
 - What neither the corpus nor the runs exercised: the exporter's `Summary` and a link's
-  `trace_state`, Vector's HEC sinks, a `useACK` client against `splunk_hec_in`, a paid Splunk
-  Cloud stack's `http-inputs-` endpoint and its certificate, Splunk Enterprise releases other
-  than 10.4.3 (including which one raised `max_content_length`), and Observability Cloud.
+  `trace_state`, Vector's HEC sinks, a third-party `useACK` client against `splunk_hec_in`, a
+  paid Splunk Cloud stack's `http-inputs-` endpoint and its certificate, Splunk Enterprise
+  releases other than 10.4.3 (including which one raised `max_content_length`), and
+  Observability Cloud.
 
 Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Splunk encode and decode
 rows in `known-gaps.md`'s "Cross-protocol semantic gaps" table (non-carrier resource attributes

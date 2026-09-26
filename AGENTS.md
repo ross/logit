@@ -72,7 +72,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `otlp_in` | `crates/logit-inputs/src/otlp.rs` | OTLP logs, metrics, and traces over OTLP/HTTP (protobuf and OTLP/JSON) and OTLP/gRPC | [ADR `otlp-json-decoding`](docs/adr/otlp-json-decoding.md) |
 | `datadog_in` | `crates/logit-inputs/src/datadog.rs` | Datadog's intake API over HTTP (series, sketches, checks, events, logs, APM traces and stats), gzip/deflate/zstd, `503` when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
 | `datadog_trace_in` | `crates/logit-inputs/src/datadog_trace.rs` | the Datadog Agent's APM API for dd-trace tracers (`/v0.3`–`/v0.7/traces` msgpack, `/v0.6/stats`, `/info`) over TCP and/or a Unix socket; keeps every span, `503` (a tracer's loss) when busy | [ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md) |
-| `splunk_hec_in` | `crates/logit-inputs/src/splunk.rs` | a stand-in for Splunk's HTTP Event Collector (HEC): `/event` JSON and `/raw` lines from any HEC client (Docker's `splunk` driver, Splunk's logging libraries, the OTel `splunk_hec` exporter, SC4S), gzip, an optional `tokens:` allowlist, `/ack` and `/health`, `503` code 9 when busy | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
+| `splunk_hec_in` | `crates/logit-inputs/src/splunk.rs` | a stand-in for Splunk's HTTP Event Collector (HEC): `/event` JSON and `/raw` lines from any HEC client (Docker's `splunk` driver, Splunk's logging libraries, the OTel `splunk_hec` exporter, SC4S), gzip, an optional `tokens:` allowlist, per-channel `ackId`s that `/ack` answers `true` once, as a `useACK` token does, `503` code 9 when busy and a `503` code 18 `/health` after it | [ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md) |
 | `prometheus_in` | `crates/logit-inputs/src/prometheus.rs` | scrapes `/metrics` targets, or receives remote-write | [ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md), [ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md) |
 | `tail_in` | `crates/logit-inputs/src/tail/` | rotation- and checkpoint-aware file tailing | [ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md) |
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
@@ -357,8 +357,9 @@ Per pair:
   as the exporter's JSON span object and are detected by shape on the way in. The encoder writes
   one object per `MessageBuf` entry, so `splunk_hec_out` packs bodies under `max_body_bytes` and,
   on a `400` code 6, drops the named object and resends the rest once by slicing. `ack: true` polls
-  `/ack` (some Splunk Cloud stacks don't offer it); `splunk_hec_in` answers `/ack` every id
-  `true`. Neither is duplicate-safe. Verified against a recorded corpus of four real HEC clients
+  `/ack` (some Splunk Cloud stacks don't offer it); `splunk_hec_in` issues ids per channel from
+  0 and answers each `true` once on its own channel, as a `useACK` token does. Neither is
+  duplicate-safe. Verified against a recorded corpus of four real HEC clients
   and a Splunk Enterprise 10.4.3 run
   ([ADR `splunk-hec-relay`](docs/adr/splunk-hec-relay.md),
   [fixtures/splunk-hec-send.yaml](fixtures/splunk-hec-send.yaml),

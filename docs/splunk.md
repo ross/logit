@@ -140,7 +140,9 @@ A token with `useACK` on answers `400` to any request without a `X-Splunk-Reques
 code 10 on Splunk Enterprise, and code 28 on Splunk Cloud, whose text adds that several indexers
 need sticky-session load balancing. `splunk_hec_out` sends one per-sink channel on every request
 whether `ack` is on or not, so it works against both token kinds. If you put another HEC client in
-front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires no channel on any route.
+front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires a channel only on
+`/ack`. It issues ids from 0 per channel and answers a poll as a `useACK` token does: an id issued
+on that channel `true` once, then `false`, and any other id `false`.
 
 ### Size caps
 
@@ -222,7 +224,9 @@ event, and both reject a token with leading or trailing whitespace at startup.
   presents that same default certificate (`CN=SplunkServerDefaultCert`), whose name doesn't match
   the host, so it needs `tls: {insecure_skip_verify: true}`. Whether a paid stack presents a
   public certificate isn't verified. `/services/collector/health` answers without a token, so it
-  can check the endpoint before a token is set up.
+  can check the endpoint before a token is set up. `splunk_hec_in` answers it the same way, and
+  `503` code 18 for up to 5 seconds after refusing a post as busy, which is Splunk's documented
+  answer for a full queue.
 
 ## What's verified
 

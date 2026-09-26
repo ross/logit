@@ -404,3 +404,47 @@ the Cloud run" section maps it item by item. By decision:
   enabling one takes Splunk's support or account team, so whether an Edge Processor's HEC
   destination delivers to a non-Splunk receiver stays open. Ingest Processor sends only to Splunk
   indexes, S3, and Observability Cloud, so it has no destination that reaches `logit`.
+
+## Amendment: faithful listener acks and a busy /health (2026-09-26)
+
+Both runs gave the same `useACK` behavior: ids count from 0 per channel, a poll answers an id
+issued on that channel and indexed `true`, the same id `false` once it has answered `true`, and an
+id never issued on that channel `false`. `splunk_hec_in` answered every polled id `true` on any
+channel, and `/health` always `200`, so a client that checks id continuity, polls the wrong
+channel, or reads `/health` as a queue signal saw something Splunk never answers.
+`crates/logit-inputs/src/splunk.rs`'s module doc describes the behavior; this list is the record
+of the choices. By decision:
+
+- **Decision 5, acknowledgment, the listener half:** amended. Each channel issues ids from 0 on
+  every `200` to a `/event` or `/raw` request that names it, and `/ack` answers an id issued on the
+  polled channel `true` once, then forgets it; any other id is `false`. A repeated id in one poll
+  is answered once. "Indexed" stays "accepted into the pipeline", the meaning a `200` already
+  has; tying `true` to sink delivery was rejected, since a listener has no view of what its
+  fan-out's sinks did, and the pipeline's own delivery guarantees are the sinks' business. This
+  replaces "every asked id `true`" and the listener amendment's one counter per listener
+  starting at 1.
+- **Decision 5, bounds:** the state is bounded for accidental data, per
+  [ADR `deployment-threat-model`](deployment-threat-model.md): `max_ack_channels` channels
+  (default 256), evicting the least recently used with its ids, and per channel an issue window of
+  the most recent `max_pending_acks` ids (default 1,000,000, Splunk's
+  `max_number_of_acked_requests_pending_query_per_ack_channel` default), the oldest expiring as a
+  new one is issued. A window rather than Splunk's count of ids outstanding, so the state is one
+  bit per id and a channel that lost one id can't pin memory; at the defaults that is at most
+  about 32 MB. Both are config fields, and rule 69 rejects `0` for either. The channel cap is
+  configurable because a listener behind more than 256 clients that each send a channel
+  (`splunk_hec_out`, Vector) would otherwise evict live channels and turn their acknowledgment
+  into timeouts and resends. Eviction, expiry, and every issue and poll outcome are counted
+  (`docs/design/internal-telemetry.md`'s `splunk_hec_in` section).
+- **Decision 16, channels:** amended for `/ack` only. An `/ack` request that names no channel is
+  `400` code 10, Splunk Enterprise's answer to a `useACK` request without one; Splunk Cloud's code
+  28 adds load-balancer advice that doesn't apply to one listener. `/event` and `/raw` still
+  require none, and a request without one is answered as a token without `useACK` answers it.
+  Answering every id `false` without a channel was rejected: a client would poll until its
+  timeout instead of reading its mistake.
+- **Decision 2, `/health`:** amended. While the listener is refusing posts, `/health` and
+  `/health/1.0` answer `503` `{"text":"HEC is unhealthy, queues are full","code":18}`, Splunk's
+  documented answer for a full queue, which a load balancer or a sink's health check reads as
+  "send elsewhere". "While" is: the most recent `/event` or `/raw` request to reach delivery was
+  answered `503` code 9, less than 5 s ago, a fixed window rather than a config field. A later
+  request whose data the pipeline takes clears it. It still checks no token. Neither run provoked
+  code 18, so its text is still a reading of Splunk's documentation.

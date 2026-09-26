@@ -1776,6 +1776,8 @@ components:
     bind: 127.0.0.1:8088
     tokens: [!env SPLUNK_HEC_TOKEN]   # empty or absent accepts any token
     # max_request_bytes: 5MiB         # the default; as sent and after gzip
+    # max_ack_channels: 256           # the default; channels whose ack ids are kept
+    # max_pending_acks: 1000000       # the default; ids per channel still answerable
     # idle_timeout: 120s              # off by default
 ```
 
@@ -1783,7 +1785,8 @@ components:
 objects, concatenated or in an array, each carrying its own envelope; the body decodes into one
 batch per distinct envelope. `/services/collector/raw` and `/raw/1.0` take one log per line, with
 `host`, `source`, `sourcetype`, and `index` from the query string. `/services/collector/health`
-answers `{"text":"HEC is healthy","code":17}` without authentication, and `OPTIONS` on any route
+answers `{"text":"HEC is healthy","code":17}` without authentication (`503` code 18 while the
+pipeline is refusing posts, below), and `OPTIONS` on any route
 answers `200` as Splunk does, which Docker's driver requires before it starts a container. Any
 other path gets `404`, and a known path with the wrong method `405`. Every answer is Splunk's own
 `{"text","code"}` body, so a client's error handling reads it as it reads Splunk's.
@@ -1808,17 +1811,24 @@ the network in the clear, and because a client configured with an `https://` URL
 **Compression.** Identity or `gzip`; any other `Content-Encoding`, `deflate` included, gets `415`,
 as Splunk answers.
 
-**Channels and acknowledgment.** No channel is required on any route. A request that names one
-(`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, and `/ack` answers every
-id asked about `true`, because a `200` already means the data reached the pipeline. Neither the
-channel nor the id enters an event.
+**Channels and acknowledgment.** `/event` and `/raw` never require a channel. A request that
+names one (`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, counted from 0
+per channel as a Splunk `useACK` token counts them. `/ack` needs a channel (`400` code 10 without
+one) and answers an id issued on that channel `true` once, since a `200` already means the data
+reached the pipeline, and any other id `false`: one already reported, one never issued, or one
+from another channel. The listener keeps `max_ack_channels` channels, evicting the one used least
+recently, and the most recent `max_pending_acks` ids per channel; an id either bound drops
+answers `false`, counted `logit.input.acks.dropped{reason}`. Raise `max_ack_channels` when more
+clients than that send a channel at once. Neither the channel nor the id enters an event.
 
 **A full pipeline gets `503`.** When the pipeline doesn't take a request's batches within 5
 seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
 `logit.input.requests{class="busy"}`, and the batches not yet delivered
 `logit.input.batches.dropped{reason="busy"}`. HEC clients retry a code 9. A body with several
 envelopes can have delivered some of its batches before the deadline, and the retry delivers
-those again.
+those again. From that answer until a later request's data is taken, for at most 5 seconds,
+`/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
+Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token

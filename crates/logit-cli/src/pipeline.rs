@@ -421,7 +421,16 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        SplunkHecIn { bind, tls, tokens, max_request_bytes, handshake_timeout, idle_timeout } => {
+        SplunkHecIn {
+            bind,
+            tls,
+            tokens,
+            max_request_bytes,
+            max_ack_channels,
+            max_pending_acks,
+            handshake_timeout,
+            idle_timeout,
+        } => {
             let mut input = SplunkHecInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
@@ -430,7 +439,9 @@ fn build_spec(
                 .with_idle_timeout(*idle_timeout)
                 .with_tokens(tokens.clone())
                 // Saturates on a 32-bit target: a cap past the address space is no cap.
-                .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX));
+                .with_max_request_bytes(usize::try_from(*max_request_bytes).unwrap_or(usize::MAX))
+                .with_max_ack_channels(*max_ack_channels)
+                .with_max_pending_acks(*max_pending_acks);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }

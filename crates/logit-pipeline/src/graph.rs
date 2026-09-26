@@ -202,8 +202,9 @@
 //! 68. A `trace_context` `trace_id_high` under a `format` other than `datadog`, where no trace id
 //!     lacks its high half, or with an empty name (`docs/adr/log-record-trace-context.md`).
 //! 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has leading or
-//!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
-//!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
+//!     trailing whitespace (it could never match a request's token), or a `max_request_bytes`,
+//!     `max_ack_channels`, or `max_pending_acks` of `0`. Its zero
+//!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/splunk-hec-relay.md`).
 //! 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a
 //!     query or fragment, or ends in a HEC route (`/event`, `/event/1.0`, `/raw`, `/raw/1.0`,
@@ -3109,9 +3110,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // nor could one with leading or trailing whitespace, which the listener trims from the
     // `Authorization` header, a typo `!env` makes easy with a token file's trailing newline. An
     // empty list is the "accept any token" setting, not an error. A zero `max_request_bytes`
-    // would answer every request `413`. The timeouts are rules 45/53's.
+    // would answer every request `413`, and a zero ack bound would keep no id to answer. The
+    // timeouts are rules 45/53's.
     for (id, component) in &components {
-        if let ComponentKind::SplunkHecIn { bind, tokens, max_request_bytes, .. } = &component.kind
+        if let ComponentKind::SplunkHecIn {
+            bind,
+            tokens,
+            max_request_bytes,
+            max_ack_channels,
+            max_pending_acks,
+            ..
+        } = &component.kind
         {
             if bind.trim().is_empty() {
                 anyhow::bail!(
@@ -3137,6 +3146,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': splunk_hec_in 'max_request_bytes' must be greater than 0 \
                      -- 0 would refuse every request"
                 );
+            }
+            for (field, value) in
+                [("max_ack_channels", max_ack_channels), ("max_pending_acks", max_pending_acks)]
+            {
+                if *value == 0 {
+                    anyhow::bail!(
+                        "component '{id}': splunk_hec_in '{field}' must be greater than 0 -- 0 \
+                         would keep no acknowledgment id to answer"
+                    );
+                }
             }
         }
     }
@@ -5628,6 +5647,8 @@ mod tests {
             tls: None,
             tokens: tokens.into_iter().map(String::from).collect(),
             max_request_bytes: 5 * 1024 * 1024,
+            max_ack_channels: 256,
+            max_pending_acks: 1_000_000,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
         }
@@ -5676,6 +5697,24 @@ mod tests {
         }
         let err = datadog_in_err(kind);
         assert!(err.contains("'max_request_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 69: a zero ack bound would keep no id to answer.
+    #[test]
+    fn a_splunk_hec_in_with_a_zero_ack_bound_is_rejected() {
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { max_ack_channels, .. } = &mut kind {
+            *max_ack_channels = 0;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'max_ack_channels' must be greater than 0"), "got: {err}");
+
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { max_pending_acks, .. } = &mut kind {
+            *max_pending_acks = 0;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'max_pending_acks' must be greater than 0"), "got: {err}");
     }
 
     /// Rules 45 and 53 cover `splunk_hec_in`'s two timeouts.
