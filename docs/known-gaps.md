@@ -2129,24 +2129,22 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   instead of silently meaning "no `flush()`". Both are documented in
   [lua-api.md](design/lua-api.md); [memory.md](design/memory.md)'s recommendations have the full
   write-up.
-- **A script is bounded only by what it opts into.** [ADR
-  `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md) adds a stall heartbeat, a
-  progress-based shutdown wedge check that revokes the wedged node's I/O rather than a
-  wall-clock drain bound, an opt-in `max_memory` (off by default), a 128-level table-depth cap on
-  Lua-to-Rust conversion, and an 8 MiB Lua thread stack, under [ADR
-  `deployment-threat-model`](adr/deployment-threat-model.md)'s trusted-script bar. No instruction
-  or time hook: LuaJIT's compiled traces skip a count hook unless the runtime is built with
-  `LUAJIT_ENABLE_CHECKHOOK`. `newproxy` is removed from the sandbox: it was the only way a script
-  reached a `__gc` finalizer on LuaJIT, and one running during an mlua allocation could SIGSEGV or
-  panic a `RefCell` borrow — closed by removing the primitive, not a non-goal. Two residuals the
-  cap and the larger stack don't close: the depth cap bounds a table's nesting, not its size, so a
-  script-built DAG (shared table references, `t = {a = t, b = t}` repeated k times) still converts
-  at 2^k nodes; and pure-Lua recursion through Rust/C frames can still abort the process past the
-  larger stack, at a higher level than the 2 MiB default's 233. Recorded non-goals, each needing a
-  crafted rather than an accidental script: `collectgarbage("stop")` defeats `max_memory`'s
-  full-GC step; a no-allocation infinite loop is caught only by the stall heartbeat; and interner
-  growth from script-derived strings (`Event.new`'s and the proxy setters' name/unit/description
-  fields, and nested attribute keys) is accepted like `telemetry`'s tags.
+- **A script has no time bound, and its memory bound will be opt-in.** No instruction or time
+  hook is used, by design: LuaJIT's compiled traces skip a count hook unless the runtime is built
+  with `LUAJIT_ENABLE_CHECKHOOK`, so a hook would be both slow and unreliable ([ADR
+  `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md)). Today nothing else bounds a
+  script either — not its CPU time, its memory, or a Lua-to-Rust table's depth — and `newproxy`
+  is still in the sandbox, so a `__gc` finalizer touching a proxy mid-allocation can SIGSEGV the
+  process. Each closes as its workstream lands: the stall heartbeat and wedge detection
+  (`luab/w3`), `max_memory` (`luab/w4`), the table-depth cap and raw table reads (`luab/w1`),
+  `newproxy`'s removal (`luab/w2`). Standing residuals that remain once every workstream has
+  landed, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md): interner growth
+  from script-derived strings (`Event.new`'s and the proxy setters' `name`/`unit`/`description`/
+  `event_name` fields, and nested attribute keys); a shared-table DAG still converts at 2^k
+  nodes, since the depth cap bounds nesting, not size; pure-Lua recursion through Rust/C
+  frames can still abort the process past the larger stack; and a loop that keeps calling
+  `Event.new` advances the stall heartbeat and is never caught as a stall, so only its
+  memory-retaining form is bounded, by `max_memory`.
 
 ## Internal telemetry and self-logging
 
