@@ -336,7 +336,9 @@ between windows" reasoning this ADR's gauge-retention amendment already used to 
 retention applies to gauges and not counters). `flush` never places a `Samples`/`SetMembers`/`Set`
 accumulator into `survivors` — only `is_gauge && self.gauge_retention > 0` does — so every one of
 these series drains on every flush exactly like a counter does, even with `gauge_retention` set to a
-large value.
+large value. (Superseded in mechanism: `Accumulator::retained_kind` now decides what enters
+`survivors`; see "One function per decision" in the stated-contract amendment below. These kinds
+still never survive.)
 
 ### The `(resource, scope)` group key, and `FlushOutput` carrying scope
 
@@ -645,7 +647,7 @@ Two identities hold for every `aggregate`:
     `evicted{cardinality}`.
 
   No counter exists for `emitted_and_removed` or `kept`, so the stream asserts this identity from
-  the aggregator's own state in tests. `agg/w3` tags `series.evicted{reason="cardinality"}` with
+  the aggregator's own state in tests. `series.evicted{reason="cardinality"}` carries
   `state="active"|"idle"`, so evicting a series updated this window is visible in telemetry.
 
 **Sample-rate reporting.** `Samples::is_clamped` decides `logit.transform.samples.weight_clamped`:
@@ -677,25 +679,40 @@ panic:
 HyperLogLog. One oversized record then costs O(cap²) `contains` compares and cap-bounded memory,
 not its own size squared.
 
-`agg/w3` tightens the config rules so every cap can hold something:
+Graph rule 39 rejects every cap that can hold nothing:
 
-- `series_retention > 0` requires `max_retained_series >= 1` in either temporality. Today delta
-  mode accepts `max_retained_series: 0`, and every retained series is then evicted at every flush,
-  with a warning.
-- `max_samples_per_series` and `max_set_members_per_series` must each be at least 1.
+- `series_retention > 0` requires `max_retained_series >= 1` in either temporality. With a cap of
+  0, every retained series would be evicted at every flush, with a warning. The error suggests
+  `series_retention: 0` to turn retention off.
+- `max_samples_per_series` and `max_set_members_per_series` must each be at least 1. At 0, every
+  record would fall back.
+
+`flush` also `debug_assert!`s that cumulative mode has both retention bounds. Every in-repo
+constructor passes them, and the config path validates before it builds a stage.
 
 ### Cardinality-cap tie-break
 
-When survivors exceed `max_retained_series`, the cap evicts the most idle series first. Among
-equally idle series, the order today is `HashMap` iteration order, which is arbitrary. So once
-active series exceed the cap, a long-lived series updated every window can lose to a one-off
-series, and a cumulative series evicted this way restarts with a new `start_timestamp`.
+When survivors exceed `max_retained_series`, the cap evicts the most idle series first, and the
+newest first among equally idle series. Each `Aggregator` assigns a series a sequence number when
+it opens it, never reused. Survivors sort by `(idle windows descending, open sequence
+descending)`, and because the key is unique, an unstable sort gives one order. So once more series
+are active in a window than the cap holds, a series updated every window outlives the one-off
+series opened after it. The order used to be `HashMap` iteration order, re-randomized every flush:
+in a soak of 20 stable series against 1000 one-off series a window and a cap of 100, about 2 of the
+20 survived each flush, and a cumulative one restarted with a new `start_timestamp` each time it
+lost.
 
-`agg/w3` breaks the tie by newest first, using a monotonic sequence number each `Aggregator`
-assigns to a series when it opens it. Survivors sort by `(idle windows descending, open sequence
-descending)`, and because the key is unique, an unstable sort gives one order. `first_seen` isn't
-the key: source timestamps tie within one statsd datagram, and a backfilled series with an old
-source timestamp would outrank a stable one.
+`first_seen` isn't the key: source timestamps tie within one statsd datagram, and a backfilled
+series with an old source timestamp would outrank a stable one.
+
+Newest first protects a series that has survived one flush, not one that hasn't. A series evicted
+while active is re-created in the next window with a new sequence number, so a stable series whose
+records arrive after the one-off series in every window is the newest every time and is evicted at
+every flush, for as long as the churn lasts. Under `temporality: cumulative` that is a restart with a
+new `start_timestamp` every window. `a_stable_series_arriving_after_the_churn_is_evicted_every_flush`
+pins the case. `logit.transform.series.evicted{reason="cardinality", state="active"}` at every flush
+is the signal that more series are active than the cap holds: raise `max_retained_series`, or bound
+cardinality upstream with `keep` or `keep_values`.
 
 ### `description` and exemplars
 
@@ -722,15 +739,18 @@ index, or cap is a separate decision, in its own change with its own allocation 
 
 ### Start time after a cap eviction
 
-**A re-created series' start time will lie between its previous incarnation's last point and its
-own first point (`agg/w3`).** `first_seen` becomes `max(event.timestamp, start of the window the
-series opened in)`, and a flushed `Sum` or `Histogram` carries `start_timestamp =
-min(first_seen, now)`. `Aggregator` keeps no window-start clock today, so `agg/w3` adds a field
-that records each flush's `now` as the next window's start; in the first window, before any
-flush, `first_seen` falls back to the event timestamp. Both bounds come from clocks the stage
-already sees, so this costs no syscall. Today `first_seen` is the re-opening event's source
-timestamp, and the previous point carries the flush clock, so a consumer can see a new start
-earlier than the old point it replaces.
+**A re-created series' start time lies between its previous incarnation's last point and its own
+first point.** `Aggregator::window_start` records each flush's `now` as the next window's start. A
+series opens with `first_seen = max(event.timestamp, window_start)`; in the first window, before
+any flush, it falls back to the event timestamp. The first flush that emits a retained `Sum` or
+`Histogram` lowers `first_seen` to `now` if it's later, emits it as `start_timestamp`, and keeps
+the lowered value, so the start never moves while the series lives. Both bounds come from clocks
+the stage already sees, so this costs no syscall.
+
+A source timestamp alone isn't enough: the previous point carries the flush clock, so a re-opening
+event's source time can precede it, run ahead of the flush, or be 0, which OTLP reads as "unknown"
+and `prometheus_out` doesn't render as `_created`. The bound assumes the flush clock doesn't step
+backwards; it is `SystemTime`, which can (`docs/known-gaps.md`).
 
 See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
 `group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and

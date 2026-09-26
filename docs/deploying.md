@@ -1236,7 +1236,8 @@ value, the mitigation is on the sending side: send an absolute value periodicall
   growth.
 - `logit.transform.series.evicted{reason="cardinality"}`: any sustained nonzero rate means
   `max_retained_series` is undersized for the pipeline's gauge cardinality, and deltas are silently
-  resolving against 0 as a result.
+  resolving against 0 as a result. Under `state="active"`, more series are updated per window than
+  the cap holds: the cap keeps the longest-lived of them, and a cumulative series it drops restarts.
 
 ## Counter temporality (`delta` vs. `cumulative`)
 

@@ -2080,12 +2080,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a counter. No encoder `logit` ships writes that shape, and the threat model treats a
   crafted one as a non-goal. Revisit if a real producer's sketch is found carrying bins under a
   zero count.
-- **A cumulative series re-created after a cap eviction can report a `start_timestamp` earlier
-  than the last point it emitted.** The new `first_seen` comes from the re-opening event's source
-  timestamp, while the previous point carries the flush clock. The start time still changes, so a
-  consumer still sees the reset and re-bases; it can't assume the new start is later than the old
-  point. The amendment cited above settles the fix (`agg/w3`): the start will be clamped between
-  the window the series opened in and the flush that emits it.
+- **`series_retention` counts flushes, not wall time.** The runtime coalesces missed flush ticks,
+  so a stalled or overloaded stage that flushes late stretches retention in wall time: a series
+  idle across one late flush has lost one flush of retention, however long the gap. The same holds
+  for a cumulative series' lifetime between restarts.
+- **`aggregate`'s flush clock is `SystemTime`, which can step backwards.** A retained series' start
+  time is clamped between the previous flush's clock and this one's (ADR
+  `aggregation-window-semantics`'s "Start time after a cap eviction"). After a backwards step the
+  new start can precede the previous point, and emitted points stop being monotonic in time. A
+  consumer still sees a changed start and re-bases. A monotonic clock would need its own mapping to
+  wall time on every emitted point, which nothing else in the pipeline does.
 
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 

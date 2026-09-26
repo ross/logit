@@ -105,8 +105,11 @@
 //! 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, and a `collectd_out`
 //!     value outside `1024..=65535`: above it every send fails `EMSGSIZE` while reporting success
 //!     (`docs/adr/collectd-binary-relay.md`).
-//! 39. A `temporality: cumulative` `aggregate` with `series_retention` or `max_retained_series` of
-//!     `0`: nothing survives a flush, so each window's increment would be labeled a running total
+//! 39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
+//!     `series_retention` or `max_retained_series` of `0` (nothing survives a flush, so each
+//!     window's increment would be labeled a running total); in either mode, `series_retention`
+//!     above `0` with `max_retained_series: 0` (every retained series evicted at every flush), and a
+//!     `max_samples_per_series` or `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
 //! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
 //!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
@@ -1688,12 +1691,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 39: a cumulative `aggregate` needs both retention bounds non-zero, or every window's
-    // `Sum`/`Histogram` is its own increment labeled `Cumulative`: a wrong number for
-    // `prometheus_out`, which reads it as a running total.
+    // Rule 39: every `aggregate` bound must be able to hold something. A cumulative `aggregate`
+    // needs both retention bounds non-zero, or every window's `Sum`/`Histogram` is its own
+    // increment labeled `Cumulative`: a wrong number for `prometheus_out`, which reads it as a
+    // running total.
     for (id, component) in &components {
         if let ComponentKind::Aggregate {
-            temporality, series_retention, max_retained_series, ..
+            temporality,
+            series_retention,
+            max_retained_series,
+            max_samples_per_series,
+            max_set_members_per_series,
+            ..
         } = &component.kind
         {
             if *temporality == logit_config::AggregateTemporality::Cumulative
@@ -1704,6 +1713,25 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      (a count of windows) and max_retained_series >= 1 -- with either at 0 no \
                      series survives a flush, so every window would emit its own increment \
                      labelled as a cumulative total"
+                );
+            }
+            if *series_retention > 0 && *max_retained_series == 0 {
+                anyhow::bail!(
+                    "component '{id}': series_retention: {series_retention} requires \
+                     max_retained_series >= 1 -- with a cap of 0 every retained series is \
+                     evicted at every flush; set series_retention: 0 to disable retention"
+                );
+            }
+            if *max_samples_per_series == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_samples_per_series must be at least 1 -- at 0 every \
+                     Samples record falls back to a sketch"
+                );
+            }
+            if *max_set_members_per_series == 0 {
+                anyhow::bail!(
+                    "component '{id}': max_set_members_per_series must be at least 1 -- at 0 \
+                     every SetMembers record falls back to an estimate"
                 );
             }
         }
@@ -9159,15 +9187,25 @@ mod tests {
         series_retention: u32,
         max_retained_series: usize,
     ) -> ComponentKind {
+        aggregate_with_caps(temporality, series_retention, max_retained_series, 1000, 1000)
+    }
+
+    fn aggregate_with_caps(
+        temporality: logit_config::AggregateTemporality,
+        series_retention: u32,
+        max_retained_series: usize,
+        max_samples_per_series: usize,
+        max_set_members_per_series: usize,
+    ) -> ComponentKind {
         ComponentKind::Aggregate {
             interval: Duration::from_secs(10),
             temporality,
             series_retention,
             max_retained_series,
             distributions: logit_config::Distributions::default(),
-            max_samples_per_series: 1000,
+            max_samples_per_series,
             sets: logit_config::Sets::default(),
-            max_set_members_per_series: 1000,
+            max_set_members_per_series,
         }
     }
 
@@ -9209,6 +9247,67 @@ mod tests {
             ("out", vec!["agg"], sink()),
         ]))
         .expect("delta mode without retention is the pre-existing default behavior");
+    }
+
+    /// Rule 39 in delta mode: retention with a cap of 0 evicts every retained series at every
+    /// flush, and the error points at `series_retention: 0`.
+    #[test]
+    fn a_delta_aggregate_with_retention_and_a_zero_cap_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], aggregate(logit_config::AggregateTemporality::Delta, 5, 0)),
+            ("out", vec!["agg"], sink()),
+        ]));
+        assert!(
+            err.contains("'agg'")
+                && err.contains("max_retained_series >= 1")
+                && err.contains("series_retention: 0"),
+            "got: {err}"
+        );
+    }
+
+    /// Rule 39: a raw-mode cap of 0 sends every record to the fallback, in either mode.
+    #[test]
+    fn an_aggregate_with_a_zero_raw_mode_cap_is_rejected() {
+        for temporality in [
+            logit_config::AggregateTemporality::Delta,
+            logit_config::AggregateTemporality::Cumulative,
+        ] {
+            for (samples, members, field) in
+                [(0, 1, "max_samples_per_series"), (1, 0, "max_set_members_per_series")]
+            {
+                let err = expect_err(cfg(vec![
+                    ("in", vec![], listener()),
+                    ("agg", vec!["in"], aggregate_with_caps(temporality, 5, 10, samples, members)),
+                    ("out", vec!["agg"], sink()),
+                ]));
+                assert!(err.contains("'agg'") && err.contains(field), "got: {err}");
+            }
+        }
+    }
+
+    /// The config defaults resolve, and so does every bound at its smallest accepted value.
+    #[test]
+    fn an_aggregate_at_the_defaults_or_the_smallest_bounds_resolves() {
+        let defaults: ComponentKind =
+            serde_json::from_str(r#"{"type": "aggregate", "interval": "10s"}"#).unwrap();
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("agg", vec!["in"], defaults),
+            ("out", vec!["agg"], sink()),
+        ]))
+        .expect("the defaults resolve");
+        for temporality in [
+            logit_config::AggregateTemporality::Delta,
+            logit_config::AggregateTemporality::Cumulative,
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("agg", vec!["in"], aggregate_with_caps(temporality, 1, 1, 1, 1)),
+                ("out", vec!["agg"], sink()),
+            ]))
+            .expect("every bound at 1 holds something");
+        }
     }
 
     /// A well-formed cumulative `aggregate` resolves.

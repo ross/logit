@@ -13,11 +13,11 @@
 //!   directly. The merge-law properties check per-window order independence and a two-stage
 //!   relay, and the unit tests at the end pin the outcomes the ADR lists as order-dependent by
 //!   design.
-//!
-//! Retention isn't modeled: `series_retention` and `max_retained_series` are 0, so every flush is
-//! tumbling. The rules a retention model needs are in `docs/adr/aggregation-window-semantics.md`,
-//! "Amendment: series identity, merge laws, and accounting as a stated contract", under
-//! "Cardinality-cap tie-break" and "Start time after a cap eviction".
+//! - XFORM-03 and XFORM-04, retention: [`Model::flush`] keeps a retainable series across the
+//!   flush, evicts it after `series_retention` idle flushes or by the global `max_retained_series`
+//!   cap (most idle first, then newest), and clamps its start time into its window. The model
+//!   checks every survivor's state and the series accounting identity. `aggregate`'s own tests
+//!   drive the cap at volume (`cap_soak`).
 //!
 //! Case counts are floors: a `PROPTEST_CASES` above one raises it for a deeper run.
 
@@ -249,7 +249,7 @@ fn ref_attrs_eq(a: &[(String, Value)], b: &[(String, Value)]) -> bool {
 }
 
 /// The reference's series key: strings, and attributes sorted by key string.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RefKey {
     name: String,
     unit: Option<String>,
@@ -769,7 +769,8 @@ impl EventSpec {
 
 fn event_spec() -> impl Strategy<Value = EventSpec> {
     (
-        prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64],
+        // 1000 runs ahead of every flush clock a run reaches, for the start-time clamp.
+        prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64, 1 => Just(1_000)],
         0..3usize,
         prop::collection::vec(record_spec(), 0..=3),
         prop::bool::weighted(0.2),
@@ -814,11 +815,19 @@ struct ModelConfig {
     samples_cap: Option<usize>,
     /// `None` for `sets: estimate`, else `members` with this cap.
     members_cap: Option<usize>,
+    series_retention: u32,
+    max_retained_series: usize,
 }
 
 impl ModelConfig {
-    /// An aggregator under this config, with `series_retention` and `max_retained_series` left at
-    /// 0: the model doesn't model retention (see the module doc).
+    /// Whether graph rule 39 accepts the retention bounds: cumulative needs both, and retention
+    /// needs a cap.
+    fn valid(&self) -> bool {
+        let cumulative = self.temporality == AggregateTemporality::Cumulative;
+        !(cumulative && self.series_retention == 0)
+            && !(self.series_retention > 0 && self.max_retained_series == 0)
+    }
+
     fn aggregator(&self) -> Aggregator {
         let (distributions, samples_cap) = match self.samples_cap {
             None => (Distributions::Sketch, 1000),
@@ -832,20 +841,44 @@ impl ModelConfig {
             .with_temporality(self.temporality)
             .with_distributions(distributions, samples_cap)
             .with_sets(sets, members_cap)
+            .with_series_retention(self.series_retention, self.max_retained_series)
     }
 }
 
+/// Every mode, and every retention bound rule 39 accepts ([`ModelConfig::valid`]): cumulative
+/// draws retention from 1, and retention above 0 draws the cap from 1. Generated, not filtered, so
+/// a deep run can't exhaust proptest's global reject budget.
 fn model_config() -> impl Strategy<Value = ModelConfig> {
     (
         prop_oneof![Just(AggregateTemporality::Delta), Just(AggregateTemporality::Cumulative)],
         prop::option::of(1..=8usize),
         prop::option::of(1..=6usize),
     )
-        .prop_map(|(temporality, samples_cap, members_cap)| ModelConfig {
-            temporality,
-            samples_cap,
-            members_cap,
+        .prop_flat_map(|(temporality, samples_cap, members_cap)| {
+            let least = u32::from(temporality == AggregateTemporality::Cumulative);
+            (Just(temporality), Just(samples_cap), Just(members_cap), least..=3u32)
         })
+        .prop_flat_map(|(temporality, samples_cap, members_cap, retention)| {
+            let least = usize::from(retention > 0);
+            (
+                Just(temporality),
+                Just(samples_cap),
+                Just(members_cap),
+                Just(retention),
+                least..=5usize,
+            )
+        })
+        .prop_map(
+            |(temporality, samples_cap, members_cap, series_retention, max_retained_series)| {
+                ModelConfig {
+                    temporality,
+                    samples_cap,
+                    members_cap,
+                    series_retention,
+                    max_retained_series,
+                }
+            },
+        )
 }
 
 /// `Samples::weight`, restated: `round(1 / rate)` in `[1, 1000]`; a non-finite or non-positive
@@ -896,7 +929,7 @@ enum RefAcc {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RefSeries {
     resource: usize,
     scope: usize,
@@ -905,6 +938,27 @@ struct RefSeries {
     contexts: Vec<usize>,
     dropped_contexts: u64,
     description: Option<Symbol>,
+    /// Absorbed a record since the last flush.
+    updated: bool,
+    /// Flushes survived with no update.
+    idle: u32,
+    /// The start time: the opening event's timestamp raised to the window start, lowered to the
+    /// flush clock when a retained `Sum`/`Histogram` first emits.
+    first_seen: i64,
+    /// Order of opening, the cap's second key.
+    open_seq: u64,
+}
+
+/// What one [`Model::flush`] emits and evicts.
+struct RefFlush {
+    /// Every updated series, with the `start_timestamp` it's emitted under.
+    emitted: Vec<(RefSeries, i64)>,
+    /// Updated series that don't survive the flush: `emitted_and_removed` in the ADR's identity.
+    removed: u64,
+    evicted_idle: u64,
+    /// Cap evictions of a series updated this flush, and of an idle one.
+    evicted_active: u64,
+    evicted_cap_idle: u64,
 }
 
 /// Counters the model expects between two flushes, keyed by counter name and tag value.
@@ -927,6 +981,7 @@ const NON_FINITE_DROPPED: &str = "logit.transform.samples.non_finite_dropped";
 const SAMPLES_FALLBACK: &str = "logit.transform.samples.fallback";
 const MEMBERS_FALLBACK: &str = "logit.transform.set_members.fallback";
 const LINKS_DROPPED: &str = "logit.transform.links.dropped";
+const EVICTED: &str = "logit.transform.series.evicted";
 /// Every counter the model predicts, and the tag each is read under ("" for none).
 const MODELED_COUNTERS: [(&str, &str); 8] = [
     (ABSORBED, ""),
@@ -948,11 +1003,20 @@ struct Model {
     config: ModelConfig,
     series: Vec<RefSeries>,
     counts: RefCounts,
+    next_open_seq: u64,
+    /// The previous flush's clock, `None` before the first flush.
+    window_start: Option<i64>,
 }
 
 impl Model {
     fn new(config: ModelConfig) -> Self {
-        Model { config, series: Vec::new(), counts: RefCounts::default() }
+        Model {
+            config,
+            series: Vec::new(),
+            counts: RefCounts::default(),
+            next_open_seq: 0,
+            window_start: None,
+        }
     }
 
     /// Whether `kind` has no merge rule under this config: the ADR's list, restated.
@@ -1020,6 +1084,10 @@ impl Model {
         let opened = found.is_none();
         let index = found.unwrap_or_else(|| {
             let acc = self.open(&spec.kind);
+            let first_seen = match self.window_start {
+                Some(start) if start > event.timestamp => start,
+                _ => event.timestamp,
+            };
             self.series.push(RefSeries {
                 resource,
                 scope,
@@ -1028,7 +1096,12 @@ impl Model {
                 contexts: Vec::new(),
                 dropped_contexts: 0,
                 description: spec.description.map(intern),
+                updated: false,
+                idle: 0,
+                first_seen,
+                open_seq: self.next_open_seq,
             });
+            self.next_open_seq += 1;
             self.series.len() - 1
         });
 
@@ -1037,6 +1110,7 @@ impl Model {
         let series = &mut self.series[index];
         let fate = merge(&mut series.acc, &spec.kind, event.timestamp, config, counts);
         if let Fate::Absorbed = fate {
+            series.updated = true;
             if opened && matches!(kind, MetricKind::GaugeDelta(_)) {
                 counts.add(UNSEEDED, "", 1);
             }
@@ -1079,10 +1153,71 @@ impl Model {
         }
     }
 
-    /// Emits and clears every series, as a tumbling flush does. With retention 0, no series
-    /// survives, a gauge or cumulative-mode `Sum`/`Histogram` included.
-    fn flush(&mut self) -> Vec<RefSeries> {
-        std::mem::take(&mut self.series)
+    /// Emits every updated series and keeps the retainable ones: a gauge, or a cumulative-mode
+    /// `Sum`/`Histogram`, while `series_retention > 0`. An idle series emits nothing and is evicted
+    /// at its `series_retention`th idle flush. Past `max_retained_series`, the most idle go first
+    /// and the newest among equally idle ones.
+    fn flush(&mut self, now: i64) -> RefFlush {
+        let config = self.config;
+        let cumulative = config.temporality == AggregateTemporality::Cumulative;
+        let mut out = RefFlush {
+            emitted: Vec::new(),
+            removed: 0,
+            evicted_idle: 0,
+            evicted_active: 0,
+            evicted_cap_idle: 0,
+        };
+        let mut kept = Vec::new();
+        for mut series in std::mem::take(&mut self.series) {
+            if !series.updated {
+                series.idle += 1;
+                if series.idle < config.series_retention {
+                    kept.push(series);
+                } else {
+                    out.evicted_idle += 1;
+                }
+                continue;
+            }
+            let retainable = match series.acc {
+                RefAcc::Gauge { .. } => true,
+                RefAcc::Sum { .. } | RefAcc::Hist { .. } => cumulative,
+                _ => false,
+            };
+            if config.series_retention == 0 || !retainable {
+                out.removed += 1;
+                out.emitted.push((series, 0));
+                continue;
+            }
+            let start = if matches!(series.acc, RefAcc::Gauge { .. }) {
+                0
+            } else {
+                series.first_seen = series.first_seen.min(now);
+                series.first_seen
+            };
+            out.emitted.push((series.clone(), start));
+            series.updated = false;
+            series.idle = 0;
+            series.contexts.clear();
+            series.dropped_contexts = 0;
+            if let RefAcc::Gauge { at, .. } = &mut series.acc {
+                *at = i64::MIN;
+            }
+            kept.push(series);
+        }
+        if kept.len() > config.max_retained_series {
+            let excess = kept.len() - config.max_retained_series;
+            kept.sort_by(|a, b| b.idle.cmp(&a.idle).then(b.open_seq.cmp(&a.open_seq)));
+            for series in kept.drain(..excess) {
+                if series.idle == 0 {
+                    out.evicted_active += 1;
+                } else {
+                    out.evicted_cap_idle += 1;
+                }
+            }
+        }
+        self.series = kept;
+        self.window_start = Some(now);
+        out
     }
 }
 
@@ -1434,13 +1569,23 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                     classes.dedup();
                     classes.len()
                 };
+                let active = model.series.iter().filter(|s| s.updated).count();
+                let retained = model.series.len() - active;
+                let series_before: usize = agg.groups.iter().map(|g| g.series.len()).sum();
+                prop_assert_eq!(series_before, model.series.len());
                 let flushed = agg.flush(now);
-                let mut expected = model.flush();
+                let RefFlush {
+                    emitted: mut expected,
+                    removed,
+                    evicted_idle,
+                    evicted_active,
+                    evicted_cap_idle,
+                } = model.flush(now);
                 let mut counts = std::mem::take(&mut model.counts);
                 counts.add(
                     LINKS_DROPPED,
                     "cardinality",
-                    expected.iter().map(|s| s.dropped_contexts).sum(),
+                    expected.iter().map(|(s, _)| s.dropped_contexts).sum(),
                 );
 
                 // (1) and (3): one emitted series per model series, with its value, key,
@@ -1465,13 +1610,14 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                         prop_assert_eq!(event.metrics.len(), 1);
                         let record = &event.metrics[0];
                         prop_assert_eq!(record.flags, 0);
-                        prop_assert_eq!(record.start_timestamp, 0, "no series is retained");
                         let key = RefKey::of(record.name, record.unit, &event.attributes);
-                        let i = expected.iter().position(|m| {
+                        let i = expected.iter().position(|(m, _)| {
                             m.resource == r && m.scope == s && ref_key_eq(&m.key, &key)
                         });
                         prop_assert!(i.is_some(), "emitted {:?} is no model series", key);
-                        let series = expected.swap_remove(i.unwrap_or_default());
+                        let (series, start) = expected.swap_remove(i.unwrap_or_default());
+                        // (9) A start time lies inside its window, fresh for a re-created series.
+                        prop_assert_eq!(record.start_timestamp, start, "{:?}", key);
                         prop_assert_eq!(record.description, series.description);
                         check_emitted(&record.kind, &series.acc, config)?;
                         let link_ids: Vec<[u8; 16]> = links.iter().map(|l| l.trace_id).collect();
@@ -1484,13 +1630,14 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
 
                 // (4) and (5): gauges and counters.
                 let events = registry.drain(now);
+                prop_assert_eq!(emitted, active);
                 prop_assert_eq!(
                     telemetry_gauge(&events, "logit.transform.series.active"),
-                    Some(emitted as f64)
+                    Some(active as f64)
                 );
                 prop_assert_eq!(
                     telemetry_gauge(&events, "logit.transform.series.retained"),
-                    Some(0.0)
+                    Some(retained as f64)
                 );
                 prop_assert_eq!(
                     telemetry_gauge(&events, "logit.transform.resource.groups"),
@@ -1505,7 +1652,75 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                 );
                 metrics_in = 0;
                 prop_assert_eq!(observed_counts(&events)?, counts);
-                prop_assert!(agg.groups.is_empty(), "a tumbling flush leaves no group");
+                prop_assert_eq!(telemetry_total(&events, EVICTED, "reason", "idle"), evicted_idle);
+                prop_assert_eq!(
+                    telemetry_total(&events, EVICTED, "state", "active"),
+                    evicted_active
+                );
+                prop_assert_eq!(
+                    telemetry_total(&events, EVICTED, "state", "idle"),
+                    evicted_cap_idle
+                );
+                prop_assert_eq!(
+                    telemetry_total(&events, EVICTED, "reason", "cardinality"),
+                    evicted_active + evicted_cap_idle
+                );
+
+                // Survivors, from the aggregator's own state.
+                let series_after: usize = agg.groups.iter().map(|g| g.series.len()).sum();
+                prop_assert_eq!(
+                    series_before as u64,
+                    removed
+                        + series_after as u64
+                        + evicted_idle
+                        + evicted_active
+                        + evicted_cap_idle,
+                    "series_at_flush_start == emitted_and_removed + kept + evicted"
+                );
+                // (6) The cap holds, and retention 0 keeps nothing.
+                prop_assert!(series_after <= config.max_retained_series);
+                if config.series_retention == 0 {
+                    prop_assert_eq!(series_after, 0);
+                }
+                // (7) No empty group, and one per surviving (resource, scope) class.
+                let mut classes: Vec<(usize, usize)> =
+                    model.series.iter().map(|s| (s.resource, s.scope)).collect();
+                classes.sort_unstable();
+                classes.dedup();
+                prop_assert_eq!(agg.groups.len(), classes.len());
+                prop_assert_eq!(series_after, model.series.len());
+                for group in &agg.groups {
+                    prop_assert!(!group.series.is_empty());
+                    let r = resources.iter().position(|x| Arc::ptr_eq(x, &group.resource));
+                    let r = resource_class[r.expect("a group's resource comes from the pool")];
+                    let s = match &group.scope {
+                        None => 0,
+                        Some(scope) => {
+                            let i = scopes
+                                .iter()
+                                .position(|x| x.as_ref().is_some_and(|x| Arc::ptr_eq(x, scope)));
+                            scope_class[i.expect("a group's scope comes from the pool")]
+                        }
+                    };
+                    // (8) Every survivor is the model's, reset for the next window.
+                    for (key, state) in &group.series {
+                        let key = RefKey::of(key.name, key.unit, &key.attributes);
+                        let m = model
+                            .series
+                            .iter()
+                            .find(|m| m.resource == r && m.scope == s && ref_key_eq(&m.key, &key));
+                        prop_assert!(m.is_some(), "survivor {:?} is no model survivor", key);
+                        let m = m.expect("checked above");
+                        prop_assert!(!state.updated_this_window);
+                        prop_assert!(state.contexts.seen.is_empty() && state.contexts.dropped == 0);
+                        prop_assert_eq!(state.idle_windows, m.idle);
+                        prop_assert_eq!(state.open_seq, m.open_seq);
+                        prop_assert_eq!(state.first_seen, m.first_seen);
+                        if let Accumulator::Gauge { at, .. } = state.accumulator {
+                            prop_assert_eq!(at, i64::MIN);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1545,6 +1760,10 @@ fn family_config(family: usize) -> BoxedStrategy<ModelConfig> {
             temporality,
             samples_cap,
             members_cap,
+            // Rule 39: cumulative needs both bounds. One series, one flush: retention changes
+            // only the emitted start time, which the laws don't compare.
+            series_retention: u32::from(family == 5),
+            max_retained_series: usize::from(family == 5),
         })
         .boxed()
 }
@@ -1649,6 +1868,35 @@ fn laws_input() -> impl Strategy<Value = (ModelConfig, Vec<KindSpec>)> {
     })
 }
 
+/// [`ModelConfig::valid`] agrees with graph rule 39 over every bound `model_config` could draw,
+/// and `model_config` draws only valid configs.
+#[test]
+fn model_config_validity_matches_rule_39() {
+    use proptest::strategy::ValueTree;
+    for temporality in [AggregateTemporality::Delta, AggregateTemporality::Cumulative] {
+        for series_retention in 0..=3u32 {
+            for max_retained_series in 0..=5usize {
+                let config = ModelConfig {
+                    temporality,
+                    samples_cap: None,
+                    members_cap: None,
+                    series_retention,
+                    max_retained_series,
+                };
+                let cumulative = temporality == AggregateTemporality::Cumulative;
+                let rule_39 = !(cumulative && (series_retention == 0 || max_retained_series == 0))
+                    && !(series_retention > 0 && max_retained_series == 0);
+                assert_eq!(config.valid(), rule_39, "{config:?}");
+            }
+        }
+    }
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    for _ in 0..512 {
+        let config = model_config().new_tree(&mut runner).expect("a config").current();
+        assert!(config.valid(), "{config:?}");
+    }
+}
+
 /// Ten distinct contexts on one series in one window: the model and the aggregator both keep the
 /// first eight as links and count two dropped.
 #[test]
@@ -1665,6 +1913,8 @@ fn the_model_caps_links_per_series() {
         temporality: AggregateTemporality::Delta,
         samples_cap: None,
         members_cap: None,
+        series_retention: 0,
+        max_retained_series: 0,
     };
     let mut ops: Vec<ModelOp> = (0..CONTEXTS)
         .map(|context| ModelOp::Batch {
@@ -1825,7 +2075,8 @@ fn a_histogram_bounds_mismatch_keeps_the_first_arrival() {
     };
     for (first, second) in [(1.0, 2.0), (2.0, 1.0)] {
         let agg = Aggregator::new(Duration::from_secs(10))
-            .with_temporality(AggregateTemporality::Cumulative);
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(1, 1);
         let (emitted, forwarded) = run_order(agg, &[(histogram(first), 0), (histogram(second), 0)]);
         let MetricKind::Histogram(h) = &emitted[0] else { panic!("{emitted:?}") };
         assert_eq!(h.buckets[0], (first, 1));
