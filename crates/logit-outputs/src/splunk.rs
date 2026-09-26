@@ -78,11 +78,6 @@
 //! re-sends the bodies already indexed, so once one was accepted each of these is `Ambiguous`
 //! instead ([`after_delivery`]). A `Retry-After` header is ignored; `write_loop`'s backoff applies.
 //!
-//! One receiver breaks the "didn't take the body" reading: a `logit` `splunk_hec_in` older than
-//! the fix that finishes a body once its first batch is delivered answers `503` code 9 after
-//! delivering part of a multi-resource body, so a relay into one can deliver that part twice
-//! (`docs/known-gaps.md`, "Splunk"). Splunk itself refuses before indexing.
-//!
 //! A drop leaves `sent_any` unset when nothing ahead of the dropped object was indexed (a code 6
 //! at object 0, or a lone object over Splunk Cloud's cap), so a busy answer later in the same
 //! `send` is still `Clean` and the whole batch is retried: a busy retry re-sends and re-counts a

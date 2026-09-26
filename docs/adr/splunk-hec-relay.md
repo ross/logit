@@ -379,7 +379,7 @@ the Cloud run" section maps it item by item. By decision:
 - **Decision 5, acknowledgment:** the premise that Splunk Cloud doesn't support it doesn't hold for
   this stack. Its token settings offer "Enable indexer acknowledgment", the `hec-ack` leg counted
   `acked=78 timeout=0 unsupported=0`, ids count from 0 per channel, a poll answers `true` within
-  about 1.2 s, and another channel sees `false`. Splunk's docs still say Splunk Cloud supports it
+  about a second, and another channel sees `false`. Splunk's docs still say Splunk Cloud supports it
   only for Firehose, and a customer stack may differ, so `ack` stays opt-in and off by default; the
   reason is now that not every token or stack acknowledges. No reply carried `Set-Cookie`, so this
   stack needs no load-balancer stickiness for polls.
@@ -394,7 +394,9 @@ the Cloud run" section maps it item by item. By decision:
   object 0 failing to parse: it drops that object as `invalid_event` and resends the rest, the
   right outcome only when one object is the whole excess. The 2 MiB `max_body_bytes` default
   sits under the cap, so the rule stands, with the sink's module doc and `docs/known-gaps.md`
-  noting the case.
+  noting the case. The amendment "busy answers before acceptance, and an oversize code 6" below
+  revises this: a code 6 naming object 0 of a body over 5 MiB is read as oversize, and the body
+  split once.
 - **Endpoint and certificate:** the trial's HEC is `https://<stack>.splunkcloud.com:8088`; the
   documented `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for it. It presents
   Splunk's default self-signed certificate, so `splunk_hec_out` needs

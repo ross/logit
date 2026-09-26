@@ -215,7 +215,7 @@ showed"). ADR `splunk-hec-relay`'s Cloud amendment records what each changed.
    stack's `http-inputs-` form presents a public CA.
 3. **Acknowledgment works on the trial stack.** The token settings offer "Enable indexer
    acknowledgment", and the ack leg counted `acked=78 timeout=0 unsupported=0`. `ackId` counts
-   from 0 per channel, a poll answers `true` within about 1.2 s, and another channel sees
+   from 0 per channel, a poll answers `true` within about a second, and another channel sees
    `false`. Splunk's docs say Splunk Cloud supports acknowledgment only
    for its Firehose path; this stack contradicts them, and a customer stack may differ.
 4. **A `useACK` token without a channel answers `400` code 28**, text `Data channel is missing.
@@ -325,9 +325,10 @@ amendment to `lossless-transit.md` lands with the ADR.
   (default 5 MiB, the OTel exporter's `max_event_size`, plus the 2 MiB default body), and the
   `TcpListener`-style `handshake_timeout` and `idle_timeout`. Routes:
   `/services/collector`, `/event`, `/event/1.0` (JSON, concatenated or array), `/raw` and
-  `/raw/1.0` (lines), `/health` and `/health/1.0` (code 17), `/ack` (every asked id `true`,
-  because a 2xx means delivered to the pipeline at-least-once, and a full pipeline answers 503
-  code 9, which every HEC client retries). Unknown routes are 404 and counted. Decompresses
+  `/raw/1.0` (lines), `/health` and `/health/1.0` (code 17, or `503` code 18 while busy), `/ack`
+  (ids issued per channel from 0, each answered `true` once on its own channel and every other
+  id `false`, as a `useACK` token answers; a 2xx means delivered to the pipeline, and a full
+  pipeline answers 503 code 9, which every HEC client retries). Unknown routes are 404 and counted. Decompresses
   gzip only; a request with another `Content-Encoding` is 415 and counted. Answers Splunk's
   own `{"text","code"}` bodies so a client's error handling reads them as it would Splunk's. The
   token is not kept as an attribute (unlike the OTel receiver's option): a secret has no
@@ -341,7 +342,9 @@ amendment to `lossless-transit.md` lands with the ADR.
   resource attributes above, set upstream with `set`; there are no per-sink fields for them,
   by [`operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
   `duplicate_safe()` is false: Splunk indexes a resent event twice.
-- Error classification: 429 (codes 26, 27) and 503 (9, 18–20, 23) retry through `write_loop`;
+- Error classification: a 429 (codes 26, 27), or a 503 with code 9 or no HEC body, is retried
+  through `write_loop` while no body of the batch has been accepted, and is `Ambiguous` after;
+  any other 503 is `Ambiguous`, which the default at-most-once posture drops;
   401, 403, and 400 are permanent and counted with the code; a 400 code 6 with
   `invalid-event-number` drops that one event and resends the rest of the body, once, so a
   single malformed event can't poison a batch.
@@ -532,7 +535,8 @@ is instead an `auto_extract_timestamp` option on `splunk_hec_out`, not built her
 
 ### What's left
 
-Each item has one entry in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section.
+A summary: [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section is the canonical list,
+with each item's consequence and revisit trigger.
 
 Not built, by scope:
 
@@ -549,6 +553,8 @@ Not built, by scope:
 - `splunk_hec_in`'s acknowledgment bounds are an issue window per channel rather than Splunk's
   outstanding-id count, with least-recently-used channel eviction: one bit per id keeps memory
   bounded, and no client has needed Splunk's count.
+- Acknowledgment on Splunk Cloud depends on the stack: the trial honored it, Splunk documents it
+  only for Firehose, so `ack: true` stays opt-in until a customer stack settles which holds.
 - Splunk Cloud's exact body cap between 5,242,881 and 6,000,000 bytes wasn't bisected: the 2 MiB
   default and the startup warning keep a sink well under it.
 
@@ -578,12 +584,12 @@ Not verified, each waiting on access:
   trial, and Splunk's support or account team has to enable it.
 - A paid Splunk Cloud stack's `http-inputs-<stack>` endpoint and its certificate: the trial's
   `http-inputs-` host doesn't resolve.
-- Which Splunk Enterprise release raised `max_content_length` from 1,000,000 bytes: only 10.4.3
-  was run.
+- Any Splunk Enterprise release other than 10.4.3, including which one raised
+  `max_content_length` from 1,000,000 bytes: only 10.4.3 was run.
 - Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`: not
   yet recorded with `script/record-fixtures`.
-- The exporter's `Summary` shape, a span link's `trace_state`, and a third-party `useACK` client
-  against `splunk_hec_in`: none of the recorded clients sends them.
+- The exporter's `Summary` shape, a span link's `trace_state`, `otel.log.name`, and a
+  third-party `useACK` client against `splunk_hec_in`: none of the recorded clients sends them.
 
 ## Verification
 

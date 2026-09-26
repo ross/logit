@@ -1256,10 +1256,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Splunk's documentation.** `logit_proto::splunk::response`'s `HecStatus` has no entry for the
   four, so `splunk_hec_out` counts one as `logit.output.requests.rejected{code="other"}` when it
   arrives with a non-retryable status, and `splunk_hec_in` never answers one. `splunk_hec_in`'s
-  busy `/health` answers code 18 with the documented text. Code 28, Splunk
-  Cloud's answer to a `useACK` request without a channel, is modeled from Splunk Cloud
-  10.5.2605.9's verbatim reply. Neither `script/splunk-interop` run provoked a code 18 through
-  27.
+  busy `/health` answers code 18 with the documented text. Code 28, Splunk Cloud's answer to a
+  `useACK` request without a channel, is modeled from Splunk Cloud 10.5.2605.9's verbatim reply.
+  No `script/splunk-interop` run (two Enterprise, three Cloud) provoked a code 18 through 27.
   - **Consequence:** a rejection with one of these codes is counted under `other`, and the
     diagnostic's body quote is what names it.
   - **Revisit trigger:** a real Splunk answers one of them.
