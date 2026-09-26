@@ -195,9 +195,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs` (`roll_read_cursor`, `advance_read_cursor`) | findings → #333, #337 |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs` (`run_output`, `finish_and_flush`) | findings → #333 |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs` (`run_with_telemetry`) | unreviewed |
-| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | in-progress (drain/w2) |
-| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | in-progress (drain/w2) (lead 11 fixed in #333) |
-| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | in-progress (drain/w2) |
+| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | findings → #PRNUM |
+| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | findings → #PRNUM (lead 11 fixed in #333) |
+| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | findings → #PRNUM |
 | [RT-11](#rt-11--lua-node-hosting-os-thread-two-oneshot-handshake-catch_unwind-handleblock_on) | P0 | Lua node hosting: OS thread, two-oneshot handshake, `catch_unwind`, `Handle::block_on` | `runtime.rs` (`run_lua`, `watch_lua_thread`, `run_lua_loop`) | findings → #386 |
 | [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → #370 |
 | [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → #370 |
@@ -2985,6 +2985,14 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `batches.dropped{reason="shutdown"}`.
 - **Priority:** **P0** — this is the drain-ordering machinery for the whole process; wrong here means silent
   loss or a hang at every shutdown.
+- **Verified (drain/w2, #PRNUM):** Both concerns were real. `count_shutdown_drop` is now the one site
+  that counts `dropped{reason="shutdown"}` and feeds `drain complete`, and
+  `drain_complete_reports_every_batch_dropped_for_shutdown_including_those_finish_drops` checks the logged
+  total against the telemetry sum through a full run (a `max_memory` Lua revoke is checked the same way).
+  `run_input`'s `select!` is `biased` toward the listener, and its backstop runs `unconstrained`, pinned by
+  `an_input_error_at_the_grace_deadline_is_never_swallowed_by_the_backstop` (32 iterations) and
+  `an_input_that_burns_its_coop_budget_after_the_signal_is_still_cancelled_at_the_grace_deadline`. Two
+  paused-time tests pin the grace anchor: first poll after the signal, kept across a dropped call.
 
 ---
 
@@ -3046,6 +3054,15 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Lead 11 fixed in #333** (verified under DISK-09): `drain_inbox` records the batch it is pushing in an
   `in_hand` slot that the sweep takes first, so a cancelled `push` under `overflow: block` no longer loses it
   uncounted. The rest of this entry is unreviewed, and its description of `drain_inbox` predates #333.
+- **Verified (drain/w2, #PRNUM):** The `received` gap was real and is fixed: the sweep counts
+  `received` for every batch it takes from the inbox, not for `in_hand`, which `drain_inbox` already counted.
+  A second loss turned up: `run_output` never closed `inbox`, so a producer parked on the full channel sent
+  into the capacity the sweep freed while `finish_and_flush` awaited, and that batch died with the
+  `Receiver`. The inbox is now closed before the sweep, which drains it with a bounded `recv`.
+  `a_batch_sent_into_the_inbox_after_the_sweep_began_is_counted_not_silently_lost` pins it, and
+  `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled` now reads
+  `received` and the new `delivered` counter from telemetry across five exit paths, both postures, and both
+  stores.
 
 ---
 
@@ -3077,7 +3094,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - The sink span's parent is `ctx.trace.span_id` (the batch's own), and `ctx.trace.child()` is used only as this
     span's identity, never propagated.
 - **Observed concerns (unverified):**
-  - **A `peek` reservation can be left standing when the grace arm wins the first `select!`.**
+  - ~~**A `peek` reservation can be left standing when the grace arm wins the first `select!`.**
     `BoundedQueue::peek` (`queue.rs`) calls `InMemoryBuffer::peek`, which sets `head_reserved = true`
     (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`). In `tokio::select!`, a branch whose future
     completed can still
@@ -3085,7 +3102,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     `Ok(())` on the `NextBatch::ShutdownExpired` arm. Today nothing breaks: `SinkStore::finish` drains with
     `commit()`, which clears it. But the
     invariant is accidental, not argued anywhere, and `BoundedQueue::pop`'s doc comment explicitly names a
-    dangling reservation as the hazard `pop` exists to avoid. Medium-high confidence the window is real; low severity today.
+    dangling reservation as the hazard `pop` exists to avoid. Medium-high confidence the window is real; low severity today.~~
+    Refuted: `select!` returns on the first `Ready` branch, and both `peek`s reserve only in the poll that
+    returns. The standing reservation comes from `DeliverStep::ShutdownExpired`, and it's benign.
   - **Cancelling `deliver_with_retry` mid-`send` at grace expiry is an ambiguous outcome silently recorded as a
     clean shutdown drop.** The batch stays uncommitted, so `finish_and_flush` counts it
     `dropped{reason="shutdown"}` — but the destination may have received it. No `Fault::Ambiguous` is recorded.
@@ -3112,6 +3131,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   the reservation state; review of whether a grace-cancelled `send` should be recorded as `Ambiguous`.
 - **Priority:** **P0** — every batch a sink ever emits goes through here, the drop decision is made here, and
   the classification plumbing is custom.
+- **Verified (drain/w2, #PRNUM):** The grace-cut send is now `Fault::Ambiguous`, decided by
+  `is_retryable`: the span is tagged `fault=ambiguous`, and at-most-once commits the batch and counts it
+  `dropped{reason="shutdown"}`. A `sending` flag set only across the `send` await tells a cut-off send from a
+  grace landing in backoff or before the deliver arm ran; the deliver `select!` is `biased`, so a send
+  completing in the grace's wake counts as delivered. Pinned by
+  `a_send_cut_off_by_shutdown_grace_is_committed_and_counted_under_at_most_once`,
+  `a_send_cut_off_by_shutdown_grace_stays_queued_for_replay_under_at_least_once`,
+  `a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once`,
+  `a_send_that_completes_in_the_same_wake_as_the_grace_deadline_is_counted_delivered`, and
+  `a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish`; the benign reservation is
+  argued at the `ShutdownExpired` arm.
 
 ---
 
