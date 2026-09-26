@@ -11,3 +11,6 @@ logit-core.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 mlua = { version = "0.9", features = ["luajit", "vendored"] }
+
+[dev-dependencies]
+proptest.workspace = true
