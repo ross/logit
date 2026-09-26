@@ -205,4 +205,16 @@ the Vector comparison asked for. Every leg passed, and the earlier probes answer
 | index-time props, `/raw` and `/event` | One line under the `logit:ta` sourcetype: on `/raw`, routed to `tcpout_probe`, renamed to `logit:ta:renamed`, and `_time` from its `ts=` prefix. On `/event`, the same index routing and renaming, but `_time` the receipt time: `/event` runs `TRANSFORMS-*` and skips timestamp extraction. `/event?auto_extract_timestamp=true` extracts `_time` from the line as `/raw` does |
 | `useACK` ids | Channel A's two posts: `ackId` 0 and 1; channel B's one: `ackId` 0. A polled for `[0, 1, 5]`: `{"0":true,"1":true,"5":false}` within a second. The same poll again: `{"0":false,"1":false}`, since Splunk forgets an id once it has answered `true`. B polled for `[0, 1]`: `{"0":true,"1":false}`. A new channel polled for `[0]`: `false`. No channel: `400` code 10 |
 
-<!-- cloud: pending browser pass -->
+The same probes against a Splunk Cloud Platform trial stack (Splunk Web reports 10.5.2605.9) on
+2026-09-26, `SPLUNK_INTEROP_TARGET=cloud`, with indexing checked by hand in Splunk Web from
+`search.spl`. Every leg was `SENT`, and every searched probe answered as Enterprise 10.4.3 did.
+
+| Probe | Splunk Cloud's answer |
+|---|---|
+| `/health` and the token | As on Enterprise: `200` code 17 on both routes with no token, the token, and a bogus token |
+| `event` with no content | As on Enterprise: `{}`, `[]`, and `0` indexed with `_raw` `{}`, `[]`, and `0`; `" "` (code 13), `null`, and `false` (code 6) not indexed |
+| `time` forms | As on Enterprise: seconds stored as `.000000000`, the 13-digit integer as `.123000000`, and the 19-digit integer, the decimal string, and the float as `.123456700`. The magnitude rule applies, and `_time` keeps microseconds |
+| envelope across objects | No carry-over, as on Enterprise: only the object carrying the envelope got `osnix`, `probe-carry-host`, `probe-carry-source`, `probe:carry`, and the envelope's time. The others got `main`, host `<stack>.splunkcloud.com:8088`, the token's name as source, the stack's default sourcetype (`log4j` on this trial), and receipt time |
+| `/raw` line merging | As on Enterprise: each of the four bodies became one three-line event, CRLF stored as LF, the indentation kept |
+| index-time props, `/raw` and `/event` | `SKIP`: the probe's `logit:ta` props and transforms exist only on the local stack |
+| `useACK` ids | A missing channel is `400` code 28, with a longer message than Enterprise's code 10. Otherwise as on Enterprise: ids 0 and 1 on channel A and 0 on channel B, each id `true` once and then `false`, an unissued id `false` |
