@@ -742,6 +742,9 @@ def probe_event_vs_raw_props():
                       ' | table _raw index sourcetype e', lambda r: len(r) >= len(replies), 60)
     parts = []
     for route, case, (status, text) in replies:
+        if rows == NOT_SEARCHED:
+            parts.append(f"{route} -> {status} {text}, {rows}")
+            continue
         row = next((r for r in rows if r.get("_raw", "").endswith(f"{m}-{case}")), None)
         if row is None:
             parts.append(f"{route} -> {status} {text}, not indexed")
