@@ -30,7 +30,8 @@ pub enum Phase {
 
 impl Phase {
     /// This module's vocabulary, not the words `/readyz` returns: `logit-cli`'s `admin.rs` maps
-    /// `Phase` to `ok`/`starting`/`draining`/`degraded` itself, as an HTTP-response concern.
+    /// `Phase` to `ok`/`starting`/`draining`/`degraded` (and a stalled node to `stalled`) itself,
+    /// as an HTTP-response concern.
     pub fn as_str(self) -> &'static str {
         match self {
             Phase::Starting => "starting",
@@ -54,6 +55,12 @@ pub enum NodeState {
     Bound,
     /// Its task (or, for a Lua node, its thread) exists and hasn't returned.
     Running,
+    /// A Lua node whose thread has been inside one `process()`/`flush()` call with no progress
+    /// for its `stall_after` (`docs/adr/lua-runaway-script-bounds.md`). Set and cleared only by
+    /// its watcher, which moves it back to `Running` on the next sign of progress. `/readyz`
+    /// reports `503 stalled` while any node is here and the phase is `Ready`, without moving
+    /// [`Phase`].
+    Stalled,
     /// It returned `Ok(())` on its own: a finite listener, or any node whose inbox closed
     /// during a graceful drain.
     Finished,
@@ -72,6 +79,7 @@ impl NodeState {
             NodeState::Pending => "pending",
             NodeState::Bound => "bound",
             NodeState::Running => "running",
+            NodeState::Stalled => "stalled",
             NodeState::Finished => "finished",
             NodeState::Failed => "failed",
             NodeState::Alias => "alias",
@@ -89,6 +97,13 @@ pub struct PipelineState {
     pub components: HashMap<String, NodeState>,
     /// When `phase` last *changed*. A per-node update alone does not move it.
     pub since: SystemTime,
+}
+
+impl PipelineState {
+    /// Whether any component reads [`NodeState::Stalled`].
+    pub fn has_stalled_node(&self) -> bool {
+        self.components.values().any(|state| *state == NodeState::Stalled)
+    }
 }
 
 impl Default for PipelineState {
@@ -273,6 +288,21 @@ mod tests {
         readiness.begin(&["a".to_string()]);
         readiness.set_node("not-in-the-graph", NodeState::Running);
         assert_eq!(readiness.snapshot().components.len(), 1);
+    }
+
+    #[test]
+    fn has_stalled_node_reflects_any_stalled_component() {
+        let (readiness, _rx) = Readiness::channel();
+        readiness.begin(&["a".to_string(), "b".to_string()]);
+        readiness.set_node("a", NodeState::Running);
+        readiness.set_node("b", NodeState::Running);
+        assert!(!readiness.snapshot().has_stalled_node());
+
+        readiness.set_node("b", NodeState::Stalled);
+        assert!(readiness.snapshot().has_stalled_node(), "one stalled component is enough");
+
+        readiness.set_node("b", NodeState::Running);
+        assert!(!readiness.snapshot().has_stalled_node(), "a resumed component clears it");
     }
 
     /// Every update method works on `disabled()`, which has no receiver (see [`Readiness`]).

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-09-26
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -171,8 +171,7 @@ Concretely:
   mutation". [ADR `trace-context-span-lifting`](trace-context-span-lifting.md)'s "Lua gains no new
   capability here" consequence is amended, dated, to point here.
 - Residual, recorded rather than fixed: a `Value::Null` log `message` or span `name` reaches
-  `to_table()` as an absent key and is rejected as missing on the way back; a `u64` count above
-  `i64::MAX` is emitted `as i64` by `to_table()` and cannot be rebuilt exactly; `U64`/`Timestamp`/
+  `to_table()` as an absent key and is rejected as missing on the way back; `U64`/`Timestamp`/
   UTF-8 `Bytes` attribute values flatten as described above, an `I64` past ±2^53 comes back `Str`
   (`to_table()` emits it as a decimal string), and an integral `F64` such as `3.0` comes back
   `I64` (LuaJIT canonicalizes it to an integer); a `sum`/`gauge`/`samples`/exemplar value that is
@@ -183,3 +182,31 @@ Concretely:
   rejected by the constructor's rules above, so a rebuilding script must fix or drop that field.
   In-place `event.log.message`/`severity`/`body_format` writes are the named follow-up.
 - Landed by [plan `lua-event-constructor`](../plans/lua-event-constructor.md), stream key `mint`.
+
+## Amendment: counts round-trip at every magnitude (2026-09-26)
+
+The residual list above named a count above `i64::MAX` as not rebuildable. It was wider than
+that: `to_table()` emitted every `u64` count as a Lua number, so any count past 2^53 rebuilt
+rounded, and one past `i64::MAX` read negative and was rejected. A count now follows the rule an
+`I64`/`U64` attribute already follows: an integer up to 2^53, a decimal string above it, in
+`to_table()` and on the `event.metrics[i]` proxy alike (`crate::value`'s `exact_u64_to_lua`).
+`Event.new` accepts a count as either form, so bucket counts, `zero_count`, a side's `counts`,
+and a summary's or exponential histogram's `count` round-trip unchanged at every magnitude. This
+ADR's shape symmetry holds: `Event.new` accepts every form `to_table()` emits.
+`crates/logit-script/tests/event_new_fixed_point.rs` checks the fixed point over generated
+events, full-range counts included, against the residual list above.
+
+Three residuals the list above lacked, each of which the test's generator leaves out:
+
+- A nonzero number smaller than 2^-52 in magnitude reads back from Lua as `0`. mlua 0.9.9's
+  LuaJIT number read (`pop_value`/`stack_value`) truncates toward zero with `num_traits::cast`
+  and keeps that integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52`
+  (and `-0.0`) collapse; `1 - 2^-53` truncates to `0` and stays a number. A metric value, bound,
+  or float attribute of `1e-20` comes back `0` through `Event.new`, and so does one written back
+  through a proxy (`event.attributes.x = event.attributes.x` stores `I64(0)`). Closing it needs
+  a number read that bypasses mlua's `Value` conversion.
+- A `Value::Null` attribute or array element. `to_table()` emits it as `nil`, which is an absent
+  key, so a `Null` attribute disappears and `Array([I64(1), Null, I64(2)])` comes back as
+  `Map{"1": 1, "3": 2}`.
+- An empty `Array` comes back an empty `Map`, the flattening Decision's "an empty table becomes
+  an empty `Map`" names.
