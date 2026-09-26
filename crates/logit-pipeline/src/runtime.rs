@@ -4,6 +4,10 @@
 //!
 //! Every component's inbox channel is created before any node is spawned, so spawn order doesn't
 //! matter: a `Fanout` is cloned `Sender`s into inboxes that already exist.
+//!
+//! Every `select!` and `timeout` a node runs, here and in the listeners and sinks, is a row of
+//! `docs/design/pipeline-graph.md`'s "Cancellation points" table: what each losing arm drops, and
+//! why that loses nothing or what counts it.
 
 use crate::fanout::{BatchContext, Delivered, TraceContext};
 use crate::graph::{Graph, Role};
@@ -1788,8 +1792,7 @@ async fn watch_lua_thread(
 
     loop {
         tokio::select! {
-            // `done_rx` first: a thread that has reported must never be read as wedged by a tick
-            // polled in the same wake-up.
+            // `done_rx` first: see `docs/design/pipeline-graph.md`'s "Cancellation points".
             biased;
             outcome = &mut done_rx => {
                 return match outcome {

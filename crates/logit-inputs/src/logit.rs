@@ -237,8 +237,9 @@ impl Input for LogitInput {
         let max_frame_bytes = self.max_frame_bytes;
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
-        // `crate::tcp`'s sampler: publishes `logit.input.accept_queue.depth`/`.utilization`, and
-        // its `accept` is cancel-safe against the `shutdown` arm below.
+        // `crate::tcp`'s sampler: publishes `logit.input.accept_queue.depth`/`.utilization`.
+        // Both accepts race `shutdown`: see `docs/design/pipeline-graph.md`'s "Cancellation
+        // points".
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
 
@@ -252,8 +253,8 @@ impl Input for LogitInput {
             let (stream, _peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    // `biased`, absorb first: the error is counted before shutdown can win, and a
-                    // stopping listener doesn't wait out the backoff.
+                    // `biased`, absorb first: see `docs/design/pipeline-graph.md`'s
+                    // "Cancellation points".
                     tokio::select! {
                         biased;
                         absorbed = crate::listener::absorb_accept_error(
@@ -451,8 +452,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
     let mut seq: u64 = 0;
     loop {
-        // Only the header read races `shutdown`; once a header has arrived, the body read,
-        // decode, forward, and ack run uninterrupted. This explicit check catches a shutdown
+        // Only the header read races `shutdown` (`docs/design/pipeline-graph.md`'s "Cancellation
+        // points"). This explicit check catches a shutdown
         // that fired before this iteration: `changed()` fires only on a transition this receiver
         // hasn't observed. The `borrow()` `Ref` drops at the end of the statement, before any
         // `.await`.

@@ -96,7 +96,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      decoder, including one `decode_into` rejects. Each gets one
      `logit.component.receive.latency` sample; a decode error is a throttled diagnostic, not a
      counter. `logit.input.datagrams.truncated` isn't a drop and never appears in the sum.
-   - Four losses are named exceptions, left uncounted and to be listed in `docs/known-gaps.md`:
+   - Four losses are named exceptions, left uncounted and listed in `docs/known-gaps.md`:
      - A UDP listener's decoded events that the grace backstop drops, either held in the
        `BatchAccumulator` or parked in `emit`'s `Fanout::send`. Their datagrams already count as
        decoded, so the datagram contract still holds.
@@ -107,9 +107,9 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      - A batch sent into a closed sink inbox (decision 9) by a permit holder still blocked when
        the sweep's bound runs out.
 2. **`drain complete`'s `batches_dropped` is the sum of every `reason="shutdown"` batch drop at a
-   sink or Lua boundary.** One helper, `count_shutdown_drop`, will be the only site that counts
+   sink or Lua boundary.** One helper, `count_shutdown_drop`, is the only site that counts
    `batches.dropped`/`events.dropped{reason="shutdown"}` and the only site that adds to
-   `shutdown_dropped_batches`. Its callers will be the `run_output` sweep, `finish_and_flush`,
+   `shutdown_dropped_batches`. Its callers are the `run_output` sweep, `finish_and_flush`,
    `write_loop`, and `revoke_lua_io`. `revoke_lua_io` has two callers: `watch_lua_thread`, on a
    wedge at shutdown, and `run_lua`'s Lua OS thread on the `max_memory` failure path, through
    `sweep_runtime.block_on(revoke_lua_io(..))`. So the counter reaches the Lua thread too. A
@@ -120,7 +120,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 
    The field doesn't include events a `Fanout` drops as `closed_consumer`, UDP datagram drops (a
    different unit), overflow evictions during the drain, or the disk sweep's push failures
-   (`frame_too_large`, `disk_full`, `disk_io_error`). `docs/deploying.md` will say so.
+   (`frame_too_large`, `disk_full`, `disk_io_error`). `docs/deploying.md` says so.
 3. **A send cut off by the shutdown grace is `Fault::Ambiguous`.** The destination may have
    received it, and the existing `is_retryable(Fault::Ambiguous, posture)` table decides what
    happens:
@@ -128,8 +128,8 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    - Under `at_most_once`, the batch is committed and counted `dropped{reason="shutdown"}`, and
      the sink span is tagged `fault=ambiguous`.
 
-   Today the send is cut when `write_loop`'s `select!` lets `shutdown_grace_expired` win and
-   drops `deliver_with_retry`. `write_loop` will track whether a send is in flight with a flag set
+   The send is cut when `write_loop`'s `select!` lets `shutdown_grace_expired` win and drops
+   `deliver_with_retry`. `write_loop` tracks whether a send is in flight with a flag set
    immediately before the `timeout(remaining, output.send(batch))` await and cleared as soon as it
    returns. A grace
    expiry while the flag is clear leaves the batch uncommitted under either posture, as for a
@@ -138,20 +138,20 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    so a send never starts after the deadline to be read as cut off.
 4. **The UDP shutdown remainders are counted** as `datagrams.dropped` and
    `bytes.dropped{reason="shutdown"}`. There are four:
-   - **A cancelled `push_many`'s remainder.** A new `CountedDrain` wrapper around a `Vec`'s drain
-     will count, when dropped, whatever it never yielded. It will call only `Telemetry::count`,
-     never the queue lock. `push_many` will iterate through it.
+   - **A cancelled `push_many`'s remainder.** A `CountedDrain` wrapper around a `Vec`'s drain
+     counts, when dropped, whatever it never yielded. It calls only `Telemetry::count`, never the
+     queue lock. `push_many` iterates through it.
    - **A batch `push_many` never started.** `push_many` is an `async fn`, so its drain exists only
      after its first poll. In `read_loop`'s second `select!`, `queue.push_many(&mut batch)` against
      `shutdown.wait_for`, `wait_for` is `Ready` on its first poll once shutdown is set, and
      `select!` starts at a random branch. About half the time `push_many` is never polled, and the
      whole batch stays in `read_loop`'s `Vec`, dropped uncounted on return. `read_loop`'s shutdown
-     arm will count whatever `batch` still holds. A polled-then-cancelled `push_many` leaves the
+     path counts whatever `batch` still holds (`ReadHalf`'s `Drop`). A polled-then-cancelled `push_many` leaves the
      `Vec` empty and a never-polled one leaves it full, so this count is exact and never overlaps
      `CountedDrain`'s.
-   - **What `decode_loop` popped but didn't decode.** `decode_loop` will iterate its popped batch
+   - **What `decode_loop` popped but didn't decode.** `decode_loop` iterates its popped batch
      through a `CountedDrain`.
-   - **The `ReceiveQueue` residual.** A guard declared in `drive` before `read` and `decode` drops
+   - **The `ReceiveQueue` residual.** A guard (`ResidualOnDrop`) declared in `drive` before `read` and `decode` drops
      after both halves' futures are gone. Its `Drop` closes the queue, drains it with `commit()`,
      and counts what it drained. `commit()` takes the queue's mutex, and taking it there is safe:
      no other holder of that queue exists by then, the mutex is never held across an await
@@ -159,12 +159,12 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 
    Each of these counts is recorded at the grace backstop or during the drain, after `internal`'s
    final drain has run, so it never reaches an exported pipeline. Each guard that counts a
-   nonzero remainder will also log a self-log `diag.warn` naming the listener and the count.
+   nonzero remainder also logs a self-log `diag.warn` naming the listener and the count.
 5. **Queue verification is a multi-thread randomized stress harness, a sequential proptest, and
-   pins against tokio's source.** The stress harness will run `BoundedQueue` and `DiskQueue` on a
+   pins against tokio's source.** The stress harness runs `BoundedQueue` and `DiskQueue` on a
    four-worker multi-thread runtime with random producers, consumers, cancellations, and close
-   timing, seeded so a failure replays. The proptest will check that batched and single-item calls
-   agree under close and cancellation. Unit tests will pin the tokio behavior the queues rely on.
+   timing, seeded so a failure replays. The proptest checks that batched and single-item calls
+   agree under close and cancellation. Unit tests pin the tokio behavior the queues rely on.
    On a tokio bump, re-check these internals:
    - `sync/notify.rs`: `notify_waiters` wakes only waiters whose `Notified` was created before the
      call, and a registered `Notified` that is assigned a `notify_one` and dropped before
@@ -179,11 +179,11 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      `poll_proceed`/`made_progress` (`runtime/io/registration.rs`), and
      `tokio::task::consume_budget` spending one unit per call.
 6. **Grace races prefer the node's own outcome, and a grace arm can't be starved.**
-   - `run_input`'s `select!` will be `biased`, with the input's arm first, so a listener's `Err`
+   - `run_input`'s `select!` is `biased`, with the input's arm first, so a listener's `Err`
      that is ready in the same poll as the backstop is returned, not discarded.
-   - `write_loop`'s `DeliverStep` `select!` will be `biased`, with the deliver arm first, so a send
+   - `write_loop`'s `DeliverStep` `select!` is `biased`, with the deliver arm first, so a send
      that completed in the same wake is counted delivered, not ambiguous.
-   - Every grace arm, `run_input`'s and both of `write_loop`'s, will be wrapped in
+   - Every grace arm, `run_input`'s and both of `write_loop`'s, is wrapped in
      `tokio::task::unconstrained`. `Sleep::poll_elapsed` and `wait_for` spend the task's coop
      budget, so an input or a delivery that exhausts the budget on every poll would otherwise
      defer the backstop.
@@ -194,23 +194,23 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    the coop budget before `write_loop` is polled.
 7. **A listener's shutdown grace is enforced only by the runtime.**
    `InputRuntimeConfig::shutdown_grace`, read by `run_input`, is the one copy. The three
-   per-listener copies (`TailBatching`, `UdpListenerConfig`, `TcpListenerConfig`) will be removed
+   per-listener copies (`TailBatching`, `UdpListenerConfig`, `TcpListenerConfig`) are removed
    with no alias.
 8. **`docs/design/pipeline-graph.md`'s "Cancellation points" table is the canonical list of every
    production `select!` and `timeout` on a node's run path.** Each row names the site, its arms,
    what a losing arm drops, and why nothing is lost or what counts it. A new `select!` or
    `timeout` on a run path adds its row in the same PR. Comments at the site point at the table
    and don't repeat it.
-9. **`run_output` closes its inbox before the sweep.** It will call `inbox.close()` first, as
+9. **`run_output` closes its inbox before the sweep.** It calls `inbox.close()` first, as
    `revoke_lua_io` does, so a later send fails upstream as `closed_consumer` instead of landing
    in a channel nobody reads. The sweep then drains with `recv` until `None`, under a short bound,
    so a send whose permit was reserved before the close still lands and is counted. Closing
    first fixes two things in [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s
    "Shutdown":
-   - The batch lost after the sweep contradicts its "the sweep … still drops nothing".
-   - Its bound on spool overshoot, "bounded by the channel's fixed capacity", breaks today by a
-     different mechanism: the inbox stays open while the sweep awaits each disk `store.push`, so
-     producers refill it. A closed inbox can't refill.
+   - The batch lost after the sweep contradicted its "the sweep … still drops nothing".
+   - Its bound on spool overshoot, "bounded by the channel's fixed capacity", broke by a different
+     mechanism: the inbox stayed open while the sweep awaited each disk `store.push`, so producers
+     refilled it. A closed inbox can't refill.
 
 ## Alternatives considered
 
@@ -250,22 +250,21 @@ was missing was executable evidence under real concurrency, and the shutdown acc
     on each `Delivery::Delivered`.
   - `logit.component.datagrams.dropped` and `logit.component.bytes.dropped` gain
     `reason="shutdown"`.
-- A disk-backed sink under `at_most_once` will be able to count
-  `batches.dropped{reason="shutdown"}`, for a send the grace cut off. Today a disk sink never
-  counts a shutdown drop.
-- `drain complete` will log at `warn` whenever any `reason="shutdown"` batch drop happened at a
+- A disk-backed sink under `at_most_once` can count `batches.dropped{reason="shutdown"}`, for a
+  send the grace cut off. It is the only shutdown drop a disk sink counts.
+- `drain complete` logs at `warn` whenever any `reason="shutdown"` batch drop happened at a
   sink or Lua boundary, from any of the four sites. Decision 2 lists what the field excludes, and
-  `docs/deploying.md` will say the same.
+  `docs/deploying.md` says the same.
 - Removing the three per-listener `shutdown_grace` fields is a wide but mechanical diff across the
   struct literals in `logit-cli`'s tests. It isn't operator-visible: the operator's field for a
   listener's grace, `receive.shutdown_grace` (`ReceiveConfig`), doesn't change.
-- The stress tests will run a small seed count in CI (64 for `BoundedQueue`, 16 for `DiskQueue`)
-  under a 30 s timeout, so they don't flake on a loaded runner. Long runs will be `#[ignore]`d,
-  and `LOGIT_QUEUE_STRESS_SEED` will replay one seed.
+- The stress tests run a small seed count in CI (64 for `BoundedQueue`, 16 for `DiskQueue`)
+  under a 30 s timeout, so they don't flake on a loaded runner. Long runs are `#[ignore]`d,
+  and `LOGIT_QUEUE_STRESS_SEED` replays one seed.
 - `internal` can't export the counts decision 4 adds. Its `run_until_shutdown` does its final
   drain the instant the signal fires, and every one of those counts is recorded later, at the
   grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
-  The self-log `diag.warn` is what an operator sees, and `docs/known-gaps.md` will record the gap.
+  The self-log `diag.warn` is what an operator sees, and `docs/known-gaps.md` records the gap.
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
@@ -530,4 +529,32 @@ Every test but the grace-cut pin failed with its fix removed. The existing
 
 ### `drain/w5`: close-out
 
-Filled in by `drain/w5`.
+`drain/w5` completes decision 8. It audits every production `tokio::select!`, `timeout`,
+`timeout_at`, and `block_on(timeout(..))` on a node's run path in `logit-pipeline`,
+`logit-inputs`, and the sinks of `logit-outputs`, and adds the 24 sites w2 through w4 didn't cover,
+so `docs/design/pipeline-graph.md`'s "Cancellation points" table has 42 rows. The new rows cover:
+
+- The runtime's remaining sites: `deliver_with_retry`'s per-attempt timeout, `run_lua_loop`,
+  `watch_lua_thread`, the default `Input::run_until_shutdown`, and
+  `Fanout::send_with_deadline`.
+- `internal`, `prometheus_in`'s scrape request timeout, the shared HTTP driver (`drive_with_idle`,
+  `collect_with_stall_bound`), every listener's TLS-accept and first-byte bound,
+  `datadog_trace_in`'s two accept loops, `AcceptQueueSampler::accept_every`, and `logit_in`'s
+  accept, header, handshake, body, and control-write sites.
+- The sinks' connect and reply bounds, `statsd_out`'s Unix datagram send, and `prometheus_out`'s
+  exposition deadline.
+
+Most sites lose nothing, because the dropped future is cancel-safe or its loss is answered on the
+wire so the peer resends. Four uncounted losses the audit found are now in `docs/known-gaps.md`:
+
+- A batch parked in `Fanout::send` when a listener's future is dropped counts as `sent` and
+  reaches no consumer. The default `run_until_shutdown` drops at the signal with no grace, which
+  reaches `prometheus_in`'s scrape mode and `generate_in`.
+- `internal`'s drained batch, lost when the backstop drops a tick parked in its send.
+- A torn line or frame in `stdio_out` and `file_out` after a grace-cut `send`, as this ADR's
+  consequences record.
+- `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver can hold the
+  graph open past shutdown, as `otlp_in` can.
+
+Site comments that restated a row now point at the table, and the runtime, `Input`, and `tcp.rs`
+module docs point at it once. No behavior changes.

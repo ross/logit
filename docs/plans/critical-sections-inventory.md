@@ -24,12 +24,15 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-26, at `luab/w4`'s head, `d80f616`):** 33 of 135
-  entries done (20 P0, 12 P1, 1 P2): 31 with findings and two reviewed clean. The four finished
+- **Progress (2026-09-26, at `drain/w5`'s head):** 44 of 135
+  entries done (27 P0, 16 P1, 1 P2): 40 with findings and four reviewed clean. The five finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
-  re-reviewed CORE-05's stale entry, and the Lua boundary (#383, #385, #386, #388, #391, #392),
-  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean. The rest of the
+  re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
+  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, and the shared
+  queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
+  NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
+  clean. The rest of the
   list is `unreviewed`. The index's **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
@@ -54,7 +57,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
-| 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done** (#333); the rest of RT-03 is unreviewed |
+| 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
@@ -72,11 +75,25 @@ Repo-wide gaps that cut across entries:
   Prometheus remote-write decoders, run out of CI (ADR `out-of-ci-fuzzing`). statsd, syslog, the
   Prometheus text parser, the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and
   tail checkpoints still have none (cluster 9).
-- **Cancellation is the least-tested axis.** The runtime drops `send`/`push` futures mid-flight by
-  design; no test drops one inside `write_all`, the UDP datagram loop, or a parked `store.push`.
+- **Cancellation is the least-tested axis.** ~~No test drops a future inside `write_all`, the UDP
+  datagram loop, or a parked `store.push`.~~ **Partly fixed (cluster 3):** every production
+  `select!` and `timeout` on a node's run path is a row of `docs/design/pipeline-graph.md`'s
+  "Cancellation points" table, naming what a losing arm drops and what counts it. Tests now drop
+  futures mid-flight in the queues (the `queue_stress` harness and the batched-versus-single
+  proptest), the UDP read and decode loops (`read_loop` at its push and at a coop-budget yield,
+  `decode_loop` mid-batch, the whole listener at the grace backstop), a parked `store.push`, a
+  grace-cut `Output::send`, and the tail driver parked in its final flush. Still untested: a
+  sink's own state after a dropped `send` (`stdio_out`/`file_out` can leave a torn line, in
+  `docs/known-gaps.md`; the pooled TCP sinks are cluster 6), and the uncounted losses the table
+  names (a batch dropped inside `Fanout::send`, pinned only for a partial fan-out).
 - **Dependency bumps are re-verification triggers**: `logit-inputs/src/http.rs`'s idle/graceful
   shutdown driver is pinned by reference to hyper 1.11.1 / hyper-util 0.1.20 internals;
-  `BoundedQueue::close` leans on a tokio `notify_waiters` internal; `logit_out`'s `Clean` vs
+  the queues lean on tokio 1.53.1 internals, now pinned by tests (ADR
+  `shutdown-accounting-and-cancellation-safety`, decision 5): `notify_waiters` wakes only a
+  `Notified` constructed before the call, `drop_notified` forwards a `notify_one` permit, a stored
+  permit is one permit, `select!` returns on the first `Ready` branch and checks
+  `poll_budget_available` before polling any arm, `wait_for` spends the coop budget
+  (`cooperative`), and the initial budget is 128 units; `logit_out`'s `Clean` vs
   `Ambiguous` fault split rests on an unverified `tokio-rustls` write-semantics assumption; the HLL
   codec's soundness rests on serde's `with_capacity(size_hint)` behaviour.
 - ~~**Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
@@ -92,7 +109,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    CODEC-16, CODEC-17. Mostly fuzz targets + size/depth caps; highest severity, most mechanical.
 2. **Durability (done, #322–#337)** — DISK-01..06, DISK-09, DISK-13, TAIL-05, DISK-10. One crash-injection harness
    serves all of it; settle the fsync policy (tmp file + directory) once for spool *and* checkpoints.
-3. **Shared queue + shutdown (in progress: `drain/w0`–`w5`)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
+3. **Shared queue + shutdown (done, #401, #403, #404, #406, #408, #409)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
    A multi-thread randomized stress harness, a sequential proptest, and tokio-source pins for the
    queues (incl. the `peek`/`commit` head reservation), then a cancellation-safety audit of every
    `select!`, recorded as `docs/design/pipeline-graph.md`'s "Cancellation points" table.

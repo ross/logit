@@ -1,5 +1,6 @@
 //! The `Input` trait every listener node implements. It lives here, not in `logit-inputs`, per
-//! `docs/design/pipeline-graph.md`'s "Crate layout" section.
+//! `docs/design/pipeline-graph.md`'s "Crate layout" section. What a listener loses when its future
+//! is dropped at shutdown is in that doc's "Cancellation points" table.
 
 use crate::Fanout;
 use std::time::Duration;

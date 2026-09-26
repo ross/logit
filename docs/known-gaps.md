@@ -95,6 +95,33 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   or a bounded shutdown grace (default 5s) expired with batches still undelivered. Load-bearing now
   that a sink can hold unwritten data at shutdown (see "Output buffering" under
   [Native wire format, `logit_in`/`logit_out`, and buffering](#native-wire-format-logit_inlogit_out-and-buffering)).
+- **A batch parked in `Fanout::send` when a listener's future is dropped is lost, already counted
+  `sent`.** `Fanout::deliver` counts `batches.sent`/`events.sent` before it awaits the first
+  consumer's channel, so a send dropped while a full downstream parks it reaches no consumer, or a
+  prefix of them, and no counter records the difference. Where a listener's future is dropped:
+  - `Input::run_until_shutdown`'s default races `run` against the signal with no grace, so the
+    drop comes the instant shutdown fires. That covers `prometheus_in` in scrape mode (the scrape
+    in flight, and each target's batch still to send) and `generate_in`. The accept loops of the
+    HTTP listeners also use the default, but their connections run on spawned tasks the drop
+    doesn't reach.
+  - `run_input`'s grace backstop drops a listener still draining after its grace: the UDP
+    listeners (under [UDP intake](#udp-intake)), `internal` (under
+    [Internal telemetry and self-logging](#internal-telemetry-and-self-logging)), and `tail_in`,
+    whose restart replays the batch from the last checkpoint (under
+    [File tailing and Docker logs](#file-tailing-and-docker-logs)).
+
+  Both need a downstream that stays full at shutdown. Counting the loss would need `Fanout` to
+  record a delivery per consumer, the fix the UDP entry names.
+  `docs/design/pipeline-graph.md`'s "Cancellation points" table has each site.
+- **A batch sent into a closed sink inbox after the sweep's bound runs out is lost uncounted.**
+  `run_output` closes its inbox before its shutdown sweep, so a later send fails upstream as
+  `closed_consumer`. A producer that reserved its channel permit before the close can still send,
+  and the sweep receives until `recv` returns `None`, but only for `SWEEP_DRAIN_TIMEOUT` (250 ms).
+  A permit holder still blocked when that runs out, on another consumer of a fan-out, sends into a
+  channel nobody reads, and the batch dies with the `Receiver`, counted `sent` upstream and nothing
+  at the sink. It's a named exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
+  Revisit if a reconciliation shows a sink's `received` short of its producers' `sent` after a
+  shutdown with no `closed_consumer` drops.
 
 ## Event model and interner
 
@@ -346,7 +373,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     different number; no `receive:`-shaped knob exists yet.
   - **`otlp_in` can hold the graph open past shutdown.** Each connection `OtlpInput::run` spawns
     holds its own `Fanout` clone, and the input doesn't override `Input::run_until_shutdown` the way
-    `logit_in` does (`crates/logit-inputs/src/logit.rs`'s module doc comment). An idle keep-alive
+    `logit_in` does (`crates/logit-inputs/src/logit.rs`'s module doc comment). `datadog_in`,
+    `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver share the
+    shape and the gap: each spawns its connections the same way and keeps the default. An idle keep-alive
     HTTP/gRPC connection at shutdown can hold its `Fanout` clone open indefinitely, but the
     cancel-by-drop shutdown ([ADR
     `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) depends on
@@ -1849,6 +1878,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`format: human | native`, ADR `file-output-native-format`); a user-supplied `format:`
   *template* over the human-readable render is designed for (the encoder is built around a
   `Format` enum with room for it) but not implemented.
+- **A send the shutdown grace cuts off can leave a torn line in a `stdio_out` or `file_out`
+  file.** Both write a batch in place with one `write_all`. When `write_loop`'s grace drops that
+  `send` part-way, the part already handed to the file stays, and the sink's `flush()` then
+  completes the write in flight, so the file can hold a torn line or native frame. The batch is
+  counted as the grace decides (ADR
+  [`shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
+  decision 3), but nothing marks the torn record, and the next run appends after it. Open, for the
+  sink send path's verification cluster.
 - ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ **Closed.** It was the
   largest single cost in the pipeline, roughly twice the end-to-end cost of ingesting an event. Now
   30 allocations per 100-event batch (from 18,024) and 2.6× faster: escaping and formatting go
@@ -2300,6 +2337,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
   under about twice the working set forces a full collection on most batches; the verdict is
   rate-limited to one a second, so that costs latency, not a failure.
+- **A batch sent into a revoked Lua inbox after `REVOKE_DRAIN_TIMEOUT` is lost uncounted.**
+  `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails,
+  closes the inbox and counts each batch it still receives as `batches.dropped{reason="shutdown"}`
+  under the node's id. It receives for `REVOKE_DRAIN_TIMEOUT` (250 ms) only, so a producer that
+  reserved its permit before the close and is still blocked on another consumer then sends into
+  a channel nobody reads: counted `sent` upstream and nothing at the Lua node. It's a named
+  exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
+  Revisit if a revoked node's `dropped` count falls short of its producers' `sent` in practice.
 - **A nonzero float under 2^-52 in magnitude reads back `0` through `Event.new`.** mlua 0.9.9's
   LuaJIT number read truncates toward zero and keeps that integer when the difference is under
   `f64::EPSILON`, so a metric value, bound, or float attribute of, say, `1e-20` — read through
@@ -2474,6 +2519,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   UDP guard that counts a nonzero remainder logs a `warn` naming the listener and the count, and
   `drain complete` logs the sinks' total. Exporting them would need `internal` to drain once more
   after every other node has stopped, into a pipeline that has itself already stopped.
+- **A self-telemetry batch `internal` has drained is lost uncounted if the grace backstop drops it
+  mid-send.** Each `tick` drains the registry, then awaits `Fanout::send`. A tick parked on a full
+  downstream when shutdown fires keeps the `select!` from seeing the signal until the send
+  completes, and if the downstream stays full for the 5 s grace, `run_input` drops the task with
+  the drained points, spans, and logs in the send. The registry no longer holds them, and nothing
+  counts them. This is the general dropped-send loss under
+  [Pipeline runtime and graph](#pipeline-runtime-and-graph), for the one listener whose data is
+  `logit`'s own.
 - ~~**`eprintln!` instead of a real diagnostics facility** — every component's diagnostic now goes
   through `logit_core::diag::Diagnostics`, which closes the two concrete hazards this entry used to
   name: every message is prefixed with its component's id, and a message that can fire once per
