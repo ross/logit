@@ -406,7 +406,8 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
 
 /// `aggregate -> prometheus_out`: a series keeps its first record's `description`, which the
 /// exposition renders as `# HELP`, on both the tumbling (gauge, no retention) and the retained
-/// (cumulative counter) flush paths.
+/// (cumulative counter) flush paths. The retained series gets a second description in its second
+/// window and still emits the first.
 #[tokio::test]
 async fn aggregate_carries_the_first_records_description_into_help() {
     use logit_core::interner::intern;
@@ -427,21 +428,32 @@ async fn aggregate_carries_the_first_records_description_into_help() {
         let gauge = record("depth", MetricKind::Gauge(i as f64), description);
         assert!(!tumbling.process(&resource, &mut Event::metric(0, AttrMap::new(), gauge)));
     }
-    let hits = record("hits", MetricKind::counter(1.0), "Requests served.");
-    assert!(!retained.process(&resource, &mut Event::metric(0, AttrMap::new(), hits)));
+    let to_batches = |flushed: logit_pipeline::FlushOutput| -> Vec<EventBatch> {
+        flushed
+            .into_iter()
+            .map(|(resource, scope, events)| EventBatch {
+                resource,
+                scope,
+                events: events.into_iter().map(|(event, _links)| event).collect(),
+            })
+            .collect()
+    };
 
     let now = 1_700_000_000_000_000_000;
-    let batches: Vec<EventBatch> = [tumbling.flush(now), retained.flush(now)]
-        .into_iter()
-        .flatten()
-        .map(|(resource, scope, events)| EventBatch {
-            resource,
-            scope,
-            events: events.into_iter().map(|(event, _links)| event).collect(),
-        })
-        .collect();
-
-    let (body, _addr) = expose_and_fetch(&batches, ACCEPT_TEXT).await;
+    let hits = record("hits", MetricKind::counter(1.0), "Requests served.");
+    assert!(!retained.process(&resource, &mut Event::metric(0, AttrMap::new(), hits)));
+    let mut first = to_batches(tumbling.flush(now));
+    first.extend(to_batches(retained.flush(now)));
+    let (body, _addr) = expose_and_fetch(&first, ACCEPT_TEXT).await;
     assert!(body.contains("# HELP depth Queue depth."), "the first record's, got:\n{body}");
     assert!(body.contains("# HELP hits_total Requests served."), "got:\n{body}");
+
+    let hits = record("hits", MetricKind::counter(1.0), "A later description.");
+    assert!(!retained.process(&resource, &mut Event::metric(1, AttrMap::new(), hits)));
+    let (body, _addr) = expose_and_fetch(&to_batches(retained.flush(now + 10)), ACCEPT_TEXT).await;
+    assert!(body.contains("hits_total 2"), "the second window's running total, got:\n{body}");
+    assert!(
+        body.contains("# HELP hits_total Requests served."),
+        "the first record's, got:\n{body}"
+    );
 }

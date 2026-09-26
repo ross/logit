@@ -395,6 +395,40 @@ fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
         && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
 }
 
+/// Unions `incoming` into the raw members `held` under `sets: members`: insertion-ordered and
+/// deduplicated by linear scan, which the cap keeps affordable. Once `held` passes `cap`, the scan
+/// stops and every held member plus the rest of `incoming` goes into the returned `HyperLogLog`,
+/// so the union survives the conversion. One oversized record then costs O(cap²) compares and
+/// cap-bounded memory, not its own size squared.
+///
+/// Also returns how many member compares the scan made, so a test can bound the cost without a
+/// clock.
+fn union_members(
+    held: &mut Vec<Bytes>,
+    incoming: &[Bytes],
+    cap: usize,
+) -> (Option<logit_core::HyperLogLog>, usize) {
+    let mut compares = 0;
+    let mut rest = incoming.iter();
+    for m in rest.by_ref() {
+        match held.iter().position(|h| h == m) {
+            Some(i) => compares += i + 1,
+            None => {
+                compares += held.len();
+                held.push(m.clone());
+                if held.len() > cap {
+                    let mut hll = logit_core::HyperLogLog::new();
+                    for m in held.iter().chain(rest) {
+                        hll.insert(m);
+                    }
+                    return (Some(hll), compares);
+                }
+            }
+        }
+    }
+    (None, compares)
+}
+
 /// Adds `samples` to `sketch` value by value at [`Samples::weight`], the fold [`Samples::sketch`]
 /// does, without building a temporary `DdSketch`. Returns how many values were non-finite:
 /// `DdSketch::add_count` drops those, since a `NaN` or infinite observation has no bin.
@@ -783,29 +817,11 @@ impl Aggregator {
                         }
                         true
                     }
-                    // `sets: members`: an insertion-ordered union, deduplicated by linear scan,
-                    // which the cap keeps affordable. The scan stops once the union passes the
-                    // cap: every held member and the rest of the record go into a
-                    // `HyperLogLog`, so the union survives the conversion, and one oversized
-                    // record costs O(cap²) compares and cap-bounded memory, not its own size
-                    // squared.
+                    // `sets: members`: see `union_members`.
                     Accumulator::SetMembers(held) => {
-                        let mut rest = incoming.iter();
-                        let mut overflowed = false;
-                        for m in rest.by_ref() {
-                            if !held.contains(m) {
-                                held.push(m.clone());
-                                if held.len() > max_set_members_per_series {
-                                    overflowed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if overflowed {
-                            let mut hll = logit_core::HyperLogLog::new();
-                            for m in held.iter().chain(rest) {
-                                hll.insert(m);
-                            }
+                        let (overflow, _) =
+                            union_members(held, incoming, max_set_members_per_series);
+                        if let Some(hll) = overflow {
                             state.accumulator = Accumulator::Set(hll);
                             set_members_fallback = true;
                         }
@@ -3878,11 +3894,33 @@ mod tests {
         }
     }
 
-    /// One record far past `max_set_members_per_series` stops the deduplicating scan at the cap
-    /// and streams the rest into the `HyperLogLog`, instead of unioning the whole record first
-    /// (quadratic in the record's own size).
+    /// The union stops scanning at member `cap + 1`: one record of 20 times the cap costs the
+    /// compares of filling the cap once, `(cap + 1)(cap + 2) / 2` at most, not the record's own
+    /// size squared.
     #[test]
-    fn a_set_members_record_past_the_cap_falls_back_without_a_quadratic_union() {
+    fn union_members_converts_at_cap_plus_one_with_bounded_compares() {
+        const CAP: usize = 1000;
+        let members: Vec<Bytes> = (0..20 * CAP).map(|i| Bytes::from(i.to_string())).collect();
+
+        let mut held = Vec::new();
+        let (overflow, compares) = union_members(&mut held, &members[..CAP], CAP);
+        assert!(overflow.is_none(), "cap members fit");
+        assert_eq!(held.len(), CAP);
+
+        let mut held = Vec::new();
+        let (overflow, compares_past_cap) = union_members(&mut held, &members, CAP);
+        let hll = overflow.expect("the record passes the cap");
+        assert!(compares_past_cap <= (CAP + 1) * (CAP + 2) / 2, "{compares_past_cap} compares");
+        assert_eq!(held.len(), CAP + 1, "the scan stops at member cap + 1");
+        assert!(compares <= compares_past_cap);
+        let error = (hll.estimate() as f64 - members.len() as f64).abs() / members.len() as f64;
+        assert!(error < 0.05, "estimate {} for {} members", hll.estimate(), members.len());
+    }
+
+    /// One record far past `max_set_members_per_series` falls back to a `HyperLogLog` holding
+    /// every member, counted once.
+    #[test]
+    fn a_set_members_record_past_the_cap_falls_back_with_every_member() {
         const CAP: usize = 1000;
         const MEMBERS: usize = 20 * CAP;
         let resource = default_resource();
@@ -3891,9 +3929,7 @@ mod tests {
         let mut agg = agg;
         let members: Vec<Bytes> = (0..MEMBERS).map(|i| Bytes::from(i.to_string())).collect();
 
-        let started = std::time::Instant::now();
         feed(&mut agg, &resource, metric_event("u", MetricKind::SetMembers(members), 0));
-        let elapsed = started.elapsed();
 
         let events = registry.drain(0);
         assert_eq!(
@@ -3908,9 +3944,6 @@ mod tests {
             }
             other => panic!("expected a Set, got {other:?}"),
         }
-        // A union of the whole record is about MEMBERS² / 2 = 2e8 compares, about 3 s in a debug
-        // build; stopping at the cap is about CAP² / 2 = 5e5.
-        assert!(elapsed < Duration::from_millis(1500), "absorb took {elapsed:?}");
     }
 }
 

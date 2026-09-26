@@ -8,11 +8,16 @@
 //!   partitions records into series and `(resource, scope)` groups the way that reference does.
 //! - XFORM-02, merge dispatch: [`Model`] restates `process` and a tumbling `flush`, and
 //!   `aggregator_matches_the_reference_model` checks every emitted series, forwarded record, link,
-//!   and counter against it over random batches and flushes. The merge-law properties check
-//!   per-window order independence and a two-stage relay, and the unit tests at the end pin the
-//!   outcomes the ADR lists as order-dependent by design.
+//!   and counter against it over random batches and flushes. Random ops rarely put more than
+//!   eight contexts on one series, so `the_model_caps_links_per_series` drives the link cap
+//!   directly. The merge-law properties check per-window order independence and a two-stage
+//!   relay, and the unit tests at the end pin the outcomes the ADR lists as order-dependent by
+//!   design.
 //!
-//! Retention (XFORM-03, XFORM-04) extends the model where it says `agg/w3`.
+//! Retention isn't modeled: `series_retention` and `max_retained_series` are 0, so every flush is
+//! tumbling. The rules a retention model needs are in `docs/adr/aggregation-window-semantics.md`,
+//! "Amendment: series identity, merge laws, and accounting as a stated contract", under
+//! "Cardinality-cap tie-break" and "Start time after a cap eviction".
 //!
 //! Case counts are floors: a `PROPTEST_CASES` above one raises it for a deeper run.
 
@@ -812,8 +817,8 @@ struct ModelConfig {
 }
 
 impl ModelConfig {
-    // agg/w3: `series_retention` and `max_retained_series` join the config here, with the
-    // retention rules in `Model::flush`. Both are 0 until then.
+    /// An aggregator under this config, with `series_retention` and `max_retained_series` left at
+    /// 0: the model doesn't model retention (see the module doc).
     fn aggregator(&self) -> Aggregator {
         let (distributions, samples_cap) = match self.samples_cap {
             None => (Distributions::Sketch, 1000),
@@ -1074,10 +1079,9 @@ impl Model {
         }
     }
 
-    /// Emits and clears every series, as a tumbling flush does.
+    /// Emits and clears every series, as a tumbling flush does. With retention 0, no series
+    /// survives, a gauge or cumulative-mode `Sum`/`Histogram` included.
     fn flush(&mut self) -> Vec<RefSeries> {
-        // agg/w3: a retainable series (a gauge, or a cumulative-mode `Sum`/`Histogram`) survives
-        // here once the config carries `series_retention`.
         std::mem::take(&mut self.series)
     }
 }
@@ -1643,6 +1647,37 @@ fn laws_input() -> impl Strategy<Value = (ModelConfig, Vec<KindSpec>)> {
     (0..FAMILIES).prop_flat_map(|family| {
         (family_config(family), prop::collection::vec(family_kind(family), 2..=4))
     })
+}
+
+/// Ten distinct contexts on one series in one window: the model and the aggregator both keep the
+/// first eight as links and count two dropped.
+#[test]
+fn the_model_caps_links_per_series() {
+    let gauge = RecordSpec {
+        name: "m0",
+        unit: None,
+        description: None,
+        kind: KindSpec::Plain(MetricKind::Gauge(1.0)),
+        no_recorded_value: false,
+    };
+    let event = EventSpec { timestamp: 0, attributes: 0, records: vec![gauge], log: false };
+    let config = ModelConfig {
+        temporality: AggregateTemporality::Delta,
+        samples_cap: None,
+        members_cap: None,
+    };
+    let mut ops: Vec<ModelOp> = (0..CONTEXTS)
+        .map(|context| ModelOp::Batch {
+            resource: 0,
+            scope: 0,
+            context,
+            events: vec![event.clone()],
+        })
+        .collect();
+    ops.push(ModelOp::Flush);
+    if let Err(e) = run_model(config, &ops) {
+        panic!("{e}");
+    }
 }
 
 proptest! {
