@@ -1,7 +1,8 @@
 # splunk-interop
 
 `script/splunk-interop` checks `splunk_hec_out` and `splunk_hec_in` against a real Splunk
-Enterprise container, then probes that Splunk directly for what
+Enterprise container, or a Splunk Cloud stack in [Splunk Cloud mode](#splunk-cloud-mode), then
+probes that Splunk directly for what
 [`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
 one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a run; the
 plan's "Settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
@@ -48,17 +49,83 @@ Every config passes `logit validate`: `script/validate` and the
 3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60).
 4. Copies every service's log into the run directory and runs `check.py` in a
    `python:3.12-slim` container on the stack's network. `check.py` searches Splunk over REST
-   (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, then runs the
-   probes: gzip, `max_content_length`, the code 6 batch semantics, `metric_type`, the dimension
-   count, `OPTIONS`, acknowledgment, and `[tcpout]` framing.
+   (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, an event
+   search bounded by index time to what arrived after the legs started (`mstats` and `mcatalog`
+   return nothing under that bound, so a metrics query is unbounded), then runs the probes: gzip,
+   `max_content_length`, the HEC endpoint's TLS and `/health`, the body-size cap, the code 6
+   batch semantics, `metric_type`, the dimension count, `OPTIONS` and `Set-Cookie`,
+   acknowledgment, and `[tcpout]` framing.
 5. Tears the project down (`down -v --remove-orphans`) on every exit.
 
-A leg's row is `PASS`, `GAP` (it arrived, with a difference recorded below), or `FAIL`; a probe's
-is `INFO`, what Splunk answered. The script exits 1 on any `FAIL`.
+A leg's row is `PASS`, `GAP` (it arrived, with a difference recorded below), `SENT` (not
+searched, see [Splunk Cloud mode](#splunk-cloud-mode)), `SKIP` (the target can't run it), or
+`FAIL`; a probe's is `INFO`, what Splunk answered, or `SKIP`. The script exits 1 on any `FAIL`.
 
 A run writes `perf/results/splunk-interop/<timestamp>/` (gitignored, or under
-`SPLUNK_INTEROP_OUT`): `results.md` and `results.json`, `provenance.txt` with the image tags,
-`logs/<service>.log`, `replay.log`, `ack-telemetry.log`, and `tcpout/tcpout-000.raw`.
+`SPLUNK_INTEROP_OUT`): `results.md` and `results.json`, `search.spl` with every SPL query the
+legs and probes ran, `provenance.txt` with the target and the image tags, `logs/<service>.log`,
+`replay.log`, `ack-telemetry.log`, and `tcpout/tcpout-000.raw`.
+
+## Splunk Cloud mode
+
+```sh
+SPLUNK_INTEROP_TARGET=cloud script/splunk-interop
+```
+
+runs the same five legs and the same probes against a Splunk Cloud Platform stack. The legs'
+`splunk_hec_out` endpoint, token, and TLS verification come from the environment, which
+`compose.yaml` defaults to the local stack, so no config changes between the two modes. In cloud
+mode the script starts only the `logit-*` legs and `replay`, with `--no-deps`: `splunk`,
+`splunk-init`, and `rawcap` never start, and nothing on the stack is set up for the run.
+
+The stack's details come from an env file, `perf/results/splunk-cloud.env` by default
+(`SPLUNK_INTEROP_CLOUD_ENV` names another). It holds credentials, so the script refuses to run
+unless git ignores it; `perf/results/` is ignored by the repository. One `KEY=value` per line,
+no quotes (`docker run --env-file` keeps them as part of the value). The script also refuses a
+file without `SPLUNK_INTEROP_HEC_URL` or `SPLUNK_INTEROP_HEC_TOKEN`.
+
+| Key | What it is |
+|---|---|
+| `SPLUNK_INTEROP_HEC_URL` | The stack's HEC base URL, ending in `/services/collector`, for example `https://<stack>.splunkcloud.com:8088/services/collector`. Required |
+| `SPLUNK_INTEROP_HEC_URL_ALT` | A second HEC URL for the endpoint probe to compare, such as the stack's `http-inputs-<stack>` host on `:443`. Optional |
+| `SPLUNK_INTEROP_HEC_TOKEN` | A HEC token that may write `main`, and `metrics` and `osnix` for the metrics and relay legs. Required |
+| `SPLUNK_INTEROP_ACK_TOKEN` | A HEC token with indexer acknowledgment on. Empty or absent, the `hec-ack` leg doesn't start and its row and the ack probe are `SKIP` |
+| `SPLUNK_INTEROP_HEC_INSECURE` | `true` turns off certificate verification in the legs, for a trial stack's self-signed HEC certificate. Default `false` |
+| `SPLUNK_INTEROP_SEARCH` | `none` (the default in cloud mode) searches nothing; `rest` searches over the REST API as in local mode |
+| `SPLUNK_INTEROP_API_URL` | The REST API base URL, for `SPLUNK_INTEROP_SEARCH=rest` |
+| `SPLUNK_INTEROP_API_AUTH` | The whole `Authorization` header value for the REST API, `Basic …` or `Bearer …` |
+| `SPLUNK_INTEROP_STACK` | The stack name, scrubbed from the results as `<stack>` |
+
+Under `SPLUNK_INTEROP_SEARCH=none`, a leg whose sink logged no rejection is `SENT` rather than
+`PASS` (for `hec-relay`, also every replayed request answered `2xx`; for `hec-ack`, every request
+acknowledged), and its detail carries the SPL that would confirm it. `search.spl` collects those
+queries and the probes', each under a `# <leg or probe>` comment, for a search pass by hand or in
+a browser afterward: run each over all time, adding `index_earliest` set to the epoch in the
+file's header to a `search` query, since the relay leg's events carry their recorded timestamps.
+The probes still post and record what the stack answered, with `not searched` where they would
+have checked indexing. `max_content_length` needs the REST API and is `SKIP`; `[tcpout]` needs
+the local `rawcap` and is `SKIP` in cloud mode.
+
+The probes that matter most for a stack:
+
+- **Endpoint**: `GET /services/collector/health` with certificate verification on and off, the
+  leaf certificate's subject and issuer, and whether `/health` needs a token, for
+  `SPLUNK_INTEROP_HEC_URL` and `SPLUNK_INTEROP_HEC_URL_ALT`. Over `http://` it records `plain
+  http` and skips the TLS checks.
+- **Body cap**: `/event` bodies of 999,000, 1,000,001, 1,048,577, and 2,000,000 bytes, then two
+  2,000,000-byte bodies gzipped, one incompressible and one compressing to a few KB, each posted
+  once with its status, reply, `Content-Type`, `Retry-After`, and whether it was indexed, or the
+  transport error when the receiver closes the connection before the reply is read. It shows
+  whether a receiver's cap counts the compressed or the uncompressed bytes.
+- **`Set-Cookie`**: the cookie names on an `/event` reply, values redacted: a load balancer in
+  front of HEC can pin a channel's ack polls to one indexer.
+
+A probe that posts to `metrics` records a `400` code 7 when the token may not write that index.
+
+`provenance.txt` records `target: cloud (stack redacted)`. `results.md`, `results.json`, and
+`search.spl` have `SPLUNK_INTEROP_STACK` and every configured token and credential replaced before
+they're written. The services' own logs under `logs/` aren't scrubbed: a sink's diagnostic can
+quote the endpoint URL.
 
 ## Cleanup and a shared daemon
 

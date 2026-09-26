@@ -8,6 +8,11 @@
 #   SPLUNK_INTEROP_OUT    the host run directory, mounted at /out where a service writes files
 #   SPLUNK_INTEROP_IMAGE  the `logit` release image tag
 #
+# The legs' `splunk_hec_out` target comes from `x-logit`'s `environment:`, which defaults to the
+# local `splunk` service below. In Splunk Cloud mode the script passes the operator's env file as
+# a second `--env-file`, which overrides those defaults, and starts only the `logit-*` legs and
+# `replay` with `--no-deps`: `splunk`, `splunk-init`, and `rawcap` never start.
+#
 # Nothing binds a host port: the harness queries Splunk from a container on this network. No
 # `container_name`, so a second stack under another project name can't collide with this one.
 #
@@ -26,6 +31,11 @@ networks:
 
 x-logit: &logit
   image: ${SPLUNK_INTEROP_IMAGE:-logit:splunk-interop}
+  environment:
+    SPLUNK_INTEROP_HEC_URL: ${SPLUNK_INTEROP_HEC_URL:-http://splunk:8088/services/collector}
+    SPLUNK_INTEROP_HEC_TOKEN: ${SPLUNK_INTEROP_HEC_TOKEN:-11111111-1111-1111-1111-111111111111}
+    SPLUNK_INTEROP_ACK_TOKEN: ${SPLUNK_INTEROP_ACK_TOKEN:-22222222-2222-2222-2222-222222222222}
+    SPLUNK_INTEROP_HEC_INSECURE: ${SPLUNK_INTEROP_HEC_INSECURE:-false}
   depends_on:
     splunk-init:
       condition: service_completed_successfully

@@ -12,6 +12,10 @@
 #   SPLUNK_INTEROP_WINDOW=60      seconds the legs run before Splunk is queried
 #   SPLUNK_INTEROP_SKIP_IMAGE=1   reuse the existing logit:splunk-interop image
 #   SPLUNK_INTEROP_OUT=<dir>      where run directories go (default perf/results/splunk-interop)
+#   SPLUNK_INTEROP_TARGET=cloud   run the legs against a Splunk Cloud stack instead of a local
+#                                 container (default `local`); see the README's "Splunk Cloud mode"
+#   SPLUNK_INTEROP_CLOUD_ENV=<f>  cloud mode's env file: the stack's HEC URL and tokens (default
+#                                 perf/results/splunk-cloud.env); it must be git-ignored
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -25,6 +29,39 @@ NETWORK="splunk-interop-net"
 IMAGE="logit:splunk-interop"
 PYTHON_IMAGE="python:3.12-slim"
 WINDOW="${SPLUNK_INTEROP_WINDOW:-60}"
+TARGET="${SPLUNK_INTEROP_TARGET:-local}"
+CLOUD_ENV="${SPLUNK_INTEROP_CLOUD_ENV:-${ROOT}/perf/results/splunk-cloud.env}"
+
+# The last value an env file gives `key`, empty if it gives none.
+env_value() {
+    sed -n "s/^${2}=//p" "${1}" | tail -n 1
+}
+
+case "${TARGET}" in
+local) ;;
+cloud)
+    if [ ! -f "${CLOUD_ENV}" ]; then
+        echo "splunk-interop: cloud mode needs ${CLOUD_ENV} (set SPLUNK_INTEROP_CLOUD_ENV)" >&2
+        exit 1
+    fi
+    CLOUD_ENV="$(readlink -f -- "${CLOUD_ENV}")"
+    # The file holds the stack's HEC tokens, so it must be one git would never commit.
+    if ! git -C "${ROOT}" check-ignore -q "${CLOUD_ENV}"; then
+        echo "splunk-interop: ${CLOUD_ENV} is not git-ignored; keep credentials under perf/results/" >&2
+        exit 1
+    fi
+    for key in SPLUNK_INTEROP_HEC_URL SPLUNK_INTEROP_HEC_TOKEN; do
+        if [ -z "$(env_value "${CLOUD_ENV}" "${key}")" ]; then
+            echo "splunk-interop: ${CLOUD_ENV} does not set ${key}" >&2
+            exit 1
+        fi
+    done
+    ;;
+*)
+    echo "splunk-interop: SPLUNK_INTEROP_TARGET must be local or cloud, got '${TARGET}'" >&2
+    exit 1
+    ;;
+esac
 
 RUN_DIR="${SPLUNK_INTEROP_OUT:-${ROOT}/perf/results/splunk-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "${RUN_DIR}/logs"
@@ -33,16 +70,26 @@ mkdir -p "${RUN_DIR}/logs"
 chmod 777 "${RUN_DIR}"
 
 # `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
-# `sudo docker` by default.
+# `sudo docker` by default. The leg variables are compose.yaml's local defaults, written here too
+# so `logit validate` below sees the same values; in cloud mode the cloud env file comes second in
+# every `--env-file` list and overrides them.
 ENV_FILE="${RUN_DIR}/compose.env"
 {
     echo "SPLUNK_INTEROP_OUT=${RUN_DIR}"
     echo "SPLUNK_INTEROP_IMAGE=${IMAGE}"
+    echo "SPLUNK_INTEROP_HEC_URL=http://splunk:8088/services/collector"
+    echo "SPLUNK_INTEROP_HEC_TOKEN=11111111-1111-1111-1111-111111111111"
+    echo "SPLUNK_INTEROP_ACK_TOKEN=22222222-2222-2222-2222-222222222222"
+    echo "SPLUNK_INTEROP_HEC_INSECURE=false"
 } >"${ENV_FILE}"
+ENV_FILES=(--env-file "${ENV_FILE}")
+if [ "${TARGET}" = cloud ]; then
+    ENV_FILES+=(--env-file "${CLOUD_ENV}")
+fi
 
 si_compose() {
     ${DOCKER} compose --progress quiet -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" \
-        --env-file "${ENV_FILE}" "$@"
+        "${ENV_FILES[@]}" "$@"
 }
 
 STARTED=0
@@ -58,8 +105,12 @@ cleanup() {
 }
 
 collect_logs() {
-    local service
-    for service in $(si_compose config --services); do
+    local service services=(config --services)
+    # Cloud mode starts only some services; an empty log for one that never ran would mislead.
+    if [ "${TARGET}" = cloud ]; then
+        services=(ps -a --services)
+    fi
+    for service in $(si_compose "${services[@]}"); do
         si_compose logs --no-color --no-log-prefix "${service}" >"${RUN_DIR}/logs/${service}.log" 2>&1 || true
     done
 }
@@ -83,8 +134,22 @@ else
     ${DOCKER} build -q -f "${ROOT}/Dockerfile" -t "${IMAGE}" "${ROOT}" >/dev/null
 fi
 
+legs=()
 for config in "${TOOLS_DIR}"/logit-*.yaml; do
-    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${IMAGE}" validate /config.yaml >/dev/null || {
+    leg="$(basename "${config}" .yaml)"
+    # A stack without a `useACK` token runs no ack leg, and its config, with an empty token,
+    # wouldn't validate.
+    if [ "${TARGET}" = cloud ] && [ "${leg}" = logit-hec-ack ] &&
+        [ -z "$(env_value "${CLOUD_ENV}" SPLUNK_INTEROP_ACK_TOKEN)" ]; then
+        continue
+    fi
+    legs+=("${leg}")
+done
+
+for leg in "${legs[@]}"; do
+    config="${TOOLS_DIR}/${leg}.yaml"
+    ${DOCKER} run --rm "${ENV_FILES[@]}" -v "${config}:/config.yaml:ro,z" "${IMAGE}" \
+        validate /config.yaml >/dev/null || {
         echo "splunk-interop: ${config} failed 'logit validate'" >&2
         exit 1
     }
@@ -92,20 +157,30 @@ done
 
 trap cleanup EXIT
 STARTED=1
-echo "splunk-interop: starting the stack (run directory ${RUN_DIR}); Splunk takes a few minutes"
-# `--wait` holds until Splunk's and every `logit` service's health check passes; `splunk-init`,
-# a one-shot, has finished by then, since every `logit` service waits on it. `replay` exits once
-# it has posted, so it starts after the wait.
-legs=()
-for config in "${TOOLS_DIR}"/logit-*.yaml; do
-    legs+=("$(basename "${config}" .yaml)")
-done
-si_compose up -d --wait --wait-timeout 900 splunk rawcap "${legs[@]}" >/dev/null
-si_compose up -d replay >/dev/null
+# check.py searches from here on, so a stack that keeps earlier runs' data doesn't match them.
+SINCE="$(date +%s)"
+if [ "${TARGET}" = cloud ]; then
+    echo "splunk-interop: starting the legs against Splunk Cloud (run directory ${RUN_DIR})"
+    # `--no-deps`: `splunk`, `splunk-init`, and `rawcap` are the local stack's, and never start.
+    si_compose up -d --wait --wait-timeout 300 --no-deps "${legs[@]}" >/dev/null
+    si_compose up -d --no-deps replay >/dev/null
+else
+    echo "splunk-interop: starting the stack (run directory ${RUN_DIR}); Splunk takes a few minutes"
+    # `--wait` holds until Splunk's and every `logit` service's health check passes; `splunk-init`,
+    # a one-shot, has finished by then, since every `logit` service waits on it. `replay` exits
+    # once it has posted, so it starts after the wait.
+    si_compose up -d --wait --wait-timeout 900 splunk rawcap "${legs[@]}" >/dev/null
+    si_compose up -d replay >/dev/null
+fi
 
 {
     echo "splunk-interop provenance"
     echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "${TARGET}" = cloud ]; then
+        echo "target: cloud (stack redacted)"
+    else
+        echo "target: local"
+    fi
     echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
     echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     si_compose images 2>/dev/null
@@ -117,7 +192,13 @@ sleep "${WINDOW}"
 collect_logs
 echo "splunk-interop: querying Splunk"
 status=0
-${DOCKER} run --rm --network "${NETWORK}" \
+check_env=(-e "SPLUNK_INTEROP_TARGET=${TARGET}" -e "SPLUNK_INTEROP_SINCE=${SINCE}")
+if [ "${TARGET}" = cloud ]; then
+    check_env+=(--env-file "${CLOUD_ENV}")
+fi
+# On the stack's network in both modes: locally it reaches `splunk` there, and in cloud mode it
+# reaches the stack through the same bridge the legs use.
+${DOCKER} run --rm --network "${NETWORK}" "${check_env[@]}" \
     -v "${TOOLS_DIR}:/tools:ro,z" \
     -v "${RUN_DIR}:/out:z" \
     "${PYTHON_IMAGE}" python3 /tools/check.py || status=$?

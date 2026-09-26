@@ -2,25 +2,37 @@
 """Confirms each leg of `script/splunk-interop` against Splunk, then probes Splunk directly.
 
 Runs in a throwaway `python:3.12-slim` container on the stack's network, stdlib only, after the
-harness has held the stack up for its window and copied every service's log into the run
+harness has held the legs up for its window and copied every service's log into the run
 directory. Mounts:
 
     /out  the run directory: logs/<service>.log, replay.log, ack-telemetry.log, tcpout/;
-          results.md and results.json land here
+          results.md, results.json, and search.spl land here
 
-Searches go through Splunk's REST API on :8089 (`/services/search/jobs/export`, `output_mode=json`)
-as admin; the probes post to HEC on :8088. A leg is PASS (Splunk holds what the leg sent, in the
-shape docs/plans/splunk-relay.md expects), GAP (it arrived, with a difference the README records),
-or FAIL. A probe row is INFO: what Splunk answered, recorded for the plan. Exits 1 on any FAIL.
+The target comes from the environment, defaulting to the local stack (the README's "Splunk Cloud
+mode" lists the variables): `SPLUNK_INTEROP_TARGET` is `local` or `cloud`, the probes post to
+HEC at `SPLUNK_INTEROP_HEC_URL`, and `SPLUNK_INTEROP_SEARCH` picks how a leg is confirmed.
+`rest` searches Splunk's REST API (`/services/search/jobs/export`, `output_mode=json`) with
+`SPLUNK_INTEROP_API_AUTH`; `none`, cloud mode's default, searches nothing. An event search is
+bounded by index time to `SPLUNK_INTEROP_SINCE` rather than by event time, since the relay leg's
+recorded events carry their recorded timestamps; an `mstats` or `mcatalog` query is unbounded.
+
+A leg is PASS (Splunk holds what the leg sent, in the shape docs/plans/splunk-relay.md expects),
+GAP (it arrived, with a difference the README records), SENT (under `none`: the sink logged no
+rejection, and the row carries the SPL that would confirm it), SKIP (the target can't run it),
+or FAIL. A probe row is INFO, what Splunk answered, or SKIP. Every SPL query a leg or probe runs,
+or would run, lands in search.spl for a manual search pass. results.md, results.json, and
+search.spl have `SPLUNK_INTEROP_STACK` and the configured tokens scrubbed. Exits 1 on any FAIL.
 """
 
 import base64
 import gzip
 import json
+import os
 import pathlib
 import re
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -28,17 +40,70 @@ import urllib.request
 import uuid
 import zlib
 
-HEC = "http://splunk:8088"
-API = "https://splunk:8089"
-TOKEN = "11111111-1111-1111-1111-111111111111"
-ACK_TOKEN = "22222222-2222-2222-2222-222222222222"
+TARGET = os.environ.get("SPLUNK_INTEROP_TARGET", "local")
+LOCAL = TARGET == "local"
+
+
+def setting(name, local_default):
+    """`name` from the environment; unset, the local stack's value, or empty in cloud mode."""
+    value = os.environ.get(name)
+    if value is None:
+        return local_default if LOCAL else ""
+    return value
+
+
+HEC_URL = setting("SPLUNK_INTEROP_HEC_URL", "http://splunk:8088/services/collector")
+HEC_URL_ALT = os.environ.get("SPLUNK_INTEROP_HEC_URL_ALT", "")
+
+
+def hec_base(url):
+    """A HEC URL without its trailing `/services/collector`: the probes append whole routes."""
+    return re.sub(r"/services/collector$", "", url.rstrip("/"))
+
+
+HEC = hec_base(HEC_URL)
+API = setting("SPLUNK_INTEROP_API_URL", "https://splunk:8089")
+TOKEN = setting("SPLUNK_INTEROP_HEC_TOKEN", "11111111-1111-1111-1111-111111111111")
+ACK_TOKEN = setting("SPLUNK_INTEROP_ACK_TOKEN", "22222222-2222-2222-2222-222222222222")
 TCPOUT_TOKEN = "44444444-4444-4444-4444-444444444444"
-ADMIN = "Basic " + base64.b64encode(b"admin:logit-splunk-interop").decode()
-# Splunk's management port serves a self-signed certificate.
+ADMIN = setting("SPLUNK_INTEROP_API_AUTH", "Basic " + base64.b64encode(b"admin:logit-splunk-interop").decode())
+SEARCH = os.environ.get("SPLUNK_INTEROP_SEARCH", "rest" if LOCAL else "none")
+SINCE = os.environ.get("SPLUNK_INTEROP_SINCE", "0")
+STACK = os.environ.get("SPLUNK_INTEROP_STACK", "")
+# Splunk's management port serves a self-signed certificate, and so does a trial stack's HEC.
 INSECURE = ssl._create_unverified_context()
 
 OUT = pathlib.Path("/out")
 RUN = f"r{int(time.time())}"
+
+#: What `indexed()` and the probes' searches return under `SPLUNK_INTEROP_SEARCH=none`.
+NOT_SEARCHED = "not searched"
+
+
+class SearchUnavailable(Exception):
+    """`SPLUNK_INTEROP_SEARCH=none`: there is no search transport to confirm a leg with."""
+
+
+#: (leg or probe, SPL) for search.spl, in the order they ran, without repeats.
+SPL = []
+#: The leg or probe running now, which `search()` files its query under.
+CURRENT = ["main"]
+
+
+def record_spl(query, label=None):
+    entry = (label or CURRENT[0], query)
+    if entry not in SPL:
+        SPL.append(entry)
+
+
+def scrub(text):
+    """`text` without the stack name or any configured credential."""
+    if STACK:
+        text = text.replace(STACK, "<stack>")
+    for secret in (TOKEN, ACK_TOKEN, TCPOUT_TOKEN, ADMIN):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text
 
 
 # ---- HTTP ---------------------------------------------------------------------------------------
@@ -49,14 +114,18 @@ def request(method, url, body=None, headers=None):
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=30, context=INSECURE) as response:
-            return response.status, dict(response.headers), response.read().decode(errors="replace")
+            return response.status, response.headers, response.read().decode(errors="replace")
     except urllib.error.HTTPError as err:
-        return err.code, dict(err.headers), err.read().decode(errors="replace")
+        return err.code, err.headers, err.read().decode(errors="replace")
+
+
+def hec_full(path, body, token=TOKEN, headers=None):
+    all_headers = {"Authorization": f"Splunk {token}", **(headers or {})}
+    return request("POST", HEC + path, body, all_headers)
 
 
 def hec(path, body, token=TOKEN, headers=None):
-    all_headers = {"Authorization": f"Splunk {token}", **(headers or {})}
-    status, _, text = request("POST", HEC + path, body, all_headers)
+    status, _, text = hec_full(path, body, token, headers)
     return status, text
 
 
@@ -64,9 +133,31 @@ def objects(*objs):
     return "".join(json.dumps(o) for o in objs).encode()
 
 
+def index_refused(text):
+    """Whether a HEC reply is code 7, an index the token may not write (a trial may lack it)."""
+    try:
+        return json.loads(text).get("code") == 7
+    except (ValueError, AttributeError):
+        return False
+
+
+#: The generating commands `search()` leaves without an index-time bound.
+METRIC_COMMANDS = ("| mstats", "| mcatalog")
+
+
 def search(query):
-    """Result rows of one export search over all time."""
-    body = urllib.parse.urlencode({"search": query, "output_mode": "json", "earliest_time": "0"})
+    """Result rows of one export search over everything indexed since `SINCE`."""
+    record_spl(query)
+    if SEARCH == "none":
+        raise SearchUnavailable(query)
+    if not API:
+        raise RuntimeError("SPLUNK_INTEROP_SEARCH=rest needs SPLUNK_INTEROP_API_URL")
+    params = {"search": query, "output_mode": "json", "earliest_time": "0"}
+    # `index_earliest` empties an `mstats` or `mcatalog` result on Splunk 10.4.3, so a metrics
+    # query stays unbounded and can match an earlier run's series.
+    if not query.startswith(METRIC_COMMANDS):
+        params["index_earliest"] = SINCE
+    body = urllib.parse.urlencode(params)
     status, _, text = request("POST", API + "/services/search/jobs/export", body.encode(),
                               {"Authorization": ADMIN})
     if status != 200:
@@ -90,7 +181,17 @@ def search_until(query, enough, timeout=60):
         time.sleep(3)
 
 
+def try_search(query, enough=None, timeout=30):
+    """`search`, or `search_until` given `enough`, but `NOT_SEARCHED` under `none`."""
+    try:
+        return search(query) if enough is None else search_until(query, enough, timeout)
+    except SearchUnavailable:
+        return NOT_SEARCHED
+
+
 def rest_json(path):
+    if SEARCH == "none":
+        raise SearchUnavailable(path)
     status, _, text = request("GET", f"{API}{path}?output_mode=json", None, {"Authorization": ADMIN})
     return json.loads(text) if status == 200 else {}
 
@@ -143,19 +244,46 @@ def rejections(service):
     return [line for line in lines if re.search(r"request_rejected|token_rejected|send_failed", line)]
 
 
+def replay_lines():
+    path = OUT / "replay.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
 # ---- legs ---------------------------------------------------------------------------------------
+
+LOGS_EVENT = ('search index=main sourcetype="logit:test" | head 1 | table _raw host source'
+              ' otel.log.severity.text otel.log.severity.number trace_id span_id detail.stage detail.ok leg')
+LOGS_TSTATS = '| tstats count where index=main sourcetype="logit:test" by detail.stage, otel.log.severity.number'
+METRICS_SERIES = '| mstats latest(_value) as v where index=metrics metric_name="splunk_interop.*" by metric_name'
+METRICS_TYPES = '| mcatalog values(metric_type) as t where index=metrics metric_name="splunk_interop.*"'
+METRICS_BY_TYPE = '| mstats count(_value) as n where index=metrics metric_name="splunk_interop.*" by metric_type'
+METRICS_BUCKETS = ('| mstats max(_value) as c where index=metrics metric_name="splunk_interop.histogram_bucket"'
+                   ' by le')
+METRICS_PERC = METRICS_BUCKETS + ' | `histperc(0.5, c, le)`'
+SPANS_EVENT = 'search index=main sourcetype="logit:span" | head 1 | spath | table *'
+ACK_COUNT = 'search index=main sourcetype="logit:ack" | stats count'
+RELAY_METRICS = '| mstats latest(_value) where index=metrics metric_name="gen*" by metric_name'
+
+#: What the relay leg must put in Splunk from each recorded producer: (label, search, minimum).
+RELAY_EXPECTED = [
+    ("docker driver", 'search index=main host="splunk-docker-fixture" | stats count', 6),
+    ("java appender", 'search index=main source="java:logback" | stats count', 9),
+    ("sc4s lines", 'search index=osnix sourcetype="nix:syslog" host="sc4s-fixture-host" | stats count', 3),
+    ("sc4s own events", 'search index=main sourcetype="sc4s:*" | stats count', 4),
+    ("otel logs", 'search index=main sourcetype="otel:logs" | stats count', 3),
+    ("otel raw", 'search index=main "the message" NOT sourcetype="otel:logs" | stats count', 3),
+    ("otel spans", 'search index=main sourcetype="otel:traces" | stats count', 6),
+]
 
 
 def leg_logs():
-    rows = search_until('search index=main sourcetype="logit:test" | head 1 | table _raw host source'
-                        ' otel.log.severity.text otel.log.severity.number trace_id span_id detail.stage detail.ok leg',
-                        lambda r: len(r) >= 1)
+    rows = search_until(LOGS_EVENT, lambda r: len(r) >= 1)
     if not rows:
         return "FAIL", "no sourcetype=logit:test events in main"
     row = rows[0]
     fields = {k: row.get(k) for k in ("host", "source", "otel.log.severity.text", "otel.log.severity.number",
                                       "trace_id", "span_id", "detail.stage", "detail.ok", "leg")}
-    indexed = search('| tstats count where index=main sourcetype="logit:test" by detail.stage, otel.log.severity.number')
+    indexed = search(LOGS_TSTATS)
     problems = [k for k, v in fields.items() if v in (None, "")]
     if rejections("logit-hec-logs"):
         problems.append(f"sink logged {len(rejections('logit-hec-logs'))} rejection(s)")
@@ -166,7 +294,7 @@ def leg_logs():
 
 
 def leg_metrics():
-    rows = search_until('| mstats latest(_value) as v where index=metrics metric_name="splunk_interop.*" by metric_name',
+    rows = search_until(METRICS_SERIES,
                         lambda r: any(x["metric_name"].startswith("splunk_interop.distribution") for x in r), 90)
     names = sorted(r["metric_name"] for r in rows)
     want = [
@@ -181,11 +309,10 @@ def leg_metrics():
     problems = [f"missing {missing}"] if missing else []
     if any("exphist" in n for n in names):
         problems.append("an exponential histogram reached Splunk")
-    types = search('| mcatalog values(metric_type) as t where index=metrics metric_name="splunk_interop.*"')
-    by_type = search('| mstats count(_value) as n where index=metrics metric_name="splunk_interop.*" by metric_type')
-    buckets = search('| mstats max(_value) as c where index=metrics metric_name="splunk_interop.histogram_bucket" by le')
-    perc = search('| mstats max(_value) as c where index=metrics metric_name="splunk_interop.histogram_bucket" by le'
-                  ' | `histperc(0.5, c, le)`')
+    types = search(METRICS_TYPES)
+    by_type = search(METRICS_BY_TYPE)
+    buckets = search(METRICS_BUCKETS)
+    perc = search(METRICS_PERC)
     if rejections("logit-hec-metrics"):
         problems.append(f"sink logged {len(rejections('logit-hec-metrics'))} rejection(s)")
     detail = (f"{len(names)} series: {names}; metric_type values {types[:1]}; count by metric_type "
@@ -195,7 +322,7 @@ def leg_metrics():
 
 
 def leg_spans():
-    rows = search_until('search index=main sourcetype="logit:span" | head 1 | spath | table *', lambda r: len(r) >= 1)
+    rows = search_until(SPANS_EVENT, lambda r: len(r) >= 1)
     if not rows:
         return "FAIL", "no sourcetype=logit:span events in main"
     # Splunk extracts the JSON `event` itself and `spath` extracts it again: one value each.
@@ -209,34 +336,26 @@ def leg_spans():
 
 
 def leg_ack():
+    if not ACK_TOKEN:
+        return "SKIP", "no SPLUNK_INTEROP_ACK_TOKEN: the leg didn't run"
     telemetry = rendered_events(OUT / "ack-telemetry.log")
     acked = telemetry_sum(telemetry, "logit.output.acks", result="acked")
     timeout = telemetry_sum(telemetry, "logit.output.acks", result="timeout")
     unsupported = telemetry_sum(telemetry, "logit.output.acks", result="unsupported")
     polls = telemetry_sum(telemetry, "logit.output.requests", route="ack")
-    rows = search('search index=main sourcetype="logit:ack" | stats count')
+    acks = f"acks acked={acked} timeout={timeout} unsupported={unsupported}; {polls} /ack polls"
+    confirmed = acked >= 1 and timeout == 0 and unsupported == 0
+    try:
+        rows = search(ACK_COUNT)
+    except SearchUnavailable:
+        return ("SENT" if confirmed else "FAIL"), f"{acks}; not searched: {ACK_COUNT}"
     count = int(rows[0]["count"]) if rows else 0
-    detail = (f"acks acked={acked} timeout={timeout} unsupported={unsupported}; {polls} /ack polls; "
-              f"{count} events indexed")
-    if acked >= 1 and timeout == 0 and unsupported == 0 and count >= 1:
-        return "PASS", detail
-    return "FAIL", detail
-
-
-#: What the relay leg must put in Splunk from each recorded producer: (label, search, minimum).
-RELAY_EXPECTED = [
-    ("docker driver", 'search index=main host="splunk-docker-fixture" | stats count', 6),
-    ("java appender", 'search index=main source="java:logback" | stats count', 9),
-    ("sc4s lines", 'search index=osnix sourcetype="nix:syslog" host="sc4s-fixture-host" | stats count', 3),
-    ("sc4s own events", 'search index=main sourcetype="sc4s:*" | stats count', 4),
-    ("otel logs", 'search index=main sourcetype="otel:logs" | stats count', 3),
-    ("otel raw", 'search index=main "the message" NOT sourcetype="otel:logs" | stats count', 3),
-    ("otel spans", 'search index=main sourcetype="otel:traces" | stats count', 6),
-]
+    detail = f"{acks}; {count} events indexed"
+    return ("PASS" if confirmed and count >= 1 else "FAIL"), detail
 
 
 def leg_relay():
-    replay = (OUT / "replay.log").read_text().splitlines() if (OUT / "replay.log").exists() else []
+    replay = replay_lines()
     bad = [line for line in replay if not line.startswith("2")]
     problems = [] if replay else ["replay.log is missing"]
     if bad:
@@ -247,7 +366,7 @@ def leg_relay():
         counts[label] = int(rows[0]["count"]) if rows else 0
         if counts[label] < least:
             problems.append(f"{label}: {counts[label]} < {least}")
-    metrics = search('| mstats latest(_value) where index=metrics metric_name="gen*" by metric_name')
+    metrics = search(RELAY_METRICS)
     names = sorted(r["metric_name"] for r in metrics)
     if not {"gen", "gen_sum", "gen_count", "gen_bucket"} <= set(names):
         problems.append(f"otel metrics: {names}")
@@ -257,24 +376,55 @@ def leg_relay():
     return ("FAIL" if problems else "PASS"), "; ".join(problems + [detail])
 
 
+#: (leg, what it sends, check, its logit service, the SPL that confirms it).
 LEGS = [
-    ("hec-logs", "structured logs -> splunk_hec_out -> main", leg_logs),
-    ("hec-metrics", "every metric kind, multi_value: expand -> metrics", leg_metrics),
-    ("hec-spans", "a span -> splunk_hec_out -> main", leg_spans),
-    ("hec-ack", "logs on a useACK token, ack: true", leg_ack),
-    ("hec-relay", "recorded captures -> splunk_hec_in -> splunk_hec_out -> Splunk", leg_relay),
+    ("hec-logs", "structured logs -> splunk_hec_out -> main", leg_logs, "logit-hec-logs",
+     [LOGS_EVENT, LOGS_TSTATS]),
+    ("hec-metrics", "every metric kind, multi_value: expand -> metrics", leg_metrics, "logit-hec-metrics",
+     [METRICS_SERIES, METRICS_TYPES, METRICS_BY_TYPE, METRICS_BUCKETS, METRICS_PERC]),
+    ("hec-spans", "a span -> splunk_hec_out -> main", leg_spans, "logit-hec-spans", [SPANS_EVENT]),
+    ("hec-ack", "logs on a useACK token, ack: true", leg_ack, "logit-hec-ack", [ACK_COUNT]),
+    ("hec-relay", "recorded captures -> splunk_hec_in -> splunk_hec_out -> Splunk", leg_relay, "logit-hec-relay",
+     [query for _, query, _ in RELAY_EXPECTED] + [RELAY_METRICS]),
 ]
+
+
+def sent(service, queries):
+    """A leg's row when nothing can search: SENT if its sink logged no rejection, else FAIL."""
+    problems, facts = [], ["no rejection in the sink's log"]
+    if not log(service).strip():
+        problems.append(f"no log from {service}")
+    refused = rejections(service)
+    if refused:
+        problems.append(f"sink logged {len(refused)} rejection(s), the first: {refused[0].strip()[:300]}")
+    if service == "logit-hec-relay":
+        replay = replay_lines()
+        bad = [line for line in replay if not line.startswith("2")]
+        if not replay:
+            problems.append("replay.log is missing")
+        elif bad:
+            problems.append(f"non-2xx replies: {bad}")
+        else:
+            facts.append(f"all {len(replay)} replayed requests 2xx")
+    would = " || ".join(queries)
+    if problems:
+        return "FAIL", "; ".join(problems + [f"would search: {would}"])
+    return "SENT", "; ".join(facts + [f"not searched: {would}"])
 
 
 # ---- probes -------------------------------------------------------------------------------------
 
 
 def indexed(markers, index="main", wait=30):
-    """Which of `markers` Splunk indexed, polled for `wait` seconds."""
+    """Which of `markers` Splunk indexed, polled for `wait` seconds; `NOT_SEARCHED` under `none`."""
     query = f'search index={index} ({" OR ".join(chr(34) + m + chr(34) for m in markers)}) | table _raw'
     deadline = time.monotonic() + wait
     while True:
-        raws = [r.get("_raw", "") for r in search(query)]
+        try:
+            rows = search(query)
+        except SearchUnavailable:
+            return NOT_SEARCHED
+        raws = [r.get("_raw", "") for r in rows]
         found = [m for m in markers if any(m in raw for raw in raws)]
         if len(found) == len(markers) or time.monotonic() > deadline:
             return found
@@ -282,12 +432,92 @@ def indexed(markers, index="main", wait=30):
 
 
 def probe_version():
+    if SEARCH == "none":
+        return [("version and max_content_length", "SKIP", "no REST API (SPLUNK_INTEROP_SEARCH=none)")]
     info = rest_json("/services/server/info")
     version = info.get("entry", [{}])[0].get("content", {}).get("version")
     limits = rest_json("/services/configs/conf-limits/http_input")
     content = limits.get("entry", [{}])[0].get("content", {})
     return [("version and max_content_length", "INFO",
              f"Splunk {version}; limits.conf [http_input] max_content_length={content.get('max_content_length')}")]
+
+
+def certificate(host, port):
+    """The leaf certificate's subject and issuer common names, fetched without verifying it."""
+    pem = ssl.get_server_certificate((host, port), timeout=15)
+    with tempfile.NamedTemporaryFile("w", suffix=".pem") as file:
+        file.write(pem)
+        file.flush()
+        decoded = ssl._ssl._test_decode_cert(file.name)
+    name = lambda rdns: ", ".join(f"{k}={v}" for rdn in rdns for k, v in rdn if k in ("commonName", "organizationName"))
+    return f"subject {name(decoded.get('subject', ()))!r}, issuer {name(decoded.get('issuer', ()))!r}"
+
+
+def endpoint_row(label, url):
+    base = hec_base(url)
+    health = base + "/services/collector/health"
+    parsed = urllib.parse.urlsplit(base)
+    status, _, body = request("GET", health)
+    with_token, _, _ = request("GET", health, None, {"Authorization": f"Splunk {TOKEN}"})
+    facts = [f"/health without a token -> {status} {body[:120]!r}, with the token -> {with_token}"]
+    if parsed.scheme != "https":
+        return (f"endpoint {label}", "INFO", "plain http; " + facts[0])
+    try:
+        req = urllib.request.Request(health, method="GET")
+        with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context()) as response:
+            verified = f"verified TLS succeeded ({response.status})"
+    except urllib.error.HTTPError as err:
+        verified = f"verified TLS succeeded ({err.code})"
+    except (ssl.SSLError, urllib.error.URLError) as err:
+        verified = f"verified TLS failed: {getattr(err, 'reason', err)}"
+    try:
+        cert = certificate(parsed.hostname, parsed.port or 443)
+    except (OSError, ssl.SSLError) as err:
+        cert = f"certificate unreadable: {type(err).__name__}: {err}"
+    return (f"endpoint {label}", "INFO", f"{verified}; unverified -> {status}; {cert}; " + facts[0])
+
+
+def probe_endpoint():
+    rows = [endpoint_row("SPLUNK_INTEROP_HEC_URL", HEC_URL)]
+    if HEC_URL_ALT:
+        rows.append(endpoint_row("SPLUNK_INTEROP_HEC_URL_ALT", HEC_URL_ALT))
+    return rows
+
+
+def sized_event(marker, size):
+    """One `/event` object of `size` bytes: `marker`, then padding."""
+    skeleton = len(json.dumps({"event": marker + " "}))
+    return json.dumps({"event": marker + " " + "x" * (size - skeleton)}).encode()
+
+
+def probe_body_cap():
+    cases = []
+    for size in (999_000, 1_000_001, 1_048_577, 2_000_000):
+        m = f"{RUN}-cap{size}"
+        cases.append((f"{size:,} bytes uncompressed", m, sized_event(m, size), {}))
+    m = f"{RUN}-capgzr"
+    noise = base64.b64encode(os.urandom(1_500_000)).decode()
+    body = json.dumps({"event": f"{m} {noise}"}).encode()[:2_000_000 - 2] + b'"}'
+    cases.append(("2,000,000 bytes incompressible, gzip", m, gzip.compress(body), {"Content-Encoding": "gzip"}))
+    m = f"{RUN}-capgzc"
+    cases.append(("2,000,000 bytes compressible, gzip", m, gzip.compress(sized_event(m, 2_000_000)),
+                  {"Content-Encoding": "gzip"}))
+    rows, replies = [], []
+    for label, marker, payload, headers in cases:
+        try:
+            status, reply, text = hec_full("/services/collector/event", payload, headers=headers)
+            answer = (f"{status} {text[:200]!r}; Content-Type={reply.get('Content-Type')!r} "
+                      f"Retry-After={reply.get('Retry-After')!r}")
+        # A receiver that refuses a body mid-upload can close the connection before the client
+        # reads its reply.
+        except OSError as err:
+            answer = f"no reply: {type(err).__name__}: {getattr(err, 'reason', err)}"
+        replies.append((label, marker, len(payload), answer))
+    found = indexed([marker for _, marker, *_ in replies], wait=60)
+    for label, marker, sent_bytes, answer in replies:
+        seen = found if found == NOT_SEARCHED else ("indexed" if marker in found else "not indexed")
+        rows.append((f"body cap, {label}", "INFO", f"{sent_bytes:,} bytes on the wire -> {answer}; {seen}"))
+    return rows
 
 
 def probe_gzip():
@@ -326,15 +556,20 @@ def probe_code6():
         m = f"{RUN}-c{i}"
         status, text = hec("/services/collector/event", body(m))
         found = indexed([f"{m}-a", f"{m}-b", f"{m}-c"], wait=30)
-        rows.append((f"batch with {label}", "INFO", f"{status} {text}; indexed {[f.rsplit('-', 1)[1] for f in found]}"))
+        seen = found if found == NOT_SEARCHED else [f.rsplit("-", 1)[1] for f in found]
+        rows.append((f"batch with {label}", "INFO", f"{status} {text}; indexed {seen}"))
     return rows
 
 
 def probe_metrics():
     rows = []
     m = f"{RUN}-mt"
-    hec("/services/collector/event", objects({"event": "metric", "index": "metrics",
-                                              "fields": {"probe": m, "metric_name:probe.mtype": 3, "metric_type": "Sum"}}))
+    mtype = hec("/services/collector/event", objects({"event": "metric", "index": "metrics",
+                                                      "fields": {"probe": m, "metric_name:probe.mtype": 3,
+                                                                 "metric_type": "Sum"}}))
+    if index_refused(mtype[1]):
+        return [("metrics index", "INFO", f"{mtype[0]} {mtype[1]}: the token may not write `metrics`; "
+                                          "the metric probes need that index")]
     sc4s = hec("/services/collector/event", objects({"time": str(int(time.time())), "index": "metrics", "source": "sc4s",
                                                      "fields": {"probe": m, "metric_name:probe.sc4s": "5"}}))
     single = hec("/services/collector/event", objects({"event": "metric", "index": "metrics",
@@ -342,18 +577,20 @@ def probe_metrics():
     for n in (200, 1000):
         fields = {"probe": m, f"metric_name:probe.dims{n}": n, **{f"d{i}": f"v{i}" for i in range(n)}}
         status, text = hec("/services/collector/event", objects({"event": "metric", "index": "metrics", "fields": fields}))
-        dims = search_until(f'| mcatalog values(_dims) as d where index=metrics metric_name="probe.dims{n}"',
-                            lambda r: bool(r) and bool(r[0].get("d")), 30)
-        count = len(as_list(dims[0].get("d"))) if dims else 0
-        rows.append((f"metric event with {n} dimensions", "INFO", f"{status} {text}; mcatalog sees {count} dimensions"))
-    stored = search_until('| mstats latest(_value) as v where index=metrics'
-                          ' metric_name IN ("probe.mtype", "probe.sc4s", "probe.single") by metric_name',
-                          lambda r: len(r) >= 3, 30)
-    by_type = search(f'| mstats latest(_value) as v where index=metrics metric_name="probe.mtype" by metric_type')
-    rows.append(("metric_type", "INFO", f"mstats by metric_type {[(r.get('metric_type'), r.get('v')) for r in by_type]}"))
+        dims = try_search(f'| mcatalog values(_dims) as d where index=metrics metric_name="probe.dims{n}"',
+                          lambda r: bool(r) and bool(r[0].get("d")))
+        seen = (f"mcatalog {dims}" if dims == NOT_SEARCHED
+                else f"mcatalog sees {len(as_list(dims[0].get('d'))) if dims else 0} dimensions")
+        rows.append((f"metric event with {n} dimensions", "INFO", f"{status} {text}; {seen}"))
+    stored = try_search('| mstats latest(_value) as v where index=metrics'
+                        ' metric_name IN ("probe.mtype", "probe.sc4s", "probe.single") by metric_name',
+                        lambda r: len(r) >= 3)
+    by_type = try_search('| mstats latest(_value) as v where index=metrics metric_name="probe.mtype" by metric_type')
+    pairs = lambda rows, key: rows if rows == NOT_SEARCHED else [(r.get(key), r.get("v")) for r in rows]
+    rows.append(("metric_type", "INFO", f"-> {mtype[0]}; mstats by metric_type {pairs(by_type, 'metric_type')}"))
     rows.append(("metric object forms", "INFO",
                  f"no `event` + string value -> {sc4s[0]}; single-metric form -> {single[0]}; stored "
-                 f"{[(r.get('metric_name'), r.get('v')) for r in stored]}"))
+                 f"{pairs(stored, 'metric_name')}"))
     return rows
 
 
@@ -370,10 +607,16 @@ def probe_http():
         rows.append((label, "INFO", f"{status} {body}"))
     status, text = hec("/services/collector/raw?sourcetype=probe", f"{RUN}-raw-no-channel\n".encode())
     rows.append(("/raw with no channel, token without useACK", "INFO", f"{status} {text}"))
+    # A load balancer in front of HEC can pin an ack channel to one indexer with a cookie.
+    status, headers, _ = hec_full("/services/collector/event", objects({"event": f"{RUN}-cookie"}))
+    cookies = [c.split("=", 1)[0].strip() + "=<redacted>" for c in headers.get_all("Set-Cookie") or []]
+    rows.append(("Set-Cookie on an /event reply", "INFO", f"{status}; {cookies or 'none'}"))
     return rows
 
 
 def probe_ack():
+    if not ACK_TOKEN:
+        return [("useACK answers", "SKIP", "no SPLUNK_INTEROP_ACK_TOKEN")]
     channel = str(uuid.uuid4())
     headers = {"X-Splunk-Request-Channel": channel}
     no_channel = hec("/services/collector/event", objects({"event": f"{RUN}-ack-a"}), token=ACK_TOKEN)
@@ -395,6 +638,8 @@ def probe_ack():
 
 
 def probe_tcpout():
+    if not LOCAL:
+        return [("[tcpout] sendCookedData=false", "SKIP", "cloud mode: no `rawcap` receiver or output group")]
     m = f"{RUN}-tcpout"
     for obj in ({"event": f"{m} first line"}, {"event": f"{m} second line\nwith an embedded newline"},
                 {"event": {"structured": m, "n": 1}, "fields": {"f": "v"}}):
@@ -416,23 +661,45 @@ def probe_tcpout():
              f"{other} other LF-terminated lines (Splunk's own logs)")]
 
 
-PROBES = [probe_version, probe_gzip, probe_code6, probe_metrics, probe_http, probe_ack, probe_tcpout]
+PROBES = [probe_version, probe_endpoint, probe_body_cap, probe_gzip, probe_code6, probe_metrics, probe_http,
+          probe_ack, probe_tcpout]
 
 
 # ---- main ---------------------------------------------------------------------------------------
 
 
+def write_spl():
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(SINCE)))
+    lines = [f"# SPL for a manual search pass over this run, whose events were indexed from {SINCE} ({since}).",
+             f"# Run each over all time, adding index_earliest={SINCE} to a `search` query to leave out",
+             "# earlier runs: the relay leg's events carry their recorded timestamps, so an event-time",
+             "# range misses them."]
+    label = None
+    for owner, query in SPL:
+        if owner != label:
+            lines += ["", f"# {owner}"]
+            label = owner
+        lines.append(query)
+    (OUT / "search.spl").write_text(scrub("\n".join(lines) + "\n"))
+
+
 def main():
     results = []
-    for leg, title, check in LEGS:
+    for leg, title, check, service, queries in LEGS:
+        CURRENT[0] = leg
+        for query in queries:
+            record_spl(query)
         try:
             result, detail = check()
+        except SearchUnavailable:
+            result, detail = sent(service, queries)
         except Exception as err:  # A query that failed is a failed leg, not a crashed harness.
             result, detail = "FAIL", f"{type(err).__name__}: {err}"
         results.append({"leg": leg, "title": title, "result": result, "detail": detail})
 
     probe_rows = []
     for probe in PROBES:
+        CURRENT[0] = probe.__name__
         try:
             probe_rows += probe()
         except Exception as err:
@@ -443,12 +710,14 @@ def main():
     lines += [f"| {r['leg']} | {r['title']} | {r['result']} | {cell(r['detail'])} |" for r in results]
     lines += ["", "| Probe | Result | Detail |", "|---|---|---|"]
     lines += [f"| {probe} | {result} | {cell(detail)} |" for probe, result, detail in probe_rows]
-    table = "\n".join(lines)
+    table = scrub("\n".join(lines))
     print(table)
     (OUT / "results.md").write_text(table + "\n")
-    (OUT / "results.json").write_text(json.dumps(
-        {"legs": results, "probes": [dict(zip(("probe", "result", "detail"), r)) for r in probe_rows]},
-        indent=2) + "\n")
+    (OUT / "results.json").write_text(scrub(json.dumps(
+        {"target": TARGET, "search": SEARCH, "since": SINCE, "legs": results,
+         "probes": [dict(zip(("probe", "result", "detail"), r)) for r in probe_rows]},
+        indent=2)) + "\n")
+    write_spl()
     failed = any(r["result"] == "FAIL" for r in results) or any(r[1] == "FAIL" for r in probe_rows)
     return 1 if failed else 0
 

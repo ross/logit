@@ -4,6 +4,10 @@
 #
 # `internal` taps the sink's own telemetry into /out/ack-telemetry.log, where the harness counts
 # `logit.output.acks` by `result`.
+#
+# The sink's `endpoint`, `token`, and `tls` come from `SPLUNK_INTEROP_HEC_URL`,
+# `SPLUNK_INTEROP_ACK_TOKEN`, and `SPLUNK_INTEROP_HEC_INSECURE` (compose.yaml's `x-logit`), so the
+# leg runs unchanged against the local Splunk or a Splunk Cloud stack.
 admin:
   bind: 127.0.0.1:9600
 
@@ -40,8 +44,10 @@ components:
   splunk:
     type: splunk_hec_out
     sources: [envelope]
-    endpoint: http://splunk:8088/services/collector
-    token: 22222222-2222-2222-2222-222222222222
+    endpoint: !env SPLUNK_INTEROP_HEC_URL
+    token: !env SPLUNK_INTEROP_ACK_TOKEN
+    tls:
+      insecure_skip_verify: !env SPLUNK_INTEROP_HEC_INSECURE
     ack: true
     ack_timeout: 60s
 
