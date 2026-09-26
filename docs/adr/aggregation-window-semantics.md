@@ -276,13 +276,13 @@ defined merge rule here (`Set`, `Histogram`, `Summary`)" as forwarded untouched.
 `distributions: sketch | samples` (default `sketch`) for the `Samples`/`Distribution` pair, and
 `sets: estimate | members` (default `estimate`) for the `SetMembers`/`Set` pair
 (`crates/logit-config/src/lib.rs`). Each mode picks the accumulator a fresh series opens with
-(`Accumulator::new_for`), not what merges into it once open — an incoming record's own kind still
+(`opener_for`), not what merges into it once open — an incoming record's own kind still
 drives the merge match in `process` regardless of mode.
 
 - **`distributions: sketch`** (the default): every `Samples` value sketches directly into the
   series' `DdSketch` via `Samples::sketch`'s weighting rule (`add_weighted(v, weight)`, `weight =
   round(1/sample_rate)` clamped to `[1, Samples::MAX_WEIGHT]`) — no raw values ever survive past
-  the absorb. `weight == Samples::MAX_WEIGHT` counts
+  the absorb. A record `Samples::is_clamped` reports counts
   `logit.transform.samples.weight_clamped` and throttle-warns `sample_rate_clamped` -- the
   diagnostic `statsd_in` used to report at decode time, now emitted only here (the decoder no
   longer sketches or clamps since W3, [ADR `statsd-output`](statsd-output.md)'s amendment).
@@ -457,8 +457,9 @@ counted, is the minimum that lets a total cross a boundary at all) and `max_reta
   `sum` adds when *both* sides have one (a running sum missing a window's contribution understates
   the series outright, which is worse than reporting no sum — a consumer can tell `None` from a wrong
   number), and `min`/`max` fold across whichever sides have one (unlike a sum, an extreme observed
-  over a subset of windows is still a genuine observation). Bucket **bounds must match exactly**
-  (compared bitwise, so a `NaN` bound keys with itself): a record whose bounds differ from the
+  over a subset of windows is still a genuine observation). The "series identity, merge laws, and
+  accounting" amendment below replaces the `min`/`max` rule with `sum`'s. Bucket **bounds must
+  match exactly** (compared bitwise, so a `NaN` bound keys with itself): a record whose bounds differ from the
   accumulating series' has no correct merge — adding bucket *i* of one to bucket *i* of the other
   would attribute counts to bounds they were never observed under — so it is passed through
   untouched, the same treatment a kind conflict gets, under its own throttled diagnostic key
@@ -498,7 +499,7 @@ explicit, named in config, and bounded by its own two documented bounds, rather 
 sink. `influxdb_out` and `statsd_out` want the `delta` default, which is why it stays the default.
 
 See `crates/logit-transforms/src/aggregate.rs`'s module doc ("Temporality: what a flushed
-`Sum`/`Histogram` means"), its `passes_through`/`flush`/`Accumulator` for the implementation, and its
+`Sum`/`Histogram` means"), its `opener_for`/`flush`/`Accumulator` for the implementation, and its
 test module for the shapes this amendment adds coverage for:
 `cumulative_mode_sums_accumulate_across_flushes_with_a_stable_start_timestamp`,
 `cumulative_mode_keeps_the_accumulated_monotonic_flag`,
@@ -610,16 +611,15 @@ Some outcomes depend on order by design, and the stream pins them as examples ra
   error. Both `Mapping::agent` and `Mapping::logarithmic` (Datadog APM stats) reach `aggregate`,
   so which one a series ends up in depends on arrival order.
 
-**A cumulative histogram's `min` and `max` will follow `sum`'s rule (`agg/w2`).** A contributing
-record that has observations but no `min` (or `max`) makes the accumulated one `None`, and a
-record whose buckets total zero is ignored for the fold. Today `fold_extreme` keeps whichever side
-has a value, so a series can emit a `min` from one window and a `max` from another with
-`min > max`.
+**A cumulative histogram's `min` and `max` follow `sum`'s rule.** A contributing record that has
+observations but no `min` (or `max`) makes the accumulated one `None`, and a record whose buckets
+total zero is ignored for the fold. Keeping whichever side has a value would let a series emit a
+`min` from one window and a `max` from another with `min > max`.
 
-**A non-finite delta `Sum` will pass through (`agg/w2`).** A delta `Sum` whose value is `NaN` or
-±infinity is forwarded unmerged and counted `passed_through{reason="non_finite"}`, so a
-cumulative total stays finite. Today it merges: a statsd `1e308|c|@0.5` extrapolates to infinity,
-and in cumulative mode that infinity stays in the series' total for as long as the series lives.
+**A non-finite delta `Sum` passes through.** A delta `Sum` whose value is `NaN` or ±infinity is
+forwarded unmerged and counted `passed_through{reason="non_finite"}`, so a cumulative total stays
+finite. A statsd `1e308|c|@0.5` extrapolates to infinity, and merged in cumulative mode that
+infinity would stay in the series' total for as long as the series lives.
 
 ### Accounting identities
 
@@ -627,12 +627,12 @@ Two identities hold for every `aggregate`:
 
 - **Records:** `metrics_in == absorbed + passed_through{reason}`, where `metrics_in` is every
   metric record `process` receives. The reasons are `no_recorded_value`, `no_merge_rule`,
-  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`. Today only
-  `logit.transform.metrics.passed_through{reason="no_recorded_value"}` exists. `agg/w2` adds the
-  other reasons and a `logit.transform.metrics.absorbed` counter, each totaled per `process` call:
-  one count per reason per event, carrying the number of records. Until then a kind conflict or
-  bounds mismatch is countable only through `logit.component.diagnostics{key}`, and a
-  pass-through kind isn't counted at all. The stream asserts this identity from telemetry.
+  `kind_conflict`, `histogram_bounds_mismatch`, and `non_finite`, each defined in
+  [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)'s "Transforms",
+  "`aggregate`" table. `absorbed` is `logit.transform.metrics.absorbed`, and each reason is
+  `logit.transform.metrics.passed_through{reason}`, totaled per `process` call: one count per
+  reason per event, carrying the number of records. The stream asserts this identity from
+  telemetry.
 - **Series:** `series_at_flush_start == emitted_and_removed + kept + evicted{idle} +
   evicted{cardinality}`. The terms partition the series, each counted once:
   - `series_at_flush_start` is `logit.transform.series.active` plus
@@ -648,36 +648,34 @@ Two identities hold for every `aggregate`:
   the aggregator's own state in tests. `agg/w3` tags `series.evicted{reason="cardinality"}` with
   `state="active"|"idle"`, so evicting a series updated this window is visible in telemetry.
 
-**Sample-rate reporting.** `logit.transform.samples.weight_clamped` fires today when a record's
-weight equals `Samples::MAX_WEIGHT`, so a legitimate `@0.001` rate and a record with empty
-`values` both report as clamped, and a clamp on a record held in a raw `Samples` accumulator is
-never reported. `agg/w2` moves the predicate to `Samples::is_clamped` (rounded `1/sample_rate`
-above `MAX_WEIGHT`, with non-empty `values`) and reports a held record's clamp when the series
-falls back to a sketch. Under `distributions: samples`, a `NaN` `sample_rate` mismatches itself
-(`!=`), so a series' first record falls back; `agg/w2` compares rates by bit pattern. Only the
-native decoder can produce a `NaN` rate.
+**Sample-rate reporting.** `Samples::is_clamped` decides `logit.transform.samples.weight_clamped`:
+rounded `1/sample_rate` above `MAX_WEIGHT`, with non-empty `values`. A weight equal to
+`MAX_WEIGHT` isn't a clamp, so a legitimate `@0.001` rate and a record with empty `values` don't
+report. A record held raw under `distributions: samples` reports its clamp when the series falls
+back to a sketch, which is when its weight is first applied. A `NaN` or infinite value a sketch
+drops is counted as `logit.transform.samples.non_finite_dropped`. Under `distributions: samples`,
+sample rates compare by bit pattern, so a `NaN` rate matches itself instead of falling back on
+every record; only the native decoder can produce one.
 
 ### One function per decision
 
-Pass-through and retention are each decided today by two pieces of code kept in agreement by
-comment: `passes_through` and `Accumulator::new_for`'s `unreachable!` arm, and `flush`'s `retain`
-predicate and `kind_for_retained`'s `unreachable!` arm. A disagreement is a runtime panic, not a
-compile error. `agg/w2` replaces each pair with one `Option`-returning function:
+Pass-through and retention are each decided by one `Option`-returning function, so no second
+piece of code has to agree with it and no `unreachable!` arm turns a disagreement into a runtime
+panic:
 
 - `opener_for(..) -> Option<Opener>`: `None` means pass through, and `Opener::open` is total. The
   opener borrows the incoming record, so deciding doesn't build an accumulator (a histogram's
   bucket `Vec`) on every merge.
 - `Accumulator::retained_kind(&self, temporality) -> Option<MetricKind>`: `None` means the series
-  doesn't survive the flush. `flush` calls it only when `series_retention > 0`.
-
-The change moves no behavior and no allocation pin.
+  doesn't survive the flush. `flush` calls it only for a series updated this window, and only when
+  `series_retention > 0`, so an idle retained `Histogram` doesn't clone its buckets.
 
 ### Raw-mode caps
 
-`SetMembers` under `sets: members` checks `max_set_members_per_series` after unioning the whole
-incoming record, so one record's own size costs O(n²) `contains` compares and transient memory
-bounded only by that record. `agg/w2` stops the union at the cap and streams the rest of the
-record into the HyperLogLog.
+`SetMembers` under `sets: members` stops its deduplicating union as soon as it passes
+`max_set_members_per_series`, and streams the held members and the rest of the record into the
+HyperLogLog. One oversized record then costs O(cap²) `contains` compares and cap-bounded memory,
+not its own size squared.
 
 `agg/w3` tightens the config rules so every cap can hold something:
 
@@ -701,9 +699,8 @@ source timestamp would outrank a stable one.
 
 ### `description` and exemplars
 
-A series will keep its first record's `description` and emit it (`agg/w2`). Today every emitted
-record has none. `description` is an interned `Option<Symbol>`, so carrying it costs no
-allocation.
+A series keeps its first record's `description` and emits it on every flush; a later record's
+is ignored. `description` is an interned `Option<Symbol>`, so carrying it costs no allocation.
 
 Exemplars are dropped, and stay dropped. An exemplar is a single observation, and a summarized
 window has no per-observation data to attach it to. `aggregate` is the stage whose stated purpose

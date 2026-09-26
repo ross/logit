@@ -3,11 +3,21 @@
 //! `docs/adr/aggregation-window-semantics.md`'s "Amendment: series identity, merge laws, and
 //! accounting as a stated contract" section.
 //!
-//! Covered so far: XFORM-01, series identity. `SeriesKey` equality and hashing agree with
-//! [`ref_eq`], a structural comparison that never calls `value_key_eq` or `hash_value`, and
-//! `Aggregator` partitions records into series and `(resource, scope)` groups the way that
-//! reference does. XFORM-02 to XFORM-04 extend this module with a reference model and reuse its
-//! strategies.
+//! - XFORM-01, series identity: `SeriesKey` equality and hashing agree with [`ref_eq`], a
+//!   structural comparison that never calls `value_key_eq` or `hash_value`, and `Aggregator`
+//!   partitions records into series and `(resource, scope)` groups the way that reference does.
+//! - XFORM-02, merge dispatch: [`Model`] restates `process` and a tumbling `flush`, and
+//!   `aggregator_matches_the_reference_model` checks every emitted series, forwarded record, link,
+//!   and counter against it over random batches and flushes. Random ops rarely put more than
+//!   eight contexts on one series, so `the_model_caps_links_per_series` drives the link cap
+//!   directly. The merge-law properties check per-window order independence and a two-stage
+//!   relay, and the unit tests at the end pin the outcomes the ADR lists as order-dependent by
+//!   design.
+//!
+//! Retention isn't modeled: `series_retention` and `max_retained_series` are 0, so every flush is
+//! tumbling. The rules a retention model needs are in `docs/adr/aggregation-window-semantics.md`,
+//! "Amendment: series identity, merge laws, and accounting as a stated contract", under
+//! "Cardinality-cap tie-break" and "Start time after a cap eviction".
 //!
 //! Case counts are floors: a `PROPTEST_CASES` above one raises it for a deeper run.
 
@@ -523,4 +533,1354 @@ fn scope_pool() -> (Vec<Option<Arc<Scope>>>, [usize; SCOPES]) {
         Some(Arc::new(Scope { name: Bytes::from_static(name), attributes, ..Scope::default() }))
     };
     (vec![None, scope(b"a"), scope(b"a"), scope(b"b")], [0, 1, 1, 2])
+}
+
+// -- Reference model (XFORM-02) ---------------------------------------------------------------
+//
+// `Model` restates `process` and a tumbling `flush` from the ADR, independently of `Aggregator`:
+// its own pass-through table, merge rules, sample weighting, and counters. Its accumulators hold
+// what a merge must preserve (observations, members, `u128` bucket totals) rather than sketches,
+// so an emitted value is checked against the ADR's per-kind equality, never against the
+// aggregator's bytes.
+
+/// Members `Set` and `SetMembers` records draw from.
+const ALPHABET: [&[u8]; 10] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j"];
+
+const LAYOUTS: [&[f64]; 3] =
+    [&[1.0, 10.0, f64::INFINITY], &[5.0, f64::INFINITY], &[f64::NAN, f64::INFINITY]];
+
+/// A record's kind, keeping what a sketch or `HyperLogLog` would hide from the model.
+#[derive(Debug, Clone)]
+enum KindSpec {
+    Plain(MetricKind),
+    /// A `Distribution` built as `Samples::sketch()` of these samples.
+    Dist(Samples),
+    /// A `Set` of these members.
+    Set(Vec<Bytes>),
+}
+
+impl KindSpec {
+    fn build(&self) -> MetricKind {
+        match self {
+            KindSpec::Plain(kind) => kind.clone(),
+            KindSpec::Dist(samples) => MetricKind::Distribution(samples.sketch()),
+            KindSpec::Set(members) => MetricKind::Set(hll_of(members)),
+        }
+    }
+}
+
+fn hll_of<'a>(members: impl IntoIterator<Item = &'a Bytes>) -> logit_core::HyperLogLog {
+    let mut hll = logit_core::HyperLogLog::new();
+    for m in members {
+        hll.insert(m);
+    }
+    hll
+}
+
+#[derive(Debug, Clone)]
+struct RecordSpec {
+    name: &'static str,
+    unit: Option<&'static str>,
+    description: Option<&'static str>,
+    kind: KindSpec,
+    no_recorded_value: bool,
+}
+
+impl RecordSpec {
+    fn build(&self) -> MetricRecord {
+        let mut record = MetricRecord::new(intern(self.name), self.kind.build());
+        record.unit = self.unit.map(intern);
+        record.description = self.description.map(intern);
+        if self.no_recorded_value {
+            record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        }
+        record
+    }
+}
+
+/// Bounded values with a rare `NaN`, infinity, or `-0.0`.
+fn scalar() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        12 => -1e3..1e3f64,
+        1 => Just(f64::NAN),
+        1 => Just(f64::INFINITY),
+        1 => Just(-0.0),
+    ]
+}
+
+/// `{0} ∪ ±[1e-6, 1e9]`, the range whose agent-mapping bins stay under the sketch's bin limit,
+/// with a rare non-finite value a sketch drops.
+fn sample_value() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        2 => Just(0.0),
+        6 => 1e-6..1e9f64,
+        6 => -1e9..-1e-6f64,
+        1 => Just(f64::NAN),
+        1 => Just(f64::NEG_INFINITY),
+    ]
+}
+
+/// Rates around `1 / Samples::MAX_WEIGHT`, plus the ones `weight` degrades to 1.
+fn rate() -> impl Strategy<Value = f64> {
+    prop::sample::select(vec![
+        1.0,
+        0.5,
+        0.1,
+        0.001,
+        0.00099,
+        0.0010005,
+        0.0011,
+        1e-4,
+        0.0,
+        -1.0,
+        f64::NAN,
+    ])
+}
+
+fn samples() -> impl Strategy<Value = Samples> {
+    (prop::collection::vec(sample_value(), 0..=12), rate())
+        .prop_map(|(values, sample_rate)| Samples { values: values.into(), sample_rate })
+}
+
+fn members() -> impl Strategy<Value = Vec<Bytes>> {
+    prop::collection::vec(prop::sample::select(ALPHABET.to_vec()), 0..6)
+        .prop_map(|m| m.into_iter().map(Bytes::from_static).collect())
+}
+
+fn temporality() -> impl Strategy<Value = Temporality> {
+    prop_oneof![Just(Temporality::Delta), Just(Temporality::Cumulative)]
+}
+
+fn stat() -> impl Strategy<Value = Option<f64>> {
+    prop_oneof![3 => Just(None), 6 => (-1e3..1e3f64).prop_map(Some), 1 => Just(Some(f64::NAN))]
+}
+
+fn histogram(layout: usize, temporality: Temporality) -> impl Strategy<Value = MetricKind> {
+    let counts = prop::sample::select(vec![0, 1, 7, u64::MAX - 1, u64::MAX]);
+    (prop::collection::vec(counts, LAYOUTS[layout].len()), stat(), stat(), stat()).prop_map(
+        move |(counts, sum, min, max)| {
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: LAYOUTS[layout].iter().copied().zip(counts).collect(),
+                temporality,
+                sum,
+                min,
+                max,
+            })
+        },
+    )
+}
+
+fn exp_histogram() -> MetricKind {
+    MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+        scale: 0,
+        zero_count: 0,
+        zero_threshold: 0.0,
+        positive: (0, vec![1]),
+        negative: (0, vec![]),
+        temporality: Temporality::Delta,
+        count: 1,
+        sum: None,
+        min: None,
+        max: None,
+    })
+}
+
+fn summary() -> MetricKind {
+    MetricKind::Summary(logit_core::Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 })
+}
+
+fn kind_spec() -> impl Strategy<Value = KindSpec> {
+    let plain = |s: BoxedStrategy<MetricKind>| s.prop_map(KindSpec::Plain);
+    prop_oneof![
+        3 => plain((scalar(), temporality(), any::<bool>())
+            .prop_map(|(value, temporality, monotonic)| {
+                MetricKind::Sum(Sum { value, temporality, monotonic })
+            })
+            .boxed()),
+        2 => plain(scalar().prop_map(MetricKind::Gauge).boxed()),
+        2 => plain(scalar().prop_map(MetricKind::GaugeDelta).boxed()),
+        3 => plain(samples().prop_map(MetricKind::Samples).boxed()),
+        1 => samples().prop_map(KindSpec::Dist),
+        1 => members().prop_map(KindSpec::Set),
+        2 => plain(members().prop_map(MetricKind::SetMembers).boxed()),
+        3 => plain(
+            (0..LAYOUTS.len(), temporality())
+                .prop_flat_map(|(layout, t)| histogram(layout, t))
+                .boxed()
+        ),
+        1 => plain(prop_oneof![Just(exp_histogram()), Just(summary())].boxed()),
+    ]
+}
+
+fn record_spec() -> impl Strategy<Value = RecordSpec> {
+    (
+        prop::sample::select(vec!["m0", "m1", "m2"]),
+        prop_oneof![Just(None), Just(Some("ms"))],
+        prop_oneof![Just(None), Just(Some("d0")), Just(Some("d1"))],
+        kind_spec(),
+        prop::bool::weighted(0.1),
+    )
+        .prop_map(|(name, unit, description, kind, no_recorded_value)| RecordSpec {
+            name,
+            unit,
+            description,
+            kind,
+            no_recorded_value,
+        })
+}
+
+/// Attribute sets an event draws from: two distinct series keys and a `NaN` one.
+fn event_attributes(i: usize) -> AttrMap {
+    let mut attrs = AttrMap::new();
+    match i {
+        0 => {}
+        1 => attrs.insert("k0", Value::Str(Bytes::from_static(b"a"))),
+        _ => attrs.insert("k0", Value::F64(f64::NAN)),
+    }
+    attrs
+}
+
+#[derive(Debug, Clone)]
+struct EventSpec {
+    timestamp: i64,
+    attributes: usize,
+    records: Vec<RecordSpec>,
+    log: bool,
+}
+
+impl EventSpec {
+    fn build(&self) -> Event {
+        let mut event = Event::empty(self.timestamp, event_attributes(self.attributes));
+        event.metrics.extend(self.records.iter().map(RecordSpec::build));
+        if self.log {
+            event.log = Some(logit_core::LogRecord {
+                message: Value::str("x"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            });
+        }
+        event
+    }
+}
+
+fn event_spec() -> impl Strategy<Value = EventSpec> {
+    (
+        prop_oneof![1 => Just(i64::MIN), 6 => 0..=5i64],
+        0..3usize,
+        prop::collection::vec(record_spec(), 0..=3),
+        prop::bool::weighted(0.2),
+    )
+        .prop_map(|(timestamp, attributes, records, log)| EventSpec {
+            timestamp,
+            attributes,
+            records,
+            log,
+        })
+}
+
+const CONTEXTS: usize = 10;
+
+fn context(i: usize) -> TraceContext {
+    TraceContext { trace_id: [i as u8 + 1; 16], span_id: [i as u8 + 1; 8] }
+}
+
+#[derive(Debug, Clone)]
+enum ModelOp {
+    Batch { resource: usize, scope: usize, context: usize, events: Vec<EventSpec> },
+    Flush,
+}
+
+fn model_op() -> impl Strategy<Value = ModelOp> {
+    prop_oneof![
+        4 => (0..RESOURCES, 0..SCOPES, 0..CONTEXTS, prop::collection::vec(event_spec(), 1..=4))
+            .prop_map(|(resource, scope, context, events)| ModelOp::Batch {
+                resource,
+                scope,
+                context,
+                events,
+            }),
+        1 => Just(ModelOp::Flush),
+    ]
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelConfig {
+    temporality: AggregateTemporality,
+    /// `None` for `distributions: sketch`, else `samples` with this cap.
+    samples_cap: Option<usize>,
+    /// `None` for `sets: estimate`, else `members` with this cap.
+    members_cap: Option<usize>,
+}
+
+impl ModelConfig {
+    /// An aggregator under this config, with `series_retention` and `max_retained_series` left at
+    /// 0: the model doesn't model retention (see the module doc).
+    fn aggregator(&self) -> Aggregator {
+        let (distributions, samples_cap) = match self.samples_cap {
+            None => (Distributions::Sketch, 1000),
+            Some(cap) => (Distributions::Samples, cap),
+        };
+        let (sets, members_cap) = match self.members_cap {
+            None => (Sets::Estimate, 1000),
+            Some(cap) => (Sets::Members, cap),
+        };
+        Aggregator::new(Duration::from_secs(10))
+            .with_temporality(self.temporality)
+            .with_distributions(distributions, samples_cap)
+            .with_sets(sets, members_cap)
+    }
+}
+
+fn model_config() -> impl Strategy<Value = ModelConfig> {
+    (
+        prop_oneof![Just(AggregateTemporality::Delta), Just(AggregateTemporality::Cumulative)],
+        prop::option::of(1..=8usize),
+        prop::option::of(1..=6usize),
+    )
+        .prop_map(|(temporality, samples_cap, members_cap)| ModelConfig {
+            temporality,
+            samples_cap,
+            members_cap,
+        })
+}
+
+/// `Samples::weight`, restated: `round(1 / rate)` in `[1, 1000]`; a non-finite or non-positive
+/// rate is 1.
+fn ref_weight(rate: f64) -> u64 {
+    if !(rate.is_finite() && rate > 0.0) {
+        return 1;
+    }
+    let w = (1.0 / rate).round();
+    if w >= 1000.0 {
+        1000
+    } else if w >= 1.0 {
+        w as u64
+    } else {
+        1
+    }
+}
+
+/// `Samples::is_clamped`, restated.
+fn ref_clamped(values: &[f64], rate: f64) -> bool {
+    !values.is_empty() && rate.is_finite() && rate > 0.0 && (1.0 / rate).round() > 1000.0
+}
+
+#[derive(Debug, Clone)]
+enum RefAcc {
+    Sum {
+        total: f64,
+        monotonic: bool,
+    },
+    Gauge {
+        value: f64,
+        at: i64,
+    },
+    /// Finite observations and their weights.
+    Dist(Vec<(f64, u64)>),
+    RawSamples {
+        values: Vec<f64>,
+        rate: f64,
+    },
+    Set(std::collections::BTreeSet<Bytes>),
+    RawMembers(Vec<Bytes>),
+    Hist {
+        bounds: Vec<u64>,
+        counts: Vec<u128>,
+        sum: Option<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+}
+
+#[derive(Debug)]
+struct RefSeries {
+    resource: usize,
+    scope: usize,
+    key: RefKey,
+    acc: RefAcc,
+    contexts: Vec<usize>,
+    dropped_contexts: u64,
+    description: Option<Symbol>,
+}
+
+/// Counters the model expects between two flushes, keyed by counter name and tag value.
+#[derive(Debug, Default, PartialEq)]
+struct RefCounts(std::collections::BTreeMap<(&'static str, &'static str), u64>);
+
+impl RefCounts {
+    fn add(&mut self, name: &'static str, tag: &'static str, n: u64) {
+        if n > 0 {
+            *self.0.entry((name, tag)).or_default() += n;
+        }
+    }
+}
+
+const ABSORBED: &str = "logit.transform.metrics.absorbed";
+const PASSED: &str = "logit.transform.metrics.passed_through";
+const UNSEEDED: &str = "logit.transform.gauge.delta.unseeded";
+const CLAMPED: &str = "logit.transform.samples.weight_clamped";
+const NON_FINITE_DROPPED: &str = "logit.transform.samples.non_finite_dropped";
+const SAMPLES_FALLBACK: &str = "logit.transform.samples.fallback";
+const MEMBERS_FALLBACK: &str = "logit.transform.set_members.fallback";
+const LINKS_DROPPED: &str = "logit.transform.links.dropped";
+/// Every counter the model predicts, and the tag each is read under ("" for none).
+const MODELED_COUNTERS: [(&str, &str); 8] = [
+    (ABSORBED, ""),
+    (PASSED, "reason"),
+    (UNSEEDED, ""),
+    (CLAMPED, ""),
+    (NON_FINITE_DROPPED, ""),
+    (SAMPLES_FALLBACK, "reason"),
+    (MEMBERS_FALLBACK, "reason"),
+    (LINKS_DROPPED, "reason"),
+];
+
+enum Fate {
+    Absorbed,
+    Passed(&'static str),
+}
+
+struct Model {
+    config: ModelConfig,
+    series: Vec<RefSeries>,
+    counts: RefCounts,
+}
+
+impl Model {
+    fn new(config: ModelConfig) -> Self {
+        Model { config, series: Vec::new(), counts: RefCounts::default() }
+    }
+
+    /// Whether `kind` has no merge rule under this config: the ADR's list, restated.
+    fn no_merge_rule(&self, kind: &MetricKind) -> bool {
+        match kind {
+            MetricKind::Sum(s) => s.temporality == Temporality::Cumulative,
+            MetricKind::Histogram(h) => {
+                h.temporality == Temporality::Cumulative
+                    || self.config.temporality == AggregateTemporality::Delta
+            }
+            MetricKind::ExponentialHistogram(_) | MetricKind::Summary(_) => true,
+            _ => false,
+        }
+    }
+
+    /// The indices of `event`'s records `process` leaves on it, in order.
+    fn process(
+        &mut self,
+        resource: usize,
+        scope: usize,
+        ctx: usize,
+        event: &EventSpec,
+    ) -> Vec<usize> {
+        let mut forwarded = Vec::new();
+        for (i, spec) in event.records.iter().enumerate() {
+            match self.absorb(resource, scope, ctx, event, spec) {
+                Fate::Absorbed => self.counts.add(ABSORBED, "", 1),
+                Fate::Passed(reason) => {
+                    self.counts.add(PASSED, reason, 1);
+                    forwarded.push(i);
+                }
+            }
+        }
+        forwarded
+    }
+
+    fn absorb(
+        &mut self,
+        resource: usize,
+        scope: usize,
+        ctx: usize,
+        event: &EventSpec,
+        spec: &RecordSpec,
+    ) -> Fate {
+        let kind = spec.kind.build();
+        if spec.no_recorded_value {
+            return Fate::Passed("no_recorded_value");
+        }
+        if self.no_merge_rule(&kind) {
+            return Fate::Passed("no_merge_rule");
+        }
+        if matches!(kind, MetricKind::Sum(s) if !s.value.is_finite()) {
+            return Fate::Passed("non_finite");
+        }
+
+        let key = RefKey::of(
+            intern(spec.name),
+            spec.unit.map(intern),
+            &event_attributes(event.attributes),
+        );
+        let found = self
+            .series
+            .iter()
+            .position(|s| s.resource == resource && s.scope == scope && ref_key_eq(&s.key, &key));
+        let opened = found.is_none();
+        let index = found.unwrap_or_else(|| {
+            let acc = self.open(&spec.kind);
+            self.series.push(RefSeries {
+                resource,
+                scope,
+                key,
+                acc,
+                contexts: Vec::new(),
+                dropped_contexts: 0,
+                description: spec.description.map(intern),
+            });
+            self.series.len() - 1
+        });
+
+        let config = self.config;
+        let counts = &mut self.counts;
+        let series = &mut self.series[index];
+        let fate = merge(&mut series.acc, &spec.kind, event.timestamp, config, counts);
+        if let Fate::Absorbed = fate {
+            if opened && matches!(kind, MetricKind::GaugeDelta(_)) {
+                counts.add(UNSEEDED, "", 1);
+            }
+            if !series.contexts.contains(&ctx) {
+                if series.contexts.len() >= 8 {
+                    series.dropped_contexts += 1;
+                } else {
+                    series.contexts.push(ctx);
+                }
+            }
+        }
+        fate
+    }
+
+    /// The empty accumulator a series of this kind opens with under this config.
+    fn open(&self, spec: &KindSpec) -> RefAcc {
+        match spec.build() {
+            MetricKind::Sum(s) => RefAcc::Sum { total: 0.0, monotonic: s.monotonic },
+            MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
+                RefAcc::Gauge { value: 0.0, at: i64::MIN }
+            }
+            MetricKind::Samples(s) => match self.config.samples_cap {
+                None => RefAcc::Dist(Vec::new()),
+                Some(_) => RefAcc::RawSamples { values: Vec::new(), rate: s.sample_rate },
+            },
+            MetricKind::Distribution(_) => RefAcc::Dist(Vec::new()),
+            MetricKind::Set(_) => RefAcc::Set(Default::default()),
+            MetricKind::SetMembers(_) => match self.config.members_cap {
+                None => RefAcc::Set(Default::default()),
+                Some(_) => RefAcc::RawMembers(Vec::new()),
+            },
+            MetricKind::Histogram(h) => RefAcc::Hist {
+                bounds: h.buckets.iter().map(|(b, _)| b.to_bits()).collect(),
+                counts: vec![0; h.buckets.len()],
+                sum: h.sum.map(|_| 0.0),
+                min: None,
+                max: None,
+            },
+            other => unreachable!("{other:?} has no merge rule"),
+        }
+    }
+
+    /// Emits and clears every series, as a tumbling flush does. With retention 0, no series
+    /// survives, a gauge or cumulative-mode `Sum`/`Histogram` included.
+    fn flush(&mut self) -> Vec<RefSeries> {
+        std::mem::take(&mut self.series)
+    }
+}
+
+/// Finite observations of `values` at `rate`'s weight, and how many values weren't finite.
+fn observations(values: &[f64], rate: f64) -> (Vec<(f64, u64)>, u64) {
+    let w = ref_weight(rate);
+    let finite: Vec<(f64, u64)> =
+        values.iter().filter(|v| v.is_finite()).map(|v| (*v, w)).collect();
+    let dropped = (values.len() - finite.len()) as u64;
+    (finite, dropped)
+}
+
+/// Folds one record into `acc` under the ADR's per-kind rules.
+fn merge(
+    acc: &mut RefAcc,
+    spec: &KindSpec,
+    timestamp: i64,
+    config: ModelConfig,
+    counts: &mut RefCounts,
+) -> Fate {
+    let kind = spec.build();
+    match (&mut *acc, &kind) {
+        (RefAcc::Sum { total, .. }, MetricKind::Sum(s)) => *total += s.value,
+        (RefAcc::Gauge { value, at }, MetricKind::Gauge(v)) => {
+            if timestamp >= *at {
+                *value = *v;
+                *at = timestamp;
+            }
+        }
+        (RefAcc::Gauge { value, .. }, MetricKind::GaugeDelta(d)) => *value += d,
+        (RefAcc::Dist(obs), MetricKind::Samples(s)) => {
+            let (finite, dropped) = observations(&s.values, s.sample_rate);
+            obs.extend(finite);
+            counts.add(NON_FINITE_DROPPED, "", dropped);
+            counts.add(CLAMPED, "", u64::from(ref_clamped(&s.values, s.sample_rate)));
+        }
+        (RefAcc::RawSamples { values, rate }, MetricKind::Samples(s)) => {
+            let cap = config.samples_cap.unwrap_or(usize::MAX);
+            let reason = if rate.to_bits() != s.sample_rate.to_bits() {
+                Some("rate_mismatch")
+            } else if values.len() + s.values.len() > cap {
+                Some("cap")
+            } else {
+                None
+            };
+            match reason {
+                None => values.extend(s.values.iter().copied()),
+                Some(reason) => {
+                    let mut obs = Vec::new();
+                    for (vs, r) in [(&values[..], *rate), (&s.values[..], s.sample_rate)] {
+                        let (finite, dropped) = observations(vs, r);
+                        obs.extend(finite);
+                        counts.add(NON_FINITE_DROPPED, "", dropped);
+                        counts.add(CLAMPED, "", u64::from(ref_clamped(vs, r)));
+                    }
+                    counts.add(SAMPLES_FALLBACK, reason, 1);
+                    *acc = RefAcc::Dist(obs);
+                }
+            }
+        }
+        (RefAcc::Dist(obs), MetricKind::Distribution(_)) => {
+            let KindSpec::Dist(s) = spec else { unreachable!() };
+            obs.extend(observations(&s.values, s.sample_rate).0);
+        }
+        (RefAcc::RawSamples { values, rate }, MetricKind::Distribution(_)) => {
+            let KindSpec::Dist(s) = spec else { unreachable!() };
+            let (mut obs, dropped) = observations(values, *rate);
+            counts.add(NON_FINITE_DROPPED, "", dropped);
+            counts.add(CLAMPED, "", u64::from(ref_clamped(values, *rate)));
+            obs.extend(observations(&s.values, s.sample_rate).0);
+            *acc = RefAcc::Dist(obs);
+        }
+        (RefAcc::Set(set), MetricKind::Set(_)) => {
+            let KindSpec::Set(members) = spec else { unreachable!() };
+            set.extend(members.iter().cloned());
+        }
+        (RefAcc::Set(set), MetricKind::SetMembers(members)) => set.extend(members.iter().cloned()),
+        (RefAcc::RawMembers(held), MetricKind::Set(_)) => {
+            let KindSpec::Set(members) = spec else { unreachable!() };
+            *acc = RefAcc::Set(held.iter().chain(members).cloned().collect());
+        }
+        (RefAcc::RawMembers(held), MetricKind::SetMembers(members)) => {
+            for m in members {
+                if !held.contains(m) {
+                    held.push(m.clone());
+                }
+            }
+            if held.len() > config.members_cap.unwrap_or(usize::MAX) {
+                counts.add(MEMBERS_FALLBACK, "cap", 1);
+                *acc = RefAcc::Set(held.iter().cloned().collect());
+            }
+        }
+        (RefAcc::Hist { bounds, counts: held, sum, min, max }, MetricKind::Histogram(h)) => {
+            let incoming: Vec<u64> = h.buckets.iter().map(|(b, _)| b.to_bits()).collect();
+            if *bounds != incoming {
+                return Fate::Passed("histogram_bounds_mismatch");
+            }
+            let held_observed = held.iter().any(|c| *c > 0);
+            let incoming_observed = h.buckets.iter().any(|(_, c)| *c > 0);
+            for (total, (_, c)) in held.iter_mut().zip(&h.buckets) {
+                *total += u128::from(*c);
+            }
+            *sum = match (*sum, h.sum) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            };
+            let fold = |held: Option<f64>, incoming: Option<f64>, pick: fn(f64, f64) -> f64| {
+                if !incoming_observed {
+                    held
+                } else if !held_observed {
+                    incoming
+                } else {
+                    held.zip(incoming).map(|(a, b)| pick(a, b))
+                }
+            };
+            *min = fold(*min, h.min, f64::min);
+            *max = fold(*max, h.max, f64::max);
+        }
+        _ => return Fate::Passed("kind_conflict"),
+    }
+    Fate::Absorbed
+}
+
+/// `a` and `b` are one value: bitwise, or both `NaN`.
+fn same_f64(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+}
+
+fn same_opt(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => same_f64(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// The `q`-quantile a sketch's rank rule picks from the true observations: the Agent mapping
+/// rounds `q * (count - 1)` to even and takes the observation holding that rank.
+fn true_quantile(obs: &[(f64, u64)], q: f64) -> f64 {
+    let mut sorted = obs.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let count: u64 = sorted.iter().map(|o| o.1).sum();
+    let rank = (q * (count - 1) as f64).round_ties_even();
+    let mut seen = 0.0;
+    for (v, w) in &sorted {
+        seen += *w as f64;
+        if seen > rank {
+            return *v;
+        }
+    }
+    sorted.last().map_or(0.0, |o| o.0)
+}
+
+/// The ADR's `Distribution` equality against the true observations: `count()` exact, `sum()`
+/// within `1e-9·max(1, Σ|v·w|)`, `min`/`max` exact, quantiles within the mapping's relative
+/// accuracy.
+fn check_sketch(sketch: &logit_core::DdSketch, obs: &[(f64, u64)]) -> Result<(), TestCaseError> {
+    let count: u64 = obs.iter().map(|o| o.1).sum();
+    prop_assert_eq!(sketch.count() as u64, count);
+    let sum: f64 = obs.iter().map(|(v, w)| v * *w as f64).sum();
+    let scale: f64 = obs.iter().map(|(v, w)| (v * *w as f64).abs()).sum();
+    prop_assert!(
+        (sketch.sum() - sum).abs() <= 1e-9 * scale.max(1.0),
+        "sum {} against {}",
+        sketch.sum(),
+        sum
+    );
+    let min = obs.iter().map(|o| o.0).reduce(f64::min);
+    let max = obs.iter().map(|o| o.0).reduce(f64::max);
+    prop_assert_eq!(sketch.min(), min);
+    prop_assert_eq!(sketch.max(), max);
+    if count > 0 {
+        // Relative to the true value. The Agent's bin center is `1 - 1/√γ` from the estimate,
+        // which is `√γ - 1` from a value at the bin's lower edge.
+        let gamma = sketch.mapping().gamma();
+        let alpha = match sketch.mapping().kind() {
+            logit_core::MappingKind::Agent => gamma.sqrt() - 1.0,
+            logit_core::MappingKind::Logarithmic => 1.0 - 2.0 / (1.0 + gamma),
+        };
+        for q in [0.25, 0.5, 0.9, 0.99] {
+            let truth = true_quantile(obs, q);
+            let estimate = sketch.quantile(q).unwrap_or(f64::NAN);
+            prop_assert!(
+                (estimate - truth).abs() <= alpha * truth.abs() + 1e-9 * gamma,
+                "q{} estimate {} against {}",
+                q,
+                estimate,
+                truth
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The emitted value against the model's accumulator, by the ADR's per-kind equality.
+fn check_emitted(
+    kind: &MetricKind,
+    acc: &RefAcc,
+    config: ModelConfig,
+) -> Result<(), TestCaseError> {
+    let mode = record_temporality(config.temporality);
+    match (kind, acc) {
+        (MetricKind::Sum(s), RefAcc::Sum { total, monotonic }) => {
+            prop_assert!(same_f64(s.value, *total), "sum {} against {}", s.value, total);
+            prop_assert_eq!(s.temporality, mode);
+            prop_assert_eq!(s.monotonic, *monotonic);
+        }
+        (MetricKind::Gauge(v), RefAcc::Gauge { value, .. }) => {
+            prop_assert!(same_f64(*v, *value), "gauge {} against {}", v, value);
+        }
+        (MetricKind::Distribution(sketch), RefAcc::Dist(obs)) => {
+            prop_assert_eq!(sketch.mapping().kind(), logit_core::MappingKind::Agent);
+            check_sketch(sketch, obs)?;
+        }
+        (MetricKind::Samples(s), RefAcc::RawSamples { values, rate }) => {
+            prop_assert_eq!(s.sample_rate.to_bits(), rate.to_bits());
+            let sorted = |v: &[f64]| {
+                let mut bits: Vec<u64> = v.iter().map(|x| x.to_bits()).collect();
+                bits.sort_unstable();
+                bits
+            };
+            prop_assert_eq!(sorted(&s.values), sorted(values));
+        }
+        (MetricKind::Set(hll), RefAcc::Set(set)) => {
+            // Exact below the HyperLogLog's small-set threshold, which ALPHABET stays under.
+            prop_assert_eq!(hll.estimate(), set.len() as u64);
+        }
+        (MetricKind::SetMembers(members), RefAcc::RawMembers(held)) => {
+            prop_assert_eq!(members, held);
+        }
+        (MetricKind::Histogram(h), RefAcc::Hist { bounds, counts, sum, min, max }) => {
+            let emitted: Vec<u64> = h.buckets.iter().map(|(b, _)| b.to_bits()).collect();
+            prop_assert_eq!(&emitted, bounds);
+            let expected: Vec<u64> =
+                counts.iter().map(|c| u64::try_from(*c).unwrap_or(u64::MAX)).collect();
+            let emitted: Vec<u64> = h.buckets.iter().map(|(_, c)| *c).collect();
+            prop_assert_eq!(emitted, expected);
+            prop_assert_eq!(h.temporality, Temporality::Cumulative);
+            prop_assert!(same_opt(h.sum, *sum), "sum {:?} against {:?}", h.sum, sum);
+            prop_assert!(same_opt(h.min, *min), "min {:?} against {:?}", h.min, min);
+            prop_assert!(same_opt(h.max, *max), "max {:?} against {:?}", h.max, max);
+        }
+        (kind, acc) => prop_assert!(false, "emitted {:?} for {:?}", kind, acc),
+    }
+    Ok(())
+}
+
+/// A counter's total in drained telemetry, over every point carrying `tag_value` under `tag`
+/// (or every point, when `tag` is empty).
+fn telemetry_total(events: &[Event], name: &str, tag: &str, tag_value: &str) -> u64 {
+    events
+        .iter()
+        .filter(|e| {
+            tag.is_empty() || e.attributes.get(tag).and_then(|v| v.as_str()) == Some(tag_value)
+        })
+        .flat_map(|e| &e.metrics)
+        .filter(|m| resolve(m.name) == name)
+        .map(|m| match &m.kind {
+            MetricKind::Sum(s) => s.value as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
+fn telemetry_gauge(events: &[Event], name: &str) -> Option<f64> {
+    events.iter().flat_map(|e| &e.metrics).find_map(|m| match &m.kind {
+        MetricKind::Gauge(v) if resolve(m.name) == name => Some(*v),
+        _ => None,
+    })
+}
+
+/// Tag values the tagged counters are read under.
+const TAG_VALUES: [&str; 8] = [
+    "no_recorded_value",
+    "no_merge_rule",
+    "kind_conflict",
+    "histogram_bounds_mismatch",
+    "non_finite",
+    "rate_mismatch",
+    "cap",
+    "cardinality",
+];
+
+/// Every counter the model predicts, read back from drained telemetry. A tagged counter must
+/// carry no tag value outside [`TAG_VALUES`].
+fn observed_counts(events: &[Event]) -> Result<RefCounts, TestCaseError> {
+    let mut observed = RefCounts::default();
+    for (name, tag) in MODELED_COUNTERS {
+        let total = telemetry_total(events, name, "", "");
+        if tag.is_empty() {
+            observed.add(name, "", total);
+            continue;
+        }
+        let mut tagged = 0;
+        for value in TAG_VALUES {
+            let n = telemetry_total(events, name, tag, value);
+            observed.add(name, value, n);
+            tagged += n;
+        }
+        prop_assert_eq!(tagged, total, "{} carries an unlisted {}", name, tag);
+    }
+    Ok(observed)
+}
+
+fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> {
+    let (resources, resource_class) = resource_pool();
+    let (scopes, scope_class) = scope_pool();
+    let registry = logit_core::Registry::new();
+    let mut agg = config.aggregator().with_telemetry(registry.telemetry_for(
+        "model",
+        "aggregate",
+        "transform",
+    ));
+    let mut model = Model::new(config);
+    let mut now = 0;
+    // Records `process` received since the last flush.
+    let mut metrics_in: u64 = 0;
+
+    for op in ops {
+        match op {
+            ModelOp::Batch { resource, scope, context: ctx, events } => {
+                agg.observe_scope(scopes[*scope].clone());
+                agg.observe_batch_context(context(*ctx));
+                for spec in events {
+                    metrics_in += spec.records.len() as u64;
+                    let original = spec.build();
+                    let mut event = spec.build();
+                    let kept = agg.process(&resources[*resource], &mut event);
+                    let forwarded =
+                        model.process(resource_class[*resource], scope_class[*scope], *ctx, spec);
+
+                    // (2) Forwarded records are untouched, in order, and `process` returns false
+                    // only when nothing is left.
+                    let expected: Vec<String> =
+                        forwarded.iter().map(|i| format!("{:?}", original.metrics[*i])).collect();
+                    let actual: Vec<String> =
+                        event.metrics.iter().map(|m| format!("{m:?}")).collect();
+                    prop_assert_eq!(actual, expected);
+                    let empty = spec.records.is_empty();
+                    prop_assert_eq!(kept, empty || !forwarded.is_empty() || spec.log);
+                }
+            }
+            ModelOp::Flush => {
+                now += 10;
+                let groups = {
+                    let mut classes: Vec<(usize, usize)> =
+                        model.series.iter().map(|s| (s.resource, s.scope)).collect();
+                    classes.sort_unstable();
+                    classes.dedup();
+                    classes.len()
+                };
+                let flushed = agg.flush(now);
+                let mut expected = model.flush();
+                let mut counts = std::mem::take(&mut model.counts);
+                counts.add(
+                    LINKS_DROPPED,
+                    "cardinality",
+                    expected.iter().map(|s| s.dropped_contexts).sum(),
+                );
+
+                // (1) and (3): one emitted series per model series, with its value, key,
+                // description, and links.
+                let mut emitted = 0;
+                for (resource, scope, events) in &flushed {
+                    let r = resources.iter().position(|x| Arc::ptr_eq(x, resource));
+                    let r = resource_class[r.expect("an emitted resource comes from the pool")];
+                    let s = match scope {
+                        None => 0,
+                        Some(scope) => {
+                            let i = scopes
+                                .iter()
+                                .position(|x| x.as_ref().is_some_and(|x| Arc::ptr_eq(x, scope)));
+                            scope_class[i.expect("an emitted scope comes from the pool")]
+                        }
+                    };
+                    for (event, links) in events {
+                        emitted += 1;
+                        prop_assert_eq!(event.timestamp, now);
+                        prop_assert!(event.log.is_none() && event.span.is_none());
+                        prop_assert_eq!(event.metrics.len(), 1);
+                        let record = &event.metrics[0];
+                        prop_assert_eq!(record.flags, 0);
+                        prop_assert_eq!(record.start_timestamp, 0, "no series is retained");
+                        let key = RefKey::of(record.name, record.unit, &event.attributes);
+                        let i = expected.iter().position(|m| {
+                            m.resource == r && m.scope == s && ref_key_eq(&m.key, &key)
+                        });
+                        prop_assert!(i.is_some(), "emitted {:?} is no model series", key);
+                        let series = expected.swap_remove(i.unwrap_or_default());
+                        prop_assert_eq!(record.description, series.description);
+                        check_emitted(&record.kind, &series.acc, config)?;
+                        let link_ids: Vec<[u8; 16]> = links.iter().map(|l| l.trace_id).collect();
+                        let model_ids: Vec<[u8; 16]> =
+                            series.contexts.iter().map(|c| context(*c).trace_id).collect();
+                        prop_assert_eq!(link_ids, model_ids);
+                    }
+                }
+                prop_assert!(expected.is_empty(), "model series not emitted: {:?}", expected);
+
+                // (4) and (5): gauges and counters.
+                let events = registry.drain(now);
+                prop_assert_eq!(
+                    telemetry_gauge(&events, "logit.transform.series.active"),
+                    Some(emitted as f64)
+                );
+                prop_assert_eq!(
+                    telemetry_gauge(&events, "logit.transform.series.retained"),
+                    Some(0.0)
+                );
+                prop_assert_eq!(
+                    telemetry_gauge(&events, "logit.transform.resource.groups"),
+                    Some(groups as f64)
+                );
+                let passed: u64 =
+                    TAG_VALUES.iter().map(|r| telemetry_total(&events, PASSED, "reason", r)).sum();
+                prop_assert_eq!(
+                    metrics_in,
+                    telemetry_total(&events, ABSORBED, "", "") + passed,
+                    "metrics_in == absorbed + passed_through"
+                );
+                metrics_in = 0;
+                prop_assert_eq!(observed_counts(&events)?, counts);
+                prop_assert!(agg.groups.is_empty(), "a tumbling flush leaves no group");
+            }
+        }
+    }
+    Ok(())
+}
+
+// -- Merge laws -------------------------------------------------------------------------------
+
+/// A kind family whose records merge with each other: 0 delta `Sum`, 1 `Samples`,
+/// 2 `Distribution`, 3 `Set`, 4 `SetMembers`, 5 delta `Histogram` (cumulative mode).
+const FAMILIES: usize = 6;
+
+fn family_kind(family: usize) -> BoxedStrategy<KindSpec> {
+    match family {
+        0 => (-1e12..1e12f64, any::<bool>())
+            .prop_map(|(value, monotonic)| {
+                KindSpec::Plain(MetricKind::Sum(Sum {
+                    value,
+                    temporality: Temporality::Delta,
+                    monotonic,
+                }))
+            })
+            .boxed(),
+        1 => samples().prop_map(|s| KindSpec::Plain(MetricKind::Samples(s))).boxed(),
+        2 => samples().prop_map(KindSpec::Dist).boxed(),
+        3 => members().prop_map(KindSpec::Set).boxed(),
+        4 => members().prop_map(|m| KindSpec::Plain(MetricKind::SetMembers(m))).boxed(),
+        _ => histogram(0, Temporality::Delta).prop_map(KindSpec::Plain).boxed(),
+    }
+}
+
+fn family_config(family: usize) -> BoxedStrategy<ModelConfig> {
+    let temporality =
+        if family == 5 { AggregateTemporality::Cumulative } else { AggregateTemporality::Delta };
+    (prop::option::of(1..=8usize), prop::option::of(1..=6usize))
+        .prop_map(move |(samples_cap, members_cap)| ModelConfig {
+            temporality,
+            samples_cap,
+            members_cap,
+        })
+        .boxed()
+}
+
+/// What one series emits after absorbing `kinds` in order, one record per event.
+fn emit_one(config: ModelConfig, kinds: &[MetricKind]) -> Result<MetricKind, TestCaseError> {
+    let resource = Arc::new(Resource::default());
+    let mut agg = config.aggregator();
+    for kind in kinds {
+        let mut event =
+            Event::metric(0, AttrMap::new(), MetricRecord::new(intern("m"), kind.clone()));
+        prop_assert!(!agg.process(&resource, &mut event), "{:?} is absorbed", kind);
+    }
+    let mut flushed = agg.flush(10);
+    prop_assert_eq!(flushed.len(), 1);
+    let (_, _, mut events) = flushed.remove(0);
+    prop_assert_eq!(events.len(), 1);
+    let (mut event, _) = events.remove(0);
+    Ok(event.metrics.remove(0).kind)
+}
+
+/// `Σ|vᵢ|` over the operands' values (each weighted, for a sample), the scale a rounding bound
+/// is taken against.
+fn magnitude(specs: &[KindSpec]) -> f64 {
+    let weighted = |s: &Samples| {
+        let w = ref_weight(s.sample_rate) as f64;
+        s.values.iter().filter(|v| v.is_finite()).map(|v| (v * w).abs()).sum::<f64>()
+    };
+    specs
+        .iter()
+        .map(|spec| match spec {
+            KindSpec::Plain(MetricKind::Sum(s)) => s.value.abs(),
+            KindSpec::Plain(MetricKind::Histogram(h)) => h.sum.map_or(0.0, f64::abs),
+            KindSpec::Plain(MetricKind::Samples(s)) | KindSpec::Dist(s) => weighted(s),
+            _ => 0.0,
+        })
+        .sum()
+}
+
+/// Two emissions of one population are equal by the ADR's merge-law equality. `n` operands were
+/// folded, and `scale` is `Σ|vᵢ|` for the rounding bound.
+fn law_eq(x: &MetricKind, y: &MetricKind, n: usize, scale: f64) -> Result<(), TestCaseError> {
+    let rounding = (n.saturating_sub(1)) as f64 * f64::EPSILON * scale;
+    let close = |a: f64, b: f64| {
+        if n <= 2 {
+            same_f64(a, b)
+        } else {
+            same_f64(a, b) || (a - b).abs() <= rounding
+        }
+    };
+    match (x, y) {
+        (MetricKind::Sum(a), MetricKind::Sum(b)) => {
+            prop_assert!(close(a.value, b.value), "{} against {}", a.value, b.value);
+        }
+        (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
+            prop_assert_eq!(a.mapping(), b.mapping());
+            prop_assert_eq!(a.positive_bins(), b.positive_bins());
+            prop_assert_eq!(a.negative_bins(), b.negative_bins());
+            prop_assert_eq!(a.zero_count(), b.zero_count());
+            prop_assert_eq!(a.count(), b.count());
+            prop_assert_eq!(a.min(), b.min());
+            prop_assert_eq!(a.max(), b.max());
+            let tolerance = 1e-9 * scale.max(1.0);
+            prop_assert!((a.sum() - b.sum()).abs() <= tolerance, "{} against {}", a.sum(), b.sum());
+        }
+        (MetricKind::Samples(a), MetricKind::Samples(b)) => {
+            prop_assert_eq!(a.sample_rate.to_bits(), b.sample_rate.to_bits());
+            let sorted = |v: &[f64]| {
+                let mut bits: Vec<u64> = v.iter().map(|x| x.to_bits()).collect();
+                bits.sort_unstable();
+                bits
+            };
+            prop_assert_eq!(sorted(&a.values), sorted(&b.values));
+        }
+        (MetricKind::Set(a), MetricKind::Set(b)) => prop_assert_eq!(a.estimate(), b.estimate()),
+        (MetricKind::SetMembers(a), MetricKind::SetMembers(b)) => {
+            let set = |m: &[Bytes]| m.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            prop_assert_eq!(a.len(), b.len());
+            prop_assert_eq!(set(a), set(b));
+        }
+        (MetricKind::Histogram(a), MetricKind::Histogram(b)) => {
+            prop_assert_eq!(&a.buckets, &b.buckets);
+            match (a.sum, b.sum) {
+                (Some(sa), Some(sb)) => prop_assert!(close(sa, sb), "{} against {}", sa, sb),
+                (sa, sb) => prop_assert_eq!(sa, sb),
+            }
+            prop_assert!(
+                same_opt(a.min, b.min) && same_opt(a.max, b.max),
+                "{:?} against {:?}",
+                a,
+                b
+            );
+        }
+        (x, y) => prop_assert!(false, "{:?} against {:?}", x, y),
+    }
+    Ok(())
+}
+
+fn laws_input() -> impl Strategy<Value = (ModelConfig, Vec<KindSpec>)> {
+    (0..FAMILIES).prop_flat_map(|family| {
+        (family_config(family), prop::collection::vec(family_kind(family), 2..=4))
+    })
+}
+
+/// Ten distinct contexts on one series in one window: the model and the aggregator both keep the
+/// first eight as links and count two dropped.
+#[test]
+fn the_model_caps_links_per_series() {
+    let gauge = RecordSpec {
+        name: "m0",
+        unit: None,
+        description: None,
+        kind: KindSpec::Plain(MetricKind::Gauge(1.0)),
+        no_recorded_value: false,
+    };
+    let event = EventSpec { timestamp: 0, attributes: 0, records: vec![gauge], log: false };
+    let config = ModelConfig {
+        temporality: AggregateTemporality::Delta,
+        samples_cap: None,
+        members_cap: None,
+    };
+    let mut ops: Vec<ModelOp> = (0..CONTEXTS)
+        .map(|context| ModelOp::Batch {
+            resource: 0,
+            scope: 0,
+            context,
+            events: vec![event.clone()],
+        })
+        .collect();
+    ops.push(ModelOp::Flush);
+    if let Err(e) = run_model(config, &ops) {
+        panic!("{e}");
+    }
+}
+
+proptest! {
+    #![proptest_config(config(128))]
+
+    /// The model's expectations hold for every emitted series and counter, over random batches
+    /// and flushes under every mode.
+    #[test]
+    fn aggregator_matches_the_reference_model(
+        config in model_config(),
+        ops in prop::collection::vec(model_op(), 1..=60),
+    ) {
+        run_model(config, &ops)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// Absorbing one window's records in reverse order emits an equal value.
+    #[test]
+    fn merge_is_order_independent_within_a_window((config, specs) in laws_input()) {
+        let kinds: Vec<MetricKind> = specs.iter().map(KindSpec::build).collect();
+        let reversed: Vec<MetricKind> = kinds.iter().rev().cloned().collect();
+        let forward = emit_one(config, &kinds)?;
+        let backward = emit_one(config, &reversed)?;
+        law_eq(&forward, &backward, kinds.len(), magnitude(&specs))?;
+    }
+
+    /// In delta mode, a relay of two stages (`a`, `b` through the first; its output and `c`
+    /// through the second) emits what one stage absorbing `a`, `b`, and `c` does.
+    #[test]
+    fn a_relay_of_two_stages_matches_one_stage(
+        (config, specs) in (0..FAMILIES - 1).prop_flat_map(|family| {
+            (family_config(family), prop::collection::vec(family_kind(family), 3))
+        }),
+    ) {
+        let kinds: Vec<MetricKind> = specs.iter().map(KindSpec::build).collect();
+        let direct = emit_one(config, &kinds)?;
+        let upstream = emit_one(config, &kinds[..2])?;
+        let relayed = emit_one(config, &[upstream, kinds[2].clone()])?;
+        law_eq(&direct, &relayed, 3, magnitude(&specs))?;
+    }
+
+    /// A relay of gauges agrees with one stage when every upstream timestamp is at or before the
+    /// first stage's flush and the later record's is at or after it.
+    #[test]
+    fn a_gauge_relay_matches_one_stage_when_the_later_record_follows_the_flush(
+        a in scalar(), b in scalar(), c in scalar(),
+        ta in 0..=10i64, tb in 0..=10i64, tc in 10..=15i64,
+    ) {
+        let resource = Arc::new(Resource::default());
+        let gauge = |v: f64, ts: i64| {
+            Event::metric(ts, AttrMap::new(), MetricRecord::new(intern("g"), MetricKind::Gauge(v)))
+        };
+        let emitted = |agg: &mut Aggregator, now: i64| {
+            let (_, _, mut events) = agg.flush(now).remove(0);
+            let (mut event, _) = events.remove(0);
+            (event.timestamp, event.metrics.remove(0).kind)
+        };
+
+        let mut direct = Aggregator::new(Duration::from_secs(10));
+        for mut event in [gauge(a, ta), gauge(b, tb), gauge(c, tc)] {
+            direct.process(&resource, &mut event);
+        }
+        let (_, direct) = emitted(&mut direct, 20);
+
+        let mut first = Aggregator::new(Duration::from_secs(10));
+        for mut event in [gauge(a, ta), gauge(b, tb)] {
+            first.process(&resource, &mut event);
+        }
+        let (now1, relayed) = emitted(&mut first, 10);
+        let MetricKind::Gauge(relayed) = relayed else { unreachable!() };
+        let mut second = Aggregator::new(Duration::from_secs(10));
+        for mut event in [gauge(relayed, now1), gauge(c, tc)] {
+            second.process(&resource, &mut event);
+        }
+        let (_, relayed) = emitted(&mut second, 20);
+        match (direct, relayed) {
+            (MetricKind::Gauge(x), MetricKind::Gauge(y)) => {
+                prop_assert!(same_f64(x, y) && same_f64(x, c), "{} and {} against {}", x, y, c);
+            }
+            other => prop_assert!(false, "{:?}", other),
+        }
+    }
+}
+
+// -- Order-dependent outcomes -----------------------------------------------------------------
+//
+// The ADR's "depend on order by design" list, pinned as examples. `aggregate`'s own tests pin
+// the gauge-and-delta interleavings (`absolute_then_delta_adds_to_the_absolute`,
+// `delta_then_absolute_is_subsumed_by_the_absolute`,
+// `a_delta_never_advances_the_last_write_wins_timestamp`) and the first record's `monotonic`
+// (`sum_merge_carries_the_first_records_monotonic_flag`).
+
+/// What one series emits from `kinds` at `timestamps`, and the records `process` forwarded.
+fn run_order(agg: Aggregator, records: &[(MetricKind, i64)]) -> (Vec<MetricKind>, Vec<MetricKind>) {
+    let mut agg = agg;
+    let resource = Arc::new(Resource::default());
+    let mut forwarded = Vec::new();
+    for (kind, ts) in records {
+        let mut event =
+            Event::metric(*ts, AttrMap::new(), MetricRecord::new(intern("m"), kind.clone()));
+        agg.process(&resource, &mut event);
+        forwarded.extend(event.metrics.into_iter().map(|m| m.kind));
+    }
+    let emitted = agg
+        .flush(100)
+        .into_iter()
+        .flat_map(|(_, _, events)| events)
+        .map(|(mut event, _)| event.metrics.remove(0).kind)
+        .collect();
+    (emitted, forwarded)
+}
+
+#[test]
+fn a_gauge_tie_goes_to_the_later_arrival() {
+    for (first, second) in [(1.0, 2.0), (2.0, 1.0)] {
+        let records = [(MetricKind::Gauge(first), 3), (MetricKind::Gauge(second), 3)];
+        let (emitted, _) = run_order(Aggregator::new(Duration::from_secs(10)), &records);
+        assert_eq!(emitted, vec![MetricKind::Gauge(second)]);
+    }
+}
+
+#[test]
+fn a_kind_conflict_keeps_the_first_arrival() {
+    let (gauge, counter) = (MetricKind::Gauge(1.0), MetricKind::counter(2.0));
+    for (first, second) in [(gauge.clone(), counter.clone()), (counter, gauge)] {
+        let records = [(first.clone(), 0), (second.clone(), 0)];
+        let (emitted, forwarded) = run_order(Aggregator::new(Duration::from_secs(10)), &records);
+        assert_eq!((emitted, forwarded), (vec![first], vec![second]));
+    }
+}
+
+#[test]
+fn a_histogram_bounds_mismatch_keeps_the_first_arrival() {
+    let histogram = |bound: f64| {
+        MetricKind::Histogram(logit_core::Histogram {
+            buckets: vec![(bound, 1), (f64::INFINITY, 0)],
+            temporality: Temporality::Delta,
+            sum: None,
+            min: None,
+            max: None,
+        })
+    };
+    for (first, second) in [(1.0, 2.0), (2.0, 1.0)] {
+        let agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative);
+        let (emitted, forwarded) = run_order(agg, &[(histogram(first), 0), (histogram(second), 0)]);
+        let MetricKind::Histogram(h) = &emitted[0] else { panic!("{emitted:?}") };
+        assert_eq!(h.buckets[0], (first, 1));
+        assert_eq!(forwarded, vec![histogram(second)]);
+    }
+}
+
+/// A series opens with an empty sketch that adopts the first record's mapping; a later record
+/// under another mapping is re-binned into it. `Mapping::logarithmic` is what Datadog APM stats
+/// carry.
+#[test]
+fn a_sketch_series_takes_the_first_records_mapping() {
+    let logarithmic = logit_core::Mapping::logarithmic(1.02, 0.0, 2048);
+    let sketch = |mapping: logit_core::Mapping| {
+        let mut sketch = logit_core::DdSketch::with_mapping(mapping);
+        for v in [1.0, 10.0, 100.0] {
+            sketch.add(v);
+        }
+        MetricKind::Distribution(sketch)
+    };
+    let agent = logit_core::Mapping::agent();
+    for (first, second) in [(agent, logarithmic), (logarithmic, agent)] {
+        let records = [(sketch(first), 0), (sketch(second), 0)];
+        let (emitted, _) = run_order(Aggregator::new(Duration::from_secs(10)), &records);
+        let MetricKind::Distribution(merged) = &emitted[0] else { panic!("{emitted:?}") };
+        assert_eq!(*merged.mapping(), first);
+        assert_eq!(merged.count(), 6);
+    }
+}
+
+/// Finding G: a cumulative histogram's `sum` that one window lacked stays `None` for the rest of
+/// the series' life, because a later window's sum can't restore the missing contribution.
+#[test]
+fn a_histogram_sum_once_none_stays_none_across_windows() {
+    let histogram = |sum: Option<f64>| {
+        let kind = MetricKind::Histogram(logit_core::Histogram {
+            buckets: vec![(1.0, 1), (f64::INFINITY, 0)],
+            temporality: Temporality::Delta,
+            sum,
+            min: None,
+            max: None,
+        });
+        Event::metric(0, AttrMap::new(), MetricRecord::new(intern("h"), kind))
+    };
+    let resource = Arc::new(Resource::default());
+    let mut agg = Aggregator::new(Duration::from_secs(10))
+        .with_temporality(AggregateTemporality::Cumulative)
+        .with_series_retention(5, 100);
+    let mut sums = Vec::new();
+    for (now, sum) in [(10, Some(1.0)), (20, None), (30, Some(2.0))] {
+        agg.process(&resource, &mut histogram(sum));
+        let (_, _, mut events) = agg.flush(now).remove(0);
+        let (mut event, _) = events.remove(0);
+        let MetricKind::Histogram(h) = event.metrics.remove(0).kind else { panic!() };
+        sums.push(h.sum);
+    }
+    assert_eq!(sums, vec![Some(1.0), None, None]);
 }

@@ -1439,7 +1439,7 @@ fn aggregate_flush_retained_gauges() {
 /// `temporality: cumulative`'s flush cost (`docs/adr/aggregation-window-semantics.md`'s cumulative
 /// amendment): [`aggregate_flush_retained_gauges`]'s 100 series, spilled maps, and second flush,
 /// with a retained delta `Sum` in place of a `Gauge`. The same 209 is the finding: a retained `Sum`
-/// reports through the same copy-then-keep path (`Accumulator::kind_for_retained`, `Copy` fields
+/// reports through the same copy-then-keep path (`Accumulator::retained_kind`, `Copy` fields
 /// both), so cumulative counters cost nothing beyond gauge retention. A cumulative `Histogram`
 /// would add one bucket-`Vec` clone per series per flush; it has no fixture yet.
 #[test]

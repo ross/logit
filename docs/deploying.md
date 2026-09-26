@@ -1306,7 +1306,7 @@ sample or set member doesn't share (see
 - `logit.transform.samples.weight_clamped` (count): a `sample_rate` implying a weight beyond
   `Samples::MAX_WEIGHT` (1000, that is `@0.001`) was clamped instead of extrapolated without bound.
   It fires in both `distributions` modes (the sketch-mode absorb and the `samples`-mode fallback's
-  re-sketch). `aggregate` is the only place the `sample_rate_clamped` diagnostic fires; `statsd_in`
+  re-sketch, which reports the records the series held as well as the incoming one). `aggregate` is the only place the `sample_rate_clamped` diagnostic fires; `statsd_in`
   doesn't emit it ([ADR `lossless-transit`](adr/lossless-transit.md), W3).
 
 ## Measuring a flow's shape with `shape`
