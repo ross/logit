@@ -137,7 +137,8 @@ sources, found:
      set forced a full collection on every batch, 76% of one measured run. Forced verdicts run at
      most once per second, or ten times the last one's duration if longer, and count as
      `logit.script.vm.gc.forced` with a `.gc.duration` timing. An over-cap reading inside that
-     window is skipped and the verdict deferred to the window's end, which the loop wakes for even
+     window is skipped and the verdict deferred to the window's end, or to the inbox closing if that
+     comes first, rate limit or not; the loop wakes for the window's end even
      with no batch arriving. The check runs after the batch's or `flush()`'s send, with the
      heartbeat idle, so the batch that crossed the cap reaches downstream rather than vanishing
      uncounted; the batches still in the node's inbox are counted as a revoked inbox's are. A
@@ -362,7 +363,8 @@ Filled in as each workstream lands.
   `a_lua_node_over_max_memory_fails_the_run_as_runtime_naming_it`,
   `garbage_over_max_memory_is_collected_before_the_node_is_failed`,
   `max_memory_is_checked_after_flush_too`, `a_memory_verdict_is_rate_limited`,
-  `a_skipped_verdict_runs_once_the_window_ends_with_no_batch_arriving`, and
+  `a_skipped_verdict_runs_once_the_window_ends_with_no_batch_arriving`,
+  `a_deferred_verdict_still_runs_when_the_inbox_closes_inside_the_window`, and
   `thread_outcome_reports_a_panic_payload_as_a_message`. Each new test failed first against a
   mutation of the behavior it pins (no verdict, no collection before it, no rate limit, no
   sticky trip, one pass only, no inbox sweep, a memory failure logged as a panic). CORE-15

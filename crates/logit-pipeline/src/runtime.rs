@@ -1789,7 +1789,9 @@ const MIN_VERDICT_SPACING: Duration = Duration::from_secs(1);
 /// batch, since the incremental collector lets garbage reach that much before a cycle ends. A
 /// skipped reading defers the verdict to the end of the window ([`MemoryVerdict::deferred_until`]),
 /// which [`run_lua_loop`] wakes for even with no batch arriving, so a node left over the cap by
-/// its last batch still fails within the window.
+/// its last batch still fails within the window. When the inbox closes first, the pending verdict
+/// runs then, rate limit or not ([`MemoryVerdict::check_at_close`]): a deferral never outlives the
+/// node.
 struct MemoryVerdict {
     cap: usize,
     next_allowed: Option<std::time::Instant>,
@@ -1815,12 +1817,36 @@ impl MemoryVerdict {
         telemetry: &Telemetry,
         diag: &Diagnostics,
     ) -> Result<(), String> {
+        self.run(worker, telemetry, diag, false)
+    }
+
+    /// The inbox has closed: a deferred verdict runs now, rate limit or not, since no later wake
+    /// is coming. Without one pending, the last `check` already decided.
+    fn check_at_close(
+        &mut self,
+        worker: &ScriptWorker,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+    ) -> Result<(), String> {
+        match self.deferred {
+            true => self.run(worker, telemetry, diag, true),
+            false => Ok(()),
+        }
+    }
+
+    fn run(
+        &mut self,
+        worker: &ScriptWorker,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+        bypass_limit: bool,
+    ) -> Result<(), String> {
         if worker.used_memory() <= self.cap {
             self.deferred = false;
             return Ok(());
         }
         let started = std::time::Instant::now();
-        if self.next_allowed.is_some_and(|next| started < next) {
+        if !bypass_limit && self.next_allowed.is_some_and(|next| started < next) {
             self.deferred = true;
             return Ok(());
         }
@@ -2039,6 +2065,9 @@ fn run_lua_loop(
                 {
                     return Err(message);
                 }
+            }
+            if let Some(verdict) = verdict.as_mut() {
+                verdict.check_at_close(&worker, &telemetry, &diag)?;
             }
             return Ok(());
         };
@@ -7536,6 +7565,42 @@ mod tests {
             "the second verdict waits out the window: {:?}",
             run.elapsed
         );
+    }
+
+    /// An inbox that closes inside the rate-limit window doesn't take a deferred verdict with it:
+    /// the verdict runs at close, with or without a close-time `flush()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_verdict_still_runs_when_the_inbox_closes_inside_the_window() {
+        // The first batch leaves ~6 MiB of garbage (its verdict passes and opens a window); the
+        // second keeps ~8 MiB, over the 4 MiB cap inside that window; then the input finishes.
+        let script = r#"
+            kept = {}
+            calls = 0
+            function process(event)
+                calls = calls + 1
+                local t, n = kept, 8000
+                if calls == 1 then t, n = {}, 6000 end
+                for i = 1, n do t[#t + 1] = string.rep(string.format("%10d", i), 100) end
+                return event
+            end
+            function flush(now) end
+        "#;
+        for (id, interval) in
+            [("mem_close_plain", None), ("mem_close_flush", Some(Duration::from_secs(3600)))]
+        {
+            let input =
+                FiniteBurstInput { batches: vec![counter_batch_of(1), counter_batch_of(1)] };
+            let run = run_under_max_memory(id, script, interval, 4 << 20, Box::new(input)).await;
+
+            let err = run.result.as_ref().expect_err("the deferred verdict runs at close");
+            assert!(matches!(err, RunError::Runtime(_)), "{id}: {err:?}");
+            assert!(err.to_string().contains(&format!("component '{id}'")), "{err}");
+            assert!(err.to_string().contains("over max_memory 4194304"), "{err}");
+            assert_eq!(run.delivered, 2, "{id}");
+            assert_eq!(run.gc_forced(), 2.0, "{id}: the first batch's verdict, then the close one");
+            assert!(run.elapsed < MIN_VERDICT_SPACING, "{id}: no wait for the window");
+            assert_eq!(run.state, Some(NodeState::Failed), "{id}");
+        }
     }
 
     /// Never completes a send, so its store fills and its inbox backs up.
