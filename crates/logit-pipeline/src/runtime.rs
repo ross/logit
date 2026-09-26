@@ -1558,21 +1558,34 @@ fn lock_io(io: &SharedLuaIo) -> std::sync::MutexGuard<'_, Option<LuaIo>> {
     io.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Drops a wedged node's channels, first counting what its inbox still held as
+/// How long [`revoke_lua_io`] waits for upstream permit holders to finish sending into a revoked
+/// inbox before it stops counting.
+const REVOKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Drops a wedged node's channels, counting what its inbox still held as
 /// `batches.dropped`/`events.dropped{reason="shutdown"}` under the node's own id, as `run_output`
 /// counts an abandoned sink inbox. Dropping a `Receiver` destroys its buffered batches, and no
 /// `Fanout` counts them: the upstream sends already succeeded.
-fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry) {
+///
+/// The outbound edges go first, so the downstream cascade starts at once. `close` fails every
+/// later send (counted `closed_consumer` upstream) but not one whose `Permit` was reserved
+/// before it, which `Fanout::send_with_deadline` can hold across an await; so the sweep receives
+/// until `recv` returns `None`, which it does once the buffer is empty and every permit is
+/// released. A permit still unreleased after [`REVOKE_DRAIN_TIMEOUT`] (its holder blocked on
+/// another consumer) stops the wait, and a batch it sends later is destroyed uncounted.
+async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry) {
     let LuaIo { mut inbox, fanout, target_fanouts } = io;
-    // Closed first, so a send racing the sweep fails (and is counted `closed_consumer` upstream)
-    // instead of landing after the last `try_recv`.
+    drop((fanout, target_fanouts));
     inbox.close();
     let mut batches: u64 = 0;
     let mut events: u64 = 0;
-    while let Ok(delivered) = inbox.try_recv() {
-        batches += 1;
-        events += unwrap_batch_arc(delivered).events.len() as u64;
-    }
+    let _ = tokio::time::timeout(REVOKE_DRAIN_TIMEOUT, async {
+        while let Some(delivered) = inbox.recv().await {
+            batches += 1;
+            events += unwrap_batch_arc(delivered).events.len() as u64;
+        }
+    })
+    .await;
     if batches > 0 {
         telemetry.count(
             "logit.component.batches.dropped",
@@ -1581,7 +1594,6 @@ fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry) {
         );
         telemetry.count("logit.component.events.dropped", events as f64, &[("reason", "shutdown")]);
     }
-    drop((inbox, fanout, target_fanouts));
 }
 
 /// A Lua node's `JoinSet` entry: waits on the thread's `done` report (see `run_lua`) and watches
@@ -1694,19 +1706,23 @@ async fn watch_lua_thread(
                 }
                 // Not blocking: the thread holds the lock only while not busy, so a failed
                 // `try_lock` means it left the call since `read()` above; look again next tick.
-                let mut guard = match io.try_lock() {
-                    Ok(guard) => guard,
-                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                // Scoped so the guard is gone before the sweep's `.await`: a `std` guard held
+                // across it would make this future `!Send`.
+                let revoked = {
+                    let mut guard = match io.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => continue,
+                    };
+                    // The thread can leave the call between `read()` and the lock; that is
+                    // progress.
+                    if heartbeat.read() != last_value {
+                        continue;
+                    }
+                    guard.take()
                 };
-                // The thread can leave the call between `read()` and the lock; that is progress.
-                if heartbeat.read() != last_value {
-                    continue;
-                }
-                let revoked = guard.take();
-                drop(guard);
                 if let Some(io) = revoked {
-                    revoke_lua_io(io, &telemetry);
+                    revoke_lua_io(io, &telemetry).await;
                 }
                 let elapsed = now.duration_since(signalled);
                 return Err(anyhow::anyhow!(
@@ -6217,6 +6233,15 @@ mod tests {
         done_rx: oneshot::Receiver<Result<(), String>>,
         config: LuaRuntimeConfig,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        spawn_watcher_with_telemetry(rig, done_rx, config, Telemetry::default())
+    }
+
+    fn spawn_watcher_with_telemetry(
+        rig: &WatcherRig,
+        done_rx: oneshot::Receiver<Result<(), String>>,
+        config: LuaRuntimeConfig,
+        telemetry: Telemetry,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         tokio::spawn(watch_lua_thread(
             "enrich".to_string(),
             done_rx,
@@ -6225,7 +6250,7 @@ mod tests {
             config,
             rig.shutdown_tx.subscribe(),
             rig.readiness.clone(),
-            Telemetry::default(),
+            telemetry,
             Diagnostics::new("enrich"),
         ))
     }
@@ -6351,6 +6376,47 @@ mod tests {
         assert!(message.contains("still inside process()/flush()"), "{message}");
         assert!(lock_io(&rig.io).is_none(), "the watcher took the node's I/O");
         assert!(rig.inbox_tx.is_closed(), "and dropping it closed the node's inbox");
+    }
+
+    /// A send whose permit was reserved before revocation still lands after `close`, and must be
+    /// drained and counted, not destroyed with the `Receiver`.
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_reserved_before_revocation_is_drained_and_counted() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig {
+            stall_after: Duration::from_secs(10),
+            shutdown_grace: Duration::from_millis(100),
+        };
+        let registry = Registry::new();
+        let (_done_tx, done_rx) = oneshot::channel();
+        let watcher = spawn_watcher_with_telemetry(
+            &rig,
+            done_rx,
+            config,
+            registry.telemetry_for("enrich", "x", "x"),
+        );
+        let permit = rig.inbox_tx.reserve().await.expect("the inbox is open and empty");
+
+        rig.heartbeat.enter();
+        rig.shutdown_tx.send(true).unwrap();
+        // Past the grace, so the watcher has revoked and is waiting on the outstanding permit.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!watcher.is_finished(), "the sweep waits for a reserved permit");
+        permit.send(counter_batch(1.0));
+
+        watcher.await.unwrap().expect_err("a wedge is an error");
+        let drained = registry.drain(0);
+        assert_eq!(
+            counter_sum(
+                &drained,
+                "enrich",
+                "logit.component.events.dropped",
+                Some(("reason", "shutdown"))
+            ),
+            1.0,
+            "the batch sent through the pre-reserved permit is counted"
+        );
+        assert!(rig.inbox_tx.is_closed());
     }
 
     #[tokio::test(start_paused = true)]
