@@ -4,9 +4,9 @@
 Enterprise container, or a Splunk Cloud stack in [Splunk Cloud mode](#splunk-cloud-mode), then
 probes that Splunk directly for what
 [`docs/plans/splunk-relay.md`](../../docs/plans/splunk-relay.md) listed as unverified. It prints
-one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a run; the
-plan's "Settled by W5" section and ADR `splunk-hec-relay`'s W5 amendment carry
-the decisions it settled.
+one row per leg and one per probe. [What the run showed](#what-the-run-showed) records a Splunk
+Enterprise run and a Splunk Cloud run; the plan's "Settled by W5" and "Settled by the Cloud run"
+sections and ADR `splunk-hec-relay`'s two amendments carry the decisions they settled.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/victoria-interop` and `script/record-fixtures`. It isn't part of `script/cibuild`, and no
@@ -164,9 +164,15 @@ stack a crashed run left behind.
 
 ## What the run showed
 
+### Splunk Enterprise 10.4.3 (2026-09-25)
+
 A run on 2026-09-25 against `splunk/splunk:10.4.3` (build `4174a2deda5d`), `logit` built from
 this branch, `SPLUNK_INTEROP_WINDOW=60`. Every leg passed; the probe rows are what Splunk
-answered. The recording of the `[tcpout]` capture is described but not committed: see its row.
+answered. A second run on 2026-09-26 added the probes the Vector comparison asked for (`/health`
+and the token, `event` with no content, `time` forms, the envelope across objects, `/raw` line
+merging, index-time props, and the `useACK` polls past the first id); every leg passed again, and
+the earlier probes answered as before. The recording of the `[tcpout]` capture is described but
+not committed: see its row.
 
 | Leg | Result | What Splunk held |
 |---|---|---|
@@ -179,42 +185,71 @@ answered. The recording of the `[tcpout]` capture is described but not committed
 | Probe | Splunk 10.4.3's answer |
 |---|---|
 | `max_content_length` | `limits.conf [http_input] max_content_length = 838860800` (800 MiB) |
+| `/health` and the token | `GET /health` and `/health/1.0`: `200` `{"text":"HEC is healthy","code":17}` with no token, the token, and a bogus token alike. Neither checks the token |
 | gzip | `Content-Encoding: gzip` on `/event` and `/raw`: `200`, indexed. `deflate`: `415` with an HTML body |
 | code 6 | A syntax error in object 1 of 3: `400` `{"text":"Invalid data format","code":6,"invalid-event-number":1}`; object 0 indexed, objects 1 and 2 not. In object 0: `invalid-event-number` 0, nothing indexed |
 | other per-object errors | A blank `event` (code 13), `fields` with a nested object (code 15), and an object with neither `event` nor `fields` (code 12), each in object 1 of 3: `400` naming 1, object 0 indexed, the rest not. An index the token doesn't allow in object 1 (code 7): `400` naming 2, object 0 indexed, the rest not |
 | lenient cases | An object with `fields` and no `event`: `200`, skipped, the others indexed (as a metric when `fields` carry a measurement). An unknown envelope key in object 1 of 3: `200`, but only object 0 indexed; in a body's only object: `400` code 5 `No data` |
+| `event` with no content | `{}` and `[]`: `200`, indexed with `_raw` `{}` and `[]`. `0`: `200`, indexed as `0`. `" "`: `400` code 13 `Event field cannot be blank`. `null` and `false`: `400` code 6 `Invalid data format`. Each refused object: nothing indexed |
+| `time` forms | Integer seconds, integer milliseconds (13 digits), integer nanoseconds (19 digits), a decimal string, and a float with nanosecond digits: all `200`. Splunk reads the 13- and 19-digit integers by magnitude, as milliseconds and nanoseconds, not as seconds. `printf("%.9f", _time)` gives `.000000000` for seconds, `.123000000` for the 13-digit integer, and `.123456700` for the 19-digit integer, the decimal string, and the float; `strftime` with `%9N` gives `.123456000` for those three. Splunk kept seven fractional digits of a nanosecond `time`, and its `strftime` rendered six |
+| envelope across objects | `host`, `index`, `source`, `sourcetype`, and `time` on object 0 of 3 only: objects 1 and 2 get the token's defaults (`main`, host `splunk:8088`, source `http:splunk_hec_token`, sourcetype `httpevent`, receipt time), not object 0's. On object 2 only: the same, for objects 0 and 1. No field carries from one object to the next |
+| `/raw` line merging | Under a sourcetype with no props, three lines (LF-terminated, CRLF-terminated, without a trailing newline, or with an indented second line) each become one event of three lines: the default `SHOULD_LINEMERGE=true` merges lines that carry no timestamp. CRLF is stored as LF |
+| index-time props, `/raw` and `/event` | One line under the `logit:ta` sourcetype: on `/raw`, routed to `tcpout_probe`, renamed to `logit:ta:renamed`, and `_time` from its `ts=` prefix. On `/event`, the same index routing and renaming, but `_time` the receipt time: `/event` runs `TRANSFORMS-*` and skips timestamp extraction. `/event?auto_extract_timestamp=true` extracts `_time` from the line as `/raw` does |
 | metric forms | No `event` with a string measurement (SC4S's shape), and the single-metric `metric_name`/`_value` pair: both `200` and stored as metrics |
 | `metric_type` | An ordinary dimension: `mcatalog values(metric_type)` lists it and `mstats … by metric_type` groups by it; a `Sum`'s value is stored as sent |
 | dimensions | 200 and 1,000 dimensions on one metric event: `200`, and `mcatalog` sees all of them (201 and 1,001 with the probe's own) |
 | `OPTIONS` | Every route: `200`, empty body, no token needed, `Allow: POST,OPTIONS` (`GET,HEAD,OPTIONS` on `/health`) |
 | HTTP errors | Unknown path: `404` `{"text":"The requested URL was not found on this server.","code":404}`; `GET` on `/event`: `405` with the same body |
 | `/raw` without a channel | On a token without `useACK`: `200` |
-| `useACK` | No channel: `400` code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1` (the key is `ackId`, ids count from 0 per channel). The id polled `true` within about a second; the same id polled on another channel: `false` |
+| `useACK` | No channel: `400` code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1` (the key is `ackId`, ids count from 0 per channel); a second channel's first: `ackId` 0. The first channel polled for `[0, 1, 5]`: `{"0":true,"1":true,"5":false}` within a second, and the same poll again: `{"0":false,"1":false}`, since Splunk forgets an id once it has answered `true`. The second channel polled for `[0, 1]`: `{"0":true,"1":false}`. A new channel polled for `[0]`: `false` |
 | `[tcpout] sendCookedData=false` | Each event's `_raw` followed by one LF, nothing else: no header, no length, no metadata. An event with an embedded newline arrives as two lines; a JSON `event` as its JSON text; a `/raw` body's lines one each. Splunk forwarded its own logs from every index too, whatever `defaultGroup` (unset) and the `forwardedindex` filters (tried: only `tcpout_probe`) said, so the capture isn't committed: it is mostly Splunk's `_internal` and `_introspection` data |
 
-A run on 2026-09-26 against `splunk/splunk:10.4.3`, `SPLUNK_INTEROP_WINDOW=60`, with the probes
-the Vector comparison asked for. Every leg passed, and the earlier probes answered as above.
+### Splunk Cloud Platform 10.5.2605.9 (2026-09-26)
 
-| Probe | Splunk 10.4.3's answer |
+Two runs on 2026-09-26 with `SPLUNK_INTEROP_TARGET=cloud` against a Splunk Cloud Platform trial
+stack (stack name redacted), which Splunk Web reports as `Splunk 10.5.2605.9`, `logit` built from
+this branch, `SPLUNK_INTEROP_HEC_INSECURE=true`, and an ack token. A trial has no REST API (`:8089`
+times out), so the runs searched nothing (`SPLUNK_INTEROP_SEARCH=none`) and every leg's row was
+`SENT`: every `/event` request answered `2xx`, nothing dropped, and no ack `timeout` or
+`unsupported`. Arrival was confirmed afterward by searching in Splunk Web with `search.spl`'s
+queries. The tables record the second run: its counts come from a search bounded to what it indexed
+(`_index_earliest` set to the run's start), and the field-level detail from the same search over the
+first run's data. The two runs' probes answered identically. What Splunk held matched the 10.4.3 run
+in every leg. A third run the same day, with every leg `SENT`, added the probes the Vector
+comparison asked for, their indexing checked the same way in Splunk Web; every searched one
+answered as Enterprise 10.4.3 did.
+
+| Leg | Result | What Splunk held |
+|---|---|---|
+| `hec-logs` | PASS | 100 events, host `splunk-interop-logit`, source `splunk-interop`, `otel.log.severity.text` `Warn` and `.number` `13`, `detail.stage` `mint`, `detail.ok` `true`, and `leg` `hec-logs`, all as indexed fields (`stats` groups by them) |
+| `hec-metrics` | PASS | 21 series `splunk_interop.*` with `metric_type` `Gauge`, `Histogram`, `Sum`, and `Summary`; the histogram's buckets `le` `0.1`=1, `1`=4, `10`=9, `+Inf`=10, and `` `histperc(0.5, c, le)` `` answers 2.8 |
+| `hec-spans` | PASS | 100 span objects with `trace_id`, `span_id`, `name` `splunk-interop-span`, `kind` `SPAN_KIND_SERVER`, `status.code` `STATUS_CODE_ERROR`, `status.message` `boom`, `start_time`, `end_time`, `events{}.name` `retry`, and `service.name` `splunk-interop-spans` |
+| `hec-ack` | PASS | 97 events indexed; the sink counted `acked=78 timeout=0 unsupported=0` over 117 `/ack` polls |
+| `hec-relay` | PASS | Every producer: the Docker driver's events, the Java appender's 9 (`java:json`, `java:raw`, and `java:text`, 3 each), SC4S's 3 lines (`nix:syslog`, index `osnix`) and 4 own events, and the exporter's 3 logs and 6 spans; in the first run, the exporter's metrics `gen` (`Gauge` and `Sum`), `gen_bucket`, `gen_count`, and `gen_sum` |
+
+| Probe | Splunk Cloud 10.5.2605.9's answer |
 |---|---|
-| `/health` and the token | `GET /health` and `/health/1.0`: `200` `{"text":"HEC is healthy","code":17}` with no token, the token, and a bogus token alike. Neither checks the token |
-| `event` with no content | `{}` and `[]`: `200`, indexed with `_raw` `{}` and `[]`. `0`: `200`, indexed as `0`. `" "`: `400` code 13 `Event field cannot be blank`. `null` and `false`: `400` code 6 `Invalid data format`. Each refused object: nothing indexed |
-| `time` forms | Integer seconds, integer milliseconds (13 digits), integer nanoseconds (19 digits), a decimal string, and a float with nanosecond digits: all `200`. Splunk reads the 13- and 19-digit integers by magnitude, as milliseconds and nanoseconds, not as seconds. `printf("%.9f", _time)` gives `.000000000` for seconds, `.123000000` for the 13-digit integer, and `.123456700` for the 19-digit integer, the decimal string, and the float; `strftime` with `%9N` gives `.123456000` for those three. Splunk kept seven fractional digits of a nanosecond `time`, and its `strftime` rendered six |
-| envelope across objects | `host`, `index`, `source`, `sourcetype`, and `time` on object 0 of 3 only: objects 1 and 2 get the token's defaults (`main`, host `splunk:8088`, source `http:splunk_hec_token`, sourcetype `httpevent`, receipt time), not object 0's. On object 2 only: the same, for objects 0 and 1. No field carries from one object to the next |
-| `/raw` line merging | Under a sourcetype with no props, three lines (LF-terminated, CRLF-terminated, without a trailing newline, or with an indented second line) each become one event of three lines: the default `SHOULD_LINEMERGE=true` merges lines that carry no timestamp. CRLF is stored as LF |
-| index-time props, `/raw` and `/event` | One line under the `logit:ta` sourcetype: on `/raw`, routed to `tcpout_probe`, renamed to `logit:ta:renamed`, and `_time` from its `ts=` prefix. On `/event`, the same index routing and renaming, but `_time` the receipt time: `/event` runs `TRANSFORMS-*` and skips timestamp extraction. `/event?auto_extract_timestamp=true` extracts `_time` from the line as `/raw` does |
-| `useACK` ids | Channel A's two posts: `ackId` 0 and 1; channel B's one: `ackId` 0. A polled for `[0, 1, 5]`: `{"0":true,"1":true,"5":false}` within a second. The same poll again: `{"0":false,"1":false}`, since Splunk forgets an id once it has answered `true`. B polled for `[0, 1]`: `{"0":true,"1":false}`. A new channel polled for `[0]`: `false`. No channel: `400` code 10 |
-
-The same probes against a Splunk Cloud Platform trial stack (Splunk Web reports 10.5.2605.9) on
-2026-09-26, `SPLUNK_INTEROP_TARGET=cloud`, with indexing checked by hand in Splunk Web from
-`search.spl`. Every leg was `SENT`, and every searched probe answered as Enterprise 10.4.3 did.
-
-| Probe | Splunk Cloud's answer |
-|---|---|
+| endpoint | `https://<stack>.splunkcloud.com:8088/services/collector`; the `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for this stack. With verification on: `certificate verify failed: self-signed certificate in certificate chain`; subject `commonName=SplunkServerDefaultCert, organizationName=SplunkUser`, issuer `organizationName=Splunk, commonName=SplunkCommonCA`. `/health` without a token: `200` `{"text":"HEC is healthy","code":17}` |
+| body cap | 999,000, 1,000,001, 1,048,577, and 2,000,000 bytes uncompressed, and 2,000,000 bytes gzipped (incompressible, 1,514,967 bytes on the wire, and compressible, 2,009): each `200` and indexed. Posted by hand: 3 MB, 5 MB, and 5,242,881 bytes `200`; 6 MB, and 7, 8, 12, and 20 MB, `400` `{"text":"Invalid data format","code":6,"invalid-event-number":0}`, not `413`. The cap is between 5,242,881 and 6,000,000 bytes |
+| gzip | `Content-Encoding: gzip` on `/event` and `/raw`: `200`, indexed. `deflate`: `415` with an HTML body |
+| code 6 and other per-object errors | As on 10.4.3: codes 6, 7, 12, 13, and 15 name the same object, and the objects before it are the ones indexed |
+| lenient cases | As on 10.4.3, `400` code 5 `No data` included |
 | `/health` and the token | As on Enterprise: `200` code 17 on both routes with no token, the token, and a bogus token |
 | `event` with no content | As on Enterprise: `{}`, `[]`, and `0` indexed with `_raw` `{}`, `[]`, and `0`; `" "` (code 13), `null`, and `false` (code 6) not indexed |
 | `time` forms | As on Enterprise: `printf("%.9f", _time)` gives `.000000000` for seconds, `.123000000` for the 13-digit integer, and `.123456700` for the 19-digit integer, the decimal string, and the float, and `strftime` with `%9N` gives `.123456000`. The magnitude rule applies: Splunk kept seven fractional digits of a nanosecond `time`, and its `strftime` rendered six |
 | envelope across objects | No carry-over, as on Enterprise: only the object carrying the envelope got `osnix`, `probe-carry-host`, `probe-carry-source`, `probe:carry`, and the envelope's time. The others got `main`, host `<stack>.splunkcloud.com:8088`, the token's name as source, the stack's default sourcetype (`log4j` on this trial), and receipt time |
 | `/raw` line merging | As on Enterprise: each of the four bodies became one three-line event, CRLF stored as LF, the indentation kept |
 | index-time props, `/raw` and `/event` | `SKIP`: the probe's `logit:ta` props and transforms exist only on the local stack |
-| `useACK` ids | A missing channel is `400` code 28, with a longer message than Enterprise's code 10. Otherwise as on Enterprise: ids 0 and 1 on channel A and 0 on channel B, each id `true` once and then `false`, an unissued id `false` |
+| metric forms | Both `200` and stored as metrics |
+| `metric_type` | `200`, stored as a dimension |
+| dimensions | 200 and 1,000 dimensions: `200`, all of them stored (201 and 1,001 with the probe's own) |
+| `OPTIONS` | As on 10.4.3 |
+| HTTP errors | As on 10.4.3: `404` for an unknown path, `405` for `GET` on `/event`, both with the `404` body |
+| `/raw` without a channel | On a token without `useACK`: `200`, indexed |
+| `Set-Cookie` | None on an `/event` reply |
+| `useACK` | The token settings offer "Enable indexer acknowledgment". No channel: `400` `{"text":"Data channel is missing. If you have multiple indexers, sticky session load balancers must be provisioned and client requests must be routed accordingly.","code":28}`, where 10.4.3 answers code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1`. The id polled `true` after 1.3 s; the same id polled on another channel: `200` `{"acks":{"0":false}}`. As on Enterprise, each id polled `true` once and then `false`, and an unissued id `false` |
+| `max_content_length` | SKIP: no REST API |
+| `[tcpout] sendCookedData=false` | SKIP: cloud mode has no `rawcap` receiver or output group |
+
+Neither Edge Processor nor Ingest Processor is provisioned on the trial stack: Data Management
+shows only a link to request it, which takes a support case or the account team.

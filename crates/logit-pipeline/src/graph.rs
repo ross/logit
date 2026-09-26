@@ -211,6 +211,8 @@
 //!     `token` or one with leading or trailing whitespace, `timeout: 0s`, an `ack_timeout` without
 //!     `ack: true` or of `0s`, a `max_body_bytes` of `0`, or a `tls` failing rule 24's checks
 //!     (`docs/adr/splunk-hec-relay.md`).
+//! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
+//!     (`docs/adr/lua-runaway-script-bounds.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3242,6 +3244,20 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 71: a `lua`/`lua_file` `max_memory` of `0` (`docs/adr/lua-runaway-script-bounds.md`).
+    // `human_bytes` parses `"0"`, and an empty VM already holds more than that, so the node
+    // would fail on its first batch.
+    for (id, component) in &components {
+        if let ComponentKind::Lua { max_memory: Some(0), .. }
+        | ComponentKind::LuaFile { max_memory: Some(0), .. } = &component.kind
+        {
+            anyhow::bail!(
+                "component '{id}': 'max_memory' must be greater than 0 -- a Lua VM holds more \
+                 than that before its first event; omit 'max_memory' for no limit"
+            );
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -3652,7 +3668,7 @@ mod tests {
     }
 
     fn lua() -> ComponentKind {
-        ComponentKind::Lua { script: "".to_string(), interval: None }
+        ComponentKind::Lua { script: "".to_string(), interval: None, max_memory: None }
     }
 
     fn json() -> ComponentKind {
@@ -11039,5 +11055,45 @@ mod tests {
         }
         let err = expect_err(cfg(vec![("in", vec![], zero), ("out", vec!["in"], sink())]));
         assert!(err.contains("must be greater than 0s"), "got: {err}");
+    }
+
+    // ---- rule 71: lua / lua_file max_memory ------------------------------------------------
+
+    fn lua_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
+        ComponentKind::Lua { script: String::new(), interval: None, max_memory }
+    }
+
+    fn lua_file_with_max_memory(max_memory: Option<u64>) -> ComponentKind {
+        ComponentKind::LuaFile { lua_file: "x.lua".to_string(), interval: None, max_memory }
+    }
+
+    /// Rule 71: an empty VM already holds more than `0` bytes.
+    #[test]
+    fn a_lua_max_memory_of_zero_is_rejected() {
+        for kind in [lua_with_max_memory(Some(0)), lua_file_with_max_memory(Some(0))] {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("script", vec!["in"], kind),
+                ("out", vec!["script"], sink()),
+            ]));
+            assert!(err.contains("'script'"), "got: {err}");
+            assert!(err.contains("'max_memory' must be greater than 0"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_lua_max_memory_validates() {
+        for kind in [
+            lua_with_max_memory(None),
+            lua_with_max_memory(Some(1)),
+            lua_file_with_max_memory(Some(4 * 1024 * 1024)),
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], listener()),
+                ("script", vec!["in"], kind),
+                ("out", vec!["script"], sink()),
+            ]))
+            .expect("an unset or nonzero max_memory is valid");
+        }
     }
 }

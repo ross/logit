@@ -44,7 +44,8 @@
 //! | `X-Splunk-Request-Channel` | one random v4 GUID per sink, on every request |
 //!
 //! The channel goes out whether or not `ack` is on (ADR decision 17): a `useACK` token answers
-//! `400` code 10 to a request without one, and any other token ignores it.
+//! `400` code 10 (Splunk Enterprise) or code 28 (Splunk Cloud) to a request without one, and any
+//! other token ignores it.
 //!
 //! The token never appears in a diagnostic or an error: a rejection body is read past the quoted
 //! snippet size by the token's own length and scrubbed of it by
@@ -66,6 +67,11 @@
 //! | connect failure, before any `/event` request of this `send` was accepted | [`Fault::Clean`] |
 //! | connect failure after one was (a 2xx, or a code 6 whose objects ahead count as delivered) | [`Fault::Ambiguous`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//!
+//! Splunk Cloud answers a body over its own size cap with `400` code 6 naming object 0, not
+//! `413`, so a `max_body_bytes` above the receiver's cap turns a valid first object into an
+//! `invalid_event` drop and a resend of the rest. The default sits under Cloud's observed cap
+//! (`docs/splunk.md`, "Size caps").
 //!
 //! A connect failure is `Clean` only while nothing of the batch has reached Splunk:
 //! `write_loop` retries `Clean` under every posture, and a retry re-sends the bodies already
@@ -92,7 +98,7 @@
 //! Two answers mean the token doesn't acknowledge: a 2xx with no `ackId`, and a poll answered
 //! `400` code 14 (`ACK is disabled`). Either counts the request, or every id still pending, as
 //! delivered, counted `logit.output.acks{result="unsupported"}` with a throttled
-//! `ack_unsupported` diagnostic. Splunk Cloud answers this way.
+//! `ack_unsupported` diagnostic.
 //!
 //! ## Telemetry
 //!
@@ -223,9 +229,9 @@ fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Error {
 /// Splunk documents ([`HecStatus::ALL`]), else `other`, so the tag stays bounded whatever a
 /// server answers.
 fn code_tag(reply: Option<&HecReply>) -> &'static str {
-    const TAGS: [&str; 28] = [
+    const TAGS: [&str; 29] = [
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
-        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27",
+        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28",
     ];
     match reply {
         Some(reply) if HecStatus::from_code(reply.code).is_some() => TAGS[usize::from(reply.code)],
@@ -535,8 +541,7 @@ impl SplunkHecOutput {
             "ack_unsupported",
             format_args!(
                 "'ack' is on, but {why}: the token doesn't acknowledge (indexer acknowledgment \
-                 is off for it, or this is Splunk Cloud), so each accepted request counts as \
-                 delivered"
+                 is off for it), so each accepted request counts as delivered"
             ),
         );
     }
@@ -1062,12 +1067,26 @@ mod tests {
         }
     }
 
+    /// Splunk Cloud 10.5.2605.9's answer to a `useACK` token's request without a channel.
+    const CLOUD_CHANNEL_MISSING: &str = r#"{"text":"Data channel is missing. If you have multiple indexers, sticky session load balancers must be provisioned and client requests must be routed accordingly.","code":28}"#;
+
+    /// A missing channel is permanent, whether Splunk Enterprise (code 10) or Splunk Cloud (code
+    /// 28) says so.
+    #[tokio::test]
+    async fn a_missing_channel_is_permanent_on_either_code() {
+        let enterprise = r#"{"text":"Data channel is missing","code":10}"#;
+        assert_eq!(fault_for(400, enterprise).await, Fault::Permanent);
+        assert_eq!(fault_for(400, CLOUD_CHANNEL_MISSING).await, Fault::Permanent);
+    }
+
     /// A rejection is counted by its HEC code, bounded: an unknown code tags `other`.
     #[tokio::test]
     async fn a_rejection_is_counted_by_its_hec_code() {
         for (status, body, tag) in [
             (403, r#"{"text":"Invalid token","code":4}"#, "4"),
             (400, r#"{"text":"Incorrect index","code":7}"#, "7"),
+            (400, r#"{"text":"Data channel is missing","code":10}"#, "10"),
+            (400, CLOUD_CHANNEL_MISSING, "28"),
             (400, r#"{"text":"?","code":99}"#, "other"),
             (413, "Request Entity Too Large", "other"),
         ] {

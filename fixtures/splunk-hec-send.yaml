@@ -13,7 +13,7 @@
 #
 # The token comes from the environment (`SPLUNK_HEC_TOKEN`). A `200` means Splunk received a
 # request, not that it indexed it; `ack: true` waits for indexing on a token with indexer
-# acknowledgment, which Splunk Cloud doesn't offer.
+# acknowledgment, which some Splunk Cloud stacks don't offer.
 components:
   app_logs:
     type: tail_in

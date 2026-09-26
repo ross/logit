@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-09-26
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -9,7 +9,8 @@ updated: 2026-09-25
 Accepted
 
 Realized as of 2026-09-25: the plan's W1 through W6 built the pair this record decides, and
-W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3; see
+W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3, and a later run
+checked it against Splunk Cloud Platform 10.5.2605.9; see
 [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing assessment for the proof and
 what stays open.
 
@@ -365,3 +366,41 @@ W5" section maps it to the survey's open items. By decision:
   lines. A raw-TCP line listener would read it as it reads any LF-framed stream, with that one
   loss. Whether an Edge Processor's HEC destination delivers to a non-Splunk receiver stays
   open: no container runs one.
+
+## Amendment: what the Splunk Cloud run settled (2026-09-26)
+
+`script/splunk-interop` ran with `SPLUNK_INTEROP_TARGET=cloud` against a Splunk Cloud Platform
+trial stack that Splunk Web reports as `Splunk 10.5.2605.9`. A trial has no REST API, so each
+leg's arrival was confirmed by searching in Splunk Web. Every leg landed as it did on 10.4.3, and
+every probe the two runs share answered the same, except as below.
+`tools/splunk-interop/README.md` holds the evidence; `docs/plans/splunk-relay.md`'s "Settled by
+the Cloud run" section maps it item by item. By decision:
+
+- **Decision 5, acknowledgment:** the premise that Splunk Cloud doesn't support it doesn't hold for
+  this stack. Its token settings offer "Enable indexer acknowledgment", the `hec-ack` leg counted
+  `acked=78 timeout=0 unsupported=0`, ids count from 0 per channel, a poll answers `true` within
+  about 1.2 s, and another channel sees `false`. Splunk's docs still say Splunk Cloud supports it
+  only for Firehose, and a customer stack may differ, so `ack` stays opt-in and off by default; the
+  reason is now that not every token or stack acknowledges. No reply carried `Set-Cookie`, so this
+  stack needs no load-balancer stickiness for polls.
+- **Decision 17, the channel:** a `useACK` token on Splunk Cloud answers a request without a
+  channel `400` code 28, `Data channel is missing. If you have multiple indexers, sticky session
+  load balancers must be provisioned and client requests must be routed accordingly.`, where
+  10.4.3 answers code 10. **Changed:** `HecStatus` models code 28, and `splunk_hec_out` counts it
+  under its own code and treats it as permanent, as it does code 10. The sink sends a channel on
+  every request, so it never draws either.
+- **Decision 18, code 6:** Splunk Cloud has a body cap between 5,242,881 and 6,000,000 bytes,
+  and answers a body over it `400` code 6 naming object 0, not `413`. The sink reads that as
+  object 0 failing to parse: it drops that object as `invalid_event` and resends the rest, the
+  right outcome only when one object is the whole excess. The 2 MiB `max_body_bytes` default
+  sits under the cap, so the rule stands, with the sink's module doc and `docs/known-gaps.md`
+  noting the case.
+- **Endpoint and certificate:** the trial's HEC is `https://<stack>.splunkcloud.com:8088`; the
+  documented `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for it. It presents
+  Splunk's default self-signed certificate, so `splunk_hec_out` needs
+  `tls: {insecure_skip_verify: true}` there. A paid stack's `http-inputs-` form and its
+  certificate stay unverified.
+- **Decision 9, Edge Processor:** the trial stack has no Edge Processor or Ingest Processor, and
+  enabling one takes Splunk's support or account team, so whether an Edge Processor's HEC
+  destination delivers to a non-Splunk receiver stays open. Ingest Processor sends only to Splunk
+  indexes, S3, and Observability Cloud, so it has no destination that reaches `logit`.

@@ -14,9 +14,10 @@
 //!   proxies report an unknown field. `has_log`/`has_metrics`/`has_span` are accepted, since
 //!   `to_table()` emits them, and must be booleans, but the payload keys decide what's present.
 //! - **Raw table access.** Keys are read with `Table::raw_get` and enumerated with `Table::pairs`,
-//!   which in mlua 0.9 walks the table with `lua_next` (`TablePairs::next`). Both are raw, so no
-//!   `__index` or `__pairs` (which LuaJIT lacks anyway) can make the key check and the field reads
-//!   disagree about what the table holds.
+//!   which in mlua 0.9 walks the table with `lua_next` (`TablePairs::next`). Both are raw, as is
+//!   `crate::value`'s conversion of a nested attribute table, so `Event.new` runs no metamethod:
+//!   no `__index` or `__pairs` (which LuaJIT lacks anyway) can make the key check and the field
+//!   reads disagree about what the table holds.
 //! - **Defaults only where core documents one** (`BodyFormat::Raw`, `observed_timestamp` and
 //!   `dropped_attributes_count` of `0`, empty `attributes`; a metric's `start_timestamp`/`flags`
 //!   of `0`, `MetricKind::counter`'s temporality and monotonicity for a bare `sum`,
@@ -26,9 +27,9 @@
 //!   `trace_id`/`span_id`/`name` are required, as the ADR lists.
 //!
 //! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...` down to the
-//! field. The exception is a malformed value inside a nested attribute table, which reports
-//! `lua_to_value`'s unprefixed error, because nested tables convert through the proxy write path's
-//! helper.
+//! field. A malformed value inside a nested attribute table, including one nested past
+//! `crate::value::MAX_TABLE_DEPTH`, converts through the proxy write path's `lua_to_value` and
+//! reports `Event.new: <path>: ` followed by that helper's message.
 //!
 //! `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`, `set_members`) and the three
 //! pre-aggregated ones (`histogram`, `exponential_histogram`, `summary`), exemplars included; the
@@ -36,8 +37,10 @@
 //! [`SpanRecord`], `events` and `links` included. It's the one way a script makes a span, since
 //! `event.span` is read-only (`crate::proxy`'s `SpanProxy`).
 
+use crate::heartbeat::Heartbeat;
+use crate::memory::MemoryCap;
 use crate::proxy::{EventProxy, TargetTable};
-use crate::value::{lua_to_value, validated_sequence_len};
+use crate::value::{lua_to_value, prefixed_error, validated_sequence_len};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
@@ -49,6 +52,7 @@ use logit_core::{
 use mlua::{Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The keys `to_table()` emits at the top level -- and therefore the only keys `Event.new`
 /// accepts there.
@@ -131,9 +135,24 @@ const CONSTRUCTIBLE_KINDS: &str =
 /// an event resolves `event:to(id)` against the component's `targets:` inside
 /// `process()`/`flush()`, and against the empty list at script top level, which runs before
 /// `ScriptWorker::with_targets` can.
-pub(crate) fn install(lua: &Lua, targets: Rc<RefCell<Rc<TargetTable>>>) -> mlua::Result<()> {
+///
+/// `heartbeat` is the worker's `ScriptWorker::heartbeat` cell, read the same way: each call ticks
+/// it, so a `flush()` constructing many events reads as progress to the runtime's stall watcher.
+///
+/// `memory` is the worker's `max_memory` state, checked on every call before anything is built
+/// (`crate::memory` has the invariant).
+pub(crate) fn install(
+    lua: &Lua,
+    targets: Rc<RefCell<Rc<TargetTable>>>,
+    heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
+    memory: Rc<MemoryCap>,
+) -> mlua::Result<()> {
     let table = lua.create_table()?;
-    let new = lua.create_function(move |_, arg: LuaValue| {
+    let new = lua.create_function(move |lua, arg: LuaValue| {
+        if let Some(heartbeat) = heartbeat.borrow().as_ref() {
+            heartbeat.tick();
+        }
+        memory.check(lua)?;
         let LuaValue::Table(t) = arg else {
             return Err(runtime_error(format!(
                 "Event.new(t) takes a table, got {}",
@@ -989,13 +1008,23 @@ fn count_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u64> {
 }
 
 /// [`u32_field`]'s rule widened to `u64`, with a lazy field name so a `counts[k]` element costs
-/// no `format!` on success: an integer `>= 0`, or an integral float in `[0, 2^64)`.
-/// `to_table()` emits counts as integers; the float arm is for a script that computed one.
+/// no `format!` on success: an integer `>= 0`, an integral float in `[0, 2^64)`, or a string of
+/// decimal digits that fits a `u64`. `to_table()` emits a count up to 2^53 as an integer and a
+/// larger one as a decimal string (`crate::value`'s `exact_u64_to_lua`); the float arm is for a
+/// script that computed one.
 fn count(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<u64> {
     let reject = |got: String| {
         runtime_error(format!("Event.new: {} must be a non-negative integer, got {got}", field()))
     };
     match value {
+        LuaValue::String(s) => {
+            let digits = s.as_bytes();
+            let parsed = match digits.iter().all(u8::is_ascii_digit) {
+                true => std::str::from_utf8(digits).ok().and_then(|d| d.parse().ok()),
+                false => None,
+            };
+            parsed.ok_or_else(|| reject(format!("{:?}", s.to_string_lossy())))
+        }
         LuaValue::Integer(n) => u64::try_from(n).map_err(|_| reject(n.to_string())),
         LuaValue::Number(n)
             if n.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&n) =>
@@ -1181,14 +1210,17 @@ fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
 }
 
 /// [`value_field`] with a lazy field name, so an attribute entry costs no `format!` on success.
+/// A nested table's error (a bad value inside it, or nesting past `MAX_TABLE_DEPTH`) gets the
+/// `Event.new: <field>: ` prefix.
 fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Value> {
     match value {
         LuaValue::Nil
         | LuaValue::Boolean(_)
         | LuaValue::Integer(_)
         | LuaValue::Number(_)
-        | LuaValue::String(_)
-        | LuaValue::Table(_) => lua_to_value(value),
+        | LuaValue::String(_) => lua_to_value(value),
+        LuaValue::Table(_) => lua_to_value(value)
+            .map_err(|err| prefixed_error(&format!("Event.new: {}", field()), err)),
         other => Err(runtime_error(format!(
             "Event.new: {} can't be a Lua {}",
             field(),
@@ -1286,7 +1318,7 @@ fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Attr
 /// value reports `Event.new: <path>.<key>.<k> ...` through [`value_at`]. Paths are built only on
 /// error, so the walk allocates nothing beyond the map (the `lua:` pins in
 /// `crates/logit-bench/tests/allocations.rs`). A value inside a nested table reports
-/// `lua_to_value`'s unprefixed error.
+/// `lua_to_value`'s error behind the same `Event.new: <path>.<key>.<k>: ` prefix.
 fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
     for pair in t.pairs::<LuaValue, LuaValue>() {
@@ -2926,6 +2958,96 @@ mod tests {
         );
         assert!(
             err.contains("Event.new: span.status_message must be a string or nil, got integer"),
+            "got: {err}"
+        );
+    }
+
+    // -- nesting, raw reads, and large counts ---------------------------------------------------
+
+    #[test]
+    fn event_new_with_a_cyclic_attribute_table_is_a_clear_error() {
+        let w = worker(
+            r#"
+            function process(event)
+                local t = {}
+                t.self = t
+                return Event.new{timestamp = "1", attributes = {loop = t}}
+            end
+            "#,
+        );
+        let err = process_err(&w, Event::empty(0, AttrMap::new()));
+        assert!(err.contains("Event.new: attributes.loop: "), "got: {err}");
+        assert!(err.contains("nested more than 128 levels deep"), "got: {err}");
+    }
+
+    /// Pins the raw-read guarantee rather than reproducing a regression: `Table::get` consults
+    /// `__index` only for a nil raw value, and every index here is present.
+    #[test]
+    fn event_new_with_a_nested_metatable_array_reads_raw() {
+        let w = worker(
+            r#"
+            function process(event)
+                local fired = false
+                local list = setmetatable({"a", "b"}, {
+                    __index = function() fired = true; return "from __index" end,
+                    __len = function() fired = true; return 5 end,
+                })
+                local e = Event.new{timestamp = "1", attributes = {list = {list}}}
+                assert(not fired, "a metamethod ran during Event.new")
+                return e
+            end
+            "#,
+        );
+        let out = emitted(w.process(Event::empty(0, AttrMap::new())).unwrap());
+        assert_eq!(
+            out.attributes.get("list"),
+            Some(&Value::Array(vec![Value::Array(vec![Value::str("a"), Value::str("b")])]))
+        );
+    }
+
+    /// Counts past 2^53 leave `to_table()` as decimal strings and `count` parses them back, so
+    /// none rounds and none past `i64::MAX` is rejected as negative.
+    #[test]
+    fn a_count_above_two_to_the_53_round_trips_through_to_table() {
+        let w = worker("function process(e) return Event.new(e:to_table()) end");
+        for big in [(1u64 << 53) + 1, (i64::MAX as u64) + 1, u64::MAX] {
+            let kinds = [
+                MetricKind::Histogram(Histogram {
+                    buckets: vec![(1.0, big), (f64::INFINITY, big)],
+                    temporality: Temporality::Cumulative,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                MetricKind::ExponentialHistogram(ExpHistogram {
+                    scale: 0,
+                    zero_count: big,
+                    zero_threshold: 0.0,
+                    positive: (0, vec![big, 1]),
+                    negative: (-1, vec![big]),
+                    temporality: Temporality::Delta,
+                    count: big,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                MetricKind::Summary(Summary { quantiles: vec![(0.5, 1.0)], count: big, sum: 1.0 }),
+            ];
+            for kind in kinds {
+                let event = metric_event(kind);
+                let out = emitted(w.process(event.clone()).unwrap());
+                assert_eq!(out, event, "count {big}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_count_string_that_is_not_decimal_digits_is_rejected() {
+        let err = new_err(
+            r#"{timestamp = "1", metrics = {{name = "m", kind = "summary", quantiles = {}, count = "-1", sum = 0}}}"#,
+        );
+        assert!(
+            err.contains(r#"Event.new: metrics[1].count must be a non-negative integer, got "-1""#),
             "got: {err}"
         );
     }

@@ -250,7 +250,8 @@ datapoint and never writes it to Whisper.
 
 References: <https://help.splunk.com> (HTTP Event Collector, "Get metrics in from other sources"),
 and the OpenTelemetry Collector contrib `exporter/splunkhecexporter` and
-`pkg/translator/splunk`; checked against Splunk Enterprise 10.4.3 by `script/splunk-interop`.
+`pkg/translator/splunk`; checked against Splunk Enterprise 10.4.3 and Splunk Cloud Platform
+10.5.2605.9 by `script/splunk-interop`.
 
 A HEC metric is a JSON object with `"event":"metric"` (or no `event`) and its measurements in
 `fields`: any number of `metric_name:<name>` numbers (the multi-metric form), or one
@@ -259,9 +260,9 @@ A HEC metric is a JSON object with `"event":"metric"` (or no `event`) and its me
 name is `[A-Za-z0-9_.:]`, with no leading digit or `_`. There is no type, temporality, unit, or
 histogram: the OTel exporter writes `metric_type` (`Gauge`, `Sum`, `Histogram`, `Summary`) as an
 ordinary dimension, and histograms and summaries as Prometheus-style `_bucket` with `le`, `_sum`,
-`_count`, and `<name>_<q>` with `qt`, which `mstats` and `histperc` read. Splunk 10.4.3 indexed
-1,000 dimensions on one object. `logit`'s mapping is `crates/logit-proto/src/splunk/metrics.rs`'s
-module doc.
+`_count`, and `<name>_<q>` with `qt`, which `mstats` and `histperc` read. Splunk 10.4.3 and Splunk
+Cloud 10.5.2605.9 indexed 1,000 dimensions on one object. `logit`'s mapping is
+`crates/logit-proto/src/splunk/metrics.rs`'s module doc.
 
 ### Metrics comparison matrix
 
@@ -371,7 +372,9 @@ service checks" sections.
 ### Splunk HEC logs
 
 References: <https://help.splunk.com> (HTTP Event Collector, "Format events for HTTP Event
-Collector"), and the OpenTelemetry Collector contrib `exporter/splunkhecexporter`.
+Collector"), and the OpenTelemetry Collector contrib `exporter/splunkhecexporter`; checked
+against Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9 by
+`script/splunk-interop`.
 
 `/services/collector/event` takes JSON objects, concatenated or in an array, each with its own
 envelope: `time` (epoch seconds, decimals allowed), `host`, `source`, `sourcetype`, `index`,
@@ -397,7 +400,7 @@ de facto schema. `logit`'s mapping is `crates/logit-proto/src/splunk/logs.rs`'s 
 | Event name (category, not message) | — | — | `event_name` | — | — | `otel.log.name` in `fields` (the exporter's convention) |
 | Dropped-attribute accounting | — | — | `dropped_attributes_count` | — | — | — |
 | Framing/injection constraint | none (`\n` implicit line end) | octet-counting or `\n` framing (TCP) | length-prefixed (protobuf/gRPC framing) | `\n`-delimited JSON | a JSON array per HTTP request | concatenated JSON objects or an array per HTTP request; `/raw`: lines, broken by the sourcetype |
-| Max length | none specified (implementations vary) | none specified (implementations vary) | none | none | 1 MB per log (truncated, still accepted); 1,000 logs and 5 MB per request | `max_content_length` per request: 1,000,000 B on old releases, 838,860,800 B on 10.4.3 |
+| Max length | none specified (implementations vary) | none specified (implementations vary) | none | none | 1 MB per log (truncated, still accepted); 1,000 logs and 5 MB per request | `max_content_length` per request: 1,000,000 B on old releases, 838,860,800 B on 10.4.3; Splunk Cloud 10.5.2605.9 caps between 5,242,881 and 6,000,000 B and answers code 6, not `413` |
 
 ## Traces
 
@@ -447,7 +450,8 @@ sections.
 ### Splunk HEC spans (the OTel exporter's shape)
 
 Reference: the OpenTelemetry Collector contrib `exporter/splunkhecexporter`'s `hecSpan`, checked
-against a recording of Collector contrib 0.161.0 (`testdata/interop/splunk/`).
+against a recording of Collector contrib 0.161.0 (`testdata/interop/splunk/`) and indexed by
+Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9 (`script/splunk-interop`).
 
 Splunk Enterprise and Splunk Cloud Platform have no trace store; the OTel exporter sends each span
 as an ordinary HEC event whose `event` is a JSON object: `trace_id`, `span_id`, and

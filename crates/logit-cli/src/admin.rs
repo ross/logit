@@ -100,8 +100,14 @@ async fn handle(
 
 /// `Phase` -> `/readyz`'s status and wire word, which differs from `Phase::as_str()` (`ready` ->
 /// `ok`, `failed` -> `degraded`): the wire word is an HTTP concern, `Phase`'s is the runtime's.
-fn readyz_wire(phase: Phase) -> (StatusCode, &'static str) {
+///
+/// A stalled Lua node (`PipelineState::has_stalled_node`) turns `Ready` into `503 stalled`
+/// without moving the phase, so the probe reads `ok` again once the script resumes. Its own word,
+/// not `degraded`, which means a node has exited. `Starting`, `Draining`, and `Failed` keep their
+/// own word.
+fn readyz_wire(phase: Phase, stalled: bool) -> (StatusCode, &'static str) {
     match phase {
+        Phase::Ready if stalled => (StatusCode::SERVICE_UNAVAILABLE, "stalled"),
         Phase::Ready => (StatusCode::OK, "ok"),
         Phase::Starting => (StatusCode::SERVICE_UNAVAILABLE, "starting"),
         Phase::Draining => (StatusCode::SERVICE_UNAVAILABLE, "draining"),
@@ -110,7 +116,7 @@ fn readyz_wire(phase: Phase) -> (StatusCode, &'static str) {
 }
 
 fn readyz_response(snapshot: &PipelineState, json: bool) -> http::Response<Full<Bytes>> {
-    let (status, word) = readyz_wire(snapshot.phase);
+    let (status, word) = readyz_wire(snapshot.phase, snapshot.has_stalled_node());
     if json {
         json_response(status, snapshot_json(word, snapshot))
     } else {
@@ -174,10 +180,42 @@ mod tests {
 
     #[test]
     fn readyz_wire_matches_the_spec_table() {
-        assert_eq!(readyz_wire(Phase::Ready), (StatusCode::OK, "ok"));
-        assert_eq!(readyz_wire(Phase::Starting), (StatusCode::SERVICE_UNAVAILABLE, "starting"));
-        assert_eq!(readyz_wire(Phase::Draining), (StatusCode::SERVICE_UNAVAILABLE, "draining"));
-        assert_eq!(readyz_wire(Phase::Failed), (StatusCode::SERVICE_UNAVAILABLE, "degraded"));
+        let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+        assert_eq!(readyz_wire(Phase::Ready, false), (StatusCode::OK, "ok"));
+        assert_eq!(readyz_wire(Phase::Ready, true), (unavailable, "stalled"));
+        for stalled in [false, true] {
+            assert_eq!(readyz_wire(Phase::Starting, stalled), (unavailable, "starting"));
+            assert_eq!(readyz_wire(Phase::Draining, stalled), (unavailable, "draining"));
+            assert_eq!(readyz_wire(Phase::Failed, stalled), (unavailable, "degraded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_node_turns_ready_into_stalled_and_back() {
+        let server = spawn_server().await;
+        server.readiness.begin(&["in".to_string(), "enrich".to_string()]);
+        server.readiness.set_node("in", NodeState::Running);
+        server.readiness.set_node("enrich", NodeState::Running);
+        server.readiness.ready();
+        let (code, _head, body) = request_raw(&server.addr, "GET", "/readyz").await;
+        assert_eq!((code, body.as_str()), (200, "ok"));
+
+        server.readiness.set_node("enrich", NodeState::Stalled);
+        let (code, _head, body) = request_raw(&server.addr, "GET", "/readyz").await;
+        assert_eq!((code, body.as_str()), (503, "stalled"));
+        let (code, _head, body) = request_raw(&server.addr, "GET", "/readyz?format=json").await;
+        assert_eq!(code, 503);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "stalled");
+        assert_eq!(value["components"]["enrich"], "stalled");
+        let (code, _head, _body) = request_raw(&server.addr, "GET", "/healthz").await;
+        assert_eq!(code, 200, "a stall never fails liveness");
+
+        server.readiness.set_node("enrich", NodeState::Running);
+        let (code, _head, body) = request_raw(&server.addr, "GET", "/readyz").await;
+        assert_eq!((code, body.as_str()), (200, "ok"), "a resumed node reads ok again");
+
+        server.handle.abort();
     }
 
     #[test]
