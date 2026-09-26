@@ -530,10 +530,10 @@ impl Aggregator {
     ///
     /// Grouped by `(resource, scope)` value, not `Arc` identity: two inputs that each build an
     /// empty `Resource` describe the same origin and aggregate together. The lookup is a linear
-    /// scan over groups. `statsd_in` holds one `Arc<Resource>` per listener, so its matching group
-    /// costs one [`resource_key_eq`] `Arc::ptr_eq`. `otlp_in` builds one `Arc` per
-    /// `ResourceMetrics`, `logit_in` one per frame, and a Lua resource write one per batch, so each
-    /// of those pays a full field compare per metric.
+    /// scan that compares every earlier group before it reaches the match. `statsd_in` holds one
+    /// `Arc<Resource>` per listener, so its match is an `Arc::ptr_eq` hit in `resource_key_eq`.
+    /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
+    /// resource write one per batch, so each of those pays a full field compare at the match too.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
@@ -1268,8 +1268,9 @@ fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     }
 }
 
-/// `AttrMap` equality with bitwise floats, for [`resource_key_eq`] and [`scope_key_eq`]. `AttrMap::iter()` yields `Symbol`
-/// order, so a length check plus a zipped walk is order-independent.
+/// `AttrMap` equality with bitwise floats, for [`resource_key_eq`] and [`scope_key_eq`].
+/// `AttrMap::iter()` yields `Symbol` order, so a length check plus a zipped walk is
+/// order-independent.
 fn attr_map_key_eq(a: &AttrMap, b: &AttrMap) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
