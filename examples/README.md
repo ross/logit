@@ -1,7 +1,7 @@
 # Examples
 
-Complete `logit` configs to start from, one directory each. Each directory holds a `logit.yaml`
-and the `graph.svg` drawn from it.
+Complete `logit` configs to start from, one directory each. Each directory holds a `logit.yaml`,
+the `graph.svg` drawn from it, and any script the config loads.
 
 Point every producer at `logit` once, and choose backends in one file. Moving a signal to another
 backend later is an edit to `logit.yaml`, not a change to every application and host.
@@ -9,6 +9,7 @@ backend later is an edit to `logit.yaml`, not a change to every application and 
 | Example | Receives | Sends to |
 |---|---|---|
 | [canonical](canonical/logit.yaml) ([graph](canonical/graph.svg)) | DogStatsD, syslog (with an nginx access-log branch), OTLP over gRPC and HTTP | Datadog, VictoriaMetrics, Loki, Tempo |
+| [lua](lua/logit.yaml) ([graph](lua/graph.svg), [script](lua/process.lua)) | An application's logfmt request log over syslog, processed by a Lua script | A syslog alert receiver, a syslog archive, and per-route metrics on stdout |
 
 ![canonical graph](canonical/graph.svg)
 
@@ -19,7 +20,11 @@ with `!env`:
 
 ```sh
 DD_API_KEY=... logit validate examples/canonical/logit.yaml
+logit validate examples/lua/logit.yaml
 ```
+
+`logit validate` checks the graph but doesn't load a `lua_file` script. `logit run` loads it and
+fails at startup if it doesn't compile.
 
 Or use the release image, whose entrypoint is `logit`:
 
