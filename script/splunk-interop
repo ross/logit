@@ -9,7 +9,8 @@
 # Not part of script/cibuild: it runs third-party images on the host's docker daemon, and no test
 # depends on it. Splunk takes several GB of RAM and a few minutes to start.
 #
-#   SPLUNK_INTEROP_WINDOW=60      seconds the legs run before Splunk is queried
+#   SPLUNK_INTEROP_WINDOW=60      seconds the legs run before Splunk is queried (at least 75 in
+#                                 cloud mode)
 #   SPLUNK_INTEROP_SKIP_IMAGE=1   reuse the existing logit:splunk-interop image
 #   SPLUNK_INTEROP_OUT=<dir>      where run directories go (default perf/results/splunk-interop)
 #   SPLUNK_INTEROP_TARGET=cloud   run the legs against a Splunk Cloud stack instead of a local
@@ -85,6 +86,11 @@ ENV_FILE="${RUN_DIR}/compose.env"
 ENV_FILES=(--env-file "${ENV_FILE}")
 if [ "${TARGET}" = cloud ]; then
     ENV_FILES+=(--env-file "${CLOUD_ENV}")
+    # `docker run --env-file` passes an empty value through, which `!env` can't read as a bool.
+    if grep -q '^SPLUNK_INTEROP_HEC_INSECURE=$' "${CLOUD_ENV}"; then
+        echo "SPLUNK_INTEROP_HEC_INSECURE=false" >"${RUN_DIR}/cloud-defaults.env"
+        ENV_FILES+=(--env-file "${RUN_DIR}/cloud-defaults.env")
+    fi
 fi
 
 si_compose() {
@@ -186,8 +192,15 @@ fi
     si_compose images 2>/dev/null
 } >"${RUN_DIR}/provenance.txt"
 
+# A connect, DNS, or TLS failure is retried for the sink's 60 s retry budget before the batch is
+# dropped and counted, so a cloud run's window outlasts it, and the extra 5 s is one telemetry
+# interval, so the legs' telemetry files hold that verdict before anything reads them.
+if [ "${TARGET}" = cloud ] && [ "${WINDOW}" -lt 75 ]; then
+    WINDOW=75
+fi
 echo "splunk-interop: generating traffic for ${WINDOW}s"
 sleep "${WINDOW}"
+sleep 5
 
 collect_logs
 echo "splunk-interop: querying Splunk"

@@ -33,7 +33,7 @@ The legs:
 | `hec-logs` | `logit-hec-logs.yaml` | a warn-level log per second with a trace reference and a nested attribute, sourcetype `logit:test`, into `main` |
 | `hec-metrics` | `logit-hec-metrics.yaml` | every metric kind under `multi_value: expand` into `metrics`: gauge, cumulative and delta sum, samples, set members, histogram, summary, exponential histogram, and, through `aggregate`, a distribution and a set |
 | `hec-spans` | `logit-hec-spans.yaml` | a server span per second with an error status and a span event, sourcetype `logit:span` |
-| `hec-ack` | `logit-hec-ack.yaml` | the logs leg on the `ack` token with `ack: true`; `internal` writes the sink's telemetry to `ack-telemetry.log` |
+| `hec-ack` | `logit-hec-ack.yaml` | the logs leg on the `ack` token with `ack: true` |
 | `hec-relay` | `logit-hec-relay.yaml` | `splunk_hec_in` fed by `replay`, relayed by `splunk_hec_out` into Splunk: the tee topology |
 
 Every config passes `logit validate`: `script/validate` and the
@@ -46,7 +46,9 @@ Every config passes `logit validate`: `script/validate` and the
 2. Brings the stack up with `docker compose up --wait`, which waits on Splunk's health check
    (`GET /services/collector/health`), on `splunk-init`, and on each `logit` service's `logit
    ready`, then starts `replay`.
-3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60).
+3. Lets traffic flow for `SPLUNK_INTEROP_WINDOW` seconds (default 60, at least 75 in cloud
+   mode, which outlasts the sink's 60 s retry budget for a connection it can't open), then
+   one telemetry interval more.
 4. Copies every service's log into the run directory and runs `check.py` in a
    `python:3.12-slim` container on the stack's network. `check.py` searches Splunk over REST
    (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, an event
@@ -64,7 +66,10 @@ searched, see [Splunk Cloud mode](#splunk-cloud-mode)), `SKIP` (the target can't
 A run writes `perf/results/splunk-interop/<timestamp>/` (gitignored, or under
 `SPLUNK_INTEROP_OUT`): `results.md` and `results.json`, `search.spl` with every SPL query the
 legs and probes ran, `provenance.txt` with the target and the image tags, `logs/<service>.log`,
-`replay.log`, `ack-telemetry.log`, and `tcpout/tcpout-000.raw`.
+`replay.log`, one `<leg>-telemetry.log` per leg (`hec-logs-telemetry.log`,
+`hec-metrics-telemetry.log`, `hec-spans-telemetry.log`, `hec-ack-telemetry.log`, and
+`hec-relay-telemetry.log`: the sink's own telemetry, which every leg config taps with
+`internal`), and `tcpout/tcpout-000.raw`.
 
 ## Splunk Cloud mode
 
@@ -90,15 +95,19 @@ file without `SPLUNK_INTEROP_HEC_URL` or `SPLUNK_INTEROP_HEC_TOKEN`.
 | `SPLUNK_INTEROP_HEC_URL_ALT` | A second HEC URL for the endpoint probe to compare, such as the stack's `http-inputs-<stack>` host on `:443`. Optional |
 | `SPLUNK_INTEROP_HEC_TOKEN` | A HEC token that may write `main`, and `metrics` and `osnix` for the metrics and relay legs. Required |
 | `SPLUNK_INTEROP_ACK_TOKEN` | A HEC token with indexer acknowledgment on. Empty or absent, the `hec-ack` leg doesn't start and its row and the ack probe are `SKIP` |
-| `SPLUNK_INTEROP_HEC_INSECURE` | `true` turns off certificate verification in the legs, for a trial stack's self-signed HEC certificate. Default `false` |
+| `SPLUNK_INTEROP_HEC_INSECURE` | `true` turns off certificate verification in the legs, for a trial stack's self-signed HEC certificate. Default `false`, and an empty value reads as `false` |
 | `SPLUNK_INTEROP_SEARCH` | `none` (the default in cloud mode) searches nothing; `rest` searches over the REST API as in local mode |
 | `SPLUNK_INTEROP_API_URL` | The REST API base URL, for `SPLUNK_INTEROP_SEARCH=rest` |
 | `SPLUNK_INTEROP_API_AUTH` | The whole `Authorization` header value for the REST API, `Basic …` or `Bearer …` |
 | `SPLUNK_INTEROP_STACK` | The stack name, scrubbed from the results as `<stack>` |
 
-Under `SPLUNK_INTEROP_SEARCH=none`, a leg whose sink logged no rejection is `SENT` rather than
-`PASS` (for `hec-relay`, also every replayed request answered `2xx`; for `hec-ack`, every request
-acknowledged), and its detail carries the SPL that would confirm it. `search.spl` collects those
+Under `SPLUNK_INTEROP_SEARCH=none`, a leg is `SENT` rather than `PASS` when the sink's
+telemetry shows N requests answered `2xx` for M records with nothing dropped; arrival is
+unconfirmed by search. `SENT` also needs no rejection in the sink's log; for `hec-relay`, every
+replayed request answered `2xx`; and for `hec-ack`, every request acknowledged. Otherwise the leg
+is `FAIL`, with the request counts by class (`network_error` included), the dropped records by
+reason, the batches dropped, and the retries in its detail. The row carries the SPL that would
+confirm arrival. `search.spl` collects those
 queries and the probes', each under a `# <leg or probe>` comment, for a search pass by hand or in
 a browser afterward: run each over all time, adding `index_earliest` set to the epoch in the
 file's header to a `search` query, since the relay leg's events carry their recorded timestamps.

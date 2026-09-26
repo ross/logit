@@ -5,7 +5,8 @@ Runs in a throwaway `python:3.12-slim` container on the stack's network, stdlib 
 harness has held the legs up for its window and copied every service's log into the run
 directory. Mounts:
 
-    /out  the run directory: logs/<service>.log, replay.log, ack-telemetry.log, tcpout/;
+    /out  the run directory: logs/<service>.log, replay.log, <leg>-telemetry.log (each leg's
+          sink telemetry), tcpout/;
           results.md, results.json, and search.spl land here
 
 The target comes from the environment, defaulting to the local stack (the README's "Splunk Cloud
@@ -17,8 +18,9 @@ bounded by index time to `SPLUNK_INTEROP_SINCE` rather than by event time, since
 recorded events carry their recorded timestamps; an `mstats` or `mcatalog` query is unbounded.
 
 A leg is PASS (Splunk holds what the leg sent, in the shape docs/plans/splunk-relay.md expects),
-GAP (it arrived, with a difference the README records), SENT (under `none`: the sink logged no
-rejection, and the row carries the SPL that would confirm it), SKIP (the target can't run it),
+GAP (it arrived, with a difference the README records), SENT (under `none`: the sink's
+telemetry shows requests answered 2xx with records and nothing dropped, and the row carries the
+SPL that would confirm arrival), SKIP (the target can't run it),
 or FAIL. A probe row is INFO, what Splunk answered, or SKIP. Every SPL query a leg or probe runs,
 or would run, lands in search.spl for a manual search pass. results.md, results.json, and
 search.spl have `SPLUNK_INTEROP_STACK` and the configured tokens scrubbed. Exits 1 on any FAIL.
@@ -238,10 +240,44 @@ def telemetry_sum(events, metric, **attrs):
     return int(total)
 
 
+#: The diagnostic keys a sink logs when Splunk refused a request or the sink dropped records.
+REJECTION_KEYS = ("request_rejected", "token_rejected", "send_failed", "invalid_event", "oversize")
+
+
 def rejections(service):
-    """The sink's warn-level diagnostics about a refused request."""
+    """The sink's warn-level diagnostics about a refused request or dropped records."""
     lines = strip_ansi(log(service)).splitlines()
-    return [line for line in lines if re.search(r"request_rejected|token_rejected|send_failed", line)]
+    pattern = re.compile(r'key="?(' + "|".join(REJECTION_KEYS) + r')\b')
+    return [line for line in lines if pattern.search(line)]
+
+
+def delivery(leg):
+    """The sink's own account of a leg from /out/<leg>-telemetry.log, as (problems, summary).
+
+    A connect, DNS, or TLS failure is retried without a log line until the retry budget runs out,
+    and a code 6 or oversize drop still returns success, so only the telemetry shows either.
+    """
+    events = rendered_events(OUT / f"{leg}-telemetry.log")
+    requests = telemetry_sum(events, "logit.output.requests", route="event")
+    ok = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "2xx"})
+    network = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "network_error"})
+    records = telemetry_sum(events, "logit.output.records")
+    dropped = {reason: telemetry_sum(events, "logit.output.records.dropped", reason=reason)
+               for reason in ("oversize", "invalid_event")}
+    dropped_total = telemetry_sum(events, "logit.output.records.dropped")
+    failed = telemetry_sum(events, "logit.component.batches.dropped", reason="send_failed")
+    retries = telemetry_sum(events, "logit.component.retries")
+    summary = (f"telemetry: {requests} /event requests, {ok} 2xx, {network} network_error, "
+               f"{requests - ok - network} other; {records} records delivered; records dropped "
+               f"{dropped_total} {dropped}; {failed} batches dropped send_failed; {retries} retries")
+    problems = []
+    if not events:
+        problems.append(f"no {leg}-telemetry.log")
+    if ok < 1 or records < 1:
+        problems.append("no request answered 2xx with records")
+    if dropped_total or failed:
+        problems.append("the sink dropped records or batches")
+    return problems, summary, ok, records
 
 
 def replay_lines():
@@ -338,7 +374,7 @@ def leg_spans():
 def leg_ack():
     if not ACK_TOKEN:
         return "SKIP", "no SPLUNK_INTEROP_ACK_TOKEN: the leg didn't run"
-    telemetry = rendered_events(OUT / "ack-telemetry.log")
+    telemetry = rendered_events(OUT / "hec-ack-telemetry.log")
     acked = telemetry_sum(telemetry, "logit.output.acks", result="acked")
     timeout = telemetry_sum(telemetry, "logit.output.acks", result="timeout")
     unsupported = telemetry_sum(telemetry, "logit.output.acks", result="unsupported")
@@ -348,7 +384,9 @@ def leg_ack():
     try:
         rows = search(ACK_COUNT)
     except SearchUnavailable:
-        return ("SENT" if confirmed else "FAIL"), f"{acks}; not searched: {ACK_COUNT}"
+        problems, summary, _, _ = delivery("hec-ack")
+        verdict = "SENT" if confirmed and not problems else "FAIL"
+        return verdict, "; ".join(problems + [acks, summary, f"not searched: {ACK_COUNT}"])
     count = int(rows[0]["count"]) if rows else 0
     detail = f"{acks}; {count} events indexed"
     return ("PASS" if confirmed and count >= 1 else "FAIL"), detail
@@ -389,11 +427,12 @@ LEGS = [
 ]
 
 
-def sent(service, queries):
-    """A leg's row when nothing can search: SENT if its sink logged no rejection, else FAIL."""
-    problems, facts = [], ["no rejection in the sink's log"]
-    if not log(service).strip():
-        problems.append(f"no log from {service}")
+def sent(leg, service, queries):
+    """A leg's row when nothing can search: SENT if its sink's telemetry shows records answered
+    2xx and nothing dropped, and its log no rejection; else FAIL."""
+    problems, summary, ok, records = delivery(leg)
+    facts = [f"the sink's telemetry shows {ok} requests answered 2xx for {records} records with "
+             "nothing dropped; arrival unconfirmed by search"]
     refused = rejections(service)
     if refused:
         problems.append(f"sink logged {len(refused)} rejection(s), the first: {refused[0].strip()[:300]}")
@@ -408,8 +447,8 @@ def sent(service, queries):
             facts.append(f"all {len(replay)} replayed requests 2xx")
     would = " || ".join(queries)
     if problems:
-        return "FAIL", "; ".join(problems + [f"would search: {would}"])
-    return "SENT", "; ".join(facts + [f"not searched: {would}"])
+        return "FAIL", "; ".join(problems + [summary, f"would search: {would}"])
+    return "SENT", "; ".join(facts + [summary, f"not searched: {would}"])
 
 
 # ---- probes -------------------------------------------------------------------------------------
@@ -692,7 +731,7 @@ def main():
         try:
             result, detail = check()
         except SearchUnavailable:
-            result, detail = sent(service, queries)
+            result, detail = sent(leg, service, queries)
         except Exception as err:  # A query that failed is a failed leg, not a crashed harness.
             result, detail = "FAIL", f"{type(err).__name__}: {err}"
         results.append({"leg": leg, "title": title, "result": result, "detail": detail})

@@ -4,6 +4,10 @@
 # relays what arrives into Splunk on the default token. The harness then searches Splunk for each
 # producer's events.
 #
+# `internal` taps the sink's own telemetry into /out/hec-relay-telemetry.log, where the harness
+# counts what Splunk answered and what the sink dropped; `has_attributes` keeps
+# `splunk_hec_in`'s own telemetry out of it.
+#
 # The sink's `endpoint`, `token`, and `tls` come from `SPLUNK_INTEROP_HEC_URL`,
 # `SPLUNK_INTEROP_HEC_TOKEN`, and `SPLUNK_INTEROP_HEC_INSECURE` (compose.yaml's `x-logit`), so the
 # leg runs unchanged against the local Splunk or a Splunk Cloud stack.
@@ -22,3 +26,20 @@ components:
     token: !env SPLUNK_INTEROP_HEC_TOKEN
     tls:
       insecure_skip_verify: !env SPLUNK_INTEROP_HEC_INSECURE
+
+  self:
+    type: internal
+    interval: 5s
+    span_sample_rate: 0.0
+    logs: off
+
+  sink_telemetry:
+    type: has_attributes
+    sources: [self]
+    attributes:
+      component: splunk
+
+  telemetry:
+    type: stdio_out
+    sources: [sink_telemetry]
+    target: /out/hec-relay-telemetry.log

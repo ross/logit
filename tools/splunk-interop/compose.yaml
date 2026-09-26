@@ -29,6 +29,7 @@ networks:
   default:
     name: splunk-interop-net
 
+# Every leg writes its sink's telemetry to /out/<leg>-telemetry.log, which check.py reads.
 x-logit: &logit
   image: ${SPLUNK_INTEROP_IMAGE:-logit:splunk-interop}
   environment:
@@ -131,15 +132,21 @@ services:
 
   logit-hec-logs:
     <<: *logit
-    volumes: ["./logit-hec-logs.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-logs.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-metrics:
     <<: *logit
-    volumes: ["./logit-hec-metrics.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-metrics.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-spans:
     <<: *logit
-    volumes: ["./logit-hec-spans.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-spans.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   logit-hec-ack:
     <<: *logit
@@ -149,7 +156,9 @@ services:
 
   logit-hec-relay:
     <<: *logit
-    volumes: ["./logit-hec-relay.yaml:/config.yaml:ro,z"]
+    volumes:
+      - ./logit-hec-relay.yaml:/config.yaml:ro,z
+      - ${SPLUNK_INTEROP_OUT:?set by script/splunk-interop}:/out:z
 
   # One pass over testdata/interop/splunk/ into the relay leg's listener (replay.py), then exits.
   replay:

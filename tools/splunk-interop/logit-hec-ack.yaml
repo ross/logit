@@ -2,8 +2,8 @@
 # with `ack: true`, so every request carries a channel and is polled on `/services/collector/ack`
 # until Splunk confirms it.
 #
-# `internal` taps the sink's own telemetry into /out/ack-telemetry.log, where the harness counts
-# `logit.output.acks` by `result`.
+# `internal` taps the sink's own telemetry into /out/hec-ack-telemetry.log, where the harness
+# counts `logit.output.acks` by `result`, what Splunk answered, and what the sink dropped.
 #
 # The sink's `endpoint`, `token`, and `tls` come from `SPLUNK_INTEROP_HEC_URL`,
 # `SPLUNK_INTEROP_ACK_TOKEN`, and `SPLUNK_INTEROP_HEC_INSECURE` (compose.yaml's `x-logit`), so the
@@ -66,4 +66,4 @@ components:
   telemetry:
     type: stdio_out
     sources: [sink_telemetry]
-    target: /out/ack-telemetry.log
+    target: /out/hec-ack-telemetry.log

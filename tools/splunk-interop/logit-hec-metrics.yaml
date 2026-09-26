@@ -11,6 +11,9 @@
 # Every name starts `splunk_interop.`, so the harness's `mstats` and `mcatalog` queries find only
 # this leg's series.
 #
+# `internal` taps the sink's own telemetry into /out/hec-metrics-telemetry.log, where the harness
+# counts what Splunk answered and what the sink dropped.
+#
 # The sink's `endpoint`, `token`, and `tls` come from `SPLUNK_INTEROP_HEC_URL`,
 # `SPLUNK_INTEROP_HEC_TOKEN`, and `SPLUNK_INTEROP_HEC_INSECURE` (compose.yaml's `x-logit`), so the
 # leg runs unchanged against the local Splunk or a Splunk Cloud stack.
@@ -95,3 +98,20 @@ components:
     tls:
       insecure_skip_verify: !env SPLUNK_INTEROP_HEC_INSECURE
     multi_value: expand
+
+  self:
+    type: internal
+    interval: 5s
+    span_sample_rate: 0.0
+    logs: off
+
+  sink_telemetry:
+    type: has_attributes
+    sources: [self]
+    attributes:
+      component: splunk
+
+  telemetry:
+    type: stdio_out
+    sources: [sink_telemetry]
+    target: /out/hec-metrics-telemetry.log
