@@ -292,8 +292,10 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
 ## Amendment: a send cut off by the shutdown grace is `Ambiguous` (2026-09-26)
 
 "`Output::flush` and a bounded shutdown grace" above caps `write_loop`'s drain time once shutdown
-fires, but doesn't say what happens to a send still in flight when the grace runs out. The
-`timeout` around it drops the send, and the destination may already have taken the batch.
+fires, but doesn't say what happens to a send still in flight when the grace runs out.
+`write_loop` races `deliver_with_retry` against `shutdown_grace_expired` in a `select!`, and the
+grace winning drops the send. The destination may already have taken the batch. The only
+`timeout` around `output.send` is the retry budget's, and its expiry is already `Ambiguous`.
 
 [ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
 decision 3 classifies that send as `Fault::Ambiguous`, and this record's retry table decides the

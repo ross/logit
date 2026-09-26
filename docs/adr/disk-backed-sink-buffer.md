@@ -480,3 +480,10 @@ at_most_once`, `write_loop` will commit that batch off the spool and count it
 `batches.dropped{reason="shutdown"}`, because the destination may have taken it and the posture
 forbids a duplicate. A restart won't replay it. Under `at_least_once` the batch stays at the
 spool's head and a restart replays it, as today. `SinkStore::finish` still drops nothing.
+
+The same ADR's decision 9 has `run_output` close its inbox before the sweep, which fixes two
+claims in "Shutdown" above. Today a send can land in the channel after the sweep's last
+`try_recv`, and that batch dies with the `Receiver`, uncounted. That contradicts "the sweep …
+still drops nothing". Separately, the spool's overshoot of `disk.max_bytes` isn't bounded by the
+channel's capacity today: the inbox stays open while the sweep awaits each `store.push`, so
+producers refill it. A closed inbox can't refill, and the bound holds.
