@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-21
+updated: 2026-09-26
 ---
 
 # UDP intake batching and socket visibility
@@ -562,6 +562,9 @@ uncounted-item drops would add lock-acquisition-from-`Drop` machinery, with its 
 ordering hazards, to shave a rare, already-bounded, already-accepted loss down from "≤ read_batch,
 uncounted" to "≤ read_batch, counted." Not worth the hazard for a shutdown-only, already-bounded
 loss path.
+
+*(Amended 2026-09-26: both remainders will be counted `reason="shutdown"`, without the
+queue lock. See "Amendment: shutdown remainders are counted" at the end of this record.)*
 
 ### The perf harness: real sockets, sender in the harness process, delivered-side denominators
 
@@ -1145,3 +1148,20 @@ same socket by construction and removes the stored fd entirely.
 socket, so giving it the same treatment means changing that function's signature, and its borrow is
 already enforced indirectly (the combined future carries `&socket` through the sibling `read_loop`
 arm). Tracked in [`docs/known-gaps.md`](../known-gaps.md).
+
+## Amendment: shutdown remainders are counted (2026-09-26)
+
+"Cancellation of `push_many`" above leaves two shutdown losses uncounted: the remainder a cancelled
+`push_many` drops, and the datagrams `decode_loop` popped but didn't decode. It argues that
+counting either needs the queue lock from a `Drop` impl. That premise is wrong. The undrained
+datagrams are still in the caller's `Drain`, so counting them needs no queue state, and
+`Telemetry::count` takes only its own buffer's lock, never the queue's.
+
+Under [ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+decision 4, both remainders will be counted `logit.component.datagrams.dropped` and
+`logit.component.bytes.dropped{reason="shutdown"}`, through a `CountedDrain` wrapper that counts
+what it never yielded when it drops. The same decision counts the datagrams still in the
+`ReceiveQueue` when the grace backstop drops the listener. The bound this section states still
+holds; only "uncounted" changes. The events a grace-dropped listener had already decoded, in the
+`BatchAccumulator` or parked in `emit`'s `Fanout::send`, stay uncounted, as that ADR's decision 1
+names.
