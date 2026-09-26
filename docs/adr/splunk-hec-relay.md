@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-09-26
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -9,7 +9,8 @@ updated: 2026-09-25
 Accepted
 
 Realized as of 2026-09-25: the plan's W1 through W6 built the pair this record decides, and
-W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3; see
+W5 verified it against four recorded HEC clients and Splunk Enterprise 10.4.3, and a later run
+checked it against Splunk Cloud Platform 10.5.2605.9; see
 [`docs/plans/splunk-relay.md`](../plans/splunk-relay.md)'s closing assessment for the proof and
 what stays open.
 
@@ -365,3 +366,159 @@ W5" section maps it to the survey's open items. By decision:
   lines. A raw-TCP line listener would read it as it reads any LF-framed stream, with that one
   loss. Whether an Edge Processor's HEC destination delivers to a non-Splunk receiver stays
   open: no container runs one.
+
+## Amendment: what the Splunk Cloud run settled (2026-09-26)
+
+`script/splunk-interop` ran with `SPLUNK_INTEROP_TARGET=cloud` against a Splunk Cloud Platform
+trial stack that Splunk Web reports as `Splunk 10.5.2605.9`. A trial has no REST API, so each
+leg's arrival was confirmed by searching in Splunk Web. Every leg landed as it did on 10.4.3, and
+every probe the two runs share answered the same, except as below.
+`tools/splunk-interop/README.md` holds the evidence; `docs/plans/splunk-relay.md`'s "Settled by
+the Cloud run" section maps it item by item. By decision:
+
+- **Decision 5, acknowledgment:** the premise that Splunk Cloud doesn't support it doesn't hold for
+  this stack. Its token settings offer "Enable indexer acknowledgment", the `hec-ack` leg counted
+  `acked=78 timeout=0 unsupported=0`, ids count from 0 per channel, a poll answers `true` within
+  about a second, and another channel sees `false`. Splunk's docs still say Splunk Cloud supports it
+  only for Firehose, and a customer stack may differ, so `ack` stays opt-in and off by default; the
+  reason is now that not every token or stack acknowledges. No reply carried `Set-Cookie`, so this
+  stack needs no load-balancer stickiness for polls.
+- **Decision 17, the channel:** a `useACK` token on Splunk Cloud answers a request without a
+  channel `400` code 28, `Data channel is missing. If you have multiple indexers, sticky session
+  load balancers must be provisioned and client requests must be routed accordingly.`, where
+  10.4.3 answers code 10. **Changed:** `HecStatus` models code 28, and `splunk_hec_out` counts it
+  under its own code and treats it as permanent, as it does code 10. The sink sends a channel on
+  every request, so it never draws either.
+- **Decision 18, code 6:** Splunk Cloud has a body cap between 5,242,881 and 6,000,000 bytes,
+  and answers a body over it `400` code 6 naming object 0, not `413`. The sink reads that as
+  object 0 failing to parse: it drops that object as `invalid_event` and resends the rest, the
+  right outcome only when one object is the whole excess. The 2 MiB `max_body_bytes` default
+  sits under the cap, so the rule stands, with the sink's module doc and `docs/known-gaps.md`
+  noting the case. The amendment "busy answers before acceptance, and an oversize code 6" below
+  revises this: a code 6 naming object 0 of a body over 5 MiB is read as oversize, and the body
+  split once.
+- **Endpoint and certificate:** the trial's HEC is `https://<stack>.splunkcloud.com:8088`; the
+  documented `http-inputs-<stack>.splunkcloud.com` form doesn't resolve for it. It presents
+  Splunk's default self-signed certificate, so `splunk_hec_out` needs
+  `tls: {insecure_skip_verify: true}` there. A paid stack's `http-inputs-` form and its
+  certificate stay unverified.
+- **Decision 9, Edge Processor:** the trial stack has no Edge Processor or Ingest Processor, and
+  enabling one takes Splunk's support or account team, so whether an Edge Processor's HEC
+  destination delivers to a non-Splunk receiver stays open. Ingest Processor sends only to Splunk
+  indexes, S3, and Observability Cloud, so it has no destination that reaches `logit`.
+
+## Amendment: busy answers before acceptance, and an oversize code 6 (2026-09-26)
+
+Two answers the sink misread under its default at-most-once posture. By decision:
+
+- **Decision 2, faults across requests (the sink amendment's bullet):** a `429` (codes 26 and
+  27), or a `503` that is code 9 ("Server is busy") or carries no HEC body, is now `Fault::Clean`
+  until a `/event` request of the `send` is accepted, and `Fault::Ambiguous` after, the rule a
+  connect failure already follows. The criterion is "not taken": each of these says Splunk
+  refused the body before indexing anything, so a retry can't duplicate it, where it used to be
+  `Ambiguous` and dropped a batch Splunk never took. A `408`, a `500` (code 8 may have indexed), a
+  `502`, a `504`, and any other `503` stay `Ambiguous` in both positions. `splunk_hec_in` answers
+  code 9 with the same meaning (the amendment "faithful listener acks and a busy /health" below),
+  so a `splunk_hec_out -> splunk_hec_in` relay keeps it. `Retry-After` is ignored: `write_loop`'s
+  retry loop has no seam for a server-supplied delay, and building one is out of scope
+  (`docs/known-gaps.md`, "Splunk").
+- **Decision 18, code 6:** a code 6 naming object 0 of a body over
+  `logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP` (5,242,880 bytes, before compression) is
+  read as Splunk Cloud's oversize answer, not a bad object 0. A body of several objects is split
+  in two at half its bytes and each half sent, one level only: a half answered the same way is
+  `Fault::Permanent`. A body of one object is dropped, counted
+  `records.dropped{reason="oversize"}` with the `oversize` diagnostic. A code 6 naming object 0
+  of a body at or under the cap keeps the drop-one rule. Rule 70 accepts a `max_body_bytes` above
+  the cap, since Splunk Enterprise allows 800 MiB, and logs a startup warning naming Cloud's cap.
+  Rejected: capping `max_body_bytes` at 5 MiB in rule 70, which would refuse a valid Enterprise
+  configuration.
+
+## Amendment: the listener delivers the prefix before a code 6 (2026-09-26)
+
+Decision 11 said a syntax error in any object rejects the whole body "and nothing is delivered,
+as Splunk does". Splunk doesn't: Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9
+both index every object before the one a `400` code 6 names and none from it on
+(`docs/plans/splunk-relay.md`, "Settled by W5" item 8 and "Settled by the Cloud run"), and
+Vector's `splunk_hec` source delivers what it parsed before answering `400`. A client that follows
+Splunk's semantics resends only the objects after the named one, so against the old listener it
+lost the objects before it. `splunk_hec_out`'s decision 18 rule is such a client, so a
+`splunk_hec_out -> splunk_hec_in` relay lost them too. **Changed:**
+
+- **Decision 11:** a `/event` body whose object `N` doesn't parse (a syntax error, or a member
+  the model can't hold) delivers objects `0..N`, grouped by resource as any body is, and answers
+  `400` code 6 with `invalid-event-number` `N`. Nothing from `N` on is decoded or counted. The
+  codec's `decode_events_prefix` returns both; `decode_events` keeps the whole-body form for
+  callers that want it.
+- **`N` = 0** delivers nothing and is answered as before: a plain code 6 with no `ackId`.
+- **`N` > 0** goes through delivery as a whole body of those `N` objects would: the bounded wait,
+  a `503` code 9 with no `ackId` if it passes, and otherwise the code 6 with the `ackId` a `200`
+  would have carried when the request named a channel, after `invalid-event-number`. Splunk
+  10.4.3 answers the same on a `useACK` token with a channel:
+  `{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":0}` for a syntax
+  error in object 1, and no `ackId` for one in object 0 (`tools/splunk-interop/README.md`). This
+  revises the listener amendment's "an `ackId` is drawn only on a `200`": the objects before
+  `N` reached the pipeline, and `/ack` reports them as it reports any other request. A prefix
+  whose every object the codec skipped sends nothing and is answered the same way, as an
+  all-skipped whole body answers `200`.
+- **gzip:** a stream that doesn't decompress is still code 6 with no `invalid-event-number` and
+  nothing delivered. Decompression yields nothing short of the whole stream, so the decoder
+  never sees a prefix to deliver.
+- **Telemetry:** the delivered objects count where any delivered batch's do, on the listener's
+  fanout edge, and the answer counts `logit.input.requests{class="rejected"}` and
+  `logit.input.requests.rejected{reason="malformed"}`, with the `request_rejected` diagnostic
+  naming how many objects were kept.
+
+## Amendment: faithful listener acks and a busy /health (2026-09-26)
+
+Both runs gave the same `useACK` behavior: ids count from 0 per channel, a poll answers an id
+issued on that channel and indexed `true`, the same id `false` once it has answered `true`, and an
+id never issued on that channel `false`. `splunk_hec_in` answered every polled id `true` on any
+channel, and `/health` always `200`, so a client that checks id continuity, polls the wrong
+channel, or reads `/health` as a queue signal saw something Splunk never answers. And its `503`
+code 9 could follow a partial delivery, where Splunk's means nothing was taken.
+`crates/logit-inputs/src/splunk.rs`'s module doc describes the behavior; this list is the record
+of the choices. By decision:
+
+- **Decision 5, acknowledgment, the listener half:** amended. Each channel issues ids from 0 on
+  every `200` to a `/event` or `/raw` request that names it, and on the code 6 that follows a
+  delivered prefix (the amendment above), and `/ack` answers an id issued on the polled channel
+  `true` once, then forgets it; any other id is `false`. A repeated id in one poll is answered
+  once. "Indexed" stays "accepted into the pipeline", the meaning a `200` already
+  has; tying `true` to sink delivery was rejected, since a listener has no view of what its
+  fan-out's sinks did, and the pipeline's own delivery guarantees are the sinks' business. This
+  replaces "every asked id `true`" and the listener amendment's one counter per listener
+  starting at 1.
+- **Decision 5, bounds:** the state is bounded for accidental data, per
+  [ADR `deployment-threat-model`](deployment-threat-model.md): `max_ack_channels` channels
+  (default 256), evicting the least recently used with its ids, and per channel an issue window of
+  the most recent `max_pending_acks` ids (default 1,000,000, Splunk's
+  `max_number_of_acked_requests_pending_query_per_ack_channel` default), the oldest expiring as a
+  new one is issued. A window rather than Splunk's count of ids outstanding, so the state is one
+  bit per id and a channel that lost one id can't pin memory; at the defaults that is at most
+  about 32 MB. Both are config fields, and rule 69 rejects `0` for either. The channel cap is
+  configurable because a listener behind more than 256 clients that each send a channel
+  (`splunk_hec_out`, Vector) would otherwise evict live channels and turn their acknowledgment
+  into timeouts and resends. Eviction, expiry, and every issue and poll outcome are counted
+  (`docs/design/internal-telemetry.md`'s `splunk_hec_in` section).
+- **Decision 16, channels:** amended for `/ack` only. An `/ack` request that names no channel is
+  `400` code 10, Splunk Enterprise's answer to a `useACK` request without one; Splunk Cloud's code
+  28 adds load-balancer advice that doesn't apply to one listener. `/event` and `/raw` still
+  require none, and a request without one is answered as a token without `useACK` answers it.
+  Answering every id `false` without a channel was rejected: a client would poll until its
+  timeout instead of reading its mistake.
+- **Decision 3, the bounded wait:** amended. The consequence that a `503` can follow a partial
+  delivery of a multi-resource request no longer holds. Only a body's first batch waits under the
+  5 s deadline; once it is delivered, the remaining batches are delivered without one (on a
+  detached task, so a closing client doesn't split a batch across consumers) and the request gets
+  `200`. A `503` code 9 then always means nothing of the body was taken, as on Splunk, which is
+  what lets `splunk_hec_out` resend a body answered code 9 before any acceptance without
+  duplicating it. The cost is that a stall after the first batch holds the request open with no
+  bound; the rejected alternative, answering `200` only for the delivered prefix, has no HEC answer
+  to carry it.
+- **Decision 2, `/health`:** amended. While the listener is refusing posts, `/health` and
+  `/health/1.0` answer `503` `{"text":"HEC is unhealthy, queues are full","code":18}`, Splunk's
+  documented answer for a full queue, which a load balancer or a sink's health check reads as
+  "send elsewhere". "While" is: the most recent `/event` or `/raw` request to reach delivery was
+  answered `503` code 9, less than 5 s ago, a fixed window rather than a config field. A later
+  request whose data the pipeline takes clears it. It still checks no token. Neither run provoked
+  code 18, so its text is still a reading of Splunk's documentation.

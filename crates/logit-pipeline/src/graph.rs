@@ -202,8 +202,9 @@
 //! 68. A `trace_context` `trace_id_high` under a `format` other than `datadog`, where no trace id
 //!     lacks its high half, or with an empty name (`docs/adr/log-record-trace-context.md`).
 //! 69. A `splunk_hec_in` with an empty `bind`, a `tokens` entry that is empty or has leading or
-//!     trailing whitespace (it could never match a request's token), or a `max_request_bytes` of
-//!     `0`. Its zero `handshake_timeout`/`idle_timeout` are rules 45/53's
+//!     trailing whitespace (it could never match a request's token), or a `max_request_bytes`,
+//!     `max_ack_channels`, or `max_pending_acks` of `0`. Its zero
+//!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/splunk-hec-relay.md`).
 //! 70. A `splunk_hec_out` whose `endpoint` isn't an absolute `http://`/`https://` URL, carries a
 //!     query or fragment, or ends in a HEC route (`/event`, `/event/1.0`, `/raw`, `/raw/1.0`,
@@ -227,6 +228,7 @@ use logit_config::{
     ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
+use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -609,6 +611,20 @@ const RESERVED_DATADOG_TRACE_HEADERS: &[&str] =
 /// The HEC routes rule 70 refuses at the end of a `splunk_hec_out` `endpoint`, lowercase.
 const SPLUNK_HEC_ROUTE_SUFFIXES: [&str; 7] =
     ["/event", "/event/1.0", "/raw", "/raw/1.0", "/ack", "/health", "/health/1.0"];
+
+/// Rule 70's startup warning for a `splunk_hec_out` `max_body_bytes` above
+/// [`SPLUNK_CLOUD_BODY_CAP`], or `None` at or under it.
+fn splunk_cloud_body_cap_warning(id: &str, max_body_bytes: u64) -> Option<String> {
+    (max_body_bytes > SPLUNK_CLOUD_BODY_CAP as u64).then(|| {
+        format!(
+            "component '{id}': splunk_hec_out 'max_body_bytes' ({max_body_bytes}) is above \
+             {SPLUNK_CLOUD_BODY_CAP} bytes, a bound at or below Splunk Cloud's observed cap (a \
+             5,242,881-byte body accepted, 6,000,000 refused) -- a Splunk Cloud stack may refuse \
+             a larger body, which the sink then resends as two requests or drops; Splunk \
+             Enterprise allows up to 800 MiB"
+        )
+    })
+}
 
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
@@ -3111,9 +3127,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // nor could one with leading or trailing whitespace, which the listener trims from the
     // `Authorization` header, a typo `!env` makes easy with a token file's trailing newline. An
     // empty list is the "accept any token" setting, not an error. A zero `max_request_bytes`
-    // would answer every request `413`. The timeouts are rules 45/53's.
+    // would answer every request `413`, and a zero ack bound would keep no id to answer. The
+    // timeouts are rules 45/53's.
     for (id, component) in &components {
-        if let ComponentKind::SplunkHecIn { bind, tokens, max_request_bytes, .. } = &component.kind
+        if let ComponentKind::SplunkHecIn {
+            bind,
+            tokens,
+            max_request_bytes,
+            max_ack_channels,
+            max_pending_acks,
+            ..
+        } = &component.kind
         {
             if bind.trim().is_empty() {
                 anyhow::bail!(
@@ -3140,6 +3164,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      -- 0 would refuse every request"
                 );
             }
+            for (field, value) in
+                [("max_ack_channels", max_ack_channels), ("max_pending_acks", max_pending_acks)]
+            {
+                if *value == 0 {
+                    anyhow::bail!(
+                        "component '{id}': splunk_hec_in '{field}' must be greater than 0 -- 0 \
+                         would keep no acknowledgment id to answer"
+                    );
+                }
+            }
         }
     }
 
@@ -3148,7 +3182,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // `/services/collector/event/event`, and one with a query or fragment would bury the route
     // inside it. The token gets rule 66's checks for the same reason:
     // HTTP strips a header value's surrounding whitespace. An `ack_timeout` without `ack` would
-    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS.
+    // do nothing. `tls` gets rule 24's checks, the scheme selecting TLS. A `max_body_bytes` over
+    // Splunk Cloud's cap is a warning, not an error: Splunk Enterprise's cap is 800 MiB.
     for (id, component) in &components {
         let ComponentKind::SplunkHecOut {
             endpoint,
@@ -3221,6 +3256,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': splunk_hec_out 'max_body_bytes' must be greater than 0 -- 0 \
                  would drop every event as oversize"
             );
+        }
+        if let Some(warning) = splunk_cloud_body_cap_warning(id, *max_body_bytes) {
+            tracing::warn!("{warning}");
         }
         if tls.cert_file.is_some() != tls.key_file.is_some() {
             anyhow::bail!(
@@ -5644,6 +5682,8 @@ mod tests {
             tls: None,
             tokens: tokens.into_iter().map(String::from).collect(),
             max_request_bytes: 5 * 1024 * 1024,
+            max_ack_channels: 256,
+            max_pending_acks: 1_000_000,
             handshake_timeout: default_handshake_timeout(),
             idle_timeout: None,
         }
@@ -5692,6 +5732,24 @@ mod tests {
         }
         let err = datadog_in_err(kind);
         assert!(err.contains("'max_request_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 69: a zero ack bound would keep no id to answer.
+    #[test]
+    fn a_splunk_hec_in_with_a_zero_ack_bound_is_rejected() {
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { max_ack_channels, .. } = &mut kind {
+            *max_ack_channels = 0;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'max_ack_channels' must be greater than 0"), "got: {err}");
+
+        let mut kind = splunk_hec_in("0.0.0.0:8088", vec![]);
+        if let ComponentKind::SplunkHecIn { max_pending_acks, .. } = &mut kind {
+            *max_pending_acks = 0;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'max_pending_acks' must be greater than 0"), "got: {err}");
     }
 
     /// Rules 45 and 53 cover `splunk_hec_in`'s two timeouts.
@@ -5859,6 +5917,25 @@ mod tests {
             }
         }));
         assert!(err.contains("'max_body_bytes' must be greater than 0"), "got: {err}");
+    }
+
+    /// Rule 70: a `max_body_bytes` above Splunk Cloud's cap resolves, with a warning; at the cap
+    /// there is none.
+    #[test]
+    fn a_splunk_hec_out_max_body_bytes_over_the_cloud_cap_warns() {
+        let cap = SPLUNK_CLOUD_BODY_CAP as u64;
+        let warning = splunk_cloud_body_cap_warning("out", cap + 1).expect("above the cap");
+        assert!(warning.contains("component 'out'"), "{warning}");
+        assert!(warning.contains("5242880 bytes"), "{warning}");
+        assert_eq!(splunk_cloud_body_cap_warning("out", cap), None);
+        assert_eq!(splunk_cloud_body_cap_warning("out", 2 * 1024 * 1024), None);
+        let kind = splunk_hec_out_with(|k| {
+            if let ComponentKind::SplunkHecOut { max_body_bytes, .. } = k {
+                *max_body_bytes = 800 * 1024 * 1024;
+            }
+        });
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("a body cap above Splunk Cloud's is valid for Splunk Enterprise");
     }
 
     /// Rule 70: rule 24's `tls` checks, including a block under `http://`.
