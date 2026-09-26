@@ -445,3 +445,50 @@ async fn aggregate_carries_the_first_records_description_into_help() {
     assert!(body.contains("# HELP depth Queue depth."), "the first record's, got:\n{body}");
     assert!(body.contains("# HELP hits_total Requests served."), "got:\n{body}");
 }
+
+/// `aggregate -> prometheus_out`: a cumulative series the cardinality cap evicts and a later event
+/// with source timestamp `0` re-creates renders `_created` as the start of the window it reopened
+/// in, not `0` and not before the point it replaces.
+#[tokio::test]
+async fn a_re_created_cumulative_series_renders_created_at_its_window_start() {
+    use logit_core::interner::intern;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource};
+    use std::sync::Arc;
+
+    let resource = Arc::new(Resource::default());
+    // A cap of 1 keeps `anchor`, opened first, and evicts `hits` at every flush.
+    let mut aggregator = Aggregator::new(Duration::from_secs(10))
+        .with_temporality(AggregateTemporality::Cumulative)
+        .with_series_retention(5, 1);
+    let feed = |aggregator: &mut Aggregator, timestamp: i64| {
+        for name in ["anchor", "hits"] {
+            let record = MetricRecord::new(intern(name), MetricKind::counter(1.0));
+            let mut event = Event::metric(timestamp, AttrMap::new(), record);
+            assert!(!aggregator.process(&resource, &mut event));
+        }
+    };
+    let first_flush = 1_700_000_000_000_000_000;
+    feed(&mut aggregator, first_flush - 1);
+    aggregator.flush(first_flush);
+    feed(&mut aggregator, 0);
+    let batches: Vec<EventBatch> = aggregator
+        .flush(first_flush + 10_000_000_000)
+        .into_iter()
+        .map(|(resource, scope, events)| EventBatch {
+            resource,
+            scope,
+            events: events.into_iter().map(|(event, _links)| event).collect(),
+        })
+        .collect();
+
+    let (body, _addr) = expose_and_fetch(&batches, ACCEPT_OM).await;
+    assert!(body.contains("hits_total 1"), "the re-created series restarts, got:\n{body}");
+    let created: f64 = body
+        .lines()
+        .find_map(|line| line.strip_prefix("hits_created "))
+        .unwrap_or_else(|| panic!("expected a hits_created line, got:\n{body}"))
+        .trim()
+        .parse()
+        .expect("hits_created parses as a float");
+    assert_eq!(created, 1.7e9, "the first flush's clock, in:\n{body}");
+}

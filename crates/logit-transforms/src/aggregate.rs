@@ -28,10 +28,11 @@
 //! `temporality: cumulative` keeps a delta `Sum`'s and a delta `Histogram`'s accumulator alive
 //! across the flush, under the same two bounds a retained gauge uses
 //! (`series_retention`/`max_retained_series`), and emits the running total every window as
-//! `Cumulative`, with `MetricRecord::start_timestamp` set to the series' first-seen event
-//! timestamp. That stamp is the reset signal OTLP and Prometheus consumers detect a counter restart
-//! with: it never changes while the series lives, and a series evicted (TTL or cardinality cap) and
-//! later re-created gets a new one.
+//! `Cumulative`, with `MetricRecord::start_timestamp` set to the series' start time (its first
+//! event's timestamp, clamped into the window it opened in; see `SeriesState::first_seen`). That
+//! stamp is the reset signal OTLP and Prometheus consumers detect a counter restart with: it never
+//! changes while the series lives, and a series evicted (TTL or cardinality cap) and later
+//! re-created gets a new one.
 //!
 //! A histogram's `sum`, `min`, and `max` each become `None` once a contributing record lacks one,
 //! because a value over part of the observations is a wrong number a consumer can't detect. For
@@ -197,6 +198,9 @@ pub struct Aggregator {
     /// a value that never changes within one batch (`Transform::observe_batch_context`'s doc makes
     /// the same argument). `None` until the first batch arrives.
     current_scope: Option<Arc<Scope>>,
+    /// The previous flush's `now`: the start of the window being filled, and the earliest start
+    /// time a series opened in it takes. `None` before the first flush.
+    window_start: Option<i64>,
     /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
     /// series this `Aggregator` has held, across groups and flushes.
     next_open_seq: u64,
@@ -224,12 +228,16 @@ struct SeriesState {
     /// `Aggregator::next_open_seq`. The cardinality cap evicts the highest first among equally idle
     /// series, so a series updated every window outlives one-off series opened after it.
     open_seq: u64,
-    /// Unix-nanos timestamp of the first event absorbed into this series, emitted as
-    /// `MetricRecord::start_timestamp` on every cumulative-mode `Sum`/`Histogram` flush. A series
-    /// evicted and re-created gets a fresh `SeriesState` and so a fresh value: that's the restart
-    /// signal. Taken from `event.timestamp`, not `SystemTime::now()`, which would put a syscall on
-    /// the open-a-series path and make this untestable. Recorded in both modes so the field has one
-    /// meaning regardless of config.
+    /// This series' start time in Unix nanos, emitted as `MetricRecord::start_timestamp` on every
+    /// cumulative-mode `Sum`/`Histogram` flush. A series evicted and re-created gets a fresh
+    /// `SeriesState` and so a fresh value: that's the restart signal.
+    ///
+    /// Opened as the opening event's timestamp, raised to `Aggregator::window_start`, and lowered
+    /// to the flush clock at the first flush that emits it, so it lies between the previous
+    /// incarnation's last point and this one's first. A source timestamp alone can precede the
+    /// point it replaces, run ahead of the flush, or be `0`. Both bounds are clocks the stage
+    /// already has, so opening a series costs no `SystemTime::now()` syscall. Recorded in both
+    /// modes so the field has one meaning regardless of config.
     first_seen: i64,
     /// Whether any event touched this series since the last flush. Not derived from `contexts.seen`
     /// being non-empty: that correlates today, but ties retention to a set built for span linking.
@@ -458,6 +466,7 @@ impl Aggregator {
             sets: Sets::default(),
             max_set_members_per_series: 1000,
             current_scope: None,
+            window_start: None,
             next_open_seq: 0,
         }
     }
@@ -556,6 +565,7 @@ impl Aggregator {
         let max_samples_per_series = self.max_samples_per_series;
         let sets = self.sets;
         let max_set_members_per_series = self.max_set_members_per_series;
+        let window_start = self.window_start;
 
         // Taken, not filtered with `retain`: a `retain` closure would borrow `event` while
         // `self.group_for` needs `&mut self`. Anything not absorbed is pushed back in its original
@@ -612,7 +622,8 @@ impl Aggregator {
                 contexts: ContributingContexts::default(),
                 idle_windows: 0,
                 open_seq,
-                first_seen: event.timestamp,
+                first_seen: window_start
+                    .map_or(event.timestamp, |start| event.timestamp.max(start)),
                 updated_this_window: false,
                 description: record.description,
             });
@@ -1026,9 +1037,11 @@ impl Aggregator {
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
                         record.description = state.description;
-                        // The reset signal (`SeriesState::first_seen`). A `Gauge` has no start
-                        // time and keeps `0`, OTLP's "unknown".
+                        // The reset signal (`SeriesState::first_seen`), kept once lowered so
+                        // it never moves while the series lives. A `Gauge` has no start time and
+                        // keeps `0`, OTLP's "unknown".
                         if matches!(record.kind, MetricKind::Sum(_) | MetricKind::Histogram(_)) {
+                            state.first_seen = state.first_seen.min(now);
                             record.start_timestamp = state.first_seen;
                         }
                         // An accumulated value is never a `NO_RECORDED_VALUE` point: `process`
@@ -1102,6 +1115,7 @@ impl Aggregator {
             self.groups[gi].series.insert(key, state);
         }
         self.groups.retain(|g| !g.series.is_empty());
+        self.window_start = Some(now);
 
         if total_dropped_links > 0 {
             self.telemetry.count(
@@ -3745,6 +3759,67 @@ mod tests {
             Some(1.0),
             "TTL eviction of a cumulative series fires series.evicted with reason=idle"
         );
+    }
+
+    /// A series the cap evicts while active and a later event re-creates starts inside the window
+    /// it reopened in, whatever the reopening event's source timestamp: never before the point it
+    /// replaces, never after its own first point, never `0`.
+    #[test]
+    fn a_re_created_cumulative_series_starts_inside_its_window() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(5, 1)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        let hits_of = |flushed: Vec<(Arc<Resource>, Vec<Event>)>| {
+            flushed
+                .into_iter()
+                .flat_map(|(_, events)| events)
+                .find(|e| logit_core::interner::resolve(e.metrics[0].name) == "hits")
+                .expect("hits is emitted before the cap evicts it")
+        };
+
+        // Before any flush there's no window start: the event timestamp stands. `anchor` opens
+        // first, so the cap keeps it and evicts the newer `hits` at every flush.
+        feed(&mut agg, &resource, metric_event("anchor", MetricKind::counter(1.0), 100));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 100));
+        let first = hits_of(flush_events(&mut agg, 1_000));
+        assert_eq!(start_timestamp_of(&first), 100);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 1.0);
+
+        // Source timestamps before the previous flush, after this one, and 0.
+        let mut previous_point = first.timestamp;
+        for (ts, now, start) in [(500, 2_000, 1_000), (9_999, 3_000, 3_000), (0, 4_000, 3_000)] {
+            feed(&mut agg, &resource, metric_event("anchor", MetricKind::counter(1.0), ts));
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+            let hits = hits_of(flush_events(&mut agg, now));
+            assert_eq!(sum_of(&hits).value, 1.0, "re-created at ts {ts}");
+            let got = start_timestamp_of(&hits);
+            assert!(
+                previous_point <= got && got <= hits.timestamp,
+                "ts {ts}: start {got} outside [{previous_point}, {}]",
+                hits.timestamp
+            );
+            assert_eq!(got, start, "ts {ts}");
+            previous_point = hits.timestamp;
+        }
+    }
+
+    /// In the first window a source timestamp past the flush clock is capped at the flush.
+    #[test]
+    fn a_first_window_start_time_is_at_most_the_flush_clock() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 5_000));
+        let flushed = flush_events(&mut agg, 1_000);
+        assert_eq!(start_timestamp_of(&flushed[0].1[0]), 1_000);
+        // The series keeps the capped value: a start time that moved would read as a reset.
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 5_000));
+        let flushed = flush_events(&mut agg, 2_000);
+        assert_eq!(start_timestamp_of(&flushed[0].1[0]), 1_000);
     }
 
     /// The cardinality cap evicts cumulative series too, counted and diagnosed.
