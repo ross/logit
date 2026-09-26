@@ -1072,15 +1072,32 @@ fn flatten_pino_http_event_warm() {
 /// `Box<str>` copy, and the component's scratch buffers (`pending`, `path`, the cache's `Vec`)
 /// grow for the first time, on top of the warm case's one spill. A process pays this once per
 /// new path, not per event.
+///
+/// A sibling `flatten` processes the same shape first, so the eight paths are already in the
+/// process-wide interner and only this component's `KeyCache` is cold. Interning a new string
+/// can grow one of the interner's `DashMap` shards, and which shard a key lands in follows the
+/// per-process `RandomState` seed and the host's core count (the shard count), so leaving that
+/// growth in the measured region adds one allocation in some processes and not others (164 of
+/// 20,000 seeds on a 24-thread host). The pin covers `flatten`'s own allocations, not the
+/// interner's.
 #[test]
 fn flatten_pino_http_event_cold_key_cache() {
-    let mut f = fixtures::flatten();
     let resource = fixtures::resource();
+    let mut sibling = fixtures::flatten();
+    let mut warm = fixtures::pino_http_event();
+    sibling.process(&resource, &mut warm);
 
+    let mut f = fixtures::flatten();
     let mut event = fixtures::pino_http_event();
+    let interned = logit_core::interner::len();
     let (forwarded, stats) = measure(|| f.process(&resource, &mut event));
     assert!(forwarded, "flatten forwards");
     assert_eq!(event.attributes.get("req.headers.host"), Some(&Value::str("api.example.com")));
+    assert_eq!(
+        logit_core::interner::len(),
+        interned,
+        "the measured region must not insert into the interner"
+    );
     expect_allocs("flatten: pino-http shape, cold KeyCache (first event)", stats, 12);
 }
 
