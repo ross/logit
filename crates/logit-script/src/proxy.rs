@@ -1466,15 +1466,21 @@ fn span_to_table<'lua>(lua: &'lua Lua, span: &SpanRecord) -> mlua::Result<Table<
 pub(crate) fn take_event(lua: &Lua, ud: AnyUserData) -> mlua::Result<(Event, Option<u16>)> {
     match ud.take::<EventProxy>() {
         Ok(proxy) => Ok(proxy.into_inner(lua)),
-        Err(mlua::Error::UserDataDestructed) => Err(mlua::Error::RuntimeError(
-            "this event was already returned/emitted elsewhere and can no longer be used -- an \
-             event handle is consumed once it's returned from process() or included in a flush() \
-             table; use event:clone() to keep an independent copy if you need to both return an \
-             event now and hold onto it for later"
-                .to_string(),
-        )),
+        Err(mlua::Error::UserDataDestructed) => Err(consumed_event_error()),
         Err(other) => Err(other),
     }
+}
+
+/// A returned event handle whose event was already returned: [`take_event`]'s wording, shared
+/// with `ScriptWorker::flush`'s bare-userdata check.
+pub(crate) fn consumed_event_error() -> mlua::Error {
+    mlua::Error::RuntimeError(
+        "this event was already returned/emitted elsewhere and can no longer be used -- an event \
+         handle is consumed once it's returned from process() or included in a flush() table; \
+         use event:clone() to keep an independent copy if you need to both return an event now \
+         and hold onto it for later"
+            .to_string(),
+    )
 }
 
 /// Rewrites a script's use of a destructed handle into this crate's "consumed once returned"

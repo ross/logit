@@ -282,6 +282,25 @@ fn returning_a_sub_handle_is_the_contract_error() {
     assert!(err.contains(&format!("{FLUSH_CONTRACT} {not_an_event}")), "got: {err}");
 }
 
+/// A stale event returned bare from `flush()` is named as consumed, not as some other userdata.
+#[test]
+fn a_stale_event_returned_bare_from_flush_gets_the_consumed_handle_wording() {
+    let w = worker(
+        r#"
+        local stashed = nil
+        function process(event)
+            stashed = event
+            return event
+        end
+        function flush() return stashed end
+        "#,
+    );
+    emitted(w.process(metric_event(sum_kind())).unwrap());
+    let err = flush_err(&w);
+    assert!(err.contains("this event was already returned/emitted elsewhere"), "got: {err}");
+    assert!(!err.contains("isn't an event"), "got: {err}");
+}
+
 #[test]
 fn returning_a_non_userdata_in_a_table_is_the_contract_error() {
     let w = worker("function process(event) return {1} end");

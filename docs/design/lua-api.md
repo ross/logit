@@ -1203,22 +1203,13 @@ results are tab-joined, and the line is logged at `info` as `print: <line>`, tag
 component id (`<unset>` for top-level code, which runs before the id is known).
 
 The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
-(`crates/logit-script/src/lib.rs`). It builds a worker as the runtime does and requires `_G` to
-hold this set and nothing else:
-
-- From Lua's base library: `_G`, `_VERSION`, `assert`, `collectgarbage`, `error`, `gcinfo`,
-  `getmetatable`, `ipairs`, `next`, `pairs`, `pcall`, `print` (rerouted, above), `rawequal`,
-  `rawget`, `rawset`, `select`, `setmetatable`, `tonumber`, `tostring`, `type`, `unpack`,
-  `xpcall`, and `coroutine`, which LuaJIT's base library registers itself.
-- The three libraries: `math`, `string`, `table`.
-- From `logit`: `Event` (the `Event.new` constructor, "Constructing events" above), `provenance`,
-  `resource`, `scope`, `telemetry`, and `trace`, each a proxy or a table of Rust closures, none a
-  route to the host.
-- The script's own `process`, and `flush` if it defines one.
-
-The same test requires `bit`, `debug`, `ffi`, `io`, `jit`, `module`, `newproxy`, `os`, `package`,
-`require`, and `rawlen` to be `nil`. `collectgarbage` and `coroutine` stay: neither reaches the
-host, and each has an ordinary use in a transform script.
+(`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
+does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
+and `newproxy`, with `print` rerouted; the `math`, `string`, and `table` libraries; the six `logit`
+globals this document describes, each a proxy or a table of Rust closures and none a route to the
+host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
+and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
+reaches the host, and each has an ordinary use in a transform script.
 
 ## Costs
 

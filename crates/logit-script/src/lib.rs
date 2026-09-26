@@ -309,13 +309,17 @@ impl ScriptWorker {
         Ok(match result {
             LuaValue::Nil => Vec::new(),
             LuaValue::Table(table) => events_from_table(&self.lua, table, Returner::Flush)?,
-            LuaValue::UserData(ud) => {
-                let got = match ud.is::<EventProxy>() {
-                    true => "an event (return {event})",
-                    false => NOT_AN_EVENT,
-                };
-                return Err(contract_error(Returner::Flush, got, None));
-            }
+            // `borrow`, not `is`: `is` answers `false` for a destructed event, which would report
+            // a stale event as "a userdata that isn't an event".
+            LuaValue::UserData(ud) => match ud.borrow::<EventProxy>() {
+                Ok(_) => {
+                    return Err(contract_error(Returner::Flush, "an event (return {event})", None))
+                }
+                Err(mlua::Error::UserDataDestructed) => {
+                    return Err(ScriptError::Lua(proxy::consumed_event_error()))
+                }
+                Err(_) => return Err(contract_error(Returner::Flush, NOT_AN_EVENT, None)),
+            },
             other => return Err(contract_error(Returner::Flush, lua_type(&other), None)),
         })
     }
