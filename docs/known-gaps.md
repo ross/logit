@@ -2130,17 +2130,17 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [lua-api.md](design/lua-api.md); [memory.md](design/memory.md)'s recommendations have the full
   write-up.
 - **A script is bounded only by what it opts into.** [ADR
-  `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md) adds a stall heartbeat, a bounded
-  shutdown drain, an opt-in `max_memory` (off by default), and a 128-level table-depth cap on
-  Lua-to-Rust conversion, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md)'s
+  `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md) adds a stall heartbeat, a
+  progress-based shutdown wedge check that revokes the wedged node's I/O rather than a
+  wall-clock drain bound, an opt-in `max_memory` (off by default), and a 128-level table-depth cap
+  on Lua-to-Rust conversion, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md)'s
   trusted-script bar. No instruction or time hook: LuaJIT's compiled traces skip a count hook
   unless the runtime is built with `LUAJIT_ENABLE_CHECKHOOK`. Recorded non-goals, each needing a
   crafted rather than an accidental script: `collectgarbage("stop")` defeats `max_memory`'s
   full-GC step; a `newproxy(true)` finalizer touching a stashed handle during collection is
-  unguarded re-entrancy; a no-allocation infinite loop is invisible to `max_memory` and caught
-  only by the stall heartbeat; and interner growth from script-derived strings (`Event.new`'s and
-  the proxy setters' name/unit/description fields, and nested attribute keys) is accepted the way
-  `telemetry`'s own tag values already are.
+  unguarded re-entrancy; a no-allocation infinite loop is caught only by the stall heartbeat; and
+  interner growth from script-derived strings (`Event.new`'s and the proxy setters'
+  name/unit/description fields, and nested attribute keys) is accepted like `telemetry`'s tags.
 
 ## Internal telemetry and self-logging
 

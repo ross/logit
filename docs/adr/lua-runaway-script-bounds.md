@@ -3,7 +3,7 @@ created: 2026-09-26
 updated: 2026-09-26
 ---
 
-# Lua scripts: stall detection, a bounded drain, opt-in `max_memory`, and a table-depth cap
+# Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
 
 ## Status
 Accepted
@@ -63,20 +63,37 @@ sources, found:
 
 ## Decision
 
-1. **Runaway CPU gets a heartbeat, not a hook.** `ScriptWorker` marks a per-call heartbeat before
-   and after each `process()`/`flush()` call. A watcher task polls it; a busy bit that stops
-   advancing for `stall_after` (default 10s) diagnoses `script_stalled` and moves the node to a
-   `NodeState::Stalled` state. `Stalled` is reversible: the heartbeat advancing again moves the
-   node back to `Running` and diagnoses `script_resumed`. `/readyz` maps a `Ready` phase with any
-   stalled node to `503 degraded`, the same status a failed node already reports. `/healthz` stays
-   `200`, because the admin task itself is unaffected: an orchestrator restart would not help a
-   node that is not making progress for reasons internal to a Lua VM.
-2. **Shutdown is bounded even with a wedged script.** The drain deadline for a run with a Lua node
-   is `max(listener shutdown_grace, sink shutdown_grace) + Lua shutdown_grace` (default 5s for the
-   Lua term). Past that bound, the join loop abandons the drain: every node still running is marked
-   `Failed`, readiness reports failure, and the process exits `2`, naming the wedged Lua node (and,
-   where relevant, the nodes downstream of it) in the diagnostic. A run with no Lua node keeps
-   today's unbounded drain, so no existing paused-time test changes.
+1. **Runaway CPU gets a heartbeat, not a hook.** The heartbeat lives in `logit-script`
+   (`logit_script::Heartbeat`, an `AtomicU64`: bit 0 is a busy flag, the upper bits a
+   call/progress count; `Relaxed` load and store, one writer). `ScriptWorker::with_heartbeat`
+   ticks it around each `process()`/`flush()` call, and inside a call too — once per `Event.new`
+   and once per element `events_from_table` builds from a returned table — so a `flush()` that
+   emits many events stays a run of progress ticks, never a stall, however long it takes. A
+   watcher task polls the heartbeat; a busy bit that stops advancing for `stall_after` (default
+   10s) diagnoses `script_stalled` and moves the node to a `NodeState::Stalled` state. `Stalled`
+   is reversible: the heartbeat advancing again moves the node back to `Running` and diagnoses
+   `script_resumed`. `/readyz` maps a `Ready` phase with any stalled node to `503 degraded`, the
+   same status a failed node already reports; the shipped image's `HEALTHCHECK` probes `/readyz`,
+   so a stalled script makes the container unhealthy — Docker Swarm restarts it, Kubernetes pulls
+   the pod from every Service's endpoints — without `logit` itself doing anything orchestrator
+   specific. `/healthz` stays `200`, because the admin task itself is unaffected: an orchestrator
+   restart would not help a node that is not making progress for reasons internal to a Lua VM.
+2. **A wedge is detected by lack of progress, never by a wall-clock drain bound.** The same
+   heartbeat is the wedge signal at shutdown. `shutdown_rx` only arms the check: once shutdown has
+   been seen, a node whose heartbeat is busy and unchanged for at least its `shutdown_grace`
+   (default 5s), measured from `max(shutdown_at, last_change)`, is wedged. A node the heartbeat
+   never marks busy — parked in `blocking_send` against a full downstream inbox, say — is never
+   blamed here; that belongs to RT-03. On a wedge the watcher revokes the Lua thread's I/O: its
+   `inbox`, `fanout`, and `target_fanouts` live behind an `Arc<Mutex<Option<LuaIo>>>` the thread
+   locks only around a receive or a send, never between entering and leaving a call, and the
+   watcher `try_lock`s the mutex and drops what it holds. Every downstream node then sees its
+   inbox close and drains on its own grace (a window flushed, a drop counted); an upstream send
+   against the revoked fanout fails and counts `closed_consumer`. Nothing is aborted and no thread
+   is cancelled: if the wedged call ever returns, it finds `None` and the thread exits on its own.
+   The watcher then fails the node the way a Rust panic already does — `Failed`, readiness
+   failure, the join loop's existing first-error cascade, exit `2` naming the node — through the
+   unchanged first-error path. A run with no Lua node is unaffected: the join loop,
+   `shutdown_grace_expired`, and the "drain complete" log are untouched.
 3. **Runaway memory is opt-in.** `lua`/`lua_file` gain an optional `max_memory` field (a byte
    count, `human_bytes`-shaped like `RotateConfig::max_bytes`). After each batch and each
    `flush()`, a VM over the cap runs a full garbage collection before the verdict: still over the
@@ -117,21 +134,29 @@ sources, found:
   leaves the node running in a state the operator can't distinguish from a real script bug. A full
   GC before the verdict, decided separately after the cap is crossed, gives the same protection
   without that false-positive class.
+- **A wall-clock drain bound with `JoinSet` abort.** The first design measured against a real
+  workload instead of dropped: a `flush()` emitting 1M events through `Event.new`, a legitimate
+  and healthy call, took 7.8s on the reference machine, tripping a bound sized for a wedge. Along
+  a chain of more than one Lua node the graces would add, so the bound a single node needs is not
+  the bound a chain needs. Worse, aborting the `JoinSet` entry hosting a Lua node would drop its
+  `Fanout` senders at once, so every downstream `aggregate` window in flight and any in-memory
+  sink state would be lost with no chance to flush. Rejected in favor of the progress-based,
+  per-node wedge check in decision 2.
 - **Killing the OS thread hosting a wedged script.** Rejected: Rust has no supported way to
-  terminate a running thread. The bounded drain accepts that a wedged thread outlives the process
-  that abandons it, and lets `process::exit` reclaim it at exit.
+  terminate a running thread. Revoking its I/O instead lets a wedged thread keep running
+  unobserved after the node around it has failed, and `process::exit` reclaims it at exit.
 - **A terminal `Phase::Failed` on a stall.** Rejected. A stall is not evidence the script (or the
   process) is broken beyond recovery — a slow but progressing script, a large batch, or a
   temporarily blocked downstream sink can all look the same for a while. `Stalled` recovers to
   `Running` on its own; a hard failure is reserved for the cases that are terminal (a
-  panic, an over-cap VM after a full GC, an abandoned drain).
+  panic, an over-cap VM after a full GC, a wedge past its `shutdown_grace`).
 - **Removing `print` instead of redirecting it.** Rejected. A leftover debug `print` is the
   accidental case this record is about, not a misuse to design out; a self-log line under the
   component id is strictly more useful to an operator than deleting the primitive would be.
-- **Bounding only the Lua watcher, leaving the drain unbounded.** Rejected. A wedged Lua thread
-  keeps its `Fanout` senders open, so a downstream native node's own inbox never closes and it
-  never finishes its own shutdown. Watching the Lua node alone would report the problem without
-  ever letting the process exit.
+- **Watching the Lua node without revoking its I/O.** Rejected. A wedged Lua thread keeps its
+  `Fanout` senders open, so a downstream native node's own inbox never closes and it never
+  finishes its own shutdown. Diagnosing the wedge without acting on its I/O would report the
+  problem without ever letting the process exit.
 
 ## Consequences
 
@@ -145,12 +170,15 @@ sources, found:
   heartbeat catches; and interner growth from script-derived strings (`Event.new`'s and the proxy
   setters' `name`/`unit`/`description`/`event_name` fields, and nested attribute keys) is accepted
   the way `telemetry`'s own tag values already are.
-- A downstream `aggregate` window in flight when a drain is abandoned is lost: the process exits
-  before that window's flush would fire. This is the same at-most-once cost an abandoned drain
-  already has for any node kind.
+- A downstream `aggregate` window in flight when a Lua node wedges is not lost: revoking the
+  wedged node's I/O (decision 2) closes every downstream inbox, so each downstream node drains on
+  its own `shutdown_grace` the way it would on an ordinary shutdown, flushing its own window and
+  counting its own drops. A send from upstream of the wedged node, against its now-revoked
+  fanout, counts `closed_consumer` rather than reaching it.
 - `/healthz` stays `200` on a stalled node, unchanged from [ADR
   `admin-readiness-endpoint`](admin-readiness-endpoint.md): the admin server itself is healthy, and
-  an orchestrator restart would not clear a script wedge.
+  an orchestrator restart would not clear a script wedge on its own — the container's
+  `HEALTHCHECK` failing `/readyz` is what prompts one.
 
 ## Running it
 
