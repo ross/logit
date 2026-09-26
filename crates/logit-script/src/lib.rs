@@ -14,6 +14,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod construct;
+mod heartbeat;
+mod memory;
+mod print;
 mod provenance;
 mod proxy;
 mod resource;
@@ -22,6 +25,11 @@ mod telemetry;
 mod trace;
 mod value;
 
+#[cfg(test)]
+mod lifetime_tests;
+
+pub use heartbeat::Heartbeat;
+pub use memory::GcVerdict;
 pub use proxy::EventProxy;
 
 #[derive(Debug, thiserror::Error)]
@@ -50,11 +58,17 @@ fn sandbox_libs() -> StdLib {
 ///   this worker was built from could run.
 /// - `getfenv`, `setfenv` inspect and replace a function's environment table, the tampering a
 ///   restricted stdlib exists to prevent.
+/// - `newproxy` is the only way a script gets a `__gc` finalizer on LuaJIT, and a finalizer
+///   running inside an mlua allocation is a reproducible SIGSEGV. Without it no script code runs
+///   during an allocation, which is what makes holding a `RefCell` borrow across one sound in
+///   `EventProxy`'s `to_table` and `AttrsProxy`'s `__index`
+///   (`docs/adr/lua-runaway-script-bounds.md`).
 ///
-/// `lua.globals()` is `_G` itself, not a copy.
+/// `lua.globals()` is `_G` itself, not a copy. The full resulting set is pinned by the
+/// `the_global_table_is_exactly_the_allowlist` test.
 fn remove_unsandboxed_base_globals(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
-    for name in ["loadfile", "dofile", "load", "loadstring", "getfenv", "setfenv"] {
+    for name in ["loadfile", "dofile", "load", "loadstring", "getfenv", "setfenv", "newproxy"] {
         globals.set(name, LuaValue::Nil)?;
     }
     Ok(())
@@ -87,6 +101,11 @@ pub struct ScriptWorker {
     /// `process` only borrows and bumps the `Rc`, so the `lua: process 1 event` allocation pin
     /// (`crates/logit-bench/tests/allocations.rs`) doesn't move.
     targets: Rc<RefCell<Rc<proxy::TargetTable>>>,
+    /// The runtime's progress counter, set by [`ScriptWorker::with_heartbeat`]. A cell for the
+    /// reason `targets` is one: `Event.new` is installed in `new` and reads it per call.
+    heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
+    /// `max_memory` and its in-call trip, shared with `Event.new` (see `crate::memory`).
+    memory: Rc<memory::MemoryCap>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -128,12 +147,17 @@ impl ScriptWorker {
         let resource_state = resource::install(&lua)?;
         let scope_state = scope::install(&lua)?;
         let provenance_state = provenance::install(&lua)?;
+        print::install(&lua, provenance_state.clone())?;
         // `Event.new` reads the targets cell at call time, so a later `with_targets` still takes
         // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
         // (`docs/design/lua-api.md` says so).
         let targets = Rc::new(RefCell::new(proxy::TargetTable::empty()));
-        construct::install(&lua, targets.clone())?;
-        lua.load(source).exec()?;
+        let heartbeat = Rc::new(RefCell::new(None));
+        let memory = Rc::new(memory::MemoryCap::default());
+        construct::install(&lua, targets.clone(), heartbeat.clone(), memory.clone())?;
+        // The `=` prefix makes the chunk name literal, so an error reads `script:4: ..`; mlua's
+        // default name is the Rust caller's source location.
+        lua.load(source).set_name("=script").exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
             _ => return Err(ScriptError::MissingProcess),
@@ -152,6 +176,8 @@ impl ScriptWorker {
             scope_state,
             provenance_state,
             targets,
+            heartbeat,
+            memory,
             _not_send_sync: PhantomData,
         })
     }
@@ -246,10 +272,66 @@ impl ScriptWorker {
         self
     }
 
+    /// Hands the worker the runtime's [`Heartbeat`], which it ticks once per `Event.new` call and
+    /// once per event taken from a returned table, so a long `process()`/`flush()` that is still
+    /// producing events reads as progress, not a stall. The runtime marks the call itself with
+    /// [`Heartbeat::enter`]/[`Heartbeat::leave`].
+    pub fn with_heartbeat(self, heartbeat: Arc<Heartbeat>) -> Self {
+        *self.heartbeat.borrow_mut() = Some(heartbeat);
+        self
+    }
+
+    /// Frees the registry slots of dropped `RegistryKey`s. mlua only queues a dropped key's slot,
+    /// so the value it held (a collected event's sub-proxies among them) stays pinned until this
+    /// runs or the slot is reused, invisible to [`ScriptWorker::used_memory`].
+    pub fn expire_registry_values(&self) {
+        self.lua.expire_registry_values();
+    }
+
     /// Bytes in use by this worker's Lua VM, the only view into a stateful script leaking state
     /// across `flush()` calls.
     pub fn used_memory(&self) -> usize {
         self.lua.used_memory()
+    }
+
+    /// Sets the `max_memory` cap `Event.new` checks inside a call; `None` (the default) turns the
+    /// check off. The post-call verdict is the caller's, through
+    /// [`ScriptWorker::collect_until_under`] (see `crate::memory`).
+    pub fn set_memory_cap(&self, cap: Option<usize>) {
+        self.memory.set(cap);
+    }
+
+    /// Clears `Event.new`'s over-cap trip. The runtime calls it after each `process()` and
+    /// `flush()` call, so a trip lasts for the rest of the call that set it and no longer.
+    pub fn reset_memory_trip(&self) {
+        self.memory.reset_trip();
+    }
+
+    /// Runs full garbage collections, each after [`ScriptWorker::expire_registry_values`], while
+    /// the VM holds more than `cap` bytes and the previous pass freed at least an eighth of what
+    /// it started from, up to `max_passes`. No pass runs when the VM is already at or under `cap`.
+    ///
+    /// Several passes because one LuaJIT cycle can't reach the live size: it halves the string
+    /// table per cycle, and frees a finalized userdata only on the cycle after it was found dead.
+    /// The eighth stops early on a VM whose excess is live, where more passes free nothing.
+    pub fn collect_until_under(
+        &self,
+        cap: usize,
+        max_passes: usize,
+    ) -> Result<GcVerdict, ScriptError> {
+        let mut used = self.lua.used_memory();
+        let mut passes = 0;
+        while used > cap && passes < max_passes {
+            self.lua.expire_registry_values();
+            self.lua.gc_collect()?;
+            passes += 1;
+            let before = used;
+            used = self.lua.used_memory();
+            if before.saturating_sub(used) < before / 8 {
+                break;
+            }
+        }
+        Ok(GcVerdict { used, passes })
     }
 
     /// Runs this worker's `process(event)` once.
@@ -266,18 +348,16 @@ impl ScriptWorker {
         Ok(match result {
             LuaValue::Nil => ProcessOutcome::Drop,
             LuaValue::UserData(ud) => {
-                let (event, target) = proxy::take_event(&self.lua, ud)?;
+                let (event, target) = take_returned(&self.lua, ud, Returner::Process, None)?;
                 ProcessOutcome::Emit(Box::new(event), target)
             }
-            LuaValue::Table(table) => {
-                ProcessOutcome::EmitMany(events_from_table(&self.lua, table, "process")?)
-            }
-            other => {
-                return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
-                    "process() must return nil, an event, or a table of events, got {}",
-                    other.type_name()
-                ))))
-            }
+            LuaValue::Table(table) => ProcessOutcome::EmitMany(events_from_table(
+                &self.lua,
+                table,
+                Returner::Process,
+                self.heartbeat.borrow().as_deref(),
+            )?),
+            other => return Err(contract_error(Returner::Process, lua_type(&other), None)),
         })
     }
 
@@ -300,36 +380,129 @@ impl ScriptWorker {
             flush.call(now.to_string()).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
-            LuaValue::Table(table) => events_from_table(&self.lua, table, "flush")?,
-            other => {
-                return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
-                    "flush() must return nil or a table of events, got {}",
-                    other.type_name()
-                ))))
-            }
+            LuaValue::Table(table) => events_from_table(
+                &self.lua,
+                table,
+                Returner::Flush,
+                self.heartbeat.borrow().as_deref(),
+            )?,
+            // `borrow`, not `is`: `is` answers `false` for a destructed event, which would report
+            // a stale event as "a userdata that isn't an event".
+            LuaValue::UserData(ud) => match ud.borrow::<EventProxy>() {
+                Ok(_) => {
+                    return Err(contract_error(Returner::Flush, "an event (return {event})", None))
+                }
+                Err(mlua::Error::UserDataDestructed) => {
+                    return Err(ScriptError::Lua(proxy::consumed_event_error()))
+                }
+                Err(_) => return Err(contract_error(Returner::Flush, NOT_AN_EVENT, None)),
+            },
+            other => return Err(contract_error(Returner::Flush, lua_type(&other), None)),
         })
     }
 }
 
+/// Which script function a value was returned from, for the return-contract error.
+#[derive(Clone, Copy)]
+enum Returner {
+    Process,
+    Flush,
+}
+
+impl Returner {
+    fn name(self) -> &'static str {
+        match self {
+            Returner::Process => "process",
+            Returner::Flush => "flush",
+        }
+    }
+
+    /// What this function may return, the prefix of every return-contract error
+    /// (`docs/design/lua-api.md`'s "Script contract").
+    fn contract(self) -> &'static str {
+        match self {
+            Returner::Process => "process() must return nil, an event, or a table of events",
+            Returner::Flush => "flush() must return nil or a table of events",
+        }
+    }
+}
+
+/// A returned value, or a returned table's element at `index`, that isn't an event.
+fn contract_error(returner: Returner, got: &str, index: Option<usize>) -> ScriptError {
+    let message = match index {
+        Some(i) => format!("{}; got {got} at index {i}", returner.contract()),
+        None => format!("{}; got {got}", returner.contract()),
+    };
+    ScriptError::Lua(mlua::Error::RuntimeError(message))
+}
+
+/// `value`'s type as a script's `type()` names it, with an article. mlua's `type_name` says
+/// `integer` for an integral number and `lightuserdata` for a light userdata; Lua 5.1 says
+/// `number` and `userdata`.
+fn lua_type(value: &LuaValue) -> &'static str {
+    match value.type_name() {
+        "nil" => "nil",
+        "boolean" => "a boolean",
+        "integer" | "number" => "a number",
+        "string" => "a string",
+        "table" => "a table",
+        "function" => "a function",
+        "thread" => "a thread",
+        "error" => "an error",
+        _ => "a userdata",
+    }
+}
+
+/// A userdata that isn't an event: the likeliest is a sub-handle returned in its event's place.
+const NOT_AN_EVENT: &str = "a userdata that isn't an event (e.g. event.attributes)";
+
+/// [`proxy::take_event`], with a userdata of any other type reported as the return-contract error
+/// rather than mlua's "userdata is not expected type". A destructed event keeps `take_event`'s
+/// own wording.
+fn take_returned(
+    lua: &Lua,
+    ud: mlua::AnyUserData,
+    returner: Returner,
+    index: Option<usize>,
+) -> Result<(Event, Option<u16>), ScriptError> {
+    proxy::take_event(lua, ud).map_err(|err| match err {
+        mlua::Error::UserDataTypeMismatch => contract_error(returner, NOT_AN_EVENT, index),
+        other => other.into(),
+    })
+}
+
 /// Extracts the events, each with its routing mark, from a table `process()` or `flush()`
-/// returned. `caller` names which, for the error message.
+/// returned.
 ///
 /// Validates a contiguous `1..=n` sequence rather than using `Table::sequence_values`, which
 /// stops at the first gap: `return {[2] = event}` would silently emit nothing. An empty table is
-/// valid and emits nothing.
+/// valid and emits nothing. Every read is raw, as in `crate::value`'s conversion, so a returned
+/// table's metatable runs no code here. An element that isn't an event fails the whole return,
+/// naming its index; the events taken before it are dropped.
+///
+/// Ticks `heartbeat` once per element: a `flush()` returning a very large table spends its time
+/// here, after the script returned, and must still read as progress.
 fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
-    caller: &str,
+    returner: Returner,
+    heartbeat: Option<&Heartbeat>,
 ) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
     let Some(len) = value::validated_sequence_len(&table)? else {
         return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
-            "{caller}() must return a contiguous array-like table of events (found non-sequence keys)"
+            "{}() must return a contiguous array-like table of events (found non-sequence keys)",
+            returner.name()
         ))));
     };
     let mut events = Vec::with_capacity(len);
     for i in 1..=len {
-        events.push(proxy::take_event(lua, table.get(i)?)?);
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.tick();
+        }
+        match table.raw_get::<_, LuaValue>(i)? {
+            LuaValue::UserData(ud) => events.push(take_returned(lua, ud, returner, Some(i))?),
+            other => return Err(contract_error(returner, lua_type(&other), Some(i))),
+        }
     }
     Ok(events)
 }
@@ -362,11 +535,11 @@ mod tests {
         event
     }
 
-    fn worker(source: &str) -> ScriptWorker {
+    pub(crate) fn worker(source: &str) -> ScriptWorker {
         ScriptWorker::new(source).expect("script should load")
     }
 
-    fn emitted(outcome: ProcessOutcome) -> Event {
+    pub(crate) fn emitted(outcome: ProcessOutcome) -> Event {
         match outcome {
             ProcessOutcome::Emit(e, _) => *e,
             _ => panic!("expected Emit"),
@@ -374,7 +547,7 @@ mod tests {
     }
 
     /// `unwrap_err` for `process`, whose `ProcessOutcome` isn't `Debug`.
-    fn process_err(w: &ScriptWorker, event: Event) -> String {
+    pub(crate) fn process_err(w: &ScriptWorker, event: Event) -> String {
         match w.process(event) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("expected process() to reject this script"),
@@ -1477,6 +1650,136 @@ mod tests {
     #[test]
     fn setfenv_is_not_available() {
         assert_global_is_nil("setfenv");
+    }
+
+    /// Every global a script can see, pinned: a new global, or one a LuaJIT or mlua upgrade
+    /// brings in, fails this test rather than widening the sandbox unnoticed. The worker is built
+    /// as `run_lua` builds it, so `telemetry` is present.
+    #[test]
+    fn the_global_table_is_exactly_the_allowlist() {
+        let w = ScriptWorker::new("function process(event) return event end")
+            .expect("script should load")
+            .with_telemetry(Telemetry::default())
+            .expect("installing telemetry should not fail")
+            .with_component("enrich")
+            .with_targets(&["a".to_string()]);
+        let mut names: Vec<String> = w
+            .lua
+            .globals()
+            .pairs::<String, LuaValue>()
+            .map(|pair| pair.expect("every global key is a string").0)
+            .collect();
+        names.sort();
+        let expected = [
+            "Event",
+            "_G",
+            "_VERSION",
+            "assert",
+            "collectgarbage",
+            "coroutine",
+            "error",
+            "gcinfo",
+            "getmetatable",
+            "ipairs",
+            "math",
+            "next",
+            "pairs",
+            "pcall",
+            "print",
+            "process",
+            "provenance",
+            "rawequal",
+            "rawget",
+            "rawset",
+            "resource",
+            "scope",
+            "select",
+            "setmetatable",
+            "string",
+            "table",
+            "telemetry",
+            "tonumber",
+            "tostring",
+            "trace",
+            "type",
+            "unpack",
+            "xpcall",
+        ];
+        assert_eq!(names, expected);
+
+        for absent in [
+            "bit", "debug", "ffi", "io", "jit", "module", "newproxy", "os", "package", "require",
+            "rawlen",
+        ] {
+            assert!(
+                w.lua.globals().get::<_, LuaValue>(absent).unwrap().is_nil(),
+                "expected global '{absent}' to be nil"
+            );
+        }
+    }
+
+    /// Collects rendered `tracing` output.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// `print` renders each argument through the script-visible `tostring`, `__tostring`
+    /// included, and emits one self-log line under the component id, or a placeholder for
+    /// top-level code that runs before `with_component`.
+    #[test]
+    fn print_writes_to_the_self_log_not_stdout() {
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let logs = CapturedLogs::default();
+        let guard = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish()
+            .set_default();
+        let w = worker(
+            r#"
+            print("loading")
+            local shown = setmetatable({}, {__tostring = function() return "custom" end})
+            function process(event)
+                print("hello", 1, nil, true, shown)
+                return event
+            end
+            "#,
+        )
+        .with_component("enrich");
+        w.process(counter_event("hits", 1.0)).unwrap();
+        drop(guard);
+
+        let logged = logs.text();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "one self-log line per print call: {logged}");
+        assert!(lines[0].contains("INFO"), "{logged}");
+        assert!(lines[0].contains("logit: print: loading"), "{logged}");
+        assert!(lines[0].contains("component=<unset>"), "{logged}");
+        assert!(lines[1].contains("print: hello\t1\tnil\ttrue\tcustom"), "{logged}");
+        assert!(lines[1].contains("component=enrich"), "{logged}");
     }
 
     /// The `Event` global, with its `new` constructor (`crate::construct`), is visible in

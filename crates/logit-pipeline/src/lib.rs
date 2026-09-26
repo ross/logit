@@ -45,6 +45,6 @@ pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use router::{Destination, Router, RouterScratch};
 pub use runtime::{
     process_batch, route_batch, run, run_with_shutdown, run_with_telemetry, send_batch,
-    unwrap_batch, NodeSpec, RetryConfig, RunError, WriteLoopConfig,
+    unwrap_batch, LuaRuntimeConfig, NodeSpec, RetryConfig, RunError, WriteLoopConfig,
 };
 pub use transform::{FlushOutput, FlushedEvent, Transform};
