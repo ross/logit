@@ -1112,7 +1112,10 @@ dependencies = [
  "bytes",
  "logit-core",
  "mlua",
+ "proptest",
  "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

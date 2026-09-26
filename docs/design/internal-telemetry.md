@@ -1355,6 +1355,11 @@ The runtime's stall watcher adds the `script_stalled` (`warn_throttled`, so coun
 `logit.component.diagnostics{key}`) and `script_resumed` (`info`) diagnostic keys; see layer 2's
 [receive and processing side](#receive-and-processing-side-the-node-loops).
 
+A script's `print(...)` is a self-log line, never stdout: `print: <arguments, tab-joined>` at
+`info`, target `logit`, with the component's `component` field (`<unset>` for top-level code that
+runs before the id is known; `crates/logit-script/src/print.rs`). At `info` it sits below the
+lowest `logs:` threshold `internal` accepts, so it reaches the process log but never the pipeline.
+
 #### Outputs
 
 Every sink's retry counting is layer 2 (`logit.component.retries`), not something each sink tracks
