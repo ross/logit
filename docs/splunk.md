@@ -190,9 +190,9 @@ from 0. Splunk Enterprise 10.4.3 indexed every object before it and none from it
 `logit.output.records.dropped{reason="invalid_event"}`, and resends the objects after it, once. A
 second code 6 on the resend is permanent. The other per-object rejections (7, 12, 13, and 15) are
 permanent: Splunk indexes the objects before the bad one and none from it on, and the rest of the
-batch is dropped with them. Code 7 names the object after the bad one. `splunk_hec_out` doesn't write the shapes behind codes
-12, 13, and 15 (a missing or blank `event`, a nested `fields` value), which leaves code 7, an
-index the token can't write.
+batch is dropped with them. Code 7 names the object after the bad one. `splunk_hec_out` doesn't
+write the shapes behind codes 12, 13, and 15 (a missing or blank `event`, a nested `fields`
+value), which leaves code 7, an index the token can't write.
 
 `splunk_hec_in` answers a `/event` body with a syntax error the same way: it delivers the objects
 before the bad one, answers `400` code 6 naming it, and delivers nothing from it on. So a client
@@ -205,8 +205,9 @@ the bad object. A gzip stream that doesn't decompress is rejected whole, with no
 `splunk_hec_in` turns a `/raw` body into one log per line, stamped with the time it arrived, with
 the envelope from the query string. Splunk would instead apply the sourcetype's `props.conf` line
 breaking and timestamp extraction. `splunk_hec_out` always sends `/event` with an explicit `time`,
-so Splunk applies neither to what `logit` relays: a multi-line event a `/raw` client sent stays
-split into its lines. Merge them upstream of the sink with a `regex` or `lua` stage, or send that
+and Splunk runs neither on `/event`, though it does run the sourcetype's index-time
+`TRANSFORMS-*`, such as index routing and sourcetype renaming. So a multi-line event a `/raw`
+client sent stays split into its lines. Merge them upstream of the sink with a `regex` or `lua` stage, or send that
 client's data to Splunk directly.
 
 ### No S2S: a universal forwarder can't point at `logit`
@@ -263,14 +264,21 @@ decodes and gets a `2xx` from `splunk_hec_in`, including the Docker driver's `OP
 - the recorded corpus, replayed into `splunk_hec_in` and relayed by `splunk_hec_out`, arrived in
   Splunk from every producer;
 - probes settled what Splunk does with gzip and per-object-invalid bodies, read its
-  `max_content_length` from `limits.conf` over REST, and settled `metric_type`, 1,000 dimensions, `OPTIONS`, and acknowledgment.
+  `max_content_length` from `limits.conf` over REST, and settled `metric_type`, 1,000
+  dimensions, `OPTIONS`, and acknowledgment;
+- a second run's probes settled that `/health` checks no token, how `time` integers are read by
+  magnitude, that no envelope field carries from one object to the next, `/raw` line merging,
+  per-channel `ackId`s, and that `/event` runs a sourcetype's `TRANSFORMS-*` but not its
+  timestamp extraction.
 
-It ran the same legs and probes against a Splunk Cloud Platform 10.5.2605.9 trial stack
-(`SPLUNK_INTEROP_TARGET=cloud`). A trial has no REST API, so each leg's arrival was confirmed by
-searching in Splunk Web. Every leg landed as on 10.4.3, acknowledgment included, and the probes
-found the endpoint, certificate, channel, and body-cap differences above. Edge Processor isn't
-provisioned on the trial stack, and Ingest Processor has no destination that reaches `logit`: it
-sends to Splunk indexes, S3, and Observability Cloud.
+It ran the same legs and probes against a Splunk Cloud Platform trial stack that Splunk Web
+reports as 10.5.2605.9 (`SPLUNK_INTEROP_TARGET=cloud`), three times on 2026-09-26. A trial has no
+REST API, so the harness reported each leg `SENT` from the sink's own telemetry, and arrival was
+confirmed afterward by running the harness's saved queries in Splunk Web. Every leg landed as on
+10.4.3, acknowledgment included, and the probes that could be searched answered as 10.4.3 did,
+except for the endpoint, certificate, missing-channel code, and body-cap differences above. Edge
+Processor isn't provisioned on the trial stack, and Ingest Processor has no destination that
+reaches `logit`: it sends to Splunk indexes, S3, and Observability Cloud.
 
 Not verified: the Observability Cloud leg (`fixtures/splunk-observability.yaml`), since no trial
 org was run; a paid Splunk Cloud stack's `http-inputs-` endpoint and its certificate; Vector's HEC

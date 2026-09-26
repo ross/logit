@@ -409,17 +409,16 @@ the Cloud run" section maps it item by item. By decision:
 
 Two answers the sink misread under its default at-most-once posture. By decision:
 
-- **Decision 2, faults across requests (the sink amendment's bullet):** a `429` (codes 26 and 27), or a `503` that is code 9
-  ("Server is busy") or carries no HEC body, is now `Fault::Clean` until a `/event` request of the
-  `send` is accepted, and `Fault::Ambiguous` after, the rule a connect failure already follows.
-  The criterion is "not taken": each of these says Splunk refused the body before indexing
-  anything, so a retry can't duplicate it, where it used to be `Ambiguous` and dropped a batch
-  Splunk never took. A `408`, a `500` (code 8 may have indexed), a `502`, a `504`, and any other
-  `503` stay `Ambiguous` in both positions. One receiver is an exception to "refused before
-  indexing": `splunk_hec_in` answered `503` code 9 after delivering part of a multi-resource
-  body until `splunk/listener-fidelity`, so a relay into a `logit` older than that can deliver
-  the part twice. `Retry-After` is ignored: `write_loop`'s retry loop
-  has no seam for a server-supplied delay, and building one is out of scope
+- **Decision 2, faults across requests (the sink amendment's bullet):** a `429` (codes 26 and
+  27), or a `503` that is code 9 ("Server is busy") or carries no HEC body, is now `Fault::Clean`
+  until a `/event` request of the `send` is accepted, and `Fault::Ambiguous` after, the rule a
+  connect failure already follows. The criterion is "not taken": each of these says Splunk
+  refused the body before indexing anything, so a retry can't duplicate it, where it used to be
+  `Ambiguous` and dropped a batch Splunk never took. A `408`, a `500` (code 8 may have indexed), a
+  `502`, a `504`, and any other `503` stay `Ambiguous` in both positions. `splunk_hec_in` answers
+  code 9 with the same meaning (the amendment "faithful listener acks and a busy /health" below),
+  so a `splunk_hec_out -> splunk_hec_in` relay keeps it. `Retry-After` is ignored: `write_loop`'s
+  retry loop has no seam for a server-supplied delay, and building one is out of scope
   (`docs/known-gaps.md`, "Splunk").
 - **Decision 18, code 6:** a code 6 naming object 0 of a body over
   `logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP` (5,242,880 bytes, before compression) is

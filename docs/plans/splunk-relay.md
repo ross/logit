@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-25
+updated: 2026-09-26
 ---
 
 # Enabling plan: Splunk — HEC in both directions, and Observability Cloud over OTLP
@@ -472,8 +472,9 @@ Each is proven by a test suite and by real traffic:
   grammar of generated ones, the OTel log and span shapes and both metric forms included.
 - **Pair round trips over real sockets**: `crates/logit-cli/tests/splunk_pair_round_trip.rs`
   (`splunk_hec_out -> splunk_hec_in`: gzip, the token check, body splitting, the channel and
-  acknowledgment exchange, and a code 6's drop and resend) and `splunk_hec_in_round_trip.rs` for the listener's routes, answers,
-  and backpressure.
+  acknowledgment exchange, and a code 6's drop and resend, checked against a stub that follows
+  Splunk's prefix rule), `splunk_hec_in_round_trip.rs` for the listener's routes, answers, and
+  backpressure, and `splunk_hec_out_retry.rs` for the sink's busy and oversize answers.
 - **Recorded interop corpus** (W5): [`testdata/interop/splunk/`](../../testdata/interop/splunk/README.md),
   from the Collector contrib 0.161.0 `splunk_hec` exporter, Docker 29.8.1's `splunk` log driver,
   SC4S 3.40.0, and splunk-library-javalogging 1.11.11, replayed through the codec by
@@ -481,54 +482,33 @@ Each is proven by a test suite and by real traffic:
   contradicted the survey, the code changed: `splunk_hec_in` answers `OPTIONS` (Docker's driver
   starts no container without it), `splunk_hec_out` writes the `SPAN_KIND_*`/`STATUS_CODE_*`
   names, and the decoder reads SC4S's metric objects.
-- **Splunk Enterprise 10.4.3 run** (W5): `script/splunk-interop` delivered logs, every metric kind
-  under `expand` (queried with `mstats` and `histperc`), spans, an `ack: true` leg on a `useACK`
-  token, and the whole corpus through `splunk_hec_in` and `splunk_hec_out`, every leg `PASS`. It
-  fixed the ack key (`ackId`, not `ackID`, which the sink had misread as "no acknowledgment") and
-  settled the survey's UNVERIFIED items, including decision 18's code 6 rule
+- **Splunk Enterprise 10.4.3 runs** (W5, then 2026-09-26 with probes for the facts Vector's HEC
+  code implies): `script/splunk-interop` delivered logs, every metric kind under `expand` (queried
+  with `mstats` and `histperc`), spans, an `ack: true` leg on a `useACK` token, and the whole
+  corpus through `splunk_hec_in` and `splunk_hec_out`, every leg `PASS`. It fixed the ack key
+  (`ackId`, not `ackID`, which the sink had misread as "no acknowledgment") and settled the
+  survey's UNVERIFIED items, including decision 18's code 6 rule
   (["Settled by W5"](#settled-by-w5-2026-09-25)).
-- **Splunk Cloud Platform 10.5.2605.9 run** (2026-09-26): the same legs and probes against a
-  trial stack, every leg `PASS` by a search in Splunk Web. It showed acknowledgment working,
+- **Splunk Cloud Platform 10.5.2605.9 runs** (2026-09-26): the same legs and probes against a
+  trial stack, every leg `PASS` by a search in Splunk Web. They showed acknowledgment working,
   added code 28, and found Cloud's body cap
   (["Settled by the Cloud run"](#settled-by-the-cloud-run-2026-09-26)).
-- **The listener's code 6** (2026-09-26): `splunk_hec_in` answers a `/event` body with a syntax
-  error as both runs showed Splunk does (["Settled by W5"](#settled-by-w5-2026-09-25), item 8):
-  it delivers the objects before the bad one and names it, where it had delivered nothing. A
-  `splunk_hec_out -> splunk_hec_in` relay now loses only the bad object, which
-  `splunk_pair_round_trip.rs` checks against a stub that follows Splunk's rule.
-- **Listener fidelity** (2026-09-26): `splunk_hec_in` issues `ackId`s from 0 per channel and
-  answers each `true` once on its own channel, as both runs' `useACK` tokens did, within
-  `max_ack_channels` and `max_pending_acks` bounds; `/ack` without a channel is code 10; and
-  `/health` answers `503` code 18 while posts are answered code 9, and code 9 now means nothing
-  of the body was delivered. `splunk_hec_in_round_trip.rs` and `splunk_pair_round_trip.rs` drive
-  them (ADR amendment "faithful listener acks and a busy /health").
 
-What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section, one entry
-each:
+What the runs changed after W6, each recorded as an amendment to ADR `splunk-hec-relay`:
 
-- No S2S listener, so a universal forwarder can't point at `logit` (§9).
-- No REST search export input (§9).
-- No listener for a forwarder's `[tcpout] sendCookedData = false` lines, shared with the Datadog
-  section's plain-lines gap (§9).
-- An Edge Processor's HEC destination pointed at `splunk_hec_in`, still unverified (item 3);
-  the Cloud trial stack has no Edge Processor.
-- Acknowledgment on Splunk Cloud: honored by the trial stack, documented by Splunk as
-  Firehose-only, so `ack: true` stays opt-in.
-- HEC codes 21, 22, 24, and 25 unmodeled; code 28 modeled from Splunk Cloud; no code 18 through
-  27 seen from a real Splunk.
-- Codes 7, 12, 13, and 15 permanent in `splunk_hec_out`, where only code 6 drops one object.
-- Splunk Cloud's body cap, between 5.2 and 6 MB, answered with code 6 rather than `413`:
-  `splunk_hec_out` reads a code 6 at object 0 on a body over 5 MiB as oversize and splits the
-  body once, and warns at startup about a `max_body_bytes` above it; the exact cap is unbisected.
-  A busy Splunk (`429`, `503` code 9) is retried before any body is accepted, ignoring
-  `Retry-After`.
-- `splunk_hec_in`'s acknowledgment bounds: an issue window per channel rather than Splunk's
-  outstanding-id count, and least-recently-used channel eviction.
-- What neither the corpus nor the runs exercised: the exporter's `Summary` and a link's
-  `trace_state`, Vector's HEC sinks, a third-party `useACK` client against `splunk_hec_in`, a
-  paid Splunk Cloud stack's `http-inputs-` endpoint and its certificate, Splunk Enterprise
-  releases other than 10.4.3 (including which one raised `max_content_length`), and
-  Observability Cloud.
+- **The listener's code 6**: `splunk_hec_in` answers a `/event` body with a syntax error as both
+  runs showed Splunk does (["Settled by W5"](#settled-by-w5-2026-09-25), item 8): it delivers
+  the objects before the bad one and names it, where it had delivered nothing, so a
+  `splunk_hec_out -> splunk_hec_in` relay loses only the bad object.
+- **Listener fidelity**: `splunk_hec_in` issues `ackId`s from 0 per channel, on a `200` and on a
+  delivered prefix's code 6 alike, and answers each `true` once on its own channel, as both runs'
+  `useACK` tokens did, within `max_ack_channels` and `max_pending_acks` bounds; `/ack` without a
+  channel is code 10; `/health` answers `503` code 18 while posts are answered code 9; and code 9
+  means nothing of the body was delivered.
+- **The sink's busy and oversize answers**: `splunk_hec_out` retries a `429` or a `503` code 9
+  before any body of the batch is accepted, under either delivery posture, and reads a code 6
+  naming object 0 of a body over 5 MiB as Splunk Cloud's oversize answer, splitting the body once
+  and warning at startup about a `max_body_bytes` above the cap.
 
 Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Splunk encode and decode
 rows in `known-gaps.md`'s "Cross-protocol semantic gaps" table (non-carrier resource attributes
@@ -539,6 +519,71 @@ closed.
 [ADR `splunk-hec-relay`](../adr/splunk-hec-relay.md)'s Status, and
 [ADR `lossless-transit`](../adr/lossless-transit.md)'s ninth-pair amendment, now record this
 closing assessment as the realization of their decisions.
+
+### Reassessed: `/raw` egress
+
+A comparison with Vector's HEC source and sinks (2026-09-25) ranked a `/raw` egress mode for `splunk_hec_out` on the grounds that only
+`/raw` runs a sourcetype's index-time props. The 10.4.3 probes showed otherwise: `/event` runs
+`TRANSFORMS-*` (index routing and sourcetype renaming both applied) and skips only timestamp
+extraction, which `/event?auto_extract_timestamp=true` restores. A `/raw` mode would buy only
+line-breaking props, at the cost of a partition by envelope and a second encoding. The candidate
+is instead an `auto_extract_timestamp` option on `splunk_hec_out`, not built here and tracked in
+`docs/known-gaps.md`'s "Splunk" section as a follow-up.
+
+### What's left
+
+Each item has one entry in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section.
+
+Not built, by scope:
+
+- No S2S listener, so a universal forwarder can't point at `logit` (§9).
+- No REST search export input (§9).
+- No listener for a forwarder's `[tcpout] sendCookedData = false` lines, shared with the Datadog
+  section's plain-lines gap (§9).
+- HEC codes 21, 22, 24, and 25 are unmodeled; code 28 is modeled from Splunk Cloud, and no code
+  18 through 27 was seen from a real Splunk.
+- Codes 7, 12, 13, and 15 are permanent in `splunk_hec_out`, where only code 6 drops one object:
+  the sink never writes the shapes behind 12, 13, and 15, and code 7 is a configuration error.
+- `Retry-After` is ignored: the runtime's retry loop has no seam for a server-supplied delay, and
+  adding one is a change to every HTTP sink.
+- `splunk_hec_in`'s acknowledgment bounds are an issue window per channel rather than Splunk's
+  outstanding-id count, with least-recently-used channel eviction: one bit per id keeps memory
+  bounded, and no client has needed Splunk's count.
+- Splunk Cloud's exact body cap between 5,242,881 and 6,000,000 bytes wasn't bisected: the 2 MiB
+  default and the startup warning keep a sink well under it.
+
+Deferred from the Vector comparison, each waiting on a user or a measurement:
+
+- **Acknowledgment pipelining and defaults**: `splunk_hec_out` blocks a batch until its ids are
+  acknowledged, with a 30 s `ack_timeout`, where Vector keeps a window of pending batches for up
+  to 300 s; deferred because `ack: true` is opt-in and no run has shown the blocking wait to
+  stall a sink.
+- **Which attributes become indexed `fields`**: every attribute goes to `fields`, as the OTel
+  exporter does, where Vector indexes an allowlist; deferred because exporter parity is the
+  pair's premise, and an opt-in mode or a transform needs a user whose index size it matters to.
+- **A sink startup healthcheck**: an optional `GET /health/1.0` when the sink starts would report
+  a bad endpoint early; deferred because the first request's failure already reports it, and
+  Splunk's `/health` checks no token.
+- **Parallel bodies**: a batch's bodies go out one after another, which is latency-bound to
+  Splunk Cloud; deferred because concurrency is a general sink concern, not specific to HEC.
+- **`auto_extract_timestamp`** on `splunk_hec_out`, from the `/raw` reassessment above; deferred
+  because `splunk_hec_out` always sends an explicit `time`, so it matters only to a sourcetype
+  whose `TIME_FORMAT` should win over the event's timestamp.
+
+Not verified, each waiting on access:
+
+- Splunk Observability Cloud through `fixtures/splunk-observability.yaml`: it needs its own
+  organization, which no trial run had.
+- An Edge Processor's HEC destination pointed at `splunk_hec_in` ("Settled by W5" item 3): it isn't on a Cloud
+  trial, and Splunk's support or account team has to enable it.
+- A paid Splunk Cloud stack's `http-inputs-<stack>` endpoint and its certificate: the trial's
+  `http-inputs-` host doesn't resolve.
+- Which Splunk Enterprise release raised `max_content_length` from 1,000,000 bytes: only 10.4.3
+  was run.
+- Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks as clients of `splunk_hec_in`: not
+  yet recorded with `script/record-fixtures`.
+- The exporter's `Summary` shape, a span link's `trace_state`, and a third-party `useACK` client
+  against `splunk_hec_in`: none of the recorded clients sends them.
 
 ## Verification
 

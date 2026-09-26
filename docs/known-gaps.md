@@ -1289,13 +1289,6 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     the batch's retry budget runs out.
   - **Revisit trigger:** a `Retry-After`-carrying sink that needs it honored, which would give
     `Fault` or `deliver_with_retry` a delay hint every HTTP sink could use.
-- **`splunk_hec_out` retries a `503` code 9 as "not taken", which a `logit` receiver may not
-  honor.** Splunk refuses a busy request before indexing it, but `splunk_hec_in` answered `503`
-  code 9 after delivering part of a multi-resource body until `splunk/listener-fidelity`.
-  - **Consequence:** a `splunk_hec_out -> splunk_hec_in` relay into a `logit` older than that
-    fix can deliver part of a body twice under the default at-most-once posture.
-  - **Revisit trigger:** `splunk/listener-fidelity` landing, after which only a relay into an
-    older `logit` is affected.
 - **`splunk_hec_out` treats codes 7, 12, 13, and 15 as permanent.** Each names an object in
   `invalid-event-number`, and Splunk 10.4.3 indexed the objects before the bad one and none from
   it on, as with code 6. Only code 6 gets the drop-one-and-resend rule; the others fail the batch.
@@ -1305,6 +1298,33 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     its request and the rest of the batch.
   - **Workaround:** keep every stamped index in the token's allowed list.
   - **Revisit trigger:** a pipeline that mixes indexes a token can and can't write.
+- **Four `splunk_hec_out` behaviors Vector's HEC sinks have are deferred.** A comparison with
+  Vector's `splunk_hec_logs` and `splunk_hec_metrics` sinks
+  ([plan, "What's left"](plans/splunk-relay.md#whats-left)) found them, and none has a user yet:
+  - acknowledgment blocks a batch until its ids are acknowledged, within `ack_timeout` (30 s),
+    where Vector keeps a window of pending batches for up to 300 s;
+  - every attribute becomes an indexed field in `fields`, as the OTel exporter writes it, where
+    Vector indexes only an allowlist and puts the rest in the `event` object;
+  - there's no startup healthcheck (`GET /health/1.0`) to report a bad endpoint before the first
+    batch;
+  - a batch's bodies go out one after another, not in parallel.
+  - **Consequence:** under load, `ack: true` can stall the sink or fail batches `Ambiguous` that a
+    longer window would have seen acknowledged; a parsed log with many attributes grows Splunk's
+    index-time field storage; a bad endpoint shows only when the first batch fails; and the
+    sink's throughput to Splunk Cloud is bound by one round trip per body.
+  - **Workaround:** leave `ack` off, or raise `ack_timeout`; `keep` or `remove` the attributes
+    that needn't be indexed before the sink.
+  - **Revisit trigger:** a deployment where one of these consequences shows: acknowledgment
+    timeouts under load, a Splunk index size complaint, or a throughput shortfall to Cloud.
+- **`splunk_hec_out` has no `auto_extract_timestamp` option.** Probes against Splunk Enterprise
+  10.4.3 showed `/event` runs a sourcetype's `TRANSFORMS-*` (index routing, sourcetype renaming)
+  and skips only timestamp extraction, which `/event?auto_extract_timestamp=true` restores
+  (`tools/splunk-interop/README.md`, "What the run showed"). So a `/raw` egress mode would add only
+  line-breaking props, and the follow-up is that query parameter, not `/raw`
+  ([plan, "Reassessed: `/raw` egress"](plans/splunk-relay.md#reassessed-raw-egress)).
+  - **Consequence:** Splunk indexes what `splunk_hec_out` sends at the event's own `time`, never
+    at a time its sourcetype's `TIME_PREFIX`/`TIME_FORMAT` would extract from the text.
+  - **Revisit trigger:** a user whose sourcetype's extracted time should win over the event's.
 - **What neither the recorded corpus nor the Splunk runs exercised.** Each is implemented from the
   exporter's source or Splunk's docs and covered by the codec's own tests:
   - the exporter's `Summary` shape and a span link's `trace_state` member (telemetrygen writes
