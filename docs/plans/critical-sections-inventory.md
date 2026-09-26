@@ -65,9 +65,10 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`); each becomes one `Option`-returning function, `opener_for -> Option<Opener>` for pass-through and `Accumulator::retained_kind -> Option<MetricKind>` for retention, with no `unreachable!` arm | XFORM-02, XFORM-03 | **Done**: findings → #405 (`opener_for` and `Accumulator::retained_kind`, each pinned by a table test over every kind and mode) |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
 | 21 | A `NaN` resource attribute opens a new `ResourceGroup` per metric, because `group_for` uses `Resource`'s derived `PartialEq` while `SeriesKey` and `scope_key_eq` compare floats bitwise: a quadratic scan, and every such metric emitted unaggregated | XFORM-01 | **Done**: findings → #402 (`group_for` compares resources bitwise, with an `Arc::ptr_eq` fast path) |
-| 22 | Cardinality-cap ties among equally idle series fall in `HashMap` order, so a series updated every window is evicted at random once active series exceed `max_retained_series`; a cumulative series then restarts with a new `start_timestamp`. The fix breaks ties by a per-`Aggregator` monotonic open sequence number, newest evicted first | XFORM-03 | in-progress (agg/w3) |
+| 22 | Cardinality-cap ties among equally idle series fall in `HashMap` order, so a series updated every window is evicted at random once active series exceed `max_retained_series`; a cumulative series then restarts with a new `start_timestamp`. The fix breaks ties by a per-`Aggregator` monotonic open sequence number, newest evicted first | XFORM-03 | **Done**: findings → agg/w3 (in a soak of 20 stable series against 1000 one-off series a window and a cap of 100, about 2 of 20 survived each flush before; all 20 after) |
 | 23 | A cumulative histogram's `min`/`max` fold (`fold_extreme`) keeps whichever side has a value, so a series can emit `min > max` when windows disagree on which extremes they carry | XFORM-02 | **Done**: findings → #405 (`min`/`max` follow the `sum` rule, and a zero-count record is ignored) |
 | 24 | A non-finite delta `Sum` (a statsd `1e308\|c\|@0.5` extrapolates to infinity) merges into a cumulative total and stays in it for the series' life | XFORM-02 | **Done**: findings → #405 (passes through, counted `passed_through{reason="non_finite"}`) |
+| 25 | A re-created cumulative series took its start time from the reopening event's source clock, which can precede the point it replaces (flush clock), run ahead of its own first point, or be `0` (no OpenMetrics `_created`, OTLP "unknown") | XFORM-04 | **Done**: findings → agg/w3 (clamped between the window start and the flush clock, and kept once emitted) |
 
 Repo-wide gaps that cut across entries:
 
@@ -219,7 +220,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-16](#core-16--eventproxy-handle-lifetime-registry-caches-the-no-clone-fast-path-and-metricproxys-weak) | P0 | `EventProxy` handle lifetime: registry caches, the no-clone fast path, and `MetricProxy`'s `Weak` | `crates/logit-script/src/proxy.rs` (`EventProxy`, `EventProxy::into_inner`, `MetricProxy`) | findings → #388 |
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
-| [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | in-progress (agg/w3) |
+| [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → agg/w3 |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | unreviewed |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | unreviewed |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | unreviewed |
@@ -277,7 +278,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-18](#core-18--eventnewt-building-a-whole-event-from-an-untrusted-shape-lua-table) | P1 | `Event.new(t)`: building a whole `Event` from an untrusted-shape Lua table | `crates/logit-script/src/construct.rs` (`event_from_table`, `metric_from_table`, the `*_KEYS` allowlists) | findings → #385 |
 | [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | reviewed @d80f616 |
 | [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | findings → #402 |
-| [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | in-progress (agg/w3) |
+| [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | findings → agg/w3 |
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
@@ -6140,8 +6141,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   Retainable ones (a Gauge in either mode; a Sum/Histogram under `temporality: cumulative`) either
   emit-and-survive (if updated this window), emit-nothing-and-age (if idle, up to
   `series_retention` windows), or get evicted. After all groups are processed, a single global
-  cardinality cap (`max_retained_series`) evicts the least-recently-updated survivors first via a
-  stable sort on `idle_windows`, across every resource group at once.
+  cardinality cap (`max_retained_series`) evicts the most idle survivors first, then the newest
+  among equally idle ones (by `SeriesState::open_seq`), across every resource group at once.
 - **Why sensitive:** hot-path (runs every flush interval, typically 10s), custom, unbounded-growth
   guard itself (the cap this function enforces is the thing standing between a high-cardinality
   gauge stream and unbounded memory), time/windowing (idle-window aging, cross-flush survival),
@@ -6190,6 +6191,16 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
 - **Priority:** P0 -- this is the actual cardinality/memory safety valve for the whole aggregate
   path; a bug here (e.g. an off-by-one in idle-window comparison, or the cap not applying
   globally) directly risks unbounded memory in production.
+- **Verification (agg/w3):** the reference model gained retention: survival, idle eviction at the
+  `series_retention`th idle flush, and the global cap predicted series by series, with every
+  survivor's state and the series identity `series_at_flush_start == emitted_and_removed + kept +
+  evicted` checked after every flush. Soak tests drive 1000 one-off series a window through a cap
+  of 100 in one group and across two. The retention walk (1, 2, 3) and a 2000-group drain are
+  pinned. Found and fixed: cap ties fell in `HashMap` order, re-randomized every flush (lead 22),
+  now newest first by open order, with `series.evicted{reason="cardinality"}` split by
+  `state="active"|"idle"`. Confirmed: the partition holds, an updated series the cap evicts is
+  emitted and counted once, `groups.retain` runs after reinsertion, and an idle retained series
+  never emits, the final flush included.
 
 ### XFORM-04 — Aggregate: cumulative temporality and counter-reset semantics
 - **Location:** `aggregate.rs` (module doc), `aggregate.rs` (`Aggregator::process`'s Sum/Histogram
@@ -6197,8 +6208,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   `Aggregator::flush`, and `Accumulator::retained_kind`), `aggregate.rs` (module doc's
   saturating bucket-count paragraph)
 - **What it does:** Under `temporality: cumulative`, a delta Sum/Histogram's accumulator survives
-  flushes and keeps summing; the emitted record is stamped `start_timestamp = SeriesState::first_seen`,
-  unchanged for the series' lifetime, which is the reset signal OTLP/Prometheus consumers use to
+  flushes and keeps summing; the emitted record is stamped `start_timestamp = SeriesState::first_seen`
+  (clamped between the window start and the flush clock), unchanged for the series' lifetime, which is the reset signal OTLP/Prometheus consumers use to
   detect a counter restart. An incoming *cumulative* Sum is always pass-through (re-summing it
   would double-count).
 - **Why sensitive:** numeric (this is the exact place a hostile or buggy producer's repeated
@@ -6231,6 +6242,16 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   outright, and the mechanism is narrow and already has a first-line test, but the OTLP/Prometheus
   contract it upholds is easy to violate quietly (e.g. by later code that touches `first_seen` for
   an unrelated reason).
+- **Verification (agg/w3):** the reference model checks `first_seen` on every survivor and
+  `start_timestamp` on every emitted record, only on the retained `Sum`/`Histogram` path. Found and
+  fixed: a re-created series' start came from the source clock (lead 25); it now opens at
+  `max(event.timestamp, window start)` and is lowered to the flush clock at its first emission and
+  kept, so the previous point comes at or before it and it at or before its own point, and it
+  never moves while the series lives. Rule 39 exists and is tested; it now also rejects retention
+  with `max_retained_series: 0` and a zero `max_samples_per_series` or
+  `max_set_members_per_series`, and `flush` `debug_assert!`s cumulative mode's bounds. Remaining,
+  in `docs/known-gaps.md`: retention counts flushes, not wall time, and the `SystemTime` flush
+  clock can step backwards.
 
 ### XFORM-05 — Aggregate: contributing-context span-link bookkeeping
 - **Location:** `aggregate.rs` (`ContributingContexts`, `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`)
