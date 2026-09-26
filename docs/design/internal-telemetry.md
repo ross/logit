@@ -1138,7 +1138,7 @@ counts what it sent, so a native equality match has nothing further worth a coun
 | `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
 | `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
 | `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
-| `logit.transform.links.dropped{reason="cardinality"}` | count | contributing span contexts past the per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry |
+| `logit.transform.links.dropped{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
 
 Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative

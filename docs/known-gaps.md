@@ -2043,8 +2043,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   linearly on every absorbed metric.** An `otlp_in` gateway or a `prometheus_in` with a resource
   per scrape target can present thousands of distinct resources, so absorb cost can grow with the
   group count. Measured with `crates/logit-bench`'s `aggregate_absorb_with_groups` (one gauge per
-  event, resources rotating, one core): about 140 ns per event at 1 group, 880 ns at 100, and
-  8.6 µs at 1000, so the scan dominates from 100 groups on. A cache, index, or cap lands in its
+  event, resources rotating, one core): 137 ns per absorbed event at 1 group, 877 ns at 100, and
+  8.6 µs at 1000, so the scan dominates from about 100 groups on. The candidates are a per-batch
+  `Arc::ptr_eq` cache and a hashed group index, decided by a measurement on the perf VM in its
   own change. `logit.transform.resource.groups` shows the count.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
@@ -2355,7 +2356,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
       and `run_output` already borrows the incoming `Delivered`. `Transform::flush`/`Aggregator`
       keep a bounded, best-effort `ContributingContexts` set per series
       (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8; overflow dropped and counted as
-      `logit.transform.links.dropped{reason="cardinality"}`) and pair each flushed `Event` with the
+      `logit.transform.links.dropped{reason="contexts"}`) and pair each flushed `Event` with the
       resulting `SpanLink`s. Lua's `flush()` has no inspectable accumulator, so it runs in a
       link-less root context ([ADR `lua-flush-root-context`](adr/lua-flush-root-context.md)), with
       `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to the script's own

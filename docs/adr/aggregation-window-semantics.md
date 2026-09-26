@@ -528,7 +528,7 @@ held series is accounted for were decided only in code and tests, and
 [`docs/design/data-model.md`](../design/data-model.md) stated none of it. The `agg` verification
 stream (`docs/plans/critical-sections-inventory.md`'s cluster 8) tests `aggregate` against a
 reference model, and a model needs a stated contract to check against. This amendment is that
-contract. Where the code doesn't meet it yet, the entry names the workstream that closes the gap.
+contract.
 
 ### Series identity
 
@@ -676,8 +676,8 @@ panic:
 
 `SetMembers` under `sets: members` stops its deduplicating union as soon as it passes
 `max_set_members_per_series`, and streams the held members and the rest of the record into the
-HyperLogLog. One oversized record then costs O(cap²) `contains` compares and cap-bounded memory,
-not its own size squared.
+HyperLogLog. The deduplicating scan makes at most `cap` compares per member, so one oversized
+record costs O(n·cap) compares and cap-bounded memory, not its own size squared.
 
 Graph rule 39 rejects every cap that can hold nothing:
 
@@ -734,8 +734,9 @@ or `prometheus_in` with a resource per scrape target).
 `crates/logit-bench`'s `aggregate_absorb_with_groups` measures it, one gauge per event with the
 resource rotating per event, on one core: about 137 ns per event at 1 group, 877 ns at 100, and
 8.6 µs at 1000. The scan dominates from 100 groups on, at about 7.5 ns per group compared. The
-`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. A cache,
-index, or cap is a separate decision, in its own change with its own allocation pins.
+`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. The
+candidates are a per-batch `Arc::ptr_eq` cache and a hashed group index. A measurement on the perf
+VM decides, in its own change with its own allocation pins.
 
 ### Start time after a cap eviction
 
