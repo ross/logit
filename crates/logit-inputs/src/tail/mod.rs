@@ -81,8 +81,8 @@ pub struct TailConfig {
     /// The read/rescan cadence under `WatchMode::Poll`, and the reconciliation pass under
     /// `Inotify`/`Auto`. Never disabled: graph validation rejects `0s`.
     pub poll_interval: Duration,
-    /// How long a dirty checkpoint may wait before it's written. It's also written on every file
-    /// close and on shutdown. Graph validation rejects `0s`.
+    /// How long a dirty checkpoint may wait before it's written. A file close dirties it, and
+    /// shutdown writes it unconditionally. Graph validation rejects `0s`.
     pub checkpoint_interval: Duration,
     /// A longer line is dropped whole (not truncated) and diagnosed. Graph validation rejects
     /// `0`.

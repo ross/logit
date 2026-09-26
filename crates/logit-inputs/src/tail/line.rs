@@ -29,6 +29,13 @@ pub trait TailDecoder: Send {
     /// [`LineSplitter::take_partial`]'s job, not this. Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
 
+    /// The on-disk bytes of the complete lines this decoder holds without having produced their
+    /// events yet: what [`TailDecoder::close`] would emit. `Tailer::write_checkpoint` subtracts
+    /// it, so a checkpoint never covers a held line. Default: nothing held.
+    fn held_bytes(&self) -> u64 {
+        0
+    }
+
     /// The file was truncated in place: drop, **not** emit, everything held across lines.
     ///
     /// Held state belongs to content that no longer exists; emitting it, or splicing it onto the
