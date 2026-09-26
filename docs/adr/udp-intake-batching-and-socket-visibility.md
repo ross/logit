@@ -1173,3 +1173,16 @@ after both halves' futures are gone, when nothing else holds the queue. The boun
 holds; only "uncounted" changes. The events a grace-dropped listener had already decoded, in the
 `BatchAccumulator` or parked in `emit`'s `Fanout::send`, stay uncounted, as that ADR's decision 1
 names.
+
+## Amendment: `wait_for` does spend coop budget (2026-09-26)
+
+Fact 2 of the section "The coop-budget argument, …" above says
+`watch::Receiver::wait_for` "has no coop call on its path at all". In tokio 1.53.1 that's wrong:
+`wait_for` is wrapped in `cooperative(..)`. `Coop::poll` runs `poll_proceed` first; a `Pending`
+restores the budget, and a `Ready` spends one unit. The conclusion stands, because a `wait_for`
+that stays `Pending` doesn't drain the budget. Only the mechanism was misdescribed.
+
+That `wait_for` and `Sleep::poll_elapsed` both spend the task's budget is why
+[ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+decision 6 wraps every grace arm in `tokio::task::unconstrained`. The `sample_while` doc comment in
+`crates/logit-inputs/src/udp.rs` repeats the wrong fact; `drain/w3` will correct it.

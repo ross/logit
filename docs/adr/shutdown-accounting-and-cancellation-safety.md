@@ -89,24 +89,34 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 1. **Shutdown has an accounting contract, and any unexplained remainder is a bug.**
    - Per sink: `logit.component.batches.received == batches.delivered + Σ batches.dropped{reason}
      + batches still spooled`, and the same for events. "Received" includes every batch the
-     abandoned-inbox sweep takes from `inbox` with `try_recv`. It doesn't recount the `in_hand`
-     batch, which `drain_inbox` counted as received before it parked on the store.
+     abandoned-inbox sweep takes from `inbox`. It doesn't recount the `in_hand` batch, which
+     `drain_inbox` counted as received before it parked on the store.
    - Per UDP listener: `logit.input.datagrams == datagrams decoded + Σ
-     logit.component.datagrams.dropped{reason}`. A decoded datagram is one
-     `logit.component.receive.latency` sample.
-   - Two losses are named exceptions, left uncounted and to be listed in `docs/known-gaps.md`.
-     The first is a UDP listener's decoded events that the grace backstop drops, either held in the
-     `BatchAccumulator` or parked in `emit`'s `Fanout::send`. Their datagrams already count as
-     decoded, so the datagram contract still holds. The second is a batch sent into a revoked Lua
-     inbox by a permit holder still blocked after `REVOKE_DRAIN_TIMEOUT`.
+     logit.component.datagrams.dropped{reason}`. "Decoded" means every datagram yielded to the
+     decoder, including one `decode_into` rejects. Each gets one
+     `logit.component.receive.latency` sample; a decode error is a throttled diagnostic, not a
+     counter. `logit.input.datagrams.truncated` isn't a drop and never appears in the sum.
+   - Four losses are named exceptions, left uncounted and to be listed in `docs/known-gaps.md`:
+     - A UDP listener's decoded events that the grace backstop drops, either held in the
+       `BatchAccumulator` or parked in `emit`'s `Fanout::send`. Their datagrams already count as
+       decoded, so the datagram contract still holds.
+     - A batch cut off mid-`Fanout::deliver` at the grace backstop. It reaches a prefix of its
+       consumers and counts as `sent` and `receive.flushed`, but never as a drop.
+     - A batch sent into a revoked Lua inbox by a permit holder still blocked after
+       `REVOKE_DRAIN_TIMEOUT`.
+     - A batch sent into a closed sink inbox (decision 9) by a permit holder still blocked when
+       the sweep's bound runs out.
 2. **`drain complete`'s `batches_dropped` is the sum of every `reason="shutdown"` batch drop at a
    sink or Lua boundary.** One helper, `count_shutdown_drop`, will be the only site that counts
    `batches.dropped`/`events.dropped{reason="shutdown"}` and the only site that adds to
    `shutdown_dropped_batches`. Its callers will be the `run_output` sweep, `finish_and_flush`,
    `write_loop`, and `revoke_lua_io`. `revoke_lua_io` has two callers: `watch_lua_thread`, on a
    wedge at shutdown, and `run_lua`'s Lua OS thread on the `max_memory` failure path, through
-   `sweep_runtime.block_on(revoke_lua_io(..))`. So the counter reaches the Lua thread too. The
-   `max_memory` path keeps `reason="shutdown"`, because that failure is what starts the drain.
+   `sweep_runtime.block_on(revoke_lua_io(..))`. So the counter reaches the Lua thread too. A
+   `max_memory` failure can land before the drain or after it has begun (`run_lua_loop`'s
+   `flush_now` and `check_at_close` verdicts). Either way the revoked inbox's contents are
+   dropped because the node is leaving the graph, on or after the drain's start, so the label
+   stays `shutdown`.
 
    The field doesn't include events a `Fanout` drops as `closed_consumer`, UDP datagram drops (a
    different unit), overflow evictions during the drain, or the disk sweep's push failures
@@ -145,6 +155,10 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      and counts what it drained. `commit()` takes the queue's mutex, and taking it there is safe:
      no other holder of that queue exists by then, the mutex is never held across an await
      anywhere, and every lock site swallows poisoning.
+
+   Each of these counts is recorded at the grace backstop or during the drain, after `internal`'s
+   final drain has run, so it never reaches an exported pipeline. Each guard that counts a
+   nonzero remainder will also log a self-log `diag.warn` naming the listener and the count.
 5. **Queue verification is a multi-thread randomized stress harness, a sequential proptest, and
    pins against tokio's source.** The stress harness will run `BoundedQueue` and `DiskQueue` on a
    four-worker multi-thread runtime with random producers, consumers, cancellations, and close
@@ -182,9 +196,13 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 9. **`run_output` closes its inbox before the sweep.** It will call `inbox.close()` first, as
    `revoke_lua_io` does, so a later send fails upstream as `closed_consumer` instead of landing
    in a channel nobody reads. The sweep then drains with `recv` until `None`, under a short bound,
-   so a send whose permit was reserved before the close still lands and is counted. This also
-   makes [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s claim hold that shutdown
-   stragglers are bounded by the channel's capacity.
+   so a send whose permit was reserved before the close still lands and is counted. Closing
+   first fixes two things in [ADR `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s
+   "Shutdown":
+   - The batch lost after the sweep contradicts its "the sweep … still drops nothing".
+   - Its bound on spool overshoot, "bounded by the channel's fixed capacity", breaks today by a
+     different mechanism: the inbox stays open while the sweep awaits each disk `store.push`, so
+     producers refill it. A closed inbox can't refill.
 
 ## Alternatives considered
 
@@ -236,6 +254,10 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 - The stress tests will run a small seed count in CI (64 for `BoundedQueue`, 16 for `DiskQueue`)
   under a 30 s timeout, so they don't flake on a loaded runner. Long runs will be `#[ignore]`d,
   and `LOGIT_QUEUE_STRESS_SEED` will replay one seed.
+- `internal` can't export the counts decision 4 adds. Its `run_until_shutdown` does its final
+  drain the instant the signal fires, and every one of those counts is recorded later, at the
+  grace backstop or during the drain. They reach a test `Registry`, but not an exported pipeline.
+  The self-log `diag.warn` is what an operator sees, and `docs/known-gaps.md` will record the gap.
 - Out of this stream's scope, recorded for the sink cluster: `stdio_out`/`file_out` write in
   place with `write_all`, so when a send is cancelled mid-write and `flush()` then completes it,
   the file can hold a torn line or native frame.
