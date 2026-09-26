@@ -1376,14 +1376,12 @@ enum ReadStep {
 
 /// One read step, raced against `shutdown`.
 ///
-/// `AsyncReadExt::read_buf` is cancellation-safe (no bytes are consumed if another `select!` arm
-/// wins), which lets both this race and [`serve_connection`]'s deadline timeout drop it mid-await
-/// without losing stream bytes.
+/// Unbiased: see `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
-/// `shutdown.changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the combined future
-/// `!Send`, and `tokio::spawn`ing this connection's task requires `Send`. The caller's explicit
-/// `*shutdown.borrow()` check covers what `changed()` alone cannot: shutdown having fired before
-/// this loop iteration began. `crate::logit`'s `serve_connection` follows the same discipline.
+/// `shutdown.changed()` needs the caller's `*shutdown.borrow()` check for a shutdown that fired
+/// before the iteration. `wait_for` would compile here, since these arms don't await; `changed()`
+/// matches `crate::logit`'s `serve_connection`, whose shutdown arm awaits, where a `Ref` kept alive
+/// by `select!` would make the future `!Send`.
 async fn read_step<S: AsyncRead + Unpin + Send>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -1456,12 +1454,17 @@ where
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
+                let mut now_instant = now_instant;
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Interval).await;
                     // Stamped after the send returns, so time blocked on a full downstream is
                     // not counted against the peer. A tick with nothing to emit never gets here:
                     // this process's own timer must not keep a silent connection alive.
                     last_progress = tokio::time::Instant::now();
+                    // Re-read for the same reason: an `emit` parked past the next deadline would
+                    // otherwise leave it already due, and every read after it would flush on
+                    // `Interval`.
+                    now_instant = last_progress;
                 }
                 next_flush = Some(BatchAccumulator::next_deadline(
                     deadline,
@@ -3593,5 +3596,87 @@ mod tests {
         assert_eq!(sum_of(&events, "logit.input.accept.errors", Some(("reason", "fatal"))), None);
 
         handle.abort();
+    }
+
+    /// An interval `emit` in `serve_connection` that parks on a full downstream past the next
+    /// deadline doesn't leave that deadline already due: the read after it resumes must not flush
+    /// again at the same instant. `crate::udp`'s
+    /// `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` is the
+    /// decode-loop twin; this drives the connection over an in-memory duplex stream.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_read() {
+        const INTERVAL: Duration = Duration::from_millis(100);
+        const CYCLES: usize = 20;
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection = tokio::spawn({
+            let telemetry = telemetry.clone();
+            async move {
+                let mut diag = Diagnostics::default();
+                serve_connection(
+                    server,
+                    TestDecoder::new(),
+                    Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, 64 * 1024),
+                    TcpListenerConfig {
+                        batch_max_events: 10_000,
+                        batch_flush_interval: INTERVAL,
+                        ..TcpListenerConfig::default()
+                    },
+                    Duration::from_secs(3600),
+                    None,
+                    Fanout::new(vec![tx]),
+                    telemetry,
+                    &mut diag,
+                    shutdown_rx,
+                )
+                .await
+            }
+        });
+
+        let mut flushes = 0.0;
+        let mut interval_flushes = |registry: &Registry| {
+            flushes += sum_of(
+                &registry.drain(0),
+                "logit.component.receive.flushed",
+                Some(("reason", "interval")),
+            )
+            .unwrap_or(0.0);
+            flushes
+        };
+        let mut line = 0usize;
+        // Off the deadline grid, so a write never shares an instant with a flush.
+        tokio::time::sleep(INTERVAL / 2).await;
+        for cycle in 0..CYCLES {
+            // Five intervals with the consumer stalled: the first flush fills the channel, the
+            // next one parks.
+            for _ in 0..5 {
+                client.write_all(format!("line-{line}\n").as_bytes()).await.unwrap();
+                line += 1;
+                tokio::time::sleep(INTERVAL).await;
+            }
+            let before = interval_flushes(&registry);
+
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a flush filled the channel during the window")
+                .expect("the connection owns the fanout and is still running");
+            client.write_all(format!("line-{line}\n").as_bytes()).await.unwrap();
+            line += 1;
+            // No clock advance: this task stays runnable, so the paused clock stands still.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                interval_flushes(&registry),
+                before,
+                "cycle {cycle}: the resumed emit must not be followed by another interval flush \
+                 at the same instant"
+            );
+        }
+        connection.abort();
     }
 }

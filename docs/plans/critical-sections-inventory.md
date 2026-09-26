@@ -178,8 +178,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | ID | Pri | Section | Primary location | Status |
 |---|---|---|---|---|
 | [NET-01](#net-01--recvmmsg2-batched-udp-read-hand-built-mmsghdriovec-arrays-over-vecu64-storage) | P0 | `recvmmsg(2)` batched UDP read: hand-built `mmsghdr`/`iovec` arrays over `Vec<u64>` storage | `crates/logit-inputs/src/udp.rs` (`BatchReader`, `build_headers`/`recvmmsg_into`/`harvest_headers`) | findings → #281 |
-| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | in-progress (drain/w3) |
-| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | in-progress (drain/w3) |
+| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | findings → #406 |
+| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
@@ -491,15 +491,15 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     before this loop iteration".
   - The reused `Vec` keeps its capacity across iterations (allocation pin).
 - **Observed concerns (unverified):**
-  - *Documented, not a surprise:* a `push_many` cancelled by the shutdown arm (the second `select!`)
+  - ~~*Documented, not a surprise:* a `push_many` cancelled by the shutdown arm (the second `select!`)
     drops its remainder uncounted — named in ADR `udp-intake-batching-and-socket-visibility` and in
-    `push_many`'s own doc. Listed here only so a verifier knows it is intentional.
-  - *Low confidence:* `udp.rs` races `shutdown.wait_for` inside a future that must be `Send`
+    `push_many`'s own doc. Listed here only so a verifier knows it is intentional.~~
+  - ~~*Low confidence:* `udp.rs` races `shutdown.wait_for` inside a future that must be `Send`
     (`#[async_trait]` `run_until_shutdown`), while `tcp.rs` (`read_step`'s doc) states that `wait_for`'s
     `Ref` guard makes a combined future `!Send` and therefore uses `changed()` + an explicit
     `*shutdown.borrow()` check. The two drivers reach the same behavior by different means; worth
     confirming the UDP side really is immune (it compiles, so it is — but the asymmetry suggests one
-    of the two comments is imprecise).
+    of the two comments is imprecise).~~
 - **Existing coverage:** `udp.rs` tests `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing`,
   `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered`,
   `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue`,
@@ -512,6 +512,22 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `datagrams sent == delivered + dropped + (bounded shutdown loss)`; `--verify` perf scenario.
 - **Priority:** P0 — the close contract is the only thing keeping `decode_loop` from hanging, and
   the accounting is the basis for every loss claim the ADR makes.
+- **Verified (drain/w3, #406):** The close contract held, and the loss was wider than the entry
+  said. The second `select!` is unbiased and `wait_for` is `Ready` at once after the signal, so
+  about half the time `push_many` is never polled and its whole batch was dropped uncounted, not
+  a cancelled call's remainder alone. `read_loop`'s batch and queue now live in a `ReadHalf` guard
+  whose `Drop` counts what the batch holds as `datagrams.dropped{reason="shutdown"}` and closes the
+  queue, on a return and on the future being dropped (the coop-budget yield between read and push,
+  reachable under `receive.shutdown_grace: 0s`); a polled `push_many` counts its own remainder
+  through `CountedDrain`. `tcp.rs`'s `read_step` doc was the imprecise one: `wait_for`'s `Ref` is
+  only returned, so `wait_for` would compile there; `changed()` matches `crate::logit`, whose
+  shutdown arm does await. Tests: the extended
+  `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue`,
+  `a_read_loop_whose_push_many_was_never_polled_before_shutdown_counts_its_whole_batch`,
+  `a_read_loop_dropped_mid_iteration_counts_what_its_batch_held_and_closes_the_queue` (drives the
+  coop-budget yield directly), `read_loop_closes_the_queue_even_when_its_future_is_dropped`, and
+  `a_zero_shutdown_grace_never_breaks_the_datagram_contract` (50 iterations of a grace-0 backstop).
+  Removing the guard's count fails three of them.
 
 ---
 
@@ -563,6 +579,20 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   drifts; fault injection dropping the future mid-decode to bound the loss.
 - **Priority:** P0 — a wrong `0`-means-closed reading or a lost `popped` vec is silent data loss on
   the main path, and the deadline math is hand-rolled.
+- **Verified (drain/w3, #406):** `pop_many`'s `0` and the `timeout` arm checked out, and two
+  findings were real. The popped-but-undecoded datagrams of a grace-backstop drop were uncounted:
+  `decode_loop` now iterates its batch through a `CountedDrain`, and `UdpListener::drive`'s
+  `ResidualOnDrop` counts what the receive queue still holds once both halves are gone, through a
+  one-lock `BoundedQueue::take_all`. The deadline could go stale: `now_instant` was read before an
+  interval `emit`, so an `emit` parked past the next deadline left it already due, and the next pop
+  batch flushed at once. The clock is re-read after the `emit`, here and in `tcp.rs`'s
+  `serve_connection`. The events already decoded when the backstop fires (the accumulator, a
+  parked `emit`, a partial fan-out) stay uncounted, recorded in `docs/known-gaps.md`'s UDP intake
+  section. Tests: `a_decode_loop_dropped_mid_batch_counts_every_popped_but_undecoded_datagram`,
+  `a_udp_listener_cancelled_by_the_grace_backstop_counts_what_its_queue_still_held`,
+  `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` (and its
+  `tcp.rs` twin), each failing with its fix removed, and
+  `a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers`, which pins the partial fan-out gap.
 
 ---
 
