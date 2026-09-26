@@ -309,8 +309,12 @@ impl ScriptWorker {
         Ok(match result {
             LuaValue::Nil => Vec::new(),
             LuaValue::Table(table) => events_from_table(&self.lua, table, Returner::Flush)?,
-            LuaValue::UserData(ud) if ud.is::<EventProxy>() => {
-                return Err(contract_error(Returner::Flush, "an event (return {event})", None))
+            LuaValue::UserData(ud) => {
+                let got = match ud.is::<EventProxy>() {
+                    true => "an event (return {event})",
+                    false => NOT_AN_EVENT,
+                };
+                return Err(contract_error(Returner::Flush, got, None));
             }
             other => return Err(contract_error(Returner::Flush, lua_type(&other), None)),
         })

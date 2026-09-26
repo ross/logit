@@ -271,6 +271,15 @@ fn returning_a_sub_handle_is_the_contract_error() {
     );
     let err = flush_err(&w);
     assert!(err.contains(&format!("{FLUSH_CONTRACT} {not_an_event} at index 1")), "got: {err}");
+
+    let w = worker(
+        r#"
+        function process(event) return nil end
+        function flush() return resource end
+        "#,
+    );
+    let err = flush_err(&w);
+    assert!(err.contains(&format!("{FLUSH_CONTRACT} {not_an_event}")), "got: {err}");
 }
 
 #[test]
