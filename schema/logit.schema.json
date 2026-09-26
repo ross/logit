@@ -1993,7 +1993,7 @@
               "type": "string"
             },
             "max_body_bytes": {
-              "description": "Caps one request body before compression; a batch larger than this goes out as several requests, and one event larger than this alone is dropped, counted. A byte-count string. Defaults to `\"2MiB\"`, the OpenTelemetry exporter's default. `0` is rejected.",
+              "description": "Caps one request body before compression; a batch larger than this goes out as several requests, and one event larger than this alone is dropped, counted. A byte-count string. Defaults to `\"2MiB\"`, the OpenTelemetry exporter's default. `0` is rejected. Splunk Cloud refuses a body over `\"5MiB\"`, so a larger value logs a warning at startup; Splunk Enterprise accepts up to 800 MiB.",
               "default": "2097152",
               "type": "string"
             },

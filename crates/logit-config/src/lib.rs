@@ -1817,7 +1817,8 @@ pub enum ComponentKind {
         /// Caps one request body before compression; a batch larger than this goes out as
         /// several requests, and one event larger than this alone is dropped, counted. A
         /// byte-count string. Defaults to `"2MiB"`, the OpenTelemetry exporter's default. `0` is
-        /// rejected.
+        /// rejected. Splunk Cloud refuses a body over `"5MiB"`, so a larger value logs a warning
+        /// at startup; Splunk Enterprise accepts up to 800 MiB.
         #[serde(default = "default_splunk_max_body_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_body_bytes: u64,

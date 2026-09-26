@@ -1873,16 +1873,23 @@ no trace store: they're searchable events, not a trace view.
 
 **Requests.** A batch is cut into bodies of at most `max_body_bytes` before compression, sent in
 order. An object larger than the cap alone is dropped, counted
-`logit.output.records.dropped{reason="oversize"}`. Every request carries one per-sink
+`logit.output.records.dropped{reason="oversize"}`. Splunk Cloud refuses a body over 5 MiB, so a
+`max_body_bytes` above 5 MiB logs a warning at startup. Every request carries one per-sink
 `X-Splunk-Request-Channel`, which a `useACK` token requires and any other token ignores.
 
-**Delivery.** `408`, `429`, `5xx`, and timeouts are retryable; `401` and `403` are permanent, with
-a `token_rejected` warning; any other `4xx`, `413` included, is permanent and counted
-`logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the object
-Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of that body
-once. The first failing request stops the rest of the batch, and the sink isn't duplicate-safe,
-since Splunk indexes a resent event twice. So the default posture is at-most-once, and a `5xx`
-drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
+**Delivery.** A `429`, or a `503` code 9 ("Server is busy"), means Splunk didn't take the body:
+before any body of the batch was accepted, the batch is retried under every posture, with the
+runtime's backoff (a `Retry-After` header is ignored). `408`, other `5xx`, timeouts, and a busy
+answer after a body was accepted are retryable only under `at_least_once`; `401` and `403` are
+permanent, with a `token_rejected` warning; any other `4xx`, `413` included, is permanent and
+counted `logit.output.requests.rejected{code}`. A `400` code 6 is the exception: the sink drops the
+object Splunk names, counted `records.dropped{reason="invalid_event"}`, and resends the rest of
+that body once. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
+answer instead: the sink splits the body in two and sends each half, or drops a lone object,
+counted `records.dropped{reason="oversize"}`. The first failing request stops the rest of the
+batch, and the sink isn't duplicate-safe, since Splunk indexes a resent event twice. So the default
+posture is at-most-once, and a `500` drops the batch; `buffer: {delivery: at_least_once}` retries
+it and accepts duplicates.
 
 **Acknowledgment.** With `ack: true`, the sink polls `/services/collector/ack` after the last body
 of a batch is accepted, until Splunk confirms every request or `ack_timeout` (30s by default)
