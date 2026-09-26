@@ -208,7 +208,7 @@ process, not a component.
 | `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
-| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
+| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch (its retry budget exhausted) since it was last healthy. |
 | `recovered` | info | A sink's first successful delivery after `degraded`. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
@@ -1117,9 +1117,12 @@ log easily holds more than a restart reading from `end` would silently skip. **P
 file on a persistent volume** (`demo/compose.yaml`'s `logit_state`), or it resets on every
 container recreate.
 
-The checkpoint is written every `checkpoint_interval` (5s default) when dirty, plus on every file
-close and at shutdown, never per line. A crash between two writes can therefore replay up to
-`checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate
+The checkpoint is written every `checkpoint_interval` (5s default) when dirty, and at shutdown,
+never per line. A file closing (rotated away, removed, deselected) dirties it. A crash between two
+writes can therefore replay up to `checkpoint_interval` worth of already-emitted lines on restart.
+While a backlog is read against a slow downstream, a write lands between two passes over the
+tracked files, and a pass reads at most 64 KiB per file, so a crash then replays at most one
+`checkpoint_interval` or one 64 KiB chunk per file, whichever is more. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 
