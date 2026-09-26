@@ -24,6 +24,8 @@ pub mod graph;
 pub mod input;
 pub mod output;
 pub mod queue;
+#[cfg(test)]
+mod queue_stress;
 pub mod readiness;
 pub mod router;
 pub mod runtime;
@@ -38,8 +40,8 @@ pub use fanout::{BatchContext, Delivered, Fanout, SendTimeout, TraceContext};
 pub use input::{Input, InputRuntimeConfig};
 pub use output::{classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fault, Output};
 pub use queue::{
-    BoundedQueue, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue, SinkQueueConfig,
-    SinkStore, SinkStoreConfig, SINK_QUEUE_METRICS,
+    BoundedQueue, CountedDrain, OverflowPolicy, QueueConfig, QueueMetrics, Queued, SinkQueue,
+    SinkQueueConfig, SinkStore, SinkStoreConfig, SINK_QUEUE_METRICS,
 };
 pub use readiness::{NodeState, Phase, PipelineState, Readiness};
 pub use router::{Destination, Router, RouterScratch};
