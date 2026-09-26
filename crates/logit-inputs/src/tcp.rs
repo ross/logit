@@ -27,6 +27,9 @@
 //! whose counts every clone shares. One decoder behind a lock would serialize every connection's
 //! decode against every other's.
 //!
+//! **Cancellation.** Every `select!` and `timeout` here, from the accept loop to `read_step`, is a
+//! row of `docs/design/pipeline-graph.md`'s "Cancellation points" table.
+//!
 //! **No receive queue.** Unlike the UDP driver, there is no [`crate::udp::ReceiveQueue`] here and
 //! no `receive.max_datagrams`/`max_bytes`/`overflow` to configure. TCP's own flow control *is* the
 //! queue: a connection whose downstream has stalled stops being read, the kernel window closes,
@@ -820,14 +823,8 @@ impl AcceptQueueSampler {
                 self.tick = None;
                 return listener.accept().await;
             }
-            // Timer arm first, matching `crate::udp::sample_while`, but for uniformity rather than
-            // need. There the work arm is one long-lived `read_loop` future, so an arm behind it
-            // is silenced by tokio's coop budget for a whole overload. Here the loop returns to
-            // the synchronous `sample_once` on every accepted connection, so a backed-up queue is
-            // sampled per connection anyway, and an idle `accept()` parks with budget to spare,
-            // so the timer fires normally. Either ordering is correct for this loop; one rule for
-            // both samplers is one thing for an edit to preserve. The cost is a due tick taken
-            // ahead of a ready connection: one extra loop turn per tick, never a lost connection.
+            // Timer arm first, matching `crate::udp::sample_while`: see
+            // `docs/design/pipeline-graph.md`'s "Cancellation points".
             let tick = self.tick.get_or_insert_with(|| Box::pin(tokio::time::sleep(interval)));
             tokio::select! {
                 biased;
@@ -906,7 +903,7 @@ impl AcceptQueueSampler {
 // ---- the listener ----------------------------------------------------------------------------
 
 /// [`TcpListener`]'s runtime knobs: [`crate::udp::UdpListenerConfig`] minus every queue field
-/// (this module's "No receive queue" doc section), with the same defaults for the other four.
+/// (this module's "No receive queue" doc section), with the same defaults for the other three.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TcpListenerConfig {
     /// Events to accumulate **per connection** before one `Fanout::send`; `1` means one send per
@@ -917,9 +914,6 @@ pub struct TcpListenerConfig {
     pub batch_max_bytes: u64,
     /// `Duration::ZERO` disables the flush timer; the bounds are then the only trigger.
     pub batch_flush_interval: Duration,
-    /// How long [`TcpListener::run_until_shutdown`] keeps draining after shutdown fires before
-    /// [`logit_pipeline::runtime::run_input`]'s grace backstop cancels it by drop.
-    pub shutdown_grace: Duration,
 }
 
 /// The same numbers as [`crate::udp::UdpListenerConfig::default`]'s corresponding fields
@@ -930,7 +924,6 @@ impl Default for TcpListenerConfig {
             batch_max_events: 1_000,
             batch_max_bytes: 1024 * 1024,
             batch_flush_interval: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
@@ -1200,10 +1193,9 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             shutdown: shutdown.clone(),
             decoder: self.decoder.clone(),
         };
-        // `accept_queue.accept(&listener)` has `listener.accept()`'s cancellation safety against
-        // the `shutdown` arm, plus the kernel accept-queue gauges (`AcceptQueueSampler`). A Unix
-        // listener has no such gauges (this module's "A Unix stream socket runs on the same
-        // loop"); `UnixListener::accept` is cancellation-safe on its own.
+        // A Unix listener has no accept-queue gauges (this module's "A Unix stream socket runs on
+        // the same loop"). Both accepts race `shutdown`: see
+        // `docs/design/pipeline-graph.md`'s "Cancellation points".
         let mut accept_queue = AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         let mut accept_diag = self.diag.clone();
         loop {
@@ -1220,8 +1212,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             let accepted = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
-                    // `biased`, absorb first: the error is counted before shutdown can win, and a
-                    // stopping listener doesn't wait out the backoff.
+                    // `biased`, absorb first: see `docs/design/pipeline-graph.md`'s
+                    // "Cancellation points".
                     tokio::select! {
                         biased;
                         absorbed = crate::listener::absorb_accept_error(
@@ -1376,14 +1368,12 @@ enum ReadStep {
 
 /// One read step, raced against `shutdown`.
 ///
-/// `AsyncReadExt::read_buf` is cancellation-safe (no bytes are consumed if another `select!` arm
-/// wins), which lets both this race and [`serve_connection`]'s deadline timeout drop it mid-await
-/// without losing stream bytes.
+/// Unbiased: see `docs/design/pipeline-graph.md`'s "Cancellation points".
 ///
-/// `shutdown.changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the combined future
-/// `!Send`, and `tokio::spawn`ing this connection's task requires `Send`. The caller's explicit
-/// `*shutdown.borrow()` check covers what `changed()` alone cannot: shutdown having fired before
-/// this loop iteration began. `crate::logit`'s `serve_connection` follows the same discipline.
+/// `shutdown.changed()` needs the caller's `*shutdown.borrow()` check for a shutdown that fired
+/// before the iteration. `wait_for` would compile here, since these arms don't await; `changed()`
+/// matches `crate::logit`'s `serve_connection`, whose shutdown arm awaits, where a `Ref` kept alive
+/// by `select!` would make the future `!Send`.
 async fn read_step<S: AsyncRead + Unpin + Send>(
     stream: &mut S,
     buf: &mut BytesMut,
@@ -1456,12 +1446,17 @@ where
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
+                let mut now_instant = now_instant;
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Interval).await;
                     // Stamped after the send returns, so time blocked on a full downstream is
                     // not counted against the peer. A tick with nothing to emit never gets here:
                     // this process's own timer must not keep a silent connection alive.
                     last_progress = tokio::time::Instant::now();
+                    // Re-read for the same reason: an `emit` parked past the next deadline would
+                    // otherwise leave it already due, and every read after it would flush on
+                    // `Interval`.
+                    now_instant = last_progress;
                 }
                 next_flush = Some(BatchAccumulator::next_deadline(
                     deadline,
@@ -3593,5 +3588,87 @@ mod tests {
         assert_eq!(sum_of(&events, "logit.input.accept.errors", Some(("reason", "fatal"))), None);
 
         handle.abort();
+    }
+
+    /// An interval `emit` in `serve_connection` that parks on a full downstream past the next
+    /// deadline doesn't leave that deadline already due: the read after it resumes must not flush
+    /// again at the same instant. `crate::udp`'s
+    /// `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` is the
+    /// decode-loop twin; this drives the connection over an in-memory duplex stream.
+    #[tokio::test(start_paused = true)]
+    async fn an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_read() {
+        const INTERVAL: Duration = Duration::from_millis(100);
+        const CYCLES: usize = 20;
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection = tokio::spawn({
+            let telemetry = telemetry.clone();
+            async move {
+                let mut diag = Diagnostics::default();
+                serve_connection(
+                    server,
+                    TestDecoder::new(),
+                    Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, 64 * 1024),
+                    TcpListenerConfig {
+                        batch_max_events: 10_000,
+                        batch_flush_interval: INTERVAL,
+                        ..TcpListenerConfig::default()
+                    },
+                    Duration::from_secs(3600),
+                    None,
+                    Fanout::new(vec![tx]),
+                    telemetry,
+                    &mut diag,
+                    shutdown_rx,
+                )
+                .await
+            }
+        });
+
+        let mut flushes = 0.0;
+        let mut interval_flushes = |registry: &Registry| {
+            flushes += sum_of(
+                &registry.drain(0),
+                "logit.component.receive.flushed",
+                Some(("reason", "interval")),
+            )
+            .unwrap_or(0.0);
+            flushes
+        };
+        let mut line = 0usize;
+        // Off the deadline grid, so a write never shares an instant with a flush.
+        tokio::time::sleep(INTERVAL / 2).await;
+        for cycle in 0..CYCLES {
+            // Five intervals with the consumer stalled: the first flush fills the channel, the
+            // next one parks.
+            for _ in 0..5 {
+                client.write_all(format!("line-{line}\n").as_bytes()).await.unwrap();
+                line += 1;
+                tokio::time::sleep(INTERVAL).await;
+            }
+            let before = interval_flushes(&registry);
+
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a flush filled the channel during the window")
+                .expect("the connection owns the fanout and is still running");
+            client.write_all(format!("line-{line}\n").as_bytes()).await.unwrap();
+            line += 1;
+            // No clock advance: this task stays runnable, so the paused clock stands still.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                interval_flushes(&registry),
+                before,
+                "cycle {cycle}: the resumed emit must not be followed by another interval flush \
+                 at the same instant"
+            );
+        }
+        connection.abort();
     }
 }

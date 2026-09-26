@@ -1,5 +1,6 @@
 //! The `Input` trait every listener node implements. It lives here, not in `logit-inputs`, per
-//! `docs/design/pipeline-graph.md`'s "Crate layout" section.
+//! `docs/design/pipeline-graph.md`'s "Crate layout" section. What a listener loses when its future
+//! is dropped at shutdown is in that doc's "Cancellation points" table.
 
 use crate::Fanout;
 use std::time::Duration;
@@ -55,7 +56,7 @@ pub trait Input {
 /// A listener's runtime knobs: how long [`crate::runtime::run_input`] waits for a cooperative
 /// [`Input::run_until_shutdown`] to drain before cancelling it by drop. Production call sites
 /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the component's `receive:`
-/// block. The default, `Duration::ZERO`, cancels by drop immediately, which is right for a
+/// block, and this is the only copy of it a listener sees. The default, `Duration::ZERO`, cancels by drop immediately, which is right for a
 /// listener with no `receive:` block: nothing overrides `run_until_shutdown`, so nothing waits to
 /// drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
