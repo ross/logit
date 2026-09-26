@@ -301,6 +301,10 @@ impl TailDecoder for DockerDecoder {
         }
     }
 
+    fn holds_entry(&self) -> bool {
+        self.partial.is_some()
+    }
+
     fn reset(&mut self) {
         // Both halves: a stale `dropping` would swallow the new generation's first complete
         // entry, as a stale `partial` would splice into it.
@@ -693,6 +697,28 @@ mod tests {
         assert_eq!(out[0].log.as_ref().unwrap().message.as_str(), Some("ok"));
     }
 
+    /// `holds_entry` is `true` from the first fragment until the closing one emits the message.
+    #[test]
+    fn holds_entry_from_the_first_fragment_until_the_closing_fragment() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        let first = r#"{"log":"one-","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#;
+        let second = r#"{"log":"two-","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#;
+        assert!(!d.holds_entry());
+        d.decode_line(line(first), 0, &mut out).unwrap();
+        assert!(d.holds_entry());
+        d.decode_line(line(second), 0, &mut out).unwrap();
+        assert!(d.holds_entry());
+        d.decode_line(
+            line(r#"{"log":"end\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#),
+            0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(!d.holds_entry());
+    }
+
     #[test]
     fn a_partial_entry_is_emitted_on_close_rather_than_lost() {
         let mut d = decoder();
@@ -950,7 +976,6 @@ mod tests {
                 max_events: 1_000,
                 max_bytes: 1024 * 1024,
                 flush_interval: Duration::from_millis(15),
-                shutdown_grace: Duration::from_secs(5),
             },
         }
     }
@@ -1638,6 +1663,170 @@ mod tests {
             vec!["ok"],
             "a stale dropping flag must not swallow the next generation's first complete entry"
         );
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- a held fragment and the checkpoint --
+
+    /// One json-file line (with its `\n`) whose `log` is `log`.
+    fn json_file_line(log: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"log": log, "stream": "stdout", "time": "2026-08-17T19:35:46.000000000Z"})
+        )
+    }
+
+    /// The first file's offset in the checkpoint at `path`, once one with a nonzero offset is
+    /// written (a tick before the first read records `0`). Waits up to 5s.
+    async fn first_nonzero_checkpoint(path: &Path) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let offset = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v["files"][0]["offset"].as_u64());
+            if let Some(offset) = offset.filter(|&o| o > 0) {
+                return offset;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for a checkpoint");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A container log holding a complete entry, then a fragment line (one Docker writes for a
+    /// line over 16 KiB) with no closing fragment yet, then `after`; and a checkpoint config with
+    /// a short interval. Returns the fragment line's file offset among the rest.
+    fn fragment_fixture(label: &str, after: &str) -> (PathBuf, PathBuf, PathBuf, u64, TailConfig) {
+        let root = scratch_dir(label);
+        let log = container(&root, &"f".repeat(64), "frag", "nginx:1.25");
+        let whole = json_file_line("whole\n");
+        let head = json_file_line("head-");
+        std::fs::write(&log, format!("{whole}{head}{after}")).unwrap();
+        let checkpoint = root.join("checkpoint.json");
+        let mut config = fast_tail_config();
+        config.checkpoint_path = Some(checkpoint.clone());
+        config.checkpoint_interval = Duration::from_millis(30);
+        (root, log, checkpoint, whole.len() as u64, config)
+    }
+
+    /// `DockerDecoder` holds a fragment line in `partial` until its closing fragment arrives, and
+    /// the line itself is complete, so the splitter holds nothing. The interval checkpoint must
+    /// still stop before it: nothing has been emitted for it.
+    #[tokio::test]
+    async fn an_interval_checkpoint_never_covers_a_held_fragment_line() {
+        let (root, _log, checkpoint, whole_len, config) =
+            fragment_fixture("docker-held-checkpoint", "");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let (tx, handle) = spawn(input, fanout);
+
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(
+            first_nonzero_checkpoint(&checkpoint).await,
+            whole_len,
+            "the checkpoint must end before the held fragment line"
+        );
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A crash (no shutdown, so no `close` and no final checkpoint) while a fragment is held, then
+    /// the closing fragment, then a restart: the restart re-reads the held fragment, so the whole
+    /// message arrives, not only its tail.
+    #[tokio::test]
+    async fn a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart() {
+        let (root, log, checkpoint, whole_len, config) = fragment_fixture("docker-held-crash", "");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        );
+        let (_tx, handle) = spawn(input, fanout);
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(first_nonzero_checkpoint(&checkpoint).await, whole_len);
+        handle.abort();
+        let _ = handle.await;
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(json_file_line("tail\n").as_bytes())
+            .unwrap();
+
+        let (fanout2, mut rx2) = recording_fanout(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let (tx2, handle2) = spawn(input2, fanout2);
+        assert_eq!(
+            messages(&expect_events(&mut rx2, 1).await),
+            vec!["head-tail"],
+            "the restart must reassemble the message from its first fragment"
+        );
+        shutdown(tx2, handle2).await;
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A line the decoder rejects, read after a held fragment, advances the file offset past the
+    /// held run without clearing it. The checkpoint still stops at the fragment's start, and the
+    /// closing fragment then emits the whole message once.
+    #[tokio::test]
+    async fn a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run(
+    ) {
+        let (root, log, checkpoint, head_start, config) =
+            fragment_fixture("docker-held-rejected", "this is not a json-file entry\n");
+        assert_held_run_bounds_the_checkpoint(root, log, checkpoint, head_start, config).await;
+    }
+
+    /// A line the splitter drops for exceeding `max_line_bytes`, read after a held fragment, never
+    /// reaches the decoder. The checkpoint still stops at the fragment's start.
+    #[tokio::test]
+    async fn an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start(
+    ) {
+        let oversized = format!("{}\n", "x".repeat(300));
+        let (root, log, checkpoint, head_start, mut config) =
+            fragment_fixture("docker-held-oversized", &oversized);
+        config.max_line_bytes = 200;
+        assert_held_run_bounds_the_checkpoint(root, log, checkpoint, head_start, config).await;
+    }
+
+    async fn assert_held_run_bounds_the_checkpoint(
+        root: PathBuf,
+        log: PathBuf,
+        checkpoint: PathBuf,
+        head_start: u64,
+        config: TailConfig,
+    ) {
+        let (fanout, mut rx) = recording_fanout(8);
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let (tx, handle) = spawn(input, fanout);
+
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(
+            first_nonzero_checkpoint(&checkpoint).await,
+            head_start,
+            "the checkpoint must stop at the held fragment's first byte, not inside it"
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(json_file_line("tail\n").as_bytes())
+            .unwrap();
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["head-tail"]);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(rx.try_recv().is_err(), "the message must be emitted once");
 
         shutdown(tx, handle).await;
         std::fs::remove_dir_all(&root).ok();

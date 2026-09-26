@@ -1117,9 +1117,12 @@ log easily holds more than a restart reading from `end` would silently skip. **P
 file on a persistent volume** (`demo/compose.yaml`'s `logit_state`), or it resets on every
 container recreate.
 
-The checkpoint is written every `checkpoint_interval` (5s default) when dirty, plus on every file
-close and at shutdown, never per line. A crash between two writes can therefore replay up to
-`checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate
+The checkpoint is written every `checkpoint_interval` (5s default) when dirty, and at shutdown,
+never per line. A file closing (rotated away, removed, deselected) dirties it. A crash between two
+writes can therefore replay up to `checkpoint_interval` worth of already-emitted lines on restart.
+While a backlog is read against a slow downstream, a write lands between two passes over the
+tracked files, and a pass reads at most 64 KiB per file, so a crash then replays at most one
+`checkpoint_interval` or one 64 KiB chunk per file, whichever is more. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 

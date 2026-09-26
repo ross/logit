@@ -472,7 +472,61 @@ test, and reading the clock before the `emit` fails both interval tests.
 
 ### `drain/w4`: tail shutdown and timers (TAIL-06, TAIL-08)
 
-Filled in by `drain/w4`.
+`drain/w4` lands decision 7: `TailBatching`, `UdpListenerConfig`, and `TcpListenerConfig` lose
+their `shutdown_grace` fields, with no alias, and `InputRuntimeConfig::shutdown_grace` is the one
+copy. It also closes three tail-driver gaps, recorded in [ADR
+`file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md)'s 2026-09-26
+amendment:
+
+- `Tailer::drain` takes the earliest of the poll, flush, and checkpoint deadlines and returns
+  `DrainEnd::TimerDue` once a completed pass finds it past. The run loop runs every due flush or
+  checkpoint tick before the next pass. Before, a backlog read against a slow downstream ran no tick
+  until it was done, so a grace-cut shutdown replayed the whole backlog read so far. Now it replays
+  at most one 64 KiB chunk per file.
+- `read_one` records `held_from`, the file offset of the oldest line the decoder still holds
+  (`TailDecoder::holds_entry`), and `write_checkpoint` persists the smaller of that and the
+  splitter's line boundary. `docker_in` holds the fragments of an entry over 16 KiB, which an
+  interval checkpoint used to cover, so a crash before the closing fragment lost the message's
+  head. It's a position, not a byte count to subtract: a line the decoder rejects, or one the
+  splitter drops as oversized, can follow the held run and advance the offset without clearing
+  it, and a subtracted count would then land inside the held run.
+- `reap_drained` dirties the checkpoint, so the next interval write drops a reaped inode's entry
+  instead of leaving it for a new file reusing the inode to resume from.
+
+The tail rows of `docs/design/pipeline-graph.md`'s "Cancellation points" table land with it.
+`docs/known-gaps.md` records that the checkpoint is at-least-once only up to the downstream
+in-memory queues, that the driver notices shutdown only between two files' reads, and that a
+rotated file still draining at shutdown whose new name matches no pattern is orphaned on restart.
+
+Tests, in `tail/driver.rs` unless noted. Paused tests run under `start_paused`: tokio 1.53.1 holds
+auto-advance while a blocking-pool task runs, so `tokio::fs` reads and checkpoint writes work there.
+
+- `a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset` (paused) fills
+  the channel, appends, signals shutdown, and drops the task parked in the final flush. The flush
+  is counted `receive.flushed{reason="shutdown"}`, and the checkpoint stays at the last interval
+  write. It passed before the change and pins the ordering.
+- `a_checkpoint_tick_lands_while_a_long_backlog_is_still_being_drained` (paused) reads 8000 lines
+  one event per batch against a consumer taking one batch per millisecond, and sees a checkpoint
+  strictly inside the file before the last line arrives.
+- `a_flush_tick_lands_while_a_long_backlog_is_still_being_drained` (paused) sees a quiet second
+  file's line flushed before the busy file's backlog is done.
+- `shutdown_during_a_backlog_drain_with_a_parked_downstream_replays_at_most_one_chunk` (paused)
+  stops the consumer mid-backlog, signals shutdown, drops the parked task, and checks that the
+  checkpoint sits on a line boundary no more than one chunk behind the last delivered line, and
+  that a restart resumes there.
+- `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` sees an
+  interval write, not shutdown's, drop a removed file's entry.
+- `docker.rs`: `an_interval_checkpoint_never_covers_a_held_fragment_line`,
+  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`,
+  `a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run`,
+  and `an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start`,
+  plus the unit test `holds_entry_from_the_first_fragment_until_the_closing_fragment`.
+  `tail/line.rs`'s `push_reports_where_each_line_starts` pins the line starts `read_one` records.
+
+Every test but the grace-cut pin failed with its fix removed. The existing
+`a_draining_file_with_more_than_one_chunk_of_backlog_is_fully_read_before_close` now reaches
+`Draining` with a chunk still unread on every run. Before, a flush tick winning the first
+`select!` let the whole file be read while `Active`.
 
 ### `drain/w5`: close-out
 

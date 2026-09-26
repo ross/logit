@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-24
+updated: 2026-09-26
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -449,3 +449,46 @@ would truncate that checkpoint and rename it away, and at restart it would load 
 fall back to `read_from`, the loss this amendment closes. Like rule 35's
 `disk.path` check, the rule compares literal strings, so two spellings of one path (`./a.json` and
 `a.json`) still pass.
+
+## Amendment: `drain` yields to due timers, and the checkpoint never covers held or reaped state (2026-09-26)
+
+Three gaps in "Checkpoints" and in the run loop, found verifying TAIL-06 and TAIL-08
+(`docs/plans/critical-sections-inventory.md`), are closed. [ADR
+`shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+"Running it" has the tests.
+
+**The poll tick is unconditional in fact.** "Wake source" says the poll tick is unconditional and
+`drain` runs after every loop iteration. `drain` used to loop while any file made progress, so a
+backlog read against a slow downstream starved the poll, flush, and checkpoint ticks for as long as
+the backlog lasted. Now `drain` runs to a pass with no progress or to the next due timer, whichever
+comes first. It checks the deadline only after a whole pass, since its record of which files
+reached EOF covers only the files a pass read, and it always runs one pass first. The run loop then
+runs every due flush or checkpoint tick before the next pass. A pass reads at most one 64 KiB chunk
+per file, so under a backlog a checkpoint lands at least once per chunk.
+
+**A checkpoint excludes the lines a decoder holds.** Docker splits a line over 16 KiB into several
+json-file entries, each a complete line on disk. `DockerDecoder` holds the fragments until the
+closing one arrives, and `LineSplitter` holds nothing for them, so an interval checkpoint covered
+them before any event existed for them. A crash before the closing fragment then lost the head of
+the message. The driver now records the file offset of the oldest line the decoder still holds
+(`TailDecoder::holds_entry`), and `Tailer::write_checkpoint` persists the smaller of that offset and
+the splitter's line boundary. It's an offset rather than a held byte count, because a line the
+decoder rejects or the splitter drops as oversized can follow the held lines, and subtracting a
+count would then land inside them. The persisted offset covers only bytes whose events have been
+emitted or absorbed into an accumulator the write flushes first.
+
+**A file's close dirties the checkpoint instead of writing it.** "Checkpoints" says the checkpoint
+is written "unconditionally on a file's own close". The code never did that, and a close didn't
+even mark the store dirty. So a reaped inode's entry stayed on disk until something else changed,
+and after a crash a new file reusing that `(dev, ino)` resumed at the stale offset, past its first
+bytes. `reap_drained` now marks the store dirty, and the next interval write drops the entry,
+because a write persists only tracked files. A write on every close was rejected: each write is two
+`fsync`s, and logrotate closing hundreds of files at once would pay them per file. The window for
+the stale entry is one `checkpoint_interval`, the same bound the at-least-once trade already
+accepts.
+
+**At-least-once ends at the downstream in-memory queues.** Shutdown flushes every accumulator and
+then force-writes the checkpoint, so the offset covers lines already handed to a sink's inbox. A
+sink whose own grace then drops that batch (`batches.dropped{reason="shutdown"}`) has lost it:
+the restart resumes past it. `docs/known-gaps.md` records this, along with a rotated file still
+draining at shutdown whose new name matches no pattern, which the restart never finds.

@@ -88,6 +88,18 @@ enum Outcome {
     Checkpoint,
 }
 
+/// Why [`Tailer::drain`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainEnd {
+    /// Shutdown fired between two files' reads.
+    Shutdown,
+    /// A full pass made no progress: every file is at EOF.
+    Idle,
+    /// A pass completed with a poll, flush, or checkpoint deadline already past, so the run loop
+    /// goes back to its `select!`, where that timer is ready at once.
+    TimerDue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartOffset {
     Beginning,
@@ -114,6 +126,11 @@ struct TrackedFile<D> {
     decoder: D,
     accumulator: BatchAccumulator,
     state: FileState,
+    /// The file offset where the oldest line the decoder still holds starts
+    /// ([`TailDecoder::holds_entry`]), or `None` while it holds nothing. Set by `read_one` when a
+    /// line starts a held run, cleared once the decoder holds nothing, and on a truncation or
+    /// close.
+    held_from: Option<u64>,
     /// This file's `inotify` watch, added in `Tailer::open_tracked` and removed in
     /// `Tailer::reap_drained`. `None` under `WatchMode::Poll`, or if `inotify_add_watch` failed
     /// (diagnosed `watch_error`; the file then relies on `poll_interval`). Not re-registered on a
@@ -247,7 +264,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         loop {
             // No arm body may `.await`: `shutdown.wait_for` yields a `watch::Ref` (a non-`Send`
             // lock guard) that would then live across the await, and `#[async_trait]`'s `Send`
-            // bound rejects that at compile time. All async work runs after the `select!`.
+            // bound rejects that at compile time. All async work runs after the `select!`. What a
+            // losing arm drops is in `docs/design/pipeline-graph.md`'s "Cancellation points".
             let outcome = tokio::select! {
                 _ = shutdown.wait_for(|&due| due) => Outcome::Shutdown,
                 wake = watcher.next_wake() => Outcome::Wake(wake),
@@ -310,8 +328,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
 
-            if self.drain(&sink, &mut shutdown, &mut watcher).await {
-                break; // shutdown fired mid-drain
+            // The earliest pending deadline: `drain` hands control back once it's past, so a
+            // sustained backlog can't starve the poll, flush, and checkpoint ticks. A flush or
+            // checkpoint tick already past goes straight back to the `select!` rather than
+            // waiting out another pass: a poll tick due again after every long pass would
+            // otherwise keep winning the `select!`'s random pick. With nothing read since either
+            // last ran, both finish at once, so this can't loop. A due poll tick doesn't skip
+            // `drain`: `scan` can outlast `poll_interval`, and `drain` would then never run.
+            let due = [next_flush, next_checkpoint].into_iter().flatten().fold(next_poll, Ord::min);
+            let now = tokio::time::Instant::now();
+            if [next_flush, next_checkpoint].into_iter().flatten().any(|d| d <= now) {
+                continue;
+            }
+            match self.drain(&sink, &shutdown, &mut watcher, due).await {
+                DrainEnd::Shutdown => break,
+                DrainEnd::Idle | DrainEnd::TimerDue => {}
             }
         }
 
@@ -488,6 +519,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // reassembly); see `TailDecoder::reset`.
         tracked.splitter = LineSplitter::new(max_line_bytes);
         tracked.decoder.reset();
+        tracked.held_from = None;
         let path = tracked.path.clone();
         self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
@@ -609,6 +641,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             decoder,
             accumulator: BatchAccumulator::new(batching.max_events, batching.max_bytes),
             state: FileState::Active,
+            held_from: None,
             watch,
         };
         self.by_path.insert(path, id);
@@ -619,22 +652,29 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// Round-robin reads every tracked file, one chunk each per pass, until a pass makes no
-    /// progress, so a burst is read without waiting for another wake. Closes `Draining` and
-    /// `Deselected` files that made no progress. Returns `true` if shutdown fired; that's checked
-    /// between files, and one chunk's read and decode is bounded.
+    /// progress ([`DrainEnd::Idle`]) or `due` has passed ([`DrainEnd::TimerDue`]), so a burst is
+    /// read without waiting for another wake and a backlog still yields to the run loop's timers.
+    /// Closes `Draining` and `Deselected` files that made no progress.
+    ///
+    /// Where shutdown is checked, and what that bounds, is in `docs/design/pipeline-graph.md`'s
+    /// "Cancellation points". `due` is checked only after a whole pass and its `reap_drained`:
+    /// `at_eof` is the set of files a pass read to EOF, and stopping mid-pass would leave files
+    /// that were never read looking like they had reached it. At least one pass always runs, so a
+    /// `select!` that keeps picking a ready wake still reads.
     async fn drain(
         &mut self,
         sink: &Fanout,
-        shutdown: &mut watch::Receiver<bool>,
+        shutdown: &watch::Receiver<bool>,
         watcher: &mut super::watch::Watcher,
-    ) -> bool {
+        due: tokio::time::Instant,
+    ) -> DrainEnd {
         loop {
             let mut any_progress = false;
             let mut at_eof: Vec<FileId> = Vec::new();
             let ids: Vec<FileId> = self.files.keys().copied().collect();
             for id in ids {
                 if *shutdown.borrow() {
-                    return true;
+                    return DrainEnd::Shutdown;
                 }
                 if self.read_one(id, sink).await {
                     any_progress = true;
@@ -644,7 +684,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             self.reap_drained(&at_eof, sink, watcher).await;
             if !any_progress {
-                return false;
+                return DrainEnd::Idle;
+            }
+            if tokio::time::Instant::now() >= due {
+                return DrainEnd::TimerDue;
             }
         }
     }
@@ -674,13 +717,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let read_at = now_nanos();
         let bytes = Bytes::copy_from_slice(&chunk[..n]);
 
-        let mut lines: Vec<Bytes> = Vec::new();
+        // Each line with the file offset it starts at, for `TrackedFile::held_from`.
+        let mut lines: Vec<(Bytes, u64)> = Vec::new();
         let dropped = {
             let tracked = match self.files.get_mut(&id) {
                 Some(t) => t,
                 None => return false,
             };
-            let stats = tracked.splitter.push(bytes, |line| lines.push(line));
+            let chunk_start = tracked.offset;
+            let partial_start = chunk_start - tracked.splitter.pending_bytes();
+            let stats = tracked.splitter.push(bytes, |line, start| {
+                let start = start.map_or(partial_start, |i| chunk_start + i as u64);
+                lines.push((line, start));
+            });
             tracked.offset += n as u64;
             stats.dropped_lines
         };
@@ -692,12 +741,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
 
         let mut scratch: Vec<Event> = Vec::new();
-        for line in lines {
+        for (line, line_start) in lines {
             let line = ensure_utf8(line, &mut self.diag);
             let Some(tracked) = self.files.get_mut(&id) else { return false };
             self.telemetry.count("logit.input.lines", 1.0, &[]);
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
-            match tracked.decoder.decode_line(line, read_at, &mut scratch) {
+            let decoded = tracked.decoder.decode_line(line, read_at, &mut scratch);
+            // A rejected line leaves the held run as it was, so `held_from` keeps its start.
+            if !tracked.decoder.holds_entry() {
+                tracked.held_from = None;
+            } else if tracked.held_from.is_none() {
+                tracked.held_from = Some(line_start);
+            }
+            match decoded {
                 Ok(resource) => {
                     // No scope: a tailed line has no instrumentation scope.
                     if let Some((batch, reason)) =
@@ -725,6 +781,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// since reaping it earlier loses the rest for good (it also leaves the next checkpoint). A
     /// read error counts as EOF, or an erroring handle would never be reaped. Emits held decoder
     /// state, flushes the accumulator (`FlushReason::Closed`), and drops the file.
+    ///
+    /// A reap dirties the checkpoint, so the next interval write drops the file's entry (a write
+    /// persists only tracked files). Left on disk, the entry would outlive the inode: a crash, then
+    /// a new file reusing that `(dev, ino)`, would resume past its first bytes.
     async fn reap_drained(
         &mut self,
         at_eof: &[FileId],
@@ -756,6 +816,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // full `offset`: `close_decoder` already emitted the held partial.
                 self.resume.insert(id, (tracked.path.clone(), tracked.offset));
             }
+            if let Some(cp) = &mut self.checkpoint {
+                cp.mark_dirty();
+            }
         }
     }
 
@@ -782,16 +845,25 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
+    /// Persists every tracked file's offset. The invariant: a persisted offset covers only bytes
+    /// whose events have been emitted, or absorbed into an accumulator the caller flushes first,
+    /// so a restart can replay lines but never skip one.
+    ///
+    /// `offset` advances per chunk, so it also covers bytes that haven't produced an event yet:
+    /// the splitter's held partial line ([`LineSplitter::pending_bytes`]) and the complete lines
+    /// the decoder holds (`docker_in`'s fragments of a split entry). The persisted offset is the
+    /// smaller of the splitter's line boundary and `held_from`, the start of the oldest line the
+    /// decoder still holds. A line rejected or dropped after that held run advances `offset`
+    /// without clearing it, which is why it's a position and not a byte count to subtract. A file
+    /// mid-drop holds no partial, so its offset lands inside the dropped line, and a restart there
+    /// treats the rest of it as a new line. At shutdown `close_all_for_shutdown` has already
+    /// emitted both, so the offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
-        // Subtract the held partial: `offset` advances per chunk, so it includes bytes that
-        // haven't produced an event yet. A file mid-drop holds no partial, so its offset lands
-        // inside the dropped line, and a restart there treats the rest of it as a new line. At
-        // shutdown `close_all_for_shutdown` has already emitted every partial, so this is `0`.
-        let entries = self
-            .files
-            .values()
-            .map(|f| (f.id, f.path.as_path(), f.offset.saturating_sub(f.splitter.pending_bytes())));
+        let entries = self.files.values().map(|f| {
+            let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
+            (f.id, f.path.as_path(), boundary.min(f.held_from.unwrap_or(u64::MAX)))
+        });
         checkpoint.write(entries, force, &mut self.diag, &self.telemetry).await;
     }
 }
@@ -825,6 +897,7 @@ async fn close_decoder<D: TailDecoder>(
     }
 
     tracked.decoder.close(&mut scratch);
+    tracked.held_from = None;
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();
         if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {
@@ -925,6 +998,11 @@ mod tests {
         }
     }
 
+    /// A `due` for a test that calls `Tailer::drain` directly and wants it to run until idle.
+    fn no_timer_due() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(3600)
+    }
+
     fn recording_fanout(capacity: usize) -> (Fanout, mpsc::Receiver<Delivered>) {
         let (tx, rx) = mpsc::channel(capacity);
         (Fanout::new(vec![tx]), rx)
@@ -944,7 +1022,6 @@ mod tests {
                 max_events: 1_000,
                 max_bytes: 1024 * 1024,
                 flush_interval: Duration::from_millis(15),
-                shutdown_grace: Duration::from_secs(5),
             },
         }
     }
@@ -1569,8 +1646,7 @@ mod tests {
         .await;
 
         std::fs::remove_file(&b_path).unwrap();
-        // Reaping doesn't dirty the store, so no interval tick prunes `b.log`: the forced write at
-        // shutdown does, and only if the reap came first.
+        // Shutdown's forced write drops `b.log` too, but only if the reap came first.
         wait_until("the removed file to be reaped", || {
             gauge_value(&registry, "logit.input.files.open") == Some(1.0)
         })
@@ -2124,7 +2200,7 @@ mod tests {
         std::fs::write(&path, b"a-longer-first-line\n").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut watcher = crate::tail::watch::Watcher::Poll;
         let mut tailer = Tailer::new(
             vec![PathPattern::new(&path)],
@@ -2132,7 +2208,7 @@ mod tests {
             fast_config(ReadFrom::Beginning),
         );
         tailer.scan(true, &mut watcher).await;
-        let _ = tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
         tailer.flush_all(&fanout, FlushReason::Interval).await;
         assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["a-longer-first-line"]);
 
@@ -2157,7 +2233,7 @@ mod tests {
         );
 
         // The drain after every wake re-emits nothing.
-        let _ = tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
         tailer.flush_all(&fanout, FlushReason::Interval).await;
         assert!(
             rx.try_recv().is_err(),
@@ -2187,7 +2263,8 @@ mod tests {
         // finds it. `rx` stays unconsumed.
         let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
         std::fs::remove_file(&path).unwrap();
-        // A poll tick marks the file `Draining` while it is still mostly unread.
+        // The first poll tick marks the file `Draining`. `drain` yields to a due tick after its
+        // first pass at the latest, so at least one chunk is still unread when that happens.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut received = Vec::new();
@@ -2555,7 +2632,7 @@ mod tests {
         let (mut tailer, mut watcher) =
             inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
         let (fanout, _rx) = recording_fanout(256);
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let path = dir.join("app.log");
 
         tailer.scan(true, &mut watcher).await;
@@ -2563,13 +2640,13 @@ mod tests {
         for i in 0..20 {
             std::fs::write(&path, format!("line {i}\n")).unwrap();
             tailer.scan(false, &mut watcher).await;
-            tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+            tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
 
             // Rotate out of `*.log`'s reach, reap, then delete: one watch added and one removed
             // per cycle, plus a queued `IN_IGNORED`.
             std::fs::rename(&path, dir.join("app.log.1")).unwrap();
             tailer.scan(false, &mut watcher).await;
-            tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+            tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
             std::fs::remove_file(dir.join("app.log.1")).unwrap();
         }
 
@@ -2596,6 +2673,290 @@ mod tests {
              {expected} the driver knows about:\n{fdinfo}"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- timers under a backlog, and the checkpoint at shutdown --
+
+    /// `n` lines of `backlog-NNNNN\n`, [`BACKLOG_LINE_BYTES`] each; 8000 of them span two read
+    /// chunks.
+    fn backlog(n: usize) -> String {
+        (0..n).map(|i| format!("backlog-{i:05}\n")).collect()
+    }
+
+    const BACKLOG_LINE_BYTES: u64 = 14;
+
+    /// An empty batch, sent from a clone of the tailer's `Fanout` to fill its channel.
+    fn filler_batch() -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events: Vec::new() }
+    }
+
+    /// Receives one batch per `per_batch` until `stop` says so or the channel has been quiet for
+    /// 5s, returning the events in arrival order.
+    async fn consume_slowly(
+        rx: &mut mpsc::Receiver<Delivered>,
+        per_batch: Duration,
+        mut stop: impl FnMut(&[Event]) -> bool,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        while !stop(&events) {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(delivered)) => events.extend(unwrap_batch(delivered).events),
+                Ok(None) | Err(_) => break,
+            }
+            tokio::time::sleep(per_batch).await;
+        }
+        events
+    }
+
+    /// A final flush parked on a full downstream when the grace backstop drops the task leaves
+    /// the on-disk checkpoint where the last interval write put it: a restart re-reads what that
+    /// flush held (duplicates), never skips it.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset() {
+        let dir = scratch_dir("grace-cut-final-flush");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_secs(1);
+        config.batching.flush_interval = Duration::from_secs(3600);
+
+        let registry = Registry::new();
+        let (fanout, mut rx) = recording_fanout(1);
+        let filler = fanout.clone();
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
+        let (shutdown_tx, mut handle) = spawn_tailer(tailer, fanout);
+
+        // The first checkpoint tick flushes both lines, then records their 8 bytes.
+        assert_eq!(messages(&expect_events(&mut rx, 2).await), vec!["one", "two"]);
+        wait_until("the interval checkpoint to record the first two lines", || {
+            checkpointed_offset(&checkpoint_path) == Some(8)
+        })
+        .await;
+
+        // Fill the channel before appending: with it full, the next flush parks, and a run loop
+        // parked in a flush never observes shutdown.
+        filler.send(filler_batch()).await;
+        let _ = counter_total(&registry, "logit.input.lines"); // count only the appended lines
+        append(&path, b"three\nfour\n");
+        let mut lines = 0.0;
+        wait_until("the appended lines to be read into the accumulator", || {
+            lines += counter_total(&registry, "logit.input.lines");
+            lines >= 2.0
+        })
+        .await;
+
+        let _ = shutdown_tx.send(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut handle).await.is_err(),
+            "the final flush should be parked on the full channel"
+        );
+        // `run_input`'s grace backstop drops the task here.
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            counter_sum(&registry, "logit.component.receive.flushed", ("reason", "shutdown"))
+                >= 1.0,
+            "the final flush is counted before its send parks"
+        );
+        assert_eq!(
+            checkpointed_offset(&checkpoint_path),
+            Some(8),
+            "a grace-cut final flush must leave the last interval checkpoint in place"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `drain` yields to a due checkpoint tick between passes, so a backlog read against a slow
+    /// downstream is checkpointed while it's still being read, not only once it's done.
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_tick_lands_while_a_long_backlog_is_still_being_drained() {
+        let dir = scratch_dir("checkpoint-under-backlog");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        let content = backlog(8_000);
+        let file_len = content.len() as u64;
+        assert!(file_len > READ_CHUNK_BYTES as u64, "fixture must exceed one read chunk");
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_millis(100);
+        config.batching.max_events = 1;
+
+        let (fanout, mut rx) = recording_fanout(1);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let mut mid_backlog: Option<(usize, u64)> = None;
+        let events = consume_slowly(&mut rx, Duration::from_millis(1), |events| {
+            if mid_backlog.is_none() && events.len() % 50 == 0 {
+                if let Some(offset) = checkpointed_offset(&checkpoint_path) {
+                    if 0 < offset && offset < file_len {
+                        mid_backlog = Some((events.len(), offset));
+                    }
+                }
+            }
+            events.len() >= 8_000
+        })
+        .await;
+
+        let (seen_at, offset) =
+            mid_backlog.expect("a checkpoint tick should land before the backlog is fully read");
+        assert!(seen_at < 8_000, "the checkpoint landed at event {seen_at}, offset {offset}");
+        assert_eq!(
+            messages(&events),
+            (0..8_000).map(|i| format!("backlog-{i:05}")).collect::<Vec<_>>(),
+            "every line should still arrive, in order, after the mid-backlog checkpoint"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The flush tick's twin of the checkpoint test: a quiet second file's accumulator is flushed
+    /// on the tick while another file's backlog is still being read.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_tick_lands_while_a_long_backlog_is_still_being_drained() {
+        let dir = scratch_dir("flush-under-backlog");
+        let busy = dir.join("busy.log");
+        let quiet = dir.join("quiet.log");
+        std::fs::write(&busy, backlog(8_000).as_bytes()).unwrap();
+        std::fs::write(&quiet, b"quiet line\n").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.batching.max_events = 50;
+        config.batching.flush_interval = Duration::from_millis(100);
+
+        let (fanout, mut rx) = recording_fanout(1);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(&busy), PathPattern::new(&quiet)],
+            LineFactory,
+            config,
+        );
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let is_quiet = |e: &Event| e.log.as_ref().unwrap().message.as_str() == Some("quiet line");
+        let events = consume_slowly(&mut rx, Duration::from_millis(50), |events| {
+            events.iter().any(is_quiet)
+        })
+        .await;
+        let busy_before_quiet = events.iter().filter(|e| !is_quiet(e)).count();
+        assert!(events.iter().any(is_quiet), "the quiet file's line should be flushed");
+        assert!(
+            busy_before_quiet < 8_000,
+            "a flush tick should land before the backlog is fully read, not after all \
+             {busy_before_quiet} of its lines"
+        );
+
+        drop(rx); // the rest of the backlog then fails fast as closed_consumer
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shutdown while a backlog is read against a downstream that then stops taking batches: the
+    /// run loop is parked in `emit` and never sees the signal, so the grace backstop drops it with
+    /// no final checkpoint. The interval checkpoints written between passes bound what a restart
+    /// replays to one read chunk, and nothing delivered is skipped.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_backlog_drain_with_a_parked_downstream_replays_at_most_one_chunk() {
+        let dir = scratch_dir("shutdown-under-backlog");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        std::fs::write(&path, backlog(8_000).as_bytes()).unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_millis(100);
+        config.batching.max_events = 1;
+
+        let (fanout, mut rx) = recording_fanout(1);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
+        let (shutdown_tx, mut handle) = spawn_tailer(tailer, fanout);
+
+        // Into the second chunk, then the downstream stops.
+        let delivered =
+            consume_slowly(&mut rx, Duration::from_millis(1), |e| e.len() >= 6_000).await.len();
+        let _ = shutdown_tx.send(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut handle).await.is_err(),
+            "the run loop should be parked in emit"
+        );
+        handle.abort();
+        let _ = handle.await;
+        drop(rx);
+
+        let offset = checkpointed_offset(&checkpoint_path)
+            .expect("an interval checkpoint should have landed during the backlog");
+        let delivered_bytes = delivered as u64 * BACKLOG_LINE_BYTES;
+        assert!(offset <= delivered_bytes, "checkpoint {offset} covers undelivered lines");
+        assert!(
+            delivered_bytes - offset <= READ_CHUNK_BYTES as u64,
+            "replay window {} exceeds one read chunk",
+            delivered_bytes - offset
+        );
+        assert_eq!(offset % BACKLOG_LINE_BYTES, 0, "the checkpoint must sit on a line boundary");
+
+        // A restart resumes at the checkpointed line: at or before the last one delivered.
+        let (fanout2, mut rx2) = recording_fanout(8);
+        let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
+        let first = expect_events(&mut rx2, 1).await;
+        let resumed_at = offset / BACKLOG_LINE_BYTES;
+        assert_eq!(messages(&first[..1]), vec![format!("backlog-{resumed_at:05}")]);
+        drop(rx2);
+        shutdown(shutdown_tx2, handle2).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reap dirties the checkpoint, so the next interval write, not only shutdown's, drops the
+    /// reaped inode's entry. Left in place, a crash followed by a new file reusing the inode would
+    /// resume from the stale offset.
+    #[tokio::test]
+    async fn a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it(
+    ) {
+        let dir = scratch_dir("reap-dirties-checkpoint");
+        let a_path = dir.join("a.log");
+        let b_path = dir.join("b.log");
+        std::fs::write(&a_path, b"a1\n").unwrap();
+        std::fs::write(&b_path, b"b1\n").unwrap();
+        let checkpoint_path = dir.join("checkpoint.json");
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_millis(20);
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer = Tailer::new(
+            vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
+            LineFactory,
+            config,
+        );
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let _ = expect_events(&mut rx, 2).await;
+        wait_until("a checkpoint tick to record both files", || {
+            std::fs::read_to_string(&checkpoint_path)
+                .is_ok_and(|text| text.contains("a.log") && text.contains("b.log"))
+        })
+        .await;
+
+        // Nothing else changes after the removal, so only the reap can dirty the store.
+        std::fs::remove_file(&b_path).unwrap();
+        wait_until("an interval write to drop the reaped file's entry", || {
+            std::fs::read_to_string(&checkpoint_path)
+                .is_ok_and(|text| text.contains("a.log") && !text.contains("b.log"))
+        })
+        .await;
+
+        shutdown(shutdown_tx, handle).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }
