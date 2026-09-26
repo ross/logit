@@ -180,8 +180,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-01](#net-01--recvmmsg2-batched-udp-read-hand-built-mmsghdriovec-arrays-over-vecu64-storage) | P0 | `recvmmsg(2)` batched UDP read: hand-built `mmsghdr`/`iovec` arrays over `Vec<u64>` storage | `crates/logit-inputs/src/udp.rs` (`BatchReader`, `build_headers`/`recvmmsg_into`/`harvest_headers`) | findings → #281 |
 | [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | in-progress (drain/w3) |
 | [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | in-progress (drain/w3) |
-| [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | in-progress (drain/w1) |
-| [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | in-progress (drain/w1) |
+| [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
+| [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | unreviewed |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | unreviewed |
@@ -232,12 +232,12 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs` (`peek`, `read_record_at`, `read_at`) | unreviewed (partly fixed in #328) |
-| [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | in-progress (drain/w1) |
+| [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | reviewed @510291b1 |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
-| [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | in-progress (drain/w1) |
+| [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | findings → #403 |
 | [RT-08](#rt-08--run_transform-flush-deadline-race-close-time-flush-and-cadence-math) | P1 | `run_transform`: flush-deadline race, close-time flush, and cadence math | `runtime.rs` (`run_transform`, `run_flush`, `advance_flush_deadline`) | unreviewed |
 | [RT-10](#rt-10--run_router--route_batch-the-four-pass-partition-and-routerscratch-reuse) | P1 | `run_router` / `route_batch`: the four-pass partition and `RouterScratch` reuse | `runtime.rs` (`run_router`, `route_batch`) | unreviewed |
 | [RT-12](#rt-12--batchaccumulator-incremental-weight-tracking-and-the-resource-scope-key) | P1 | `BatchAccumulator`: incremental weight tracking and the `(resource, scope)` key | `crates/logit-pipeline/src/accumulator.rs` (`BatchAccumulator::absorb`) | unreviewed |
@@ -658,7 +658,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 - **Why sensitive:** hot-path (one call per `recvmmsg` batch); concurrency (the `Notify` condvar
   pattern, permit vs. broadcast semantics); cancellation (the `Drain` is held across every
   `.await`); backpressure (`Block` is the operator-selectable mode that makes the reader stop);
-  data-loss (the cancelled remainder is dropped uncounted, by design); accounting
+  data-loss (~~the cancelled remainder is dropped uncounted, by design~~ the cancelled remainder is counted `shutdown`); accounting
   (`logit.component.datagrams.dropped` / `.bytes.dropped` must reconcile);
   nontrivial-3p-use(tokio::sync::Notify — the code depends on documented-but-subtle
   `notified()`-constructed-before-state-check ordering and on `notify_one` storing a permit where
@@ -676,17 +676,19 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     after each accepted item).
   - `items` is always left empty with capacity intact, on the ordinary path *and* on cancellation.
   - The cancelled-mid-wait case leaves: accepted prefix queued, fully accounted, and announced;
-    remainder dropped uncounted; caller's `Vec` empty.
+    ~~remainder dropped uncounted~~ remainder counted `reason="shutdown"`; caller's `Vec` empty.
   - `dropped` is drained and counted *outside* the lock, per iteration, so evicted datagrams are
     freed promptly rather than held for the whole `Block` wait (the `dropped.drain(..)` loop after each lock release).
   - Mutex poisoning is swallowed (`unwrap_or_else(|p| p.into_inner())`) at every lock site — verify
     a poisoned queue can't serve corrupted state.
 - **Observed concerns (unverified):**
-  - *Low confidence:* `would_overflow` is `inner.len() >= max_items || inner.weight()
+  - ~~*Low confidence:* `would_overflow` is `inner.len() >= max_items || inner.weight()
     + weight > max_weight`; `inner.weight() + weight` is a plain `u64` add with no overflow guard.
-    `Datagram::weight()` is ≤ ~65 KB so unreachable today, but the type is generic.
-  - *Documented:* the uncounted cancellation remainder (`push_many`'s "Cancellation" doc paragraph) is an accepted,
-    shutdown-only loss; listed for context, not as a finding.
+    `Datagram::weight()` is ≤ ~65 KB so unreachable today, but the type is generic.~~ **fixed in
+    #403:** saturating, along with `InMemoryBuffer`'s add and subtract.
+  - ~~*Documented:* the uncounted cancellation remainder (`push_many`'s "Cancellation" doc paragraph) is an accepted,
+    shutdown-only loss; listed for context, not as a finding.~~ **Counted since #403** (ADR
+    `shutdown-accounting-and-cancellation-safety`, decision 4).
 - **Existing coverage:** `queue.rs` tests: the block of eleven `push_many_*` tests (including
   `a_cancelled_push_many_leaves_the_prefix_queued_the_vec_empty_and_accounting_exact`),
   `a_consumer_parked_before_a_blocking_push_many_is_woken_by_the_prefix_it_admits`,
@@ -697,13 +699,20 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `any_interleaving_of_batched_and_single_calls_agrees_with_the_single_call_sequence`.
   ADR: `udp-intake-batching-and-socket-visibility` ("`push_many`/`pop_many` live on `BoundedQueue`
   itself"), `decoupled-listener-io`.
-- **Suggested verification approach:** loom or shuttle model of push/push_many/pop/pop_many/close
+- **Suggested verification approach:** ~~loom or shuttle model of push/push_many/pop/pop_many/close
   interleavings with 1–2 producers and 1–2 consumers — the `Notify` permit reasoning is exactly
-  what a model checker is for; supplement with a proptest comparing batched vs. single-call
+  what a model checker is for;~~ (neither can instrument `tokio::sync::Notify`; ADR
+  `shutdown-accounting-and-cancellation-safety`, decision 5) supplement with a proptest comparing batched vs. single-call
   sequences (`any_interleaving_of_batched_and_single_calls_agrees_with_the_single_call_sequence` already
   exists — extend it to cover `close()` racing).
 - **Priority:** P0 — a lost wakeup here wedges a listener permanently, and the drop accounting is
   the source of truth for every "logit counted the loss" claim.
+- **Verified (drain/w1, #403):** findings. A cancelled `push_many` now counts its remainder through
+  `CountedDrain`, a never-polled one leaves its `Vec` for the caller to count, and weight
+  arithmetic saturates. `queue_stress`'s `BoundedQueue` ledger (1–3 producers, 1–2 consumers,
+  every policy, random cancellation and close; 64 seeds in CI, 20,000 once locally) and the
+  batched-vs-single proptest under `close()` and cancellation found no lost wakeup or unaccounted
+  item; each fails on a planted bug (the remainder uncounted, the pre-wait `notify_one` removed).
 
 ---
 
@@ -745,10 +754,17 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `a_notify_waiters_call_between_constructing_a_notified_and_polling_it_is_never_lost`,
   `pop_many_with_max_zero_trips_a_debug_assert` / `…_is_clamped_to_one_rather_than_hanging`,
   plus `pop_is_fifo_and_returns_none_once_closed_and_empty`.
-- **Suggested verification approach:** loom/shuttle (same model as `push_many`); re-run the
+- **Suggested verification approach:** ~~loom/shuttle (same model as `push_many`);~~ re-run the
   tokio-internals pin test on any `tokio` bump; targeted review of the `Ordering` choices.
 - **Priority:** P0 — same lock/notify protocol as `push_many`; a lost `not_empty` wakeup hangs a
   listener's decode loop with a non-empty queue.
+- **Verified (drain/w1, #403):** reviewed @510291b1, no change to `pop`/`pop_many`/`close`. Every
+  `closed` access is Acquire/Release, and `pop_many` awaits only on an iteration that removed
+  nothing. `queue_stress` runs `pop`/`pop_many` consumers cut off at random against concurrent
+  producers and `close()`, `a_close_while_every_producer_and_consumer_is_parked_wakes_all_of_them`
+  checks the closed-and-empty signal reaches every parked waiter, and
+  `a_notify_one_delivered_to_a_registered_notified_that_is_dropped_unpolled_is_passed_on` pins the
+  permit forwarding a cut-off `pop_many` relies on.
 
 ---
 
@@ -2499,9 +2515,10 @@ surveyor's.
     least one segment")` appears in `push`, `write_record` (several times), `rotate_segment`, and `open` — any of
     those firing poisons the mutex and the next lock proceeds on inconsistent state.
   - `Ordering::Acquire`/`Release` on `closed` is sufficient given the `Mutex` also synchronizes.
-- **Observed concerns (unverified):** the `expect("always at least one segment")` family is the invariant a
+- **Observed concerns (unverified):** ~~the `expect("always at least one segment")` family is the invariant a
   poisoned-mutex-ignored design leans on hardest; `rotate_segment` can fail to create a new segment, and
-  `roll_read_cursor` can remove entries — worth proving `segments` is never emptied. Medium confidence it holds.
+  `roll_read_cursor` can remove entries — worth proving `segments` is never emptied. Medium confidence it holds.~~
+  **Holds:** `State::segments`' doc lists the mutation sites and why each keeps it non-empty.
 - **Existing coverage:** `close_then_peek_returns_none_when_empty`, and the two roll-forward tests that
   assert `peek` doesn't hang (`the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`,
   `live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes`, with explicit `tokio::time::timeout`). No dedicated concurrency
@@ -2509,6 +2526,16 @@ surveyor's.
 - **Suggested verification approach:** a loom-style or high-iteration randomized concurrency test (producer +
   consumer + close) under `tokio::time::pause`, plus targeted review of the notify/re-check ordering.
 - **Priority:** P1 — a lost wakeup is a hang, not corruption, and the roll-forward tests already caught one.
+- **Verified (drain/w1, #403):** reviewed @510291b1, no behavior change. `State::segments`' doc
+  states the never-empty invariant at its mutation sites, with `debug_assert!`s after `open`'s
+  `leaked` loop and `roll_read_cursor`'s removals. `DiskQueue`'s doc states the same-task contract:
+  `commit` and `evict_oldest` each check under one lock and act under another, safe only because
+  `drain_inbox` and `write_loop` are two futures in one task. `queue_stress` drives a producer and
+  consumer that way under random bounds, policies, cancellation, and close, then finishes and
+  reopens (16 seeds in CI, 1,000 once locally), and
+  `a_block_push_whose_make_room_rotation_fails_writes_over_bound_rather_than_parking` covers the
+  failed make-room create. Follow-up: make each of those two pairs one lock acquisition, so the
+  contract no longer rests on task placement.
 
 ---
 
@@ -3231,11 +3258,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `crates/logit-proto/src/buffer.rs`'s `tests` module for `InMemoryBuffer`'s reservation semantics. Governed by
   `docs/adr/buffered-sink-delivery.md`, `docs/adr/decoupled-listener-io.md`,
   `docs/adr/udp-intake-batching-and-socket-visibility.md`.
-- **Suggested verification approach:** a loom or shuttle model over `push`/`commit`/`close` with one producer and
-  one consumer (the sink shape), asserting no lost wakeup and no permanent park; a re-check of the tokio
+- **Suggested verification approach:** ~~a loom or shuttle model over `push`/`commit`/`close` with one producer and
+  one consumer (the sink shape), asserting no lost wakeup and no permanent park;~~ a re-check of the tokio
   `Notify` internals against the currently pinned tokio version.
 - **Priority:** **P1** — a lost wakeup here hangs a sink permanently, but the argument is explicit, the pattern is
   standard, and a regression test already guards the tokio dependency.
+- **Verified (drain/w1, #403):** findings. `would_overflow` and `InMemoryBuffer`'s weight
+  arithmetic saturate on add and subtract (`commit_after_saturated_weights_never_underflows_and_an_empty_queue_has_zero_weight`).
+  `peek`'s doc now states the one-consumer contract (a second consumer delivers one item twice and
+  loses the next), and `update_gauges`' doc the stale last write under parallel callers, benign
+  because each queue's halves share one task; `queue_stress` checks the gauges read 0 once drained.
+  Its `peek`→`commit` consumer checks `commit` removes the item `peek` reserved, under every policy.
 
 ---
 
