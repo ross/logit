@@ -182,6 +182,12 @@ batch is dropped with them. Code 7 names the object after the bad one. `splunk_h
 12, 13, and 15 (a missing or blank `event`, a nested `fields` value), which leaves code 7, an
 index the token can't write.
 
+`splunk_hec_in` answers a `/event` body with a syntax error the same way: it delivers the objects
+before the bad one, answers `400` code 6 naming it, and delivers nothing from it on. So a client
+that resends only the objects after the named one, `splunk_hec_out` included, loses nothing but
+the bad object. A gzip stream that doesn't decompress is rejected whole, with no
+`invalid-event-number`.
+
 ### `/raw` bodies are split into lines, and Splunk's line breaking doesn't run again
 
 `splunk_hec_in` turns a `/raw` body into one log per line, stamped with the time it arrived, with

@@ -140,8 +140,18 @@ pub fn encode_success(ack_id: Option<u64>) -> Vec<u8> {
 /// `status`'s body plus `"invalid-event-number":<n>`, the index of the first rejected object in
 /// a batch (Splunk's code 6 answer to a malformed `/event` body).
 pub fn encode_invalid_event(status: HecStatus, n: u64) -> Vec<u8> {
+    encode_invalid_event_acked(status, n, None)
+}
+
+/// [`encode_invalid_event`] plus, with `ack_id`, `"ackId":<id>` after `invalid-event-number`:
+/// Splunk's answer, and `splunk_hec_in`'s, to a request with a channel whose objects before `n`
+/// were indexed (`tools/splunk-interop/README.md`'s code 6 probe).
+pub fn encode_invalid_event_acked(status: HecStatus, n: u64, ack_id: Option<u64>) -> Vec<u8> {
     status_body(status.text, status.code, |obj| {
         obj.key("invalid-event-number").extend_from_slice(n.to_string().as_bytes());
+        if let Some(id) = ack_id {
+            obj.key("ackId").extend_from_slice(id.to_string().as_bytes());
+        }
     })
 }
 

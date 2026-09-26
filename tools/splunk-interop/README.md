@@ -164,7 +164,7 @@ answered. The recording of the `[tcpout]` capture is described but not committed
 |---|---|
 | `max_content_length` | `limits.conf [http_input] max_content_length = 838860800` (800 MiB) |
 | gzip | `Content-Encoding: gzip` on `/event` and `/raw`: `200`, indexed. `deflate`: `415` with an HTML body |
-| code 6 | A syntax error in object 1 of 3: `400` `{"text":"Invalid data format","code":6,"invalid-event-number":1}`; object 0 indexed, objects 1 and 2 not. In object 0: `invalid-event-number` 0, nothing indexed |
+| code 6 | A syntax error in object 1 of 3: `400` `{"text":"Invalid data format","code":6,"invalid-event-number":1}`; object 0 indexed, objects 1 and 2 not. In object 0: `invalid-event-number` 0, nothing indexed. On the `useACK` token with a channel (a 2026-09-26 run of the same image): `{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":0}` for object 1, and no `ackId` for object 0 |
 | other per-object errors | A blank `event` (code 13), `fields` with a nested object (code 15), and an object with neither `event` nor `fields` (code 12), each in object 1 of 3: `400` naming 1, object 0 indexed, the rest not. An index the token doesn't allow in object 1 (code 7): `400` naming 2, object 0 indexed, the rest not |
 | lenient cases | An object with `fields` and no `event`: `200`, skipped, the others indexed (as a metric when `fields` carry a measurement). An unknown envelope key in object 1 of 3: `200`, but only object 0 indexed; in a body's only object: `400` code 5 `No data` |
 | metric forms | No `event` with a string measurement (SC4S's shape), and the single-metric `metric_name`/`_value` pair: both `200` and stored as metrics |
