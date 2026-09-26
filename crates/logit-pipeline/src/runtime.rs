@@ -19,6 +19,7 @@ use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Tele
 use logit_script::{Heartbeat, ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -44,8 +45,8 @@ pub enum NodeSpec {
     /// that omits `receive:` gets `ReceiveConfig::default()`'s 5 s, not
     /// `InputRuntimeConfig::default()`'s `Duration::ZERO`, which only tests reach. The
     /// difference matters: at `ZERO` the backstop arm in `run_input` is ready the instant
-    /// shutdown fires, so `select!`'s random rotation cancels the listener by drop about half
-    /// the time. See `docs/adr/decoupled-listener-io.md`.
+    /// shutdown fires, so an overriding listener that still has anything to drain is cancelled
+    /// by drop. See `docs/adr/decoupled-listener-io.md`.
     Input(Box<dyn Input + Send>, InputRuntimeConfig),
     /// The sink, its queue (in memory or disk-backed; see `SinkStoreConfig`), and its retry
     /// budget and shutdown grace (`WriteLoopConfig`). Production builds these from the
@@ -186,9 +187,9 @@ pub async fn run_with_telemetry(
         let _ = shutdown_tx_for_driver.send(true);
     });
 
-    // Batches abandoned in any sink's inbox because shutdown grace expired before `write_loop`
-    // drained them, summed so the `drain complete` log can say whether the drain was clean.
-    let shutdown_dropped_batches = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Every batch any node dropped for shutdown, summed by `count_shutdown_drop` so the `drain
+    // complete` log can say whether the drain was clean.
+    let shutdown_dropped_batches = Arc::new(AtomicU64::new(0));
 
     // Every listener and sink binds before any channel exists or task spawns, so a bind failure
     // fails startup with nothing else running. Sequential and sorted, so "which one failed" never
@@ -337,6 +338,7 @@ pub async fn run_with_telemetry(
                     Diagnostics::new(id.clone()).with_telemetry(node_telemetry.clone());
                 let thread_heartbeat = heartbeat.clone();
                 let thread_io = io.clone();
+                let thread_dropped = shutdown_dropped_batches.clone();
                 let max_memory = runtime.max_memory;
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
@@ -356,6 +358,7 @@ pub async fn run_with_telemetry(
                             thread_heartbeat,
                             max_memory,
                             node_telemetry,
+                            thread_dropped,
                             handle,
                         )
                     })
@@ -378,6 +381,7 @@ pub async fn run_with_telemetry(
                             readiness.clone(),
                             watcher_telemetry,
                             watcher_diag,
+                            shutdown_dropped_batches.clone(),
                         ));
                         node_ids.insert(watcher.id(), id.clone());
                     }
@@ -469,6 +473,11 @@ pub async fn run_with_telemetry(
 /// default (or any override that finishes within the grace) always wins, adding no latency; only
 /// an override still working at the deadline is cancelled by drop, a loss now bounded by
 /// `shutdown_grace`.
+///
+/// `biased`, input arm first: a listener result ready in the same wake as the backstop (an `Err`
+/// returned at the grace deadline) is returned, not discarded. The backstop runs `unconstrained`
+/// so an input that spends its whole coop budget on every poll can't keep the deadline from
+/// firing. See `docs/design/pipeline-graph.md`'s "Cancellation points".
 async fn run_input(
     id: String,
     mut input: Box<dyn Input + Send>,
@@ -478,9 +487,12 @@ async fn run_input(
 ) -> anyhow::Result<()> {
     let mut deadline: Option<tokio::time::Instant> = None;
     tokio::select! {
+        biased;
         result = input.run_until_shutdown(fanout, shutdown.clone())
             => result.with_context(|| format!("component '{id}'")),
-        () = shutdown_grace_expired(&mut shutdown, &mut deadline, shutdown_grace) => Ok(()),
+        () = tokio::task::unconstrained(
+            shutdown_grace_expired(&mut shutdown, &mut deadline, shutdown_grace),
+        ) => Ok(()),
     }
 }
 
@@ -501,7 +513,7 @@ async fn run_output(
     store_config: SinkStoreConfig,
     write_config: WriteLoopConfig,
     shutdown: watch::Receiver<bool>,
-    shutdown_dropped_batches: Arc<std::sync::atomic::AtomicU64>,
+    shutdown_dropped_batches: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
     // Idempotent (`Output::bind`'s contract): a no-op after `run_with_telemetry`'s pre-spawn
@@ -527,6 +539,7 @@ async fn run_output(
         telemetry.clone(),
         write_config,
         shutdown,
+        &shutdown_dropped_batches,
     ));
 
     // Not `tokio::join!`: `write_loop` can return early (a permanent failure, or shutdown grace
@@ -568,26 +581,41 @@ async fn run_output(
     // ignores `closed`.
     store.close();
 
+    // Closed before the sweep, so a producer that lands after it fails upstream as
+    // `closed_consumer` instead of completing a send into a channel nothing reads again. Left
+    // open, a producer parked on the full channel (an upstream `aggregate` or Lua node's
+    // close-time flush) takes the capacity the sweep frees and sends while `finish_and_flush`
+    // awaits, and the batch dies with `inbox`, neither received nor dropped.
+    inbox.close();
+
     // An abandoned `drain` may leave batches that never reached `store`, so `finish_and_flush`
     // can't see them: the one its dropped `store.push` held (`in_hand`, first, since it arrived
     // first), then any still in `inbox`. A `Disk` store persists them (it drops nothing at
-    // shutdown); a `Memory` store counts and diagnoses them as dropped. `try_recv` never waits.
+    // shutdown); a `Memory` store counts and diagnoses them as dropped.
     let mut abandoned_batches: u64 = 0;
     let mut abandoned_events: u64 = 0;
-    let mut parked = in_hand.lock().unwrap_or_else(|p| p.into_inner()).take();
-    loop {
-        let (batch, ctx) = match parked.take() {
-            Some(item) => item,
-            None => match inbox.try_recv() {
-                Ok(delivered) => {
-                    let ctx = delivered.batch_context();
-                    (unwrap_batch_arc(delivered), ctx)
-                }
-                Err(_) => break,
-            },
-        };
+    // Not counted `received` here: `drain_inbox` counted it before parking it in `in_hand`.
+    let parked = in_hand.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some((batch, ctx)) = parked {
         abandoned_batches += 1;
         abandoned_events += batch.events.len() as u64;
+        if matches!(store.as_ref(), SinkStore::Disk(_)) {
+            store.push((batch, ctx)).await;
+        }
+    }
+    // `recv` on a closed channel returns `None` once the buffer is empty and every reserved
+    // `Permit` is released, so a batch sent through a permit `Fanout::send_with_deadline`
+    // reserved before the close still lands here. The bound covers only `recv`, never a disk
+    // `push`, so a cancelled wait loses nothing already taken.
+    let sweep_deadline = tokio::time::Instant::now() + SWEEP_DRAIN_TIMEOUT;
+    while let Ok(Some(delivered)) = tokio::time::timeout_at(sweep_deadline, inbox.recv()).await {
+        let ctx = delivered.batch_context();
+        let batch = unwrap_batch_arc(delivered);
+        let events = batch.events.len() as u64;
+        telemetry.count("logit.component.batches.received", 1.0, &[]);
+        telemetry.count("logit.component.events.received", events as f64, &[]);
+        abandoned_batches += 1;
+        abandoned_events += events;
         if matches!(store.as_ref(), SinkStore::Disk(_)) {
             store.push((batch, ctx)).await;
         }
@@ -599,17 +627,11 @@ async fn run_output(
                  sink's disk spool when it stopped -- appended to it instead of being dropped"
             ));
         } else {
-            shutdown_dropped_batches
-                .fetch_add(abandoned_batches, std::sync::atomic::Ordering::Relaxed);
-            telemetry.count(
-                "logit.component.batches.dropped",
-                abandoned_batches as f64,
-                &[("reason", "shutdown")],
-            );
-            telemetry.count(
-                "logit.component.events.dropped",
-                abandoned_events as f64,
-                &[("reason", "shutdown")],
+            count_shutdown_drop(
+                &telemetry,
+                &shutdown_dropped_batches,
+                abandoned_batches,
+                abandoned_events,
             );
             diag.warn(format_args!(
                 "{abandoned_batches} batch(es) ({abandoned_events} event(s)) never handed to \
@@ -618,9 +640,28 @@ async fn run_output(
         }
     }
 
-    finish_and_flush(&diag, &store, &telemetry, output.as_mut()).await;
+    finish_and_flush(&diag, &store, &telemetry, output.as_mut(), &shutdown_dropped_batches).await;
 
     write_result
+}
+
+/// How long `run_output`'s shutdown sweep waits on a closed inbox for upstream permit holders to
+/// send. A permit still unreleased past it is the same uncounted case [`REVOKE_DRAIN_TIMEOUT`]
+/// documents for a revoked Lua inbox.
+const SWEEP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Counts `batches` batches (`events` events) dropped for shutdown: the only site that counts
+/// `batches.dropped`/`events.dropped{reason="shutdown"}` and the only one that adds to
+/// `drain_total`, the sum the `drain complete` log reports (`run_with_telemetry`). Callers:
+/// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send, and
+/// [`revoke_lua_io`].
+fn count_shutdown_drop(telemetry: &Telemetry, drain_total: &AtomicU64, batches: u64, events: u64) {
+    if batches == 0 {
+        return;
+    }
+    drain_total.fetch_add(batches, std::sync::atomic::Ordering::Relaxed);
+    telemetry.count("logit.component.batches.dropped", batches as f64, &[("reason", "shutdown")]);
+    telemetry.count("logit.component.events.dropped", events as f64, &[("reason", "shutdown")]);
 }
 
 /// Moves every `Delivered` batch off `inbox` into `store` as fast as `store.push`'s bounds allow,
@@ -775,12 +816,20 @@ enum Delivery {
 /// a sink's own timeout (`InfluxDbOutput`'s 10 s HTTP timeout) can exceed the budget, which would
 /// otherwise go unenforced until that attempt gave up. A timeout is `Fault::Ambiguous` (the
 /// destination may have received the request), never `Permanent`.
+///
+/// `sending` is `true` only while an `output.send` call is in flight: set just before the
+/// attempt's await and cleared as soon as it returns, before classification and before any
+/// backoff sleep. So when [`write_loop`] drops this future for the shutdown grace, `true` means
+/// `send` was polled at least once and hadn't completed. Neither of the other ways the grace can
+/// win is a send in flight: a `select!` that never polled this future because the grace was
+/// already due, and a grace that lands during a backoff sleep.
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
     batch: &EventBatch,
     posture: DeliveryPosture,
     retry: &RetryConfig,
     telemetry: &Telemetry,
+    sending: &mut bool,
 ) -> Delivery {
     let deadline = tokio::time::Instant::now() + retry.total_budget;
     let mut attempt: u32 = 0;
@@ -788,7 +837,9 @@ async fn deliver_with_retry(
         attempt += 1;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let timer = telemetry.timer("logit.component.send.duration");
+        *sending = true;
         let result = tokio::time::timeout(remaining, output.send(batch)).await;
+        *sending = false;
         drop(timer);
 
         let err = match result {
@@ -841,12 +892,15 @@ fn fault_tag(fault: Fault) -> &'static str {
     }
 }
 
-/// Resolves `grace` after `shutdown` first fires, never before it fires.
+/// Resolves `grace` after the first poll that sees `shutdown` fired, never before it fires.
 ///
-/// `deadline` persists across calls (one per `write_loop` iteration), anchoring the window to the
-/// first signal rather than resetting per batch. It's set synchronously when `wait_for` resolves,
-/// so it sticks even if this call then loses a `select!` race and is dropped before its
-/// `sleep_until` completes; the next call waits out the remainder. Cancellation-safe.
+/// The deadline is anchored at that first poll after the signal, not at the signal instant.
+/// Every caller runs this under `tokio::task::unconstrained` in a `select!` it re-polls on each
+/// wake, which keeps that poll within one scheduling of the signal. `deadline` persists across
+/// calls (one per `write_loop` iteration), so the window is not reset per batch. It's set
+/// synchronously when `wait_for` resolves, so a call dropped after that poll (one that loses a
+/// `select!` race) keeps the anchor and the next call waits out the remainder. A call never
+/// polled after the signal anchors nothing. Cancellation-safe.
 async fn shutdown_grace_expired(
     shutdown: &mut watch::Receiver<bool>,
     deadline: &mut Option<tokio::time::Instant>,
@@ -875,19 +929,11 @@ async fn finish_and_flush(
     store: &SinkStore,
     telemetry: &Telemetry,
     output: &mut (dyn Output + Send),
+    shutdown_dropped: &AtomicU64,
 ) {
     let (dropped_batches, dropped_events) = store.finish().await;
     if dropped_batches > 0 {
-        telemetry.count(
-            "logit.component.batches.dropped",
-            dropped_batches as f64,
-            &[("reason", "shutdown")],
-        );
-        telemetry.count(
-            "logit.component.events.dropped",
-            dropped_events as f64,
-            &[("reason", "shutdown")],
-        );
+        count_shutdown_drop(telemetry, shutdown_dropped, dropped_batches, dropped_events);
         // Unthrottled: fires at most once per `run_output`.
         diag.warn(format_args!(
             "{dropped_batches} batch(es) ({dropped_events} event(s)) still queued when this sink \
@@ -913,6 +959,10 @@ async fn finish_and_flush(
 ///
 /// Never drains the queue or calls `output.flush()`; [`finish_and_flush`] does, and says why.
 /// Returns `Ok(())` when shutdown grace expires: an incomplete drain on shutdown isn't a failure.
+/// A send the grace cuts off mid-flight is `Fault::Ambiguous`, decided by [`is_retryable`]:
+/// under at-least-once it stays queued, under at-most-once it's committed and counted through
+/// [`count_shutdown_drop`] into `shutdown_dropped`
+/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 3).
 async fn write_loop(
     id: String,
     output: &mut (dyn Output + Send),
@@ -920,6 +970,7 @@ async fn write_loop(
     telemetry: Telemetry,
     write_config: WriteLoopConfig,
     mut shutdown: watch::Receiver<bool>,
+    shutdown_dropped: &AtomicU64,
 ) -> anyhow::Result<()> {
     let posture = write_config
         .delivery_override
@@ -942,14 +993,21 @@ async fn write_loop(
             Closed,
             ShutdownExpired,
         }
+        // Unbiased: `peek` reserves the head only in the poll that returns it, so whichever arm
+        // wins, nothing is left reserved here. `unconstrained` on the grace arm: `Sleep` and
+        // `wait_for` spend the task's coop budget, and a sibling that exhausts it on every poll
+        // would otherwise defer the deadline indefinitely. See `docs/design/pipeline-graph.md`'s
+        // "Cancellation points".
         let next = tokio::select! {
             batch = store.peek() => match batch {
                 Some((batch, ctx)) => NextBatch::Batch(batch, ctx),
                 None => NextBatch::Closed,
             },
-            () = shutdown_grace_expired(&mut shutdown, &mut shutdown_deadline, write_config.shutdown_grace) => {
-                NextBatch::ShutdownExpired
-            }
+            () = tokio::task::unconstrained(shutdown_grace_expired(
+                &mut shutdown,
+                &mut shutdown_deadline,
+                write_config.shutdown_grace,
+            )) => NextBatch::ShutdownExpired,
         };
         let (batch, ctx) = match next {
             NextBatch::Batch(batch, ctx) => (batch, ctx),
@@ -978,22 +1036,61 @@ async fn write_loop(
             Outcome(Delivery),
             ShutdownExpired,
         }
+        let mut sending = false;
+        // `biased`, deliver arm first: a send that completed in the same wake as the grace
+        // deadline is counted delivered, not cut off as ambiguous.
         let step = tokio::select! {
-            outcome = deliver_with_retry(output, &batch, posture, &write_config.retry, &telemetry) => {
-                DeliverStep::Outcome(outcome)
-            }
-            () = shutdown_grace_expired(&mut shutdown, &mut shutdown_deadline, write_config.shutdown_grace) => {
-                DeliverStep::ShutdownExpired
-            }
+            biased;
+            outcome = deliver_with_retry(
+                output,
+                &batch,
+                posture,
+                &write_config.retry,
+                &telemetry,
+                &mut sending,
+            ) => DeliverStep::Outcome(outcome),
+            () = tokio::task::unconstrained(shutdown_grace_expired(
+                &mut shutdown,
+                &mut shutdown_deadline,
+                write_config.shutdown_grace,
+            )) => DeliverStep::ShutdownExpired,
         };
         let outcome = match step {
             DeliverStep::Outcome(outcome) => outcome,
-            DeliverStep::ShutdownExpired => return Ok(()),
+            DeliverStep::ShutdownExpired => {
+                if sending {
+                    span.error();
+                    span.tag("fault", fault_tag(Fault::Ambiguous));
+                    if !is_retryable(Fault::Ambiguous, posture) {
+                        store.commit();
+                        count_shutdown_drop(
+                            &telemetry,
+                            shutdown_dropped,
+                            1,
+                            batch.events.len() as u64,
+                        );
+                        diag.warn(
+                            "a batch cut off mid-send at shutdown was dropped: the destination \
+                             may have taken it, and at-most-once delivery never replays it",
+                        );
+                    }
+                }
+                // Any head still reserved here is benign: `SinkStore::finish` commits and
+                // counts it for `Memory`, and persists the read cursor at it for `Disk`, so it
+                // replays on the next open.
+                return Ok(());
+            }
         };
 
         match outcome {
             Delivery::Delivered => {
                 store.commit();
+                telemetry.count("logit.component.batches.delivered", 1.0, &[]);
+                telemetry.count(
+                    "logit.component.events.delivered",
+                    batch.events.len() as f64,
+                    &[],
+                );
                 last_success = Some(tokio::time::Instant::now());
                 permanent_streak_since = None;
                 if degraded {
@@ -1484,6 +1581,7 @@ fn run_lua(
     heartbeat: Arc<Heartbeat>,
     max_memory: Option<usize>,
     telemetry: Telemetry,
+    shutdown_dropped: Arc<AtomicU64>,
     runtime: tokio::runtime::Handle,
 ) {
     let worker = match ScriptWorker::new(&script)
@@ -1533,11 +1631,14 @@ fn run_lua(
     // Dropped here, after a return or a panic alike, so the downstream cascade is underway
     // before `done_tx` reports. `None` already if the watcher revoked it. A loop that failed the
     // node left its inbox open with batches still queued, so those are swept and counted, as
-    // the watcher's revocation counts them.
+    // the watcher's revocation counts them. Counted `reason="shutdown"` although no signal
+    // preceded it: the node's failure is what starts the drain.
     let leftover = lock_io(&io).take();
     let failed = matches!(outcome, Ok(Err(_)));
     match leftover {
-        Some(io) if failed => sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry)),
+        Some(io) if failed => {
+            sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry, &shutdown_dropped))
+        }
         leftover => drop(leftover),
     }
     let panicked = outcome.is_err();
@@ -1597,7 +1698,8 @@ fn lock_io(io: &SharedLuaIo) -> std::sync::MutexGuard<'_, Option<LuaIo>> {
 const REVOKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Drops a wedged node's channels, counting what its inbox still held as
-/// `batches.dropped`/`events.dropped{reason="shutdown"}` under the node's own id, as `run_output`
+/// `batches.dropped`/`events.dropped{reason="shutdown"}` under the node's own id through
+/// [`count_shutdown_drop`], as `run_output`
 /// counts an abandoned sink inbox. Dropping a `Receiver` destroys its buffered batches, and no
 /// `Fanout` counts them: the upstream sends already succeeded.
 ///
@@ -1607,7 +1709,7 @@ const REVOKE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// until `recv` returns `None`, which it does once the buffer is empty and every permit is
 /// released. A permit still unreleased after [`REVOKE_DRAIN_TIMEOUT`] (its holder blocked on
 /// another consumer) stops the wait, and a batch it sends later is destroyed uncounted.
-async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry) {
+async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry, shutdown_dropped: &AtomicU64) {
     let LuaIo { mut inbox, fanout, target_fanouts } = io;
     drop((fanout, target_fanouts));
     inbox.close();
@@ -1620,14 +1722,7 @@ async fn revoke_lua_io(io: LuaIo, telemetry: &Telemetry) {
         }
     })
     .await;
-    if batches > 0 {
-        telemetry.count(
-            "logit.component.batches.dropped",
-            batches as f64,
-            &[("reason", "shutdown")],
-        );
-        telemetry.count("logit.component.events.dropped", events as f64, &[("reason", "shutdown")]);
-    }
+    count_shutdown_drop(telemetry, shutdown_dropped, batches, events);
 }
 
 /// A Lua node's `JoinSet` entry: waits on the thread's `done` report (see `run_lua`) and watches
@@ -1663,6 +1758,7 @@ async fn watch_lua_thread(
     readiness: Readiness,
     telemetry: Telemetry,
     mut diag: Diagnostics,
+    shutdown_dropped: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     // A quarter of the shorter threshold, so either verdict lands within 25% of its own bound.
     let period = (config.stall_after.min(config.shutdown_grace) / 4).max(Duration::from_millis(10));
@@ -1756,7 +1852,7 @@ async fn watch_lua_thread(
                     guard.take()
                 };
                 if let Some(io) = revoked {
-                    revoke_lua_io(io, &telemetry).await;
+                    revoke_lua_io(io, &telemetry, &shutdown_dropped).await;
                 }
                 let elapsed = now.duration_since(signalled);
                 return Err(anyhow::anyhow!(
@@ -4497,7 +4593,15 @@ mod tests {
         };
         tokio::time::timeout(
             Duration::from_secs(5),
-            write_loop("out".to_string(), &mut output, store, telemetry, write_config, shutdown_rx),
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                store,
+                telemetry,
+                write_config,
+                shutdown_rx,
+                &AtomicU64::new(0),
+            ),
         )
         .await
         .expect("write_loop should not hang")
@@ -4646,6 +4750,7 @@ mod tests {
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
+                &AtomicU64::new(0),
             )
             .await
         });
@@ -4720,6 +4825,7 @@ mod tests {
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
+                &AtomicU64::new(0),
             )
             .await
         });
@@ -4783,6 +4889,7 @@ mod tests {
                 telemetry,
                 WriteLoopConfig::default(),
                 shutdown_rx,
+                &AtomicU64::new(0),
             )
             .await
         });
@@ -4860,6 +4967,7 @@ mod tests {
                 telemetry,
                 write_config,
                 shutdown_rx,
+                &AtomicU64::new(0),
             )
             .await
         });
@@ -4920,6 +5028,7 @@ mod tests {
                 telemetry,
                 write_config,
                 shutdown_rx,
+                &AtomicU64::new(0),
             )
             .await
         });
@@ -4966,7 +5075,7 @@ mod tests {
             SinkStoreConfig::Memory(SinkQueueConfig::default()),
             write_config,
             shutdown_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         // Fails forever, so write_loop is mid-retry when shutdown fires.
@@ -5049,7 +5158,7 @@ mod tests {
             store_config,
             write_config,
             shutdown_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         // Batch 1: fills the queue's one slot and is reserved by the retry loop.
@@ -5179,7 +5288,7 @@ mod tests {
             store_config,
             write_config,
             shutdown_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         // Batch 1: fills the spool and is reserved by the retry loop.
@@ -5423,7 +5532,7 @@ mod tests {
                     }),
                     (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
                 };
-                let delivered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let delivered = Arc::new(AtomicU64::new(0));
                 let (delay, fail) = match path {
                     ExitPath::DrainFirst => (Duration::from_millis(10), None),
                     ExitPath::GraceExpiry => (Duration::from_millis(10), Some(Fault::Clean)),
@@ -5442,7 +5551,7 @@ mod tests {
                     store_config,
                     slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
                     shutdown_rx,
-                    Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
                 ));
 
                 for value in 1..=SENT {
@@ -5515,7 +5624,7 @@ mod tests {
         let output = PacedOutput {
             delay: Duration::from_millis(10),
             fail: Some(Fault::Clean),
-            delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            delivered: Arc::new(AtomicU64::new(0)),
         };
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -5528,7 +5637,7 @@ mod tests {
             SinkStoreConfig::Disk(disk_store_config(&dir, one_counter_record_len())),
             slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
             shutdown_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         inbox_tx.send(counter_batch(1.0)).await.unwrap();
@@ -5557,7 +5666,7 @@ mod tests {
         let output = PacedOutput {
             delay: Duration::from_millis(10),
             fail: Some(Fault::Clean),
-            delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            delivered: Arc::new(AtomicU64::new(0)),
         };
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -5570,7 +5679,7 @@ mod tests {
             SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
             slow_retry_write_config(Duration::from_secs(1), Duration::from_secs(5)),
             shutdown_rx,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         ));
         inbox_tx.send(counter_batch(1.0)).await.unwrap();
         inbox_tx.send(counter_batch(2.0)).await.unwrap();
@@ -6457,6 +6566,7 @@ mod tests {
             rig.readiness.clone(),
             telemetry,
             Diagnostics::new("enrich"),
+            Arc::new(AtomicU64::new(0)),
         ))
     }
 
@@ -8262,6 +8372,7 @@ mod tests {
             telemetry.clone(),
             WriteLoopConfig { retry: fast_retry_config(), ..WriteLoopConfig::default() },
             shutdown_rx,
+            &AtomicU64::new(0),
         )
         .await
         .expect("one permanent failure alone should not end write_loop");
@@ -8297,6 +8408,7 @@ mod tests {
             telemetry.clone(),
             WriteLoopConfig::default(),
             shutdown_rx,
+            &AtomicU64::new(0),
         )
         .await
         .expect("a successful delivery should not end write_loop with an error");
