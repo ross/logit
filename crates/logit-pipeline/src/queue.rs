@@ -8,8 +8,10 @@
 use crate::fanout::BatchContext;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::buffer::{Buffer, InMemoryBuffer, OverflowPolicy as DropPolicy, PushOutcome};
+use std::iter::Peekable;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::vec;
 use tokio::sync::Notify;
 
 /// What a [`BoundedQueue`] needs to know about an item: `weight`, read once at push time and
@@ -115,6 +117,68 @@ impl Default for SinkQueueConfig {
 impl From<SinkQueueConfig> for QueueConfig {
     fn from(c: SinkQueueConfig) -> Self {
         Self { max_items: c.max_batches, max_weight: c.max_bytes, overflow: c.overflow }
+    }
+}
+
+/// A `Vec`'s drain that, when dropped, counts every item it never yielded as dropped under
+/// `reason`: one `metrics.items_dropped` per item and its [`Queued::units`] as
+/// `metrics.units_dropped`. An item is either yielded, and the caller accounts for it, or still in
+/// the drain when it drops, so nothing is counted twice. Exhausting it disarms it: the drop then
+/// makes no telemetry call and allocates nothing.
+///
+/// `reason` is `"shutdown"` at every call site: the shutdown race and the grace backstop are the
+/// only production cancellers of a future that holds one.
+///
+/// The drop calls only `Telemetry::count`, never the queue lock. `Telemetry::count` takes its own
+/// buffer's lock, which is never held across an await or while a `CountedDrain` drops
+/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, "Alternatives considered").
+pub struct CountedDrain<'a, T: Queued> {
+    drain: Peekable<vec::Drain<'a, T>>,
+    telemetry: &'a Telemetry,
+    metrics: &'static QueueMetrics,
+    reason: &'static str,
+}
+
+impl<'a, T: Queued> CountedDrain<'a, T> {
+    /// Drains all of `items`. The `Vec` is empty, with its capacity intact, once this drops.
+    pub fn new(
+        items: &'a mut Vec<T>,
+        telemetry: &'a Telemetry,
+        metrics: &'static QueueMetrics,
+        reason: &'static str,
+    ) -> Self {
+        Self { drain: items.drain(..).peekable(), telemetry, metrics, reason }
+    }
+
+    /// The next item without yielding it. A peeked item that is never yielded is counted.
+    pub fn peek(&mut self) -> Option<&T> {
+        self.drain.peek()
+    }
+}
+
+impl<T: Queued> Iterator for CountedDrain<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.drain.next()
+    }
+}
+
+impl<T: Queued> Drop for CountedDrain<'_, T> {
+    fn drop(&mut self) {
+        // Iterates the `Peekable` itself: an item `peek` returned sits in its peeked slot, not in
+        // the inner `Drain`.
+        let mut items = 0u64;
+        let mut units = 0u64;
+        for item in self.drain.by_ref() {
+            items += 1;
+            units = units.saturating_add(item.units());
+        }
+        if items > 0 {
+            let tags = [("reason", self.reason)];
+            self.telemetry.count(self.metrics.items_dropped, items as f64, &tags);
+            self.telemetry.count(self.metrics.units_dropped, units as f64, &tags);
+        }
     }
 }
 
@@ -272,9 +336,10 @@ impl<T: Queued> BoundedQueue<T> {
     /// (`docs/adr/udp-intake-batching-and-socket-visibility.md`, "`push_many`/`pop_many` live on
     /// `BoundedQueue` itself").
     ///
-    /// `items` is always left empty with its capacity intact, including on cancellation (dropping
-    /// a `Drain` removes what it had not yielded). An empty `items` is a no-op: no lock, no
-    /// notification, no gauge update.
+    /// `items` is left empty with its capacity intact once the future has been polled, including
+    /// on cancellation (dropping the [`CountedDrain`] removes what it had not yielded). A future
+    /// dropped without ever being polled never touches `items`. An empty `items` is a no-op: no
+    /// lock, no notification, no gauge update.
     ///
     /// At most one `push_blocked` sample per call, spanning the first wait to the last, so one
     /// 5 ms stall stays distinguishable from 64 stalls of 78 µs.
@@ -289,11 +354,13 @@ impl<T: Queued> BoundedQueue<T> {
     /// stores nothing and would lose that race. Repeated permits collapse into one, so they are
     /// not extra wakeups.
     ///
-    /// **Cancellation drops the remainder uncounted.** A future dropped mid-call (the listener's
-    /// shutdown race) leaves the accepted prefix queued, accounted for, and already announced;
-    /// the unreached remainder is dropped with the `Drain` and not counted. Counting it would
-    /// need a `Drop` impl that locks the queue, for a loss bounded to one batch on the shutdown
-    /// path only (the ADR's "Cancellation of `push_many`" section).
+    /// **Cancellation counts the remainder.** A future dropped mid-call (the listener's shutdown
+    /// race, or the grace backstop) leaves the accepted prefix queued, accounted for, and already
+    /// announced. The [`CountedDrain`] counts the unreached remainder as
+    /// `items_dropped`/`units_dropped{reason="shutdown"}` as it drops, without the queue lock
+    /// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, decision 4). A future dropped
+    /// before its first poll has taken nothing out of `items`, so the caller still holds every
+    /// item and is the one that must count them.
     pub async fn push_many(&self, items: &mut Vec<T>) {
         if items.is_empty() {
             return;
@@ -304,7 +371,7 @@ impl<T: Queued> BoundedQueue<T> {
         // wait and keep evicted datagrams alive for it.
         let mut dropped: Vec<(&'static str, T)> = Vec::new();
         let (len, total_weight) = {
-            let mut drain = items.drain(..).peekable();
+            let mut drain = CountedDrain::new(items, &self.telemetry, self.metrics, "shutdown");
             // The head item's weight, computed once however many times the wait loop re-examines
             // it.
             let mut head_weight: Option<u64> = None;
@@ -371,7 +438,8 @@ impl<T: Queued> BoundedQueue<T> {
     }
 
     /// Removes and returns the head (`None` on an empty queue), clearing any reservation from
-    /// [`BoundedQueue::peek`], wakes a blocked `push`, and refreshes the gauges.
+    /// [`BoundedQueue::peek`], wakes a blocked `push`, and refreshes the gauges. After a `peek`,
+    /// this removes the peeked item only under `peek`'s one-consumer contract.
     pub fn commit(&self) -> Option<T> {
         let (item, len, weight) = {
             let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -481,8 +549,10 @@ impl<T: Queued> BoundedQueue<T> {
         self.not_full.notify_waiters();
     }
 
+    /// Saturating, as `InMemoryBuffer`'s own check is: `Queued::weight` is generic, and an
+    /// overflowing add would panic under the lock in debug builds or wrap to "fits" in release.
     fn would_overflow(&self, inner: &InMemoryBuffer<T>, weight: u64) -> bool {
-        inner.len() >= self.max_items || inner.weight() + weight > self.max_weight
+        inner.len() >= self.max_items || inner.weight().saturating_add(weight) > self.max_weight
     }
 
     fn count_dropped(&self, reason: &'static str, item: &T) {
@@ -497,6 +567,10 @@ impl<T: Queued> BoundedQueue<T> {
     /// `metrics.utilization` is `max(items ratio, bytes ratio)`: whichever bound is closer to
     /// tripping predicts the next block or drop. A zero bound reports a ratio of 0 rather than
     /// NaN or infinity.
+    ///
+    /// Runs after the lock is released, so under callers on parallel threads the last write can
+    /// carry an older state than the queue's. Benign in production: each queue's producer and
+    /// consumer halves run in one task, so their calls never overlap.
     fn update_gauges(&self, len: usize, weight: u64) {
         #[cfg(test)]
         self.gauge_updates.fetch_add(1, Ordering::Relaxed);
@@ -519,6 +593,12 @@ impl<T: Queued + Clone> BoundedQueue<T> {
     /// Awaits while the queue is empty and open; returns `None` once it is closed and empty,
     /// both checked under one lock so a racing `push` is either seen or left for the next
     /// iteration.
+    ///
+    /// **One consumer.** `peek` then `commit` removes the peeked item only if nothing else
+    /// removed items in between. Two `peek`/`commit` consumers, or one beside a `pop`/`pop_many`
+    /// consumer, deliver one item twice and lose the next: A peeks X, B's `pop_many` removes X,
+    /// and A's `commit` removes Y, which nobody delivered. Every production queue has one
+    /// consumer: a sink's `write_loop`, or a listener's decode loop.
     pub async fn peek(&self) -> Option<T> {
         loop {
             let notified = self.not_empty.notified();
@@ -647,6 +727,8 @@ mod tests {
     use super::*;
     use crate::fanout::TraceContext;
     use logit_core::{AttrMap, Event, Resource, Value};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     /// A batch carrying about `extra_bytes` of attribute payload, to force the byte bound without
@@ -1281,10 +1363,11 @@ mod tests {
         assert_eq!(drain_units(&q3), vec![20]);
     }
 
-    /// A cancelled `push_many` keeps its accepted prefix, drops the remainder uncounted, empties
-    /// the caller's `Vec`, and leaves the queue's accounting exact.
+    /// A cancelled `push_many` keeps its accepted prefix, counts the remainder as `shutdown` drops
+    /// with each item's own units, empties the caller's `Vec`, and leaves the queue's accounting
+    /// exact.
     #[tokio::test(start_paused = true)]
-    async fn a_cancelled_push_many_leaves_the_prefix_queued_the_vec_empty_and_accounting_exact() {
+    async fn a_cancelled_push_many_keeps_its_prefix_and_counts_its_remainder_as_shutdown_drops() {
         let (registry, q) = recording_queue(2, u64::MAX, OverflowPolicy::Block);
         let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4)]);
 
@@ -1293,17 +1376,24 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(1), &mut pushing)
                 .await
                 .expect_err("the queue holds 2 of 4 -- push_many must still be waiting");
-            // Dropping `pushing` drops the `Drain` holding items 3 and 4.
+            // Dropping `pushing` drops the `CountedDrain` holding items 3 and 4.
         }
 
         assert!(items.is_empty(), "the caller's Vec is emptied even by a cancellation");
         assert_eq!(drain_units(&q), vec![1, 2], "the accepted prefix stayed accepted");
 
         let events = registry.drain(0);
+        let shutdown = Some(("reason", "shutdown"));
+        assert_eq!(metric_sum(&events, TEST_METRICS.items_dropped, shutdown), 2.0);
+        assert_eq!(
+            metric_sum(&events, TEST_METRICS.units_dropped, shutdown),
+            3.0 + 4.0,
+            "each unreached item counts its own units()"
+        );
         assert_eq!(
             metric_sum(&events, TEST_METRICS.items_dropped, None),
-            0.0,
-            "the cancelled remainder is dropped uncounted -- deliberately, see the doc comment"
+            2.0,
+            "nothing else is counted: the prefix was admitted, not dropped"
         );
 
         // Exact accounting: once drained, the queue takes a full batch without evicting.
@@ -1318,10 +1408,119 @@ mod tests {
         let mut fresh = batch_of(&[(1, 9), (1, 8)]);
         q2.push_many(&mut fresh).await;
         assert_eq!(drain_units(&q2), vec![9, 8]);
+        let events2 = registry2.drain(0);
         assert_eq!(
-            metric_sum(&registry2.drain(0), TEST_METRICS.items_dropped, None),
+            metric_sum(&events2, TEST_METRICS.items_dropped, Some(("reason", "overflow_oldest"))),
             0.0,
             "a queue whose accounting leaked would have evicted to make room for these two"
+        );
+        assert_eq!(metric_sum(&events2, TEST_METRICS.items_dropped, shutdown), 1.0);
+    }
+
+    /// A `push_many` future dropped before its first poll has taken nothing: every item is still in
+    /// the caller's `Vec`, and nothing is counted. Counting what it holds is the caller's job.
+    #[tokio::test]
+    async fn a_push_many_never_polled_before_shutdown_leaves_every_item_in_the_callers_vec_uncounted(
+    ) {
+        let (registry, q) = recording_queue(2, u64::MAX, OverflowPolicy::Block);
+        let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4)]);
+
+        let pushing = q.push_many(&mut items);
+        drop(pushing);
+
+        assert_eq!(
+            items.iter().map(|i| i.units).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "an unpolled push_many leaves the caller's Vec intact"
+        );
+        assert!(q.commit().is_none(), "and queues nothing");
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(&events, TEST_METRICS.items_dropped, None),
+            0.0,
+            "and counts nothing: the caller still holds the items"
+        );
+        assert_eq!(q.gauge_updates(), 1, "only the commit above refreshed the gauges");
+    }
+
+    /// Weights summing past `u64::MAX` saturate, so committing them never underflows, and an empty
+    /// queue weighs 0: a `Block` push against it completes rather than waiting forever.
+    #[tokio::test]
+    async fn commit_after_saturated_weights_never_underflows_and_an_empty_queue_has_zero_weight() {
+        let q = test_queue(10, u64::MAX, OverflowPolicy::Block);
+        q.push(TestItem { weight: u64::MAX, units: 1 }).await;
+        q.push(TestItem { weight: 5, units: 2 }).await;
+        assert_eq!(q.commit().expect("should commit").units, 1);
+        assert_eq!(q.commit().expect("should commit").units, 2);
+        {
+            let inner = q.inner.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(inner.len(), 0);
+            assert_eq!(inner.weight(), 0, "len == 0 must mean weight == 0");
+        }
+        tokio::time::timeout(Duration::from_secs(5), q.push(TestItem { weight: 1, units: 3 }))
+            .await
+            .expect("a Block push against an empty queue must complete");
+        assert_eq!(drain_units(&q), vec![3]);
+    }
+
+    /// Near `u64::MAX`, `would_overflow` reports a full queue rather than wrapping to "fits".
+    #[tokio::test]
+    async fn would_overflow_saturates_rather_than_wrapping_near_u64_max() {
+        let (registry, q) = recording_queue(10, u64::MAX - 1, OverflowPolicy::DropNewest);
+        q.push(TestItem { weight: u64::MAX - 1, units: 1 }).await;
+        {
+            let inner = q.inner.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                q.would_overflow(&inner, 2),
+                "(u64::MAX - 1) + 2 wraps to 0 unchecked, which would read as room to spare"
+            );
+            assert!(!q.would_overflow(&inner, 0), "a weightless item still fits");
+        }
+        q.push(TestItem { weight: 2, units: 2 }).await;
+        assert_eq!(
+            drain_units(&q),
+            vec![1],
+            "the heavy item stays; the overflowing one is rejected"
+        );
+        assert_eq!(
+            metric_sum(
+                &registry.drain(0),
+                TEST_METRICS.items_dropped,
+                Some(("reason", "overflow_newest"))
+            ),
+            1.0
+        );
+    }
+
+    /// A `CountedDrain` counts what it never yielded, a peeked item included, and nothing for what
+    /// it yielded; an exhausted one records no point at all.
+    #[test]
+    fn counted_drain_counts_only_what_it_never_yielded() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("test", "input", "source");
+        let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4), (1, 5)]);
+        let capacity = items.capacity();
+        {
+            let mut drain = CountedDrain::new(&mut items, &telemetry, &TEST_METRICS, "shutdown");
+            assert_eq!(drain.next().map(|i| i.units), Some(1));
+            assert_eq!(drain.next().map(|i| i.units), Some(2));
+            assert_eq!(drain.peek().map(|i| i.units), Some(3), "peeked, not yielded");
+        }
+        assert!(items.is_empty());
+        assert_eq!(items.capacity(), capacity);
+        let events = registry.drain(0);
+        let shutdown = Some(("reason", "shutdown"));
+        assert_eq!(metric_sum(&events, TEST_METRICS.items_dropped, shutdown), 3.0);
+        assert_eq!(metric_sum(&events, TEST_METRICS.units_dropped, shutdown), 3.0 + 4.0 + 5.0);
+
+        let mut all = batch_of(&[(1, 1), (1, 2)]);
+        let yielded: Vec<u64> = CountedDrain::new(&mut all, &telemetry, &TEST_METRICS, "shutdown")
+            .map(|i| i.units)
+            .collect();
+        assert_eq!(yielded, vec![1, 2]);
+        assert!(
+            !recorded_point(&registry.drain(0), TEST_METRICS.items_dropped),
+            "an exhausted drain makes no telemetry call"
         );
     }
 
@@ -1418,6 +1617,43 @@ mod tests {
             "a notify_waiters() landing after a Notified is constructed but before it is first \
              polled must still wake it -- BoundedQueue::close's contract depends on this",
         );
+    }
+
+    /// Pins the tokio behavior every losing `select!` arm and `decode_loop`'s
+    /// `timeout(wait, pop_many)` rely on: a `notify_one` delivered to a registered `Notified` that
+    /// is then dropped without being polled again passes to the next waiter, or is stored as a
+    /// permit when there is none. A `Notified` that has already returned `Ready` has consumed its
+    /// permit, and dropping it passes nothing on.
+    #[test]
+    fn a_notify_one_delivered_to_a_registered_notified_that_is_dropped_unpolled_is_passed_on() {
+        let notify = Notify::new();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut first = std::pin::pin!(notify.notified());
+            assert!(first.as_mut().poll(&mut cx).is_pending(), "registers as a waiter");
+            notify.notify_one(); // delivered to `first`
+        } // dropped without another poll
+        let mut second = std::pin::pin!(notify.notified());
+        assert!(
+            second.as_mut().poll(&mut cx).is_ready(),
+            "the permit `first` was handed must reach the next Notified, or a losing select! arm \
+             swallows a wakeup"
+        );
+    }
+
+    /// Pins that `notify_one` with no waiter stores one permit, not a count: two calls wake one
+    /// later `Notified`, not two. The queues rely on repeated permits collapsing (see
+    /// `BoundedQueue::push_many`'s notification paragraph).
+    #[test]
+    fn a_notify_one_with_no_waiter_stores_one_permit_not_two() {
+        let notify = Notify::new();
+        notify.notify_one();
+        notify.notify_one();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut first = std::pin::pin!(notify.notified());
+        assert!(first.as_mut().poll(&mut cx).is_ready(), "one permit is stored");
+        let mut second = std::pin::pin!(notify.notified());
+        assert!(second.as_mut().poll(&mut cx).is_pending(), "and only one");
     }
 
     // -- The lost wakeup: a consumer parked before a blocking `push_many`. --
@@ -1826,6 +2062,199 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// `any_sequence_with_close_and_cancelled_calls_agrees_between_batched_and_single_calls`: the
+    /// exhaustive test above, extended with `Block`, `close()`, and cancellation. Every call is
+    /// polled once with a no-op waker and dropped if `Pending`, so where a call is cut off is
+    /// exact, or dropped before its first poll.
+    mod batched_vs_single {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Polling {
+            /// Polled once, then dropped if `Pending`.
+            Once,
+            /// Built and dropped without a poll.
+            Never,
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Push(u64, Polling),
+            PushMany(Vec<u64>, Polling),
+            Pop(Polling),
+            PopMany(usize, Polling),
+            Close,
+        }
+
+        fn poll_once<F: Future>(fut: F) -> Poll<F::Output> {
+            let mut fut = std::pin::pin!(fut);
+            fut.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        }
+
+        /// What one run observed, every item named by its unique `units`.
+        #[derive(Debug, PartialEq, Default)]
+        struct Run {
+            popped: Vec<u64>,
+            remaining: Vec<u64>,
+            /// Items a never-polled `push_many` left in the caller's `Vec`.
+            held_by_caller: Vec<u64>,
+            /// Single `push` calls that were never admitted.
+            cancelled_pushes: Vec<u64>,
+        }
+
+        /// Runs `ops`. `batched` picks `push_many`/`pop_many` or their single-item expansion. The
+        /// expansion of a `push_many` stops at the first `push` left `Pending`, and returns what it
+        /// never reached as `(items, units)`: the remainder a cancelled `push_many` counts itself.
+        fn run(q: &BoundedQueue<TestItem>, ops: &[Op], batched: bool) -> (Run, (f64, f64)) {
+            let mut next_unit = 1u64;
+            let mut item = |weight: u64| {
+                let item = TestItem { weight, units: next_unit };
+                next_unit += 1;
+                item
+            };
+            let mut out = Run::default();
+            let mut unreached = (0.0, 0.0);
+            for op in ops {
+                match op {
+                    Op::Push(weight, polling) => {
+                        let it = item(*weight);
+                        let units = it.units;
+                        let admitted = match polling {
+                            Polling::Once => poll_once(q.push(it)).is_ready(),
+                            Polling::Never => {
+                                drop(q.push(it));
+                                false
+                            }
+                        };
+                        if !admitted {
+                            out.cancelled_pushes.push(units);
+                        }
+                    }
+                    Op::PushMany(weights, polling) => {
+                        let mut items: Vec<TestItem> = weights.iter().map(|&w| item(w)).collect();
+                        match polling {
+                            Polling::Never => {
+                                drop(q.push_many(&mut items));
+                                out.held_by_caller.extend(items.iter().map(|i| i.units));
+                            }
+                            Polling::Once if batched => {
+                                let _ = poll_once(q.push_many(&mut items));
+                                assert!(items.is_empty(), "a polled push_many drains its Vec");
+                            }
+                            Polling::Once => {
+                                let mut rest = items.into_iter();
+                                for it in rest.by_ref() {
+                                    let units = it.units;
+                                    if poll_once(q.push(it)).is_pending() {
+                                        unreached.0 += 1.0;
+                                        unreached.1 += units as f64;
+                                        break;
+                                    }
+                                }
+                                for it in rest {
+                                    unreached.0 += 1.0;
+                                    unreached.1 += it.units as f64;
+                                }
+                            }
+                        }
+                    }
+                    Op::Pop(Polling::Once) => {
+                        if let Poll::Ready(Some(it)) = poll_once(q.pop()) {
+                            out.popped.push(it.units);
+                        }
+                    }
+                    Op::Pop(Polling::Never) | Op::PopMany(_, Polling::Never) => {}
+                    Op::PopMany(max, Polling::Once) if batched => {
+                        let mut got = Vec::new();
+                        match poll_once(q.pop_many(&mut got, *max)) {
+                            Poll::Ready(n) => assert_eq!(n, got.len()),
+                            Poll::Pending => assert!(got.is_empty(), "Pending removes nothing"),
+                        }
+                        out.popped.extend(got.into_iter().map(|i| i.units));
+                    }
+                    Op::PopMany(max, Polling::Once) => {
+                        for _ in 0..*max {
+                            match poll_once(q.pop()) {
+                                Poll::Ready(Some(it)) => out.popped.push(it.units),
+                                _ => break,
+                            }
+                        }
+                    }
+                    Op::Close => q.close(),
+                }
+            }
+            out.remaining = drain_units(q);
+            (out, unreached)
+        }
+
+        fn polling() -> impl Strategy<Value = Polling> {
+            prop_oneof![4 => Just(Polling::Once), 1 => Just(Polling::Never)]
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                4 => (0u64..=7, polling()).prop_map(|(w, p)| Op::Push(w, p)),
+                4 => (prop::collection::vec(0u64..=7, 2..=5), polling())
+                    .prop_map(|(ws, p)| Op::PushMany(ws, p)),
+                3 => polling().prop_map(Op::Pop),
+                3 => (2usize..=4, polling()).prop_map(|(k, p)| Op::PopMany(k, p)),
+                1 => Just(Op::Close),
+            ]
+        }
+
+        const POLICIES: [OverflowPolicy; 3] =
+            [OverflowPolicy::Block, OverflowPolicy::DropOldest, OverflowPolicy::DropNewest];
+        /// `(max_items, max_weight)`. Weights run 0..=7, so the last two shapes also see items
+        /// that can never fit.
+        const SHAPES: [(usize, u64); 3] = [(2, u64::MAX), (100, 4), (3, 6)];
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+            #[test]
+            fn any_sequence_with_close_and_cancelled_calls_agrees_between_batched_and_single_calls(
+                ops in prop::collection::vec(op(), 1..=24),
+                policy in 0usize..3,
+                shape in 0usize..3,
+            ) {
+                let overflow = POLICIES[policy];
+                let (max_items, max_weight) = SHAPES[shape];
+                let (r1, q1) = recording_queue(max_items, max_weight, overflow);
+                let (batched, batched_unreached) = run(&q1, &ops, true);
+                let (r2, q2) = recording_queue(max_items, max_weight, overflow);
+                let (single, single_unreached) = run(&q2, &ops, false);
+
+                prop_assert_eq!(&batched, &single, "{:?} under {:?}", ops, overflow);
+                prop_assert_eq!(batched_unreached, (0.0, 0.0));
+                let (e1, e2) = (r1.drain(0), r2.drain(0));
+                for reason in ["overflow_oldest", "overflow_newest"] {
+                    let tag = Some(("reason", reason));
+                    prop_assert_eq!(
+                        metric_sum(&e1, TEST_METRICS.items_dropped, tag),
+                        metric_sum(&e2, TEST_METRICS.items_dropped, tag),
+                        "{} item drops", reason
+                    );
+                    prop_assert_eq!(
+                        metric_sum(&e1, TEST_METRICS.units_dropped, tag),
+                        metric_sum(&e2, TEST_METRICS.units_dropped, tag),
+                        "{} unit drops", reason
+                    );
+                }
+                let shutdown = Some(("reason", "shutdown"));
+                prop_assert_eq!(
+                    (
+                        metric_sum(&e1, TEST_METRICS.items_dropped, shutdown),
+                        metric_sum(&e1, TEST_METRICS.units_dropped, shutdown),
+                    ),
+                    single_unreached,
+                    "a cancelled push_many counts what the single calls never reached"
+                );
+                prop_assert_eq!(metric_sum(&e2, TEST_METRICS.items_dropped, shutdown), 0.0);
             }
         }
     }
