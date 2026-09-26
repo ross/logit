@@ -1,13 +1,10 @@
 //! `Event.new(e:to_table())` is a fixed point over generated events, through the public API only.
 //!
 //! The generator covers every constructible payload: logs, the seven constructible metric kinds
-//! with exemplars, and spans with events and links. It leaves out what
-//! `docs/adr/lua-event-constructor.md`'s residual list says doesn't round-trip (the two sketch
-//! kinds and `gauge_delta`; `U64`, `Timestamp`, UTF-8 `Bytes`, an `I64` past ±2^53, and an
-//! integral `F64` among attribute values; a `Null` log message or span name; non-finite metric
-//! values; all-zero ids; a span ending before its event), plus a `Null` attribute or array
-//! element (`nil` in a table is an absent key) and an empty `Array` (`{}` reads back as `Map`).
-//! Counts draw from the full `u64` range, boundary values first.
+//! with exemplars, and spans with events and links. It leaves out the kinds the constructor
+//! refuses (the two sketches and `gauge_delta`) and every shape `docs/adr/lua-event-constructor.md`
+//! lists as not round-tripping: the "Residual, recorded rather than fixed" consequence and the
+//! count amendment. Counts draw from the full `u64` range, boundary values first.
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -25,8 +22,9 @@ use proptest::test_runner::{Config, TestCaseError, TestRunner};
 const MAX_EXACT: i64 = 1 << 53;
 
 /// A finite number a script reads back unchanged. mlua 0.9.9's LuaJIT conversion
-/// (`Lua::pop_value`'s `LUA_TNUMBER` arm) reads a number within `f64::EPSILON` of an integer as
-/// that integer, so a nonzero magnitude below `f64::EPSILON` reads back as `0`; left out here.
+/// (`Lua::pop_value`/`stack_value`) truncates toward zero with `num_traits::cast` and keeps the
+/// integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52` collapses to
+/// `0` (`1 - 2^-53` doesn't); those magnitudes are left out here.
 fn finite() -> impl Strategy<Value = f64> {
     prop_oneof![
         Just(0.0),

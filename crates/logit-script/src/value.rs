@@ -168,12 +168,19 @@ pub fn lua_to_value(value: LuaValue) -> mlua::Result<Value> {
 }
 
 /// Prefixes a [`lua_to_value`] error with the attribute it was converting for, as
-/// `<path>.<key>: <message>`, so a depth error names the write that raised it. Call it only on
-/// the error branch: it formats.
+/// `<path>.<key>: <message>`, so a depth error or a bad nested key names the write that raised
+/// it. Run the resource/scope relabel first, since it matches only `RuntimeError`. Call it only
+/// on the error branch: it formats.
 pub(crate) fn attribute_error(path: &str, key: &str, err: mlua::Error) -> mlua::Error {
+    prefixed_error(&format!("{path}.{key}"), err)
+}
+
+/// `err` as a `RuntimeError` reading `<prefix>: <message>`, whatever its variant: a nested key
+/// mlua can't read as a string is a `FromLuaConversionError`, and it needs the prefix too.
+pub(crate) fn prefixed_error(prefix: &str, err: mlua::Error) -> mlua::Error {
     match err {
-        mlua::Error::RuntimeError(msg) => mlua::Error::RuntimeError(format!("{path}.{key}: {msg}")),
-        other => other,
+        mlua::Error::RuntimeError(msg) => mlua::Error::RuntimeError(format!("{prefix}: {msg}")),
+        other => mlua::Error::RuntimeError(format!("{prefix}: {other}")),
     }
 }
 
@@ -452,6 +459,9 @@ mod depth_tests {
         assert!(err.contains("nested more than 128 levels deep"), "{err}");
     }
 
+    /// Pins the raw-read guarantee rather than reproducing a regression: `Table::get` consults
+    /// `__index` only for a nil raw value, and every index here is present, so this passes
+    /// whether the array branch reads with `get` or `raw_get`.
     #[test]
     fn an_array_tables_index_metamethod_never_fires_during_conversion() {
         let out = emitted(
@@ -478,6 +488,9 @@ mod depth_tests {
         );
     }
 
+    /// Pins the guarantee that conversion runs no script code while it builds the value, as
+    /// [`an_array_tables_index_metamethod_never_fires_during_conversion`] does; it doesn't
+    /// reproduce a regression.
     #[test]
     fn a_metamethod_that_writes_back_into_the_event_never_runs_during_an_attribute_write() {
         let out = emitted(
@@ -506,6 +519,30 @@ mod depth_tests {
         );
     }
 
+    /// A nested key mlua can't read as a string fails as a `FromLuaConversionError`, which gets
+    /// the attribute's prefix like any other conversion error.
+    #[test]
+    fn a_bad_key_inside_a_nested_attribute_table_names_the_attribute() {
+        let err = process_err(
+            r#"
+            function process(event)
+                event.attributes.x = {[true] = 1}
+                return event
+            end
+            "#,
+        );
+        assert!(err.contains("event.attributes.x: "), "{err}");
+
+        let err = process_err(
+            r#"
+            function process(event)
+                return Event.new{timestamp = "1", attributes = {x = {[true] = 1}}}
+            end
+            "#,
+        );
+        assert!(err.contains("Event.new: attributes.x: "), "{err}");
+    }
+
     #[test]
     fn a_resource_and_a_scope_attribute_write_get_the_same_cap() {
         let resource_err = process_err(&nest_and_assign(129, "resource.deep"));
@@ -519,9 +556,10 @@ mod depth_tests {
         assert!(scope_err.contains("nested more than 128 levels deep"), "{scope_err}");
     }
 
-    /// mlua 0.9.9 reads a LuaJIT number within `f64::EPSILON` of an integer as that integer, so
-    /// a tiny nonzero float written back is stored as `I64(0)`. A recorded residual
-    /// (`docs/adr/lua-event-constructor.md`'s count amendment); this pins it.
+    /// mlua 0.9.9's LuaJIT number read truncates toward zero (`num_traits::cast`) and keeps the
+    /// integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52` (and
+    /// `-0.0`) collapse to `0`: a tiny nonzero float written back is stored as `I64(0)`. A
+    /// recorded residual (`docs/adr/lua-event-constructor.md`'s count amendment); this pins it.
     #[test]
     fn a_float_below_epsilon_written_back_becomes_zero_a_recorded_residual() {
         let mut attrs = AttrMap::new();
