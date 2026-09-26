@@ -1133,7 +1133,11 @@ counts what it sent, so a native equality match has nothing further worth a coun
 | `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
 | `logit.transform.samples.non_finite_dropped` | count | `NaN` or infinite `Samples` values dropped while sketching, since they have no bin |
 | `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
-| `logit.transform.metrics.passed_through{reason}` | count | a metric record forwarded unmerged. `no_recorded_value`: an OTLP `NO_RECORDED_VALUE`-flagged record, which has no reading to fold into a series. `no_merge_rule`: a kind this stage doesn't merge (a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative). `kind_conflict`: its series holds another kind. `histogram_bounds_mismatch`: its bucket bounds differ from its series'. `non_finite`: a delta `Sum` whose value is `NaN` or infinite |
+| `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
+| `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
+| `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
+| `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
+| `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
 | `logit.transform.links.dropped{reason="cardinality"}` | count | contributing span contexts past the per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry |
 
 Series retention across the window boundary comes from
@@ -1146,9 +1150,10 @@ amendment.
 unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
 and `sample_rate_clamped` (mirroring the raw-retention counters); `kind_conflict` (a metric whose
 kind conflicts with an already-accumulating series under the same name/unit/tags, forwarded
-untouched); and `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
+untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
 accumulating series', also forwarded untouched, under its own key so an operator knows it's a
-producer that re-bucketed rather than two kinds colliding).
+producer that re-bucketed rather than two kinds colliding); and `sum_non_finite` (a delta `Sum`
+whose value is `NaN` or infinite, forwarded untouched).
 
 ##### `kv_metrics`
 
