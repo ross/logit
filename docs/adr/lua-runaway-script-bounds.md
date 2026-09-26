@@ -41,8 +41,13 @@ sources, found:
 - Lifetime tests cover a stashed `event`, `event.attributes`, and `event.metrics[i]` used in
   `flush()`, but not a stashed `event.log` or `event.span`, a stash from `process()` call N used in
   call N+1, returning the same handle twice, or `return {e}` beside a live alias to `e`.
-  `into_inner`'s `Err(rc)` clone fallback looks unreachable by analysis, but is silent if a path
-  ever reaches it.
+  `into_inner`'s `Err(rc)` clone fallback is reachable, not merely theoretical: `lua_newuserdata`
+  (used by `attrs_userdata`, `log_userdata`, `metrics_userdata`, and `span_userdata` alike) runs
+  `lj_gc_check`, which can run a script's `__gc` finalizer while the accessor's cache is still
+  unset, and a finalizer that reads the same sub-proxy fills the cache first. A probe script
+  (`newproxy(true)` with a re-armed `__gc`, `collectgarbage("setpause", 0)`/`setstepmul`) silently
+  cloned 14 of 20 returned events this way, with writes through the orphaned handle changing
+  nothing.
 - The sandbox exposes `coroutine` (registered by `luaopen_base` itself), `print` (writes to
   process stdout, which corrupts `stdio_out` on stdout and is fatal under `format: native`),
   `collectgarbage`, `newproxy`, and `gcinfo`. No test enumerates `_G`. `bit`, `jit`, `debug`,
@@ -109,10 +114,15 @@ sources, found:
    released before conversion runs, because a GC finalizer can run script code at any allocation
    point, conversion or not.
 6. **`print` goes to the self-log.** `ScriptWorker::new` replaces the global `print` with a Rust
-   closure that `tostring`s its arguments, joins them the way Lua's own `print` does, and emits a
-   `tracing::info!` line tagged with the component id. It never touches process stdout. A leftover
-   debug `print` is the accidental case this cluster's threat model names, and a self-log
-   line is more useful to an operator than corrupted `stdio_out` output.
+   closure that calls the script-visible global `tostring` on each argument in turn — so a
+   script's own `__tostring` metamethod or a redefined `tostring` renders the same way it would
+   under Lua's real `print` (`luaB_print`) — tab-joins the results, and emits a `tracing::info!`
+   line tagged with the component id. The id is shared with `with_component` through the same
+   `Rc<RefCell<String>>` the component's provenance state already uses, holding a placeholder
+   until `with_component` sets it (only top-level code during `.exec()` can print before then). It
+   never touches process stdout. A leftover debug `print` is the accidental case this cluster's
+   threat model names, and a self-log line is more useful to an operator than corrupted
+   `stdio_out` output.
 7. **`collectgarbage`, `setmetatable`, `newproxy`, and `coroutine` stay in the sandbox.** None of
    the four reaches the host filesystem, network, or process, and each has an ordinary use in a
    transform script (freeing memory early, building a read-only wrapper table, closing over a
@@ -121,6 +131,27 @@ sources, found:
    (`collectgarbage`), the depth cap (`setmetatable`-driven aliasing still converts through the
    same raw path), or is left as a documented non-goal below (`newproxy` and `coroutine`'s crafted
    cases).
+8. **A re-entrant `__gc` finalizer can't orphan a returned event's cache.** Every sub-proxy
+   accessor (`attrs_userdata`, `log_userdata`, `metrics_userdata`, `span_userdata`) re-checks its
+   cache immediately after `create_userdata`: if a finalizer that ran during that call's
+   `lj_gc_check` already filled the cache, the accessor takes the new userdata's proxy back out
+   and returns the cached one instead of overwriting it. One branch, so it is built rather than
+   left as a non-goal; `into_inner`'s `Err(rc)` arm keeps its `debug_assert!(false)` in a debug
+   build and its clone fallback in release, for whatever this doesn't catch.
+9. **The registry is expired on a schedule, not left to mlua.** mlua 0.9.9's `RegistryKey::drop`
+   only queues its id for reuse; the slot, and the `Rc<RefCell<Event>>` a sub-proxy handle holds
+   through it, stays live until `create_registry_value` reuses the id or `expire_registry_values`
+   runs. Left alone, that gap is bounded only by the size of the next GC batch and invisible to
+   `used_memory()`. `ScriptWorker::expire_registry_values` runs after each batch and each
+   `flush()`, and again before the full garbage collection that decides a `max_memory` verdict
+   (decision 3).
+10. **A malformed return value gets one wording, from the script's own name.** `take_event` on a
+    non-event userdata and `events_from_table`'s conversion error both report "process() must
+    return nil, an event, or a table of events; got …" (and the `flush()` analogue), rather than
+    two different messages for the same mistake. The script is loaded with
+    `Lua::load(source).set_name("=script")`, so a traceback cites the script, not a
+    `crates/logit-script/src/lib.rs` line. A script's own `pcall` still sees mlua's raw
+    destructed-userdata wording for a stale handle; documented, not changed.
 
 ## Alternatives considered
 
@@ -164,12 +195,12 @@ sources, found:
   in the PR that lands its artifact.
 - The following stay documented non-goals in `docs/known-gaps.md`, citing [ADR
   `deployment-threat-model`](deployment-threat-model.md): `collectgarbage("stop")` run from a
-  script defeats the memory cap's full-GC step; a `newproxy(true)` finalizer that touches a
-  stashed handle during collection is a crafted re-entrancy case, not an accidental one; a
-  no-allocation infinite loop (a pure numeric spin) is invisible to `max_memory`, which only the
-  heartbeat catches; and interner growth from script-derived strings (`Event.new`'s and the proxy
-  setters' `name`/`unit`/`description`/`event_name` fields, and nested attribute keys) is accepted
-  the way `telemetry`'s own tag values already are.
+  script defeats the memory cap's full-GC step; a no-allocation infinite loop (a pure numeric
+  spin) is invisible to `max_memory`, which only the heartbeat catches; and interner growth from
+  script-derived strings (`Event.new`'s and the proxy setters' `name`/`unit`/`description`/
+  `event_name` fields, and nested attribute keys) is accepted the way `telemetry`'s own tag values
+  already are. A `newproxy(true)` finalizer touching a stashed handle during collection is no
+  longer on this list: decision 8 defends it, because the defense is one branch.
 - A downstream `aggregate` window in flight when a Lua node wedges is not lost: revoking the
   wedged node's I/O (decision 2) closes every downstream inbox, so each downstream node drains on
   its own `shutdown_grace` the way it would on an ordinary shutdown, flushing its own window and

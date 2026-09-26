@@ -2135,12 +2135,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   wall-clock drain bound, an opt-in `max_memory` (off by default), and a 128-level table-depth cap
   on Lua-to-Rust conversion, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md)'s
   trusted-script bar. No instruction or time hook: LuaJIT's compiled traces skip a count hook
-  unless the runtime is built with `LUAJIT_ENABLE_CHECKHOOK`. Recorded non-goals, each needing a
-  crafted rather than an accidental script: `collectgarbage("stop")` defeats `max_memory`'s
-  full-GC step; a `newproxy(true)` finalizer touching a stashed handle during collection is
-  unguarded re-entrancy; a no-allocation infinite loop is caught only by the stall heartbeat; and
-  interner growth from script-derived strings (`Event.new`'s and the proxy setters'
-  name/unit/description fields, and nested attribute keys) is accepted like `telemetry`'s tags.
+  unless the runtime is built with `LUAJIT_ENABLE_CHECKHOOK`. A re-entrant `__gc` finalizer
+  orphaning a returned event's sub-proxy cache is defended (one branch), not a non-goal. Recorded
+  non-goals, each needing a crafted rather than an accidental script: `collectgarbage("stop")`
+  defeats `max_memory`'s full-GC step; a no-allocation infinite loop is caught only by the stall
+  heartbeat; and interner growth from script-derived strings (`Event.new`'s and the proxy
+  setters' name/unit/description fields, and nested attribute keys) is accepted like
+  `telemetry`'s tags.
 
 ## Internal telemetry and self-logging
 
