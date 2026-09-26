@@ -528,7 +528,7 @@ held series is accounted for were decided only in code and tests, and
 [`docs/design/data-model.md`](../design/data-model.md) stated none of it. The `agg` verification
 stream (`docs/plans/critical-sections-inventory.md`'s cluster 8) tests `aggregate` against a
 reference model, and a model needs a stated contract to check against. This amendment is that
-contract. Where the code doesn't meet it yet, the entry names the workstream that closes the gap.
+contract.
 
 ### Series identity
 
@@ -676,8 +676,8 @@ panic:
 
 `SetMembers` under `sets: members` stops its deduplicating union as soon as it passes
 `max_set_members_per_series`, and streams the held members and the rest of the record into the
-HyperLogLog. One oversized record then costs O(cap²) `contains` compares and cap-bounded memory,
-not its own size squared.
+HyperLogLog. The deduplicating scan makes at most `cap` compares per member, so one oversized
+record costs O(n·cap) compares and cap-bounded memory, not its own size squared.
 
 Graph rule 39 rejects every cap that can hold nothing:
 

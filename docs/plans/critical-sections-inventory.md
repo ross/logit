@@ -6303,7 +6303,7 @@ fixed:
 - Five diagnostic strings carried runs of spaces (#405).
 - Emitted records lost the series' `description` (#405).
 - Absorbed and most passed-through records had no counter (#405).
-- `links.dropped` shared a tag value with an unrelated cap (agg/w4).
+- `links.dropped` shared a tag value with an unrelated cap (#410).
 
 It also measured the `groups` scan: 137 ns per absorbed event at 1 group, 877 ns at 100, and
 8.6 µs at 1000, dominated by the scan from about 100 groups (#402). Open, each in

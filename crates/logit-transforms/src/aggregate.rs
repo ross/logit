@@ -137,7 +137,8 @@ impl ContributingContexts {
     }
 
     /// Consumes the tracked set into the `SpanLink`s `flush` pairs with this series' emitted
-    /// event, plus how many distinct contexts the cap rejected.
+    /// event, plus how many observations the cap rejected: one per observation of a context the
+    /// full set doesn't link, so a context seen in two batches counts twice.
     fn into_links(self) -> (Vec<SpanLink>, u64) {
         let links = self
             .seen
