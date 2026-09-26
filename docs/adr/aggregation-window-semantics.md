@@ -565,8 +565,10 @@ accumulator's bytes.
   value:
   - `Sum`: bit-equal for two records, because `f64` addition commutes; within `f64` rounding for
     three or more, because it doesn't associate.
-  - `Histogram` (cumulative mode): bucket counts equal (saturating add), and `sum`, `min`, and
-    `max` as the fold rules below define them.
+  - `Histogram` (cumulative mode): bucket counts equal (saturating add). `sum` is bit-equal for
+    two records and within `f64` rounding for three or more, because the accumulator starts at
+    `Some(0.0)` and adds one record at a time. `min`, `max`, and a `None` `sum` follow the fold
+    rules below.
   - Sketches (`Distribution`, and `Samples` under `distributions: sketch`), when every record
     shares one `DdSketch` mapping: bin counts, `count()`, `min`, and `max` equal, and `sum`
     within rounding.
@@ -581,13 +583,16 @@ accumulator's bytes.
 - **Associativity through a relay.** In `temporality: delta`, two `aggregate` stages in series
   (the first absorbs `a` and `b` and flushes, the second absorbs that output and `c`) emit a value
   equal, by the rules above, to what one stage absorbing `a`, `b`, and `c` emits. Two cases are
-  excluded:
+  excluded or limited:
   - Cumulative mode: a flushed cumulative record passes through a downstream `aggregate` by
     design.
-  - `Gauge` and `GaugeDelta`: `flush` stamps its output with the flush clock, so the downstream
-    stage's last-write-wins compares the relayed value at the first stage's `now` against `c`'s
-    source timestamp. A relay of gauges agrees with one stage only when every later record's
-    source timestamp exceeds the first stage's flush time.
+  - `Gauge`: `flush` stamps its output with the flush clock, so the downstream stage's
+    last-write-wins compares the relayed value at the first stage's `now` against `c`'s source
+    timestamp. A relay of gauges agrees with one stage when every upstream source timestamp is at
+    or below the first stage's flush `now` and every later record's is at or above it.
+  - `GaugeDelta` is excluded outright. A delta follows arrival order and never advances `at`, and
+    the first stage re-emits it as an absolute `Gauge` stamped `now`, which the downstream stage
+    then orders by timestamp.
 
 Some outcomes depend on order by design, and the stream pins them as examples rather than laws:
 
@@ -719,10 +724,12 @@ own allocation pins.
 **A re-created series' start time will lie between its previous incarnation's last point and its
 own first point (`agg/w3`).** `first_seen` becomes `max(event.timestamp, start of the window the
 series opened in)`, and a flushed `Sum` or `Histogram` carries `start_timestamp =
-min(first_seen, now)`. Both bounds are clocks `aggregate` already holds, so this costs no
-syscall. Today `first_seen` is the re-opening event's source timestamp, and the previous point
-carries the flush clock, so a consumer can see a new start earlier than the old point it
-replaces.
+min(first_seen, now)`. `Aggregator` keeps no window-start clock today, so `agg/w3` adds a field
+that records each flush's `now` as the next window's start; in the first window, before any
+flush, `first_seen` falls back to the event timestamp. Both bounds come from clocks the stage
+already sees, so this costs no syscall. Today `first_seen` is the re-opening event's source
+timestamp, and the previous point carries the flush clock, so a consumer can see a new start
+earlier than the old point it replaces.
 
 See `crates/logit-transforms/src/aggregate.rs`'s `SeriesKey`, `value_key_eq`, `scope_key_eq`,
 `group_for`, `fold_extreme`, and `Aggregator::flush` for the code this amendment describes, and

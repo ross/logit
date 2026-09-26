@@ -67,7 +67,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 21 | A `NaN` resource attribute opens a new `ResourceGroup` per metric, because `group_for` uses `Resource`'s derived `PartialEq` while `SeriesKey` and `scope_key_eq` compare floats bitwise: a quadratic scan, and every such metric emitted unaggregated | XFORM-01 | in-progress (agg/w1) |
 | 22 | Cardinality-cap ties among equally idle series fall in `HashMap` order, so a series updated every window is evicted at random once active series exceed `max_retained_series`; a cumulative series then restarts with a new `start_timestamp`. The fix breaks ties by a per-`Aggregator` monotonic open sequence number, newest evicted first | XFORM-03 | in-progress (agg/w3) |
 | 23 | A cumulative histogram's `min`/`max` fold (`fold_extreme`) keeps whichever side has a value, so a series can emit `min > max` when windows disagree on which extremes they carry | XFORM-02 | in-progress (agg/w2) |
-| 24 | A non-finite delta `Sum` (a statsd `1e308\|c\|@0.5` extrapolates to infinity) merges into a cumulative total and stays in it for the series' life | XFORM-04 | in-progress (agg/w2) |
+| 24 | A non-finite delta `Sum` (a statsd `1e308\|c\|@0.5` extrapolates to infinity) merges into a cumulative total and stays in it for the series' life | XFORM-02 | in-progress (agg/w2) |
 
 Repo-wide gaps that cut across entries:
 
