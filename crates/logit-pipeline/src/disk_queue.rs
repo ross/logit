@@ -526,6 +526,17 @@ struct HeadCache {
 }
 
 struct State {
+    /// Every tracked segment, oldest first, the active one at the back. Never empty: each
+    /// `expect("always at least one segment")` relies on it, and every lock site swallows poison,
+    /// so a panic there would leave each later caller on the same state. Each mutation site keeps
+    /// it non-empty:
+    ///
+    /// - [`DiskQueue::open`] pushes one entry per segment file, creating segment 0 if there is
+    ///   none, then pops the segments behind the cursor (`leaked`) off the front. That loop stops
+    ///   at `read_seq`, which the cursor clamp before it guarantees is a tracked segment.
+    /// - [`DiskQueue::rotate_segment`] pushes the new active segment onto the back.
+    /// - [`DiskQueue::roll_read_cursor`] removes only segments below the `read_seq` it moves to,
+    ///   which is itself tracked, so never the active segment.
     segments: VecDeque<Segment>,
     read_seq: u64,
     read_offset: u64,
@@ -559,6 +570,19 @@ struct State {
 
 /// A disk-backed sink queue. See the module doc for the on-disk layout and
 /// `docs/adr/disk-backed-sink-buffer.md` for the design decisions.
+///
+/// **One producer and one consumer, polled from one task.** Two operations check under one lock
+/// acquisition and act under another:
+///
+/// - [`DiskQueue::commit`] takes `head_cache`, then advances the cursor.
+/// - `evict_oldest` re-checks the head is unreserved, then advances the cursor.
+///
+/// Neither has an `.await` in that gap, and `run_output` polls the producer (`drain_inbox`) and
+/// the consumer (`write_loop`) as two futures in one task, so the other side never runs inside
+/// it. With the two sides on separate tasks, an `evict_oldest` inside `commit`'s gap could count a
+/// record already delivered as evicted and move the cursor past the next one, and a `peek` inside
+/// `evict_oldest`'s gap could reserve a record the eviction then advances past, delivering it
+/// and counting it dropped.
 pub struct DiskQueue {
     dir: PathBuf,
     max_bytes: u64,
@@ -700,6 +724,7 @@ impl DiskQueue {
         while segments.front().is_some_and(|s| s.seq < read_seq) {
             leaked.extend(segments.pop_front().map(|s| s.seq));
         }
+        debug_assert!(!segments.is_empty(), "`read_seq` is always a tracked segment");
 
         // Replay count: walk every record from the resume point to the end of the spool.
         {
@@ -1431,6 +1456,7 @@ impl DiskQueue {
                     }
                 }
             }
+            debug_assert!(!state.segments.is_empty(), "a roll never removes the active segment");
         }
 
         let seq = state.read_seq;
@@ -3759,6 +3785,32 @@ mod tests {
             let delivered = drain_all(&reopened).await;
             assert_no_loss(&delivered, &["a", "b", "c"], &["swept"], "reopen");
         });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A make-room rotation whose create fails with no file left behind leaves the push nothing
+    /// to wait on: no consumer has anything to consume. Under `Block` it writes over the bound
+    /// rather than parking forever.
+    #[tokio::test]
+    async fn a_block_push_whose_make_room_rotation_fails_writes_over_bound_rather_than_parking() {
+        let dir = scratch_dir("block-make-room-fails");
+        let (q, registry) = consumed_full_spool(&dir, OverflowPolicy::Block).await;
+        let scope = fault::scope(&dir);
+        scope.fail_nth(SEGMENT_CREATE, 1, errno::EIO);
+
+        tokio::time::timeout(Duration::from_secs(5), q.push((batch("d"), ctx())))
+            .await
+            .expect("a push whose make-room rotation failed must not park");
+
+        let events = registry.drain(0);
+        assert_eq!(metric_sum(&events, DISK_ERRORS, Some(("op", "create"))), 1.0);
+        assert_eq!(
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, None),
+            0.0,
+            "the batch is written, not dropped"
+        );
+        drop(scope);
+        assert_eq!(drain_all(&q).await, vec!["d"], "and readable");
         std::fs::remove_dir_all(&dir).ok();
     }
 
