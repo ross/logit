@@ -243,7 +243,21 @@ sources, found:
 
 Filled in as each workstream lands.
 
-- `luab/w1` (CORE-17, CORE-18): pending.
+- `luab/w1` (CORE-17, CORE-18): #385. `crates/logit-script/src/value.rs`'s `depth_tests`
+  (`a_table_nested_128_deep_converts`, `a_table_nested_129_deep_is_an_error_naming_the_cap`,
+  `a_self_referencing_table_is_the_depth_error_not_a_stack_overflow`,
+  `a_self_referencing_array_is_the_depth_error`,
+  `an_array_tables_index_metamethod_never_fires_during_conversion`,
+  `a_metamethod_that_writes_back_into_the_event_never_runs_during_an_attribute_write`,
+  `a_resource_and_a_scope_attribute_write_get_the_same_cap`); `construct.rs`'s
+  `event_new_with_a_cyclic_attribute_table_is_a_clear_error`,
+  `event_new_with_a_nested_metatable_array_reads_raw`, and
+  `a_count_above_two_to_the_53_round_trips_through_to_table`; `proxy.rs`'s
+  `a_metric_count_above_two_to_the_53_reads_as_a_decimal_string`; and
+  `crates/logit-script/tests/event_new_fixed_point.rs`
+  (`event_new_of_to_table_is_a_fixed_point_over_generated_events`,
+  `a_fixed_point_event_survives_two_round_trips`). Both self-reference tests aborted the test
+  process before the cap existed.
 - `luab/w2` (CORE-16, CORE-15 sandbox half): pending.
 - `luab/w3` (RT-11, CORE-15 limits half): pending.
 - `luab/w4` (CORE-15 close, `max_memory`): pending.
