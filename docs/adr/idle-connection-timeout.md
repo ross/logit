@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-25
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -284,3 +284,56 @@ comment.
   doing its job rather than something to investigate.
 - No new crate dependency: `Notify`, `poll_fn`, `ReadBuf`, `Instant::checked_add`/`far_future`, and
   `BodyExt::frame` are all already in the dependency tree the workstreams above build on.
+
+## Amendment: the wait-out loop and the per-frame stall bound are the contract (2026-09-25)
+
+A review of the remote-reachable listeners against
+[ADR `untrusted-input-bounds`](untrusted-input-bounds.md) confirmed two properties of this ADR and
+kept both:
+
+- `drive_with_idle`'s wait for an in-flight request has no ceiling. A request blocked in
+  `Fanout::send` is backpressure, which question 1 of this ADR's Context rules out treating as
+  idleness, and the request's body read is bounded by the stall timeout on its own.
+- The body stall bound is per frame (per `read` on `logit_in`), not a total deadline, and it is
+  `idle_timeout` itself, so it exists only when `idle_timeout` is set. With `idle_timeout` unset,
+  the default, a stalled or dribbled body is unbounded in time. With it set, a peer that sends one
+  byte per frame slightly under the bound holds a connection permit for up to
+  `MAX_REQUEST_BYTES × idle_timeout` on an HTTP listener, and `max_frame_bytes × idle_timeout` on
+  `logit_in`. A total deadline was declined because a slow link sending a large legitimate body
+  looks the same. The cost is recorded under "TLS and connection lifecycle" in
+  [`docs/known-gaps.md`](../known-gaps.md#tls-and-connection-lifecycle).
+
+## Amendment: the hyper derivation re-run, and one claim corrected (2026-09-25)
+
+The close sequence in "`otlp_in`: a service-level in-flight tracker" depends on hyper internals,
+so it was derived again from the pinned sources (hyper 1.11.1, hyper-util 0.1.20, h2 0.4.19) and
+each claim checked with a test against a real socket:
+
+| Claim | Result |
+|---|---|
+| The h1 server polls the socket mid-message (`mid_message_detect_eof`'s `force_io_read`) | Holds |
+| `graceful_shutdown` closes a `KA::Idle` h1 connection at once (`disable_keep_alive` calls `state.close()`) | Holds |
+| A fresh h1 connection stopped mid-head is `KA::Busy` and keeps waiting after `graceful_shutdown` | Holds; it spends the grace |
+| An h2 connection still handshaking only sets `close_pending` | Holds; it spends the grace |
+| An established h2 connection gets `GOAWAY` | Holds |
+| `header_read_timeout` re-arms across idle keep-alive gaps | Holds |
+| hyper-util's pre-sniff `ReadVersion` is one of the cases the grace exists for | **Corrected.** `graceful_shutdown` cancels it, and the first grace poll resolves at once to `Err("Cancelled")`. It never spends the grace; it is the reason the post-shutdown result is discarded |
+| A pipelined h1 client, or an h2 client opening streams, can hold the wait-out loop open while silent | Retired. Requests pipelined inside the grace are served one at a time and the connection then closes; only being served extends the window |
+
+Two findings came out of the same review, both fixed in the shared listener code:
+
+- **A body read held one hyper buffer per read.** On h1, each body frame is a slice of the
+  connection's read buffer, and hyper allocates a fresh buffer behind it while the frame is
+  alive. `collect_with_stall_bound` kept every frame until the body ended, so a 4 MiB body
+  arriving one MSS per read held about 23 MiB. It now copies every frame after the first into one
+  growing buffer.
+- **A client that closes mid-send cancels the handler.** On h1 an EOF drops hyper's service
+  future, and on h2 an `RST_STREAM` or a dropped connection cancels the stream's task. A handler
+  parked in `Fanout::send` on its second consumer then leaves the first holding the batch, and
+  the client's retry duplicates it there. `otlp_in` and `prometheus_in`'s receiver now run a
+  request's sends on a task of their own and await it, so a closing client cancels only the wait
+  and every consumer gets every batch; the retry then duplicates on every branch alike, the
+  ordinary at-least-once outcome. Reserving every consumer first was rejected: without a deadline,
+  senders holding one consumer's slots while waiting on another deadlock a diamond graph
+  (`logit_pipeline::fanout`'s module doc). The wait-out loop's contract is unchanged: a handler
+  blocked forever in a send holds its connection and permit, as the amendment above records.

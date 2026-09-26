@@ -105,9 +105,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   names are interned, never values, so the usual cardinality explosion (host, request id, user
   agent, path) never touches it. What's left is a real metric name that never repeats: a user who
   embedded an id in a metric name. That namespace is user-controlled, not attacker-controlled,
-  because `logit`'s listeners are private by deployment shape ([OVERVIEW.md](OVERVIEW.md)); the
-  anti-pattern is well known; and `logit` isn't what breaks first. The metric store fails well
-  before (a million distinct measurement names is a million-plus series, against 94 MB here), and
+  because `logit`'s listeners are private by deployment shape
+  ([ADR `deployment-threat-model`](adr/deployment-threat-model.md)); the anti-pattern is well
+  known; and `logit` isn't what breaks first. The metric store fails well before (a million
+  distinct measurement names is a million-plus series, against 94 MB here), and
   even inside `logit`, `aggregate`'s window costs ~600 bytes per series *per window* against the
   interner's ~94 bytes once — ~6× harder, sooner, and already mitigated by putting `keep` in front
   of it.
@@ -143,6 +144,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     recommends `keep` in front of `otlp_in` specifically, beyond the general
     `aggregate`-cardinality recommendation
     [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml) demonstrates.
+  - **`logit_in`'s native dictionary.** `crates/logit-proto/src/native/dict.rs`'s `Dict::read`
+    interns every dictionary string a `logit_in` peer sends before the rest of the batch
+    validates, so its strings stay in the interner, including from a batch the decoder then
+    rejects; not defended, per the threat model in
+    [ADR `deployment-threat-model`](adr/deployment-threat-model.md). Nothing budgets dictionary
+    strings across frames. The per-frame bound is the dictionary entry cap and the frame size; the
+    process-lifetime bound is the same premise as every other feeder: `logit_in`'s peers are other
+    `logit` processes the operator runs.
   - **`flatten` adds no new bound, by design** (`crates/logit-transforms/src/flatten.rs`,
     [ADR `flatten-transform`](adr/flatten-transform.md)). Its marginal exposure over
     `json`/`syslog_in`/`otlp_in`: path *combinations* of already-interned keys (a product, bounded by
@@ -170,9 +179,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   the already-rounded capacity as `serde::de::SeqAccess::size_hint` for the members list (so the
   first allocation is the size the crate settles on), and bounds the claimed member count before
   allocating at all. Full mechanism: `HyperLogLog`'s and `HllBytesReader`'s doc comments (same file);
-  pinning test: `hyperloglog_round_trips_non_power_of_two_member_counts`. Pinned to
+  pinning tests: `hyperloglog_round_trips_non_power_of_two_member_counts`, which Miri fails on a
+  regressed size hint only under `-Zmiri-disable-stacked-borrows -Zmiri-permissive-provenance`
+  (`script/unsafe-check miri` passes both), and
+  `a_members_vec_deserialized_through_the_hll_reader_has_the_capacity_upstream_frees`, which pins
+  serde's `Vec` preallocation on stable. Pinned to
   `cardinality-estimator` 1.0.3; the upstream fix would be `into_boxed_slice`/`shrink_to_fit` in
   `Array::from_vec`, so the freed layout always matches the `Vec`'s capacity by construction.
+- **A decoded sketch's or HyperLogLog's summary fields are taken as written**
+  (`crates/logit-core/src/sketch.rs`'s module doc, `HyperLogLog::from_bytes`). `from_bytes`
+  bounds what a blob can allocate or make later operations cost, and rejects a zero-register
+  count past the register count, but trusts the rest of a peer's summary: a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md) (accidental data from private
+  peers), and [ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md) adds a check only
+  where it is free and would catch an accident. None of these panics:
+  - A `DdSketch` with `min > max` answers non-monotonic quantiles.
+  - A `DdSketch` with an infinite or `NaN` `min` or `max` hands it to `quantile`'s clamp, so a
+    decoded sketch can answer `±∞`.
+  - A `DdSketch` with a `count` of 0 over populated bins is skipped by `merge`, which returns
+    early on an empty incoming sketch.
+  - A `HyperLogLog` whose harmonic sum (`data[1]`) is wrong estimates wrong: the sum is an `f32`
+    accumulated per register update, so recomputing it on decode wouldn't reproduce the bytes.
 - ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ **Closed, both halves.**
   - **Real implementation** ([`docs/plans/lossless-transit.md`](plans/lossless-transit.md)):
     `HyperLogLog` (`crates/logit-core/src/metric.rs`) wraps the `cardinality-estimator` crate —
@@ -273,14 +300,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **An OTLP passthrough codec.** Whether the native protocol should carry OTLP-encoded payloads
     unmodified (a relay forwarding OTLP without re-encoding into native) is an open question in
     `docs/design/wire-protocol.md`'s "Open question" section.
-  - **`cargo-fuzz` targets over the decoders.** `crates/logit-proto/tests/robustness.rs`'s seeded
-    mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the ground a
-    corpus-driven fuzzer would, but `cargo-fuzz` needs nightly Rust, and the dev toolchain is
-    stable-only (`docs/adr/containerized-development.md`), so fuzz targets are deferred.
-    [ADR `out-of-ci-unsafe-verification`](adr/out-of-ci-unsafe-verification.md)'s throwaway
-    nightly image serves a different, narrower need (miri/`cargo-careful`/fault injection over the
-    raw-`libc` `unsafe`) and defers `cargo-fuzz` again in its "Alternatives considered". Closing
-    this gap still means writing `cargo-fuzz` targets, not just pointing them at that image.
+  - ~~**`cargo-fuzz` targets over the decoders.**~~ **Closed (2026-09-25).** `fuzz/` holds
+    `cargo-fuzz` targets over the native, sketch, HyperLogLog, OTLP, and Prometheus remote-write
+    decoders, built in the `tools/unsafe-check` nightly image and run by hand with
+    `script/unsafe-check fuzz <target>` or `fuzz-all`, never in CI. A crash lands as a stable
+    regression test in the owning crate. [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md) has
+    the design and the campaign record.
+  - **Nothing builds `fuzz/` in `script/check` or CI.** `fuzz/` is its own cargo workspace, so a
+    signature change in `logit-proto` or `logit-core` breaks the targets without failing any
+    check, and the break shows only at the next campaign's `cargo fuzz build`. #370's decode-budget
+    argument broke both native batch targets this way. See
+    [ADR `out-of-ci-fuzzing`](adr/out-of-ci-fuzzing.md). **Revisit:** add a
+    `cargo check --manifest-path fuzz/Cargo.toml` step to `script/check` if it works on the stable
+    toolchain (`libfuzzer-sys` compiles on stable; only `cargo fuzz run` needs nightly), or else a
+    build step in the nightly image, run by hand.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable.** Graph
     validation's rule 17 rejects a `receive:` block on both (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace`. Both use that grace:
@@ -316,6 +349,25 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     idle-connection timeout on a TCP listener" under
     [TLS and connection lifecycle](#tls-and-connection-lifecycle)), not by this pre-message bound.
 
+- **A native attribute map with keys in descending dictionary order inserts in quadratic time.**
+  `read_attr_map` inserts each key into `AttrMap`'s sorted storage (`AttrMap::insert_sym`, a
+  binary search and a `Vec::insert`) as it reads it, so a map whose keys arrive in descending order
+  of the receiver's interned symbols shifts every earlier entry on each insert. Measured
+  2026-09-25: 80,000 keys take 3.4 s in descending order against 20 ms ascending. Real maps are far
+  too small for this to show ([`docs/design/data-shapes.md`](design/data-shapes.md)); only a map
+  with tens of thousands of keys in the worst order pays it. A non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): the fix (collect, then sort
+  once) changes the ordinary decode path for a shape only crafted input produces.
+- **The native decode budget bounds only what arrives over `logit_in`.** The `buffer.disk:` spool
+  decodes its records with no budget (`parse_record` in `crates/logit-pipeline/src/disk_queue.rs`),
+  because each spooled batch was already that size in memory when `DiskQueue::push` wrote it, and
+  a budget refusal there would discard the batch as corrupt. `NativeDecoder` (the `Decoder` seam)
+  uses the 256 MiB default. See [`docs/design/wire-protocol.md`](design/wire-protocol.md)'s
+  "Decode amplification". A sender learns only `max_frame_bytes` from `HelloAck`, not the budget,
+  so a stock `logit_out` batch between roughly 10% and 100% of the cap can be refused; the
+  refusal is deterministic, `logit_in` answers it with `REJECT_FRAME_TOO_LARGE` (#372) so the
+  sender drops the batch as permanent and diagnoses it rather than retrying, and the operator's
+  fix is the sender's batching.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
@@ -632,6 +684,51 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   reconnect for the next request, never a lost response or batch. A silent peer can't exploit this:
   with nothing in flight the drop still happens at the end of the grace, and a stalled body is
   bounded by the per-frame stall timeout.
+- **A stalled or dribbled body holds a connection permit, without bound unless `idle_timeout` is
+  set.** A body read's only time bound is a per-frame stall bound (per `read` on `logit_in`), and
+  that bound is the listener's `idle_timeout`, which is off by default. With `idle_timeout` unset,
+  a peer that stops sending mid-body, or sends one byte at a time, holds its request and its
+  connection permit indefinitely. With it set, a peer that sends one byte per frame, each slightly
+  under `idle_timeout`, holds them for up to `MAX_REQUEST_BYTES × idle_timeout` per request on an
+  HTTP listener (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`,
+  `datadog_trace_in`) and up to `max_frame_bytes × idle_timeout` per frame on `logit_in`. With
+  enough connections, such a peer can hold the connection cap. A documented cost of the per-frame
+  design, not a bug, and a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): a total body deadline was
+  declined because a slow link sending a large legitimate body looks the same
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md),
+  [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendment).
+  **Revisit trigger:** a listener exposed to untrusted networks, where a total deadline, a minimum
+  transfer rate, or a per-peer connection cap is worth the false positives.
+- **`logit_in`'s `idle_timeout` bounds reads only; a blocked write is bounded by
+  `handshake_timeout`.** `idle_timeout` can't reach a write that a peer has stopped reading, so
+  `logit_in` writes every `HelloAck`, `Ack`, and `Reject` (`GOING_AWAY` included) within
+  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded writes").
+  A peer that sends frames but never reads its `Ack`s is disconnected once the listener's send
+  buffer fills and one `Ack` write stalls for `handshake_timeout`
+  (`logit.proto.errors{reason="ack_write_stalled"}`). The cost is one knob covering two waits: an
+  operator who raises `handshake_timeout` for slow TLS handshakes also lengthens how long a wedged
+  peer holds its connection slot. A conforming `logit_out` never trips the bound: it keeps one
+  frame in flight, so at most one unread `Ack` sits in its receive buffer, even while it's paused.
+  A separate write timeout was not added. **Revisit trigger:** an operator who needs the two waits set apart.
+- **No per-listener in-flight byte budget on the HTTP listeners.** Each hyper listener
+  (`otlp_in`, `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`) caps
+  concurrent connections and, per connection, concurrent streams (hyper's default of 200, pinned),
+  so its worst case is
+  `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 × MAX_REQUEST_BYTES`: 1024 × 200 × 2 ×
+  4 MiB = 1.6 TiB for `otlp_in`, which is why this is a follow-up and not a fix. The stream cap
+  bounds one factor of that product, not the product. A budget over the bytes held in request
+  bodies across a listener (a semaphore acquired per body chunk) would bound the product directly.
+  Recorded as a follow-up, not built: it changes how every HTTP listener reads a body
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)'s "Alternatives considered"), and
+  the concurrent large requests it guards against are a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit trigger:** a public
+  listener, or an operator seeing memory pressure from concurrent large requests.
+- **A request handler blocked forever in a `Fanout` send holds its connection and permit.** A
+  handler parked on a full downstream is backpressure, not idleness, so neither `idle_timeout` nor
+  the grace after it closes the connection; it ends when the send completes or the client goes
+  away ([ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)'s 2026-09-25 amendments).
+  By design: closing it would drop a batch that never reached the fanout.
 
 ## Cross-protocol mappings
 
@@ -1068,6 +1165,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
     pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
     believing it helps.
+- **`datadog_out` drops a sketch that would encode as more than 2^20 `k`/`n` entries**
+  (`MAX_DOGSKETCH_ENTRIES`, `crates/logit-proto/src/datadog/sketches.rs`), counted
+  `logit.output.metrics.skipped{reason="oversized_sketch"}` with diag `oversized_sketch`, rather
+  than splitting each bin's count into `uint16` entries without bound; it takes per-bin counts of
+  millions (a statsd sample-rate typo extrapolated through `aggregate`) across many bins, and
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md) treats that as an accident to
+  bound, not data to scale down ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)
+  has the rule).
 - **`datadog_out` reports a connect failure `Clean` after an earlier request of the same batch
   succeeded.** One `send` is up to eight routes' requests, and `crate::http`'s
   `classify_reqwest_error` makes any connect failure `Fault::Clean`. `write_loop` retries `Clean`
@@ -1349,10 +1454,23 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **An OTLP/JSON request costs more peak memory per byte than a same-sized protobuf one, under the
   same `MAX_REQUEST_BYTES` cap.** The JSON path parses into a `serde_json::Value` tree
   (`crates/logit-proto/src/otlp/json/`) first, one `Map`/`Vec`/`String`/`Number` allocation per
-  node, where `prost::Message::decode` builds the target structs directly. The bound still holds:
-  `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
-  worst case across all connections is a finite multiple of the existing 4 GiB figure, but no one
-  has measured the multiplier. **Revisit:** profile it before OTLP/JSON sees production volume.
+  node, where `prost::Message::decode` builds the target structs directly. Measured 2026-09-25 as
+  peak live heap bytes per input byte, debug build:
+  - Ordinary OTLP/JSON structure (`testdata/interop/otlp/logs.json`, a real SDK export): about 19.
+    The same batch as protobuf: about 17.
+  - Crafted input, a body of tiny `{"":0}` objects under a key OTLP doesn't define, which
+    serde_json builds in full and the decoder then ignores: about 98, at both 1 MiB and 4 MiB. At
+    4 MiB that is about 400 MiB for one request.
+
+  `crates/logit-proto/tests/robustness.rs`'s `otlp_json_peak_memory_per_input_byte_is_documented`
+  asserts ceilings of 24 and 128 over these two shapes, so a change that moves either ratio fails
+  a test before this entry drifts. The bound still holds: `MAX_CONCURRENT_CONNECTIONS`'s doc
+  comment (`crates/logit-inputs/src/otlp.rs`) states the worst case across all connections is a
+  finite multiple of the protobuf path's 1.6 TiB, itself a bound rather than a memory budget
+  (`MAX_CONCURRENT_STREAMS` in `crates/logit-inputs/src/http.rs` has the formula). No cap and no streaming parser are added: the
+  98× shape needs crafted input, a non-goal under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:** if
+  an OTLP listener ever faces an untrusted network.
 - **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
   close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
   about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
@@ -1367,6 +1485,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
   raced a close; it counts `send_failed` lines but can't force the race.
+- **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
+  (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
+  and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper, and
+  relays as 2262-04-11T23:47:16.854775807Z, not the original. It is listed under [ADR
+  `lossless-transit`](adr/lossless-transit.md)'s "Permitted normalizations"
+  ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md) has the rule).
 - ~~**`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON**~~ **Closed.** `otlp_in`
   (`crates/logit-inputs/src/otlp.rs`) accepts `Content-Type: application/json` alongside protobuf
   on the HTTP transport, through a hand-written dialect layer (`crates/logit-proto/src/otlp/json/`)
@@ -1502,9 +1626,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `X-Prometheus-Remote-Write-Samples-Written` header, and a counter disagreeing with that header
   would have no right answer. A mode tag was considered and not added: the modes are already told
   apart by which of `logit.input.scrapes`/`logit.input.writes` the component reports.
-- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.** `Fanout::send`
-  silently skips a closed consumer (counted `logit.component.events.dropped{reason=
-  "closed_consumer"}`, `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
+- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**
+  `Fanout::send`, which the receiver's delivery task calls, silently skips a closed consumer (counted
+  `logit.component.events.dropped{reason="closed_consumer"}`,
+  `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
   the `Fanout` *before* building the response — `otlp_in`'s ordering, which lets channel
   backpressure throttle the sender's queue. So during a shutdown that has already torn down the
   downstream half of the graph, a sender gets `204` (and, on 2.0, a non-zero `Samples-Written`) for

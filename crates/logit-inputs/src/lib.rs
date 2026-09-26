@@ -21,6 +21,7 @@ pub mod generate;
 pub mod graphite;
 mod http;
 pub mod internal;
+mod listener;
 pub mod logit;
 pub mod otlp;
 pub mod prometheus;

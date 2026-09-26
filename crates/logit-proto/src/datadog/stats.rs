@@ -90,6 +90,7 @@ pub const RESOURCE_ATTR_STATS_SPLIT_PAYLOAD: &str = "datadog.stats.split_payload
 /// The bin limit a decoded stats sketch keeps: the Agent's `LogCollapsingLowestDenseDDSketch(0.01,
 /// 2048)` (`pkg/trace/stats/statsraw.go`).
 pub const STATS_BIN_LIMIT: u32 = 2048;
+const _: () = assert!(STATS_BIN_LIMIT <= Mapping::MAX_BIN_LIMIT);
 
 /// Every per-group string field's attribute, mapped to its wire field by [`group_string_mut`].
 /// Written when non-empty on decode, read back as `Str` on encode. `ATTR_SERVICE_NAME` /

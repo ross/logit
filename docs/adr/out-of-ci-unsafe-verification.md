@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-09-21
+updated: 2026-09-25
 ---
 
 # Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change
@@ -154,6 +154,12 @@ this repo's own dev box needed `--cap-add SYS_PTRACE` alone, with no `seccomp=un
 Real output, wall-clock times, and any workarounds are recorded in the `libc/w0` PR description
 rather than duplicated here — this ADR is the decision record, not the run log.
 
+**Re-run at the remote-reachable crash/DoS stack's tip (2026-09-25, `d04a494`):** `miri` passed
+all six `MIRI_TARGETS` entries with their per-entry flags in 904 s (`parse_events` 20 tests,
+`batch_reader_helpers` 6, `reply_parsing` 4, `hyperloglog` 13, `hll_` 5, `sketch::tests` 27), and
+`inject-all` ran all seven `INJECT_SCENARIOS` in 116 s, each with the shape its EXPECT line
+states: four pass and three fail on their closed fanout after one injected call.
+
 ## Consequences
 
 - A new, throwaway, non-default image (`tools/unsafe-check/Dockerfile`) and script
@@ -182,3 +188,61 @@ rather than duplicated here — this ADR is the decision record, not the run log
   reviewed value to bump, the same way `docs/adr/committed-pregenerated-otlp-protobuf.md` treats
   regenerating the OTLP bindings — not something to float to `nightly` for convenience, which would
   make "miri passed" stop meaning the same thing run to run.
+
+## Amendment: the image also hosts `cargo-fuzz` (2026-09-25)
+
+[ADR `out-of-ci-fuzzing`](out-of-ci-fuzzing.md) installs a pinned `cargo-fuzz` in
+`tools/unsafe-check/Dockerfile`, adds `llvm` for ASan's symbolizer, and adds `fuzz`, `fuzz-all`,
+`fuzz-tmin`, and `fuzz-seed` to `script/unsafe-check`. That supersedes the "`cargo-fuzz` over these same call sites" deferral under
+"Alternatives considered": the fuzz targets now exist, over the native, sketch, OTLP, and
+Prometheus decoders rather than this ADR's `libc` surface. The nightly pin, the plain `docker run`,
+and the separate cargo-home volume are unchanged. Fuzz builds get their own target volume,
+`logit_fuzz_target`, because sanitizer `RUSTFLAGS` would invalidate every miri and careful
+artifact in `logit_unsafe_check_target`. `MIRI_TARGETS` also gains the `HyperLogLog` fuzz
+regressions, because AddressSanitizer can't see the wrong-`Layout` deallocation that codec guards
+against and Miri can.
+
+## Amendment: Sketch and HyperLogLog targets (2026-09-25)
+
+`MIRI_TARGETS` entries now carry their own Miri flags, as `"<package>|<libtest args>|<extra
+MIRIFLAGS>"`, because the `logit-core` sketch targets can't run under the defaults.
+
+- **`HyperLogLog` (`hyperloglog`, `hll_`) runs with `-Zmiri-disable-stacked-borrows
+  -Zmiri-permissive-provenance`.** `cardinality-estimator` 1.0.3 stores its heap pointer in a
+  tagged `usize` and casts it back (`array.rs`, `hyperloglog.rs`). Under the default Stacked
+  Borrows, and under Tree Borrows ("retag from <wildcard>"), Miri stops inside upstream before
+  any assertion in our tests runs. With both aliasing models off and permissive provenance, the
+  tests run and Miri still checks allocation layouts. The negative control confirms this: with
+  `validate_members_len` returning the unrounded length as the size hint,
+  `hyperloglog_round_trips_non_power_of_two_member_counts` fails with "incorrect layout on
+  deallocation: alloc has size 24 and alignment 4, but gave size 16 and alignment 4". So these
+  flags give up aliasing checks of upstream's pointer tagging, which we can't fix, and keep the
+  `Layout` check the codec exists for.
+- **`DdSketch` (`sketch::tests`) runs with `-Zmiri-deterministic-floats`.** Miri perturbs float
+  results by default, so two calls to `Mapping::agent()` can derive different `gamma_ln` or bias
+  values, and structural equality tests fail for a reason no real build shows.
+- **Proptest `properties` modules are skipped** (`--skip properties`). They run minutes each
+  under Miri at proptest's default case count and touch no `unsafe`. The libtest arguments in a
+  `MIRI_TARGETS` entry are word-split so an entry can carry `--skip`.
+
+## Amendment: accept-error inject scenarios (2026-09-25)
+
+ADR [`untrusted-input-bounds`](untrusted-input-bounds.md) makes every input accept loop classify an
+`accept()` error instead of propagating it. `script/unsafe-check`'s `INJECT_SCENARIOS` gains four
+`accept4` scenarios that force the classifier's branches on a real listener, because no in-process
+test can make `accept4` return `EBADF` on a working socket. The code they exercise
+(`classify_accept_error` and `absorb_accept_error` in `crates/logit-inputs/src/listener.rs`) is
+safe Rust, a departure from this ADR's raw-`libc` surface in the same way the `cargo-fuzz`
+amendment's decoder targets are one: the image hosts them because it already has the tool that
+reaches them. They were run on the dev box with `--cap-add SYS_PTRACE` alone:
+
+| Scenario | Spec | Test | Observed |
+|---|---|---|---|
+| `tcp-accept-emfile` | `accept4:error=EMFILE:when=1` | `a_plaintext_connection_round_trips_a_decoded_frame` | Passes in 0.11 s. The strace shows the injected `accept4`, then a second `accept4` that returns the connection after the 100 ms backoff, then `EAGAIN` as the loop parks. |
+| `logit-accept-emfile` | `accept4:error=EMFILE:when=1` | `a_v2_clients_provenance_is_relayed_untouched` | Passes in 0.11 s, with the same three `accept4` calls on `logit_in`'s loop. |
+| `tcp-accept-eperm` | `accept4:error=EPERM:when=1` | `a_plaintext_connection_round_trips_a_decoded_frame` | Passes in 0.11 s: the injected `EPERM`, then a second `accept4` that returns the connection after the 100 ms backoff. A seccomp or LSM refusal leaves the connection queued, so an immediate retry would spin. |
+| `tcp-accept-ebadf` | `accept4:error=EBADF:when=1` | `a_plaintext_connection_round_trips_a_decoded_frame` | Fails in under 10 ms with `the fanout should not have closed`. The strace shows one injected `accept4` and no second: the listener returns the error and ends rather than retrying. |
+
+An `EMFILE` or `EPERM` scenario that fails, or an `EBADF` scenario that shows repeated `accept4`
+calls, means the classification in `crates/logit-inputs/src/listener.rs`
+(`classify_accept_error`) regressed.

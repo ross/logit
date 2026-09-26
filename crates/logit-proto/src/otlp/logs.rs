@@ -217,9 +217,9 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
     let message = record.body.map(common::any_value_to_value).unwrap_or(Value::Null);
     // 0 means "unknown", not the epoch (module doc).
     let timestamp = if record.time_unix_nano != 0 {
-        record.time_unix_nano as i64
+        common::wire_nanos(record.time_unix_nano)
     } else {
-        record.observed_time_unix_nano as i64
+        common::wire_nanos(record.observed_time_unix_nano)
     };
     // `LOG_RECORD_FLAGS_TRACE_FLAGS_MASK`: the low 8 bits are the W3C trace flags, the rest is
     // reserved. A malformed id degrades to `None` (module doc).
@@ -236,7 +236,7 @@ pub(crate) fn decode_log_record(record: pb::LogRecord, mut attrs: AttrMap) -> Ev
             body_format,
             trace,
             event_name,
-            observed_timestamp: record.observed_time_unix_nano as i64,
+            observed_timestamp: common::wire_nanos(record.observed_time_unix_nano),
             dropped_attributes_count: record.dropped_attributes_count,
         },
     )
@@ -330,7 +330,7 @@ mod tests {
         );
         let encoded = encode_log_record(&event, event.log.as_ref().unwrap());
         assert!(
-            encoded.observed_time_unix_nano as i64 >= before,
+            common::wire_nanos(encoded.observed_time_unix_nano) >= before,
             "observed_time_unix_nano should be stamped with the current wall clock, not left at 0"
         );
     }

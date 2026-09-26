@@ -18,8 +18,25 @@
 //! shutdown (`docs/adr/service-lifecycle-and-output-retry.md`) needs nothing to outlive the
 //! listener's future. So each connection races its wait for the next frame header against a clone
 //! of [`Input::run_until_shutdown`]'s `shutdown` receiver, and once idle at a frame boundary sends
-//! `Reject{GOING_AWAY}` and closes. A frame whose header has arrived always finishes: the
-//! `select!` is re-evaluated only between frames.
+//! `Reject{GOING_AWAY}` and closes. A frame whose header this listener has finished reading always
+//! finishes: the `select!` is re-evaluated only between frames. A frame still in the socket
+//! buffer, or partly read into the header, when shutdown fires is answered `GOING_AWAY` and never
+//! forwarded.
+//!
+//! *`GOING_AWAY` and forwarding exclude each other.* Every `Reject` this listener writes (the
+//! past-the-cap one, the handshake's, the loop-top and `select!` shutdown arms, an idle close, and
+//! `FRAME_TOO_LARGE`) goes out before the frame it answers reaches `send_relayed`; after
+//! `send_relayed` the only write is that frame's `Ack`. So a `logit_out` that gets `GOING_AWAY`
+//! in place of an `Ack` knows the batch never landed, and resends it at any delivery posture.
+//!
+//! **Bounded writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`, including
+//! `GOING_AWAY`) finishes within `handshake_timeout` or is abandoned ([`write_control`]). A peer
+//! that sends frames but never reads its `Ack`s fills this side's send buffer; unbounded, the
+//! blocked write would hold the task, its permit, and its [`Fanout`] clone, and so the
+//! shutdown, for as long as the peer stayed connected. `idle_timeout` bounds reads only and can't
+//! reach a blocked write. A stalled `Ack` ends the connection as an error, counted as
+//! `logit.proto.errors{reason="ack_write_stalled"}`; a stalled `Reject` is abandoned, since the
+//! connection is closing anyway, and counted as `reason="reject_write_stalled"`.
 //!
 //! **Connection limit.** A non-blocking `try_acquire_owned` against the same 1024-connection cap
 //! `otlp_in` ([`crate::otlp::MAX_CONCURRENT_CONNECTIONS`]) and `syslog_in`'s driver use: past the
@@ -43,6 +60,8 @@
 //! **Idle timeout.** [`LogitInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds
 //! how long a handshaken connection may stay quiet before this listener closes it and returns its
 //! permit (`docs/adr/idle-connection-timeout.md`). It's a rolling deadline, not a per-phase one.
+//! It bounds reads only; a write blocked on a peer that stopped reading is `handshake_timeout`'s
+//! ("Bounded writes" above).
 //!
 //! *Measured from the last `Ack` written* (or from the handshake, before any frame), never from
 //! the last frame read. A peer waiting for an `Ack` is not idle: a slow downstream is delaying
@@ -74,7 +93,6 @@ use logit_proto::frame::{self, Compression, FrameHeader};
 use logit_proto::native::{self, control};
 use logit_proto::CodecError;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -215,7 +233,7 @@ impl Input for LogitInput {
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let max_frame_bytes = self.max_frame_bytes;
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
@@ -224,10 +242,29 @@ impl Input for LogitInput {
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
 
+        let mut accept_diag = self.diag.clone();
+
         loop {
-            let (stream, _peer) = tokio::select! {
-                accepted = accept_queue.accept(&listener) => accepted?,
+            let accepted = tokio::select! {
+                accepted = accept_queue.accept(&listener) => accepted,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
+            };
+            let (stream, _peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // `biased`, absorb first: the error is counted before shutdown can win, and a
+                    // stopping listener doesn't wait out the backoff.
+                    tokio::select! {
+                        biased;
+                        absorbed = crate::listener::absorb_accept_error(
+                            err,
+                            &self.telemetry,
+                            &mut accept_diag,
+                        ) => absorbed?,
+                        _ = shutdown.wait_for(|&due| due) => return Ok(()),
+                    }
+                    continue;
+                }
             };
 
             // `None` means past the cap. `reject_or_serve` writes the reject, after the TLS wrap
@@ -292,7 +329,23 @@ impl Input for LogitInput {
                 // or timed-out TLS accept, a cap reject that failed to write) is never fatal to
                 // the listener; only `accept` failing above is.
                 if let Err(err) = result {
-                    diag.warn_throttled("connection_error", err);
+                    match err.downcast_ref::<CodecError>() {
+                        Some(CodecError::BudgetExceeded { limit }) => {
+                            diag.warn_throttled(
+                                "decode_budget",
+                                format_args!(
+                                    "closing a connection whose batch decodes past its \
+                                     {limit}-byte budget ({}x max_frame_bytes of \
+                                     {max_frame_bytes}); the sender's batches are too large \
+                                     for this listener: {err:#}",
+                                    native::budget::DECODE_BUDGET_PER_FRAME_BYTE
+                                ),
+                            );
+                        }
+                        _ => {
+                            diag.warn_throttled("connection_error", err);
+                        }
+                    }
                 }
             });
         }
@@ -313,23 +366,19 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     shutdown: watch::Receiver<bool>,
-    live_connections: Arc<AtomicI64>,
+    live_connections: crate::listener::LiveConnections,
 ) -> anyhow::Result<()> {
     let Some(_permit) = permit else {
         let reject = control::Reject {
             code: control::REJECT_INTERNAL,
             message: "connection limit reached, retry later".to_string(),
         };
-        return write_control(&mut stream, &reject).await;
+        return write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
     };
 
-    // Published from the read-modify-write's own return value, not a separate `load`:
-    // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add and a load
-    // could leave a stale value published until the next transition.
-    let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-    telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-    let result = serve_connection(
+    // Counted out on drop, so a panic in the connection brings the gauge back down too.
+    let _live = live_connections.enter();
+    serve_connection(
         stream,
         sink,
         telemetry.clone(),
@@ -338,12 +387,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         idle_timeout,
         shutdown,
     )
-    .await;
-
-    let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-    telemetry.gauge("logit.input.connections", live as f64, &[]);
-
-    result
+    .await
 }
 
 /// What the handshake negotiated for one connection.
@@ -370,13 +414,19 @@ fn codec_tag(codec: u8) -> &'static str {
     }
 }
 
+/// The `logit.proto.errors` reason for a batch that failed to decode.
+fn decode_error_reason(err: &CodecError) -> &'static str {
+    match err {
+        CodecError::BudgetExceeded { .. } => "decode_budget",
+        _ => "magic",
+    }
+}
+
 /// Serves one accepted (and, with TLS on, already TLS-handshaken) connection to completion:
 /// `Hello`/`HelloAck`, then frame, `Fanout::send`, `Ack`, until close, shutdown, or idle close.
 ///
-/// `logit.proto.errors{reason}`: `handshake` (the handshake failed), `too_large` (a header
-/// declared more than `max_frame_bytes`), `truncated` (the body read hit EOF or an I/O error),
-/// `crc`, `codec` (a frame not under the negotiated codec), `magic` (any other malformed frame, or
-/// an undecodable batch). A close or error mid-header is not counted.
+/// Counts every rejection under `logit.proto.errors{reason}`; `docs/design/internal-telemetry.md`'s
+/// `logit_in` section is the canonical list of reasons. A close or error mid-header is not counted.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     sink: Fanout,
@@ -386,13 +436,14 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     idle_timeout: Option<Duration>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let negotiated = match handshake(&mut stream, max_frame_bytes, handshake_timeout).await {
-        Ok(n) => n,
-        Err(err) => {
-            telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
-            return Err(err);
-        }
-    };
+    let negotiated =
+        match handshake(&mut stream, max_frame_bytes, handshake_timeout, &telemetry).await {
+            Ok(n) => n,
+            Err(err) => {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
+                return Err(err);
+            }
+        };
     let compression = compression_tag(negotiated.compression);
 
     // The idle clock starts at the handshake; after this, only an `Ack` write advances it.
@@ -406,7 +457,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // hasn't observed. The `borrow()` `Ref` drops at the end of the statement, before any
         // `.await`.
         if *shutdown.borrow() {
-            going_away(&mut stream, "listener shutting down").await;
+            going_away(&mut stream, "listener shutting down", handshake_timeout, &telemetry).await;
             return Ok(());
         }
         // `changed()`, not `wait_for`: `wait_for`'s `Ref` guard makes the `select!` future
@@ -420,13 +471,13 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 match result {
                     Ok(header_buf) => header_buf,
                     Err(HeaderReadError::Idle(idle)) => {
-                        return close_idle(&mut stream, &telemetry, idle).await
+                        return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
                     }
                     Err(err) => return Err(err.into_inner()),
                 }
             }
             _ = shutdown.changed() => {
-                going_away(&mut stream, "listener shutting down").await;
+                going_away(&mut stream, "listener shutting down", handshake_timeout, &telemetry).await;
                 return Ok(());
             }
         };
@@ -441,10 +492,17 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 // A stalled body is an idle close like a gap between frames: policy, not a
                 // fault, so no `logit.proto.errors`.
                 Err(FrameReadError::Stalled(idle)) => {
-                    return close_idle(&mut stream, &telemetry, idle).await
+                    return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
                 }
+                // Answered before the close, so the peer sees a permanent refusal rather than an
+                // EOF it can't tell from a crash. Nothing of the body has been read.
                 Err(FrameReadError::TooLarge(err)) => {
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", "too_large")]);
+                    let reject = control::Reject {
+                        code: control::REJECT_FRAME_TOO_LARGE,
+                        message: err.to_string(),
+                    };
+                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
                     return Err(err);
                 }
                 Err(FrameReadError::Truncated(err)) => {
@@ -474,17 +532,35 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             );
         }
 
-        let (batch, provenance) = if negotiated.codec == native::CODEC_NATIVE_V2 {
-            native::decode_batch_v2(&mut payload).map_err(|err| {
-                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
-                anyhow::Error::new(err).context("decoding a native v2 batch")
-            })?
+        // A fresh budget per frame, scaled to the cap this peer's frames arrive under.
+        let budget = native::DecodeBudget::for_frame_cap(max_frame_bytes);
+        let decoded = if negotiated.codec == native::CODEC_NATIVE_V2 {
+            native::decode_batch_v2(&mut payload, &budget)
+                .map_err(|err| (err, "decoding a native v2 batch"))
         } else {
-            let batch = native::decode_batch(&mut payload).map_err(|err| {
-                telemetry.count("logit.proto.errors", 1.0, &[("reason", "magic")]);
-                anyhow::Error::new(err).context("decoding a native batch")
-            })?;
-            (batch, Provenance::default())
+            native::decode_batch(&mut payload, &budget)
+                .map(|batch| (batch, Provenance::default()))
+                .map_err(|err| (err, "decoding a native batch"))
+        };
+        let (batch, provenance) = match decoded {
+            Ok(decoded) => decoded,
+            Err((err, what)) => {
+                telemetry.count(
+                    "logit.proto.errors",
+                    1.0,
+                    &[("reason", decode_error_reason(&err))],
+                );
+                // A batch past its budget would be past it on every resend, so it's answered as
+                // a frame too large: a `logit_out` drops it as permanent rather than retrying.
+                if matches!(err, CodecError::BudgetExceeded { .. }) {
+                    let reject = control::Reject {
+                        code: control::REJECT_FRAME_TOO_LARGE,
+                        message: err.to_string(),
+                    };
+                    let _ = write_reject(&mut stream, &reject, handshake_timeout, &telemetry).await;
+                }
+                return Err(anyhow::Error::new(err).context(what));
+            }
         };
 
         telemetry.count(
@@ -510,7 +586,15 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         // `seq` is implicit: the Nth data frame on a connection is acked as N.
         seq += 1;
-        write_control(&mut stream, &control::Ack { seq }).await?;
+        // After `send_relayed` this is the only write: a frame is never both forwarded and
+        // answered `GOING_AWAY` (module doc's "Shutdown").
+        if let Err(err) = write_control(&mut stream, &control::Ack { seq }, handshake_timeout).await
+        {
+            if err.is::<WriteStalled>() {
+                telemetry.count("logit.proto.errors", 1.0, &[("reason", "ack_write_stalled")]);
+            }
+            return Err(err);
+        }
         // The only place the idle clock restarts: after the send and the ack, so time spent on a
         // full downstream is charged to this listener, not the waiting peer.
         last_progress = tokio::time::Instant::now();
@@ -520,11 +604,17 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// Writes `Reject{GOING_AWAY, why}` before this listener closes a connection, for a shutdown and
 /// an idle close alike. `logit_out` treats `REJECT_GOING_AWAY` as transient and reconnects.
 ///
-/// The write's result is discarded: the connection is closing anyway, and a peer that already
-/// vanished is not a fault. Every caller returns `Ok(())` right after.
-async fn going_away<S: AsyncWrite + Unpin>(stream: &mut S, why: &str) {
+/// The write is bounded by `bound` and its result discarded: the connection is closing anyway,
+/// and a peer that already vanished or stopped reading is not a fault ([`write_reject`] counts a
+/// stall). Every caller returns `Ok(())` right after.
+async fn going_away<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    why: &str,
+    bound: Duration,
+    telemetry: &Telemetry,
+) {
     let reject = control::Reject { code: control::REJECT_GOING_AWAY, message: why.to_string() };
-    let _ = write_control(stream, &reject).await;
+    let _ = write_reject(stream, &reject, bound, telemetry).await;
 }
 
 /// Ends a connection quiet (or mid-frame stalled) past its `idle_timeout`: tells the peer, counts
@@ -536,8 +626,9 @@ async fn close_idle<S: AsyncWrite + Unpin>(
     stream: &mut S,
     telemetry: &Telemetry,
     idle: Duration,
+    bound: Duration,
 ) -> anyhow::Result<()> {
-    going_away(stream, &format!("idle for {idle:?}")).await;
+    going_away(stream, &format!("idle for {idle:?}"), bound, telemetry).await;
     telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
     Ok(())
 }
@@ -547,11 +638,13 @@ async fn close_idle<S: AsyncWrite + Unpin>(
 /// client can't proceed.
 ///
 /// `HelloAck` carries the best shared codec, `lz4` or no compression, this listener's
-/// `max_frame_bytes` (every later frame is bounded by it), and `window: 1`.
+/// `max_frame_bytes` (every later frame is bounded by it), and `window: 1`. Each reply is written
+/// within `handshake_timeout` too, a fresh bound per write.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
+    telemetry: &Telemetry,
 ) -> anyhow::Result<Negotiated> {
     let read = tokio::time::timeout(handshake_timeout, async {
         let Some(header_buf) =
@@ -584,7 +677,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
                 hello.version
             ),
         };
-        let _ = write_control(stream, &reject).await;
+        let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
         anyhow::bail!(
             "version mismatch: listener {}, client {}",
             control::PROTOCOL_VERSION,
@@ -603,7 +696,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             code: control::REJECT_NO_COMMON_CODEC,
             message: "this listener speaks native v1 or v2".to_string(),
         };
-        let _ = write_control(stream, &reject).await;
+        let _ = write_reject(stream, &reject, handshake_timeout, telemetry).await;
         anyhow::bail!("client offered no codec this listener speaks: {:?}", hello.codecs);
     };
 
@@ -621,7 +714,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         max_frame_bytes,
         window: 1,
     };
-    write_control(stream, &ack).await?;
+    write_control(stream, &ack, handshake_timeout).await?;
     Ok(Negotiated { compression, codec })
 }
 
@@ -677,9 +770,9 @@ impl HeaderReadError {
 /// last `Ack`. Once the first byte arrives the header is progress, so each later read gets
 /// [`IdleBounds::stall`], the per-`read` rule [`read_frame_body`] applies to a body. One absolute
 /// deadline around the whole header would discard a header that started shortly before it, and send
-/// `Reject{GOING_AWAY}` to a peer already writing a frame: for `logit_out`, the
-/// `Fault::Ambiguous` batch its pooled-connection probe exists to avoid. The first-byte deadline
-/// firing loses nothing, since no byte has been read.
+/// `Reject{GOING_AWAY}` to a peer already writing a frame, costing `logit_out` a reconnect and a
+/// resend of a batch that was on its way. The first-byte deadline firing loses nothing, since no
+/// byte has been read.
 async fn read_header<S: AsyncRead + Unpin>(
     stream: &mut S,
     bounds: Option<IdleBounds>,
@@ -748,9 +841,13 @@ impl FrameReadError {
     }
 }
 
-/// Parses `header_buf` and checks both declared lengths against `max_frame_bytes` (capped at
-/// [`frame::MAX_SANE_UNCOMPRESSED_LEN`]) *before* reading the body, then hands the whole frame to
-/// [`frame::read_frame_with_header`] for its CRC, decompression, and length checks.
+/// Parses `header_buf` and checks its declared lengths before reading the body:
+/// `uncompressed_len` against `max_frame_bytes` (capped at [`frame::MAX_SANE_UNCOMPRESSED_LEN`]),
+/// and `compressed_len` against [`frame::compressed_bound`] of that, since an incompressible
+/// payload at the cap grows under lz4. Then reads the body into the frame's final buffer, after a
+/// copy of the header, and hands it to [`frame::read_frame_with_header`] for its CRC,
+/// decompression, and length checks. The body is held once: peak heap is one
+/// `HEADER_LEN + compressed_len` buffer.
 ///
 /// `stall` bounds each `read` of the body, not the body in total (module doc's "Idle timeout").
 /// It's the connection's `idle_timeout`; `None` (the handshake, test helpers) means unbounded.
@@ -766,9 +863,11 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     })?;
 
     let bound = max_frame_bytes.min(frame::MAX_SANE_UNCOMPRESSED_LEN);
-    if header.uncompressed_len > bound || header.compressed_len > bound {
+    let compressed_bound = frame::compressed_bound(bound);
+    if header.uncompressed_len > bound || header.compressed_len > compressed_bound {
         return Err(FrameReadError::TooLarge(anyhow::anyhow!(
-            "frame declares {}/{} (uncompressed/compressed) bytes, over the {bound}-byte bound",
+            "frame declares {}/{} (uncompressed/compressed) bytes, over the \
+             {bound}/{compressed_bound}-byte bound",
             header.uncompressed_len,
             header.compressed_len
         )));
@@ -777,33 +876,34 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     // A fill loop rather than `read_exact`, so each `read` carries the `stall` bound and a peer
     // that closed mid-body (`Ok(0)`, `Truncated`) stays distinct from one that stopped
     // (`Stalled`, an idle close).
-    let mut body = vec![0u8; header.compressed_len as usize];
-    let mut filled = 0usize;
-    while filled < body.len() {
+    let body_len = header.compressed_len as usize;
+    let mut full = BytesMut::zeroed(frame::HEADER_LEN + body_len);
+    full[..frame::HEADER_LEN].copy_from_slice(&header_buf);
+    let mut filled = frame::HEADER_LEN;
+    while filled < full.len() {
         let read = match stall {
             Some(stall) => {
-                match tokio::time::timeout(stall, stream.read(&mut body[filled..])).await {
+                match tokio::time::timeout(stall, stream.read(&mut full[filled..])).await {
                     Ok(read) => read,
                     Err(_elapsed) => return Err(FrameReadError::Stalled(stall)),
                 }
             }
-            None => stream.read(&mut body[filled..]).await,
+            None => stream.read(&mut full[filled..]).await,
         };
         let n = read.map_err(|e| {
             FrameReadError::Truncated(anyhow::Error::new(e).context("reading a frame body"))
         })?;
         if n == 0 {
             return Err(FrameReadError::Truncated(anyhow::anyhow!(
-                "connection closed mid-body ({filled}/{} bytes)",
-                body.len()
+                "connection closed mid-body ({}/{body_len} bytes)",
+                filled - frame::HEADER_LEN
             )));
         }
         filled += n;
     }
 
-    let mut full = BytesMut::with_capacity(frame::HEADER_LEN + body.len());
-    full.extend_from_slice(&header_buf);
-    full.extend_from_slice(&body);
+    // `read_frame_with_header` re-parses the header from the front of `full`, then splits the
+    // body off it for the CRC: the buffer must hold both.
     let mut full = full.freeze();
     match frame::read_frame_with_header(&mut full) {
         Ok((header, payload)) => Ok((header, payload)),
@@ -816,41 +916,95 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
     }
 }
 
-/// Writes one control message with [`frame::FLAG_CONTROL`] set. `codec`/`compression` mean
-/// nothing on a control frame (`logit_proto::native::control`), so they're always `0`/`None`.
+/// Writes one control message with [`frame::FLAG_CONTROL`] set, within `bound` (the connection's
+/// `handshake_timeout`; module doc's "Bounded writes"). A write not finished within it
+/// fails with [`WriteStalled`]. `codec`/`compression` mean nothing on a control frame
+/// (`logit_proto::native::control`), so they're always `0`/`None`.
 async fn write_control<S: AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &impl ControlEncode,
+    bound: Duration,
 ) -> anyhow::Result<()> {
     let framed =
         frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &msg.encode())?;
-    stream.write_all(&framed).await?;
-    Ok(())
+    match tokio::time::timeout(bound, stream.write_all(&framed)).await {
+        Ok(written) => Ok(written?),
+        Err(_elapsed) => Err(anyhow::Error::new(WriteStalled { what: msg.name(), bound })),
+    }
+}
+
+/// A [`write_control`] that didn't finish within its bound: the peer has stopped reading, and
+/// the kernel's send buffer toward it is full. A caller tells it from an I/O error with
+/// `anyhow::Error::is`.
+#[derive(Debug)]
+struct WriteStalled {
+    what: &'static str,
+    bound: Duration,
+}
+
+impl std::fmt::Display for WriteStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} write stalled for {:?}: the peer is not reading", self.what, self.bound)
+    }
+}
+
+impl std::error::Error for WriteStalled {}
+
+/// Writes `reject` within `bound` before this listener closes a connection. A stalled write is
+/// counted as `logit.proto.errors{reason="reject_write_stalled"}` and returned like any other
+/// write error; every caller is about to close the connection either way.
+async fn write_reject<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reject: &control::Reject,
+    bound: Duration,
+    telemetry: &Telemetry,
+) -> anyhow::Result<()> {
+    let result = write_control(stream, reject, bound).await;
+    if let Err(err) = &result {
+        if err.is::<WriteStalled>() {
+            telemetry.count("logit.proto.errors", 1.0, &[("reason", "reject_write_stalled")]);
+        }
+    }
+    result
 }
 
 /// Lets [`write_control`] take any control message type without wrapping it in
 /// `control::ControlMessage`.
 trait ControlEncode {
     fn encode(&self) -> Bytes;
+    /// The message's name, for [`WriteStalled`].
+    fn name(&self) -> &'static str;
 }
 impl ControlEncode for control::Hello {
     fn encode(&self) -> Bytes {
         control::Hello::encode(self)
+    }
+    fn name(&self) -> &'static str {
+        "Hello"
     }
 }
 impl ControlEncode for control::HelloAck {
     fn encode(&self) -> Bytes {
         control::HelloAck::encode(self)
     }
+    fn name(&self) -> &'static str {
+        "HelloAck"
+    }
 }
 impl ControlEncode for control::Ack {
     fn encode(&self) -> Bytes {
         control::Ack::encode(self)
     }
+    fn name(&self) -> &'static str {
+        "Ack"
+    }
 }
 impl ControlEncode for control::Reject {
     fn encode(&self) -> Bytes {
         control::Reject::encode(self)
+    }
+    fn name(&self) -> &'static str {
+        "Reject"
     }
 }
 
@@ -935,8 +1089,13 @@ mod tests {
         TcpStream::connect(addr).await.unwrap()
     }
 
-    async fn write_msg(stream: &mut TcpStream, msg: &impl ControlEncode) {
-        write_control(stream, msg).await.unwrap();
+    /// Writes a control message the way a client does: unbounded, so a test's writes never
+    /// depend on the listener-side bound [`write_control`] applies.
+    async fn write_msg<S: AsyncWrite + Unpin>(stream: &mut S, msg: &impl ControlEncode) {
+        let framed =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &msg.encode())
+                .unwrap();
+        stream.write_all(&framed).await.unwrap();
     }
 
     /// Reads one whole frame, unbounded, returning the header (for `flags`) and payload.
@@ -1269,10 +1428,19 @@ mod tests {
                 .unwrap();
         client.write_all(&framed[..frame::HEADER_LEN]).await.unwrap();
 
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("should answer within 2s, not hang waiting for a body")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE)
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
-            .expect("should observe a close within 2s, not hang waiting for a body")
+            .expect("should observe a close within 2s")
             .unwrap();
         assert_eq!(n, 0);
     }
@@ -1340,6 +1508,98 @@ mod tests {
         // The server task records the counter after closing the socket.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(drained_counter(&registry, "logit.proto.errors", ("reason", "crc")), Some(1.0));
+    }
+
+    /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
+    /// connection, counted as `decode_budget` rather than `magic` and diagnosed under its own key.
+    #[tokio::test]
+    async fn a_batch_past_the_decode_budget_is_counted_and_diagnosed_as_decode_budget() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let diag = Diagnostics::new("logit_in");
+        let listener_diag = diag.clone();
+        let (addr, input) = bound_input().await;
+        // A 4 KiB budget: five empty events (864 bytes each) exceed it in a ~10-byte payload.
+        let mut input =
+            input.with_telemetry(telemetry).with_diagnostics(diag).with_max_frame_bytes(1024);
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        send_data_frame(&mut client, &batch, Compression::None).await;
+
+        // `a_frame_past_the_decode_budget_is_answered_frame_too_large` pins the `Reject`.
+        let _ = read_control_response(&mut client).await;
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("should observe a close within 2s")
+            .unwrap();
+        assert_eq!(n, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "decode_budget")),
+            Some(1.0)
+        );
+        assert_eq!(listener_diag.occurrences("decode_budget"), 1);
+        assert_eq!(listener_diag.occurrences("connection_error"), 0);
+    }
+
+    /// A batch past its decode budget is answered `Reject{FRAME_TOO_LARGE}` before the close, so
+    /// a `logit_out` drops it as `Fault::Permanent` instead of resending it under at-least-once.
+    /// Counted once, as `decode_budget`.
+    #[tokio::test]
+    async fn a_frame_past_the_decode_budget_is_answered_frame_too_large() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // A 4 KiB budget: five empty events exceed it in a ~10-byte payload.
+        let mut input = input.with_telemetry(telemetry).with_max_frame_bytes(1024);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let events = (0..5).map(|i| Event::empty(i, AttrMap::new())).collect();
+        let batch = EventBatch { resource: Arc::new(Resource::default()), scope: None, events };
+        send_data_frame(&mut client, &batch, Compression::None).await;
+
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("the listener answers within 2s")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE, "{}", reject.message);
+                assert!(reject.message.contains("decode budget"), "{}", reject.message);
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject")
+            .unwrap();
+        assert_eq!(n, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_value(&events, "logit.proto.errors", Some(("reason", "decode_budget"))),
+            Some(1.0)
+        );
+        assert_eq!(
+            metric_value(&events, "logit.proto.errors", Some(("reason", "too_large"))),
+            None
+        );
+        assert!(rx.try_recv().is_err(), "nothing was forwarded");
     }
 
     #[tokio::test]
@@ -1481,7 +1741,7 @@ mod tests {
             max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
             window: 1,
         };
-        write_control(&mut tls_stream, &hello).await.unwrap();
+        write_msg(&mut tls_stream, &hello).await;
         match read_control_response_over(&mut tls_stream).await {
             control::ControlMessage::HelloAck(ack) => {
                 assert_eq!(ack.codec, native::CODEC_NATIVE_V1);
@@ -1797,5 +2057,504 @@ mod tests {
             None,
             "nothing was closed as idle, so the counter was never touched"
         );
+    }
+
+    // ---- bounded control writes, the GOING_AWAY invariant, frame bounds, and the body copy -----
+
+    /// The `Hello` every test client below sends: native v1, no compression.
+    fn hello_v1() -> control::Hello {
+        control::Hello {
+            version: control::PROTOCOL_VERSION,
+            codecs: vec![native::CODEC_NATIVE_V1],
+            compressions: vec![0],
+            max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+            window: 1,
+        }
+    }
+
+    fn sample_frame() -> Bytes {
+        NativeEncoder::new(Compression::None).encode(&sample_batch()).unwrap()
+    }
+
+    /// The encoded length of `msg` as a control frame: sizes a `duplex` to hold a set number.
+    fn control_frame_len(msg: &impl ControlEncode) -> usize {
+        frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &msg.encode())
+            .unwrap()
+            .len()
+    }
+
+    /// The value of `metric` in `events` (a `Sum`'s or a `Gauge`'s), filtered by `tag` if given.
+    /// A drained registry holds a gauge's last write, so this reads its final value.
+    fn metric_value(
+        events: &[logit_core::Event],
+        metric: &str,
+        tag: Option<(&str, &str)>,
+    ) -> Option<f64> {
+        events.iter().rev().find_map(|e| {
+            if let Some((key, value)) = tag {
+                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
+                    return None;
+                }
+            }
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    MetricKind::Sum(sum) => Some(sum.value),
+                    MetricKind::Gauge(value) => Some(value),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// A handshaken peer that keeps writing frames but never reads its `Ack`s fills this
+    /// listener's send buffer, and the next `Ack` write blocks. The bound ends the connection,
+    /// returns the permit, and counts the stall; unbounded, the task, its permit, and its
+    /// `Fanout` clone stay held for as long as the peer does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ack_write_to_a_peer_that_never_reads_ends_the_connection_within_the_bound() {
+        const BOUND: Duration = Duration::from_millis(300);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A 4 KiB client receive window: the listener's `Ack`s fill it, and then its own send
+        // buffer, after tens of thousands of frames.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let (client, accepted) = tokio::join!(socket.connect(addr), listener.accept());
+        let mut client = client.unwrap();
+        let (server, _) = accepted.unwrap();
+
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = limit.clone().try_acquire_owned().unwrap();
+        let live = crate::listener::LiveConnections::new(telemetry.clone());
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(reject_or_serve(
+            server,
+            Some(permit),
+            sink,
+            telemetry,
+            frame::MAX_SANE_UNCOMPRESSED_LEN,
+            BOUND,
+            None,
+            shutdown_rx,
+            live.clone(),
+        ));
+
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response(&mut client).await;
+        let (unread, mut writer) = client.into_split();
+        let frame = sample_frame();
+        let spam = tokio::spawn(async move { while writer.write_all(&frame).await.is_ok() {} });
+        // Drains the listener's forwards and stamps the last one: the blocked `Ack` write
+        // follows it.
+        let last_forward = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let stamp = last_forward.clone();
+        let drain = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                *stamp.lock().unwrap() = std::time::Instant::now();
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the connection task must end once an Ack write stalls past the bound")
+            .unwrap();
+        let stalled_for = last_forward.lock().unwrap().elapsed();
+        let err = result.expect_err("a stalled Ack write ends the connection as an error");
+        assert!(
+            err.to_string().contains("Ack") && err.to_string().contains("stalled"),
+            "the error names the stalled Ack write: {err:#}"
+        );
+        assert!(
+            stalled_for < BOUND + Duration::from_secs(2),
+            "the task ended {stalled_for:?} after its last forward, past the {BOUND:?} bound"
+        );
+        assert_eq!(limit.available_permits(), 1, "the permit came back");
+        assert_eq!(live.count(), 0, "the live-connection count came back to 0");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_value(&events, "logit.proto.errors", Some(("reason", "ack_write_stalled"))),
+            Some(1.0)
+        );
+        assert_eq!(metric_value(&events, "logit.input.connections", None), Some(0.0));
+
+        spam.abort();
+        drain.abort();
+        drop(unread);
+    }
+
+    /// Shutdown's `GOING_AWAY` to a peer whose receive path is full returns within the bound: a
+    /// `duplex` sized for two `Ack`s, both written and never read.
+    #[tokio::test]
+    async fn going_away_to_a_peer_with_a_full_send_buffer_returns_within_the_bound() {
+        const BOUND: Duration = Duration::from_millis(300);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let ack_len = control_frame_len(&control::Ack { seq: 1 });
+        let (mut client, server) = tokio::io::duplex(2 * ack_len);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_connection(
+            server,
+            sink,
+            telemetry,
+            frame::MAX_SANE_UNCOMPRESSED_LEN,
+            BOUND,
+            None,
+            shutdown_rx,
+        ));
+
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response_over(&mut client).await;
+        let frame = sample_frame();
+        client.write_all(&frame).await.unwrap();
+        client.write_all(&frame).await.unwrap();
+        recv_batch(&mut rx).await;
+        recv_batch(&mut rx).await;
+        // Lets the second `Ack` land; the task then parks at the next header read.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(BOUND + Duration::from_secs(2), task)
+            .await
+            .expect("going_away must return within the bound, not wait on the peer")
+            .unwrap();
+        assert!(result.is_ok(), "a shutdown close is policy, not a fault: {result:?}");
+        assert_eq!(
+            metric_value(
+                &registry.drain(0),
+                "logit.proto.errors",
+                Some(("reason", "reject_write_stalled"))
+            ),
+            Some(1.0),
+            "the discarded GOING_AWAY is counted"
+        );
+        drop(client);
+    }
+
+    /// End to end: with a peer that never reads its `Ack`s connected, a shutdown still closes
+    /// the listener's `Fanout` within the runtime's 5s grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_graph_closes_after_shutdown_with_a_peer_that_never_reads_its_acks() {
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_handshake_timeout(Duration::from_millis(300));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut client = socket.connect(addr.parse().unwrap()).await.unwrap();
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response(&mut client).await;
+        let (unread, mut writer) = client.into_split();
+        let frame = sample_frame();
+        let spam = tokio::spawn(async move { while writer.write_all(&frame).await.is_ok() {} });
+        // Forwards stop once the listener's `Ack` write blocks.
+        while tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.is_ok() {}
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "every Fanout clone must be gone within the 5s grace");
+
+        spam.abort();
+        drop(unread);
+    }
+
+    /// Every `Reject{GOING_AWAY}` goes out before the frame it answers reaches `send_relayed`,
+    /// so a frame answered with one is never forwarded, and a `logit_out` may resend it at any
+    /// delivery posture. A whole frame buffered as shutdown fires races the header read against
+    /// the shutdown arm; this runs the race until both outcomes have occurred.
+    #[tokio::test]
+    async fn a_frame_answered_with_going_away_is_never_forwarded() {
+        let (mut acked, mut going_away) = (0, 0);
+        for _ in 0..400 {
+            let (mut client, server) = tokio::io::duplex(1 << 16);
+            let (sink, mut rx) = fanout_into_channel(16);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(serve_connection(
+                server,
+                sink,
+                Telemetry::default(),
+                frame::MAX_SANE_UNCOMPRESSED_LEN,
+                HANDSHAKE_TIMEOUT,
+                None,
+                shutdown_rx,
+            ));
+            write_msg(&mut client, &hello_v1()).await;
+            let _ = read_control_response_over(&mut client).await;
+            tokio::task::yield_now().await; // the task parks in its `select!`
+            client.write_all(&sample_frame()).await.unwrap(); // fits the buffer: no yield
+            shutdown_tx.send(true).unwrap();
+            match read_control_response_over(&mut client).await {
+                control::ControlMessage::Ack(_) => {
+                    acked += 1;
+                    assert!(rx.try_recv().is_ok(), "an acked frame was forwarded first");
+                }
+                control::ControlMessage::Reject(reject) => {
+                    assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+                    going_away += 1;
+                    task.await.unwrap().unwrap();
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "a frame answered with GOING_AWAY must never be forwarded"
+                    );
+                }
+                other => panic!("expected Ack or Reject, got {other:?}"),
+            }
+        }
+        assert!(
+            going_away > 0 && acked > 0,
+            "both arms ran: {acked} acked, {going_away} going away"
+        );
+    }
+
+    /// An xorshift-generated printable-ASCII string: lz4 finds almost no 4-byte match in it, so
+    /// its lz4 frame is larger than its payload.
+    fn incompressible_text(len: usize) -> String {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b'!' + (x % 94) as u8)
+            })
+            .collect()
+    }
+
+    /// A one-event batch whose native v1 encoding is at most `target` bytes, within a few bytes
+    /// of it, and whose message is [`incompressible_text`].
+    fn incompressible_batch_encoding_to(target: usize) -> EventBatch {
+        let batch_with = |len: usize| {
+            let mut batch = sample_batch();
+            batch.events[0].log.as_mut().unwrap().message = Value::str(incompressible_text(len));
+            batch
+        };
+        let mut len = target;
+        loop {
+            let encoded = native::encode_batch(&batch_with(len)).len();
+            if encoded <= target {
+                return batch_with(len);
+            }
+            len -= encoded - target;
+        }
+    }
+
+    /// A payload a few bytes under `max_frame_bytes` that lz4 expands past it still relays: the
+    /// compressed length is bounded by lz4's worst case over the cap, not by the cap itself.
+    #[tokio::test]
+    async fn an_incompressible_batch_just_under_the_cap_relays_under_lz4() {
+        const CAP: u32 = 64 * 1024;
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_frame_bytes(CAP);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+            .await;
+        match read_control_response(&mut client).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.compression, Compression::Lz4 as u8)
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        let batch = incompressible_batch_encoding_to(CAP as usize - 8);
+        let framed = NativeEncoder::new(Compression::Lz4).encode(&batch).unwrap();
+        let compressed_len = framed.len() - frame::HEADER_LEN;
+        assert!(
+            compressed_len > CAP as usize,
+            "precondition: the lz4 frame ({compressed_len} bytes) is larger than the cap"
+        );
+        client.write_all(&framed).await.unwrap();
+
+        assert_eq!(read_ack(&mut client).await.seq, 1, "the frame is acked, not rejected");
+        let relayed = recv_batch(&mut rx).await;
+        assert_eq!(relayed.events.len(), 1);
+    }
+
+    /// A header declaring a `compressed_len` one past lz4's worst case over `max_frame_bytes`
+    /// is answered `Reject{FRAME_TOO_LARGE}` on the header alone, counted, and closed.
+    #[tokio::test]
+    async fn a_frame_over_the_compressed_bound_is_answered_frame_too_large() {
+        const CAP: u32 = 64;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_frame_bytes(CAP).with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![Compression::Lz4 as u8])
+            .await;
+        let _ = read_control_response(&mut client).await;
+
+        // A real lz4 frame's header, its `compressed_len` (bytes 16..20) raised to one past
+        // `CAP + CAP / 255 + 16`, sent with no body.
+        let mut header = BytesMut::from(
+            &frame::write_frame(native::CODEC_NATIVE_V1, Compression::Lz4, &[0u8; CAP as usize])
+                .unwrap()[..frame::HEADER_LEN],
+        );
+        let over = CAP + CAP / 255 + 16 + 1;
+        header[16..20].copy_from_slice(&over.to_le_bytes());
+        client.write_all(&header).await.unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), read_control_response(&mut client))
+            .await
+            .expect("the listener answers within 2s, not after waiting for a body")
+        {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_FRAME_TOO_LARGE, "{}", reject.message)
+            }
+            other => panic!("expected Reject{{FRAME_TOO_LARGE}}, got {other:?}"),
+        }
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject")
+            .unwrap();
+        assert_eq!(n, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "too_large")),
+            Some(1.0)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A header partly read when shutdown fires is discarded with the connection: the client
+    /// gets `GOING_AWAY`, the rest of its frame is never read, and nothing is forwarded.
+    #[tokio::test]
+    async fn a_partial_header_at_shutdown_is_discarded_and_the_connection_closes() {
+        let (addr, mut input) = bound_input().await;
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+        let frame = sample_frame();
+        client.write_all(&frame[..10]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await; // the listener reads those 10 bytes
+
+        shutdown_tx.send(true).unwrap();
+        match read_control_response(&mut client).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY)
+            }
+            other => panic!("expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
+        let _ = client.write_all(&frame[10..]).await; // may fail: the listener has closed
+        let mut buf = [0u8; 1];
+        let after = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection closes right behind the Reject");
+        assert!(matches!(after, Ok(0) | Err(_)), "expected a close, got {after:?}");
+
+        handle.await.unwrap().unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            closed.expect("the fanout closes within 2s").is_none(),
+            "the partial frame was never forwarded"
+        );
+    }
+
+    /// Something that isn't `logit` on this port (an HTTP request, a syslog line) fails the
+    /// header's magic check. That check comes before the length bound and the body allocation, so
+    /// the connection closes at once, counted as a handshake error. `tests/robustness.rs`'s
+    /// `a_stray_client_allocates_nothing_sized_from_its_bytes` pins the allocation side.
+    #[tokio::test]
+    async fn a_stray_http_or_syslog_client_is_reset_before_any_allocation() {
+        const STRAYS: [(&str, &[u8]); 2] = [
+            ("http", b"GET /metrics HTTP/1.1\r\nHost: logit\r\n\r\n"),
+            ("syslog", b"<13>1 2026-09-25T00:00:00Z host app - - - hello world\n"),
+        ];
+
+        for (name, bytes) in STRAYS {
+            let mut header = [0u8; frame::HEADER_LEN];
+            header.copy_from_slice(&bytes[..frame::HEADER_LEN]);
+            let (_client, mut server) = tokio::io::duplex(64);
+            let result =
+                read_frame_body(&mut server, header, frame::MAX_SANE_UNCOMPRESSED_LEN, None).await;
+            match result {
+                Err(FrameReadError::Malformed(err)) => {
+                    assert!(format!("{err:#}").contains("magic"), "{name}: {err:#}")
+                }
+                Err(other) => panic!("{name}: expected Malformed, got {:#}", other.into_inner()),
+                Ok(_) => panic!("{name}: stray bytes parsed as a frame"),
+            }
+        }
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: a close comes from the magic check, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+        for (name, bytes) in STRAYS {
+            let mut stray = connect(&addr).await;
+            stray.write_all(bytes).await.unwrap();
+            let mut buf = [0u8; 64];
+            let read = tokio::time::timeout(Duration::from_secs(2), stray.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{name}: expected a close within 2s"));
+            assert!(matches!(read, Ok(0) | Err(_)), "{name}: expected a close, got {read:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            drained_counter(&registry, "logit.proto.errors", ("reason", "handshake")),
+            Some(2.0)
+        );
+    }
+
+    /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected
+    /// connection still open, and the first one closed, a third handshakes.
+    #[tokio::test]
+    async fn a_past_the_cap_connection_holds_no_permit() {
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut first = connect(&addr).await;
+        client_hello(&mut first, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut first).await;
+
+        let mut rejected = connect(&addr).await;
+        match read_control_response(&mut rejected).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_INTERNAL)
+            }
+            other => panic!("expected Reject{{INTERNAL}}, got {other:?}"),
+        }
+
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await; // the first task ends
+        let mut third = connect(&addr).await;
+        client_hello(&mut third, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        match read_control_response(&mut third).await {
+            control::ControlMessage::HelloAck(_) => {}
+            other => {
+                panic!("expected HelloAck with the rejected connection still open, got {other:?}")
+            }
+        }
+        drop(rejected);
     }
 }

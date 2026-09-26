@@ -121,7 +121,8 @@
 //! 2. **Size.** A `Content-Length` over [`MAX_REQUEST_BYTES`] (25 MiB, the Agent's
 //!    `max_request_bytes`) is a `413` before any byte is read, and the body is read through
 //!    [`Limited`] at the same cap. No API key is checked: tracers send none.
-//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`. Tracers don't compress,
+//! 3. **`Content-Encoding`.** `identity` (or none) or `gzip`, else `415`, including a header that
+//!    is present but empty or not ASCII. Tracers don't compress,
 //!    and the Agent accepts gzip. The decompressed size is capped at the same 25 MiB.
 //! 4. **Decode.** `CodecError::Malformed` is a `400`.
 //! 5. **Delivery**, bounded (below), then the route's `200`. A body that decodes to no events is
@@ -180,8 +181,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::{
@@ -197,7 +197,6 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -210,6 +209,8 @@ const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once, across the TCP listener and the Unix
 /// socket together: the same 1024 as `datadog_in`, and the `connection_limit` `/info` reports.
+/// With 25 MiB requests this listener's worst case is about 9.8 TiB, a bound rather than a memory
+/// budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula).
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogTraceInput::with_handshake_timeout`]: the same 5s as every other TCP
@@ -392,7 +393,7 @@ impl Input for DatadogTraceInput {
             telemetry: self.telemetry.clone(),
             diag: self.diag.clone(),
             connection_limit: Arc::new(Semaphore::new(self.max_connections)),
-            live_connections: AtomicI64::new(0),
+            live_connections: crate::listener::LiveConnections::new(self.telemetry.clone()),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             busy_after: self.busy_after,
@@ -436,7 +437,7 @@ struct AcceptContext {
     diag: Diagnostics,
     /// One cap across both listeners.
     connection_limit: Arc<Semaphore>,
-    live_connections: AtomicI64,
+    live_connections: crate::listener::LiveConnections,
     handshake_timeout: Duration,
     idle_timeout: Option<Duration>,
     busy_after: Duration,
@@ -476,11 +477,9 @@ impl AcceptContext {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let _permit = permit; // released on drop
-            let live = this.live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-            this.telemetry.gauge("logit.input.connections", live as f64, &[]);
+            let live = this.live_connections.enter();
             let result = connection.await;
-            let live = this.live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-            this.telemetry.gauge("logit.input.connections", live as f64, &[]);
+            drop(live);
             if let Err(err) = result {
                 this.diag.clone().warn_throttled("connection_error", err);
             }
@@ -498,8 +497,16 @@ async fn accept_tcp(
 ) -> anyhow::Result<()> {
     let mut accept_queue =
         crate::tcp::AcceptQueueSampler::new(accept.telemetry.clone(), accept.diag.clone());
+    let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, peer) = accept_queue.accept(&listener).await?;
+        let (stream, peer) = match accept_queue.accept(&listener).await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
+                    .await?;
+                continue;
+            }
+        };
         let Some(permit) = accept.permit() else {
             drop(stream);
             continue;
@@ -559,8 +566,16 @@ async fn accept_unix(
     path: Arc<Path>,
     accept: Arc<AcceptContext>,
 ) -> anyhow::Result<()> {
+    let mut accept_diag = accept.diag.clone();
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                crate::listener::absorb_accept_error(err, &accept.telemetry, &mut accept_diag)
+                    .await?;
+                continue;
+            }
+        };
         let Some(permit) = accept.permit() else {
             drop(stream);
             continue;
@@ -654,7 +669,7 @@ where
             }
         }
     });
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
     drive_with_idle(
         conn,

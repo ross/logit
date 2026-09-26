@@ -3687,14 +3687,14 @@ fn expect_native_round_trip_allocs(
 ///
 /// | Shape | encode | decode |
 /// |---|--:|--:|
-/// | 12-attribute flat JSON log | 16 | 5 |
-/// | pino-http nested record | 24 | 9 |
-/// | 30-attribute access log | 24 | 5 |
-/// | 17-attribute server span | 20 | 5 |
-/// | 3-record collectd event | 20 | 5 |
+/// | 12-attribute flat JSON log | 16 | 4 |
+/// | pino-http nested record | 24 | 8 |
+/// | 30-attribute access log | 24 | 4 |
+/// | 17-attribute server span | 20 | 4 |
+/// | 3-record collectd event | 20 | 4 |
 ///
-/// Decode is 5 for every flat shape (one `Vec<Event>`, one spill, and the frame's buffers) and
-/// 9 for the nested one (four boxed `Value::Map`s). Encode tracks fields rather than attributes:
+/// Decode is 4 for every flat shape (one `Vec<Event>`, moved into the caller's empty `Vec`, one
+/// spill, and the frame's buffers) and 8 for the nested one (four boxed `Value::Map`s). Encode tracks fields rather than attributes:
 /// the span and the three-record collectd event write more structure than the 12-attribute log.
 #[test]
 fn native_round_trip_survey_shapes() {
@@ -3702,31 +3702,31 @@ fn native_round_trip_survey_shapes() {
         "12-attribute flat log",
         parsed_survey_event(fixtures::flat_json_log_event),
         16,
-        5,
+        4,
     );
     expect_native_round_trip_allocs(
         "nested pino-http log",
         parsed_survey_event(fixtures::pino_http_log_event),
         24,
-        9,
+        8,
     );
     expect_native_round_trip_allocs(
         "30-attribute access log",
         parsed_survey_event(fixtures::access_log_event),
         24,
-        5,
+        4,
     );
     expect_native_round_trip_allocs(
         "17-attribute server span",
         fixtures::wide_server_span_event(),
         20,
-        5,
+        4,
     );
     expect_native_round_trip_allocs(
         "3-record collectd event",
         fixtures::collectd_three_record_event(),
         20,
-        5,
+        4,
     );
 }
 
@@ -3749,7 +3749,7 @@ fn native_round_trip_enriched_resource_batch() {
         measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
     assert_eq!(events.len(), 5);
     assert_eq!(events[0].attributes.len(), 9);
-    expect_allocs("native: decode 5-event batch, 17-attr resource", stats, 10);
+    expect_allocs("native: decode 5-event batch, 17-attr resource", stats, 9);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3773,8 +3773,9 @@ fn native_encode_one_event() {
     expect_allocs("native: encode 1 event", stats, 30);
 }
 
-/// The decode-side mirror of [`native_encode_one_event`]: 8. `decode_into` appends into a
-/// caller-held `Vec<Event>`, as every other decoder here does.
+/// The decode-side mirror of [`native_encode_one_event`]: 7. `decode_into` moves the decoded
+/// `Vec<Event>` into an empty caller-held one rather than copying into it, so it costs what
+/// `logit_in`'s direct `decode_batch` does.
 #[test]
 fn native_decode_one_event() {
     let batch = fixtures::nginx_batch(1);
@@ -3792,7 +3793,7 @@ fn native_decode_one_event() {
     // `MetricList` (one `reserve`, then a push per record): one allocation for the list. Collecting
     // an intermediate `Vec<MetricRecord>` into the `SmallVec` would cost a second, since
     // `SmallVec`'s `FromIterator` can't reuse the donor `Vec`'s buffer.
-    expect_allocs("native: decode 1 event", stats, 8);
+    expect_allocs("native: decode 1 event", stats, 7);
 }
 
 /// `logit_out`'s encode+frame step through the primitives it calls (`native::encode_batch`, then
@@ -3825,9 +3826,9 @@ fn logit_out_encode_and_frame_one_batch() {
 }
 
 /// `logit_in`'s read+decode step through the primitives its connection loop calls on a buffered
-/// frame (`frame::read_frame_with_header`, then `native::decode_batch`): 7, one less than
-/// [`native_decode_one_event`]. `NativeDecoder::decode_into` also extends a caller-held `Vec`;
-/// `decode_batch` returns an owned `EventBatch` that `Fanout::send` takes as-is.
+/// frame (`frame::read_frame_with_header`, then `native::decode_batch`): 7, the same as
+/// [`native_decode_one_event`]. `decode_batch` returns an owned `EventBatch` that
+/// `Fanout::send` takes as-is.
 #[test]
 fn logit_in_read_and_decode_one_batch() {
     let batch = fixtures::nginx_batch(1);
@@ -3836,13 +3837,16 @@ fn logit_in_read_and_decode_one_batch() {
 
     let mut warm = framed.clone();
     let (_, mut warm_payload) = logit_proto::frame::read_frame_with_header(&mut warm).unwrap();
-    drop(logit_proto::native::decode_batch(&mut warm_payload));
+    drop(logit_proto::native::decode_batch(&mut warm_payload, &Default::default()));
 
     let (event_count, stats) = measure(|| {
         let mut bytes = framed.clone();
         let (_, mut payload) =
             logit_proto::frame::read_frame_with_header(&mut bytes).expect("should read frame");
-        logit_proto::native::decode_batch(&mut payload).expect("should decode").events.len()
+        logit_proto::native::decode_batch(&mut payload, &Default::default())
+            .expect("should decode")
+            .events
+            .len()
     });
     assert_eq!(event_count, 1);
     // Same `native::decode_batch` as `native_decode_one_event`, including its one-allocation
@@ -3863,7 +3867,8 @@ fn native_dict_read_clamps_its_capacity_to_a_count_far_larger_than_4096() {
     write_uvarint(&mut buf, 1_000_000);
     let declared = buf.freeze();
 
-    let (result, stats) = measure(|| Dict::read(&mut declared.clone()));
+    let budget = logit_proto::native::DecodeBudget::default();
+    let (result, stats) = measure(|| Dict::read(&mut declared.clone(), &budget));
     assert!(result.is_err(), "a count with nothing behind it should still fail to decode");
     assert!(
         stats.bytes < 100_000,

@@ -17,12 +17,14 @@
 //! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
 //!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
 //!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
-//!   cap; `REJECT_GOING_AWAY`, the peer shutting down; a code a newer peer adds) is transient:
-//!   `Clean` at the handshake, `Ambiguous` after a data frame left. The latter is reachable:
-//!   `logit_in`'s `serve_connection` races shutdown only against the header read, so
-//!   `GOING_AWAY` can replace the `Ack` of a batch that may have been forwarded.
+//!   cap; `REJECT_GOING_AWAY`, the peer shutting down or closing an idle connection; a code a
+//!   newer peer adds) is transient: `Clean` at the handshake. After a data frame left,
+//!   `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only before the frame it answers
+//!   is forwarded (its module doc's "Shutdown"), so the batch never landed and is resent at any
+//!   delivery posture. Any other transient code there is `Ambiguous`.
 //! - A `HelloAck` naming a codec never offered: `Ambiguous`.
-//! - A batch over the sanity cap or the peer's `max_frame_bytes`: `Permanent`, nothing written.
+//! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
+//!   `frame::compressed_bound` of that: `Permanent`, nothing written.
 //! - A first write that sends nothing: `Clean`. Any failure once a byte of the frame left, an ack
 //!   timeout, or a mismatched `Ack.seq`: `Ambiguous`, and the connection is dropped.
 //!
@@ -363,6 +365,22 @@ impl Output for LogitOutput {
 
         let framed = frame::write_frame_with_flags(conn.codec, conn.compression, 0, &payload)
             .context(Fault::Permanent)?;
+        // The peer bounds `compressed_len` by `frame::compressed_bound`, lz4's worst case over
+        // the payload bound; checked here so this side never sends a frame the peer refuses.
+        let compressed_len = framed.len() - frame::HEADER_LEN;
+        if compressed_len as u64 > frame::compressed_bound(bound) as u64 {
+            self.stream = Some(conn);
+            self.diag.warn_throttled(
+                "frame_too_large",
+                format!(
+                    "batch compresses to {compressed_len} bytes, over this connection's {}-byte \
+                     compressed bound",
+                    frame::compressed_bound(bound)
+                ),
+            );
+            return Err(anyhow::anyhow!("compressed batch too large for this connection"))
+                .context(Fault::Permanent);
+        }
 
         // One `write` first to learn whether anything left (`Clean` if not), `write_all` only for
         // the remainder: never resend once a byte of this frame reached the peer.
@@ -424,9 +442,13 @@ impl Output for LogitOutput {
         let ack = match ack_result {
             Ok(Ok(control::ControlMessage::Ack(ack))) => ack,
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
-                // The frame already left, so a transient reject is `Ambiguous`.
+                // `logit_in` writes `GOING_AWAY` only before a frame is forwarded, so in place of
+                // the `Ack` it means this batch never landed: `Clean`. Any other transient code
+                // after the frame left is `Ambiguous`.
                 let fault = if reject_is_permanent(reject.code) {
                     Fault::Permanent
+                } else if reject.code == control::REJECT_GOING_AWAY {
+                    Fault::Clean
                 } else {
                     Fault::Ambiguous
                 };
@@ -580,7 +602,9 @@ mod tests {
     use logit_core::{AttrMap, Event, LogRecord, Resource, Severity, Value};
     use logit_inputs::logit::LogitInput;
     use logit_inputs::Input;
-    use logit_pipeline::{classify, is_explicitly_permanent, Fanout};
+    use logit_pipeline::{
+        classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fanout,
+    };
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -836,7 +860,8 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            let (_batch, provenance) = native::decode_batch_v2(&mut payload).unwrap();
+            let (_batch, provenance) =
+                native::decode_batch_v2(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
             provenance
@@ -885,8 +910,8 @@ mod tests {
             let mut body = vec![0u8; h.compressed_len as usize];
             stream.read_exact(&mut body).await.unwrap();
             let mut payload = Bytes::from(body);
-            assert!(native::decode_batch_v2(&mut payload.clone()).is_err());
-            native::decode_batch(&mut payload).unwrap();
+            assert!(native::decode_batch_v2(&mut payload.clone(), &Default::default()).is_err());
+            native::decode_batch(&mut payload, &Default::default()).unwrap();
 
             write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
         });
@@ -1115,6 +1140,61 @@ mod tests {
         let err = output.send(&sample_batch()).await.unwrap_err();
         assert_eq!(classify(&err), Fault::Permanent);
         assert!(is_explicitly_permanent(&err));
+    }
+
+    /// `logit_in` writes `Reject{GOING_AWAY}` only before the frame it answers is forwarded
+    /// (`logit_inputs::logit`'s module doc, "Shutdown"), so the batch never landed: `Clean`,
+    /// retried at every posture, and the retry on a fresh connection delivers the same frame.
+    #[tokio::test]
+    async fn a_going_away_in_place_of_an_ack_is_a_clean_fault_and_the_batch_is_resent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            // The first connection's frame is answered `GOING_AWAY`, the second's `Ack`.
+            for acked in [false, true] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let control::ControlMessage::Hello(_) = read_control(&mut stream).await.unwrap()
+                else {
+                    panic!("expected Hello");
+                };
+                let ack = control::HelloAck {
+                    version: control::PROTOCOL_VERSION,
+                    codec: native::CODEC_NATIVE_V1,
+                    compression: 0,
+                    max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                    window: 1,
+                };
+                write_control(&mut stream, &ack).await.unwrap();
+                let mut header = [0u8; frame::HEADER_LEN];
+                stream.read_exact(&mut header).await.unwrap();
+                let h = frame::FrameHeader::read(&mut Bytes::copy_from_slice(&header)).unwrap();
+                let mut body = vec![0u8; h.compressed_len as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                frames_tx.send(body).unwrap();
+                if acked {
+                    write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
+                } else {
+                    let reject = control::Reject {
+                        code: control::REJECT_GOING_AWAY,
+                        message: "listener shutting down".to_string(),
+                    };
+                    write_control(&mut stream, &reject).await.unwrap();
+                }
+            }
+        });
+
+        let mut output = LogitOutput::new(addr);
+        let batch = sample_batch();
+        let err = output.send(&batch).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+        assert!(is_retryable(classify(&err), DeliveryPosture::AtMostOnce));
+        assert!(output.stream.is_none(), "the rejected connection is dropped");
+
+        output.send(&batch).await.expect("the resend on a fresh connection is acked");
+        let first = frames_rx.recv().await.unwrap();
+        let second = frames_rx.recv().await.unwrap();
+        assert_eq!(first, second, "the same batch was sent again");
     }
 
     #[tokio::test]

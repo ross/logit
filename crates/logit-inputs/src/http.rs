@@ -1,10 +1,13 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
 //! `prometheus_in`'s remote-write receiver, `datadog_in`, `datadog_trace_in`, and
-//! `splunk_hec_in`): the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
-//! that acts on it ([`drive_with_idle`]), and the bounded request-body read. The two Datadog
-//! listeners and `splunk_hec_in` also share their request helpers here: `Content-Encoding` and
-//! `Content-Type` parsing, bounded decompression, the JSON response shapes, the constant-time key
-//! check, and the deadline-bounded delivery.
+//! `splunk_hec_in`): the connection builders that pin hyper's HTTP/2 settings ([`auto_builder`],
+//! [`h2_builder`]), the idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver
+//! that acts on it ([`drive_with_idle`]), and the bounded request-body read
+//! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
+//! in). All five listeners build and read through these. The two Datadog listeners and
+//! `splunk_hec_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
+//! parsing, bounded decompression, the JSON response shapes, the constant-time key check, and the
+//! deadline-bounded delivery.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -19,11 +22,56 @@
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
+use hyper::server::conn::http2;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::server::conn::auto;
 use logit_core::Telemetry;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+
+/// The most concurrent HTTP/2 streams one connection may open: hyper 1.11.1's own server default,
+/// pinned here so a hyper upgrade cannot move it.
+///
+/// A listener's worst case is `MAX_CONCURRENT_CONNECTIONS × MAX_CONCURRENT_STREAMS × 2 ×
+/// MAX_REQUEST_BYTES`: a compressed body and its decompressed copy on every stream of every
+/// connection. For `otlp_in` that is 1024 × 200 × 2 × 4 MiB = 1.6 TiB, a bound on what peers could
+/// make the process try to allocate, not a memory budget
+/// (`docs/adr/untrusted-input-bounds.md`'s "HTTP and gRPC listeners" section).
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 200;
+
+/// Stream resets a peer may cause before they are accepted, after which h2 sends `GOAWAY`: h2
+/// 0.4.19's `DEFAULT_REMOTE_RESET_STREAM_MAX`, which hyper applies when this is left unset. The
+/// rapid-reset (CVE-2023-44487) bound.
+const MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 20;
+
+/// The `SETTINGS_MAX_HEADER_LIST_SIZE` advertised: hyper 1.11.1's server default of 16 KiB.
+const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
+
+/// The HTTP/1.1-and-h2c builder every `auto` listener serves through, with the h2 settings
+/// above set explicitly. `otlp_in`'s HTTP transport, `prometheus_in`'s receiver, `datadog_in`,
+/// `datadog_trace_in`, and `splunk_hec_in` build here.
+pub(crate) fn auto_builder() -> auto::Builder<TokioExecutor> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http2()
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_pending_accept_reset_streams(MAX_PENDING_ACCEPT_RESET_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+    builder
+}
+
+/// The HTTP/2-only builder, for `otlp_in`'s gRPC transport, with the same settings as
+/// [`auto_builder`].
+pub(crate) fn h2_builder() -> http2::Builder<TokioExecutor> {
+    let mut builder = http2::Builder::new(TokioExecutor::new());
+    builder
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_pending_accept_reset_streams(MAX_PENDING_ACCEPT_RESET_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
+    builder
+}
 
 /// One connection's idle state, shared between its service and [`drive_with_idle`].
 ///
@@ -165,10 +213,12 @@ where
     }
 
     // Idle, or a stalled body asked for this. Ask hyper to close, give it `grace`, then drop the
-    // connection whatever that returned: `graceful_shutdown` alone leaves three cases parked, and
-    // the pre-sniff `ReadVersion` resolves `Err("Cancelled")` rather than `Ok(())`, so the result
-    // is discarded (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket
-    // closes with the pinned future.
+    // connection whatever that returned. `graceful_shutdown` alone leaves two cases parked, an h1
+    // head stopped mid-way (`KA::Busy`) and an h2 connection still handshaking, and those spend
+    // the grace. A pre-sniff `ReadVersion` does not: `graceful_shutdown` cancels it and the first
+    // poll below resolves at once to `Err("Cancelled")`, which is why the result is discarded
+    // (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket closes with
+    // the pinned future.
     shutdown(conn.as_mut());
     loop {
         if tokio::time::timeout(grace, conn.as_mut()).await.is_ok() {
@@ -176,11 +226,11 @@ where
         }
         if activity.in_flight() == 0 {
             // Nothing in flight, so the drop costs nothing: this is the case the grace exists
-            // for (a `KA::Busy` head, a cancelled pre-sniff, an h2 still handshaking).
+            // for (a `KA::Busy` head, an h2 still handshaking).
             break;
         }
         // A request started inside the grace window and its handler has not returned, most
-        // likely parked in `Fanout::send` on a full downstream. Dropping now would discard a
+        // likely waiting on a send parked on a full downstream. Dropping now would discard a
         // batch that never reached the fanout (backpressure causing loss), so wait it out: keep
         // polling `conn` (on h1 the handler's future is polled inside it) until the count is
         // zero, then run the grace again so the response reaches the wire. A stalled body is
@@ -196,6 +246,10 @@ where
                 () = activity.changed.notified() => {}
             }
         }
+        // A delivery a handler runs on its own task ([`deliver_detached`]) outlives the
+        // connection only if the client itself closed: it then holds its `Fanout` clone until the
+        // downstream drains, as a handler parked in a send held its connection. Shutdown waits
+        // on it the same way.
         if connection_finished {
             break;
         }
@@ -221,15 +275,21 @@ pub(crate) enum BodyReadError {
 ///
 /// The bound is per *frame*, never a total: a large body that keeps arriving in pieces is making
 /// progress, however long it takes in aggregate (the distinction `logit_in`'s per-`read` body
-/// bound also draws). With `stall: None` this behaves as `limited.collect().await`, including
-/// which errors reach [`body_read_error_message`].
+/// bound also draws). With `stall: None` no frame is timed, and the same errors reach
+/// [`body_read_error_message`].
+///
+/// **One buffer, not one per frame.** A body of one frame is returned as that frame, with no
+/// copy. From the second frame on, every frame is copied into one growing [`BytesMut`] and
+/// dropped. Keeping the frames instead would keep hyper's read buffers: on h1 a frame is a slice
+/// of the connection's read buffer, and hyper allocates a fresh buffer behind it while the frame
+/// is alive, so a body arriving in small segments (a slow WAN client, one MSS per read) held
+/// several times its own size until it ended. Trailers are dropped: nothing here reads them.
 pub(crate) async fn collect_with_stall_bound(
     mut body: Limited<Incoming>,
     stall: Option<std::time::Duration>,
 ) -> Result<Bytes, BodyReadError> {
-    // Frames are accumulated rather than concatenated as they arrive so the common single-frame
-    // body is handed on without a copy, as `Collected::to_bytes` does.
-    let mut frames: Vec<Bytes> = Vec::new();
+    let mut first: Option<Bytes> = None;
+    let mut joined: Option<BytesMut> = None;
     loop {
         let next = match stall {
             Some(stall) => match tokio::time::timeout(stall, body.frame()).await {
@@ -240,22 +300,22 @@ pub(crate) async fn collect_with_stall_bound(
         };
         let Some(frame) = next else { break };
         let frame = frame.map_err(BodyReadError::Failed)?;
-        // Trailers on a request body are legal and carry nothing this input reads; dropping them
-        // is what `Collected::to_bytes` does too.
-        if let Ok(data) = frame.into_data() {
-            frames.push(data);
+        let Ok(data) = frame.into_data() else { continue };
+        if let Some(joined) = joined.as_mut() {
+            joined.extend_from_slice(&data);
+        } else if let Some(held) = first.take() {
+            let mut buf = BytesMut::with_capacity(held.len() + data.len());
+            buf.extend_from_slice(&held);
+            buf.extend_from_slice(&data);
+            joined = Some(buf);
+        } else {
+            first = Some(data);
         }
     }
-    Ok(match frames.len() {
-        0 => Bytes::new(),
-        1 => frames.pop().expect("length checked just above"),
-        _ => {
-            let mut joined = BytesMut::with_capacity(frames.iter().map(Bytes::len).sum());
-            for frame in frames {
-                joined.extend_from_slice(&frame);
-            }
-            joined.freeze()
-        }
+    Ok(match (joined, first) {
+        (Some(joined), _) => joined.freeze(),
+        (None, Some(first)) => first,
+        (None, None) => Bytes::new(),
     })
 }
 
@@ -305,14 +365,21 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    /// Matched case-insensitively, since HTTP content codings are. `Err` carries what was sent,
-    /// for the `415` message.
+    /// Matched case-insensitively, since HTTP content codings are (RFC 9110 §8.4.1); ADR
+    /// `untrusted-input-bounds` makes that uniform across the HTTP listeners. Only an absent header
+    /// means identity: a present one that is empty or not ASCII names no coding, so it is an `Err`
+    /// like an unknown name. `Err` carries what was sent, for the `415` message.
     pub(crate) fn from_headers(headers: &http::HeaderMap) -> Result<Self, String> {
         let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
             return Ok(Self::Identity);
         };
-        let value = value.to_str().unwrap_or("").trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+        let Ok(value) = value.to_str() else {
+            return Err(String::from_utf8_lossy(value.as_bytes()).into_owned());
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            Err(String::new())
+        } else if value.eq_ignore_ascii_case("identity") {
             Ok(Self::Identity)
         } else if value.eq_ignore_ascii_case("gzip") {
             Ok(Self::Gzip)
@@ -443,6 +510,37 @@ pub(crate) fn error_response(
     // Formatted rather than built as a `serde_json::Value`, whose map would sort `errors` first.
     let message = serde_json::to_string(message).expect("a string always serializes");
     json_response(status, Bytes::from(format!(r#"{{"status":"error","errors":[{message}]}}"#)))
+}
+
+/// Sends one request's `batches` in order through [`logit_pipeline::Fanout::send`] on a task of
+/// their own, and waits for it. Dropping this future (a client that closed mid-request cancels
+/// hyper's service future) cancels only the wait: the task still delivers every batch to every
+/// consumer, where a `send` dropped part way would leave some consumers with a batch and others
+/// without (`logit_pipeline::fanout`'s module doc). The client never saw a success, so its retry
+/// duplicates on every branch alike, the ordinary at-least-once outcome. No slot is held while
+/// waiting on another consumer, so this cannot deadlock a diamond the way a reservation without a
+/// deadline would.
+///
+/// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
+/// does ([`drive_with_idle`]'s wait-out loop). A panic inside it is resumed here.
+pub(crate) async fn deliver_detached(
+    sink: &logit_pipeline::Fanout,
+    batches: Vec<logit_core::EventBatch>,
+) {
+    if batches.is_empty() {
+        return;
+    }
+    let sink = sink.clone();
+    let delivery = tokio::spawn(async move {
+        for batch in batches {
+            sink.send(batch).await;
+        }
+    });
+    if let Err(err) = delivery.await {
+        if err.is_panic() {
+            std::panic::resume_unwind(err.into_panic());
+        }
+    }
 }
 
 /// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait both

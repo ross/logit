@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-12
+updated: 2026-09-25
 ---
 
 # Closing plan: lossless like-protocol transit
@@ -563,7 +563,9 @@ against the three like-protocol pairs is closed:
   field (`event_name`, `observed_timestamp` preserved rather than re-stamped, `otel.severity_*`
   outranking the normalized `Severity`), and every span field (`trace_state`/`flags` on
   `Span`/`Span.Link`, every `dropped_*_count`, a real status-message field) are closed — see "W4
-  outcome: every named loss above is closed, not just narrowed" above.
+  outcome: every named loss above is closed, not just narrowed" above. Out-of-range timestamp
+  saturation is lossless under [ADR `lossless-transit`](../adr/lossless-transit.md)'s "Permitted
+  normalizations" list.
 - **syslog_in -> syslog_out**: RFC 5424 STRUCTURED-DATA parses and re-emits through `syslog.sd`, a
   non-numeric PROCID survives as `Value::Str`, a non-UTF-8 MSG decodes to `Value::Bytes`, and
   `syslog_out`'s TIMESTAMP follows [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md)'s
