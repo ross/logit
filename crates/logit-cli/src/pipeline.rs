@@ -582,12 +582,20 @@ fn build_spec(
 
         // The runtime reads a Lua router's `targets:` off the `ResolvedComponent`, not
         // `NodeSpec::Lua` (`docs/adr/target-components.md`).
-        Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
+        Lua { script, interval } => NodeSpec::Lua {
+            script: script.clone(),
+            interval: *interval,
+            runtime: logit_pipeline::LuaRuntimeConfig::default(),
+        },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
-            NodeSpec::Lua { script, interval: *interval }
+            NodeSpec::Lua {
+                script,
+                interval: *interval,
+                runtime: logit_pipeline::LuaRuntimeConfig::default(),
+            }
         }
         Aggregate {
             interval,

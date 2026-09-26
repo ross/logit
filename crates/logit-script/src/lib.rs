@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod construct;
+mod heartbeat;
 mod provenance;
 mod proxy;
 mod resource;
@@ -22,6 +23,7 @@ mod telemetry;
 mod trace;
 mod value;
 
+pub use heartbeat::Heartbeat;
 pub use proxy::EventProxy;
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +89,9 @@ pub struct ScriptWorker {
     /// `process` only borrows and bumps the `Rc`, so the `lua: process 1 event` allocation pin
     /// (`crates/logit-bench/tests/allocations.rs`) doesn't move.
     targets: Rc<RefCell<Rc<proxy::TargetTable>>>,
+    /// The runtime's progress counter, set by [`ScriptWorker::with_heartbeat`]. A cell for the
+    /// reason `targets` is one: `Event.new` is installed in `new` and reads it per call.
+    heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -132,7 +137,8 @@ impl ScriptWorker {
         // effect; an `Event.new` at top level, during `.exec()`, sees the empty table
         // (`docs/design/lua-api.md` says so).
         let targets = Rc::new(RefCell::new(proxy::TargetTable::empty()));
-        construct::install(&lua, targets.clone())?;
+        let heartbeat = Rc::new(RefCell::new(None));
+        construct::install(&lua, targets.clone(), heartbeat.clone())?;
         lua.load(source).exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
@@ -152,6 +158,7 @@ impl ScriptWorker {
             scope_state,
             provenance_state,
             targets,
+            heartbeat,
             _not_send_sync: PhantomData,
         })
     }
@@ -246,6 +253,22 @@ impl ScriptWorker {
         self
     }
 
+    /// Hands the worker the runtime's [`Heartbeat`], which it ticks once per `Event.new` call and
+    /// once per event taken from a returned table, so a long `process()`/`flush()` that is still
+    /// producing events reads as progress, not a stall. The runtime marks the call itself with
+    /// [`Heartbeat::enter`]/[`Heartbeat::leave`].
+    pub fn with_heartbeat(self, heartbeat: Arc<Heartbeat>) -> Self {
+        *self.heartbeat.borrow_mut() = Some(heartbeat);
+        self
+    }
+
+    /// Frees the registry slots of dropped `RegistryKey`s. mlua only queues a dropped key's slot,
+    /// so the value it held (a collected event's sub-proxies among them) stays pinned until this
+    /// runs or the slot is reused, invisible to [`ScriptWorker::used_memory`].
+    pub fn expire_registry_values(&self) {
+        self.lua.expire_registry_values();
+    }
+
     /// Bytes in use by this worker's Lua VM, the only view into a stateful script leaking state
     /// across `flush()` calls.
     pub fn used_memory(&self) -> usize {
@@ -269,9 +292,12 @@ impl ScriptWorker {
                 let (event, target) = proxy::take_event(&self.lua, ud)?;
                 ProcessOutcome::Emit(Box::new(event), target)
             }
-            LuaValue::Table(table) => {
-                ProcessOutcome::EmitMany(events_from_table(&self.lua, table, "process")?)
-            }
+            LuaValue::Table(table) => ProcessOutcome::EmitMany(events_from_table(
+                &self.lua,
+                table,
+                "process",
+                self.heartbeat.borrow().as_deref(),
+            )?),
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
                     "process() must return nil, an event, or a table of events, got {}",
@@ -300,7 +326,9 @@ impl ScriptWorker {
             flush.call(now.to_string()).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
-            LuaValue::Table(table) => events_from_table(&self.lua, table, "flush")?,
+            LuaValue::Table(table) => {
+                events_from_table(&self.lua, table, "flush", self.heartbeat.borrow().as_deref())?
+            }
             other => {
                 return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
                     "flush() must return nil or a table of events, got {}",
@@ -317,10 +345,14 @@ impl ScriptWorker {
 /// Validates a contiguous `1..=n` sequence rather than using `Table::sequence_values`, which
 /// stops at the first gap: `return {[2] = event}` would silently emit nothing. An empty table is
 /// valid and emits nothing.
+///
+/// Ticks `heartbeat` once per element: a `flush()` returning a very large table spends its time
+/// here, after the script returned, and must still read as progress.
 fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
     caller: &str,
+    heartbeat: Option<&Heartbeat>,
 ) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
     let Some(len) = value::validated_sequence_len(&table)? else {
         return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
@@ -329,6 +361,9 @@ fn events_from_table(
     };
     let mut events = Vec::with_capacity(len);
     for i in 1..=len {
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.tick();
+        }
         events.push(proxy::take_event(lua, table.get(i)?)?);
     }
     Ok(events)

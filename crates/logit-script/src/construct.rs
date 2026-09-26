@@ -36,6 +36,7 @@
 //! [`SpanRecord`], `events` and `links` included. It's the one way a script makes a span, since
 //! `event.span` is read-only (`crate::proxy`'s `SpanProxy`).
 
+use crate::heartbeat::Heartbeat;
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_to_value, validated_sequence_len};
 use bytes::Bytes;
@@ -49,6 +50,7 @@ use logit_core::{
 use mlua::{Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The keys `to_table()` emits at the top level -- and therefore the only keys `Event.new`
 /// accepts there.
@@ -131,9 +133,19 @@ const CONSTRUCTIBLE_KINDS: &str =
 /// an event resolves `event:to(id)` against the component's `targets:` inside
 /// `process()`/`flush()`, and against the empty list at script top level, which runs before
 /// `ScriptWorker::with_targets` can.
-pub(crate) fn install(lua: &Lua, targets: Rc<RefCell<Rc<TargetTable>>>) -> mlua::Result<()> {
+///
+/// `heartbeat` is the worker's `ScriptWorker::heartbeat` cell, read the same way: each call ticks
+/// it, so a `flush()` constructing many events reads as progress to the runtime's stall watcher.
+pub(crate) fn install(
+    lua: &Lua,
+    targets: Rc<RefCell<Rc<TargetTable>>>,
+    heartbeat: Rc<RefCell<Option<Arc<Heartbeat>>>>,
+) -> mlua::Result<()> {
     let table = lua.create_table()?;
     let new = lua.create_function(move |_, arg: LuaValue| {
+        if let Some(heartbeat) = heartbeat.borrow().as_ref() {
+            heartbeat.tick();
+        }
         let LuaValue::Table(t) = arg else {
             return Err(runtime_error(format!(
                 "Event.new(t) takes a table, got {}",

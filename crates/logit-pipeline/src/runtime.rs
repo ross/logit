@@ -16,7 +16,7 @@ use crate::router::{Destination, Router, RouterScratch};
 use crate::{Fanout, Input, InputRuntimeConfig, Output, Readiness, Transform};
 use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
-use logit_script::{ProcessOutcome, ScriptWorker};
+use logit_script::{Heartbeat, ProcessOutcome, ScriptWorker};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -71,6 +71,7 @@ pub enum NodeSpec {
     Lua {
         script: String,
         interval: Option<Duration>,
+        runtime: LuaRuntimeConfig,
     },
 }
 
@@ -313,7 +314,7 @@ pub async fn run_with_telemetry(
                 // component (nothing checks spec kind against config kind here); the `Role::Target`
                 // guard above skips real targets. Doing nothing beats panicking.
             }
-            NodeSpec::Lua { script, interval } => {
+            NodeSpec::Lua { script, interval, runtime } => {
                 // A Lua node is a router too: the ids in `component.targets` become
                 // `event:to("..")`'s name -> slot table in the VM, resolved from the same
                 // pre-spawn map as the `Router` arm, so `Destination::To(n)` and the script's n-th
@@ -325,8 +326,22 @@ pub async fn run_with_telemetry(
                 let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
                 let handle = runtime_handle.clone();
                 let thread_id = id.clone();
+                let heartbeat = Arc::new(Heartbeat::new());
+                let io: SharedLuaIo = Arc::new(std::sync::Mutex::new(Some(LuaIo {
+                    inbox,
+                    fanout,
+                    target_fanouts: target_routes,
+                })));
+                let watcher_diag =
+                    Diagnostics::new(id.clone()).with_telemetry(node_telemetry.clone());
+                let thread_heartbeat = heartbeat.clone();
+                let thread_io = io.clone();
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
+                    // Script recursion through C frames (a `string.gsub` callback a few hundred
+                    // deep) overflows the 2 MiB default and aborts the process. Virtual: pages are
+                    // committed only when touched.
+                    .stack_size(8 << 20)
                     .spawn(move || {
                         run_lua(
                             thread_id,
@@ -335,9 +350,8 @@ pub async fn run_with_telemetry(
                             targets,
                             ready_tx,
                             done_tx,
-                            inbox,
-                            fanout,
-                            target_routes,
+                            thread_io,
+                            thread_heartbeat,
                             node_telemetry,
                             handle,
                         )
@@ -348,10 +362,20 @@ pub async fn run_with_telemetry(
                     Ok(Ok(())) => {
                         // Spawned only after the ready handshake, so a load failure never leaves a
                         // watcher behind. `done_tx` buffers its one message, so a thread that dies
-                        // between reporting ready and this spawn is still observed.
-                        let watcher = tasks.spawn(watch_lua_thread(id.clone(), done_rx));
-                        node_ids.insert(watcher.id(), id.clone());
+                        // between reporting ready and this spawn is still observed. `Running` is
+                        // set before the spawn so it can never overwrite the watcher's `Stalled`.
                         readiness.set_node(&id, NodeState::Running);
+                        let watcher = tasks.spawn(watch_lua_thread(
+                            id.clone(),
+                            done_rx,
+                            heartbeat,
+                            io,
+                            runtime,
+                            shutdown_rx.clone(),
+                            readiness.clone(),
+                            watcher_diag,
+                        ));
+                        node_ids.insert(watcher.id(), id.clone());
                     }
                     Ok(Err(message)) => {
                         return Err(RunError::Startup(anyhow::anyhow!(
@@ -690,6 +714,31 @@ impl Default for WriteLoopConfig {
             shutdown_grace: Duration::from_secs(5),
             delivery_override: None,
         }
+    }
+}
+
+/// A Lua node's stall and wedge thresholds (`docs/adr/lua-runaway-script-bounds.md`), read by
+/// [`watch_lua_thread`]. Not config-exposed.
+#[derive(Debug, Clone, Copy)]
+pub struct LuaRuntimeConfig {
+    /// How long the thread may sit inside one `process()`/`flush()` with its [`Heartbeat`]
+    /// unchanged before the node reads [`NodeState::Stalled`]. The node reads `Running` again
+    /// on the next change.
+    pub stall_after: Duration,
+    /// Once shutdown has begun, how long the thread may sit inside a call with its heartbeat
+    /// unchanged before the watcher revokes its I/O and fails the node, measured from the later
+    /// of the signal and the last change. A node already `Stalled` is measured from its last
+    /// change alone, which with the defaults means the watcher's next tick after the signal.
+    ///
+    /// Shorter than a sink's `WriteLoopConfig::shutdown_grace` (5 s): revoking the node closes
+    /// its downstream inboxes, and a downstream `aggregate`'s close-time flush must reach the sink
+    /// before that sink's `write_loop` stops draining.
+    pub shutdown_grace: Duration,
+}
+
+impl Default for LuaRuntimeConfig {
+    fn default() -> Self {
+        Self { stall_after: Duration::from_secs(10), shutdown_grace: Duration::from_secs(2) }
     }
 }
 
@@ -1403,9 +1452,13 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// Lua exit like any task's. The loop runs under `catch_unwind` so a panic becomes a message, not
 /// a dropped sender; `AssertUnwindSafe` because `ScriptWorker` holds `Lua` and `Rc<RefCell>`s and
 /// nothing is used after the unwind. A script's own `process()`/`flush()` errors are logged and
-/// counted in [`run_lua_loop`] and never end the node. `done_tx` sends only after the closure
-/// drops `inbox` and the `Fanout`s, so the downstream cascade is already underway when the
+/// counted in [`run_lua_loop`] and never end the node. `done_tx` sends only after the [`LuaIo`]
+/// is taken out of `io` and dropped, so the downstream cascade is already underway when the
 /// watcher resolves.
+///
+/// `io` is shared with the watcher so it can revoke the node's channels without the thread's
+/// cooperation (see [`LuaIo`]); `heartbeat` is how the watcher tells a working script from a
+/// stuck one (see [`watch_lua_thread`]).
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1414,9 +1467,8 @@ fn run_lua(
     targets: Vec<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
     done_tx: oneshot::Sender<Result<(), String>>,
-    inbox: mpsc::Receiver<Delivered>,
-    fanout: Fanout,
-    target_fanouts: Vec<Fanout>,
+    io: SharedLuaIo,
+    heartbeat: Arc<Heartbeat>,
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
@@ -1424,6 +1476,7 @@ fn run_lua(
         .and_then(|w| w.with_telemetry(telemetry.clone()))
         .map(|w| w.with_component(&id))
         .map(|w| w.with_targets(&targets))
+        .map(|w| w.with_heartbeat(heartbeat.clone()))
     {
         Ok(worker) => worker,
         Err(err) => {
@@ -1442,19 +1495,13 @@ fn run_lua(
     // The same `Symbol` `Fanout::with_component` interned for this node's edge.
     let me = logit_core::interner::intern(&id);
 
+    let loop_io = io.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        run_lua_loop(
-            worker,
-            me,
-            configured_interval,
-            inbox,
-            fanout,
-            target_fanouts,
-            telemetry,
-            runtime,
-            diag,
-        )
+        run_lua_loop(worker, me, configured_interval, loop_io, heartbeat, telemetry, runtime, diag)
     }));
+    // Dropped here, after a return or a panic alike, so the downstream cascade is underway
+    // before `done_tx` reports. `None` already if the watcher revoked it.
+    drop(lock_io(&io).take());
     let report = thread_outcome(outcome);
     if let Err(message) = &report {
         reporter.error("thread_panicked", format_args!("{message}"));
@@ -1481,32 +1528,171 @@ fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
     }
 }
 
-/// A Lua node's `JoinSet` entry: waits on the thread's `done` report (see `run_lua`).
+/// A Lua node's channels: its inbox, its own edge, and its target edges.
 ///
-/// Doesn't watch `shutdown`: shutdown reaches the thread through the cascade closing its inbox,
-/// and racing `shutdown` here would resolve before the thread's close-time flush finished. The
-/// `Err(_)` arm is defensive; `run_lua` always sends after `catch_unwind`.
+/// Held in a [`SharedLuaIo`] the thread and its watcher share, so the watcher can revoke them
+/// from a thread wedged inside a script call: dropping the `LuaIo` closes every downstream inbox
+/// (each drains on its own grace, flushing its own window) and fails every upstream send as
+/// `closed_consumer`, with nothing aborted (`docs/adr/lua-runaway-script-bounds.md`).
+///
+/// The thread locks it only around a receive and around a send, never while its heartbeat is
+/// busy, so the watcher's `try_lock` on a busy node always succeeds unless the thread is between
+/// `leave()` and the lock, and a revoked node finds `None` the next time it looks and exits.
+struct LuaIo {
+    inbox: mpsc::Receiver<Delivered>,
+    fanout: Fanout,
+    target_fanouts: Vec<Fanout>,
+}
+
+type SharedLuaIo = Arc<std::sync::Mutex<Option<LuaIo>>>;
+
+/// Locks `io`, recovering from poison: the guarded value is an `Option` of channels, left
+/// consistent whatever a panicking holder was doing.
+fn lock_io(io: &SharedLuaIo) -> std::sync::MutexGuard<'_, Option<LuaIo>> {
+    io.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A Lua node's `JoinSet` entry: waits on the thread's `done` report (see `run_lua`) and watches
+/// its [`Heartbeat`] (`docs/adr/lua-runaway-script-bounds.md`).
+///
+/// - Busy and unchanged for `stall_after`: the node reads [`NodeState::Stalled`] and
+///   `script_stalled` is logged once; the next change sets `Running` and logs `script_resumed`.
+/// - After shutdown, busy and unchanged for `shutdown_grace` measured from the later of the
+///   signal and the last change: the node is wedged. A node already `Stalled` is measured from
+///   its last change alone (with the defaults, the first tick after the signal). The watcher
+///   drops its [`LuaIo`] and returns `Err`, and the join loop fails the run as it would for any
+///   node. The thread is left running; `main`'s exit reclaims it.
+///
+/// A loop that keeps calling `Event.new` advances the heartbeat and is never stalled or wedged;
+/// telling it from a large `flush()` would take a time limit, which
+/// `docs/adr/lua-runaway-script-bounds.md` declines.
+///
+/// A node that isn't busy is never stalled or wedged: a thread parked sending into a full inbox is
+/// backpressure, and the sink's own grace unparks it.
+///
+/// `shutdown` only arms the wedge rule; it never resolves this future, because shutdown reaches
+/// the thread through its inbox closing, and resolving on it would end the node before its
+/// close-time flush. The `Err(_)` arm on `done_rx` is defensive; `run_lua` always sends after
+/// `catch_unwind`.
+#[allow(clippy::too_many_arguments)]
 async fn watch_lua_thread(
     id: String,
-    done_rx: oneshot::Receiver<Result<(), String>>,
+    mut done_rx: oneshot::Receiver<Result<(), String>>,
+    heartbeat: Arc<Heartbeat>,
+    io: SharedLuaIo,
+    config: LuaRuntimeConfig,
+    mut shutdown: watch::Receiver<bool>,
+    readiness: Readiness,
+    mut diag: Diagnostics,
 ) -> anyhow::Result<()> {
-    match done_rx.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(message)) => Err(anyhow::anyhow!("component '{id}': {message}")),
-        Err(_) => Err(anyhow::anyhow!("component '{id}': thread exited without reporting")),
+    // A quarter of the shorter threshold, so either verdict lands within 25% of its own bound.
+    let period = (config.stall_after.min(config.shutdown_grace) / 4).max(Duration::from_millis(10));
+    let mut ticker = tokio::time::interval(period);
+    // A late tick is observed late, not replayed in a burst that would read one pause as several.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut last_value = heartbeat.read();
+    let mut last_change = tokio::time::Instant::now();
+    let mut stalled = false;
+    let mut shutdown_at = shutdown.borrow().then(tokio::time::Instant::now);
+    // A closed `watch` (its sender dropped) can't signal again; stop polling it.
+    let mut shutdown_open = true;
+
+    loop {
+        tokio::select! {
+            outcome = &mut done_rx => {
+                return match outcome {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(message)) => Err(anyhow::anyhow!("component '{id}': {message}")),
+                    Err(_) => {
+                        Err(anyhow::anyhow!("component '{id}': thread exited without reporting"))
+                    }
+                };
+            }
+            changed = shutdown.changed(), if shutdown_at.is_none() && shutdown_open => {
+                match changed {
+                    Ok(()) if *shutdown.borrow_and_update() => {
+                        shutdown_at = Some(tokio::time::Instant::now());
+                    }
+                    Ok(()) => {}
+                    Err(_) => shutdown_open = false,
+                }
+            }
+            _ = ticker.tick() => {
+                let now = tokio::time::Instant::now();
+                let value = heartbeat.read();
+                if value != last_value {
+                    last_value = value;
+                    last_change = now;
+                    if stalled {
+                        stalled = false;
+                        readiness.set_node(&id, NodeState::Running);
+                        diag.info("script_resumed", "the script is making progress again");
+                    }
+                    continue;
+                }
+                if !Heartbeat::is_busy(value) {
+                    continue;
+                }
+                let quiet = now.duration_since(last_change);
+                if !stalled && quiet >= config.stall_after {
+                    stalled = true;
+                    readiness.set_node(&id, NodeState::Stalled);
+                    diag.warn_throttled(
+                        "script_stalled",
+                        format_args!(
+                            "inside process()/flush() with no progress for {quiet:?}; \
+                             /readyz reports stalled until it resumes"
+                        ),
+                    );
+                }
+                let Some(signalled) = shutdown_at else {
+                    continue;
+                };
+                // A stalled node's quiet time counts from its last progress, before the signal
+                // included; anything else gets the full grace from the signal or its last
+                // progress, whichever is later.
+                let since = if stalled { last_change } else { signalled.max(last_change) };
+                if now.duration_since(since) < config.shutdown_grace {
+                    continue;
+                }
+                // Not blocking: the thread holds the lock only while not busy, so a failed
+                // `try_lock` means it left the call since `read()` above; look again next tick.
+                let mut guard = match io.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => continue,
+                };
+                // The thread can leave the call between `read()` and the lock; that is progress.
+                if heartbeat.read() != last_value {
+                    continue;
+                }
+                drop(guard.take());
+                drop(guard);
+                let elapsed = now.duration_since(signalled);
+                return Err(anyhow::anyhow!(
+                    "component '{id}': still inside process()/flush() {elapsed:?} after shutdown \
+                     began; exiting without it"
+                ));
+            }
+        }
     }
 }
 
 /// The loop half of [`run_lua`]. Takes everything by value so `catch_unwind` has nothing borrowed.
-/// Returns once `inbox` closes, after a last `flush()` if the component has an interval.
+/// Returns once `inbox` closes, after a last `flush()` if the component has an interval, or once
+/// the watcher has revoked `io` (see [`LuaIo`]).
+///
+/// The heartbeat is busy only inside a script call: `enter()` before each `process()` and around
+/// `flush()`, `leave()` before anything is sent. A thread parked in a send is therefore never
+/// read as stalled, and never holds `io`'s lock while busy.
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
     me: logit_core::Symbol,
     configured_interval: Option<Duration>,
-    mut inbox: mpsc::Receiver<Delivered>,
-    fanout: Fanout,
-    target_fanouts: Vec<Fanout>,
+    io: SharedLuaIo,
+    heartbeat: Arc<Heartbeat>,
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
     mut diag: Diagnostics,
@@ -1522,20 +1708,19 @@ fn run_lua_loop(
 
     // The same reused per-destination buffers a native `Router` uses (`RouterScratch`), shared
     // by the batch path and `flush_now`. Only `dests` is used: a script returns its verdict with
-    // each event, so there's no route-then-count pass as in `route_batch`.
-    let mut scratch = RouterScratch::new(target_fanouts.len());
+    // each event, so there's no route-then-count pass as in `route_batch`. Sized once from the
+    // target count, which revocation never changes.
+    let mut scratch =
+        RouterScratch::new(lock_io(&io).as_ref().map_or(0, |io| io.target_fanouts.len()));
 
     // Mints its own root and records the `flush` span, as `run_flush` does: a Lua `flush()` has
     // no single parent batch (`docs/adr/lua-flush-root-context.md`). The script's batch-scoped
     // globals are reset to that root first, so `flush()` reads what its emission goes out as.
+    // Returns `false` once `io` has been revoked.
     //
     // `diag` and `scratch` are parameters, not captures: the loop body also borrows both mutably,
     // and a capture would hold the borrow for the closure's lifetime.
-    let flush_now = |diag: &mut Diagnostics,
-                     worker: &ScriptWorker,
-                     fanout: &Fanout,
-                     target_fanouts: &[Fanout],
-                     scratch: &mut RouterScratch| {
+    let flush_now = |diag: &mut Diagnostics, worker: &ScriptWorker, scratch: &mut RouterScratch| {
         let ctx = BatchContext { trace: TraceContext::new_root(), provenance: flush_provenance };
         let mut span = telemetry.span(
             "flush",
@@ -1559,8 +1744,11 @@ fn run_lua_loop(
         // The same `now_unix_nanos()` `run_flush` hands `Transform::flush`, so a flush-driven
         // `Event.new{timestamp = now, ..}` is stamped like an aggregate window
         // (`docs/adr/lua-event-constructor.md`).
+        heartbeat.enter();
         let result = worker.flush(now_unix_nanos());
+        heartbeat.leave();
         drop(timer);
+        worker.expire_registry_values();
         // A script that wrote `resource` in `flush()` gives the emission that identity; `None`
         // keeps the empty root (an `Arc` clone, no allocation).
         let resource = worker.take_resource().unwrap_or_else(|| root_resource.clone());
@@ -1579,10 +1767,16 @@ fn run_lua_loop(
                     let slot = lua_slot_of(mark, scratch.dests.len());
                     scratch.dests[slot].push(event);
                 }
+                let guard = lock_io(&io);
+                let Some(io) = guard.as_ref() else {
+                    drop(guard);
+                    count_revoked(&mut scratch.dests, &telemetry);
+                    return false;
+                };
                 let sent = send_lua_partitions(
                     &mut scratch.dests,
-                    fanout,
-                    target_fanouts,
+                    &io.fanout,
+                    &io.target_fanouts,
                     &resource,
                     &scope,
                     ctx,
@@ -1597,35 +1791,48 @@ fn run_lua_loop(
                 span.error();
             }
         }
+        true
     };
 
     loop {
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
+                if !flush_now(&mut diag, &worker, &mut scratch) {
+                    return;
+                }
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
             }
         }
 
-        let batch = match next_flush {
-            None => inbox.blocking_recv(),
-            Some(deadline) => {
-                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-                // The `async` block is required: `tokio::time::timeout` builds its `Sleep` eagerly,
-                // which panics outside a runtime context. Inside the block it's built only once
-                // `block_on` has entered one.
-                match runtime.block_on(async { tokio::time::timeout(wait, inbox.recv()).await }) {
-                    Ok(batch) => batch,
-                    Err(_elapsed) => continue,
+        // The lock is held across the wait. The heartbeat is idle here, and the watcher only
+        // takes the lock from a busy node, so the two never contend.
+        let batch = {
+            let mut guard = lock_io(&io);
+            let Some(io) = guard.as_mut() else {
+                return;
+            };
+            match next_flush {
+                None => io.inbox.blocking_recv(),
+                Some(deadline) => {
+                    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    // The `async` block is required: `tokio::time::timeout` builds its `Sleep`
+                    // eagerly, which panics outside a runtime context. Inside the block it's
+                    // built only once `block_on` has entered one.
+                    match runtime
+                        .block_on(async { tokio::time::timeout(wait, io.inbox.recv()).await })
+                    {
+                        Ok(batch) => batch,
+                        Err(_elapsed) => continue,
+                    }
                 }
             }
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
+                flush_now(&mut diag, &worker, &mut scratch);
             }
             return;
         };
@@ -1668,6 +1875,7 @@ fn run_lua_loop(
         let mut errors: u64 = 0;
         let slots = scratch.dests.len();
         for event in batch.events {
+            heartbeat.enter();
             match worker.process(event) {
                 Ok(ProcessOutcome::Emit(e, mark)) => {
                     scratch.dests[lua_slot_of(mark, slots)].push(*e);
@@ -1691,7 +1899,9 @@ fn run_lua_loop(
                 }
             }
         }
+        heartbeat.leave();
         drop(process_timer);
+        worker.expire_registry_values();
         // Once per batch: how a script leaking VM-side state becomes visible
         // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
@@ -1715,18 +1925,39 @@ fn run_lua_loop(
         // Unwritten falls back to the batch's own scope, which may itself be `None`.
         let scope = worker.take_scope().or_else(|| batch.scope.clone());
         // One send per non-empty destination, all under the one `ctx`, as in `run_router`.
+        let guard = lock_io(&io);
+        let Some(io) = guard.as_ref() else {
+            drop(guard);
+            count_revoked(&mut scratch.dests, &telemetry);
+            return;
+        };
         let sent = send_lua_partitions(
             &mut scratch.dests,
-            &fanout,
-            &target_fanouts,
+            &io.fanout,
+            &io.target_fanouts,
             &resource,
             &scope,
             ctx,
             &telemetry,
         );
+        drop(guard);
         if sent > 0 {
             span.events(sent);
         }
+    }
+}
+
+/// Counts what a revoked node produced but can no longer send as
+/// `events.dropped{reason="closed_consumer"}`: its consumers are gone, as they would be for a
+/// `Fanout` sending into closed inboxes.
+fn count_revoked(dests: &mut [Vec<Event>], telemetry: &Telemetry) {
+    let lost: usize = dests.iter_mut().map(|d| std::mem::take(d).len()).sum();
+    if lost > 0 {
+        telemetry.count(
+            "logit.component.events.dropped",
+            lost as f64,
+            &[("reason", "closed_consumer")],
+        );
     }
 }
 
@@ -2002,6 +2233,7 @@ mod tests {
                     r#"function process(event) event.attributes.tagged = "yes" return event end"#
                         .to_string(),
                 interval: None,
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         specs.insert(
@@ -2890,6 +3122,7 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) return {event, event:clone()} end".to_string(),
                 interval: None,
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         specs.insert(
@@ -3022,7 +3255,10 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+        );
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3120,7 +3356,10 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+        );
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3237,6 +3476,7 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) error('boom') end".to_string(),
                 interval: None,
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         specs.insert(
@@ -3338,7 +3578,10 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua { script, interval: None, runtime: LuaRuntimeConfig::default() },
+        );
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3432,6 +3675,7 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) return event end".to_string(),
                 interval: Some(Duration::from_secs(3600)),
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         let (result_tx, _result_rx) = std::sync::mpsc::channel();
@@ -5753,6 +5997,7 @@ mod tests {
                 // zero interval from config, so only the spec carries it. If a runtime guard
                 // lands, find a new vector rather than relaxing the assertions.
                 interval: Some(Duration::ZERO),
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         let (tx, _out_rx) = std::sync::mpsc::channel();
@@ -5834,6 +6079,7 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) return event end".to_string(),
                 interval: None,
+                runtime: LuaRuntimeConfig::default(),
             },
         );
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -5892,29 +6138,912 @@ mod tests {
         );
     }
 
+    // -- `watch_lua_thread` against a hand-driven heartbeat. No Lua thread, so paused time is
+    //    safe here; the tests further down that run a real Lua thread use real time.
+
+    /// A watcher's inputs besides `done_rx`, kept alive by the test so nothing closes under it.
+    struct WatcherRig {
+        heartbeat: Arc<Heartbeat>,
+        io: SharedLuaIo,
+        /// The sending half of the `io`'s inbox, to observe revocation (`is_closed`).
+        inbox_tx: mpsc::Sender<Delivered>,
+        shutdown_tx: watch::Sender<bool>,
+        readiness: Readiness,
+        rx: watch::Receiver<crate::readiness::PipelineState>,
+    }
+
+    fn watcher_rig() -> WatcherRig {
+        let (inbox_tx, inbox) = mpsc::channel(1);
+        let io = Arc::new(std::sync::Mutex::new(Some(LuaIo {
+            inbox,
+            fanout: Fanout::new(Vec::new()),
+            target_fanouts: Vec::new(),
+        })));
+        let (shutdown_tx, _) = watch::channel(false);
+        let (readiness, rx) = Readiness::channel();
+        readiness.begin(&["enrich".to_string()]);
+        readiness.set_node("enrich", NodeState::Running);
+        WatcherRig {
+            heartbeat: Arc::new(Heartbeat::new()),
+            io,
+            inbox_tx,
+            shutdown_tx,
+            readiness,
+            rx,
+        }
+    }
+
+    fn spawn_watcher(
+        rig: &WatcherRig,
+        done_rx: oneshot::Receiver<Result<(), String>>,
+        config: LuaRuntimeConfig,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(watch_lua_thread(
+            "enrich".to_string(),
+            done_rx,
+            rig.heartbeat.clone(),
+            rig.io.clone(),
+            config,
+            rig.shutdown_tx.subscribe(),
+            rig.readiness.clone(),
+            Diagnostics::new("enrich"),
+        ))
+    }
+
+    fn enrich_state(rig: &WatcherRig) -> Option<NodeState> {
+        rig.rx.borrow().components.get("enrich").copied()
+    }
+
     /// A clean report is `Ok`; a panic report or a dropped sender is an error naming the node.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_lua_thread_maps_each_outcome() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig::default();
+
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(())).expect("receiver alive");
-        watch_lua_thread("enrich".to_string(), rx).await.expect("a clean report is Ok");
+        spawn_watcher(&rig, rx, config).await.unwrap().expect("a clean report is Ok");
 
         let (tx, rx) = oneshot::channel();
         tx.send(Err("thread panicked: boom".to_string())).expect("receiver alive");
-        let err = watch_lua_thread("enrich".to_string(), rx)
-            .await
-            .expect_err("a panic report is an error");
+        let err =
+            spawn_watcher(&rig, rx, config).await.unwrap().expect_err("a panic report is an error");
         assert_eq!(err.to_string(), "component 'enrich': thread panicked: boom");
 
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
         drop(tx);
-        let err = watch_lua_thread("enrich".to_string(), rx)
+        let err = spawn_watcher(&rig, rx, config)
             .await
+            .unwrap()
             .expect_err("a dropped sender is an error, not a silent Ok");
         assert!(
             err.to_string().contains("without reporting"),
             "the defensive arm should say what happened: {err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_heartbeat_that_stops_advancing_is_stalled_and_resumes() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(100),
+            shutdown_grace: Duration::from_millis(100),
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        let watcher = spawn_watcher(&rig, done_rx, config);
+
+        rig.heartbeat.enter();
+        // Advancing more often than `stall_after` keeps it running however long the call lasts.
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            rig.heartbeat.tick();
+        }
+        assert_eq!(enrich_state(&rig), Some(NodeState::Running), "progress is never a stall");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Stalled));
+        assert!(rig.rx.borrow().has_stalled_node());
+
+        rig.heartbeat.tick();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Running), "one change clears the stall");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Stalled), "and a new pause stalls again");
+
+        assert!(lock_io(&rig.io).is_some(), "a stall without shutdown never revokes I/O");
+        done_tx.send(Ok(())).unwrap();
+        watcher.await.unwrap().expect("a clean report after a stall is still Ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_heartbeat_is_never_stalled() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(50),
+            shutdown_grace: Duration::from_millis(50),
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        let watcher = spawn_watcher(&rig, done_rx, config);
+
+        rig.heartbeat.enter();
+        rig.heartbeat.leave();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Running));
+
+        // Idle through shutdown too: a node parked outside a script call is never blamed.
+        rig.shutdown_tx.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Running));
+        assert!(!watcher.is_finished(), "an idle node is never wedged");
+        assert!(!rig.inbox_tx.is_closed(), "an idle node's I/O is never revoked");
+
+        done_tx.send(Ok(())).unwrap();
+        watcher.await.unwrap().expect("Ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_node_after_shutdown_has_its_io_revoked_and_fails() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig {
+            stall_after: Duration::from_secs(10),
+            shutdown_grace: Duration::from_millis(200),
+        };
+        let (_done_tx, done_rx) = oneshot::channel();
+        let watcher = spawn_watcher(&rig, done_rx, config);
+
+        rig.heartbeat.enter();
+        rig.shutdown_tx.send(true).unwrap();
+        // Progress after the signal moves the deadline: the grace runs from the later of the two.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        rig.heartbeat.tick();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!watcher.is_finished(), "300 ms after shutdown, but 150 ms after progress");
+        assert!(!rig.inbox_tx.is_closed());
+
+        let err = tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .expect("a wedged node fails within its grace")
+            .unwrap()
+            .expect_err("a wedge is an error");
+        let message = err.to_string();
+        assert!(message.contains("component 'enrich'"), "{message}");
+        assert!(message.contains("still inside process()/flush()"), "{message}");
+        assert!(lock_io(&rig.io).is_none(), "the watcher took the node's I/O");
+        assert!(rig.inbox_tx.is_closed(), "and dropping it closed the node's inbox");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick() {
+        let rig = watcher_rig();
+        let config = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(100),
+            shutdown_grace: Duration::from_secs(2),
+        };
+        let (_done_tx, done_rx) = oneshot::channel();
+        let watcher = spawn_watcher(&rig, done_rx, config);
+
+        rig.heartbeat.enter();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(enrich_state(&rig), Some(NodeState::Stalled));
+        assert!(!watcher.is_finished(), "no shutdown yet, so a stall alone never revokes");
+
+        let signalled = tokio::time::Instant::now();
+        rig.shutdown_tx.send(true).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("a stalled node is revoked")
+            .unwrap()
+            .expect_err("a wedge is an error");
+        let waited = signalled.elapsed();
+        assert!(
+            waited <= Duration::from_millis(100),
+            "revoked {waited:?} after the signal; its quiet time already exceeded the grace"
+        );
+        assert!(err.to_string().contains("still inside process()/flush()"), "{err}");
+        assert!(rig.inbox_tx.is_closed());
+    }
+
+    // -- A Lua node's stall and wedge path against a real Lua thread
+    //    (`docs/adr/lua-runaway-script-bounds.md`). Real time only: a paused runtime auto-advances
+    //    its clock whenever every task is idle, which it is while the Lua thread works on its own
+    //    OS thread, so the watcher would see minutes pass in a few real milliseconds and report
+    //    spurious stalls. A spinning `while true do end` thread outlives its test; nextest runs
+    //    each test in its own process, which reclaims it.
+
+    const SPIN_ON_SECOND_EVENT: &str = r#"
+        local seen = 0
+        function process(event)
+            seen = seen + 1
+            if seen > 1 then
+                while true do end
+            end
+            return event
+        end
+    "#;
+
+    fn one_counter_batch(name: &str) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![counter_event(name, 1.0)],
+        }
+    }
+
+    fn lua_spec(script: &str, interval: Option<Duration>, runtime: LuaRuntimeConfig) -> NodeSpec {
+        NodeSpec::Lua { script: script.to_string(), interval, runtime }
+    }
+
+    /// Sums counter `name` for `component` (optionally only under tag `key = value`) across
+    /// `events`.
+    fn counter_sum(
+        events: &[logit_core::Event],
+        component: &str,
+        name: &str,
+        tag: Option<(&str, &str)>,
+    ) -> f64 {
+        events
+            .iter()
+            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some(component))
+            .filter(|e| {
+                tag.is_none_or(|(k, v)| e.attributes.get(k).and_then(|x| x.as_str()) == Some(v))
+            })
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .filter_map(|m| match &m.kind {
+                MetricKind::Sum(s) => Some(s.value),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_infinite_loop_script_is_reported_stalled_and_degrades_readyz() {
+        let script = "function process(event) while true do end end";
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: script.to_string(), interval: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(OneShotInput { batch: Some(one_counter_batch("hits")) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        let runtime = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(50),
+            shutdown_grace: Duration::from_millis(100),
+        };
+        specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task =
+            tokio::spawn(run_with_telemetry(g, specs, HashMap::new(), readiness, async move {
+                let _ = shutdown_rx.await;
+            }));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            rx.wait_for(|s| s.components.get("enrich") == Some(&NodeState::Stalled)),
+        )
+        .await
+        .expect("a spinning script must be reported stalled")
+        .expect("readiness sender alive");
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Ready, "a stall moves no phase");
+        assert!(snapshot.has_stalled_node(), "which `/readyz` turns into `503 stalled`");
+
+        shutdown_tx.send(()).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("a wedged script must not hang shutdown")
+            .unwrap()
+            .expect_err("a wedged script fails the run");
+        assert!(matches!(err, RunError::Runtime(_)));
+        assert!(err.to_string().contains("enrich"), "{err}");
+    }
+
+    /// Feeds `before` at start; once shutdown fires, waits `after_shutdown` and sends `after`.
+    struct WedgeFeedInput {
+        before: Vec<EventBatch>,
+        after_shutdown: Duration,
+        after: Option<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for WedgeFeedInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            for batch in self.before.drain(..) {
+                sink.send(batch).await;
+            }
+            let _ = shutdown.wait_for(|&due| due).await;
+            tokio::time::sleep(self.after_shutdown).await;
+            if let Some(batch) = self.after.take() {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_with_a_wedged_script_revokes_its_io_and_returns_runtime_naming_it() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: SPIN_ON_SECOND_EVENT.to_string(), interval: None },
+            ),
+        );
+        components.insert(
+            "windowed".to_string(),
+            plain_component(
+                vec!["enrich".to_string()],
+                ComponentKind::Aggregate {
+                    interval: Duration::from_secs(3600),
+                    temporality: logit_config::AggregateTemporality::default(),
+                    series_retention: 5,
+                    max_retained_series: 10_000,
+                    distributions: logit_config::Distributions::default(),
+                    max_samples_per_series: 1000,
+                    sets: logit_config::Sets::default(),
+                    max_set_members_per_series: 1000,
+                },
+            ),
+        );
+        components.insert(
+            "out".to_string(),
+            plain_component(vec!["windowed".to_string()], influxdb_out()),
+        );
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(WedgeFeedInput {
+                    // The first passes through into the window; the second wedges the script.
+                    before: vec![one_counter_batch("kept"), one_counter_batch("wedge")],
+                    // Past the Lua node's default 2 s grace, so this send meets a revoked inbox.
+                    after_shutdown: Duration::from_millis(2500),
+                    after: Some(one_counter_batch("late")),
+                }),
+                InputRuntimeConfig { shutdown_grace: Duration::from_secs(5) },
+            ),
+        );
+        // Default graces everywhere but `stall_after`: the default Lua grace must be short enough
+        // that the window flushed after revocation still beats the sink's default grace. With
+        // `stall_after` below the grace, the node is revoked once its quiet time reaches 2 s.
+        let runtime =
+            LuaRuntimeConfig { stall_after: Duration::from_millis(50), ..Default::default() };
+        specs.insert("enrich".to_string(), lua_spec(SPIN_ON_SECOND_EVENT, None, runtime));
+        // The `aggregate` stand-in: holds everything until its close-time flush.
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Transform(Box::new(WindowingTransform {
+                interval: Duration::from_secs(3600),
+                buffered: Vec::new(),
+            })),
+        );
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "windowed", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+        let (readiness, mut rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task =
+            tokio::spawn(run_with_telemetry(g, specs, telemetry, readiness, async move {
+                let _ = shutdown_rx.await;
+            }));
+
+        // Shut down once the script is known to be spinning, so the wedge is certain.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            rx.wait_for(|s| s.components.get("enrich") == Some(&NodeState::Stalled)),
+        )
+        .await
+        .expect("the spinning script is reported stalled first")
+        .expect("readiness sender alive");
+        let started = std::time::Instant::now();
+        shutdown_tx.send(()).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("a wedged script must not hang shutdown")
+            .unwrap()
+            .expect_err("a wedged script fails the run");
+        let elapsed = started.elapsed();
+        // The input's own 2.5 s wait bounds the run from below; the wedge adds nothing past it.
+        assert!(elapsed < Duration::from_secs(4), "the run took {elapsed:?} after shutdown");
+        assert!(matches!(err, RunError::Runtime(_)), "a wedge is a runtime failure: {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("component 'enrich'"), "{message}");
+        assert!(message.contains("still inside process()/flush()"), "{message}");
+
+        let flushed: Vec<EventBatch> = out_rx.try_iter().collect();
+        let names: Vec<&str> = flushed
+            .iter()
+            .flat_map(|b| b.events.iter())
+            .flat_map(|e| e.metrics.iter())
+            .map(|m| logit_core::interner::resolve(m.name))
+            .collect();
+        assert_eq!(names, ["kept"], "the downstream window's close-time flush reached the sink");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_sum(
+                &events,
+                "in",
+                "logit.component.events.dropped",
+                Some(("reason", "closed_consumer"))
+            ),
+            1.0,
+            "the send after revocation meets a closed inbox and is counted"
+        );
+
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Failed);
+        assert_eq!(snapshot.components.get("enrich"), Some(&NodeState::Failed));
+        assert_eq!(snapshot.components.get("windowed"), Some(&NodeState::Finished));
+        assert_eq!(snapshot.components.get("out"), Some(&NodeState::Finished));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_progressing_flush_emitting_many_events_is_never_stalled() {
+        let script = r#"
+            function process(event) return nil end
+            function flush(now)
+                local out = {}
+                for i = 1, 100000 do
+                    out[i] = Event.new{timestamp = now, attributes = {i = i}}
+                end
+                return out
+            end
+        "#;
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        // Finishes at once, so the close-time `flush()` is the only work the node does.
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(one_counter_batch("hits")) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        // Well above scheduling noise on a loaded test run, well below the flush's own length.
+        let runtime = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(200),
+            shutdown_grace: Duration::from_millis(50),
+        };
+        specs.insert(
+            "enrich".to_string(),
+            lua_spec(script, Some(Duration::from_secs(3600)), runtime),
+        );
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> =
+            [("enrich".to_string(), registry.telemetry_for("enrich", "x", "x"))].into();
+        let (readiness, mut rx) = Readiness::channel();
+        // Records every state the node passes through, so a stall that clears again is seen.
+        let seen_stalled = tokio::spawn(async move {
+            let mut seen = false;
+            while rx.changed().await.is_ok() {
+                seen |=
+                    rx.borrow_and_update().components.get("enrich") == Some(&NodeState::Stalled);
+            }
+            seen
+        });
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_with_telemetry(g, specs, telemetry, readiness, std::future::pending()),
+        )
+        .await
+        .expect("the flush finishes")
+        .expect("a progressing flush is a clean run");
+        let took = started.elapsed();
+
+        let emitted: usize = out_rx.try_iter().map(|b| b.events.len()).sum();
+        assert_eq!(emitted, 100_000);
+        assert!(
+            took > Duration::from_millis(400),
+            "the flush must outlast `stall_after` for this test to mean anything: {took:?}"
+        );
+        assert!(!seen_stalled.await.unwrap(), "a flush making progress was reported stalled");
+        assert_eq!(
+            counter_sum(
+                &registry.drain(0),
+                "enrich",
+                "logit.component.diagnostics",
+                Some(("key", "script_stalled"))
+            ),
+            0.0
+        );
+    }
+
+    /// Pins an accepted residual (`docs/adr/lua-runaway-script-bounds.md`): each `Event.new`
+    /// advances the heartbeat, so a script constructing and discarding events in a loop reads as
+    /// progress however long it runs, the same as a large `flush()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loop_that_keeps_constructing_events_is_progress_not_a_stall() {
+        let script = r#"
+            function process(event)
+                for i = 1, 200000 do
+                    local discarded = Event.new{timestamp = "1", attributes = {i = i}}
+                end
+                return event
+            end
+        "#;
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: script.to_string(), interval: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(one_counter_batch("hits")) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        // Well above scheduling noise on a loaded test run, well below the loop's own length.
+        let runtime = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(100),
+            shutdown_grace: Duration::from_millis(20),
+        };
+        specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (readiness, mut rx) = Readiness::channel();
+        let seen_stalled = tokio::spawn(async move {
+            let mut seen = false;
+            while rx.changed().await.is_ok() {
+                seen |=
+                    rx.borrow_and_update().components.get("enrich") == Some(&NodeState::Stalled);
+            }
+            seen
+        });
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
+        )
+        .await
+        .expect("the loop finishes")
+        .expect("a constructing loop is a clean run");
+        let took = started.elapsed();
+
+        assert_eq!(out_rx.try_iter().map(|b| b.events.len()).sum::<usize>(), 1);
+        assert!(
+            took > Duration::from_millis(400),
+            "the loop must run for well over `stall_after` for this test to mean anything: {took:?}"
+        );
+        assert!(!seen_stalled.await.unwrap(), "a loop constructing events was reported stalled");
+    }
+
+    /// Never completes a send, so its store fills and its inbox backs up.
+    struct NeverOutput;
+
+    #[async_trait::async_trait]
+    impl Output for NeverOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok()
+    {
+        let script = "function process(event) return event end";
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: script.to_string(), interval: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let batches: Vec<EventBatch> = (0..200).map(|_| one_counter_batch("hits")).collect();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(BurstInput { batches }), InputRuntimeConfig::default()),
+        );
+        // A grace far below the sink's: if a parked send were read as a wedge, it would fire.
+        let runtime = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(50),
+            shutdown_grace: Duration::from_millis(50),
+        };
+        specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(NeverOutput),
+                SinkStoreConfig::Memory(SinkQueueConfig {
+                    max_batches: 2,
+                    max_bytes: u64::MAX,
+                    overflow: OverflowPolicy::Block,
+                }),
+                WriteLoopConfig {
+                    shutdown_grace: Duration::from_millis(300),
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["enrich", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+        let (readiness, rx) = Readiness::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task =
+            tokio::spawn(run_with_telemetry(g, specs, telemetry, readiness, async move {
+                let _ = shutdown_rx.await;
+            }));
+
+        // The Lua node has sent enough to fill the sink's store and inbox, so its next send parks.
+        let mut drained = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            drained.extend(registry.drain(0));
+            if counter_sum(&drained, "enrich", "logit.component.batches.sent", None) >= 66.0 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the Lua node never filled the sink");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Parked well past `stall_after` and the Lua grace, outside any script call.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(rx.borrow().components.get("enrich"), Some(&NodeState::Running));
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("the sink's grace unparks the Lua node")
+            .unwrap()
+            .expect("a node parked by backpressure is never wedged");
+        drained.extend(registry.drain(0));
+        assert_eq!(
+            counter_sum(
+                &drained,
+                "enrich",
+                "logit.component.diagnostics",
+                Some(("key", "script_stalled"))
+            ),
+            0.0
+        );
+        assert_eq!(rx.borrow().components.get("enrich"), Some(&NodeState::Finished));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_later_script_failing_to_load_returns_startup_promptly() {
+        let good = "function process(event) return event end";
+        let bad = "function process(event) return event";
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "a_ok".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua { script: good.to_string(), interval: None },
+            ),
+        );
+        components.insert(
+            "b_bad".to_string(),
+            plain_component(
+                vec!["a_ok".to_string()],
+                ComponentKind::Lua { script: bad.to_string(), interval: None },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["b_bad".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        // `a_ok` sorts first, so its thread is running when `b_bad` fails to load. The early
+        // return drops every `Sender` into `a_ok`'s inbox, so that thread exits on its own.
+        specs.insert("a_ok".to_string(), lua_spec(good, None, LuaRuntimeConfig::default()));
+        specs.insert("b_bad".to_string(), lua_spec(bad, None, LuaRuntimeConfig::default()));
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_with_telemetry(
+                g,
+                specs,
+                HashMap::new(),
+                Readiness::disabled(),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("a load failure must not hang")
+        .expect_err("a script that doesn't parse fails startup");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(matches!(err, RunError::Startup(_)), "a load failure is a startup failure");
+        assert!(err.to_string().contains("b_bad"), "the error names the failing script: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interval_tick_runs_flush_through_the_elapsed_branch() {
+        let script = r#"
+            function process(event) return event end
+            function flush(now) return {Event.new{timestamp = now, attributes = {tick = true}}} end
+        "#;
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_millis(50)),
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        // Sends nothing and never closes the inbox, so only the timeout branch can flush.
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            lua_spec(script, Some(Duration::from_millis(50)), LuaRuntimeConfig::default()),
+        );
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let run_task = tokio::spawn(run_with_telemetry(
+            g,
+            specs,
+            HashMap::new(),
+            Readiness::disabled(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let received = tokio::task::spawn_blocking(move || {
+            out_rx.recv_timeout(Duration::from_secs(10)).map(|b| b.events.len())
+        })
+        .await
+        .unwrap()
+        .expect("an interval tick's flush() emission reaches the sink");
+        assert_eq!(received, 1);
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("shutdown completes")
+            .unwrap()
+            .expect("a clean run");
     }
 
     /// A sustained permanent sink failure ends `run` with an error naming the sink.
@@ -7145,7 +8274,11 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+            NodeSpec::Lua {
+                script: SPLIT_SCRIPT.to_string(),
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("b".to_string(), NodeSpec::Target);
@@ -7222,7 +8355,11 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+            NodeSpec::Lua {
+                script: SPLIT_SCRIPT.to_string(),
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("b".to_string(), NodeSpec::Target);
@@ -7299,7 +8436,11 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua { script: script.to_string(), interval: None },
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: None,
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("sink_a".to_string(), recording_sink(tx_a));
@@ -7419,7 +8560,11 @@ mod tests {
         );
         specs.insert(
             "windowed".to_string(),
-            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: Some(Duration::from_secs(3600)),
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("sink_a".to_string(), recording_sink(tx_a));
@@ -7521,7 +8666,11 @@ mod tests {
         );
         specs.insert(
             "windowed".to_string(),
-            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: Some(Duration::from_secs(3600)),
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert(
             "watcher".to_string(),
@@ -7751,7 +8900,11 @@ mod tests {
         );
         specs.insert(
             "windowed".to_string(),
-            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+            NodeSpec::Lua {
+                script: script.to_string(),
+                interval: Some(Duration::from_secs(3600)),
+                runtime: LuaRuntimeConfig::default(),
+            },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("watcher".to_string(), NodeSpec::Transform(Box::new(RecordProvenance { tx })));
