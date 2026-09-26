@@ -628,8 +628,10 @@ points here and doesn't repeat the row
 | `tcp.rs`, `TcpListener`'s accept-error backoff | `biased`: `absorb_accept_error`, then `shutdown.wait_for` | Shutdown winning drops the backoff sleep | The error is counted before the first await, so only the wait is lost |
 | `tcp.rs`, `serve_connection` | `timeout_at(read_deadline, read_step)`, the earlier of the flush tick and the next-byte deadline | The deadline firing drops a `read_step` | `read_step` is cancel-safe (next row), so the tick loses no stream bytes |
 | `tcp.rs`, `read_step` | Unbiased: `read_buf`, `shutdown.changed()` | Shutdown winning drops a `read_buf` | `AsyncReadExt::read_buf` is cancel-safe: no bytes are consumed unless it returns. The caller's `*shutdown.borrow()` check covers a shutdown that fired before the iteration |
+| `tail/driver.rs`, `Tailer::run_until_shutdown` | Unbiased: `shutdown.wait_for`, `Watcher::next_wake`, and `sleep_until` on the poll, flush, and checkpoint deadlines (flush and checkpoint only when set) | The winner drops every other arm: a pending `next_wake`, the sleeps, and a `wait_for` | Each arm yields a plain `Outcome` and awaits nothing, and all async work runs after the `select!`. `InotifyWatcher::next_wake` parses a whole `read` into its `pending` buffer synchronously and awaits only readiness, so a dropped call loses no event. A dropped sleep loses nothing, because each deadline is state in the run loop and the next iteration re-arms it. A dropped `wait_for` loses no edge: the value stays `true`, and `drain`'s check reads it |
+| `tail/driver.rs`, `Tailer::drain` (shutdown check) | None: `*shutdown.borrow()` between two files' reads, not a `select!` | Nothing is cancelled. Shutdown returns `DrainEnd::Shutdown` before the next file's read, and the run loop does the final close, flush, and forced checkpoint | Shutdown isn't noticed while a read's lines are emitted, since an `emit` waiting on the downstream isn't raced against it. If `run_input`'s backstop drops the task there, the final flush and checkpoint don't run, and the restart replays from the last interval checkpoint: duplicates, never loss (`docs/known-gaps.md`, "File tailing and Docker logs") |
 
-The remaining rows land with the `drain/w4` and `drain/w5` workstreams.
+The remaining rows land with the `drain/w5` workstream.
 
 ## Backpressure: diamonds are the normal shape now
 

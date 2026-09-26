@@ -225,9 +225,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → #377 |
 | [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs` (`meminfo`/`listen_queue`) | findings → #282 |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs` (`sample_while`, `ReceiveBufferSampler`), `crates/logit-inputs/src/tcp.rs` (`AcceptQueueSampler`) | findings → #281, #282 |
-| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | in-progress (drain/w4) |
+| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #PRNUM |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs` (`InotifyWatcher`, `parse_events`) | findings → #283 |
-| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | in-progress (drain/w4) |
+| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #PRNUM |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | unreviewed |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
@@ -1695,15 +1695,32 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     is never lost.
   - `emit`'s `sink.send().await` inside the shutdown path can block; confirm what the runtime does
     when the grace expires there, and that nothing is half-sent.
-- **Observed concerns (unverified):** `TailBatching::shutdown_grace` (`crates/logit-inputs/src/tail/mod.rs`) is carried
+- **Observed concerns (unverified):** ~~`TailBatching::shutdown_grace` (`crates/logit-inputs/src/tail/mod.rs`) is carried
   into `TailConfig` but never read inside the tail driver — the grace is enforced only externally
   by the runtime. That's consistent with other listeners, but means the driver has no internal
-  bound on how long the final flush may block. Low-medium confidence that it matters.
+  bound on how long the final flush may block. Low-medium confidence that it matters.~~ Retired:
+  the field is removed (see "Verified" below).
 - **Existing coverage:** `shutdown_flushes_every_accumulator_and_writes_the_checkpoint_within_grace`
   (`driver.rs`), `an_unterminated_last_line_is_held_until_its_newline_arrives_and_emitted_on_close`
   (`driver.rs`), `a_partial_entry_is_emitted_on_close_rather_than_lost` (`docker.rs`).
 - **Priority:** P1 — correct in the tested paths; the untested interaction is an abort during a
   blocked final send.
+- **Verified (drain/w4, #PRNUM):** The close → flush → checkpoint ordering held: a final flush
+  parked on a full downstream and cut by the grace backstop leaves the last interval checkpoint in
+  place, so the restart duplicates and never skips
+  (`a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset`, which passed
+  before the change). Two ways the checkpoint could get ahead of delivery were real. `docker_in`'s
+  held fragments of an entry over 16 KiB are line-complete, so `pending_bytes()` excluded nothing
+  and an interval checkpoint covered them; `TailDecoder::held_bytes` now reports them and
+  `write_checkpoint` subtracts them (`an_interval_checkpoint_never_covers_a_held_fragment_line`,
+  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`). `reap_drained`
+  never dirtied the store, so a reaped inode's entry outlived it on disk and a reused inode could
+  resume past its first bytes; a reap now dirties it
+  (`a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it`). The
+  three dead `shutdown_grace` copies are removed; `InputRuntimeConfig::shutdown_grace` is the one.
+  Two gaps are documented, not fixed: the checkpoint is at-least-once only up to the downstream
+  in-memory queues (a sink's grace drop isn't replayed), and a rotated file still draining at
+  shutdown whose new name matches no pattern is orphaned on restart (`docs/known-gaps.md`).
 
 ### TAIL-07 — Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area
 - **Location:** `crates/logit-inputs/src/tail/watch.rs`, `mod inotify` (the module roughly doubled
@@ -1856,6 +1873,23 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   test that drives a long drain and asserts the checkpoint tick still lands.
 - **Priority:** P1 — correctness of the loop shape is well argued; the residual risk is timer
   starvation and cancel-safety of the hand-rolled wake future.
+- **Verified (drain/w4, #PRNUM):** Timer starvation was real. `drain` looped while any file made
+  progress, so a backlog against a slow downstream ran no poll, flush, or checkpoint tick until it
+  was done, and a grace-cut shutdown then replayed the whole backlog read so far. `drain` now takes
+  the earliest deadline and returns `DrainEnd::TimerDue` after a completed pass that finds it past,
+  and the run loop runs every due flush or checkpoint tick before the next pass, so a poll tick due
+  again after each long pass can't keep winning the random pick. Tests (paused time):
+  `a_checkpoint_tick_lands_while_a_long_backlog_is_still_being_drained`,
+  `a_flush_tick_lands_while_a_long_backlog_is_still_being_drained`, and
+  `shutdown_during_a_backlog_drain_with_a_parked_downstream_replays_at_most_one_chunk`; all three
+  fail without the fix. The cancel-safety invariants checked out: `InotifyWatcher::next_wake`
+  parses a whole `read` into `pending` before returning and awaits only readiness, a dropped
+  `wait_for` leaves the value `true` for the next poll and for `drain`'s `borrow()`, and each
+  deadline is loop state re-armed on the next iteration. `bind()`'s `expect` is unreachable:
+  `run_until_shutdown` calls `bind()` first, which leaves a watcher or returns `Err`. The one
+  shutdown bound left is documented in `docs/known-gaps.md`: shutdown is noticed only between two
+  files' reads, so a parked `emit` can hold it until the backstop. The `select!` and the `drain`
+  shutdown check have rows in `docs/design/pipeline-graph.md`'s "Cancellation points".
 
 ### TAIL-09 — Docker json-file envelope decode and 16 KiB partial-line reassembly
 - **Location:** `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder` and its

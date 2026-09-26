@@ -1901,6 +1901,23 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a volume moved to different storage, or a bind mount re-created from a snapshot resumes from the
   beginning instead of the checkpointed offset. Safe (at-least-once still holds), just not the
   seamless resume of the common case.
+- **The tail checkpoint is at-least-once only up to the downstream in-memory queues.** Shutdown
+  flushes every file's accumulator, then force-writes the checkpoint, so the offset covers every
+  line flushed into a sink's inbox. A sink that then drops that batch when its own grace runs out
+  (`logit.component.batches.dropped{reason="shutdown"}`) has lost it for good: the restart resumes
+  past it. A `buffer.disk:` sink spools the batch instead. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-26
+  amendment.
+- **The tail driver notices shutdown only between two files' reads.** One read is at most 64 KiB,
+  but its lines are emitted before the next check, each `emit` waiting on the downstream. Against a
+  slow or stalled downstream, `run_input`'s grace backstop can drop the task first, with no final
+  flush and no final checkpoint. Nothing is lost: the restart resumes from the last interval
+  checkpoint, which lands between passes even under a backlog, so it replays at most one
+  `checkpoint_interval` or one 64 KiB chunk per file.
+- **A rotated file still draining at shutdown is orphaned on restart if its new name matches no
+  pattern.** The shutdown checkpoint records its inode and offset, but the restart's scan never
+  finds the file, so the entry is never used and the file's unread tail is lost. A pattern that
+  also matches the rotated name (`app.log*`) avoids it.
 - **`inotify` doesn't reliably fire over network or FUSE-backed mounts** (NFS chief among them) —
   and `watch: auto` falls back to polling only on outright setup failure, not on a mount type it
   can't detect in advance. For a config on such a mount, set `watch: poll` explicitly rather than
