@@ -201,6 +201,18 @@ impl Samples {
         }
     }
 
+    /// Whether [`Samples::weight`] clamps this record: `round(1 / sample_rate)` exceeds
+    /// [`Samples::MAX_WEIGHT`] and there is at least one value to under-weight. A rate of exactly
+    /// `1 / MAX_WEIGHT` (`@0.001`) isn't clamped, and neither is a non-finite or non-positive rate,
+    /// which `weight` degrades to `1` rather than clamps. Consumers that report a clamp decide it
+    /// here, not by comparing `weight()` against `MAX_WEIGHT`.
+    pub fn is_clamped(&self) -> bool {
+        !self.values.is_empty()
+            && self.sample_rate.is_finite()
+            && self.sample_rate > 0.0
+            && (1.0 / self.sample_rate).round() > Self::MAX_WEIGHT as f64
+    }
+
     /// Sketches these observations into a fresh [`DdSketch`], each weighted by
     /// [`Samples::weight`]. Every consumer that summarizes a `Samples` (`aggregate`, and the OTLP,
     /// Prometheus, and Graphite encoders) goes through this, so they agree by construction.
@@ -1060,6 +1072,21 @@ mod tests {
         assert_eq!(record.flags, 0);
     }
 
+    #[test]
+    fn samples_is_clamped_only_past_max_weight_and_with_values() {
+        let with_rate =
+            |rate: f64| Samples { values: SmallVec::from_slice(&[1.0]), sample_rate: rate };
+        assert!(!with_rate(0.001).is_clamped(), "@0.001 is weight 1000, not clamped");
+        assert!(!with_rate(0.0010005).is_clamped(), "rounds to 1000 (999.5)");
+        assert!(with_rate(0.00099).is_clamped(), "rounds to 1010");
+        assert!(with_rate(1e-320).is_clamped(), "1 / rate overflows to infinity");
+        for rate in [1.0, 0.5, 2.0, 0.0, -0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!with_rate(rate).is_clamped(), "rate {rate}");
+        }
+        let empty = Samples { values: SmallVec::new(), sample_rate: 0.0001 };
+        assert!(!empty.is_clamped(), "no value is under-weighted");
+    }
+
     /// A NaN rate sketches every value once rather than dropping them.
     #[test]
     fn sketch_of_a_nan_rate_samples_still_counts_every_value() {
@@ -1429,6 +1456,71 @@ mod tests {
             fn hll_merge_estimates_what_inserting_both_does(a in members(), b in members()) {
                 let both: Vec<u32> = a.iter().chain(&b).copied().collect();
                 prop_assert_eq!(union(&hll_of(&a), &hll_of(&b)).estimate(), hll_of(&both).estimate());
+            }
+        }
+
+        /// A rate drawn from every `f64` bit pattern, with the edges `weight` special-cases
+        /// weighted in.
+        fn any_rate() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                4 => any::<u64>().prop_map(f64::from_bits),
+                1 => prop_oneof![
+                    Just(0.0),
+                    Just(-0.0),
+                    Just(f64::NAN),
+                    Just(f64::INFINITY),
+                    Just(f64::MIN_POSITIVE),
+                    Just(f64::from_bits(1)),
+                    Just(0.001),
+                    Just(0.00099),
+                    Just(0.0010005),
+                ],
+                2 => 1e-5..=1.5f64,
+            ]
+        }
+
+        fn finite_value() -> impl Strategy<Value = f64> {
+            prop_oneof![Just(0.0), -1e9..1e9f64]
+        }
+
+        fn any_value() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                4 => finite_value(),
+                1 => prop_oneof![Just(f64::NAN), Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
+            ]
+        }
+
+        // `Samples::weight` is the defense the sample rate needs: it's wire input, and the native
+        // decoder reads a bare `f64`.
+        proptest! {
+            #[test]
+            fn weight_is_within_one_and_max_weight_for_every_rate(rate in any_rate()) {
+                let s = Samples { values: SmallVec::from_slice(&[1.0]), sample_rate: rate };
+                prop_assert!((1..=Samples::MAX_WEIGHT).contains(&s.weight()), "rate {rate:e}");
+                if s.is_clamped() {
+                    prop_assert_eq!(s.weight(), Samples::MAX_WEIGHT);
+                }
+            }
+
+            #[test]
+            fn sketch_counts_every_finite_value_at_its_weight(
+                rate in any_rate(),
+                values in prop::collection::vec(finite_value(), 0..40),
+            ) {
+                let s = Samples { values: SmallVec::from_vec(values), sample_rate: rate };
+                prop_assert_eq!(s.sketch().count() as u64, s.values.len() as u64 * s.weight());
+            }
+
+            /// A non-finite value has no bin: `DdSketch::add_count` drops it, so the sketch counts
+            /// only the finite ones. `aggregate` counts what it drops this way.
+            #[test]
+            fn sketch_drops_non_finite_values(
+                rate in any_rate(),
+                values in prop::collection::vec(any_value(), 0..40),
+            ) {
+                let s = Samples { values: SmallVec::from_vec(values), sample_rate: rate };
+                let finite = s.values.iter().filter(|v| v.is_finite()).count() as u64;
+                prop_assert_eq!(s.sketch().count() as u64, finite * s.weight());
             }
         }
     }

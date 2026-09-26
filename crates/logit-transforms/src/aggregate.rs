@@ -391,6 +391,22 @@ fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
         && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
 }
 
+/// Adds `samples` to `sketch` value by value at [`Samples::weight`], the fold [`Samples::sketch`]
+/// does, without building a temporary `DdSketch`. Returns how many values were non-finite:
+/// `DdSketch::add_count` drops those, since a `NaN` or infinite observation has no bin.
+fn sketch_samples(sketch: &mut logit_core::DdSketch, samples: &Samples) -> u32 {
+    let weight = samples.weight();
+    let mut non_finite = 0;
+    for v in &samples.values {
+        if v.is_finite() {
+            sketch.add_weighted(*v, weight);
+        } else {
+            non_finite += 1;
+        }
+    }
+    non_finite
+}
+
 /// Whether a histogram's buckets hold any observation. A record that observed nothing has no
 /// `min`/`max` to contribute, so [`fold_extreme`] skips it.
 fn observed(buckets: &[(f64, u64)]) -> bool {
@@ -587,7 +603,10 @@ impl Aggregator {
             });
 
             // Set inside the merge match, reported after it: the match can't borrow `self`.
-            let mut samples_weight_clamped = false;
+            // Records whose sample rate `Samples::is_clamped`, held or incoming, and values a
+            // sketch dropped as non-finite.
+            let mut samples_clamped: u32 = 0;
+            let mut samples_non_finite: u32 = 0;
             let mut samples_fallback_reason: Option<&'static str> = None;
             let mut set_members_fallback = false;
             let mut histogram_bounds_mismatch = false;
@@ -679,7 +698,9 @@ impl Aggregator {
                     // an upstream `aggregate`): sketch what's held and merge.
                     Accumulator::Samples(held) => {
                         let held_owned = std::mem::take(held);
-                        let mut sketch = held_owned.sketch();
+                        let mut sketch = logit_core::DdSketch::new();
+                        samples_non_finite += sketch_samples(&mut sketch, &held_owned);
+                        samples_clamped += u32::from(held_owned.is_clamped());
                         sketch.merge(incoming);
                         state.accumulator = Accumulator::Distribution(sketch);
                         true
@@ -694,49 +715,36 @@ impl Aggregator {
                     // Per-value `add_weighted`, not `sketch.merge(&incoming.sketch())`, which
                     // would allocate a temporary `DdSketch` only to fold it in.
                     Accumulator::Distribution(sketch) => {
-                        let weight = incoming.weight();
-                        for v in &incoming.values {
-                            sketch.add_weighted(*v, weight);
-                        }
-                        if weight == Samples::MAX_WEIGHT {
-                            samples_weight_clamped = true;
-                        }
+                        samples_non_finite += sketch_samples(sketch, incoming);
+                        samples_clamped += u32::from(incoming.is_clamped());
                         true
                     }
                     // `distributions: samples`: concatenate while the rate agrees and the cap
-                    // holds; otherwise sketch `held` plus `incoming` and record why.
+                    // holds; otherwise sketch `held` plus `incoming` and record why. A clamp on
+                    // the held records is reported here, when their weight is first applied.
                     Accumulator::Samples(held) => {
-                        if held.sample_rate != incoming.sample_rate {
-                            let held_owned = std::mem::take(held);
-                            let mut sketch = held_owned.sketch();
-                            let weight = incoming.weight();
-                            for v in &incoming.values {
-                                sketch.add_weighted(*v, weight);
-                            }
-                            if weight == Samples::MAX_WEIGHT {
-                                samples_weight_clamped = true;
-                            }
-                            state.accumulator = Accumulator::Distribution(sketch);
-                            samples_fallback_reason = Some("rate_mismatch");
-                            true
+                        let fallback = if held.sample_rate != incoming.sample_rate {
+                            Some("rate_mismatch")
                         } else if held.values.len() + incoming.values.len() > max_samples_per_series
                         {
-                            let held_owned = std::mem::take(held);
-                            let mut sketch = held_owned.sketch();
-                            let weight = incoming.weight();
-                            for v in &incoming.values {
-                                sketch.add_weighted(*v, weight);
-                            }
-                            if weight == Samples::MAX_WEIGHT {
-                                samples_weight_clamped = true;
-                            }
-                            state.accumulator = Accumulator::Distribution(sketch);
-                            samples_fallback_reason = Some("cap");
-                            true
+                            Some("cap")
                         } else {
-                            held.values.extend(incoming.values.iter().copied());
-                            true
+                            None
+                        };
+                        match fallback {
+                            None => held.values.extend(incoming.values.iter().copied()),
+                            Some(reason) => {
+                                let held_owned = std::mem::take(held);
+                                let mut sketch = logit_core::DdSketch::new();
+                                for side in [&held_owned, incoming] {
+                                    samples_non_finite += sketch_samples(&mut sketch, side);
+                                    samples_clamped += u32::from(side.is_clamped());
+                                }
+                                state.accumulator = Accumulator::Distribution(sketch);
+                                samples_fallback_reason = Some(reason);
+                            }
                         }
+                        true
                     }
                     _ => false,
                 },
@@ -815,10 +823,21 @@ impl Aggregator {
                         ),
                     );
                 }
-                if samples_weight_clamped {
+                if samples_non_finite > 0 {
+                    self.telemetry.count(
+                        "logit.transform.samples.non_finite_dropped",
+                        f64::from(samples_non_finite),
+                        &[],
+                    );
+                }
+                if samples_clamped > 0 {
                     // The one place a sample rate implying more than `Samples::MAX_WEIGHT`
                     // observations per value is noticed: `statsd_in` doesn't sketch or clamp.
-                    self.telemetry.count("logit.transform.samples.weight_clamped", 1.0, &[]);
+                    self.telemetry.count(
+                        "logit.transform.samples.weight_clamped",
+                        f64::from(samples_clamped),
+                        &[],
+                    );
                     self.diag.warn_throttled(
                         "sample_rate_clamped",
                         format_args!(
@@ -3617,13 +3636,18 @@ mod tests {
             .unwrap_or(0.0)
     }
 
-    fn absorbed(events: &[Event]) -> f64 {
+    /// Every `name` counter in drained telemetry, whatever its tags, summed.
+    fn counter_total(events: &[Event], name: &str) -> f64 {
         events
             .iter()
             .flat_map(|e| &e.metrics)
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.transform.metrics.absorbed")
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
             .map(|m| counter_value(&m.kind))
             .sum()
+    }
+
+    fn absorbed(events: &[Event]) -> f64 {
+        counter_total(events, "logit.transform.metrics.absorbed")
     }
 
     /// Every record `process` receives is absorbed or passed through under one reason, and the
@@ -3746,6 +3770,71 @@ mod tests {
             assert_eq!(emitted.min, Some(0.5), "empty first: {empty_first}");
             assert_eq!(emitted.max, Some(2.0), "empty first: {empty_first}");
             assert_eq!(emitted.sum, Some(3.0));
+        }
+    }
+
+    fn samples_at(rate: f64, values: &[f64]) -> MetricKind {
+        MetricKind::Samples(Samples { values: values.iter().copied().collect(), sample_rate: rate })
+    }
+
+    fn with_registry(agg: Aggregator) -> (Aggregator, Arc<logit_core::Registry>) {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let diag = Diagnostics::default().with_telemetry(telemetry.clone());
+        (agg.with_diagnostics(diag).with_telemetry(telemetry), registry)
+    }
+
+    fn weight_clamped(events: &[Event]) -> f64 {
+        counter_total(events, "logit.transform.samples.weight_clamped")
+    }
+
+    /// `@0.001` is weight 1000, the largest unclamped one; `@0.00099` rounds to 1010 and clamps;
+    /// a record with no values under-weights nothing.
+    #[test]
+    fn weight_clamped_fires_only_past_max_weight_and_with_values() {
+        let resource = default_resource();
+        for (rate, values, expected) in
+            [(0.001, &[1.0][..], 0.0), (0.00099, &[1.0][..], 1.0), (0.0001, &[][..], 0.0)]
+        {
+            let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+            feed(&mut agg, &resource, metric_event("t", samples_at(rate, values), 0));
+            let events = registry.drain(0);
+            assert_eq!(weight_clamped(&events), expected, "rate {rate}, values {values:?}");
+        }
+    }
+
+    /// A clamped record held raw under `distributions: samples` is reported when the series falls
+    /// back and its weight is first applied.
+    #[test]
+    fn a_held_clamped_record_is_reported_at_fallback() {
+        let resource = default_resource();
+        let (agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 100),
+        );
+        let mut agg = agg;
+        feed(&mut agg, &resource, metric_event("t", samples_at(0.0001, &[1.0]), 0));
+        feed(&mut agg, &resource, metric_event("t", samples_at(0.5, &[1.0]), 0));
+        let events = registry.drain(0);
+        assert_eq!(weight_clamped(&events), 1.0, "the held @0.0001 record");
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1000 + 2),
+            other => panic!("expected a Distribution, got {other:?}"),
+        }
+    }
+
+    /// A non-finite sample has no bin; the sketch drops it and `aggregate` counts it.
+    #[test]
+    fn non_finite_samples_are_dropped_from_the_sketch_and_counted() {
+        let resource = default_resource();
+        let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+        let values = [1.0, f64::NAN, f64::INFINITY];
+        feed(&mut agg, &resource, metric_event("t", samples_at(1.0, &values), 0));
+        let events = registry.drain(0);
+        assert_eq!(counter_total(&events, "logit.transform.samples.non_finite_dropped"), 2.0);
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
+            other => panic!("expected a Distribution, got {other:?}"),
         }
     }
 }
