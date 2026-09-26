@@ -2138,9 +2138,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   process. Each closes as its workstream lands: the stall heartbeat and wedge detection
   (`luab/w3`), `max_memory` (`luab/w4`), the table-depth cap and raw table reads (`luab/w1`),
   `newproxy`'s removal (`luab/w2`). Standing residuals that remain once every workstream has
-  landed: interner growth from script-derived strings (`Event.new`'s and the proxy setters'
-  name/unit/description fields, and nested attribute keys); a shared-table DAG still converts at
-  2^k nodes, since the depth cap bounds nesting, not size; pure-Lua recursion through Rust/C
+  landed, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md): interner growth
+  from script-derived strings (`Event.new`'s and the proxy setters' `name`/`unit`/`description`/
+  `event_name` fields, and nested attribute keys); a shared-table DAG still converts at 2^k
+  nodes, since the depth cap bounds nesting, not size; pure-Lua recursion through Rust/C
   frames can still abort the process past the larger stack; and a loop that keeps calling
   `Event.new` advances the stall heartbeat and is never caught as a stall, so only its
   memory-retaining form is bounded, by `max_memory`.
