@@ -88,7 +88,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    - Per UDP listener: `logit.input.datagrams == datagrams decoded + Σ
      logit.component.datagrams.dropped{reason}`. A decoded datagram is one
      `logit.component.receive.latency` sample.
-   - Two losses are named exceptions, left uncounted and listed in `docs/known-gaps.md`. The first
+   - Two losses are named exceptions, left uncounted and to be listed in `docs/known-gaps.md`. The first
      is a UDP listener's decoded events that the grace backstop drops, either held in the
      `BatchAccumulator` or parked in `emit`'s `Fanout::send`. Their datagrams already count as
      decoded, so the datagram contract still holds. The second is a batch sent into a revoked Lua
@@ -96,7 +96,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
 2. **`drain complete`'s `batches_dropped` is the sum of every `reason="shutdown"` batch drop.**
    One helper, `count_shutdown_drop`, will be the only site that counts
    `batches.dropped`/`events.dropped{reason="shutdown"}` and the only site that adds to
-   `shutdown_dropped_batches`. Its callers are the `run_output` sweep, `finish_and_flush`,
+   `shutdown_dropped_batches`. Its callers will be the `run_output` sweep, `finish_and_flush`,
    `write_loop`, and `revoke_lua_io`.
 3. **A send cut off by the shutdown grace is `Fault::Ambiguous`.** The destination may have
    received it, and the existing `is_retryable(Fault::Ambiguous, posture)` table decides what
