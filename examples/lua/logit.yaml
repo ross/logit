@@ -1,0 +1,93 @@
+# A Lua stage turning one application's log stream into alerts, an archive, and metrics. A web
+# shop's API sends one logfmt line per request over syslog:
+#
+#   level=info msg=request method=GET path=/api/orders/42 status=200 dur=12ms user=alice
+#
+# and process.lua, beside this file, decides what each line becomes:
+#
+#   alerts   the first server error per route and status each interval, plus a count of the
+#            repeats                                                  -> alerts_out
+#   archive  every other line, with route, status, and duration added; passing health
+#            checks dropped                                           -> archive_out
+#   stats    per-route requests, errors, and latencies, and distinct users, each interval
+#                                                                     -> window -> stats_out
+#
+#   shop API -> syslog_in :5140/udp -> parse -> shop -> errors -> alerts_out
+#                                                   -> stats  -> window -> stats_out
+#                                                   -> archive_out
+#
+# `logit validate logit.yaml` checks this file but doesn't load process.lua; `logit run` loads
+# it and fails at startup if it doesn't compile. Draw the graph with
+# `logit graph logit.yaml | dot -Tsvg > graph.svg`.
+
+# /readyz and /healthz for a container or Kubernetes probe. No TLS and no auth: keep this port
+# off public networks.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  # --- Input ---------------------------------------------------------------------------------
+
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+
+  # Splits each line into attributes. Every value stays a string (`status=200` becomes "200"),
+  # so the script converts what it does arithmetic on.
+  parse:
+    type: logfmt
+    sources: [syslog_in]
+
+  # --- Lua -----------------------------------------------------------------------------------
+
+  # A relative `lua_file` resolves against this file's directory. `targets:` lists where the
+  # script may send an event with event:to("..."); an event it returns unmarked goes to the
+  # components that list `shop` in their sources, here archive_out. `interval:` is how often
+  # the script's flush() runs.
+  shop:
+    type: lua_file
+    sources: [parse]
+    lua_file: process.lua
+    interval: 10s
+    targets: [errors, stats]
+
+  errors:
+    type: target
+
+  stats:
+    type: target
+
+  # --- Alerts and archive --------------------------------------------------------------------
+
+  # Point both endpoints at your own receivers. `structured_data` sends each event's attributes
+  # (the parsed fields and the ones the script added) as RFC 5424 structured data, so a receiver
+  # can filter on http.route without parsing the message. 32473 is RFC 5424's example enterprise
+  # number; use your organization's.
+  alerts_out:
+    type: syslog_out
+    sources: [errors]
+    endpoint: 127.0.0.1:5514
+    # The APP-NAME for flush()'s summary lines, which carry no syslog.tag of their own.
+    app_name: shop-api
+    structured_data:
+      sd_id: shop@32473
+
+  archive_out:
+    type: syslog_out
+    sources: [shop]
+    endpoint: 127.0.0.1:5515
+    structured_data:
+      sd_id: shop@32473
+
+  # --- Stats ---------------------------------------------------------------------------------
+
+  # The script emits raw durations and user names; this window folds each route's durations
+  # into a distribution (quantiles, not every value) and the users into a distinct count.
+  window:
+    type: aggregate
+    sources: [stats]
+    interval: 10s
+
+  stats_out:
+    type: stdio_out
+    sources: [window]
