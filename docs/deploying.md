@@ -97,7 +97,7 @@ configured, answers readiness and liveness probes. See
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal). |
+| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal), a `lua`/`lua_file` component's VM still over its `max_memory` after a full garbage collection (logged `memory_limit_exceeded`), or a script still wedged inside `process()`/`flush()` with no progress 2 s after shutdown began, which `logit` exits without (see [What to watch on `/readyz`](#what-to-watch-on-readyz)). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 To enable the probe endpoint, add a top-level `admin:` block:
@@ -116,15 +116,19 @@ across a real network boundary.
 - `503 starting` before that.
 - `503 draining` after a shutdown signal.
 - `503 degraded` if any node has exited with an error while the process is still draining.
+- `503 stalled` while the process is otherwise ready but a `lua`/`lua_file` component is
+  `stalled` (below). A stall clears on its own: the probe reads `200 ok` again once the script
+  makes progress. `draining` and `degraded` win over it.
 
 `GET /healthz` returns `200 ok` whenever the admin task itself can answer, regardless of the
 pipeline's state.
 
 Add `?format=json` to `/readyz` for `{status, since, components: {id: "pending"|"bound"|
-"running"|"finished"|"failed"|"alias"}}` instead of the bare status word. `/healthz?format=json`
-returns only `{status}`, since it has nothing else to report. A `target` component
-([ADR `target-components`](adr/target-components.md)) is always `alias` and nothing else: it has no
-task and no inbox, only a name for its routers' outbound edges, so its liveness is theirs.
+"running"|"stalled"|"finished"|"failed"|"alias"}}` instead of the bare status word.
+`/healthz?format=json` returns only `{status}`, since it has nothing else to report. A `target`
+component ([ADR `target-components`](adr/target-components.md)) is always `alias` and nothing else:
+it has no task and no inbox, only a name for its routers' outbound edges, so its liveness is
+theirs.
 
 In Kubernetes, map the two routes onto the two probes:
 
@@ -153,6 +157,22 @@ configured).
 - **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
   [Sink failure semantics](#sink-failure-semantics-degrade-to-dropping-dont-exit) for what does
   and doesn't trip it.
+- **`/readyz` at `503 stalled`** means a `lua`/`lua_file` script has been inside one
+  `process()`/`flush()` call for 10 s with no progress: an infinite loop, or a pathological pattern
+  match. The self-log carries a `script_stalled` warning naming the component. A script that is
+  slow but still producing events (a `flush()` building a large table with `Event.new`) is
+  progress, and never reads `stalled`; so is a script looping over `Event.new` forever, which
+  nothing detects. `/healthz` stays `200`: the process is alive, and a restart alone doesn't fix a
+  script. The shipped image's `HEALTHCHECK` probes `/readyz` (`logit ready`), though, so a stalled
+  script marks the container unhealthy: Swarm restarts it, and Kubernetes, probing `/readyz` for
+  readiness, takes the pod out of its Service endpoints until the script resumes.
+- **Exit code `2` naming a component "still inside process()/flush() ... after shutdown began"**
+  means a script made no progress for 2 s after the signal (or after its last progress, whichever
+  is later); a script already `stalled` when the signal arrives has been quiet longer than that,
+  and is let go at once. `logit` closes that component's channels, so everything downstream of it
+  still drains and flushes normally; what was waiting for it, and anything sent to it afterwards,
+  is counted as dropped. It then exits without it. 2 s is shorter than a sink's 5 s
+  `buffer.shutdown_grace`, so a window flushed downstream of the script still reaches its sink.
 - **`/readyz` never returning `200` within the orchestrator's startup timeout** means a listener,
   or a listening sink like `prometheus_out`, can't bind, or a Lua script fails to load. Check the
   `starting`/`bound`/`ready` lifecycle log lines in [Self-logging](#self-logging).
