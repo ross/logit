@@ -547,13 +547,13 @@ contract. Where the code doesn't meet it yet, the entry names the workstream tha
 - The attribute set as a whole is order-independent: `AttrMap::iter()` yields keys in `Symbol`
   order, whatever order they were inserted in.
 
-**Resource and scope grouping use the same rule.** Scope already does: `scope_key_eq` compares
-attributes through `value_key_eq`. Resource doesn't yet: `group_for` compares resources with
-`Resource`'s derived `PartialEq`, so a `NaN` resource attribute never equals itself, even through
-the same `Arc`. Every metric carrying such a resource opens a new `ResourceGroup`, lengthens
-`group_for`'s scan, and is emitted unaggregated at the flush. An OTLP double resource attribute
-reaches this path. `agg/w1` makes `group_for` compare `Arc::ptr_eq` first and then bitwise, as
-`scope_key_eq` does.
+**Resource and scope grouping use the same rule.** `group_for` finds a metric's group with
+`resource_key_eq` and `scope_key_eq`. Each tries `Arc::ptr_eq` first, then compares every field,
+attributes through `attr_map_key_eq`. `Resource`'s derived `PartialEq` would judge a `NaN`
+resource attribute unequal to itself, even through the same `Arc`, so every metric carrying it
+would open a new `ResourceGroup` and be emitted unaggregated; an OTLP double resource attribute
+reaches this path. It would also merge a `-0.0` resource with a `0.0` one, which series identity
+keeps apart.
 
 ### Merge laws
 
@@ -715,9 +715,13 @@ rule that summarization is opt-in and named.
 `max_retained_series` bounds series, not groups. The number of distinct `(resource, scope)`
 groups within one window is unbounded, and `group_for` scans them linearly with a full resource
 compare on every absorbed metric. A realistic count reaches the thousands (an `otlp_in` gateway,
-or `prometheus_in` with a resource per scrape target). `agg/w1` measures absorb cost at 1, 100,
-and 1000 groups. Any cache, index, or cap is decided by that number, in its own change with its
-own allocation pins.
+or `prometheus_in` with a resource per scrape target).
+
+`crates/logit-bench`'s `aggregate_absorb_with_groups` measures it, one gauge per event with the
+resource rotating per event, on one core: about 137 ns per event at 1 group, 877 ns at 100, and
+8.6 µs at 1000. The scan dominates from 100 groups on, at about 7.5 ns per group compared. The
+`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. A cache,
+index, or cap is a separate decision, in its own change with its own allocation pins.
 
 ### Start time after a cap eviction
 
