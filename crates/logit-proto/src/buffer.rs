@@ -61,6 +61,10 @@ pub struct InMemoryBuffer<T> {
     items: VecDeque<(T, u64)>,
     max_len: usize,
     max_weight: u64,
+    /// The held items' weights, summed saturating and reduced saturating: exact whenever the true
+    /// sum fits in a `u64`, otherwise at most the true sum, so `len == 0` always means
+    /// `weight == 0`. Unchecked arithmetic would panic under the caller's lock in debug builds, or
+    /// wrap in release and leave a `Block` push waiting forever on an empty queue.
     weight: u64,
     overflow: OverflowPolicy,
     /// Set by `peek`, cleared by `commit`; while set, `items[0]` is never evicted.
@@ -84,7 +88,7 @@ impl<T> InMemoryBuffer<T> {
 
     /// Whether one more item of `weight` bytes would trip either bound.
     fn would_overflow(&self, weight: u64) -> bool {
-        self.items.len() >= self.max_len || self.weight + weight > self.max_weight
+        self.items.len() >= self.max_len || self.weight.saturating_add(weight) > self.max_weight
     }
 
     /// Evicts from the front until `weight` fits or nothing but a reserved head is left. Returns
@@ -100,7 +104,7 @@ impl<T> InMemoryBuffer<T> {
             let Some((item, item_weight)) = self.items.remove(evict_at) else {
                 break; // unreachable given the length check above; defensive, not a real path
             };
-            self.weight -= item_weight;
+            self.weight = self.weight.saturating_sub(item_weight);
             evicted.push(item);
         }
         evicted
@@ -111,14 +115,14 @@ impl<T> Buffer<T> for InMemoryBuffer<T> {
     fn push(&mut self, item: T, weight: u64) -> PushOutcome<T> {
         if !self.would_overflow(weight) {
             self.items.push_back((item, weight));
-            self.weight += weight;
+            self.weight = self.weight.saturating_add(weight);
             return PushOutcome::Accepted;
         }
         match self.overflow {
             OverflowPolicy::DropOldest => {
                 let evicted = self.evict_to_fit(weight);
                 self.items.push_back((item, weight));
-                self.weight += weight;
+                self.weight = self.weight.saturating_add(weight);
                 PushOutcome::Evicted(evicted)
             }
             OverflowPolicy::DropNewest => PushOutcome::Rejected(item),
@@ -135,7 +139,7 @@ impl<T> Buffer<T> for InMemoryBuffer<T> {
     fn commit(&mut self) -> Option<T> {
         self.head_reserved = false;
         self.items.pop_front().map(|(item, weight)| {
-            self.weight -= weight;
+            self.weight = self.weight.saturating_sub(weight);
             item
         })
     }
@@ -367,6 +371,31 @@ mod tests {
         assert_eq!(buf.commit(), Some("d"));
         assert_eq!(buf.weight(), 0);
         assert_eq!(buf.commit(), None);
+        assert_eq!(buf.weight(), 0);
+    }
+
+    /// A weight sum past `u64::MAX` saturates on the way in and never underflows on the way out,
+    /// through `commit` or eviction, so an empty buffer always weighs 0.
+    #[test]
+    fn saturated_weights_never_underflow_and_an_empty_buffer_weighs_nothing() {
+        let mut buf = InMemoryBuffer::new(10, u64::MAX, OverflowPolicy::DropOldest);
+        push_accepted(&mut buf, "huge", u64::MAX);
+        push_accepted(&mut buf, "small", 5);
+        assert_eq!(buf.weight(), u64::MAX, "the sum saturates rather than wrapping");
+        assert_eq!(buf.commit(), Some("huge"));
+        assert_eq!(buf.commit(), Some("small"));
+        assert_eq!(buf.weight(), 0, "len == 0 must mean weight == 0");
+
+        // The same through eviction: two items at a two-item bound, then a third evicts one.
+        let mut buf = InMemoryBuffer::new(2, u64::MAX, OverflowPolicy::DropOldest);
+        push_accepted(&mut buf, "huge", u64::MAX);
+        push_accepted(&mut buf, "small", 5);
+        match buf.push("next", 1) {
+            PushOutcome::Evicted(evicted) => assert_eq!(evicted, vec!["huge"]),
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+        assert_eq!(buf.commit(), Some("small"));
+        assert_eq!(buf.commit(), Some("next"));
         assert_eq!(buf.weight(), 0);
     }
 }
