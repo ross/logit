@@ -45,6 +45,15 @@ scripts depend on the table shape, the choice is expensive to undo.
 `event.attributes` is a second userdata over the same underlying event, not a copy, so chained
 access like the example above materializes only what it reads or writes.
 
+**A table assigned to an attribute converts raw and at most 128 levels deep.** Conversion reads
+the table without its metatable, so no `__index`, `__len`, or other metamethod runs while it does.
+A table nested past 128 levels, a self-referencing one such as `t.self = t` included, is an error
+naming the attribute:
+`event.attributes.loop: can't use a table nested more than 128 levels deep as an event attribute
+value (does a table contain itself?)`. The cap is the native wire format's own nesting limit, so
+any value a script builds also decodes on a `logit_in` peer. `resource`, `scope.attributes`, and
+`Event.new` share the conversion and the cap.
+
 **Presence, not a type.** An event can carry a log, several metrics, and a span at once
 ([ADR `multi-payload-events`](../adr/multi-payload-events.md)), so the proxy exposes
 `event.has_log` / `event.has_metrics` / `event.has_span` (read-only booleans). There is
@@ -170,19 +179,36 @@ exists so a flush-driven `Event.new{timestamp = now, ...}` ("Constructing events
 timestamp without a general clock. A script that declares `function flush()` with no parameter
 ignores it, per ordinary Lua semantics.
 
-**Don't use an event handle after you hand the event back.** An event handle, and its
-`event.attributes` handle, is consumed once the event is returned from `process()` or included in
-a `flush()` table. Lua userdata is a reference type, so a variable a script stashed elsewhere
-(`pending = event`, or `pending_attrs = event.attributes`) can be the *exact same* object as the
-one returned, not a copy. Extracting the returned event invalidates every other reference to it,
-including a stashed `event.attributes` handle, because one is cached per event and reused for
-every access (`crates/logit-script/src/proxy.rs`). Using a stale alias is a clear error, not
-silently wrong data. To emit an event now and keep something for later (a stateful `flush()`
-re-emitting it, say), stash `event:clone()` instead of `event` (or `event.attributes`).
+**Don't use an event handle after you hand the event back.** An event handle, and every handle
+obtained from it (`event.attributes`, `event.log`, `event.metrics`, `event.metrics[i]`,
+`event.span`), is consumed once the event is returned from `process()` or included in a `flush()`
+table. Lua userdata is a reference type, so a variable a script stashed elsewhere (`pending =
+event`, or `pending_attrs = event.attributes`, in a global or an upvalue) can be the same object as
+the one returned, not a copy. Extracting the returned event invalidates every other reference to
+it, including a stashed sub-handle, because one is cached per event and reused for every access
+(`crates/logit-script/src/proxy.rs`). Using a stale alias, in a later `process()` or in `flush()`,
+fails the call with an error naming the rule, not silently wrong data. A script's own `pcall`
+around that use sees mlua's raw "destructed userdata" wording instead. To emit an event now and
+keep something for later (a stateful `flush()` re-emitting it, say), stash `event:clone()` instead
+of `event` (or a handle from it). The `resource`, `scope`, `trace`, and `provenance` globals aren't
+per-event handles: a stashed alias of one reads whatever the current call's batch, or the flush
+root, set.
 
-`return {a, b}` must be a proper array-like table (keys exactly `1..=n`, Lua's own notion of a
-sequence). A malformed table (non-contiguous keys) is a clear error, not a silently incomplete or
-empty result.
+`return {a, b}` must be a proper array-like table (keys `1..=n`, Lua's own notion of a sequence).
+A malformed table (non-contiguous keys) is a clear error, not a silently incomplete or empty
+result. Anything else that isn't an event fails the whole call with one wording, naming the type
+and, inside a table, the index:
+
+- `process() must return nil, an event, or a table of events; got a userdata that isn't an event (e.g. event.attributes)`
+- `process() must return nil, an event, or a table of events; got a number at index 1`
+- `flush() must return nil or a table of events; got an event (return {event})`
+
+Returning the same event twice (`return {event, event}`) is the consumed-handle error at the
+second copy, and the call emits nothing.
+
+**An error names the script, not `logit`'s source.** The script loads under the chunk name
+`script`, so an error and its traceback read `script:4: attempt to index local 'missing' (a nil
+value)`, with the line in the script's own source.
 
 **`process`/`flush` are resolved once, when the script loads**, not looked up from `_G` on every
 event or flush tick, a deliberate cost/behavior trade-off (`crates/logit-script/src/lib.rs`). A
@@ -564,7 +590,7 @@ need; it isn't an oversight. Assigning to any of the three raises a "read-only f
 ([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)).
 
 - `event_name` is read/write, a plain string or `nil`. `event.log.event_name = "request.completed"`
-  interns the string, as a string-valued attribute write does. **Use a name from a fixed, bounded
+  interns the string, as an attribute key is. **Use a name from a fixed, bounded
   vocabulary in the script's own source, never one built from event data.** This is the same
   cardinality caution `telemetry.count`'s metric name carries ("Emitting telemetry from a script"
   above): a name built from a request id or order id leaks one process-wide interner entry per
@@ -660,22 +686,29 @@ target model). Every field is readable on every kind (`nil` when the kind doesn'
 | `values` | table, array of numbers | read-only | `samples` |
 | `sample_rate` | number | read-only | `samples` |
 | `members` | table, array of strings | read-only | `set_members` |
-| `estimate` | integer | read-only | `set` |
-| `buckets` | table, array of `{bound=, count=}` | read-only | `histogram` |
+| `estimate` | count | read-only | `set` |
+| `buckets` | table, array of `{bound=, count=}` (`count` a count) | read-only | `histogram` |
 | `sum` | number or `nil` | read-only | `histogram`/`exponential_histogram` (optional), `summary` (always a number) |
 | `min` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
 | `max` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
-| `count` | integer | read-only | `distribution` (the sketch's own observation count, `DdSketch::count()`), `exponential_histogram`, `summary` |
+| `count` | count | read-only | `distribution` (the sketch's own observation count, `DdSketch::count()`), `exponential_histogram`, `summary` |
 | `scale` | integer | read-only | `exponential_histogram` |
-| `zero_count` | integer | read-only | `exponential_histogram` |
+| `zero_count` | count | read-only | `exponential_histogram` |
 | `zero_threshold` | number | read-only | `exponential_histogram` |
-| `positive` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
-| `negative` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
+| `positive` | table, `{offset=, counts=[...]}` (`counts` an array of counts) | read-only | `exponential_histogram` |
+| `negative` | table, `{offset=, counts=[...]}` (`counts` an array of counts) | read-only | `exponential_histogram` |
 | `quantiles` | table, array of `{quantile=, value=}` | read-only | `summary` |
 | `:quantile(q)` | method, returns a number or `nil` | -- | meaningful only on `distribution`; `nil` on every other kind |
 
 `count` is a plain field, not a method: unlike `:quantile(q)`, no argument changes its meaning, so
 a script writes `m.count`, not `m:count()`.
+
+**A count is an integer up to 2^53 and a decimal string above it**, the rule an `I64`/`U64`
+attribute follows ("Timestamps are strings" above): a Lua number would round a larger count, and
+one past `i64::MAX` would read negative. `m.count` on a summary of 9007199254740993 observations
+is the string `"9007199254740993"`; `tonumber()` it for arithmetic at the precision a Lua number
+has. The same encoding applies in `to_table()`, and `Event.new` accepts either form, so a count at
+any magnitude round-trips.
 
 **A write the metric's kind doesn't allow names the kind.** Writing an always-read-only field
 (`flags`, `kind`, `exemplars`, `values`, `sum`, `count`, ...), or a kind-specific one (`value`,
@@ -844,17 +877,17 @@ Per kind (only that kind's keys are accepted):
 | `samples` | `values` | array of finite numbers | optional, default empty |
 | | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
 | `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
-| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer>}` rows; may be empty. `count` is each bucket's *own* observation count, not a running total -- a Prometheus `le="1"`=3, `le="+Inf"`=5 series is `{bound = 1, count = 3}, {bound = math.huge, count = 2}`. Bounds must be strictly increasing (a duplicate or out-of-order bound is an error). `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`, and only on the *last* row: that is the overflow bucket (Prometheus's `+Inf`, OTLP's implicit last `bucket_counts` entry), which `to_table()` emits with the bound `math.huge`. A non-empty `buckets` whose last bound is finite gets `{bound = math.huge, count = 0}` appended -- the constructor's one normalization; it adds no information and keeps the OTLP shape valid. NaN and `-math.huge` are rejected | **required** |
+| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer or decimal-digit string>}` rows; may be empty. `count` is each bucket's *own* observation count, not a running total -- a Prometheus `le="1"`=3, `le="+Inf"`=5 series is `{bound = 1, count = 3}, {bound = math.huge, count = 2}`. Bounds must be strictly increasing (a duplicate or out-of-order bound is an error). `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`, and only on the *last* row: that is the overflow bucket (Prometheus's `+Inf`, OTLP's implicit last `bucket_counts` entry), which `to_table()` emits with the bound `math.huge`. A non-empty `buckets` whose last bound is finite gets `{bound = math.huge, count = 0}` appended -- the constructor's one normalization; it adds no information and keeps the OTLP shape valid. NaN and `-math.huge` are rejected | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` (`to_table()` emits `nil` for an absent one) | optional, default absent |
 | `exponential_histogram` | `scale` | integer in `[-10, 20]` (OTLP's `ExponentialHistogramDataPoint.scale` range) | **required** |
-| | `zero_count`, `count` | non-negative integer | **required** |
+| | `zero_count`, `count` | non-negative integer, or a string of decimal digits (the form `to_table()` gives a count past 2^53) | **required** |
 | | `zero_threshold` | finite number | **required** |
-| | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers>}`; `counts` may be empty but must be present | **required** |
+| | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers or decimal-digit strings>}`; `counts` may be empty but must be present | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` | optional, default absent |
 | `summary` | `quantiles` | array of `{quantile = <number in [0, 1]>, value = <finite number>}` rows; may be empty and need not be sorted | **required** |
-| | `count` | non-negative integer | **required** |
+| | `count` | non-negative integer, or a string of decimal digits | **required** |
 | | `sum` | finite number | **required** |
 
 A `sum` given only its `value` is `MetricKind::counter` (delta, monotonic), so `{name = "hits",
@@ -1010,7 +1043,7 @@ Errors carry the full path. For example:
 
 **Every mistake is a runtime error at the call, prefixed with the dotted path down to the
 field.** A malformed value inside a nested attribute table reports the shared
-attribute-conversion error instead. Unknown keys are rejected everywhere, at the top level and in
+attribute-conversion error behind the attribute's own path. Unknown keys are rejected everywhere, at the top level and in
 sub-tables, the same strictness the proxies apply to an unknown field on read or write. Examples:
 
 - `Event.new: log.severty is not a field`
@@ -1019,6 +1052,7 @@ sub-tables, the same strictness the proxies apply to an unknown field on read or
 - `Event.new: log.span_id can't be set without a trace_id`
 - `Event.new: attributes has a non-string key (integer)`
 - `Event.new: attributes.cb can't be a Lua function`
+- `Event.new: attributes.loop: can't use a table nested more than 128 levels deep as an event attribute value (does a table contain itself?)`
 
 Table access is raw, so a metatable on the input can't make the key check and the field reads
 disagree. Defaults exist only where core already documents one (`BodyFormat::Raw`, the zeros
@@ -1102,6 +1136,11 @@ components:
 never ticks, the same as a script with no `flush()`. Config validation rejects a zero interval on
 either kind of component.
 
+**`max_memory`** is optional and caps the component's Lua VM heap, as a quoted byte-count string
+(`"256MiB"`). A VM still over it after full garbage collection fails the component and, with it,
+the process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config
+validation rejects `0`. "Limits and costs" below says what the cap bounds and how to size it.
+
 **`targets:`** is optional and lists the `target` components this one may direct events into:
 what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
 the component, not among the `script:`/`lua_file:` fields. A non-empty `targets:` is legal only on
@@ -1152,24 +1191,72 @@ no ambient access to the host or to files. Core language functions like `pairs`/
 library.** Review against the real implementation found `loadfile ~= nil` and `dofile ~= nil`
 both true in a worker built with only `TABLE | STRING | MATH`, so a script could read and execute
 any file this process can read. `remove_unsandboxed_base_globals`
-(`crates/logit-script/src/lib.rs`) sets six base globals to `nil` after VM creation:
+(`crates/logit-script/src/lib.rs`) sets seven base globals to `nil` after VM creation:
 
 - `loadfile`/`dofile`: the reproduced file-access issue.
 - `load`/`loadstring`: dynamic execution of arbitrary constructed strings. Not file I/O, but it
   undermines "only the configured script source ever runs".
 - `getfenv`/`setfenv`: Lua 5.1-specific, and well known as sandbox-escape-adjacent tools for
   tampering with a function's environment.
+- `newproxy`: the only way a script gets a `__gc` finalizer on LuaJIT, and a finalizer that runs
+  while `logit` is allocating inside a proxy call can crash the process
+  ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
 
-`crates/logit-script/src/lib.rs`'s tests confirm with real scripts that `os`, `io`, `ffi`,
-`require`, `loadfile`, `dofile`, `load`, `loadstring`, `getfenv`, and `setfenv` are all absent:
-ten checks, each its own test, so a regression in any one fails on its own.
+**`print` writes to `logit`'s own log, never stdout**, where it would corrupt a `stdio_out`
+writing there. Each argument goes through the script's `tostring` (so `__tostring` works), the
+results are tab-joined, and the line is logged at `info` as `print: <line>`, tagged with the
+component id (`<unset>` for top-level code, which runs before the id is known).
 
-On top of that base, `logit` adds exactly the globals this document describes: `telemetry`,
-`trace`, `provenance`, `resource`, `scope`, and `Event` (the `Event.new` constructor,
-"Constructing events" above). Each is a proxy or a table of Rust closures, and none is a route to
-the host.
+The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
+(`crates/logit-script/src/lib.rs`), which holds the exact list. It builds a worker as the runtime
+does and requires `_G` to be Lua's base library, minus the removed loaders, environment functions,
+and `newproxy`, with `print` rerouted; the `math`, `string`, and `table` libraries; the six `logit`
+globals this document describes, each a proxy or a table of Rust closures and none a route to the
+host; and the script's own `process`, and `flush` if it defines one. It also checks that the host
+and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
+reaches the host, and each has an ordinary use in a transform script.
 
-## Costs
+## Limits and costs
+
+### Limits
+
+Each bound below is `logit`'s own answer to the accidental-misuse cases
+[ADR `deployment-threat-model`](../adr/deployment-threat-model.md) sets the bar at; the full
+mechanism is at the citation, not restated here.
+
+- **Table depth.** A script-built table converts at most 128 levels deep; a table nested past
+  that, a self-referencing one included, is a clear conversion error rather than a stack overflow.
+  See `MAX_TABLE_DEPTH`'s doc (`crates/logit-script/src/value.rs`).
+- **No time limit.** LuaJIT's compiled traces skip a count hook unless the runtime is built with
+  `LUAJIT_ENABLE_CHECKHOOK` (this build isn't), so a hook would be both slow and unreliable. See
+  [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md).
+- **Stall detection and the bounded wedge.** A per-call heartbeat drives `script_stalled`/
+  `script_resumed` diagnostics and a `503 stalled` `/readyz`; once shutdown begins, a node whose
+  heartbeat stays busy past its grace has its channels revoked rather than left to hang the
+  process. See [`pipeline-graph.md`](pipeline-graph.md)'s "Thread model".
+- **`max_memory`.** Optional; bounds one component's Lua VM heap. See "Config shape" above and
+  "Costs" below for what it covers and how to size it, or `MemoryVerdict`
+  (`crates/logit-pipeline/src/runtime.rs`) and `crates/logit-script/src/memory.rs`'s module doc
+  for the algorithm.
+- **`print`.** Routed to `logit`'s own log, never process stdout. See "Sandboxing" above.
+- **Thread stack.** Each Lua node's OS thread gets an 8 MiB stack, so ordinary pure-Lua recursion
+  through Rust/C frames doesn't abort the process. See [ADR
+  `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 12.
+- **The interner.** Five feeders, one guarded (`telemetry`); every such string is interned for
+  the life of the process, so derive names and keys from a bounded set, never from per-event data.
+  See [`known-gaps.md`](../known-gaps.md)'s interner entry for the full list.
+- **Residuals.** A nonzero float under 2^-52 in magnitude reads back `0`; a `Value::Null`
+  attribute/array element and an empty `Array` don't round-trip through `Event.new`
+  ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)'s amendment). A table built by
+  sharing references rather than nesting (`t = {a = t, b = t}` repeated k times) still converts at
+  the depth cap, at 2^k nodes, and a 128-deep value a script builds does not survive a relay
+  through `otlp_out -> otlp_in` (OTLP's own nesting limits, 41 and 49 levels, are both under the
+  cap). A loop that keeps calling `Event.new` advances the heartbeat and is
+  never a stall. Pure-Lua recursion through Rust/C frames can still abort the process past the
+  larger stack. See [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s
+  Consequences.
+
+### Costs
 
 | Surface | Where to look |
 |---|---|
@@ -1181,3 +1268,15 @@ the host.
 `crates/logit-bench/tests/allocations.rs` measures every number for these surfaces. This table
 deliberately carries none, so it can't drift when a benchmark changes; see
 [`memory.md`](memory.md) §2 for the current figures.
+
+**`max_memory` bounds the Lua VM heap only** ([ADR
+`lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 3). An event a script
+retains costs the VM about 150 bytes while its payload stays in the Rust heap, which the cap
+doesn't see, so a script that hoards events shows in process RSS long before it trips the cap.
+Size the cap at least twice the script's steady working set, read from `logit.script.vm.memory`;
+a tighter cap forces a full collection on most batches (`logit.script.vm.gc.forced`). The check
+runs after each batch and `flush()`, and inside a call in `Event.new`, which collects at most
+once per 1024 over-cap calls and, once a collection leaves the VM still over the cap, raises
+`Event.new: over max_memory (<used> > <cap>)` for the rest of that call. `MemoryVerdict` in
+`crates/logit-pipeline/src/runtime.rs` and the module doc of `crates/logit-script/src/memory.rs`
+have the algorithm.

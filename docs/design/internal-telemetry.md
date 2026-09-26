@@ -423,10 +423,33 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
+| `logit.script.vm.gc.forced` / `.gc.duration` | count / timing | `run_lua`, per `max_memory` verdict: the full collections forced by a VM over its cap, rate-limited to about one a second. A steady count means the cap sits too close to the working set |
 
-The last two rows are Lua-specific (recorded in `run_lua`, not shared with
+The last three rows are Lua-specific (recorded in `run_lua`, not shared with
 `run_transform`/`run_output`), because only a Lua node has a VM to sample or a script return value
 to classify. Every other row applies uniformly across component kinds.
+
+**A Lua node's watcher adds two diagnostic keys and no metric**
+([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). `watch_lua_thread`
+reads the thread's heartbeat and reports `script_stalled` through `Diagnostics::warn_throttled`
+once per stall, when the thread has sat inside one `process()`/`flush()` call with no progress
+for its `stall_after` (10 s), so a stall also counts
+`logit.component.diagnostics{key="script_stalled"}`.
+It reports `script_resumed` through `Diagnostics::info` when progress returns, which counts
+nothing. The node's `/readyz` state (`stalled`) is the durable signal; the diagnostic is the
+alert. A node wedged at shutdown fails the run with an error naming it, not a diagnostic key.
+A script looping over `Event.new` forever advances the heartbeat and is never stalled or
+wedged: telling it from a large `flush()` would take a time limit, which the ADR declines.
+Events it produced after its channels were revoked count as
+`events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
+inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under
+its own id, as a sink's abandoned inbox does.
+
+**A node over its `max_memory` logs `memory_limit_exceeded`** through `Diagnostics::error`, which
+counts nothing, naming the bytes held, the collections run, and the cap, then fails the run like
+a wedge, with an error naming the node. The batch that crossed the cap has already been sent; the
+batches still waiting in its inbox count as `batches.dropped`/`events.dropped{reason="shutdown"}`
+under its own id. A memory failure is not a panic, so it never logs `thread_panicked`.
 
 **`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
 `Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
@@ -965,9 +988,9 @@ and the accept-queue gauges.
 | `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy` (a `503`: code 9 on a post, code 18 on `/health`); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
-| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), `malformed` (`400` code 6, a body the codec rejects whole, or an `/ack` body that isn't `{"acks":[…]}`), or `no_channel` (`400` code 10, an `/ack` request that names no channel) |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), `malformed` (`400` code 6: a `/event` object the codec can't parse, after the objects before it were delivered, or an `/ack` body that isn't `{"acks":[…]}`), or `no_channel` (`400` code 10, an `/ack` request that names no channel) |
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`. See below |
-| `logit.input.acks.issued` | count | `ackId`s issued, one per `200` to a request that names a channel |
+| `logit.input.acks.issued` | count | `ackId`s issued, one per `200`, or code 6 after a delivered prefix, to a request that names a channel |
 | `logit.input.acks.polled{result}` | count | ids asked about on `/ack`: `acked` (answered `true`), or `unknown` (answered `false`: already reported, never issued on that channel, or dropped) |
 | `logit.input.acks.dropped{reason}` | count | ids issued and never reported: `expired` (more than `max_pending_acks` newer ids issued on the channel) or `evicted` (with its channel) |
 | `logit.input.ack_channels.evicted` | count | channels evicted, least recently used first, once `max_ack_channels` are held |
@@ -976,9 +999,10 @@ and the accept-queue gauges.
 taking a request's first batch, the request gets `503` code 9 with `Retry-After: 1`, counted
 `class="busy"`, with nothing of it delivered, and every HEC client retries it. A `/event` body
 that carries several envelopes decodes to one batch per resource; once the first is delivered,
-the rest wait without a deadline and the request gets `200`, so `logit.input.request.duration` can
-run past 5 seconds while `busy` stays flat (the module doc's "Backpressure" section). From a busy answer until a later request's data is
-taken, for at most 5 seconds, `/health` answers `503` code 18, counted
+the rest wait without a deadline and the request gets `200` (or, for a body cut short, its code
+6), so `logit.input.request.duration` can run past 5 seconds while `busy` stays flat (the module
+doc's "Backpressure" section). From a busy answer until a later request's data is taken, for at
+most 5 seconds, `/health` answers `503` code 18, counted
 `logit.input.requests{route="health", class="busy"}`.
 
 The codec's own counters (an object skipped for a missing or blank `event`, an unknown envelope
@@ -1340,6 +1364,17 @@ leaking stateful script) and `logit.script.events.emitted{outcome}`, both from t
 layer 2). Uniquely, a script can also call a **script-facing** `telemetry` global
 (`telemetry.count(...)`/`.gauge(...)`) for domain facts only the script knows. See
 [Metrics from Lua scripts](#metrics-from-lua-scripts) and `docs/design/lua-api.md`.
+
+The runtime's stall watcher adds the `script_stalled` (`warn_throttled`, so counted in
+`logit.component.diagnostics{key}`) and `script_resumed` (`info`) diagnostic keys, and
+`max_memory` adds `memory_limit_exceeded` (`error`) and the `logit.script.vm.gc.forced` count and
+`.gc.duration` timing; see layer 2's
+[receive and processing side](#receive-and-processing-side-the-node-loops).
+
+A script's `print(...)` is a self-log line, never stdout: `print: <arguments, tab-joined>` at
+`info`, target `logit`, with the component's `component` field (`<unset>` for top-level code that
+runs before the id is known; `crates/logit-script/src/print.rs`). At `info` it sits below the
+lowest `logs:` threshold `internal` accepts, so it reaches the process log but never the pipeline.
 
 #### Outputs
 

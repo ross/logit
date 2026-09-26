@@ -10,7 +10,9 @@
 //! not a `RegistryKey`-held table, because [`crate::ScriptWorker::set_resource`]/`take_resource`
 //! must reach it without a `&Lua`.
 
-use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
+use crate::value::{
+    attribute_error, attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua,
+};
 use logit_core::Resource;
 use mlua::{Lua, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
 use std::cell::RefCell;
@@ -118,8 +120,7 @@ impl UserData for ResourceProxy {
                     _ => {}
                 }
                 // Same no-op check and borrow ordering as `crate::proxy::AttrsProxy::__newindex`:
-                // `lua_to_value`'s `pairs()` walk over a table can re-enter this `__index`, so the
-                // borrow must be released before it runs.
+                // conversion reads raw and runs no metamethod; the borrow is still released first.
                 let is_noop = {
                     let state = this.0.borrow();
                     let existing = match &state.modified {
@@ -131,7 +132,8 @@ impl UserData for ResourceProxy {
                 if is_noop {
                     return Ok(());
                 }
-                let value = lua_to_resource_value(value)?;
+                let value = lua_to_resource_value(value)
+                    .map_err(|err| attribute_error("resource", key, err))?;
                 let mut state = this.0.borrow_mut();
                 ensure_modified(&mut state);
                 state

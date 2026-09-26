@@ -405,6 +405,68 @@ the Cloud run" section maps it item by item. By decision:
   destination delivers to a non-Splunk receiver stays open. Ingest Processor sends only to Splunk
   indexes, S3, and Observability Cloud, so it has no destination that reaches `logit`.
 
+## Amendment: busy answers before acceptance, and an oversize code 6 (2026-09-26)
+
+Two answers the sink misread under its default at-most-once posture. By decision:
+
+- **Decision 2, faults across requests (the sink amendment's bullet):** a `429` (codes 26 and 27), or a `503` that is code 9
+  ("Server is busy") or carries no HEC body, is now `Fault::Clean` until a `/event` request of the
+  `send` is accepted, and `Fault::Ambiguous` after, the rule a connect failure already follows.
+  The criterion is "not taken": each of these says Splunk refused the body before indexing
+  anything, so a retry can't duplicate it, where it used to be `Ambiguous` and dropped a batch
+  Splunk never took. A `408`, a `500` (code 8 may have indexed), a `502`, a `504`, and any other
+  `503` stay `Ambiguous` in both positions. One receiver is an exception to "refused before
+  indexing": `splunk_hec_in` answered `503` code 9 after delivering part of a multi-resource
+  body until `splunk/listener-fidelity`, so a relay into a `logit` older than that can deliver
+  the part twice. `Retry-After` is ignored: `write_loop`'s retry loop
+  has no seam for a server-supplied delay, and building one is out of scope
+  (`docs/known-gaps.md`, "Splunk").
+- **Decision 18, code 6:** a code 6 naming object 0 of a body over
+  `logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP` (5,242,880 bytes, before compression) is
+  read as Splunk Cloud's oversize answer, not a bad object 0. A body of several objects is split
+  in two at half its bytes and each half sent, one level only: a half answered the same way is
+  `Fault::Permanent`. A body of one object is dropped, counted
+  `records.dropped{reason="oversize"}` with the `oversize` diagnostic. A code 6 naming object 0
+  of a body at or under the cap keeps the drop-one rule. Rule 70 accepts a `max_body_bytes` above
+  the cap, since Splunk Enterprise allows 800 MiB, and logs a startup warning naming Cloud's cap.
+  Rejected: capping `max_body_bytes` at 5 MiB in rule 70, which would refuse a valid Enterprise
+  configuration.
+
+## Amendment: the listener delivers the prefix before a code 6 (2026-09-26)
+
+Decision 11 said a syntax error in any object rejects the whole body "and nothing is delivered,
+as Splunk does". Splunk doesn't: Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9
+both index every object before the one a `400` code 6 names and none from it on
+(`docs/plans/splunk-relay.md`, "Settled by W5" item 8 and "Settled by the Cloud run"), and
+Vector's `splunk_hec` source delivers what it parsed before answering `400`. A client that follows
+Splunk's semantics resends only the objects after the named one, so against the old listener it
+lost the objects before it. `splunk_hec_out`'s decision 18 rule is such a client, so a
+`splunk_hec_out -> splunk_hec_in` relay lost them too. **Changed:**
+
+- **Decision 11:** a `/event` body whose object `N` doesn't parse (a syntax error, or a member
+  the model can't hold) delivers objects `0..N`, grouped by resource as any body is, and answers
+  `400` code 6 with `invalid-event-number` `N`. Nothing from `N` on is decoded or counted. The
+  codec's `decode_events_prefix` returns both; `decode_events` keeps the whole-body form for
+  callers that want it.
+- **`N` = 0** delivers nothing and is answered as before: a plain code 6 with no `ackId`.
+- **`N` > 0** goes through delivery as a whole body of those `N` objects would: the bounded wait,
+  a `503` code 9 with no `ackId` if it passes, and otherwise the code 6 with the `ackId` a `200`
+  would have carried when the request named a channel, after `invalid-event-number`. Splunk
+  10.4.3 answers the same on a `useACK` token with a channel:
+  `{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":0}` for a syntax
+  error in object 1, and no `ackId` for one in object 0 (`tools/splunk-interop/README.md`). This
+  revises the listener amendment's "an `ackId` is drawn only on a `200`": the objects before
+  `N` reached the pipeline, and `/ack` reports them as it reports any other request. A prefix
+  whose every object the codec skipped sends nothing and is answered the same way, as an
+  all-skipped whole body answers `200`.
+- **gzip:** a stream that doesn't decompress is still code 6 with no `invalid-event-number` and
+  nothing delivered. Decompression yields nothing short of the whole stream, so the decoder
+  never sees a prefix to deliver.
+- **Telemetry:** the delivered objects count where any delivered batch's do, on the listener's
+  fanout edge, and the answer counts `logit.input.requests{class="rejected"}` and
+  `logit.input.requests.rejected{reason="malformed"}`, with the `request_rejected` diagnostic
+  naming how many objects were kept.
+
 ## Amendment: faithful listener acks and a busy /health (2026-09-26)
 
 Both runs gave the same `useACK` behavior: ids count from 0 per channel, a poll answers an id
@@ -417,9 +479,10 @@ code 9 could follow a partial delivery, where Splunk's means nothing was taken.
 of the choices. By decision:
 
 - **Decision 5, acknowledgment, the listener half:** amended. Each channel issues ids from 0 on
-  every `200` to a `/event` or `/raw` request that names it, and `/ack` answers an id issued on the
-  polled channel `true` once, then forgets it; any other id is `false`. A repeated id in one poll
-  is answered once. "Indexed" stays "accepted into the pipeline", the meaning a `200` already
+  every `200` to a `/event` or `/raw` request that names it, and on the code 6 that follows a
+  delivered prefix (the amendment above), and `/ack` answers an id issued on the polled channel
+  `true` once, then forgets it; any other id is `false`. A repeated id in one poll is answered
+  once. "Indexed" stays "accepted into the pipeline", the meaning a `200` already
   has; tying `true` to sink delivery was rejected, since a listener has no view of what its
   fan-out's sinks did, and the pipeline's own delivery guarantees are the sinks' business. This
   replaces "every asked id `true`" and the listener amendment's one counter per listener

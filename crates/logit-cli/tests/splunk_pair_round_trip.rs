@@ -4,15 +4,24 @@
 //! Each batch is one decode of a hand-written HEC body, so it sits on the codec's fixed point
 //! (`crates/logit-proto/tests/splunk_fixed_point.rs`), and `splunk_hec_out` re-encoding it gives
 //! the same batch back through `splunk_hec_in`. What this file adds over the codec tests is both
-//! HTTP hops: the `/event` route, gzip, the token check, body splitting, and the channel and
-//! acknowledgment exchange, which the listener answers per channel as a `useACK` token does.
+//! HTTP hops: the `/event` route, gzip, the token check, body splitting, the channel and
+//! acknowledgment exchange, which the listener answers per channel as a `useACK` token does, and a
+//! code 6's drop and resend.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use logit_core::{Event, EventBatch, MetricKind, Registry, Value};
 use logit_inputs::splunk::SplunkHecInput;
 use logit_outputs::splunk::{SplunkCompression, SplunkHecOutput};
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::splunk::SplunkDecoder;
+use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -192,4 +201,117 @@ async fn a_wrong_token_is_a_permanent_fault() {
     let err = out.send(&logs()).await.unwrap_err();
     assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Permanent);
     assert_nothing_delivered(&mut rx).await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Code 6: the sink's drop-and-resend against the listener's prefix rule
+// -------------------------------------------------------------------------------------------------
+
+/// A stand-in for Splunk's `/event` code 6 behavior: it keeps the objects of a body before the
+/// first one `serde_json` can't parse, answers `400` code 6 naming that object, and records the
+/// kept objects' bytes, one entry per request. `serde_json::Value`'s 128-level recursion limit is
+/// what makes an object unparseable here, as it is for `splunk_hec_in`.
+async fn stub_splunk() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let kept: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let record = Arc::clone(&kept);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let record = Arc::clone(&record);
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let (end, failed_at) = parse_prefix(&body);
+                        record.lock().unwrap().push(body[..end].to_vec());
+                        let (status, reply) = match failed_at {
+                            None => (200, r#"{"text":"Success","code":0}"#.to_string()),
+                            Some(n) => (
+                                400,
+                                format!(
+                                    r#"{{"text":"Invalid data format","code":6,"invalid-event-number":{n}}}"#
+                                ),
+                            ),
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from(reply)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, kept)
+}
+
+/// The byte length of the objects of concatenated JSON `body` before the first that doesn't
+/// parse, and that object's index.
+fn parse_prefix(body: &[u8]) -> (usize, Option<usize>) {
+    let mut stream = serde_json::Deserializer::from_slice(body).into_iter::<serde_json::Value>();
+    let mut end = 0;
+    let mut index = 0;
+    while let Some(object) = stream.next() {
+        if object.is_err() {
+            return (end, Some(index));
+        }
+        end = stream.byte_offset();
+        index += 1;
+    }
+    (end, None)
+}
+
+/// Three logs whose middle one's message nests past the 128 levels a JSON parser takes, so its
+/// object is the one a code 6 names.
+fn batch_with_an_unparseable_middle_object() -> EventBatch {
+    let mut batch = seed(concat!(
+        r#"{"time":1700000000,"host":"web-1","event":"first"}"#,
+        r#"{"time":1700000001,"host":"web-1","event":"second"}"#,
+        r#"{"time":1700000002,"host":"web-1","event":"third"}"#,
+    ));
+    let mut deep = Value::I64(1);
+    for _ in 0..200 {
+        deep = Value::Array(vec![deep]);
+    }
+    batch.events[1].log.as_mut().expect("a log").message = deep;
+    batch
+}
+
+/// `splunk_hec_out` answered code 6 by `splunk_hec_in` drops the named object and resends the
+/// rest, and the listener, keeping the objects before the one it named, ends with every valid
+/// object delivered once: what the same sink leaves in a stub that follows Splunk's prefix rule.
+#[tokio::test]
+async fn a_code_6_from_the_listener_leaves_every_valid_object_delivered_once() {
+    let batch = batch_with_an_unparseable_middle_object();
+    let registry = Registry::new();
+
+    let (addr, mut rx) = listener().await;
+    let mut out = sink(addr, &registry).with_compression(SplunkCompression::None);
+    out.send(&batch).await.expect("the resend is accepted");
+    let first = recv(&mut rx).await;
+    let resent = recv(&mut rx).await;
+    assert_nothing_delivered(&mut rx).await;
+    assert_eq!(first.events, [batch.events[0].clone()], "the object before the bad one");
+    assert_eq!(resent.events, [batch.events[2].clone()], "the object after it, resent");
+
+    let (stub, kept) = stub_splunk().await;
+    let mut out = SplunkHecOutput::new(format!("http://{stub}/services/collector"), TOKEN)
+        .unwrap()
+        .with_compression(SplunkCompression::None);
+    out.send(&batch).await.expect("the resend is accepted");
+    let kept = kept.lock().unwrap().clone();
+    assert_eq!(kept.len(), 2, "the body, then the resend");
+    let indexed: Vec<EventBatch> = kept
+        .iter()
+        .flat_map(|body| SplunkDecoder::new().decode_events(body, RECEIVED_AT).unwrap())
+        .collect();
+    assert_eq!(indexed, [first, resent], "the listener delivered what the stub indexed");
 }

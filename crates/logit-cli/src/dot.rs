@@ -216,7 +216,7 @@ mod tests {
             component(
                 vec!["in"],
                 vec!["app_stream"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
         );
         components
@@ -262,7 +262,7 @@ mod tests {
             component(
                 vec!["split"],
                 vec![],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
         );
         let dot = render(&Config { components, ..Default::default() });

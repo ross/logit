@@ -943,6 +943,7 @@ dependencies = [
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
+ "logit-script",
  "logit-transforms",
  "prost",
  "reqwest",
@@ -1084,6 +1085,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1112,7 +1114,10 @@ dependencies = [
  "bytes",
  "logit-core",
  "mlua",
+ "proptest",
  "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-26
 ---
 
 # A top-level `admin:` block, not a component, for readiness/liveness
@@ -80,3 +80,20 @@ retrying.
 - A future per-sink readiness surface (e.g. per-component status in a richer probe) is additive to
   the existing `PipelineState.components` map — no schema break — should an operator's real need
   for it ever show up.
+
+## Amendment (2026-09-26): a stalled Lua script reads `stalled`
+
+[ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md) adds a component state,
+`stalled`: a `lua`/`lua_file` component whose thread has been inside one `process()`/`flush()`
+call with no progress for 10 s. While any component is `stalled`, `/readyz` answers `503 stalled`
+in place of `200 ok`, with no change of phase, so it reads `200 ok` again once the script makes
+progress. `starting`, `draining`, and `degraded` keep their own word whatever a component's state.
+`/readyz?format=json` lists the component as `"stalled"`.
+
+`stalled` sits beside `degraded` rather than widening it: the Decision reserves `degraded` for a
+node that has exited with an error, and a stalled node hasn't. It is still not ready, because a
+node that won't return from a call can't do its job, unlike a sink that is retrying. `logit ready`
+treats it like any non-`200` answer. `/healthz` is unchanged and stays `200`: the process is alive,
+and a restart doesn't fix a script. The shipped image's `HEALTHCHECK` probes `/readyz`, so a
+stalled script does mark that container unhealthy; the operator-facing consequences are in
+`docs/deploying.md`'s "Probes and exit codes".
