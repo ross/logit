@@ -728,7 +728,8 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "gauge_delta_unseeded",
                         format_args!(
-                            "gauge delta for '{}' opened a new series and resolved against 0.0                              -- no prior absolute value seen for this series",
+                            "gauge delta for '{}' opened a new series and resolved against 0.0 \
+                             -- no prior absolute value seen for this series",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
@@ -740,7 +741,8 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "sample_rate_clamped",
                         format_args!(
-                            "sample_rate for '{}' implies a weight beyond Samples::MAX_WEIGHT                              ({}); clamping",
+                            "sample_rate for '{}' implies a weight beyond Samples::MAX_WEIGHT \
+                             ({}); clamping",
                             logit_core::interner::resolve(record.name),
                             Samples::MAX_WEIGHT
                         ),
@@ -755,7 +757,8 @@ impl Aggregator {
                     let (key, why) = if reason == "rate_mismatch" {
                         (
                             "samples_rate_mismatch",
-                            "an incoming record's sample_rate disagreed with this series' first                              record",
+                            "an incoming record's sample_rate disagreed with this series' first \
+                             record",
                         )
                     } else {
                         ("samples_cap_exceeded", "max_samples_per_series was exceeded")
@@ -777,7 +780,8 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "set_members_cap_exceeded",
                         format_args!(
-                            "raw set members for '{}' fell back to a HyperLogLog estimate:                              max_set_members_per_series was exceeded",
+                            "raw set members for '{}' fell back to a HyperLogLog estimate: \
+                             max_set_members_per_series was exceeded",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
@@ -800,7 +804,8 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "kind_conflict",
                         format_args!(
-                            "metric '{}' has a kind that conflicts with an already-accumulating                          series under the same name/unit/tags -- forwarding it untouched",
+                            "metric '{}' has a kind that conflicts with an already-accumulating \
+                             series under the same name/unit/tags -- forwarding it untouched",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
@@ -3439,6 +3444,87 @@ mod tests {
         feed(&mut agg, &resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
         assert_eq!(agg.flush(100).len(), 1, "the first flush emits the sketch");
         assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
+    }
+
+    /// Every `warn` message a `tracing` subscriber sees, by its `message` field.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut messages = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            event.record(&mut Message(&mut messages));
+        }
+    }
+
+    /// Each diagnostic `process` and `flush` report reads as one sentence: a `\` lost from a
+    /// wrapped string literal leaves a run of the source's indentation inside the message.
+    #[test]
+    fn no_diagnostic_message_carries_a_run_of_spaces() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let resource = default_resource();
+            let samples = |rate: f64, values: &[f64]| {
+                MetricKind::Samples(Samples {
+                    values: values.iter().copied().collect(),
+                    sample_rate: rate,
+                })
+            };
+            let members = |m: &[&'static [u8]]| {
+                MetricKind::SetMembers(m.iter().map(|m| Bytes::from_static(m)).collect())
+            };
+
+            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped.
+            let mut agg = Aggregator::new(Duration::from_secs(10));
+            feed(&mut agg, &resource, metric_event("g", MetricKind::GaugeDelta(1.0), 0));
+            feed(&mut agg, &resource, metric_event("g", MetricKind::counter(1.0), 0));
+            feed(&mut agg, &resource, metric_event("s", samples(0.0001, &[1.0]), 0));
+
+            // samples_rate_mismatch and samples_cap_exceeded.
+            let mut agg = Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 2);
+            feed(&mut agg, &resource, metric_event("r", samples(1.0, &[1.0]), 0));
+            feed(&mut agg, &resource, metric_event("r", samples(0.5, &[1.0]), 0));
+            feed(&mut agg, &resource, metric_event("c", samples(1.0, &[1.0, 2.0]), 0));
+            feed(&mut agg, &resource, metric_event("c", samples(1.0, &[3.0]), 0));
+
+            // set_members_cap_exceeded.
+            let mut agg = Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, 1);
+            feed(&mut agg, &resource, metric_event("u", members(&[b"a", b"b"]), 0));
+
+            // histogram_bounds_mismatch, and series_retention_full from the flush.
+            let mut agg = cumulative_agg().with_series_retention(5, 1);
+            let h = |bounds: &[(f64, u64)]| delta_histogram_event("h", bounds, None, None, None, 0);
+            feed(&mut agg, &resource, h(&[(1.0, 1)]));
+            feed(&mut agg, &resource, h(&[(2.0, 1)]));
+            feed(&mut agg, &resource, metric_event("other", MetricKind::counter(1.0), 0));
+            agg.flush(100);
+        });
+
+        let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(messages.len(), 8, "one report per diagnostic key: {messages:#?}");
+        for message in &messages {
+            assert!(!message.contains("  "), "a run of spaces in {message:?}");
+        }
     }
 }
 
