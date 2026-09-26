@@ -2060,10 +2060,10 @@ fn run_lua_loop(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                if let FlushOutcome::Failed(message) =
-                    flush_now(&mut diag, &worker, &mut scratch, &mut verdict)
-                {
-                    return Err(message);
+                match flush_now(&mut diag, &worker, &mut scratch, &mut verdict) {
+                    FlushOutcome::Continue => {}
+                    FlushOutcome::Revoked => return Ok(()),
+                    FlushOutcome::Failed(message) => return Err(message),
                 }
             }
             if let Some(verdict) = verdict.as_mut() {
