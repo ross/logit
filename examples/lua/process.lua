@@ -25,6 +25,7 @@ local SERVICE = "shop-api"
 local MAX_ROUTES = 50     -- distinct routes per interval; the rest count as "/{other}"
 local MAX_SAMPLES = 500   -- durations kept per route per interval
 local MAX_USERS = 1000    -- distinct users per interval
+local MAX_ALERTS = 50     -- distinct route+status alerts per interval; the rest only archive
 local SLOW_MS = 1000      -- a request taking this long or longer is marked slow
 
 ---------------------------------------------------------------------------------------------
@@ -67,7 +68,10 @@ local route_count = 0
 local users = {}         -- distinct users, as a set: users[name] = true
 local user_count = 0
 local alerted = {}       -- server errors already alerted, keyed by "<route> <status>"
+local alert_count = 0
 
+-- The counters for a route. Only the counters are bucketed past MAX_ROUTES: the event keeps its
+-- real route, so the archive and the alerts always name the endpoint.
 local function stats_for(route)
   if routes[route] == nil and route_count >= MAX_ROUTES then
     route = "/{other}"
@@ -78,7 +82,7 @@ local function stats_for(route)
     routes[route] = stats
     route_count = route_count + 1
   end
-  return stats, route
+  return stats
 end
 
 -- Keeps up to MAX_SAMPLES durations. Past that, each new one replaces a random kept one with
@@ -141,7 +145,8 @@ function process(event)
   end
 
   -- Computation: typed fields the archive and the alerts can be searched by.
-  local stats, route = stats_for(route_of(a.path))
+  local route = route_of(a.path)
+  local stats = stats_for(route)
   local ms = duration_ms(a.dur)
   a["http.route"] = route
   a["http.response.status_code"] = status
@@ -157,13 +162,13 @@ function process(event)
   end
   remember_user(a.user)
 
-  -- Load-balancer health checks count toward the stats but aren't worth archiving.
-  if route == "/healthz" then
-    return nil
-  end
-
-  -- Routing: anything under 500 goes out unmarked, to the archive.
+  -- Routing: anything under 500 goes out unmarked, to the archive. A passing load-balancer
+  -- health check counts toward the stats but isn't worth archiving; a failing one is a server
+  -- error like any other.
   if status < 500 then
+    if route == "/healthz" then
+      return nil
+    end
     return event
   end
 
@@ -175,7 +180,11 @@ function process(event)
     held.repeats = held.repeats + 1
     return event
   end
+  if alert_count >= MAX_ALERTS then
+    return event
+  end
   alerted[key] = {route = route, status = status, host = a["syslog.hostname"], repeats = 0}
+  alert_count = alert_count + 1
 
   -- Fan-out: the first server error per route and status becomes two events, an alert marked
   -- for `errors` and the original line, unmarked, for the archive.
@@ -246,6 +255,6 @@ function flush(now)
 
   routes, route_count = {}, 0
   users, user_count = {}, 0
-  alerted = {}
+  alerted, alert_count = {}, 0
   return out
 end

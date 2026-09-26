@@ -7,8 +7,8 @@
 #
 #   alerts   the first server error per route and status each interval, plus a count of the
 #            repeats                                                  -> alerts_out
-#   archive  every other line, with route, status, and duration added; health checks
-#            dropped                                                  -> archive_out
+#   archive  every other line, with route, status, and duration added; passing health
+#            checks dropped                                           -> archive_out
 #   stats    per-route requests, errors, and latencies, and distinct users, each interval
 #                                                                     -> window -> stats_out
 #

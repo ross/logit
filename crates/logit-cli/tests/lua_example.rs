@@ -253,6 +253,27 @@ fn health_checks_are_dropped_but_counted() {
 }
 
 #[test]
+fn a_failing_health_check_is_alerted_and_counted() {
+    let w = worker();
+    let events = emit_many(
+        w.process(request_event(
+            "level=error msg=request method=GET path=/healthz status=503 dur=1ms",
+        ))
+        .unwrap(),
+    );
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].1, Some(0));
+    assert_eq!(message(&events[0].0), "GET /healthz returned 503");
+    assert_eq!(events[1].1, None);
+
+    let flushed = w.flush(NOW).unwrap();
+    let healthz = events_for_route(&flushed, "/healthz");
+    assert_eq!(healthz.len(), 1);
+    assert_eq!(sum_value(metric(healthz[0], "http.server.requests")), 1.0);
+    assert_eq!(sum_value(metric(healthz[0], "http.server.errors")), 1.0);
+}
+
+#[test]
 fn flush_emits_per_route_metrics_to_stats() {
     let w = worker();
     for line in [
@@ -330,6 +351,67 @@ fn routes_past_the_cap_collapse_into_other() {
     let other = events_for_route(&flushed, "/{other}");
     assert_eq!(other.len(), 1);
     assert_eq!(sum_value(metric(other[0], "http.server.requests")), 10.0);
+}
+
+/// Only the counters are bucketed past the route cap: the event, the health-check drop, and the
+/// alert keep the real route.
+#[test]
+fn the_route_cap_buckets_counters_only() {
+    let w = worker();
+    for i in 0..50 {
+        let line = format!("level=info msg=request method=GET path=/p{i} status=200 dur=1ms");
+        let _ = w.process(request_event(&line));
+    }
+
+    let (archived, mark) = emit(
+        w.process(request_event(
+            "level=info msg=request method=GET path=/overflow status=200 dur=1ms",
+        ))
+        .unwrap(),
+    );
+    assert_eq!(mark, None);
+    assert_eq!(archived.attributes.get("http.route").and_then(Value::as_str), Some("/overflow"));
+
+    let outcome = w
+        .process(request_event(
+            "level=info msg=request method=GET path=/healthz status=200 dur=1ms",
+        ))
+        .unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Drop));
+
+    let events = emit_many(
+        w.process(request_event(
+            "level=error msg=request method=POST path=/overflow status=502 dur=1ms",
+        ))
+        .unwrap(),
+    );
+    assert_eq!(message(&events[0].0), "POST /overflow returned 502");
+
+    let flushed = w.flush(NOW).unwrap();
+    let other = events_for_route(&flushed, "/{other}");
+    assert_eq!(other.len(), 1);
+    assert_eq!(sum_value(metric(other[0], "http.server.requests")), 3.0);
+    assert_eq!(sum_value(metric(other[0], "http.server.errors")), 1.0);
+    assert!(events_for_route(&flushed, "/overflow").is_empty());
+}
+
+#[test]
+fn alerts_past_the_cap_are_archived_only() {
+    let w = worker();
+    for i in 0..50 {
+        let line = format!("level=error msg=request method=GET path=/e{i} status=500 dur=1ms");
+        assert_eq!(emit_many(w.process(request_event(&line)).unwrap()).len(), 2);
+    }
+
+    let (archived, mark) = emit(
+        w.process(request_event("level=error msg=request method=GET path=/e50 status=500 dur=1ms"))
+            .unwrap(),
+    );
+    assert_eq!(mark, None);
+    assert_eq!(archived.attributes.get("http.route").and_then(Value::as_str), Some("/e50"));
+
+    let flushed = w.flush(NOW).unwrap();
+    assert!(flushed.iter().all(|(e, _)| e.log.is_none()), "no repeats, so no summary lines");
 }
 
 #[test]
