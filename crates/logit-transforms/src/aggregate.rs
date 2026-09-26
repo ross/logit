@@ -227,6 +227,10 @@ struct SeriesState {
     /// Whether any event touched this series since the last flush. Not derived from `contexts.seen`
     /// being non-empty: that correlates today, but ties retention to a set built for span linking.
     updated_this_window: bool,
+    /// The opening record's `description`, emitted on every flush of this series. A later record's
+    /// is ignored. Exemplars aren't carried: a summarized window has no single observation to
+    /// attach one to.
+    description: Option<Symbol>,
 }
 
 enum Accumulator {
@@ -600,6 +604,7 @@ impl Aggregator {
                 idle_windows: 0,
                 first_seen: event.timestamp,
                 updated_this_window: false,
+                description: record.description,
             });
 
             // Set inside the merge match, reported after it: the match can't borrow `self`.
@@ -1007,6 +1012,7 @@ impl Aggregator {
                         // into the map.
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
+                        record.description = state.description;
                         // The reset signal (`SeriesState::first_seen`). A `Gauge` has no start
                         // time and keeps `0`, OTLP's "unknown".
                         if matches!(record.kind, MetricKind::Sum(_) | MetricKind::Histogram(_)) {
@@ -1030,6 +1036,7 @@ impl Aggregator {
                         let kind = state.accumulator.into_kind(self.temporality);
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
+                        record.description = state.description;
                         record.flags = 0;
                         events.push((Event::metric(now, key.attributes, record), links));
                     }
@@ -1650,6 +1657,7 @@ mod tests {
                         idle_windows: 0,
                         first_seen: 0,
                         updated_this_window: true,
+                        description: None,
                     };
                     agg.groups.push(ResourceGroup {
                         resource: default_resource(),

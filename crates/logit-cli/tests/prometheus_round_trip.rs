@@ -403,3 +403,45 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
         "expected at least one logit_component_* counter family, got:\n{body}"
     );
 }
+
+/// `aggregate -> prometheus_out`: a series keeps its first record's `description`, which the
+/// exposition renders as `# HELP`, on both the tumbling (gauge, no retention) and the retained
+/// (cumulative counter) flush paths.
+#[tokio::test]
+async fn aggregate_carries_the_first_records_description_into_help() {
+    use logit_core::interner::intern;
+    use logit_core::{AttrMap, Event, MetricKind, MetricRecord, Resource};
+    use std::sync::Arc;
+
+    let record = |name: &str, kind: MetricKind, description: &str| {
+        let mut record = MetricRecord::new(intern(name), kind);
+        record.description = Some(intern(description));
+        record
+    };
+    let resource = Arc::new(Resource::default());
+    let mut tumbling = Aggregator::new(Duration::from_secs(10));
+    let mut retained = Aggregator::new(Duration::from_secs(10))
+        .with_temporality(AggregateTemporality::Cumulative)
+        .with_series_retention(5, 100);
+    for (i, description) in ["Queue depth.", "A later description."].into_iter().enumerate() {
+        let gauge = record("depth", MetricKind::Gauge(i as f64), description);
+        assert!(!tumbling.process(&resource, &mut Event::metric(0, AttrMap::new(), gauge)));
+    }
+    let hits = record("hits", MetricKind::counter(1.0), "Requests served.");
+    assert!(!retained.process(&resource, &mut Event::metric(0, AttrMap::new(), hits)));
+
+    let now = 1_700_000_000_000_000_000;
+    let batches: Vec<EventBatch> = [tumbling.flush(now), retained.flush(now)]
+        .into_iter()
+        .flatten()
+        .map(|(resource, scope, events)| EventBatch {
+            resource,
+            scope,
+            events: events.into_iter().map(|(event, _links)| event).collect(),
+        })
+        .collect();
+
+    let (body, _addr) = expose_and_fetch(&batches, ACCEPT_TEXT).await;
+    assert!(body.contains("# HELP depth Queue depth."), "the first record's, got:\n{body}");
+    assert!(body.contains("# HELP hits_total Requests served."), "got:\n{body}");
+}
