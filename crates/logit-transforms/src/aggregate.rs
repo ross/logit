@@ -723,7 +723,10 @@ impl Aggregator {
                     // holds; otherwise sketch `held` plus `incoming` and record why. A clamp on
                     // the held records is reported here, when their weight is first applied.
                     Accumulator::Samples(held) => {
-                        let fallback = if held.sample_rate != incoming.sample_rate {
+                        // Bitwise, like a series key's `f64`: a `NaN` rate must match itself.
+                        let fallback = if held.sample_rate.to_bits()
+                            != incoming.sample_rate.to_bits()
+                        {
                             Some("rate_mismatch")
                         } else if held.values.len() + incoming.values.len() > max_samples_per_series
                         {
@@ -3835,6 +3838,29 @@ mod tests {
         match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
             MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
             other => panic!("expected a Distribution, got {other:?}"),
+        }
+    }
+
+    /// Sample rates compare by bit pattern, so a `NaN` rate (which only the native decoder
+    /// produces) matches itself and the series stays raw.
+    #[test]
+    fn a_nan_sample_rate_matches_itself_under_distributions_samples() {
+        let resource = default_resource();
+        let (agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 100),
+        );
+        let mut agg = agg;
+        feed(&mut agg, &resource, metric_event("t", samples_at(f64::NAN, &[1.0]), 0));
+        feed(&mut agg, &resource, metric_event("t", samples_at(f64::NAN, &[2.0]), 0));
+        let events = registry.drain(0);
+        assert_eq!(counter_total(&events, "logit.transform.samples.fallback"), 0.0);
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Samples(s) => {
+                assert_eq!(&s.values[..], &[1.0, 2.0]);
+                assert!(s.sample_rate.is_nan());
+            }
+            other => panic!("expected raw Samples, got {other:?}"),
         }
     }
 }
