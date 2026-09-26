@@ -45,6 +45,15 @@ scripts depend on the table shape, the choice is expensive to undo.
 `event.attributes` is a second userdata over the same underlying event, not a copy, so chained
 access like the example above materializes only what it reads or writes.
 
+**A table assigned to an attribute converts raw and at most 128 levels deep.** Conversion reads
+the table without its metatable, so no `__index`, `__len`, or other metamethod runs while it does.
+A table nested past 128 levels, a self-referencing one such as `t.self = t` included, is an error
+naming the attribute:
+`event.attributes.loop: can't use a table nested more than 128 levels deep as an event attribute
+value (does a table contain itself?)`. The cap is the native wire format's own nesting limit, so
+any value a script builds also decodes on a `logit_in` peer. `resource`, `scope.attributes`, and
+`Event.new` share the conversion and the cap.
+
 **Presence, not a type.** An event can carry a log, several metrics, and a span at once
 ([ADR `multi-payload-events`](../adr/multi-payload-events.md)), so the proxy exposes
 `event.has_log` / `event.has_metrics` / `event.has_span` (read-only booleans). There is
@@ -660,22 +669,29 @@ target model). Every field is readable on every kind (`nil` when the kind doesn'
 | `values` | table, array of numbers | read-only | `samples` |
 | `sample_rate` | number | read-only | `samples` |
 | `members` | table, array of strings | read-only | `set_members` |
-| `estimate` | integer | read-only | `set` |
-| `buckets` | table, array of `{bound=, count=}` | read-only | `histogram` |
+| `estimate` | count | read-only | `set` |
+| `buckets` | table, array of `{bound=, count=}` (`count` a count) | read-only | `histogram` |
 | `sum` | number or `nil` | read-only | `histogram`/`exponential_histogram` (optional), `summary` (always a number) |
 | `min` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
 | `max` | number or `nil` | read-only | `histogram`/`exponential_histogram` |
-| `count` | integer | read-only | `distribution` (the sketch's own observation count, `DdSketch::count()`), `exponential_histogram`, `summary` |
+| `count` | count | read-only | `distribution` (the sketch's own observation count, `DdSketch::count()`), `exponential_histogram`, `summary` |
 | `scale` | integer | read-only | `exponential_histogram` |
-| `zero_count` | integer | read-only | `exponential_histogram` |
+| `zero_count` | count | read-only | `exponential_histogram` |
 | `zero_threshold` | number | read-only | `exponential_histogram` |
-| `positive` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
-| `negative` | table, `{offset=, counts=[...]}` | read-only | `exponential_histogram` |
+| `positive` | table, `{offset=, counts=[...]}` (`counts` an array of counts) | read-only | `exponential_histogram` |
+| `negative` | table, `{offset=, counts=[...]}` (`counts` an array of counts) | read-only | `exponential_histogram` |
 | `quantiles` | table, array of `{quantile=, value=}` | read-only | `summary` |
 | `:quantile(q)` | method, returns a number or `nil` | -- | meaningful only on `distribution`; `nil` on every other kind |
 
 `count` is a plain field, not a method: unlike `:quantile(q)`, no argument changes its meaning, so
 a script writes `m.count`, not `m:count()`.
+
+**A count is an integer up to 2^53 and a decimal string above it**, the rule an `I64`/`U64`
+attribute follows ("Timestamps are strings" above): a Lua number would round a larger count, and
+one past `i64::MAX` would read negative. `m.count` on a summary of 9007199254740993 observations
+is the string `"9007199254740993"`; `tonumber()` it for arithmetic at the precision a Lua number
+has. The same encoding applies in `to_table()`, and `Event.new` accepts either form, so a count at
+any magnitude round-trips.
 
 **A write the metric's kind doesn't allow names the kind.** Writing an always-read-only field
 (`flags`, `kind`, `exemplars`, `values`, `sum`, `count`, ...), or a kind-specific one (`value`,
@@ -844,17 +860,17 @@ Per kind (only that kind's keys are accepted):
 | `samples` | `values` | array of finite numbers | optional, default empty |
 | | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
 | `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
-| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer>}` rows; may be empty. `count` is each bucket's *own* observation count, not a running total -- a Prometheus `le="1"`=3, `le="+Inf"`=5 series is `{bound = 1, count = 3}, {bound = math.huge, count = 2}`. Bounds must be strictly increasing (a duplicate or out-of-order bound is an error). `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`, and only on the *last* row: that is the overflow bucket (Prometheus's `+Inf`, OTLP's implicit last `bucket_counts` entry), which `to_table()` emits with the bound `math.huge`. A non-empty `buckets` whose last bound is finite gets `{bound = math.huge, count = 0}` appended -- the constructor's one normalization; it adds no information and keeps the OTLP shape valid. NaN and `-math.huge` are rejected | **required** |
+| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer or decimal-digit string>}` rows; may be empty. `count` is each bucket's *own* observation count, not a running total -- a Prometheus `le="1"`=3, `le="+Inf"`=5 series is `{bound = 1, count = 3}, {bound = math.huge, count = 2}`. Bounds must be strictly increasing (a duplicate or out-of-order bound is an error). `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`, and only on the *last* row: that is the overflow bucket (Prometheus's `+Inf`, OTLP's implicit last `bucket_counts` entry), which `to_table()` emits with the bound `math.huge`. A non-empty `buckets` whose last bound is finite gets `{bound = math.huge, count = 0}` appended -- the constructor's one normalization; it adds no information and keeps the OTLP shape valid. NaN and `-math.huge` are rejected | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` (`to_table()` emits `nil` for an absent one) | optional, default absent |
 | `exponential_histogram` | `scale` | integer in `[-10, 20]` (OTLP's `ExponentialHistogramDataPoint.scale` range) | **required** |
-| | `zero_count`, `count` | non-negative integer | **required** |
+| | `zero_count`, `count` | non-negative integer, or a string of decimal digits (the form `to_table()` gives a count past 2^53) | **required** |
 | | `zero_threshold` | finite number | **required** |
-| | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers>}`; `counts` may be empty but must be present | **required** |
+| | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers or decimal-digit strings>}`; `counts` may be empty but must be present | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` | optional, default absent |
 | `summary` | `quantiles` | array of `{quantile = <number in [0, 1]>, value = <finite number>}` rows; may be empty and need not be sorted | **required** |
-| | `count` | non-negative integer | **required** |
+| | `count` | non-negative integer, or a string of decimal digits | **required** |
 | | `sum` | finite number | **required** |
 
 A `sum` given only its `value` is `MetricKind::counter` (delta, monotonic), so `{name = "hits",
@@ -1010,7 +1026,7 @@ Errors carry the full path. For example:
 
 **Every mistake is a runtime error at the call, prefixed with the dotted path down to the
 field.** A malformed value inside a nested attribute table reports the shared
-attribute-conversion error instead. Unknown keys are rejected everywhere, at the top level and in
+attribute-conversion error behind the attribute's own path. Unknown keys are rejected everywhere, at the top level and in
 sub-tables, the same strictness the proxies apply to an unknown field on read or write. Examples:
 
 - `Event.new: log.severty is not a field`
@@ -1019,6 +1035,7 @@ sub-tables, the same strictness the proxies apply to an unknown field on read or
 - `Event.new: log.span_id can't be set without a trace_id`
 - `Event.new: attributes has a non-string key (integer)`
 - `Event.new: attributes.cb can't be a Lua function`
+- `Event.new: attributes.loop: can't use a table nested more than 128 levels deep as an event attribute value (does a table contain itself?)`
 
 Table access is raw, so a metatable on the input can't make the key check and the field reads
 disagree. Defaults exist only where core already documents one (`BodyFormat::Raw`, the zeros
