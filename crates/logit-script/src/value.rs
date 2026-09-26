@@ -82,7 +82,11 @@ fn exact_i64_to_lua(lua: &Lua, i: i64) -> mlua::Result<LuaValue<'_>> {
 
 /// As [`exact_i64_to_lua`], for `u64`. The exact range is within `i64`'s, so the cast never
 /// truncates.
-fn exact_u64_to_lua(lua: &Lua, u: u64) -> mlua::Result<LuaValue<'_>> {
+///
+/// Also the one encoding of a metric's `u64` count (`crate::proxy`'s `metric_to_table` and
+/// `MetricProxy`), which `construct::count` reads back from either form, so a count at any
+/// magnitude survives `Event.new(e:to_table())`.
+pub(crate) fn exact_u64_to_lua(lua: &Lua, u: u64) -> mlua::Result<LuaValue<'_>> {
     if u64_is_exact_lua_number(u) {
         Ok(LuaValue::Integer(u as mlua::Integer))
     } else {
@@ -115,8 +119,8 @@ fn lua_string_repr(value: &Value) -> Option<Cow<'_, [u8]>> {
 /// variant survives an unmodified round trip (`docs/adr/lua-value-identity-preservation.md`).
 ///
 /// Shallow: a `Table` never matches, so `Array([Bytes(..)])` assigned back to itself becomes
-/// `Array([Str(..)])`. Recursing would walk the incoming table, which can run a script's
-/// `__index` and re-enter the proxy while the event's `RefCell` is borrowed. A tested gap:
+/// `Array([Str(..)])`. Recursing would walk the incoming table while the event's `RefCell` is
+/// borrowed, which the attribute write paths release before any table walk. A tested gap:
 /// `docs/design/lua-value-type-preservation.md`'s "Known residual gaps".
 pub(crate) fn lua_value_matches(existing: &Value, new: &LuaValue) -> bool {
     match new {
@@ -146,11 +150,42 @@ pub fn attrmap_to_lua_table<'lua>(lua: &'lua Lua, map: &AttrMap) -> mlua::Result
     Ok(table)
 }
 
+/// How many `Map`/`Array` levels a converted value may nest: an attribute value sits at depth 0
+/// and each `Map` or `Array` is one level, so a scalar leaf at depth 128 converts and a table at
+/// depth 128 is an error. The same accounting as `logit_proto::native`'s `MAX_VALUE_DEPTH`
+/// (`crates/logit-proto/src/native/value.rs`), so a value a script builds always decodes on a
+/// `logit_in` peer. The cap is what turns a self-referencing table into an error instead of a
+/// stack overflow.
+pub(crate) const MAX_TABLE_DEPTH: usize = 128;
+
 /// Converts a script's value into a `Value`, per the module doc's table.
 ///
 /// Lua has one table type, so a table is an `Array` if its keys are a non-empty `1..=n` and a
-/// `Map` otherwise. Any other Lua type (a function, userdata) is an error.
+/// `Map` otherwise. Any other Lua type (a function, userdata) is an error, and so is a table
+/// nested past [`MAX_TABLE_DEPTH`]. Every table read is raw, so conversion runs no metamethod.
 pub fn lua_to_value(value: LuaValue) -> mlua::Result<Value> {
+    lua_to_value_at(value, 0)
+}
+
+/// Prefixes a [`lua_to_value`] error with the attribute it was converting for, as
+/// `<path>.<key>: <message>`, so a depth error or a bad nested key names the write that raised
+/// it. Run the resource/scope relabel first, since it matches only `RuntimeError`. Call it only
+/// on the error branch: it formats.
+pub(crate) fn attribute_error(path: &str, key: &str, err: mlua::Error) -> mlua::Error {
+    prefixed_error(&format!("{path}.{key}"), err)
+}
+
+/// `err` as a `RuntimeError` reading `<prefix>: <message>`, whatever its variant: a nested key
+/// mlua can't read as a string is a `FromLuaConversionError`, and it needs the prefix too.
+pub(crate) fn prefixed_error(prefix: &str, err: mlua::Error) -> mlua::Error {
+    match err {
+        mlua::Error::RuntimeError(msg) => mlua::Error::RuntimeError(format!("{prefix}: {msg}")),
+        other => mlua::Error::RuntimeError(format!("{prefix}: {other}")),
+    }
+}
+
+/// [`lua_to_value`] for a value `depth` tables below the attribute value.
+fn lua_to_value_at(value: LuaValue, depth: usize) -> mlua::Result<Value> {
     Ok(match value {
         LuaValue::Nil => Value::Null,
         LuaValue::Boolean(b) => Value::Bool(b),
@@ -163,7 +198,13 @@ pub fn lua_to_value(value: LuaValue) -> mlua::Result<Value> {
                 Err(_) => Value::Bytes(bytes),
             }
         }
-        LuaValue::Table(table) => lua_table_to_value(table)?,
+        LuaValue::Table(_) if depth >= MAX_TABLE_DEPTH => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "can't use a table nested more than {MAX_TABLE_DEPTH} levels deep as an event \
+                 attribute value (does a table contain itself?)"
+            )))
+        }
+        LuaValue::Table(table) => lua_table_to_value(table, depth)?,
         other => {
             return Err(mlua::Error::RuntimeError(format!(
                 "can't use a Lua {} as an event attribute value",
@@ -194,7 +235,8 @@ pub(crate) fn validated_sequence_len(table: &Table) -> mlua::Result<Option<usize
     Ok(is_contiguous_from_one.then_some(keys.len()))
 }
 
-fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
+/// `table`, found `depth` tables below the attribute value; its children convert at `depth + 1`.
+fn lua_table_to_value(table: Table, depth: usize) -> mlua::Result<Value> {
     match validated_sequence_len(&table)? {
         // `{}` is ambiguous between an empty `Array` and an empty `Map`; it becomes `Map` because
         // attributes are map-shaped. The case lives here, not in `validated_sequence_len`, because
@@ -203,24 +245,25 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
         Some(seq_len) => {
             let mut items = Vec::with_capacity(seq_len);
             for i in 1..=seq_len {
-                items.push(lua_to_value(table.get(i)?)?);
+                items.push(lua_to_value_at(table.raw_get(i)?, depth + 1)?);
             }
             Ok(Value::Array(items))
         }
-        None => Ok(Value::Map(Box::new(lua_table_to_attrmap(table)?))),
+        None => Ok(Value::Map(Box::new(lua_table_to_attrmap(table, depth)?))),
     }
 }
 
-/// Converts a map-shaped Lua table into an [`AttrMap`], every value through [`lua_to_value`].
+/// Converts a map-shaped Lua table into an [`AttrMap`], every value through [`lua_to_value_at`]
+/// one level down. `Table::pairs` walks with `lua_next` in mlua 0.9, so the walk is raw.
 ///
 /// A numeric key is coerced to its decimal string (`{[1] = "a", x = "b"}` gives keys `"1"` and
 /// `"x"`), a key must be UTF-8, and any other non-string key is mlua's conversion error.
 /// `Event.new` rejects numeric and non-UTF-8 keys instead (`construct::attributes_from_table`).
-pub(crate) fn lua_table_to_attrmap(table: Table) -> mlua::Result<AttrMap> {
+fn lua_table_to_attrmap(table: Table, depth: usize) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
     for pair in table.pairs::<mlua::String, LuaValue>() {
         let (key, value) = pair?;
-        map.insert(key.to_str()?, lua_to_value(value)?);
+        map.insert(key.to_str()?, lua_to_value_at(value, depth + 1)?);
     }
     Ok(map)
 }
@@ -307,5 +350,235 @@ mod array_attribute_tests {
             out.attributes.get("team"),
             Some(&Value::Array(vec![Value::Bool(true), Value::str("1")]))
         );
+    }
+}
+
+/// [`MAX_TABLE_DEPTH`] and raw reads, driven through a real [`crate::ScriptWorker`].
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use crate::{ProcessOutcome, ScriptWorker};
+    use logit_core::Event;
+
+    fn worker(source: &str) -> ScriptWorker {
+        ScriptWorker::new(source).expect("script should load")
+    }
+
+    fn emitted(outcome: ProcessOutcome) -> Event {
+        match outcome {
+            ProcessOutcome::Emit(e, _) => *e,
+            _ => panic!("expected Emit"),
+        }
+    }
+
+    /// `process()`'s error text, for a script that must fail.
+    fn process_err(source: &str) -> String {
+        match worker(source).process(Event::empty(0, AttrMap::new())) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected process() to fail"),
+        }
+    }
+
+    /// A script that wraps a scalar leaf in `levels` tables, alternating one-key maps and
+    /// one-element arrays, and assigns the result to `target`.
+    fn nest_and_assign(levels: usize, target: &str) -> String {
+        format!(
+            r#"
+            function process(event)
+                local v = 1
+                for i = 1, {levels} do
+                    if i % 2 == 0 then v = {{v}} else v = {{k = v}} end
+                end
+                {target} = v
+                return event
+            end
+            "#
+        )
+    }
+
+    /// How many `Map`/`Array` levels wrap the scalar leaf of `value`.
+    fn table_levels(mut value: &Value) -> usize {
+        let mut levels = 0;
+        loop {
+            value = match value {
+                Value::Map(m) => m.get("k").expect("a one-key map level"),
+                Value::Array(items) => &items[0],
+                _ => return levels,
+            };
+            levels += 1;
+        }
+    }
+
+    #[test]
+    fn a_table_nested_128_deep_converts() {
+        let out = emitted(
+            worker(&nest_and_assign(128, "event.attributes.deep"))
+                .process(Event::empty(0, AttrMap::new()))
+                .unwrap(),
+        );
+        let deep = out.attributes.get("deep").expect("the attribute was written");
+        assert_eq!(table_levels(deep), 128);
+    }
+
+    #[test]
+    fn a_table_nested_129_deep_is_an_error_naming_the_cap() {
+        let err = process_err(&nest_and_assign(129, "event.attributes.deep"));
+        assert!(err.contains("event.attributes.deep: "), "{err}");
+        assert!(err.contains("nested more than 128 levels deep"), "{err}");
+    }
+
+    #[test]
+    fn a_self_referencing_table_is_the_depth_error_not_a_stack_overflow() {
+        let err = process_err(
+            r#"
+            function process(event)
+                local t = {}
+                t.self = t
+                event.attributes.loop = t
+                return event
+            end
+            "#,
+        );
+        assert!(err.contains("event.attributes.loop: "), "{err}");
+        assert!(err.contains("does a table contain itself?"), "{err}");
+    }
+
+    #[test]
+    fn a_self_referencing_array_is_the_depth_error() {
+        let err = process_err(
+            r#"
+            function process(event)
+                local t = {}
+                t[1] = t
+                event.attributes.loop = t
+                return event
+            end
+            "#,
+        );
+        assert!(err.contains("event.attributes.loop: "), "{err}");
+        assert!(err.contains("nested more than 128 levels deep"), "{err}");
+    }
+
+    /// Pins the raw-read guarantee rather than reproducing a regression: `Table::get` consults
+    /// `__index` only for a nil raw value, and every index here is present, so this passes
+    /// whether the array branch reads with `get` or `raw_get`.
+    #[test]
+    fn an_array_tables_index_metamethod_never_fires_during_conversion() {
+        let out = emitted(
+            worker(
+                r#"
+                fired = false
+                function process(event)
+                    local list = setmetatable({"a", "b"}, {
+                        __index = function() fired = true; return "from __index" end,
+                        __len = function() fired = true; return 5 end,
+                    })
+                    event.attributes.list = list
+                    assert(not fired, "a metamethod ran during conversion")
+                    return event
+                end
+                "#,
+            )
+            .process(Event::empty(0, AttrMap::new()))
+            .unwrap(),
+        );
+        assert_eq!(
+            out.attributes.get("list"),
+            Some(&Value::Array(vec![Value::str("a"), Value::str("b")]))
+        );
+    }
+
+    /// Pins the guarantee that conversion runs no script code while it builds the value, as
+    /// [`an_array_tables_index_metamethod_never_fires_during_conversion`] does; it doesn't
+    /// reproduce a regression.
+    #[test]
+    fn a_metamethod_that_writes_back_into_the_event_never_runs_during_an_attribute_write() {
+        let out = emitted(
+            worker(
+                r#"
+                function process(event)
+                    local writeback = function()
+                        event.attributes.intruder = "wrote during conversion"
+                        return nil
+                    end
+                    local inner = setmetatable({x = 1}, {__index = writeback, __newindex = writeback})
+                    event.attributes.value = setmetatable({"a", inner}, {__index = writeback})
+                    return event
+                end
+                "#,
+            )
+            .process(Event::empty(0, AttrMap::new()))
+            .unwrap(),
+        );
+        assert!(out.attributes.get("intruder").is_none(), "a metamethod wrote into the event");
+        let mut inner = AttrMap::new();
+        inner.insert("x", 1i64);
+        assert_eq!(
+            out.attributes.get("value"),
+            Some(&Value::Array(vec![Value::str("a"), Value::Map(Box::new(inner))]))
+        );
+    }
+
+    /// A nested key mlua can't read as a string fails as a `FromLuaConversionError`, which gets
+    /// the attribute's prefix like any other conversion error.
+    #[test]
+    fn a_bad_key_inside_a_nested_attribute_table_names_the_attribute() {
+        let err = process_err(
+            r#"
+            function process(event)
+                event.attributes.x = {[true] = 1}
+                return event
+            end
+            "#,
+        );
+        assert!(err.contains("event.attributes.x: "), "{err}");
+
+        let err = process_err(
+            r#"
+            function process(event)
+                return Event.new{timestamp = "1", attributes = {x = {[true] = 1}}}
+            end
+            "#,
+        );
+        assert!(err.contains("Event.new: attributes.x: "), "{err}");
+    }
+
+    #[test]
+    fn a_resource_and_a_scope_attribute_write_get_the_same_cap() {
+        let resource_err = process_err(&nest_and_assign(129, "resource.deep"));
+        assert!(resource_err.contains("resource.deep: "), "{resource_err}");
+        assert!(resource_err.contains("resource attribute value"), "{resource_err}");
+        assert!(resource_err.contains("nested more than 128 levels deep"), "{resource_err}");
+
+        let scope_err = process_err(&nest_and_assign(129, "scope.attributes.deep"));
+        assert!(scope_err.contains("scope.attributes.deep: "), "{scope_err}");
+        assert!(scope_err.contains("scope attribute value"), "{scope_err}");
+        assert!(scope_err.contains("nested more than 128 levels deep"), "{scope_err}");
+    }
+
+    /// mlua 0.9.9's LuaJIT number read truncates toward zero (`num_traits::cast`) and keeps the
+    /// integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52` (and
+    /// `-0.0`) collapse to `0`: a tiny nonzero float written back is stored as `I64(0)`. A
+    /// recorded residual (`docs/adr/lua-event-constructor.md`'s count amendment); this pins it.
+    #[test]
+    fn a_float_below_epsilon_written_back_becomes_zero_a_recorded_residual() {
+        let mut attrs = AttrMap::new();
+        attrs.insert("tiny", 1e-20f64);
+        attrs.insert("small", 1e-10f64);
+        let out = emitted(
+            worker(
+                r#"
+                function process(event)
+                    event.attributes.tiny = event.attributes.tiny
+                    event.attributes.small = event.attributes.small
+                    return event
+                end
+                "#,
+            )
+            .process(Event::empty(0, attrs))
+            .unwrap(),
+        );
+        assert_eq!(out.attributes.get("tiny"), Some(&Value::I64(0)));
+        assert_eq!(out.attributes.get("small"), Some(&Value::F64(1e-10)));
     }
 }

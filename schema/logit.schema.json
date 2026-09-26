@@ -805,6 +805,14 @@
                 "null"
               ]
             },
+            "max_memory": {
+              "description": "Fails this component, and with it the process (exit code 2), once its Lua VM holds more than this many bytes after a full garbage collection. Checked after each batch and each `flush()`, so one call can briefly go over it. A quoted byte-count string (`\"256MiB\"` or `\"268435456\"`). Omitted (the default) means no limit; `0` is rejected.\n\nBounds the Lua VM heap only: an event a script retains keeps its payload in Rust memory the cap does not see. Size it at least twice the script's steady working set as read from `logit.script.vm.memory`; a lower cap forces a full collection on most batches.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "script": {
               "type": "string"
             },
@@ -817,7 +825,7 @@
           }
         },
         {
-          "description": "A `.lua` file path, relative to the config file. Takes the same `interval` as `lua`.",
+          "description": "A `.lua` file path, relative to the config file. Takes the same `interval` and `max_memory` as `lua`.",
           "type": "object",
           "required": [
             "lua_file",
@@ -833,6 +841,13 @@
             },
             "lua_file": {
               "type": "string"
+            },
+            "max_memory": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "type": "string",
