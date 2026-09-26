@@ -179,19 +179,36 @@ exists so a flush-driven `Event.new{timestamp = now, ...}` ("Constructing events
 timestamp without a general clock. A script that declares `function flush()` with no parameter
 ignores it, per ordinary Lua semantics.
 
-**Don't use an event handle after you hand the event back.** An event handle, and its
-`event.attributes` handle, is consumed once the event is returned from `process()` or included in
-a `flush()` table. Lua userdata is a reference type, so a variable a script stashed elsewhere
-(`pending = event`, or `pending_attrs = event.attributes`) can be the *exact same* object as the
-one returned, not a copy. Extracting the returned event invalidates every other reference to it,
-including a stashed `event.attributes` handle, because one is cached per event and reused for
-every access (`crates/logit-script/src/proxy.rs`). Using a stale alias is a clear error, not
-silently wrong data. To emit an event now and keep something for later (a stateful `flush()`
-re-emitting it, say), stash `event:clone()` instead of `event` (or `event.attributes`).
+**Don't use an event handle after you hand the event back.** An event handle, and every handle
+obtained from it (`event.attributes`, `event.log`, `event.metrics`, `event.metrics[i]`,
+`event.span`), is consumed once the event is returned from `process()` or included in a `flush()`
+table. Lua userdata is a reference type, so a variable a script stashed elsewhere (`pending =
+event`, or `pending_attrs = event.attributes`, in a global or an upvalue) can be the same object as
+the one returned, not a copy. Extracting the returned event invalidates every other reference to
+it, including a stashed sub-handle, because one is cached per event and reused for every access
+(`crates/logit-script/src/proxy.rs`). Using a stale alias, in a later `process()` or in `flush()`,
+fails the call with an error naming the rule, not silently wrong data. A script's own `pcall`
+around that use sees mlua's raw "destructed userdata" wording instead. To emit an event now and
+keep something for later (a stateful `flush()` re-emitting it, say), stash `event:clone()` instead
+of `event` (or a handle from it). The `resource`, `scope`, `trace`, and `provenance` globals aren't
+per-event handles: a stashed alias of one reads whatever the current call's batch, or the flush
+root, set.
 
-`return {a, b}` must be a proper array-like table (keys exactly `1..=n`, Lua's own notion of a
-sequence). A malformed table (non-contiguous keys) is a clear error, not a silently incomplete or
-empty result.
+`return {a, b}` must be a proper array-like table (keys `1..=n`, Lua's own notion of a sequence).
+A malformed table (non-contiguous keys) is a clear error, not a silently incomplete or empty
+result. Anything else that isn't an event fails the whole call with one wording, naming the type
+and, inside a table, the index:
+
+- `process() must return nil, an event, or a table of events; got a userdata that isn't an event (e.g. event.attributes)`
+- `process() must return nil, an event, or a table of events; got a number at index 1`
+- `flush() must return nil or a table of events; got an event (return {event})`
+
+Returning the same event twice (`return {event, event}`) is the consumed-handle error at the
+second copy, and the call emits nothing.
+
+**An error names the script, not `logit`'s source.** The script loads under the chunk name
+`script`, so an error and its traceback read `script:4: attempt to index local 'missing' (a nil
+value)`, with the line in the script's own source.
 
 **`process`/`flush` are resolved once, when the script loads**, not looked up from `_G` on every
 event or flush tick, a deliberate cost/behavior trade-off (`crates/logit-script/src/lib.rs`). A
@@ -1169,22 +1186,39 @@ no ambient access to the host or to files. Core language functions like `pairs`/
 library.** Review against the real implementation found `loadfile ~= nil` and `dofile ~= nil`
 both true in a worker built with only `TABLE | STRING | MATH`, so a script could read and execute
 any file this process can read. `remove_unsandboxed_base_globals`
-(`crates/logit-script/src/lib.rs`) sets six base globals to `nil` after VM creation:
+(`crates/logit-script/src/lib.rs`) sets seven base globals to `nil` after VM creation:
 
 - `loadfile`/`dofile`: the reproduced file-access issue.
 - `load`/`loadstring`: dynamic execution of arbitrary constructed strings. Not file I/O, but it
   undermines "only the configured script source ever runs".
 - `getfenv`/`setfenv`: Lua 5.1-specific, and well known as sandbox-escape-adjacent tools for
   tampering with a function's environment.
+- `newproxy`: the only way a script gets a `__gc` finalizer on LuaJIT, and a finalizer that runs
+  while `logit` is allocating inside a proxy call can crash the process
+  ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)).
 
-`crates/logit-script/src/lib.rs`'s tests confirm with real scripts that `os`, `io`, `ffi`,
-`require`, `loadfile`, `dofile`, `load`, `loadstring`, `getfenv`, and `setfenv` are all absent:
-ten checks, each its own test, so a regression in any one fails on its own.
+**`print` writes to `logit`'s own log, never stdout**, where it would corrupt a `stdio_out`
+writing there. Each argument goes through the script's `tostring` (so `__tostring` works), the
+results are tab-joined, and the line is logged at `info` as `print: <line>`, tagged with the
+component id (`<unset>` for top-level code, which runs before the id is known).
 
-On top of that base, `logit` adds exactly the globals this document describes: `telemetry`,
-`trace`, `provenance`, `resource`, `scope`, and `Event` (the `Event.new` constructor,
-"Constructing events" above). Each is a proxy or a table of Rust closures, and none is a route to
-the host.
+The sandbox is pinned by one test, `the_global_table_is_exactly_the_allowlist`
+(`crates/logit-script/src/lib.rs`). It builds a worker as the runtime does and requires `_G` to
+hold this set and nothing else:
+
+- From Lua's base library: `_G`, `_VERSION`, `assert`, `collectgarbage`, `error`, `gcinfo`,
+  `getmetatable`, `ipairs`, `next`, `pairs`, `pcall`, `print` (rerouted, above), `rawequal`,
+  `rawget`, `rawset`, `select`, `setmetatable`, `tonumber`, `tostring`, `type`, `unpack`,
+  `xpcall`, and `coroutine`, which LuaJIT's base library registers itself.
+- The three libraries: `math`, `string`, `table`.
+- From `logit`: `Event` (the `Event.new` constructor, "Constructing events" above), `provenance`,
+  `resource`, `scope`, `telemetry`, and `trace`, each a proxy or a table of Rust closures, none a
+  route to the host.
+- The script's own `process`, and `flush` if it defines one.
+
+The same test requires `bit`, `debug`, `ffi`, `io`, `jit`, `module`, `newproxy`, `os`, `package`,
+`require`, and `rawlen` to be `nil`. `collectgarbage` and `coroutine` stay: neither reaches the
+host, and each has an ordinary use in a transform script.
 
 ## Costs
 

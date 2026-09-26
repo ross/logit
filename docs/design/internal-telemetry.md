@@ -1335,6 +1335,11 @@ layer 2). Uniquely, a script can also call a **script-facing** `telemetry` globa
 (`telemetry.count(...)`/`.gauge(...)`) for domain facts only the script knows. See
 [Metrics from Lua scripts](#metrics-from-lua-scripts) and `docs/design/lua-api.md`.
 
+A script's `print(...)` is a self-log line, never stdout: `print: <arguments, tab-joined>` at
+`info`, target `logit`, with the component's `component` field (`<unset>` for top-level code that
+runs before the id is known; `crates/logit-script/src/print.rs`). At `info` it sits below the
+lowest `logs:` threshold `internal` accepts, so it reaches the process log but never the pipeline.
+
 #### Outputs
 
 Every sink's retry counting is layer 2 (`logit.component.retries`), not something each sink tracks
