@@ -615,9 +615,10 @@ fn splunk_cloud_body_cap_warning(id: &str, max_body_bytes: u64) -> Option<String
     (max_body_bytes > SPLUNK_CLOUD_BODY_CAP as u64).then(|| {
         format!(
             "component '{id}': splunk_hec_out 'max_body_bytes' ({max_body_bytes}) is above \
-             {SPLUNK_CLOUD_BODY_CAP} bytes, the largest body Splunk Cloud has been seen to \
-             accept -- a Splunk Cloud stack refuses a larger one, which the sink then resends as \
-             two requests or drops; Splunk Enterprise allows up to 800 MiB"
+             {SPLUNK_CLOUD_BODY_CAP} bytes, a bound at or below Splunk Cloud's observed cap (a \
+             5,242,881-byte body accepted, 6,000,000 refused) -- a Splunk Cloud stack may refuse \
+             a larger body, which the sink then resends as two requests or drops; Splunk \
+             Enterprise allows up to 800 MiB"
         )
     })
 }

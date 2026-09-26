@@ -228,8 +228,9 @@ showed"). ADR `splunk-hec-relay`'s Cloud amendment records what each changed.
 6. **The body cap is between 5,242,881 and 6,000,000 bytes, and over it the answer is `400` code
    6 naming object 0, not `413`.** Bodies up to 5,242,881 bytes uncompressed, and 2,000,000
    gzipped, were accepted and indexed. `splunk_hec_out`'s 2 MiB `max_body_bytes` default sits
-   under the cap. A `max_body_bytes` above it turns the body's first object into an
-   `invalid_event` drop and resends the rest, the right outcome only for one huge object.
+   under the cap. `splunk_hec_out` reads a code 6 naming object 0 of a body over 5,242,880 bytes
+   as this answer: it splits the body in two once, or drops a lone object as `oversize`, and
+   warns at startup about a `max_body_bytes` above the cap.
 7. **Everything else matches 10.4.3**: gzip accepted and `deflate` `415`; the prefix semantics
    of codes 6, 7, 12, 13, and 15; the lenient cases; `OPTIONS`; the `404` and `405` bodies;
    `/raw` without a channel; 200 and 1,000 dimensions; both metric forms; `metric_type` a
