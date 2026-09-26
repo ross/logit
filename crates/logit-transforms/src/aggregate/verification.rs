@@ -18,6 +18,9 @@
 //!   cap (most idle first, then newest), and clamps its start time into its window. The model
 //!   checks every survivor's state and the series accounting identity. `aggregate`'s own tests
 //!   drive the cap at volume (`cap_soak`).
+//! - XFORM-05, contributing contexts:
+//!   `contributing_contexts_cap_per_series_and_count_only_new_and_full` drives the per-series
+//!   context cap with more contexts than it holds, against [`ref_links`].
 //!
 //! Case counts are floors: a `PROPTEST_CASES` above one raises it for a deeper run.
 
@@ -2093,4 +2096,139 @@ fn a_histogram_sum_once_none_stays_none_across_windows() {
         sums.push(h.sum);
     }
     assert_eq!(sums, vec![Some(1.0), None, None]);
+}
+
+/// Series names a context-cap case feeds, one gauge series each.
+const CAP_SERIES: [&str; 3] = ["cap0", "cap1", "cap2"];
+/// Contexts a context-cap case draws from: more than the cap, so some series fill it.
+const CAP_CONTEXTS: usize = 12;
+
+/// One batch of one record: `conflict` sends a delta `Sum` under the series' gauge key, which the
+/// aggregator passes through, when the series already exists.
+#[derive(Debug, Clone, Copy)]
+struct CapOp {
+    series: usize,
+    context: usize,
+    conflict: bool,
+}
+
+fn cap_window(series: usize) -> impl Strategy<Value = Vec<CapOp>> {
+    prop::collection::vec(
+        (0..series, 0..CAP_CONTEXTS, prop::bool::weighted(0.2))
+            .prop_map(|(series, context, conflict)| CapOp { series, context, conflict }),
+        0..=60,
+    )
+}
+
+/// The links a series' merged observations in one window become, and the count the cap drops:
+/// the first `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES` distinct contexts in order, and one drop per
+/// observation of any other context.
+fn ref_links(accepted: &[usize]) -> (Vec<usize>, u64) {
+    let mut linked: Vec<usize> = Vec::new();
+    for &c in accepted {
+        if !linked.contains(&c) && linked.len() < MAX_CONTRIBUTING_CONTEXTS_PER_SERIES {
+            linked.push(c);
+        }
+    }
+    let dropped = accepted.iter().filter(|c| !linked.contains(c)).count() as u64;
+    (linked, dropped)
+}
+
+/// Each series' `ContributingContexts`, by series index, read off the aggregator.
+fn held_contexts(agg: &Aggregator) -> Vec<(usize, Vec<TraceContext>, u64)> {
+    let mut held: Vec<_> = agg
+        .groups
+        .iter()
+        .flat_map(|g| &g.series)
+        .map(|(key, state)| {
+            let series = CAP_SERIES.iter().position(|n| intern(n) == key.name).unwrap();
+            (series, state.contexts.seen.to_vec(), state.contexts.dropped)
+        })
+        .collect();
+    held.sort_unstable_by_key(|(series, _, _)| *series);
+    held
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// XFORM-05: over two windows of random batches, each series links the first eight distinct
+    /// contexts its merged records carried and counts every other observation as dropped. A
+    /// context re-observed on a series that links it, and a context on a kind-conflicted record,
+    /// count nothing, and no series sees another's contexts. A flush empties every series' set,
+    /// retained ones included.
+    #[test]
+    fn contributing_contexts_cap_per_series_and_count_only_new_and_full(
+        windows in (1..=3usize).prop_flat_map(|n| prop::collection::vec(cap_window(n), 2)),
+    ) {
+        let resource = Arc::new(Resource::default());
+        let registry = logit_core::Registry::new();
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(3, 10)
+            .with_telemetry(registry.telemetry_for("cap", "aggregate", "transform"));
+        let mut exists = [false; CAP_SERIES.len()];
+        let mut now = 0;
+
+        for ops in &windows {
+            let mut accepted: [Vec<usize>; CAP_SERIES.len()] = Default::default();
+            for op in ops {
+                let conflict = op.conflict && exists[op.series];
+                let kind = if conflict { MetricKind::counter(1.0) } else { MetricKind::Gauge(1.0) };
+                let record = MetricRecord::new(intern(CAP_SERIES[op.series]), kind);
+                let mut event = Event::metric(now, AttrMap::new(), record);
+                agg.observe_batch_context(context(op.context));
+                agg.process(&resource, &mut event);
+                prop_assert_eq!(event.metrics.len(), usize::from(conflict));
+                if !conflict {
+                    exists[op.series] = true;
+                    accepted[op.series].push(op.context);
+                }
+            }
+
+            // Before the flush: each series holds its own contexts and nothing else.
+            let expected: Vec<(usize, Vec<usize>, u64)> = (0..CAP_SERIES.len())
+                .filter(|&s| exists[s])
+                .map(|s| {
+                    let (linked, dropped) = ref_links(&accepted[s]);
+                    (s, linked, dropped)
+                })
+                .collect();
+            let expected_held: Vec<(usize, Vec<TraceContext>, u64)> = expected
+                .iter()
+                .map(|(s, linked, dropped)| {
+                    (*s, linked.iter().map(|c| context(*c)).collect(), *dropped)
+                })
+                .collect();
+            prop_assert_eq!(held_contexts(&agg), expected_held);
+
+            // The flush: links in observation order, the drops counted under `reason=contexts`.
+            now += 10;
+            let mut emitted: Vec<(usize, Vec<[u8; 16]>)> = agg
+                .flush(now)
+                .into_iter()
+                .flat_map(|(_, _, events)| events)
+                .map(|(event, links)| {
+                    let name = event.metrics[0].name;
+                    let series = CAP_SERIES.iter().position(|n| intern(n) == name).unwrap();
+                    (series, links.iter().map(|l| l.trace_id).collect())
+                })
+                .collect();
+            emitted.sort_unstable_by_key(|(s, _)| *s);
+            let expected_links: Vec<(usize, Vec<[u8; 16]>)> = expected
+                .iter()
+                .filter(|(s, _, _)| !accepted[*s].is_empty())
+                .map(|(s, linked, _)| (*s, linked.iter().map(|c| context(*c).trace_id).collect()))
+                .collect();
+            prop_assert_eq!(emitted, expected_links);
+            let dropped: u64 = expected.iter().map(|(_, _, d)| d).sum();
+            let drained = registry.drain(now);
+            prop_assert_eq!(telemetry_total(&drained, LINKS_DROPPED, "reason", "contexts"), dropped);
+            prop_assert_eq!(telemetry_total(&drained, LINKS_DROPPED, "", ""), dropped);
+
+            // After the flush: every retained series starts the next window with an empty set.
+            for (series, seen, dropped) in held_contexts(&agg) {
+                prop_assert!(seen.is_empty() && dropped == 0, "series {} kept contexts", series);
+            }
+        }
+    }
 }
