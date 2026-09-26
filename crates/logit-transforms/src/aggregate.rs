@@ -3296,3 +3296,6 @@ mod tests {
         assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
     }
 }
+
+#[cfg(test)]
+mod verification;

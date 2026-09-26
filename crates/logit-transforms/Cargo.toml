@@ -18,6 +18,7 @@ smallvec.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 # Only `chained_pipeline_test` needs these -- driving a real graph through
 # `logit_pipeline::run`/`Fanout` (see `provenance::tests`'s end-to-end test), not just calling
 # `Transform::process` directly the way every other test in this crate does.

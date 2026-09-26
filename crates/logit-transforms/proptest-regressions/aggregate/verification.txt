@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc afaf98540fd2b910b54eb6be54ccfced6091bcdea6042d2d246949bcf24e9dca # shrinks to ops = [Batch(4, 0, 2)]
+cc c484bd3c6bb7ff763cb00f37aa83ea46bb14defdc2d3743f8fa84f672129ed9a # shrinks to pool = [Null, Null, Null, Null, Null, Null, Null, Null], spec = KeySpec { name: "m0", unit: None, attrs: [] }, which = 7, how = 0, swap = false, slot = "k0"
+cc 2108cf88c51958696986928fe7c5726f7d58aaeb6f58353c9ab6269f5e169aea # shrinks to pool = [Null, Null, Null, Array([Map(AttrMap([(Spur(1), F64(NaN))]))]), Null, Null, Null, Null], spec = KeySpec { name: "m0", unit: None, attrs: [("k3", 3)] }, perm = [0, 1, 2]
+cc 16693d0d2bf7ff2e0d4d20abb9a276d8da35a2a8ff58e9d2b872add5af2ca2e8 # shrinks to pool = [Null, Null, Null, Null, Null, Array([Array([F64(NaN)])]), Null, Null], a = KeySpec { name: "m0", unit: None, attrs: [("k5", 5)] }, independent = KeySpec { name: "m0", unit: None, attrs: [] }, reuse = false, perm = [0, 1, 2]
+cc 32fb8c98c442f0fdddacea099353f5dac7487738c6a681778dcf488559fc2689 # shrinks to pool = [Null, Null, Map(AttrMap([(Spur(1), F64(NaN))])), Null, Null, Null, Null, Null], specs = [KeySpec { name: "m0", unit: None, attrs: [("k0", 2)] }, KeySpec { name: "m0", unit: None, attrs: [("k0", 2)] }]
+cc 11adf1d21ab5a3c2595161686a3ecce1014aa9229edf45428155c84b56ad0c64 # shrinks to pool = [Null, Array([Bytes(b"")]), Null, Null, Null, Array([Str(b"")]), Null, Null], a = KeySpec { name: "m0", unit: None, attrs: [("k1", 5)] }, independent = KeySpec { name: "m0", unit: None, attrs: [] }, mode = 1, perm = [0, 1, 2], twin = [true, false, false]
