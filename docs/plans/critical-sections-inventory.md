@@ -178,8 +178,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | ID | Pri | Section | Primary location | Status |
 |---|---|---|---|---|
 | [NET-01](#net-01--recvmmsg2-batched-udp-read-hand-built-mmsghdriovec-arrays-over-vecu64-storage) | P0 | `recvmmsg(2)` batched UDP read: hand-built `mmsghdr`/`iovec` arrays over `Vec<u64>` storage | `crates/logit-inputs/src/udp.rs` (`BatchReader`, `build_headers`/`recvmmsg_into`/`harvest_headers`) | findings → #281 |
-| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | findings → #PRNUM |
-| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #PRNUM |
+| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | findings → #406 |
+| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
@@ -512,7 +512,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `datagrams sent == delivered + dropped + (bounded shutdown loss)`; `--verify` perf scenario.
 - **Priority:** P0 — the close contract is the only thing keeping `decode_loop` from hanging, and
   the accounting is the basis for every loss claim the ADR makes.
-- **Verified (drain/w3, #PRNUM):** The close contract held, and the loss was wider than the entry
+- **Verified (drain/w3, #406):** The close contract held, and the loss was wider than the entry
   said. The second `select!` is unbiased and `wait_for` is `Ready` at once after the signal, so
   about half the time `push_many` is never polled and its whole batch was dropped uncounted, not
   a cancelled call's remainder alone. `read_loop`'s batch and queue now live in a `ReadHalf` guard
@@ -579,7 +579,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   drifts; fault injection dropping the future mid-decode to bound the loss.
 - **Priority:** P0 — a wrong `0`-means-closed reading or a lost `popped` vec is silent data loss on
   the main path, and the deadline math is hand-rolled.
-- **Verified (drain/w3, #PRNUM):** `pop_many`'s `0` and the `timeout` arm checked out, and two
+- **Verified (drain/w3, #406):** `pop_many`'s `0` and the `timeout` arm checked out, and two
   findings were real. The popped-but-undecoded datagrams of a grace-backstop drop were uncounted:
   `decode_loop` now iterates its batch through a `CountedDrain`, and `UdpListener::drive`'s
   `ResidualOnDrop` counts what the receive queue still holds once both halves are gone, through a
