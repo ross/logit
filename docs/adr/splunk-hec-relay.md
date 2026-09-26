@@ -431,3 +431,38 @@ Two answers the sink misread under its default at-most-once posture. By decision
   the cap, since Splunk Enterprise allows 800 MiB, and logs a startup warning naming Cloud's cap.
   Rejected: capping `max_body_bytes` at 5 MiB in rule 70, which would refuse a valid Enterprise
   configuration.
+
+## Amendment: the listener delivers the prefix before a code 6 (2026-09-26)
+
+Decision 11 said a syntax error in any object rejects the whole body "and nothing is delivered,
+as Splunk does". Splunk doesn't: Splunk Enterprise 10.4.3 and Splunk Cloud Platform 10.5.2605.9
+both index every object before the one a `400` code 6 names and none from it on
+(`docs/plans/splunk-relay.md`, "Settled by W5" item 8 and "Settled by the Cloud run"), and
+Vector's `splunk_hec` source delivers what it parsed before answering `400`. A client that follows
+Splunk's semantics resends only the objects after the named one, so against the old listener it
+lost the objects before it. `splunk_hec_out`'s decision 18 rule is such a client, so a
+`splunk_hec_out -> splunk_hec_in` relay lost them too. **Changed:**
+
+- **Decision 11:** a `/event` body whose object `N` doesn't parse (a syntax error, or a member
+  the model can't hold) delivers objects `0..N`, grouped by resource as any body is, and answers
+  `400` code 6 with `invalid-event-number` `N`. Nothing from `N` on is decoded or counted. The
+  codec's `decode_events_prefix` returns both; `decode_events` keeps the whole-body form for
+  callers that want it.
+- **`N` = 0** delivers nothing and is answered as before: a plain code 6 with no `ackId`.
+- **`N` > 0** goes through delivery as a whole body of those `N` objects would: the bounded wait,
+  a `503` code 9 with no `ackId` if it passes, and otherwise the code 6 with the `ackId` a `200`
+  would have carried when the request named a channel, after `invalid-event-number`. Splunk
+  10.4.3 answers the same on a `useACK` token with a channel:
+  `{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":0}` for a syntax
+  error in object 1, and no `ackId` for one in object 0 (`tools/splunk-interop/README.md`). This
+  revises the listener amendment's "an `ackId` is drawn only on a `200`": the objects before
+  `N` reached the pipeline, and `/ack` reports them as it reports any other request. A prefix
+  whose every object the codec skipped sends nothing and is answered the same way, as an
+  all-skipped whole body answers `200`.
+- **gzip:** a stream that doesn't decompress is still code 6 with no `invalid-event-number` and
+  nothing delivered. Decompression yields nothing short of the whole stream, so the decoder
+  never sees a prefix to deliver.
+- **Telemetry:** the delivered objects count where any delivered batch's do, on the listener's
+  fanout edge, and the answer counts `logit.input.requests{class="rejected"}` and
+  `logit.input.requests.rejected{reason="malformed"}`, with the `request_rejected` diagnostic
+  naming how many objects were kept.

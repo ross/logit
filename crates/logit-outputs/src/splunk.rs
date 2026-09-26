@@ -250,10 +250,9 @@ fn split_point(objects: &[Object<'_>]) -> usize {
 
 /// Which objects of a body to resend after Splunk answered `400` code 6 with
 /// `invalid-event-number` `n`: the object to drop, and the range of objects to send again, or
-/// `None` when `n` names no object of the body. It assumes Splunk indexed every object before
-/// `n` and none after, which Splunk doesn't document: UNVERIFIED item 8 in
-/// `docs/plans/splunk-relay.md`, which W5 settles against a real Splunk (ADR `splunk-hec-relay`,
-/// decision 18). This function is the one place that assumption lives.
+/// `None` when `n` names no object of the body. Splunk indexes every object before `n` and none
+/// from it on, which it doesn't document (`docs/plans/splunk-relay.md`, "Settled by W5" item 8),
+/// and `splunk_hec_in` delivers the same prefix. This function is the one place that rule lives.
 fn after_invalid_event(objects: usize, n: u64) -> Option<(usize, Range<usize>)> {
     let n = usize::try_from(n).ok().filter(|&n| n < objects)?;
     Some((n, n + 1..objects))
@@ -666,7 +665,7 @@ impl SplunkHecOutput {
             return Err(anyhow::anyhow!("splunk_hec_out: {message}"))
                 .map_err(|err| err.context(Fault::Permanent));
         };
-        // The objects ahead of `bad` count as indexed (`after_invalid_event`'s assumption).
+        // The objects ahead of `bad` count as indexed (`after_invalid_event`'s rule).
         *sent_any |= bad > 0;
         let ahead: usize = objects[..bad].iter().map(|(_, records)| records).sum();
         self.telemetry.count(RECORDS, ahead as f64, &[]);

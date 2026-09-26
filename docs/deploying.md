@@ -1796,7 +1796,10 @@ anything else to a log. An object with no `event` and no measurement, or a blank
 skipped and counted, and every valid object in the body is delivered. Splunk Enterprise 10.4.3
 skips an object with `fields` and no `event` and answers `200`, but answers an object with neither
 `400` code 12 and a blank `event` `400` code 13, indexing the objects before it and none after.
-`crates/logit-proto/src/splunk/mod.rs`'s module doc has every mapping.
+An object that isn't valid JSON is answered as Splunk answers it: the objects before it are
+delivered, and `400` code 6 names it in `invalid-event-number`, so a client that resends only the
+objects after it loses nothing else. `crates/logit-proto/src/splunk/mod.rs`'s module doc has
+every mapping.
 
 **Authentication.** With `tokens` set, a request needs `Authorization: Splunk <token>` (or
 `Basic` with the token as the password) naming one of them: none gets `401`, an unlisted one
@@ -1809,7 +1812,8 @@ the network in the clear, and because a client configured with an `https://` URL
 as Splunk answers.
 
 **Channels and acknowledgment.** No channel is required on any route. A request that names one
-(`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, and `/ack` answers every
+(`X-Splunk-Request-Channel` or `?channel=`) gets an `ackId` in its `200`, or in a code 6 that
+followed delivered objects, and `/ack` answers every
 id asked about `true`, because a `200` already means the data reached the pipeline. Neither the
 channel nor the id enters an event.
 

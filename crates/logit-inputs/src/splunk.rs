@@ -34,7 +34,9 @@
 //!
 //! **Channels and acknowledgment.** A request that names a channel (the `X-Splunk-Request-Channel`
 //! header, or `?channel=`) is answered with an `ackId`, drawn from one per-listener counter that
-//! starts at 1; a request without one gets no `ackId`, as from a token without `useACK`. `/ack`
+//! starts at 1, as is a `400` code 6 naming an object past the first whose prefix passed the
+//! bounded wait, delivered or all skipped (step 7); a request without one gets no `ackId`, as from
+//! a token without `useACK`. `/ack`
 //! answers every id it is asked about `true`: a `200` already means the data reached the pipeline,
 //! and a pipeline that can't take it answers `503` instead. No channel is ever required, and
 //! neither the channel nor the id enters an event.
@@ -57,13 +59,17 @@
 //!    included, which Splunk doesn't accept either.
 //! 5. **Body.** A body that stops arriving mid-upload gets `408` and the connection closes, when
 //!    `idle_timeout` is set. The gzip output is capped at `max_request_bytes` too (`413` past it),
-//!    and a stream that doesn't decompress is `400` code 6.
-//! 6. **Decode.** An empty body is `400` code 5. A body that isn't HEC JSON is the codec's
-//!    [`HecError`]: code 6 with `invalid-event-number` naming the first bad object, and nothing is
-//!    delivered. A `/raw` body with no non-empty line is code 5. A malformed `/ack` body is code
-//!    6.
-//! 7. **Delivery**, bounded (below), then the route's `200`. A body whose every object the codec
-//!    skipped (no `event`) sends nothing and still answers `200`.
+//!    and a stream that doesn't decompress is `400` code 6 with no `invalid-event-number`,
+//!    delivering nothing: decompression yields no output short of the whole stream.
+//! 6. **Decode.** An empty body is `400` code 5. A `/event` body that isn't HEC JSON is the
+//!    codec's [`HecError`]: code 6 with `invalid-event-number` naming the first bad object `N`.
+//!    As Splunk does, the objects before `N` are kept and go on to delivery, and none from `N` on;
+//!    `N` = 0 is answered here with nothing delivered and no `ackId`. A `/raw` body with no
+//!    non-empty line is code 5. A malformed `/ack` body is code 6.
+//! 7. **Delivery**, bounded (below), then the route's `200`, or for a body cut short at object
+//!    `N` > 0, the same `400` code 6 naming `N`, with the `ackId` a `200` would have carried. A
+//!    body whose every kept object the codec skipped (no `event`) sends nothing and still answers
+//!    as if it had.
 //!
 //! # Backpressure: a bounded wait, then `503`
 //!
@@ -88,7 +94,9 @@
 //! size as sent, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
 //! `unknown_route`, `method`, `oversize`, `query_token`, `auth`, `encoding`,
 //! `malformed_encoding`, `no_data`, `malformed`, `stalled`, or `body_read` (a body that failed for a
-//! reason other than its size, such as a client disconnecting mid-upload).
+//! reason other than its size, such as a client disconnecting mid-upload). A code 6 that follows a
+//! delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects are counted where
+//! any delivered batch's are, on the listener's fanout edge.
 //! `logit.input.batches.dropped{reason="busy"}` counts the batches a `503` left undelivered. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s
 //! `splunk_hec_in` section is the operator-facing account.
@@ -615,11 +623,20 @@ async fn respond(
     let mut decoder = SplunkDecoder::new()
         .with_telemetry(shared.telemetry.clone())
         .with_diagnostics(shared.diag.clone());
+    // A code 6 naming object `N > 0` still delivers objects `0..N`, as Splunk indexes them, and
+    // is answered once they are delivered; a client resends from `N + 1`.
+    let mut invalid: Option<HecError> = None;
     let batches: Vec<EventBatch> = match route {
-        Route::Event => match decoder.decode_events(&body, received_at) {
-            Ok(batches) => batches.into_iter().filter(|batch| !batch.events.is_empty()).collect(),
-            Err(err) => return (name, REJECTED, reject_hec_error(shared, &err)),
-        },
+        Route::Event => {
+            let decoded = decoder.decode_events_prefix(&body, received_at);
+            if let Some(err) = decoded.error {
+                if err.invalid_event_number.unwrap_or(0) == 0 {
+                    return (name, REJECTED, reject_hec_error(shared, &err, None));
+                }
+                invalid = Some(err);
+            }
+            decoded.batches.into_iter().filter(|batch| !batch.events.is_empty()).collect()
+        }
         Route::Raw => {
             let batch = decoder.decode_raw(&body, &query.envelope, received_at);
             if batch.events.is_empty() {
@@ -654,6 +671,9 @@ async fn respond(
         }
     }
     let ack_id = channel.then(|| shared.next_ack_id.fetch_add(1, Ordering::Relaxed));
+    if let Some(err) = invalid {
+        return (name, REJECTED, reject_hec_error(shared, &err, ack_id));
+    }
     (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
 }
 
@@ -675,11 +695,21 @@ fn reject(
     response
 }
 
-/// The codec's whole-body rejection: code 5 is `no_data`, anything else `malformed`.
-fn reject_hec_error(shared: &Shared, err: &HecError) -> http::Response<Full<Bytes>> {
+/// The codec's rejection: code 5 is `no_data`, anything else `malformed`. A code 6 naming object
+/// `N > 0` comes after objects `0..N` were delivered, and carries the request's `ack_id`, if any.
+fn reject_hec_error(
+    shared: &Shared,
+    err: &HecError,
+    ack_id: Option<u64>,
+) -> http::Response<Full<Bytes>> {
     let reason = if err.status == HecStatus::NO_DATA { "no_data" } else { "malformed" };
-    let response = json_response(http_status(err.status), Bytes::from(err.body()));
-    reject(shared, reason, Some(&err.to_string()), response)
+    let response = json_response(http_status(err.status), Bytes::from(err.body_with_ack(ack_id)));
+    let message = match err.invalid_event_number {
+        Some(n) if n > 0 => format!("{err} at object {n}; kept the {n} objects before it"),
+        Some(n) => format!("{err} at object {n}"),
+        None => err.to_string(),
+    };
+    reject(shared, reason, Some(&message), response)
 }
 
 /// `{"text":…,"code":N}` under the HTTP status Splunk sends that code with.
@@ -1258,16 +1288,17 @@ mod tests {
         );
     }
 
-    /// A syntax error in any object rejects the whole body, naming that object's index, and
-    /// delivers nothing; so does a number the model can't hold.
+    /// A syntax error in an object, or a number the model can't hold, is `400` code 6 naming that
+    /// object's index; the objects before it are delivered, and none from it on.
     #[tokio::test]
     async fn a_malformed_body_is_400_code_6_with_the_first_bad_index() {
-        let (addr, rx) = start_default().await;
+        let (addr, mut rx) = start_default().await;
         let path = "/services/collector/event";
-        let cases: [(&[u8], u64); 3] = [
+        let cases: [(&[u8], u64); 4] = [
             (b"{\"event\":\"a\"}{\"event\":\"b\"}{\"event\":", 2),
             (b"[{\"event\":\"a\"},7]", 1),
             (b"{\"event\":\"a\"}{\"event\":{\"n\":1e400}}", 1),
+            (b"{\"event\":", 0),
         ];
         for (body, index) in cases {
             let response = post_raw(&addr, path, "", body).await;
@@ -1278,8 +1309,117 @@ mod tests {
                     r#"{{"text":"Invalid data format","code":6,"invalid-event-number":{index}}}"#
                 )
             );
+            if index > 0 {
+                assert_eq!(recv_batch(&mut rx).await.events.len() as u64, index);
+            }
         }
-        assert!(rx.is_empty(), "a rejected body delivers nothing");
+        assert!(rx.is_empty(), "nothing from the bad object on");
+    }
+
+    /// The events of a delivered prefix, in order, as their string bodies.
+    fn bodies(batch: &EventBatch) -> Vec<String> {
+        batch
+            .events
+            .iter()
+            .map(|e| {
+                let log = e.log.as_ref().expect("a log");
+                log.message.as_str().expect("a string message").to_string()
+            })
+            .collect()
+    }
+
+    /// Splunk's prefix rule: the objects before the one a code 6 names are delivered, grouped by
+    /// resource, and none from it on. An error in object 0 delivers nothing; one after the last
+    /// object's closing brace delivers them all and names the count.
+    #[tokio::test]
+    async fn a_code_6_delivers_the_objects_before_the_one_it_names() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let (addr, mut rx) =
+            start(SplunkHecInput::new("127.0.0.1:0").with_telemetry(telemetry), 16).await;
+        let path = "/services/collector/event";
+        let a = r#"{"host":"h1","event":"a"}"#;
+        let b = r#"{"host":"h2","event":"b"}"#;
+        let c = r#"{"host":"h1","event":"c"}"#;
+        let bad = r#"{"host":"h1","event":"x","#;
+        let code_6 = |n: u32| {
+            format!(r#"{{"text":"Invalid data format","code":6,"invalid-event-number":{n}}}"#)
+        };
+
+        let response = post_raw(&addr, path, "", format!("{a}{bad}{c}").as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(body_of(&response), code_6(1));
+        assert_eq!(bodies(&recv_batch(&mut rx).await), ["a"]);
+        assert!(rx.try_recv().is_err(), "object 1 and after are not delivered");
+
+        let response = post_raw(&addr, path, "", format!("{bad}{b}{c}").as_bytes()).await;
+        assert_eq!(body_of(&response), code_6(0));
+        assert!(rx.try_recv().is_err(), "an error in object 0 delivers nothing");
+
+        let response = post_raw(&addr, path, "", format!("{a}{b}{c}}}").as_bytes()).await;
+        assert_eq!(body_of(&response), code_6(3));
+        assert_eq!(bodies(&recv_batch(&mut rx).await), ["a", "c"], "h1's objects");
+        assert_eq!(bodies(&recv_batch(&mut rx).await), ["b"], "then h2's");
+        assert!(rx.try_recv().is_err());
+
+        let events = registry.drain(0);
+        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "rejected")), Some(3.0));
+        assert_eq!(
+            sum_of(&events, "logit.input.requests.rejected", ("reason", "malformed")),
+            Some(3.0)
+        );
+    }
+
+    /// With a channel, a code 6 after a delivered prefix carries the `ackId` a `200` would; one
+    /// naming object 0 delivers nothing and draws none. A prefix the pipeline doesn't take in time
+    /// is a `503` with no `ackId`, as for a whole body.
+    #[tokio::test]
+    async fn a_code_6_after_a_prefix_draws_an_ack_id_and_waits_like_a_whole_body() {
+        let input = SplunkHecInput::new("127.0.0.1:0").with_busy_after(Duration::from_millis(200));
+        let (addr, mut rx) = start(input, 1).await;
+        let path = "/services/collector/event";
+        let channel = "X-Splunk-Request-Channel: c\r\n";
+        let cut_short = br#"{"event":"a"}{"event":"#;
+
+        let response = post_raw(&addr, path, channel, cut_short).await;
+        assert_eq!(
+            body_of(&response),
+            r#"{"text":"Invalid data format","code":6,"invalid-event-number":1,"ackId":1}"#
+        );
+        let response = post_raw(&addr, path, channel, br#"{"event":"#).await;
+        assert_eq!(
+            body_of(&response),
+            r#"{"text":"Invalid data format","code":6,"invalid-event-number":0}"#
+        );
+
+        // The first prefix still fills the one slot, so this one waits out the bound.
+        let response = post_raw(&addr, path, channel, cut_short).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert_eq!(body_of(&response), r#"{"text":"Server is busy","code":9}"#);
+
+        recv_batch(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "the 503'd prefix was never delivered");
+        let response = post_raw(&addr, path, channel, ONE_EVENT).await;
+        assert_eq!(
+            body_of(&response),
+            r#"{"text":"Success","code":0,"ackId":2}"#,
+            "neither the object-0 code 6 nor the 503 drew an id"
+        );
+    }
+
+    /// A gzip stream cut off after its first object decompresses to nothing, so the body is
+    /// rejected whole, with no `invalid-event-number`.
+    #[tokio::test]
+    async fn a_truncated_gzip_stream_delivers_nothing() {
+        let (addr, rx) = start_default().await;
+        let whole = gzip(br#"{"event":"a"}{"event":"b"}{"event":"c"}"#);
+        let truncated = &whole[..whole.len() - 12];
+        let response =
+            post_raw(&addr, "/services/collector/event", "Content-Encoding: gzip\r\n", truncated)
+                .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(body_of(&response), r#"{"text":"Invalid data format","code":6}"#);
+        assert!(rx.is_empty());
     }
 
     #[tokio::test]

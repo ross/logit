@@ -239,6 +239,52 @@ async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     assert_eq!(recv(&mut rx).await, expected[0]);
 }
 
+/// A body with a syntax error delivers the objects before the bad one, as Splunk indexes them,
+/// and answers `400` code 6 naming it: after object 0, the first object; in object 0, nothing;
+/// after the last object's closing brace, all three, naming 3.
+#[tokio::test]
+async fn a_code_6_delivers_the_objects_before_the_one_it_names() {
+    let (addr, mut rx) = start(16).await;
+    let (expected, _) = fixed_point_case(
+        br#"{"time":1,"host":"h","event":"a"}{"time":2,"host":"h","event":"b"}{"time":3,"host":"h","event":"c"}"#,
+    );
+    let objects: Vec<Vec<u8>> = expected[0]
+        .events
+        .iter()
+        .map(|event| {
+            let batch = EventBatch { events: vec![event.clone()], ..expected[0].clone() };
+            SplunkEncoder::new().encode(&batch).expect("encode never fails").to_vec()
+        })
+        .collect();
+    let bad: &[u8] = br#"{"time":9,"host":"h","event":"#;
+    let [a, b, c] = [&objects[0][..], &objects[1][..], &objects[2][..]];
+    let path = "/services/collector/event";
+
+    for (parts, index, delivered) in
+        [(vec![a, bad, c], 1, 1), (vec![bad, b, c], 0, 0), (vec![a, b, c, b"}"], 3, 3)]
+    {
+        let body = parts.concat();
+        for gzipped in [false, true] {
+            let (status, text) = post(addr, path, &body, gzipped, None).await;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{text}");
+            assert_eq!(
+                text,
+                format!(
+                    r#"{{"text":"Invalid data format","code":6,"invalid-event-number":{index}}}"#
+                )
+            );
+            if delivered > 0 {
+                let batch = recv(&mut rx).await;
+                assert_eq!(batch.events, expected[0].events[..delivered], "index {index}");
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
+                "nothing from object {index} on"
+            );
+        }
+    }
+}
+
 /// A wrong token is refused with Splunk's `403` code 4 and delivers nothing.
 #[tokio::test]
 async fn a_wrong_token_is_403_code_4() {

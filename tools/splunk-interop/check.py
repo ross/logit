@@ -597,6 +597,14 @@ def probe_code6():
         found = indexed([f"{m}-a", f"{m}-b", f"{m}-c"], wait=30)
         seen = found if found == NOT_SEARCHED else [f.rsplit("-", 1)[1] for f in found]
         rows.append((f"batch with {label}", "INFO", f"{status} {text}; indexed {seen}"))
+    # Whether a code 6 after an indexed prefix carries an `ackId` on a `useACK` token.
+    if ACK_TOKEN:
+        headers = {"X-Splunk-Request-Channel": str(uuid.uuid4())}
+        for label, index in (("syntax error in object 1", 0), ("syntax error in object 0", 1)):
+            m = f"{RUN}-ca{index}"
+            status, text = hec("/services/collector/event", cases[index][1](m), token=ACK_TOKEN,
+                               headers=headers)
+            rows.append((f"useACK batch with {label}", "INFO", f"{status} {text}"))
     return rows
 
 

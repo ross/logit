@@ -471,8 +471,8 @@ Each is proven by a test suite and by real traffic:
   `decode(encode(decode(b)))` against the normalization list over hand-written bodies and a
   grammar of generated ones, the OTel log and span shapes and both metric forms included.
 - **Pair round trips over real sockets**: `crates/logit-cli/tests/splunk_pair_round_trip.rs`
-  (`splunk_hec_out -> splunk_hec_in`: gzip, the token check, body splitting, and the channel and
-  acknowledgment exchange) and `splunk_hec_in_round_trip.rs` for the listener's routes, answers,
+  (`splunk_hec_out -> splunk_hec_in`: gzip, the token check, body splitting, the channel and
+  acknowledgment exchange, and a code 6's drop and resend) and `splunk_hec_in_round_trip.rs` for the listener's routes, answers,
   and backpressure.
 - **Recorded interop corpus** (W5): [`testdata/interop/splunk/`](../../testdata/interop/splunk/README.md),
   from the Collector contrib 0.161.0 `splunk_hec` exporter, Docker 29.8.1's `splunk` log driver,
@@ -491,6 +491,11 @@ Each is proven by a test suite and by real traffic:
   trial stack, every leg `PASS` by a search in Splunk Web. It showed acknowledgment working,
   added code 28, and found Cloud's body cap
   (["Settled by the Cloud run"](#settled-by-the-cloud-run-2026-09-26)).
+- **The listener's code 6** (2026-09-26): `splunk_hec_in` answers a `/event` body with a syntax
+  error as both runs showed Splunk does (["Settled by W5"](#settled-by-w5-2026-09-25), item 8):
+  it delivers the objects before the bad one and names it, where it had delivered nothing. A
+  `splunk_hec_out -> splunk_hec_in` relay now loses only the bad object, which
+  `splunk_pair_round_trip.rs` checks against a stub that follows Splunk's rule.
 
 What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Splunk" section, one entry
 each:
