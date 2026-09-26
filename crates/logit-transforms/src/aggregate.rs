@@ -1142,7 +1142,7 @@ impl Aggregator {
             self.telemetry.count(
                 "logit.transform.links.dropped",
                 total_dropped_links as f64,
-                &[("reason", "cardinality")],
+                &[("reason", "contexts")],
             );
         }
         if evicted_idle > 0 {
@@ -2344,17 +2344,11 @@ mod tests {
         assert_eq!(links.len(), 8, "capped at MAX_CONTRIBUTING_CONTEXTS_PER_SERIES");
 
         let drained = registry.drain(0);
-        let dropped = drained.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum)
-                    if logit_core::interner::resolve(m.name) == "logit.transform.links.dropped" =>
-                {
-                    Some(sum.value)
-                }
-                _ => None,
-            })
-        });
-        assert_eq!(dropped, Some(1.0), "the 9th distinct context should be dropped and counted");
+        assert_eq!(
+            counter_with_tag(&drained, "logit.transform.links.dropped", "reason", "contexts"),
+            Some(1.0),
+            "the 9th distinct context should be dropped and counted under reason=contexts"
+        );
     }
 
     /// A series' contributing contexts reset at flush along with its value.

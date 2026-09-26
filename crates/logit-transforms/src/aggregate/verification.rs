@@ -1485,7 +1485,7 @@ const TAG_VALUES: [&str; 8] = [
     "non_finite",
     "rate_mismatch",
     "cap",
-    "cardinality",
+    "contexts",
 ];
 
 /// Every counter the model predicts, read back from drained telemetry. A tagged counter must
@@ -1571,7 +1571,7 @@ fn run_model(config: ModelConfig, ops: &[ModelOp]) -> Result<(), TestCaseError> 
                 let mut counts = std::mem::take(&mut model.counts);
                 counts.add(
                     LINKS_DROPPED,
-                    "cardinality",
+                    "contexts",
                     expected.iter().map(|(s, _)| s.dropped_contexts).sum(),
                 );
 

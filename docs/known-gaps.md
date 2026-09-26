@@ -2355,7 +2355,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
       and `run_output` already borrows the incoming `Delivered`. `Transform::flush`/`Aggregator`
       keep a bounded, best-effort `ContributingContexts` set per series
       (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8; overflow dropped and counted as
-      `logit.transform.links.dropped{reason="cardinality"}`) and pair each flushed `Event` with the
+      `logit.transform.links.dropped{reason="contexts"}`) and pair each flushed `Event` with the
       resulting `SpanLink`s. Lua's `flush()` has no inspectable accumulator, so it runs in a
       link-less root context ([ADR `lua-flush-root-context`](adr/lua-flush-root-context.md)), with
       `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to the script's own
