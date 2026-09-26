@@ -73,3 +73,6 @@ snap.workspace = true
 # Datadog Agent does. Both already transitive at these versions via `logit-inputs`.
 flate2.workspace = true
 ruzstd.workspace = true
+# `tests/lua_example.rs` runs `examples/lua/process.lua` in a `ScriptWorker`. Already a
+# transitive dependency via `logit-pipeline`.
+logit-script.workspace = true
