@@ -33,6 +33,10 @@
 //! with: it never changes while the series lives, and a series evicted (TTL or cardinality cap) and
 //! later re-created gets a new one.
 //!
+//! A histogram's `sum`, `min`, and `max` each become `None` once a contributing record lacks one,
+//! because a value over part of the observations is a wrong number a consumer can't detect. For
+//! `min`/`max`, a record whose buckets total zero observed nothing and doesn't count.
+//!
 //! A histogram's bucket counts add with `saturating_add`, not `+`: they are wire-supplied `u64`s,
 //! so a producer sending `u64::MAX` twice pins the bucket at `u64::MAX` (wrong but still monotonic)
 //! instead of panicking or wrapping the total backwards under an unchanged `start_timestamp`.
@@ -387,17 +391,27 @@ fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
         && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
 }
 
-/// Folds an optional `min`/`max` across a merge: the side with a value wins when only one has one,
-/// `pick` decides when both do. More forgiving than the `sum` rule; see the `Histogram` merge arm.
+/// Whether a histogram's buckets hold any observation. A record that observed nothing has no
+/// `min`/`max` to contribute, so [`fold_extreme`] skips it.
+fn observed(buckets: &[(f64, u64)]) -> bool {
+    buckets.iter().any(|(_, count)| *count > 0)
+}
+
+/// Folds a histogram's `min`/`max` across a merge under the `sum` rule: once both sides observed
+/// something, a side missing the value makes the result `None`, because an extreme taken over
+/// part of the observations can pair one window's `min` with another's `max` and give
+/// `min > max`. A side that observed nothing is ignored, so the empty accumulator a series opens
+/// with takes the first observed record's value. `pick` decides when both sides have one.
 fn fold_extreme(
-    held: Option<f64>,
-    incoming: Option<f64>,
+    held: (bool, Option<f64>),
+    incoming: (bool, Option<f64>),
     pick: fn(f64, f64) -> f64,
 ) -> Option<f64> {
     match (held, incoming) {
-        (Some(held), Some(incoming)) => Some(pick(held, incoming)),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
+        (held, (false, _)) => held.1,
+        ((false, _), incoming) => incoming.1,
+        ((true, Some(held)), (true, Some(incoming))) => Some(pick(held, incoming)),
+        _ => None,
     }
 }
 
@@ -598,6 +612,8 @@ impl Aggregator {
                             histogram_bounds_mismatch = true;
                             false
                         } else {
+                            let held_observed = observed(&held.buckets);
+                            let incoming_observed = observed(&incoming.buckets);
                             for (held_bucket, incoming_bucket) in
                                 held.buckets.iter_mut().zip(incoming.buckets.iter())
                             {
@@ -607,16 +623,24 @@ impl Aggregator {
                             }
                             // `sum` adds only when both sides have one: a total missing a window's
                             // contribution is a wrong number, and a consumer can tell `None` from
-                            // that. `min`/`max` fold across whichever sides have one: an extreme
-                            // seen over some windows is still a real observation.
+                            // that. `min`/`max` follow the same rule over the records that
+                            // observed something (`fold_extreme`).
                             held.sum = match (held.sum, incoming.sum) {
                                 (Some(held_sum), Some(incoming_sum)) => {
                                     Some(held_sum + incoming_sum)
                                 }
                                 _ => None,
                             };
-                            held.min = fold_extreme(held.min, incoming.min, f64::min);
-                            held.max = fold_extreme(held.max, incoming.max, f64::max);
+                            held.min = fold_extreme(
+                                (held_observed, held.min),
+                                (incoming_observed, incoming.min),
+                                f64::min,
+                            );
+                            held.max = fold_extreme(
+                                (held_observed, held.max),
+                                (incoming_observed, incoming.max),
+                                f64::max,
+                            );
                             true
                         }
                     }
@@ -3290,9 +3314,9 @@ mod tests {
         assert_eq!(start_timestamp_of(second), 500, "start_timestamp is still the first-seen time");
     }
 
-    /// A window with no `sum` makes the running `sum` `None` but leaves `min`/`max` standing.
+    /// A window with observations but no `sum`, `min`, or `max` makes each running value `None`.
     #[test]
-    fn a_histogram_window_without_a_sum_drops_the_running_sum_but_keeps_min_and_max() {
+    fn a_histogram_window_without_sum_min_or_max_drops_all_three() {
         let mut agg = cumulative_agg();
         let resource = default_resource();
         let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
@@ -3307,8 +3331,8 @@ mod tests {
         let emitted = histogram_of(&flushed[0].1[0]);
         assert_eq!(emitted.buckets, vec![(1.0, 2), (f64::INFINITY, 2)]);
         assert_eq!(emitted.sum, None, "a sum missing one window's contribution is no sum at all");
-        assert_eq!(emitted.min, Some(0.5), "the extremes observed so far still stand");
-        assert_eq!(emitted.max, Some(2.0));
+        assert_eq!(emitted.min, None, "a min missing one window's observations is no min");
+        assert_eq!(emitted.max, None);
     }
 
     /// Two `u64::MAX` bucket counts saturate at `u64::MAX` rather than panic or wrap.
@@ -3684,6 +3708,45 @@ mod tests {
         }
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 0));
         assert_eq!(sum_of(&flush_events(&mut agg, 10)[0].1[0]).value, 3.0);
+    }
+
+    /// `min` and `max` follow the `sum` rule: a record with observations but no `min` (or `max`)
+    /// makes the accumulated one `None`, so a series never pairs one window's `min` with another's
+    /// `max`.
+    #[test]
+    fn a_histogram_min_or_max_missing_from_an_observed_window_becomes_none() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
+        feed(&mut agg, &resource, delta_histogram_event("h", &bounds, None, Some(5.0), None, 0));
+        feed(&mut agg, &resource, delta_histogram_event("h", &bounds, None, None, Some(1.0), 1));
+
+        let flushed = flush_events(&mut agg, 100);
+        let emitted = histogram_of(&flushed[0].1[0]);
+        assert_eq!((emitted.min, emitted.max), (None, None), "never min 5 above max 1");
+    }
+
+    /// A record whose buckets total zero observed nothing, so its missing `min`/`max` doesn't
+    /// erase the series' extremes, in either arrival order.
+    #[test]
+    fn a_zero_count_histogram_record_is_ignored_for_min_and_max() {
+        let observed = [(1.0, 1u64), (f64::INFINITY, 1)];
+        let empty = [(1.0, 0u64), (f64::INFINITY, 0)];
+        for empty_first in [false, true] {
+            let mut agg = cumulative_agg();
+            let resource = default_resource();
+            let a = delta_histogram_event("h", &observed, Some(3.0), Some(0.5), Some(2.0), 0);
+            let z = delta_histogram_event("h", &empty, Some(0.0), None, None, 0);
+            let (first, second) = if empty_first { (z, a) } else { (a, z) };
+            feed(&mut agg, &resource, first);
+            feed(&mut agg, &resource, second);
+
+            let flushed = flush_events(&mut agg, 100);
+            let emitted = histogram_of(&flushed[0].1[0]);
+            assert_eq!(emitted.min, Some(0.5), "empty first: {empty_first}");
+            assert_eq!(emitted.max, Some(2.0), "empty first: {empty_first}");
+            assert_eq!(emitted.sum, Some(3.0));
+        }
     }
 }
 
