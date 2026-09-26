@@ -58,7 +58,6 @@ pub struct TailBatching {
     pub max_events: usize,
     pub max_bytes: u64,
     pub flush_interval: Duration,
-    pub shutdown_grace: Duration,
 }
 
 impl Default for TailBatching {
@@ -67,7 +66,6 @@ impl Default for TailBatching {
             max_events: 1_000,
             max_bytes: 1024 * 1024,
             flush_interval: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
@@ -83,8 +81,8 @@ pub struct TailConfig {
     /// The read/rescan cadence under `WatchMode::Poll`, and the reconciliation pass under
     /// `Inotify`/`Auto`. Never disabled: graph validation rejects `0s`.
     pub poll_interval: Duration,
-    /// How long a dirty checkpoint may wait before it's written. It's also written on every file
-    /// close and on shutdown. Graph validation rejects `0s`.
+    /// How long a dirty checkpoint may wait before it's written. A file close dirties it, and
+    /// shutdown writes it unconditionally. Graph validation rejects `0s`.
     pub checkpoint_interval: Duration,
     /// A longer line is dropped whole (not truncated) and diagnosed. Graph validation rejects
     /// `0`.
