@@ -536,6 +536,10 @@ backpressure), but its accept queue has the same shape of problem:
   sees as a connect timeout or reset with nothing in `logit`'s logs to explain it. Sustained
   pressure here is usually connection churn (senders reconnecting per batch instead of holding one
   connection); fix it at the sender before raising `net.core.somaxconn`.
+- `logit.input.accept.errors{reason}` (count): an `accept()` that failed. A burst of file
+  descriptor exhaustion shows here as `reason="resource"` while the listener backs off 100 ms and
+  keeps accepting, not as a dead listener; raise the process's `nofile` limit if it recurs.
+  `reason="fatal"` means the listening socket itself failed, and ends the listener.
 
 ### `handshake_timeout` on a TCP listener
 
@@ -2188,6 +2192,16 @@ nothing TLS-specific beyond that. `docs/known-gaps.md` tracks two open items: **
 read once at startup, so a renewed certificate needs a restart**, not a live reload; and `otlp_out`
 has no `server_name` override for an endpoint reached by IP or through a proxy.
 
+### Trust boundary
+
+Keep every `logit` listener on a private network, and don't expose one to the internet or to
+peers you don't control. Each listener is built to survive accidental data, such as a
+misconfigured sender, a wedged peer, or a corrupt file, but not a malicious peer sending crafted
+input. Keeping untrusted peers out is your job: use network policy, TLS with `client_ca_file` so
+only peers with a certificate you issued can connect, or a proxy in front of the listener. See
+[ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps.md` for
+what isn't defended.
+
 ### Syslog over TLS (RFC 5425)
 
 `syslog_in`/`syslog_out` can speak TLS too: RFC 5425, syslog framed per RFC 6587 over TLS over TCP
@@ -2374,8 +2388,9 @@ that gets `Reject{code: REJECT_INTERNAL}` never classifies it `permanent`:
 
 Either way the sink reconnects on its own once the peer has capacity, with no operator action. To
 risk a duplicate instead of losing that batch, set `buffer.delivery: at_least_once` on the
-`logit_out` component. The same holds for `Reject{code: REJECT_GOING_AWAY}` during the peer's own
-shutdown.
+`logit_out` component. `Reject{code: REJECT_GOING_AWAY}`, from the peer's own shutdown or an idle
+close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
+even after a frame left, and the batch is resent under either posture.
 
 **What to watch.**
 
@@ -2385,8 +2400,10 @@ shutdown.
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
-  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`; any of these on a healthy
-  link points at a version-mismatched or misbehaving peer, not routine loss).
+  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`/`ack_write_stalled`/
+  `reject_write_stalled`; any of these on a healthy link points at a version-mismatched or
+  misbehaving peer, not routine loss. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  for `handshake_timeout`, and the connection was closed).
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.
 

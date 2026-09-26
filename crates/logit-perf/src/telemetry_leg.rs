@@ -40,7 +40,7 @@ use anyhow::{bail, Context};
 use bytes::Bytes;
 use logit_core::Event;
 use logit_proto::frame::read_frame;
-use logit_proto::native::{decode_batch, CODEC_NATIVE_V1};
+use logit_proto::native::{decode_batch, DecodeBudget, CODEC_NATIVE_V1};
 use logit_proto::CodecError;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -286,7 +286,7 @@ pub fn decode_dump(path: &Path, quiet: bool) -> anyhow::Result<Vec<Event>> {
                 path.display()
             );
         }
-        let batch = decode_batch(&mut payload)
+        let batch = decode_batch(&mut payload, &DecodeBudget::default())
             .with_context(|| format!("decoding frame {frames} of {}", path.display()))?;
         events.extend(batch.events);
         frames += 1;

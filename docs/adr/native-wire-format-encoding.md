@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-24
+updated: 2026-09-25
 ---
 
 # Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive
@@ -258,3 +258,18 @@ still out, and `Compression::Zstd` in the native frame is still a reserved discr
 `write_frame` and `read_frame` reject. `ruzstd`'s decoder is what changed since the alternative
 was written; its encoder reaches about libzstd level 1, which is enough for a remote-write body
 and not the "genuinely competitive" bar the native frame's revisit clause sets.
+
+## Amendment: canonical varints, no trailing bytes, and a writer-side length cap (2026-09-25)
+
+[ADR `untrusted-input-bounds`](untrusted-input-bounds.md) tightens three decode rules. None of
+them changes what a conforming writer emits:
+
+- **Canonical varints.** A 10-byte varint whose last byte has any bit above bit 0 set is
+  `Malformed`. `read_uvarint` used to discard those bits.
+- **No trailing bytes.** A metric-kind body carved by `read_metric_kind`, or a field carved by
+  `for_each_field`, with bytes left after its parse is `Malformed`, the rule
+  `read_record_list_into` already applied. Before release there is no forward-compatibility
+  padding to preserve.
+- **Writer-side cap.** `write_frame` returns an error for a payload over
+  `MAX_SANE_UNCOMPRESSED_LEN` instead of truncating its length to `u32`, so the cap every reader
+  checks is also enforced once where frames are written.

@@ -551,7 +551,7 @@ fn native_frames_from_several_batches_concatenate_into_one_decodable_buffer() {
     while !cursor.is_empty() {
         let (codec, mut payload) = logit_proto::frame::read_frame(&mut cursor).unwrap();
         assert_eq!(codec, logit_proto::native::CODEC_NATIVE_V1);
-        let batch = logit_proto::native::decode_batch(&mut payload).unwrap();
+        let batch = logit_proto::native::decode_batch(&mut payload, &Default::default()).unwrap();
         decoded_counts.push(batch.events.len());
     }
     assert_eq!(decoded_counts, expected_event_counts);

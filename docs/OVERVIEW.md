@@ -78,3 +78,7 @@ makes a narrower, more opinionated bet than any of them:
 - Built-in parsers for the common cases, in front of that language.
 - An event model and wire protocol designed from the start for efficient splitting of collection
   and processing across nodes.
+
+`logit` runs on a private network, behind a trust boundary the operator owns. It is built to
+survive accidental data, such as a misconfigured sender or a corrupt file, not a malicious peer;
+see [ADR `deployment-threat-model`](adr/deployment-threat-model.md).

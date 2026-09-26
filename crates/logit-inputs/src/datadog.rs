@@ -64,7 +64,7 @@
 //!    `api_keys` every request passes, and the validate routes answer `200` to any key.
 //! 4. **`Content-Encoding`.** `identity` (or none), `gzip`, `deflate` (zlib-wrapped: what the
 //!    Agent's `zlib` compressor kind sends under that name), or `zstd` (the Agent's default), else
-//!    `415`. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
+//!    `415`. A header that is present but empty, or not ASCII, is a `415` too, not identity. The decompressed size is capped at [`MAX_DECOMPRESSED_BYTES`], or
 //!    [`MAX_TRACES_DECOMPRESSED_BYTES`] for traces, by `otlp_in`'s pattern: read through
 //!    `Read::take(cap + 1)`, and `413` when that last byte arrives. A stream that doesn't decode is a
 //!    `400`. zstd has its own bounds ([`crate::zstd`]).
@@ -129,15 +129,13 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::CodecError;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -157,7 +155,9 @@ const MAX_DECOMPRESSED_BYTES: usize = 5_242_880;
 const MAX_TRACES_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bounds the connections [`Input::run`] serves at once: the same 1024 as `otlp_in`, `logit_in`,
-/// and `crate::tcp`'s listeners. A connection past the cap is rejected, not queued.
+/// and `crate::tcp`'s listeners. A connection past the cap is rejected, not queued. With a 5 MiB
+/// body inflating to 16 MiB on the traces route, this listener's worst case is 4.1 TiB, a bound
+/// rather than a memory budget ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula).
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Default for [`DatadogInput::with_handshake_timeout`]: the same 5s as every other TCP listener,
@@ -295,13 +295,21 @@ impl Input for DatadogInput {
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
+        let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, peer) = accept_queue.accept(&listener).await?;
+            let (stream, peer) = match accept_queue.accept(&listener).await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
+                        .await?;
+                    continue;
+                }
+            };
 
             let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
                 self.telemetry.count(
@@ -322,15 +330,13 @@ impl Input for DatadogInput {
                 peer,
             });
             let mut diag = self.diag.clone();
-            let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let live_connections = Arc::clone(&live_connections);
+            let live_connections = live_connections.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
-                // From the read-modify-write's return value, as `otlp_in` publishes it.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
+                let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
                     Some(acceptor) => {
@@ -373,9 +379,6 @@ impl Input for DatadogInput {
                         }
                     }
                 };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 if let Err(err) = result {
                     diag.warn_throttled("connection_error", err);
@@ -423,7 +426,7 @@ where
             }
         }
     });
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
     drive_with_idle(
         conn,

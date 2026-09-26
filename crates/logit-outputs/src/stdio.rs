@@ -1469,8 +1469,8 @@ mod tests {
         let (codec_id, mut payload) =
             logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
         assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
-        let decoded =
-            logit_proto::native::decode_batch(&mut payload).expect("payload should decode");
+        let decoded = logit_proto::native::decode_batch(&mut payload, &Default::default())
+            .expect("payload should decode");
         assert_eq!(decoded.events.len(), 1);
         match &decoded.events[0].metrics[0].kind {
             MetricKind::Sum(s) => assert_eq!(s.value, 1.0),
@@ -1528,8 +1528,8 @@ mod tests {
             let (codec_id, mut payload) =
                 logit_proto::frame::read_frame(&mut bytes).expect("frame should read");
             assert_eq!(codec_id, logit_proto::native::CODEC_NATIVE_V1);
-            let decoded =
-                logit_proto::native::decode_batch(&mut payload).expect("payload should decode");
+            let decoded = logit_proto::native::decode_batch(&mut payload, &Default::default())
+                .expect("payload should decode");
             assert_eq!(
                 logit_core::interner::resolve(decoded.events[0].metrics[0].name),
                 expected_name,

@@ -250,6 +250,8 @@
 //! streaming decode that stops one byte past the cap. So a compression bomb is rejected rather
 //! than inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
 //! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
+//! An HTTP/2 connection carries up to [`crate::http::MAX_CONCURRENT_STREAMS`] requests at once;
+//! [`MAX_CONCURRENT_CONNECTIONS`] states the listener's worst case.
 //! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
 //! listener, its first byte on a plaintext one. None of the three is a config field: the first
 //! two are denial-of-service bounds rather than tuning knobs, and graph rule 45's
@@ -317,8 +319,7 @@ use http::{Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
+use hyper_util::rt::TokioIo;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
@@ -332,7 +333,6 @@ use logit_proto::prometheus::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -770,8 +770,9 @@ impl Input for PrometheusInput {
 /// operator who hits this has a misconfigured sender.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the connections [`PrometheusReceiver`] serves at once, so [`MAX_REQUEST_BYTES`] bounds
-/// the listener's worst case rather than one connection's. The same 1024 as `otlp_in`,
+/// Bounds the connections [`PrometheusReceiver`] serves at once. With 4 MiB requests this
+/// listener's worst case is 1.6 TiB, a bound rather than a memory budget
+/// ([`crate::http::MAX_CONCURRENT_STREAMS`] has the formula). The same 1024 as `otlp_in`,
 /// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
 /// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
@@ -931,7 +932,7 @@ impl MetadataCache {
     /// what is left. Allocation-free; the seed is rebuilt only if something expired.
     fn sweep(&self, state: &mut CacheState, now: Instant, telemetry: &Telemetry) {
         #[cfg(test)]
-        self.sweeps.fetch_add(1, Ordering::Relaxed);
+        self.sweeps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ttl = self.ttl;
         let mut expired = 0u64;
         state.families.retain(|_, family| {
@@ -1195,7 +1196,7 @@ impl Input for PrometheusReceiver {
         // `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so a per-connection clone is an `Arc`
         // clone, not a config rebuild.
         let tls_acceptor = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
-        let live_connections = Arc::new(AtomicI64::new(0));
+        let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         let metadata_cache = self.metadata_cache.clone();
@@ -1203,8 +1204,16 @@ impl Input for PrometheusReceiver {
         // sampled before each accept and once a second while waiting for one.
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
+        let mut accept_diag = self.diag.clone();
         loop {
-            let (stream, peer) = accept_queue.accept(&listener).await?;
+            let (stream, peer) = match accept_queue.accept(&listener).await {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    crate::listener::absorb_accept_error(err, &self.telemetry, &mut accept_diag)
+                        .await?;
+                    continue;
+                }
+            };
 
             // Non-blocking (`try_acquire_owned`): at capacity the connection is closed rather than
             // queued behind a permit that may never come, and *before* any TLS accept, since
@@ -1225,17 +1234,14 @@ impl Input for PrometheusReceiver {
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
-            let live_connections = Arc::clone(&live_connections);
+            let live_connections = live_connections.clone();
             let resource = Arc::clone(&self.resource);
             let metadata_cache = metadata_cache.clone();
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime; released on drop
-
-                // Published from the read-modify-write's return value, not a separate `load`:
-                // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
-                // and a load would leave the stale one published until the next transition.
-                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
+                // Held for the connection's lifetime; released on drop.
+                let _permit = permit;
+                // Counted out on drop, so a panicking handler brings the gauge back down too.
+                let _live = live_connections.enter();
 
                 let result = match tls_acceptor {
                     // No first-byte peek on this arm: `acceptor.accept` already waits on this
@@ -1296,9 +1302,6 @@ impl Input for PrometheusReceiver {
                         }
                     }
                 };
-
-                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // One connection's I/O error shouldn't be fatal to the listener or its siblings --
                 // only `TcpListener::accept` failing in `run`'s own loop is.
@@ -1365,7 +1368,7 @@ where
     });
     // Bound to a local: `auto::Connection` borrows its builder, so a temporary would not live long
     // enough to be held across `drive_with_idle`'s loop.
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let builder = crate::http::auto_builder();
     let conn = builder.serve_connection(io, svc);
     drive_with_idle(
         conn,
@@ -1614,7 +1617,10 @@ async fn write_response(
     if !events.is_empty() {
         // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
-        sink.send(EventBatch { resource, scope: None, events }).await;
+        // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
+        // part of the fan-out (`crate::http::deliver_detached`).
+        crate::http::deliver_detached(sink, vec![EventBatch { resource, scope: None, events }])
+            .await;
     }
     ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }

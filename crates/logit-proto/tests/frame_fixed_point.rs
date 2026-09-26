@@ -174,14 +174,7 @@ fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// A payload of exactly `MAX_SANE_UNCOMPRESSED_LEN` bytes (64 MiB) round-trips under both
-/// compressions, and one byte more than the cap is rejected.
-///
-/// `write_frame` does not itself enforce `MAX_SANE_UNCOMPRESSED_LEN` -- the constant's own doc
-/// comment calls this out ("Deliberately asymmetric with `write_frame`"): the cap exists to bound
-/// what a *decoder* trusts off untrusted bytes, and nothing stops a writer from encoding a payload
-/// this codebase never actually produces. So the over-the-cap half of this test asserts
-/// `write_frame` succeeds and `read_frame` is the one that rejects the result, matching that
-/// documented asymmetry rather than assuming the cap is enforced on write.
+/// compressions, and `write_frame` refuses one byte more, the same bound `read_frame` enforces.
 #[test]
 fn a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none() {
     let data = lcg_bytes(0xC0FF_EE15_5EED_0001, MAX_SANE_UNCOMPRESSED_LEN as usize);
@@ -202,10 +195,10 @@ fn a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none() {
     );
 
     let over = vec![0u8; MAX_SANE_UNCOMPRESSED_LEN as usize + 1];
-    let framed = write_frame(1, Compression::None, &over)
-        .expect("write_frame does not cap uncompressed_len");
-    let mut bytes = framed;
-    assert!(matches!(read_frame(&mut bytes), Err(CodecError::Malformed(_))));
+    assert!(matches!(
+        write_frame(1, Compression::None, &over),
+        Err(CodecError::Malformed(msg)) if msg.contains("uncompressed cap")
+    ));
 }
 
 // -- 5: a corrupted compressed_len below the cap is Truncated, not Malformed ----------------------

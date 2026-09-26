@@ -17,7 +17,22 @@
 //! (`docs/adr/trace-context-propagation-on-delivered.md`) and a [`Provenance`], which node created
 //! the batch and which last handed it off (`docs/adr/batch-provenance-on-delivered.md`).
 //! `Fanout::send`/`send_blocking`/`send_with_deadline` record a listener's span around the send
-//! (`docs/adr/internal-span-emission-and-deterministic-sampling.md`). See
+//! (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
+//!
+//! **A send must not be dropped part way.** `send` delivers consumer by consumer, so a send
+//! dropped while parked on a full consumer leaves the ones before it holding the batch and the
+//! rest without it, and a retry then duplicates on some branches only. A send inside an HTTP
+//! handler is exposed to this: a client that closes mid-request drops hyper's service future on
+//! h1, and an h2 `RST_STREAM` cancels the stream's task. `otlp_in` and `prometheus_in`'s receiver
+//! therefore run a request's sends on a task of their own and await it
+//! (`logit-inputs`' `http::deliver_detached`), so a closing client cancels only the wait. The two
+//! Datadog listeners call `send_with_deadline`, which answers "busy" instead.
+//!
+//! **A reservation always carries a deadline.** `send_with_deadline` holds a slot on every
+//! consumer it has reached while it waits for the next. In a diamond (`in -> [a, b]`, `b -> a`),
+//! enough parked senders can hold all of `a`'s capacity while waiting on `b`, `b` can then never
+//! send into `a`, so `b` never drains and no sender ever gets `b`'s slot. Only the deadline
+//! releases the held slots and breaks that cycle, so there is no deadline-less reservation. See
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for which node kinds
 //! propagate a parent and which mint a root, and its "Provenance propagation" section for the
 //! stamping rule ([`Fanout::stamp`]/[`Fanout::stamp_relayed`]).
@@ -265,6 +280,8 @@ impl Fanout {
             return Ok(());
         }
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+        // Until every slot is held, a timeout or a dropped future discards both unrecorded.
+        let mut unsent = Unsent(Some((span, timer)));
         let reserve_all = async {
             let mut permits = Vec::with_capacity(self.consumers.len());
             for tx in &self.consumers {
@@ -275,10 +292,9 @@ impl Fanout {
         };
         let Ok(permits) = tokio::time::timeout_at(deadline, reserve_all).await else {
             // Dropping the partial `permits` inside the cancelled future releases every held slot.
-            timer.cancel();
-            span.cancel();
             return Err(SendTimeout);
         };
+        let (span, timer) = unsent.0.take().expect("taken only here, once every slot is held");
         let n = batch.events.len();
         if permits.len() == 1 {
             match permits.into_iter().next().flatten() {
@@ -407,6 +423,20 @@ impl Fanout {
             n as f64,
             &[("reason", "closed_consumer")],
         );
+    }
+}
+
+/// The span and blocked-duration timer of an all-or-nothing send that has not sent yet. Dropped
+/// while still holding them (a deadline passed, or the send's future was dropped), it cancels
+/// both, so a send that never happened records nothing.
+struct Unsent(Option<(logit_core::SpanGuard, logit_core::telemetry::Timer)>);
+
+impl Drop for Unsent {
+    fn drop(&mut self) {
+        if let Some((span, timer)) = self.0.take() {
+            timer.cancel();
+            span.cancel();
+        }
     }
 }
 
@@ -662,6 +692,34 @@ mod tests {
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.component.events.dropped"), Some(4.0));
+    }
+
+    /// A `send_with_deadline` dropped before its deadline, while it waits on a full second
+    /// consumer, leaves neither consumer with the batch and records nothing: the first's slot was
+    /// only reserved, and dropping the future releases it.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_with_deadline_dropped_mid_wait_leaves_no_consumer_with_the_batch() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "datadog_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        tx_b.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill b");
+        let probe_a = tx_a.clone();
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        let mut send = Box::pin(fanout.send_with_deadline(batch(2), in_ms(1_000)));
+        tokio::select! {
+            _ = &mut send => panic!("b is full, so the send cannot complete"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        drop(send);
+
+        let a = rx_a.try_recv().is_ok();
+        rx_b.recv().await.expect("b's prefill");
+        let b = rx_b.try_recv().is_ok();
+        assert_eq!((a, b), (false, false), "every consumer or none has the batch (a, b)");
+        assert_eq!(probe_a.capacity(), 1, "a's reserved slot must be released, not leaked");
+        assert_nothing_recorded_as_sent(&registry.drain(0));
     }
 
     /// `send` mints a fresh root every call.
