@@ -101,9 +101,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   life of the process, at a measured ~94-124 bytes each.
 
   **Accepted, not planned work.** Measured bounds: re-interning a string the table already holds
-  allocates *nothing*, so a fixed schema reaches steady state and stays flat. Only keys and metric
-  names are interned, never values, so the usual cardinality explosion (host, request id, user
-  agent, path) never touches it. What's left is a real metric name that never repeats: a user who
+  allocates *nothing*, so a fixed schema reaches steady state and stays flat. Attribute and
+  resource keys, metric names, and the symbol-typed metric/log fields (`unit`, `description`,
+  `event_name`) are interned, along with `telemetry`'s tag keys and values; an attribute's
+  *value* never is, so the usual cardinality explosion (host, request id, user agent, path) never
+  touches it. What's left is a real metric name that never repeats: a user who
   embedded an id in a metric name. That namespace is user-controlled, not attacker-controlled,
   because `logit`'s listeners are private by deployment shape
   ([ADR `deployment-threat-model`](adr/deployment-threat-model.md)); the anti-pattern is well
@@ -162,6 +164,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     and `arrays: skip`. A rotating key space in *value* position that `flatten` promotes to *key*
     position (a map keyed by request or user IDs) is the exposure `json`/`otlp_in` already have one
     level shallower, multiplied by every distinct path above it.
+  - **`lua`/`lua_file` feed it from five feeders, one guarded.** `telemetry`'s tag keys/values
+    and metric names (`crates/logit-script/src/telemetry.rs`'s `static_str`/`static_metric_name`/
+    `read_tags`) are the guarded case: `install`'s `count`/`gauge` closures check
+    `Telemetry::is_enabled` before calling them, so a disabled handle costs nothing whatever a
+    script passes. The rest are unguarded, per this entry's accepted posture: `MetricProxy`'s
+    `__newindex` on `name`/`unit`/`description`; `LogProxy`'s `__newindex` on `event_name`;
+    `Event.new`'s symbol fields (`construct::metric_from_table`'s `name`, directly, and
+    `unit`/`description`, and `construct::log_from_table`'s `event_name`, through `symbol_field`);
+    and every attribute key a script writes, top-level through `AttrsProxy::__newindex` and
+    nested through `value.rs`'s `lua_table_to_attrmap`. See [ADR
+    `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md) and the Lua section's entry
+    below.
 
   Unrelated to growth, fixed: **`AttrMap::get` used to intern rather than probe** (`attrs.rs`). All
   three production call sites were keyed by config strings or Lua literals, so it was a wasted hash
@@ -2146,23 +2160,30 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   progress for 10 s reads `stalled`, and one still stuck 2 s into shutdown has its channels revoked
   and fails the run. Its memory is bounded only when the component sets `max_memory` (`luab/w4`):
   a VM still over the cap after full garbage collections fails the node, exit code 2. Each Lua
-  thread
-  runs on an 8 MiB stack (virtual, committed on touch), so pure-Lua recursion through C frames
-  (`string.gsub` callbacks a few hundred deep) doesn't abort the process. Standing residuals that
-  remain once every workstream has landed, under
-  [ADR `deployment-threat-model`](adr/deployment-threat-model.md): interner growth from
-  script-derived strings (`Event.new`'s and the proxy setters' `name`/`unit`/`description`/
-  `event_name` fields, and nested attribute keys); a shared-table DAG still converts at 2^k
-  nodes, since the depth cap bounds nesting, not size; pure-Lua recursion through Rust/C
-  frames can still abort the process past the larger stack; and a loop that keeps calling
-  `Event.new` advances the stall heartbeat and is never caught as a stall, since telling it from a
-  large `flush()` would need a time limit, so only its memory-retaining form is bounded, by
-  `max_memory`. And `max_memory` bounds the Lua VM heap only: a retained event costs the VM about
-  150 bytes while its payload stays in the Rust heap (10k retained 1 KiB events: 1.5 MB of VM,
-  about 10 MB of Rust), so a script that hoards events shows in process RSS long before it trips
-  the cap. A cap under about twice the working set forces a full
-  collection on most batches; the verdict is rate-limited to one a second, so that costs latency,
-  not a failure.
+  thread runs on an 8 MiB stack (virtual, committed on touch), so pure-Lua recursion through C
+  frames (`string.gsub` callbacks a few hundred deep) doesn't abort the process. Standing
+  residuals, under [ADR `deployment-threat-model`](adr/deployment-threat-model.md): interner
+  growth from script-derived strings (`Event.new`'s and the proxy setters'
+  `name`/`unit`/`description`/`event_name` fields, and nested attribute keys — the interner entry
+  under "Event model and interner" lists every site); a shared-table DAG still converts at 2^k nodes, since
+  the depth cap bounds nesting, not size; a 128-deep value a script builds does not survive a
+  relay through `otlp_out -> otlp_in` (OTLP's own JSON and protobuf nesting limits, 41 and 49
+  levels, are both under the cap); pure-Lua recursion through Rust/C frames can still
+  abort the process past the larger stack; and a loop that keeps calling `Event.new` advances the
+  stall heartbeat and is never caught as a stall, since telling it from a large `flush()` would
+  need a time limit, so only its memory-retaining form is bounded, by `max_memory`. And
+  `max_memory` bounds the Lua VM heap only: a retained event costs the VM about 150 bytes while
+  its payload stays in the Rust heap (10k retained 1 KiB events: 1.5 MB of VM, about 10 MB of
+  Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
+  under about twice the working set forces a full collection on most batches; the verdict is
+  rate-limited to one a second, so that costs latency, not a failure.
+- **A nonzero float under 2^-52 in magnitude reads back `0` through `Event.new`.** mlua 0.9.9's
+  LuaJIT number read truncates toward zero and keeps that integer when the difference is under
+  `f64::EPSILON`, so a metric value, bound, or float attribute of, say, `1e-20` — read through
+  `Event.new(event:to_table())`, or written back through a proxy
+  (`event.attributes.x = event.attributes.x`) — comes back `I64(0)`. Closing it needs a number
+  read that bypasses mlua's `Value` conversion. See [ADR `lua-event-constructor`](adr/lua-event-constructor.md)'s
+  "Amendment: counts round-trip at every magnitude".
 
 ## Internal telemetry and self-logging
 

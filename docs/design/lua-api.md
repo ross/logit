@@ -590,7 +590,7 @@ need; it isn't an oversight. Assigning to any of the three raises a "read-only f
 ([`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)).
 
 - `event_name` is read/write, a plain string or `nil`. `event.log.event_name = "request.completed"`
-  interns the string, as a string-valued attribute write does. **Use a name from a fixed, bounded
+  interns the string, as an attribute key is. **Use a name from a fixed, bounded
   vocabulary in the script's own source, never one built from event data.** This is the same
   cardinality caution `telemetry.count`'s metric name carries ("Emitting telemetry from a script"
   above): a name built from a request id or order id leaks one process-wide interner entry per
@@ -1139,7 +1139,7 @@ either kind of component.
 **`max_memory`** is optional and caps the component's Lua VM heap, as a quoted byte-count string
 (`"256MiB"`). A VM still over it after full garbage collection fails the component and, with it,
 the process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config
-validation rejects `0`. "Costs" below says what the cap covers and how to size it.
+validation rejects `0`. "Limits and costs" below says what the cap bounds and how to size it.
 
 **`targets:`** is optional and lists the `target` components this one may direct events into:
 what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
@@ -1216,7 +1216,47 @@ host; and the script's own `process`, and `flush` if it defines one. It also che
 and debugging libraries LuaJIT can load are absent. `collectgarbage` and `coroutine` stay: neither
 reaches the host, and each has an ordinary use in a transform script.
 
-## Costs
+## Limits and costs
+
+### Limits
+
+Each bound below is `logit`'s own answer to the accidental-misuse cases
+[ADR `deployment-threat-model`](../adr/deployment-threat-model.md) sets the bar at; the full
+mechanism is at the citation, not restated here.
+
+- **Table depth.** A script-built table converts at most 128 levels deep; a table nested past
+  that, a self-referencing one included, is a clear conversion error rather than a stack overflow.
+  See `MAX_TABLE_DEPTH`'s doc (`crates/logit-script/src/value.rs`).
+- **No time limit.** LuaJIT's compiled traces skip a count hook unless the runtime is built with
+  `LUAJIT_ENABLE_CHECKHOOK` (this build isn't), so a hook would be both slow and unreliable. See
+  [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md).
+- **Stall detection and the bounded wedge.** A per-call heartbeat drives `script_stalled`/
+  `script_resumed` diagnostics and a `503 stalled` `/readyz`; once shutdown begins, a node whose
+  heartbeat stays busy past its grace has its channels revoked rather than left to hang the
+  process. See [`pipeline-graph.md`](pipeline-graph.md)'s "Thread model".
+- **`max_memory`.** Optional; bounds one component's Lua VM heap. See "Config shape" above and
+  "Costs" below for what it covers and how to size it, or `MemoryVerdict`
+  (`crates/logit-pipeline/src/runtime.rs`) and `crates/logit-script/src/memory.rs`'s module doc
+  for the algorithm.
+- **`print`.** Routed to `logit`'s own log, never process stdout. See "Sandboxing" above.
+- **Thread stack.** Each Lua node's OS thread gets an 8 MiB stack, so ordinary pure-Lua recursion
+  through Rust/C frames doesn't abort the process. See [ADR
+  `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 12.
+- **The interner.** Five feeders, one guarded (`telemetry`); every such string is interned for
+  the life of the process, so derive names and keys from a bounded set, never from per-event data.
+  See [`known-gaps.md`](../known-gaps.md)'s interner entry for the full list.
+- **Residuals.** A nonzero float under 2^-52 in magnitude reads back `0`; a `Value::Null`
+  attribute/array element and an empty `Array` don't round-trip through `Event.new`
+  ([ADR `lua-event-constructor`](../adr/lua-event-constructor.md)'s amendment). A table built by
+  sharing references rather than nesting (`t = {a = t, b = t}` repeated k times) still converts at
+  the depth cap, at 2^k nodes, and a 128-deep value a script builds does not survive a relay
+  through `otlp_out -> otlp_in` (OTLP's own nesting limits, 41 and 49 levels, are both under the
+  cap). A loop that keeps calling `Event.new` advances the heartbeat and is
+  never a stall. Pure-Lua recursion through Rust/C frames can still abort the process past the
+  larger stack. See [ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s
+  Consequences.
+
+### Costs
 
 | Surface | Where to look |
 |---|---|
@@ -1235,7 +1275,8 @@ retains costs the VM about 150 bytes while its payload stays in the Rust heap, w
 doesn't see, so a script that hoards events shows in process RSS long before it trips the cap.
 Size the cap at least twice the script's steady working set, read from `logit.script.vm.memory`;
 a tighter cap forces a full collection on most batches (`logit.script.vm.gc.forced`). The check
-runs after each batch and `flush()`, and inside a call in `Event.new`, which raises
-`Event.new: over max_memory (<used> > <cap>)` for the rest of the call once the VM is over it.
-`MemoryVerdict` in `crates/logit-pipeline/src/runtime.rs` and the module doc of
-`crates/logit-script/src/memory.rs` have the algorithm.
+runs after each batch and `flush()`, and inside a call in `Event.new`, which collects at most
+once per 1024 over-cap calls and, once a collection leaves the VM still over the cap, raises
+`Event.new: over max_memory (<used> > <cap>)` for the rest of that call. `MemoryVerdict` in
+`crates/logit-pipeline/src/runtime.rs` and the module doc of `crates/logit-script/src/memory.rs`
+have the algorithm.

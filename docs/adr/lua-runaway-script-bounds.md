@@ -64,9 +64,9 @@ sources, found:
   `Event.new(e:to_table())`. Attributes already cross the boundary as decimal strings past
   ±2^53 (`exact_i64_to_lua`); counts do not yet follow that convention.
 - Script strings intern with no guard from `MetricProxy`'s `name`/`unit`/`description`,
-  `LogProxy`'s `event_name`, `Event.new`'s same fields, every attribute key a script writes
-  (nested-table keys included), and `telemetry` tag keys and values. Only `telemetry` documents the
-  hazard.
+  `LogProxy`'s `event_name`, `Event.new`'s same fields, and every attribute key a script writes
+  (nested-table keys included). Only `telemetry`'s tag keys/values and metric names are guarded,
+  and only `telemetry` documents the hazard.
 
 ## Decision
 
@@ -332,7 +332,7 @@ Filled in as each workstream lands.
   live bytes, the latter through a counting allocator local to the test module), and
   `a_script_error_traceback_names_the_script_not_a_rust_file`. The allowlist, `print`, both
   contract-error tests, and the traceback test failed before the change.
-- `luab/w3` (RT-11, CORE-15 limits half): `logit_script::Heartbeat`, `NodeState::Stalled`, and the
+- `luab/w3` (RT-11, CORE-15 limits half): #386. `logit_script::Heartbeat`, `NodeState::Stalled`, and the
   watcher's revocable `LuaIo`, pinned in `crates/logit-pipeline/src/runtime.rs` by
   `an_infinite_loop_script_is_reported_stalled_and_degrades_readyz`,
   `shutdown_with_a_wedged_script_revokes_its_io_and_returns_runtime_naming_it`,
@@ -369,4 +369,10 @@ Filled in as each workstream lands.
   mutation of the behavior it pins (no verdict, no collection before it, no rate limit, no
   sticky trip, one pass only, no inbox sweep, a memory failure logged as a panic). CORE-15
   findings.
-- `luab/w5` (CORE-19 close, docs): pending.
+- `luab/w5` (CORE-19 close, docs): #392. `docs/design/lua-api.md`'s "Costs" section renamed
+  "Limits and costs" with a new "Limits" summary; `docs/known-gaps.md`'s interner entry lists the
+  five Lua feeders, one guarded, and its Lua entry gains the sub-epsilon-float residual;
+  `docs/plans/critical-sections-inventory.md`'s CORE-19 row moves to `reviewed`, pinned by
+  `telemetry.rs`'s existing `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input`
+  and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either`. CORE-19 reviewed, no
+  findings — the asymmetry with the unguarded feeders is a decision, not a gap.

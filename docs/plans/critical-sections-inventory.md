@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-25
+updated: 2026-09-26
 ---
 
 # Verification plan: critical sections inventory
@@ -24,12 +24,13 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-25, at the remote-reachable crash/DoS stack tip, `d04a494`):** 27 of 135
-  entries done (16 P0, 10 P1, 1 P2): 25 with findings and two reviewed clean. The three finished
-  clusters are the `libc` surface (#280–#283), durability (#322–#337), and remote-reachable
+- **Progress (2026-09-26, at `luab/w4`'s head, `d80f616`):** 33 of 135
+  entries done (20 P0, 12 P1, 1 P2): 31 with findings and two reviewed clean. The four finished
+  clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
-  re-reviewed CORE-05's stale entry. The rest of the list is `unreviewed`. The index's
-  **Status** column is the source of truth.
+  re-reviewed CORE-05's stale entry, and the Lua boundary (#383, #385, #386, #388, #391, #392),
+  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean. The rest of the
+  list is `unreviewed`. The index's **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three
@@ -47,8 +48,8 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 2 | `HyperLogLog::from_bytes` reaches an upstream allocation-layout UB (per `known-gaps.md`) from untrusted native-frame bytes | CORE-06, WIRE-03 | CORE-06 done: findings → #369 (the UB stays unreachable; Miri runs the HLL tests under two named flags; header and trailing-byte checks added). WIRE-03 findings → #370: the `METRIC_SET` blob reaches `HyperLogLog::from_bytes` whole, so the UB guard is CORE-06's |
 | 3 | No `http2_max_concurrent_streams` on `otlp_in` or `prometheus_in`'s h2c receiver — per-listener memory worst case is under-estimated by the stream count. Correction: hyper 1.11.1's h2 server default is 200 concurrent streams per connection, not unlimited, so the documented worst case is low by a factor of 200 | WIRE-10, WIRE-11, WIRE-15 | **Done** (findings → #374): the 200 is pinned explicitly with the reset and header-list defaults, and every worst-case figure is corrected |
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
-| 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 findings → #385: `lua_to_value` caps nesting at 128 levels, native's own cap, so a script-built value (and `value_heap_bytes`'s walk of it) is bounded like every other producer's |
-| 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | → ADR `lua-runaway-script-bounds`, `luab/w2`–`w4` |
+| 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 closed, #385: `lua_to_value` caps nesting at 128 levels, native's own cap, so a script-built value (and `value_heap_bytes`'s walk of it) is bounded like every other producer's |
+| 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | Closed, #386/#388/#391: ADR `lua-runaway-script-bounds`'s stall heartbeat + bounded wedge (`luab/w3`, #386), sandbox/handle-lifetime half (`luab/w2`, #388), and opt-in `max_memory` (`luab/w4`, #391) |
 | 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | open |
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
@@ -59,7 +60,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
-| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half → ADR `lua-runaway-script-bounds`, `luab/w5`; the rest open |
+| 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
 | 18 | `influxdb_out` keeps its own `reqwest` client: default redirect policy (credential-carrying 307/308 replay) and an unbounded error-body read | SINK-08 | Partly: error-body read bounded (#332); the redirect policy is open |
 | 19 | Aggregate has two "kept in sync by comment, not compiler" pairs guarded by `unreachable!` (`passes_through`/`Accumulator::new_for`; `flush`'s `retain`/`kind_for_retained`) | XFORM-02, XFORM-03 | open |
 | 20 | Under `DropOldest`, one spool `push` can decode-and-evict a whole segment in one loop, because `total_bytes` shrinks only on segment deletion | DISK-05 | **Done**: confirmed and documented (#331); the `Block` park it turned up is fixed (#333) |
@@ -99,7 +100,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
 6. **Sink send path** — SINK-01..06, WIRE-08/09, RT-05. Mechanical diff of the three copies first,
    then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
-7. **Lua boundary (started: `luab`)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
+7. **Lua boundary (done, #383, #385, #388, #386, #391, #392)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
    borrow, a proxy held past its scope, infinite loop, deep/huge table.
 8. **Aggregate** — XFORM-01..04, CORE-07. Proptest against a naive reference aggregator, merge
    laws (associativity/commutativity) for every mergeable kind, cardinality-cap soak.
@@ -269,7 +270,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-10](#core-10--deterministic-span-sampling-and-spanguard-span-minting) | P1 | Deterministic span sampling and `SpanGuard` span minting | `crates/logit-core/src/telemetry.rs` (`trace_is_sampled`, `Telemetry::span`, `SpanGuard`) | unreviewed |
 | [CORE-12](#core-12--hand-rolled-rfc-3339-formattingparsing-and-exact-decimal-to-nanos) | P1 | Hand-rolled RFC 3339 formatting/parsing and exact decimal-to-nanos | `crates/logit-core/src/time.rs` (`format_rfc3339_utc`, `parse_rfc3339_to_nanos`, `parse_decimal_nanos`) | unreviewed |
 | [CORE-18](#core-18--eventnewt-building-a-whole-event-from-an-untrusted-shape-lua-table) | P1 | `Event.new(t)`: building a whole `Event` from an untrusted-shape Lua table | `crates/logit-script/src/construct.rs` (`event_from_table`, `metric_from_table`, the `*_KEYS` allowlists) | findings → #385 |
-| [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | in-progress (luab/w5) |
+| [CORE-19](#core-19--the-lua-telemetry-global-script-strings-into-the-process-interner) | P1 | The Lua `telemetry` global: script strings into the process interner | `crates/logit-script/src/telemetry.rs` (`static_str`, `static_metric_name`, `install`) | reviewed @d80f616 |
 | [XFORM-01](#xform-01--aggregate-serieskey-identity-hashing-and-grouping) | P1 | Aggregate: SeriesKey identity, hashing, and grouping | `crates/logit-transforms/src/aggregate.rs` (`SeriesKey`, `hash_value`, `value_key_eq`) | unreviewed |
 | [XFORM-04](#xform-04--aggregate-cumulative-temporality-and-counter-reset-semantics) | P1 | Aggregate: cumulative temporality and counter-reset semantics | `crates/logit-transforms/src/aggregate.rs` (module doc, `SeriesState::first_seen`) | unreviewed |
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
@@ -5918,11 +5919,12 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Invariants to verify:**
   - A disabled handle costs *nothing*: `is_enabled()` is checked before `to_str()`, before `static_str`, before `read_tags` (in both the `count` and `gauge` closures of `install`). A pipeline without an `internal` component must never grow the interner from script activity.
   - The `logit.` prefix check is applied to the name before interning (it is — `static_metric_name` returns before `static_str`), so a rejected name doesn't leak either.
-  - No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).
+  - ~~No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`LogProxy`'s `event_name` write and `MetricProxy`'s `name`/`unit`/`description` writes in `proxy.rs`; `metric_from_table`'s `name` and `symbol_field` in `construct.rs`).~~ **Retired (#392):** they do, and that unguarded interning is now the documented, accepted posture rather than an open question — see the Verified line below and `docs/known-gaps.md`'s interner entry.
   - `read_tags` rejects reserved keys before interning them.
-- **Observed concerns (unverified):** the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.
+- **Observed concerns (unverified):** ~~the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.~~ **Decided, not a gap (`luab/w5`):** the asymmetry stands. `telemetry`'s guard exists because a disabled `internal` component is the common case and must cost nothing; the proxy/`construct.rs` sites always run when a script writes a name, unit, description, or attribute key, so there is no disabled state to guard. `docs/known-gaps.md`'s interner entry now lists all five feeders under the interner's accepted posture, `telemetry` named as the guarded one.
 - **Existing coverage:** `crates/logit-script/src/telemetry.rs`'s `tests` module. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps.md`](../known-gaps.md#internal-telemetry-and-self-logging).
-- **Priority:** P1 — a documented, deliberately accepted leak path whose guards must all stay in the right order.
+- **Verified 2026-09-26 (#392):** the guard ordering in `telemetry.rs` is pinned by `a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input` and `a_disabled_handle_never_reads_the_lua_argument_as_a_str_either` — a disabled handle interns nothing and never even UTF-8-checks its argument. The unguarded feeders (`MetricProxy`/`LogProxy` `__newindex`, `construct::metric_from_table`'s `name` directly and `unit`/`description` and `log_from_table`'s `event_name` through `symbol_field`, and every attribute key via `AttrsProxy::__newindex` or, nested, `lua_table_to_attrmap`) are documented, by decision, under the interner's accepted posture rather than gated to match `telemetry`; `docs/design/lua-api.md`'s new "Limits" list and `docs/known-gaps.md`'s interner entry are the operator-facing record.
+- **Priority:** P1 — a documented, accepted leak path whose guards must all stay in the right order.
 
 ---
 
