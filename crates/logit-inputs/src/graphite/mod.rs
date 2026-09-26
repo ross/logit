@@ -234,7 +234,7 @@ impl GraphiteInput {
     /// UDP. Defaults to [`UdpListenerConfig::default`].
     ///
     /// One setter for both transports, unlike [`crate::syslog::SyslogInput::with_receive`]: the
-    /// four fields TCP reads mean the same in both structs, and graph rule 17 keeps the
+    /// three fields TCP reads mean the same in both structs, and graph rule 17 keeps the
     /// queue-bounding fields off a TCP listener, so the TCP arm ignores nothing it was given.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.receive = config;
@@ -244,7 +244,6 @@ impl GraphiteInput {
                 batch_max_events: config.batch_max_events,
                 batch_max_bytes: config.batch_max_bytes,
                 batch_flush_interval: config.batch_flush_interval,
-                shutdown_grace: config.shutdown_grace,
             })),
         };
         self

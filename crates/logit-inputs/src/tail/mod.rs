@@ -58,7 +58,6 @@ pub struct TailBatching {
     pub max_events: usize,
     pub max_bytes: u64,
     pub flush_interval: Duration,
-    pub shutdown_grace: Duration,
 }
 
 impl Default for TailBatching {
@@ -67,7 +66,6 @@ impl Default for TailBatching {
             max_events: 1_000,
             max_bytes: 1024 * 1024,
             flush_interval: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(5),
         }
     }
 }

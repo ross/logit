@@ -944,7 +944,6 @@ mod tests {
                 max_events: 1_000,
                 max_bytes: 1024 * 1024,
                 flush_interval: Duration::from_millis(15),
-                shutdown_grace: Duration::from_secs(5),
             },
         }
     }

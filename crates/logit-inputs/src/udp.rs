@@ -85,9 +85,6 @@ pub struct UdpListenerConfig {
     pub batch_max_bytes: u64,
     /// `Duration::ZERO` disables the flush timer entirely; bounds are then the only trigger.
     pub batch_flush_interval: Duration,
-    /// How long [`UdpListener::run_until_shutdown`] keeps draining after shutdown fires before
-    /// [`logit_pipeline::runtime::run_input`]'s grace backstop cancels it by drop.
-    pub shutdown_grace: Duration,
     /// Datagrams one `recvmmsg(2)` call may return on Linux, and how many [`decode_loop`] takes
     /// off the [`ReceiveQueue`] per `pop_many`. `logit_config::ReceiveConfig::read_batch` has the
     /// operator-facing account, including the slab cost and the wider shutdown loss. Clamped into
@@ -108,7 +105,6 @@ impl Default for UdpListenerConfig {
             batch_max_events: 1_000,
             batch_max_bytes: 1024 * 1024,
             batch_flush_interval: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(5),
             read_batch: 64,
         }
     }
@@ -1924,7 +1920,6 @@ mod tests {
             UdpListenerConfig {
                 batch_max_events: 1,
                 batch_flush_interval: Duration::ZERO,
-                shutdown_grace: Duration::from_secs(5),
                 ..UdpListenerConfig::default()
             },
         );

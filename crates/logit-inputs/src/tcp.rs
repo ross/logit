@@ -906,7 +906,7 @@ impl AcceptQueueSampler {
 // ---- the listener ----------------------------------------------------------------------------
 
 /// [`TcpListener`]'s runtime knobs: [`crate::udp::UdpListenerConfig`] minus every queue field
-/// (this module's "No receive queue" doc section), with the same defaults for the other four.
+/// (this module's "No receive queue" doc section), with the same defaults for the other three.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TcpListenerConfig {
     /// Events to accumulate **per connection** before one `Fanout::send`; `1` means one send per
@@ -917,9 +917,6 @@ pub struct TcpListenerConfig {
     pub batch_max_bytes: u64,
     /// `Duration::ZERO` disables the flush timer; the bounds are then the only trigger.
     pub batch_flush_interval: Duration,
-    /// How long [`TcpListener::run_until_shutdown`] keeps draining after shutdown fires before
-    /// [`logit_pipeline::runtime::run_input`]'s grace backstop cancels it by drop.
-    pub shutdown_grace: Duration,
 }
 
 /// The same numbers as [`crate::udp::UdpListenerConfig::default`]'s corresponding fields
@@ -930,7 +927,6 @@ impl Default for TcpListenerConfig {
             batch_max_events: 1_000,
             batch_max_bytes: 1024 * 1024,
             batch_flush_interval: Duration::from_millis(100),
-            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
