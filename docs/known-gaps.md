@@ -113,6 +113,15 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Both need a downstream that stays full at shutdown. Counting the loss would need `Fanout` to
   record a delivery per consumer, the fix the UDP entry names.
   `docs/design/pipeline-graph.md`'s "Cancellation points" table has each site.
+- **A batch sent into a closed sink inbox after the sweep's bound runs out is lost uncounted.**
+  `run_output` closes its inbox before its shutdown sweep, so a later send fails upstream as
+  `closed_consumer`. A producer that reserved its channel permit before the close can still send,
+  and the sweep receives until `recv` returns `None`, but only for `SWEEP_DRAIN_TIMEOUT` (250 ms).
+  A permit holder still blocked when that runs out, on another consumer of a fan-out, sends into a
+  channel nobody reads, and the batch dies with the `Receiver`, counted `sent` upstream and nothing
+  at the sink. It's a named exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
+  Revisit if a reconciliation shows a sink's `received` short of its producers' `sent` after a
+  shutdown with no `closed_consumer` drops.
 
 ## Event model and interner
 
@@ -2328,6 +2337,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Rust), so a script that hoards events shows in process RSS long before it trips the cap. A cap
   under about twice the working set forces a full collection on most batches; the verdict is
   rate-limited to one a second, so that costs latency, not a failure.
+- **A batch sent into a revoked Lua inbox after `REVOKE_DRAIN_TIMEOUT` is lost uncounted.**
+  `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails,
+  closes the inbox and counts each batch it still receives as `batches.dropped{reason="shutdown"}`
+  under the node's id. It receives for `REVOKE_DRAIN_TIMEOUT` (250 ms) only, so a producer that
+  reserved its permit before the close and is still blocked on another consumer then sends into
+  a channel nobody reads: counted `sent` upstream and nothing at the Lua node. It's a named
+  exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
+  Revisit if a revoked node's `dropped` count falls short of its producers' `sent` in practice.
 - **A nonzero float under 2^-52 in magnitude reads back `0` through `Event.new`.** mlua 0.9.9's
   LuaJIT number read truncates toward zero and keeps that integer when the difference is under
   `f64::EPSILON`, so a metric value, bound, or float attribute of, say, `1e-20` — read through

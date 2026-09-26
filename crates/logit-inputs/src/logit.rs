@@ -238,6 +238,8 @@ impl Input for LogitInput {
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         // `crate::tcp`'s sampler: publishes `logit.input.accept_queue.depth`/`.utilization`.
+        // Both accepts race `shutdown`: see `docs/design/pipeline-graph.md`'s "Cancellation
+        // points".
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
 

@@ -531,16 +531,16 @@ Every test but the grace-cut pin failed with its fix removed. The existing
 
 `drain/w5` completes decision 8. It audits every production `tokio::select!`, `timeout`,
 `timeout_at`, and `block_on(timeout(..))` on a node's run path in `logit-pipeline`,
-`logit-inputs`, and the sinks of `logit-outputs`, and adds the 23 sites w2 through w4 didn't cover,
-so `docs/design/pipeline-graph.md`'s "Cancellation points" table has 41 rows. The new rows cover:
+`logit-inputs`, and the sinks of `logit-outputs`, and adds the 24 sites w2 through w4 didn't cover,
+so `docs/design/pipeline-graph.md`'s "Cancellation points" table has 42 rows. The new rows cover:
 
 - The runtime's remaining sites: `deliver_with_retry`'s per-attempt timeout, `run_lua_loop`,
   `watch_lua_thread`, the default `Input::run_until_shutdown`, and
   `Fanout::send_with_deadline`.
-- `internal`, the shared HTTP driver (`drive_with_idle`, `collect_with_stall_bound`), every
-  listener's TLS-accept and first-byte bound, `datadog_trace_in`'s two accept loops,
-  `AcceptQueueSampler::accept_every`, and `logit_in`'s accept, header, handshake, body, and
-  control-write sites.
+- `internal`, `prometheus_in`'s scrape request timeout, the shared HTTP driver (`drive_with_idle`,
+  `collect_with_stall_bound`), every listener's TLS-accept and first-byte bound,
+  `datadog_trace_in`'s two accept loops, `AcceptQueueSampler::accept_every`, and `logit_in`'s
+  accept, header, handshake, body, and control-write sites.
 - The sinks' connect and reply bounds, `statsd_out`'s Unix datagram send, and `prometheus_out`'s
   exposition deadline.
 
