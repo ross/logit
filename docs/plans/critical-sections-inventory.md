@@ -188,7 +188,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | unreviewed |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::open`) | findings → #328 |
-| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `parse_record`, `walk_segment`) | findings → #328 |
+| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `parse_record`, `walk_segment`) | findings → #328, #367 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`, `write_record`) | findings → #331 |
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs` (`roll_read_cursor`, `advance_read_cursor`) | findings → #333, #337 |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs` (`run_output`, `finish_and_flush`) | findings → #333 |
@@ -232,7 +232,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs` (`peek`, `read_record_at`, `read_at`) | unreviewed (partly fixed in #328) |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | unreviewed |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
-| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | reviewed @e3aa53b |
+| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | unreviewed |
@@ -2143,6 +2143,13 @@ surveyor's.
   insert, truncation, or in-cap length rewrite over real segments with `MAGIC` in some
   `trace_id`s; oracle: terminates, offsets strictly increase, every untouched record exactly once
   at its offset, corruption counted exactly when present), both failing against the pre-fix code.
+- **fixed in #367: the walk was quadratic.** The `dos` stream's W2 refuter measured it:
+  `resync` is O(n), but `parse_record` copied the rest of the segment for every record and every resync
+  candidate, so a healthy 32k-record segment took 1.4 s in release and a default 64 MiB one extrapolated to
+  minutes at `DiskQueue::open`. `parse_record` now copies one frame, bounded by `frame::frame_extent`.
+  Checked by `walking_a_healthy_segment_copies_each_frame_once` and
+  `resyncing_past_spurious_magics_copies_a_header_per_candidate` (both count the bytes copied, and fail
+  against the pre-fix code), with every existing walk and recovery test unchanged.
 - **Existing coverage:** the corruption tests listed in the previous entry, plus
   `a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance` and
   `provenance_survives_a_spool_round_trip`. No fuzz target.
@@ -2743,8 +2750,9 @@ surveyor's.
     segment) — on a closed segment that silence means corruption, not a short read. F1 in ADR
     `durable-checkpoint-writes-and-fault-injection`'s Context; tracked as DISK-01/DISK-02's finding, fixed in
     `dur/w3`.
-  - `resync`'s linear scan is the performance term in `walk_segment`'s worst case (see the parse entry), not a
-    correctness issue.
+  - ~~`resync`'s linear scan is the performance term in `walk_segment`'s worst case (see the parse entry), not a
+    correctness issue.~~ **fixed in #367.** `resync` is O(n), but `parse_record`'s per-record copy
+    of the rest of the segment made the walk quadratic (found by the `dos` stream's W2 refuter; see DISK-02).
 - **Existing coverage:** `frame.rs`'s unit tests — 16 of them, including
   `a_header_truncated_by_one_byte_is_truncated_not_malformed`,
   `a_body_truncated_by_one_byte_is_truncated_not_malformed`,
@@ -2763,6 +2771,12 @@ surveyor's.
   corrected this entry's first invariant above (it previously claimed every corrupt length is `Malformed`; that
   was wrong). The closed-segment consumer behavior F1 (ADR `durable-checkpoint-writes-and-fault-injection`'s
   Context) flags is `dur/w3`'s fix, not this file's.
+- **fixed in #367.** This entry was `reviewed @e3aa53b` before #367; that review's verdict on the `resync`
+  scan stands, but not its view of the walk's cost. `resync` is O(n), but `parse_record`'s copy of the rest
+  of the segment per record made `walk_segment` quadratic, a finding from the `dos` stream's W2 refuter. `frame_extent` returns
+  the bytes `read_frame_with_header` reads, so a caller copies one frame;
+  `read_frame_over_frame_extent_matches_read_frame_over_the_whole_buffer` checks that the bounded read returns
+  what the unbounded one does for whole, torn, over-cap, in-cap-but-long, bad-magic, and bad-CRC frames.
 - **Priority:** P1 — the caps and CRC are correct and tested, but this is the one decoder standing between corrupt
   disk bytes and an allocation, and the `Truncated`/`Malformed` distinction is load-bearing for disk recovery.
 

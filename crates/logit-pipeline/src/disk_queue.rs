@@ -162,7 +162,13 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
         return Err(CodecError::Truncated { needed: CONTEXT_LEN - buf.len() });
     }
     let trace = decode_context(&buf[..CONTEXT_LEN]);
-    let mut rest = Bytes::copy_from_slice(&buf[CONTEXT_LEN..]);
+    // `buf` can run to the end of a segment: copying all of it per record makes `walk_segment`
+    // quadratic in the segment's size. `frame_extent` bounds the copy to this one frame.
+    let frame_bytes = &buf[CONTEXT_LEN..];
+    let frame_bytes = &frame_bytes[..frame::frame_extent(frame_bytes)];
+    #[cfg(test)]
+    test_support::PARSE_RECORD_COPIED.with(|c| c.set(c.get() + frame_bytes.len() as u64));
+    let mut rest = Bytes::copy_from_slice(frame_bytes);
     let before = rest.len();
     let (codec, mut payload) = frame::read_frame(&mut rest)?;
     // No decode budget: `push` encoded this record from a batch that was already this size in
@@ -1723,6 +1729,12 @@ pub(crate) mod test_support {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    thread_local! {
+        /// Bytes `parse_record` has copied out of its input on this thread.
+        pub(crate) static PARSE_RECORD_COPIED: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
+    }
+
     /// The active (highest tracked) segment's sequence number.
     pub(crate) fn active_seq(q: &DiskQueue) -> u64 {
         let state = q.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -2781,6 +2793,102 @@ mod tests {
             assert_eq!(emitted, vec![(0, a.len() as u64)], "filler {filler}: only A is a record");
             assert_eq!(outcome.corrupt_skipped, 1, "filler {filler}");
             assert_eq!(outcome.good_len, bytes.len() as u64, "filler {filler}");
+        }
+    }
+
+    fn parse_record_copied() -> u64 {
+        test_support::PARSE_RECORD_COPIED.with(|c| c.get())
+    }
+
+    /// A segment of `n` copies of one small record, and that record's length.
+    fn healthy_segment(n: usize) -> (Vec<u8>, usize) {
+        let record = raw_record(&batch("x"), ctx());
+        (record.repeat(n), record.len())
+    }
+
+    /// A segment holding one record with a bad magic, `spurious` `MAGIC`s each followed by a
+    /// header no reader accepts, `filler` zero bytes, then one good record: every spurious `MAGIC`
+    /// is a resync candidate that fails to parse. Returns the segment and the good record's frame
+    /// length.
+    fn spurious_magic_segment(spurious: usize, filler: usize) -> (Vec<u8>, usize) {
+        // A fixed context, so no `MAGIC` lands in the good record's trace id by chance.
+        let fixed = BatchContext {
+            trace: TraceContext { trace_id: [1; 16], span_id: [2; 8] },
+            provenance: Provenance::default(),
+        };
+        let good = raw_record(&batch("x"), fixed);
+        let mut seg = vec![0u8; CONTEXT_LEN];
+        seg.extend_from_slice(b"XXXX");
+        seg.extend_from_slice(&[0u8; frame::HEADER_LEN - 4]);
+        for _ in 0..spurious {
+            seg.extend_from_slice(&frame::MAGIC);
+            // Version 0xffff and a `compressed_len` over the sanity cap.
+            seg.extend_from_slice(&[0xff; frame::HEADER_LEN - 4]);
+        }
+        seg.resize(seg.len() + filler, 0);
+        seg.extend_from_slice(&good);
+        (seg, good.len() - CONTEXT_LEN)
+    }
+
+    #[test]
+    fn walking_a_healthy_segment_copies_each_frame_once() {
+        let n = 2_000;
+        let (seg, record_len) = healthy_segment(n);
+        let before = parse_record_copied();
+        let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+        assert_eq!(outcome.valid_count, n as u64);
+        assert_eq!(outcome.good_len, seg.len() as u64);
+        assert_eq!(
+            parse_record_copied() - before,
+            (n * (record_len - CONTEXT_LEN)) as u64,
+            "each record copies its own frame, never the rest of the segment"
+        );
+    }
+
+    #[test]
+    fn resyncing_past_spurious_magics_copies_a_header_per_candidate() {
+        let spurious = 2_000;
+        let (seg, good_frame_len) = spurious_magic_segment(spurious, 64 * 1024);
+        let before = parse_record_copied();
+        let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+        assert_eq!(outcome.valid_count, 1);
+        assert_eq!(outcome.corrupt_skipped, 1);
+        // The bad-magic record and each spurious candidate copy one header; the good record is
+        // parsed twice, once by `resync_after` and once by the walk.
+        let header = frame::HEADER_LEN as u64;
+        assert_eq!(
+            parse_record_copied() - before,
+            header * (spurious as u64 + 1) + 2 * good_frame_len as u64
+        );
+    }
+
+    /// Prints `walk_segment`'s wall time over growing healthy and spurious-magic segments. Linear
+    /// cost shows as roughly 4x per row; run with `--ignored --nocapture` in release.
+    #[test]
+    #[ignore = "timing report for a maintainer, not an assertion"]
+    fn walk_segment_timing_report() {
+        for n in [2_000usize, 8_000, 32_000] {
+            let (seg, record_len) = healthy_segment(n);
+            let t = std::time::Instant::now();
+            let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+            eprintln!(
+                "healthy: record_len={record_len} n={n} seg_bytes={} valid={} took={:?}",
+                seg.len(),
+                outcome.valid_count,
+                t.elapsed()
+            );
+        }
+        for k in [2_000usize, 8_000, 32_000] {
+            let (seg, _) = spurious_magic_segment(k, 1024 * 1024);
+            let t = std::time::Instant::now();
+            let outcome = walk_segment(&seg, 0, |_, _, _, _| {});
+            eprintln!(
+                "spurious magics: k={k} seg_bytes={} valid={} skipped={} took={:?}",
+                seg.len(),
+                outcome.valid_count,
+                outcome.corrupt_skipped,
+                t.elapsed()
+            );
         }
     }
 

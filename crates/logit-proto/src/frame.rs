@@ -243,6 +243,21 @@ pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes),
     Ok((header, payload))
 }
 
+/// How many bytes off the front of `bytes` [`read_frame_with_header`] reads: the header plus its
+/// declared `compressed_len`, clamped to `bytes.len()`. A `compressed_len` over the sanity cap
+/// counts as zero, because `read_frame_with_header` rejects it before looking at the body.
+///
+/// `read_frame_with_header` over `bytes[..frame_extent(bytes)]` returns what it returns over all
+/// of `bytes`, so a reader holding a long borrowed buffer (`DiskQueue` walking a segment) copies
+/// one frame into a `Bytes` rather than the whole remainder. Reads only `compressed_len`; the
+/// header's other fields are `read_frame_with_header`'s to validate.
+pub fn frame_extent(bytes: &[u8]) -> usize {
+    let Some(len_field) = bytes.get(16..20) else { return bytes.len() };
+    let compressed_len = u32::from_le_bytes(len_field.try_into().expect("a 4-byte slice"));
+    let body = if compressed_len > MAX_SANE_COMPRESSED_LEN { 0 } else { compressed_len as usize };
+    (HEADER_LEN + body).min(bytes.len())
+}
+
 /// Sizes the output to lz4's worst case, then truncates to what `compress_into` wrote.
 fn lz4_compress(payload: &[u8]) -> Vec<u8> {
     let max_len = lz4_flex::block::get_maximum_output_size(payload.len());
@@ -407,6 +422,51 @@ mod tests {
         let (codec, payload) = read_frame(&mut rest).unwrap();
         assert_eq!(codec, 1);
         assert_eq!(&payload[..], b"payload");
+    }
+
+    /// `read_frame_with_header` over `bytes[..frame_extent(bytes)]` must match it over all of
+    /// `bytes`: the same header, payload, and bytes consumed, or the same error.
+    #[test]
+    fn read_frame_over_frame_extent_matches_read_frame_over_the_whole_buffer() {
+        fn outcome(bytes: &[u8]) -> String {
+            let mut b = Bytes::copy_from_slice(bytes);
+            let before = b.len();
+            match read_frame_with_header(&mut b) {
+                Ok((h, payload)) => format!("ok {h:?} {payload:?} consumed {}", before - b.len()),
+                Err(e) => format!("err {e:?}"),
+            }
+        }
+        let framed = write_frame(1, Compression::None, b"payload").unwrap();
+        let lz4 = write_frame(1, Compression::Lz4, &[7u8; 300]).unwrap();
+        let mut over_cap = framed.to_vec();
+        over_cap[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut in_cap_long = framed.to_vec();
+        in_cap_long[16..20].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let mut bad_magic = framed.to_vec();
+        bad_magic[0] = b'X';
+        let mut bad_crc = framed.to_vec();
+        *bad_crc.last_mut().unwrap() ^= 0xff;
+        let trailing = [&framed[..], &[0xAB; 64], &framed[..]].concat();
+
+        let cases: [(&str, &[u8]); 10] = [
+            ("empty", &[]),
+            ("short header", &framed[..10]),
+            ("header only", &framed[..HEADER_LEN]),
+            ("torn body", &framed[..framed.len() - 1]),
+            ("whole frame", &framed),
+            ("lz4 frame", &lz4),
+            ("frame then more bytes", &trailing),
+            ("compressed_len over the cap", &over_cap),
+            ("compressed_len in the cap but past the end", &in_cap_long),
+            ("bad magic", &bad_magic),
+        ];
+        for (label, bytes) in cases.iter().copied().chain([("bad crc", &bad_crc[..])]) {
+            let extent = frame_extent(bytes);
+            assert!(extent <= bytes.len(), "{label}");
+            assert_eq!(outcome(&bytes[..extent]), outcome(bytes), "{label}");
+        }
+        assert_eq!(frame_extent(&trailing), framed.len());
+        assert_eq!(frame_extent(&over_cap), HEADER_LEN);
     }
 
     #[test]
