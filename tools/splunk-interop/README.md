@@ -21,7 +21,7 @@ container; `compose.yaml`'s header lists them.
 | Service | Image | Role |
 |---|---|---|
 | `splunk` | `splunk/splunk:10.4.3` | Splunk Enterprise, HEC over plain HTTP on `:8088`, the default token `splunk_hec_token` |
-| `splunk-init` | `curlimages/curl:8.22.0` | One-shot REST setup on `:8089`: a metrics index `metrics`, event indexes `osnix` and `tcpout_probe`, a `useACK` token `ack`, and the `[tcpout]` probe's output group and token, then a restart for the output group to load |
+| `splunk-init` | `curlimages/curl:8.22.0` | One-shot REST setup on `:8089`: a metrics index `metrics`, event indexes `osnix` and `tcpout_probe`, a `useACK` token `ack`, the `[tcpout]` probe's output group and token, and a sourcetype `logit:ta` with index-time props and transforms, then a restart for the output group, props, and transforms to load |
 | `rawcap` | `python:3.12-slim` | `tools/record-fixtures/raw_capture.py --proto tcp`, the `[tcpout] sendCookedData=false` destination |
 | `logit-<leg>` | `logit:splunk-interop`, built from the current tree | one per `logit-<leg>.yaml` |
 | `replay` | `python:3.12-slim` | `replay.py`: every request in `testdata/interop/splunk/` into the `hec-relay` leg, once |
@@ -53,11 +53,29 @@ Every config passes `logit validate`: `script/validate` and the
    `python:3.12-slim` container on the stack's network. `check.py` searches Splunk over REST
    (`/services/search/jobs/export`, `mstats`, `mcatalog`, `tstats`) for each leg, an event
    search bounded by index time to what arrived after the legs started (`mstats` and `mcatalog`
-   return nothing under that bound, so a metrics query is unbounded), then runs the probes: gzip,
-   `max_content_length`, the HEC endpoint's TLS and `/health`, the body-size cap, the code 6
-   batch semantics, `metric_type`, the dimension count, `OPTIONS` and `Set-Cookie`,
-   acknowledgment, and `[tcpout]` framing.
+   return nothing under that bound, so a metrics query is unbounded), then runs the probes (the
+   list below).
 5. Tears the project down (`down -v --remove-orphans`) on every exit.
+
+The probes, in the order they run, each named for its function in `check.py`:
+
+| Probe | What it posts or asks |
+|---|---|
+| `probe_version` | `max_content_length` and the version, over REST |
+| `probe_endpoint` | the HEC endpoint's TLS and certificate, and `/health` without a token |
+| `probe_health_token` | `GET /health` and `/health/1.0` with no token, the token, and a bogus token |
+| `probe_body_cap` | the body-size cap, uncompressed and gzipped |
+| `probe_gzip` | `gzip` on `/event` and `/raw`, and `deflate` |
+| `probe_code6` | the code 6 batch semantics, and the other per-object errors |
+| `probe_empty_event_object` | `event` as `{}`, `[]`, `" "`, `null`, `0`, and `false` |
+| `probe_time_forms` | `time` as integer seconds, milliseconds, and nanoseconds, a decimal string, and a float with nanosecond digits, and the `_time` Splunk stores for each |
+| `probe_envelope_carryover` | three objects with `host`, `index`, `source`, `sourcetype`, and `time` on only the first, then on only the last: what the others get |
+| `probe_raw_merging` | `/raw` bodies of three lines, LF, CRLF, without a trailing newline, and with an indented line, under a sourcetype with no props: the events Splunk makes |
+| `probe_event_vs_raw_props` | one line under `logit:ta` to `/raw`, `/event`, and `/event?auto_extract_timestamp=true`: which of its `TIME_PREFIX`/`TIME_FORMAT`, index-routing transform, and sourcetype-renaming transform each applies. Local only |
+| `probe_metrics` | `metric_type`, the dimension count, and the metric object forms |
+| `probe_http` | `OPTIONS`, HTTP errors, `/raw` without a channel, and `Set-Cookie` |
+| `probe_ack_ids` | acknowledgment: no channel, the ids two channels issue, polls of issued and unissued ids, and a repeat poll |
+| `probe_tcpout` | `[tcpout] sendCookedData=false` framing. Local only |
 
 A leg's row is `PASS`, `GAP` (it arrived, with a difference recorded below), `SENT` (not
 searched, see [Splunk Cloud mode](#splunk-cloud-mode)), `SKIP` (the target can't run it), or
@@ -119,7 +137,7 @@ the local `rawcap` and is `SKIP` in cloud mode.
 The probes that matter most for a stack:
 
 - **Endpoint**: `GET /services/collector/health` with certificate verification on and off, the
-  leaf certificate's subject and issuer, and whether `/health` needs a token, for
+  leaf certificate's subject and issuer, and `/health` without a token, for
   `SPLUNK_INTEROP_HEC_URL` and `SPLUNK_INTEROP_HEC_URL_ALT`. Over `http://` it records `plain
   http` and skips the TLS checks.
 - **Body cap**: `/event` bodies of 999,000, 1,000,001, 1,048,577, and 2,000,000 bytes, then two
@@ -173,3 +191,18 @@ answered. The recording of the `[tcpout]` capture is described but not committed
 | `/raw` without a channel | On a token without `useACK`: `200` |
 | `useACK` | No channel: `400` code 10. A new channel's first two requests: `{"text":"Success","code":0,"ackId":0}`, then `"ackId":1` (the key is `ackId`, ids count from 0 per channel). The id polled `true` within about a second; the same id polled on another channel: `false` |
 | `[tcpout] sendCookedData=false` | Each event's `_raw` followed by one LF, nothing else: no header, no length, no metadata. An event with an embedded newline arrives as two lines; a JSON `event` as its JSON text; a `/raw` body's lines one each. Splunk forwarded its own logs from every index too, whatever `defaultGroup` (unset) and the `forwardedindex` filters (tried: only `tcpout_probe`) said, so the capture isn't committed: it is mostly Splunk's `_internal` and `_introspection` data |
+
+A run on 2026-09-26 against `splunk/splunk:10.4.3`, `SPLUNK_INTEROP_WINDOW=60`, with the probes
+the Vector comparison asked for. Every leg passed, and the earlier probes answered as above.
+
+| Probe | Splunk 10.4.3's answer |
+|---|---|
+| `/health` and the token | `GET /health` and `/health/1.0`: `200` `{"text":"HEC is healthy","code":17}` with no token, the token, and a bogus token alike. Neither checks the token |
+| `event` with no content | `{}` and `[]`: `200`, indexed with `_raw` `{}` and `[]`. `0`: `200`, indexed as `0`. `" "`: `400` code 13 `Event field cannot be blank`. `null` and `false`: `400` code 6 `Invalid data format`. Each refused object: nothing indexed |
+| `time` forms | Integer seconds, integer milliseconds (13 digits), integer nanoseconds (19 digits), a decimal string, and a float with nanosecond digits: all `200`. Splunk reads the 13- and 19-digit integers by magnitude, as milliseconds and nanoseconds, not as seconds. `_time` keeps microseconds: every nanosecond form stored `.123456`, the rest of the digits dropped |
+| envelope across objects | `host`, `index`, `source`, `sourcetype`, and `time` on object 0 of 3 only: objects 1 and 2 get the token's defaults (`main`, host `splunk:8088`, source `http:splunk_hec_token`, sourcetype `httpevent`, receipt time), not object 0's. On object 2 only: the same, for objects 0 and 1. No field carries from one object to the next |
+| `/raw` line merging | Under a sourcetype with no props, three lines (LF-terminated, CRLF-terminated, without a trailing newline, or with an indented second line) each become one event of three lines: the default `SHOULD_LINEMERGE=true` merges lines that carry no timestamp. CRLF is stored as LF |
+| index-time props, `/raw` and `/event` | One line under the `logit:ta` sourcetype: on `/raw`, routed to `tcpout_probe`, renamed to `logit:ta:renamed`, and `_time` from its `ts=` prefix. On `/event`, the same index routing and renaming, but `_time` the receipt time: `/event` runs `TRANSFORMS-*` and skips timestamp extraction. `/event?auto_extract_timestamp=true` extracts `_time` from the line as `/raw` does |
+| `useACK` ids | Channel A's two posts: `ackId` 0 and 1; channel B's one: `ackId` 0. A polled for `[0, 1, 5]`: `{"0":true,"1":true,"5":false}` within a second. The same poll again: `{"0":false,"1":false}`, since Splunk forgets an id once it has answered `true`. B polled for `[0, 1]`: `{"0":true,"1":false}`. A new channel polled for `[0]`: `false`. No channel: `400` code 10 |
+
+<!-- cloud: pending browser pass -->
