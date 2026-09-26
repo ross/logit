@@ -703,9 +703,16 @@ in a soak of 20 stable series against 1000 one-off series a window and a cap of 
 lost.
 
 `first_seen` isn't the key: source timestamps tie within one statsd datagram, and a backfilled
-series with an old source timestamp would outrank a stable one. A series first seen in the same
-window as the churn is only as old as its open order: newest first can't tell it from a one-off
-series until it survives a flush.
+series with an old source timestamp would outrank a stable one.
+
+Newest first protects a series that has survived one flush, not one that hasn't. A series evicted
+while active is re-created in the next window with a new sequence number, so a stable series whose
+records arrive after the one-off series in every window is the newest every time and is evicted at
+every flush, for as long as the churn lasts. Under `temporality: cumulative` that is a restart with a
+new `start_timestamp` every window. `a_stable_series_arriving_after_the_churn_is_evicted_every_flush`
+pins the case. `logit.transform.series.evicted{reason="cardinality", state="active"}` at every flush
+is the signal that more series are active than the cap holds: raise `max_retained_series`, or bound
+cardinality upstream with `keep` or `keep_values`.
 
 ### `description` and exemplars
 
