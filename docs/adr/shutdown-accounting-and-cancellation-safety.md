@@ -123,7 +123,9 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    agree under close and cancellation. Unit tests will pin the tokio behavior the queues rely on.
    On a tokio bump, re-check these internals:
    - `sync/notify.rs`: `notify_waiters` wakes only waiters whose `Notified` was created before the
-     call, and dropping a `Notified` that consumed a `notify_one` permit passes the permit on.
+     call. A `notify_one` delivered to a registered `Notified` that is dropped before its next
+     poll passes to the next waiter, or is stored as a permit. A `Notified` that already returned
+     `Ready` has consumed its permit and passes nothing on when dropped.
    - `macros/select.rs`: `select!` returns on the first branch that is `Ready` and drops the rest.
    - `sync/watch.rs`: `wait_for`'s behavior when its future is dropped and re-created.
 6. **`run_input` prefers the listener's own result.** Its `select!` will be `biased`, with the
@@ -193,7 +195,81 @@ Each workstream updates its inventory rows in the PR that lands its artifact.
 
 ### `drain/w1`: queue protocol (NET-06, NET-07, RT-07, DISK-08)
 
-Filled in by `drain/w1`.
+`drain/w1` lands `CountedDrain`, which `BoundedQueue::push_many` now iterates, so a cancelled
+call counts its remainder `items_dropped`/`units_dropped{reason="shutdown"}`. A `push_many`
+future dropped before its first poll takes nothing, and the caller still holds every item. Weight
+arithmetic in `BoundedQueue::would_overflow` and `InMemoryBuffer` saturates, on the add and the
+subtract, so an empty queue always weighs 0. Saturating only the add would underflow: push
+weights `u64::MAX` and 5, commit both, and `0 - 5` panics under the lock in a debug build, or wraps
+in release and parks every later `Block` push on an empty queue.
+
+It also documents three contracts at the code: `BoundedQueue::peek`/`commit` assume one consumer,
+`BoundedQueue::update_gauges` can write a stale gauge under parallel callers, and `DiskQueue`'s
+`commit` and `evict_oldest` are check-then-act pairs that are safe only with the producer and
+consumer polled from one task. `DiskQueue`'s behavior doesn't change.
+
+Run the long stress modes with:
+
+```sh
+script/test -p logit-pipeline --run-ignored only -E 'test(/queue_stress::.*long/)'
+```
+
+Replay one seed with `LOGIT_QUEUE_STRESS_SEED=N` (and `--run-ignored all` for a long-mode seed).
+The thread schedule isn't replayed, only the scenario the seed picks.
+
+Tests in `crates/logit-pipeline/src/queue_stress.rs`:
+
+- `bounded_queue_under_random_producers_consumers_cancellation_and_close_loses_and_duplicates_nothing`
+  (64 seeds in CI) runs one to three producers and one or two consumers as tasks on a four-worker
+  runtime, under every overflow policy and bound shape, with random cancellations (including
+  cancellers ready at once and futures never polled) and random close timing. Every handed item
+  must be popped, still queued, counted dropped (`overflow_oldest`, `overflow_newest`,
+  `shutdown`), or known not admitted, in items and units. No item appears twice, each consumer
+  sees each producer's items in order, a `peek` consumer's `commit` removes the item it peeked,
+  zero-drop runs drop nothing, and the gauges read 0 once the queue is drained.
+- `bounded_queue_long_stress` (ignored) runs the same scenario over 20,000 seeds.
+- `a_close_while_every_producer_and_consumer_is_parked_wakes_all_of_them` parks three `Block`
+  pushers on a full queue, then `pop`, `pop_many`, and `peek` on an empty one, and checks that
+  `close()` wakes each of them.
+- `disk_queue_under_a_random_producer_consumer_and_close_loses_and_duplicates_nothing` (16 seeds
+  in CI) joins one producer and one consumer as two futures in one task, under random spool
+  bounds, segment sizes, policies, cancellations, and close timing, then finishes, reopens, and
+  drains the spool. Every handed push that wasn't cut off is delivered, counted dropped, or
+  replayed; delivery and replay together follow push order with nothing twice; and only the
+  trailing cut-off push, whose write `finish` flushed, may reappear on reopen.
+- `disk_queue_long_stress` (ignored) runs the same scenario over 1,000 seeds.
+
+Tests in `crates/logit-pipeline/src/queue.rs`:
+
+- `any_sequence_with_close_and_cancelled_calls_agrees_between_batched_and_single_calls` (proptest,
+  256 cases) runs random sequences of `push`, `push_many`, `pop`, `pop_many`, and `close` under
+  every policy and three bound shapes. Each call is polled once with a no-op waker and dropped if
+  `Pending`, or dropped unpolled. Batched and single-item runs must pop and retain the same items
+  and count the same overflow drops, and a batched run's `shutdown` count must equal what the
+  single-item run never reached.
+- `a_notify_one_delivered_to_a_registered_notified_that_is_dropped_unpolled_is_passed_on` and
+  `a_notify_one_with_no_waiter_stores_one_permit_not_two` pin the tokio `Notify` behavior under
+  decision 5.
+- `a_cancelled_push_many_keeps_its_prefix_and_counts_its_remainder_as_shutdown_drops` checks the
+  counted remainder, 2 items and their own units.
+- `a_push_many_never_polled_before_shutdown_leaves_every_item_in_the_callers_vec_uncounted` pins
+  that the caller counts what an unpolled call never took.
+- `commit_after_saturated_weights_never_underflows_and_an_empty_queue_has_zero_weight` and
+  `would_overflow_saturates_rather_than_wrapping_near_u64_max` cover the saturating arithmetic.
+- `counted_drain_counts_only_what_it_never_yielded` counts a peeked-but-unyielded item and
+  records nothing for an exhausted drain.
+
+`crates/logit-proto/src/buffer.rs` adds
+`saturated_weights_never_underflow_and_an_empty_buffer_weighs_nothing`, through `commit` and
+eviction. `crates/logit-pipeline/src/disk_queue.rs` adds
+`a_block_push_whose_make_room_rotation_fails_writes_over_bound_rather_than_parking`: a consumed,
+full spool whose make-room create fails with no file left behind still completes a `Block` push,
+the batch is readable, and `disk.errors{op="create"}` counts 1.
+
+Each harness was checked against a planted bug: counting nothing on cancellation fails the
+proptest and the `BoundedQueue` ledger; removing `push_many`'s pre-wait `notify_one` stops a
+`BoundedQueue` seed within its 30 s timeout; and removing the `not_full` wake in
+`DiskQueue::after_cursor_advance` stops a `DiskQueue` seed within its timeout.
 
 ### `drain/w2`: runtime shutdown accounting (RT-02, RT-03, RT-04)
 
