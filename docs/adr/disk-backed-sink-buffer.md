@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-24
+updated: 2026-09-26
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -469,3 +469,21 @@ failed unlink.
 The reason is measured: with 1 MiB segments, the inline durable persist cost 16–27% of throughput
 on the perf VM. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
 "Amendment: the spool persists its cursor on a worker thread" has the numbers and the tests.
+
+## Amendment: a disk sink under `at_most_once` can count a shutdown drop (2026-09-26)
+
+"Shutdown" above says a disk-backed sink counts nothing as `reason="shutdown"`. That will stop being
+true for one case. Under
+[ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+decision 3, a send cut off by the shutdown grace is `Fault::Ambiguous`. Under `delivery:
+at_most_once`, `write_loop` will commit that batch off the spool and count it
+`batches.dropped{reason="shutdown"}`, because the destination may have taken it and the posture
+forbids a duplicate. A restart won't replay it. Under `at_least_once` the batch stays at the
+spool's head and a restart replays it, as today. `SinkStore::finish` still drops nothing.
+
+The same ADR's decision 9 has `run_output` close its inbox before the sweep, which fixes two
+claims in "Shutdown" above. Today a send can land in the channel after the sweep's last
+`try_recv`, and that batch dies with the `Receiver`, uncounted. That contradicts "the sweep …
+still drops nothing". Separately, the spool's overshoot of `disk.max_bytes` isn't bounded by the
+channel's capacity today: the inbox stays open while the sweep awaits each `store.push`, so
+producers refill it. A closed inbox can't refill, and the bound holds.

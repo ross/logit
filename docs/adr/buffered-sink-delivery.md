@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-02
+updated: 2026-09-26
 ---
 
 # Buffered, decoupled sink delivery
@@ -288,3 +288,24 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
   remains — no durable buffering, no end-to-end acknowledgement, no out-of-order/credit-based acks.
 - `docs/adr/service-lifecycle-and-output-retry.md`: gains a note that this ADR revises its
   retry-budget rationale; 0013's other decisions are unaffected.
+
+## Amendment: a send cut off by the shutdown grace is `Ambiguous` (2026-09-26)
+
+"`Output::flush` and a bounded shutdown grace" above caps `write_loop`'s drain time once shutdown
+fires, but doesn't say what happens to a send still in flight when the grace runs out.
+`write_loop` races `deliver_with_retry` against `shutdown_grace_expired` in a `select!`, and the
+grace winning drops the send. The destination may already have taken the batch. The only
+`timeout` around `output.send` is the retry budget's, and its expiry is already `Ambiguous`.
+
+[ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+decision 3 classifies that send as `Fault::Ambiguous`, and this record's retry table decides the
+rest:
+
+- Under `at_least_once`, the batch will stay uncommitted, so it's replayed or counted by
+  `SinkStore::finish`, as any queued batch is.
+- Under `at_most_once`, the batch will be committed and counted
+  `batches.dropped{reason="shutdown"}`, not `send_failed`, and the sink span tagged
+  `fault=ambiguous`.
+
+A grace that expires while no send is in flight, such as during a backoff sleep, will leave the
+batch uncommitted under either posture.

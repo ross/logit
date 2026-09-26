@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-18
+updated: 2026-09-26
 ---
 
 # Decoupled listener I/O
@@ -396,3 +396,18 @@ to ignore the one warning that matters.
   allocations in steady state (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`
   §2) — a strict improvement, not merely a neutral refactor, because the accumulator's own need for
   a reusable buffer forced the `decode_into` signature that makes it possible.
+
+## Amendment: a listener's grace is enforced only by the runtime (2026-09-26)
+
+"`Input::run_until_shutdown`" above puts a listener's shutdown grace in
+`InputRuntimeConfig { shutdown_grace }`, which `run_input` races as its backstop. Three
+per-listener copies also exist: `TailBatching::shutdown_grace`,
+`UdpListenerConfig::shutdown_grace`, and `TcpListenerConfig::shutdown_grace`. `logit-cli`'s
+`pipeline` sets them, and nothing reads them.
+
+Under [ADR `shutdown-accounting-and-cancellation-safety`](shutdown-accounting-and-cancellation-safety.md)'s
+decision 7, `run_input` is the only place a listener's grace is enforced, and the three copies
+will be removed with no alias. A listener's `run_until_shutdown` override drains until it's done
+or `run_input`'s backstop drops it; it doesn't time itself. The same ADR's decision 6 makes
+`run_input`'s `select!` `biased` toward the listener, so a listener's error that is ready in the
+same poll as the backstop is returned, not discarded.

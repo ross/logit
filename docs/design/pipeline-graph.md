@@ -603,6 +603,18 @@ previous = Some(self.component)              // rewritten on every send
 read as one graph across `logit_out -> logit_in`. See the ADR for the wire-format decision
 (`CODEC_NATIVE_V2`) this relies on.
 
+### Cancellation points
+
+This table is the canonical list of every production `tokio::select!` and `tokio::time::timeout`
+on a node's run path. A branch that adds one adds its row in the same PR. A comment at the site
+points here and doesn't repeat the row
+([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md)).
+
+| Site (file, item) | Arms | What a losing arm drops | Why nothing is lost, or what counts it |
+|---|---|---|---|
+
+The rows land with the `drain/w2` to `drain/w5` workstreams.
+
 ## Backpressure: diamonds are the normal shape now
 
 The usual way to route by condition is a set of sibling branches off one upstream, each a
