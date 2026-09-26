@@ -49,6 +49,15 @@ pub(crate) fn set_component(state: &Rc<RefCell<ProvenanceState>>, id: &str) {
     state.borrow_mut().component = Some(id.to_string());
 }
 
+/// Runs `f` with this worker's component id, `None` before
+/// [`crate::ScriptWorker::with_component`]. `crate::print` tags its self-log line with it.
+pub(crate) fn with_component<R>(
+    state: &Rc<RefCell<ProvenanceState>>,
+    f: impl FnOnce(Option<&str>) -> R,
+) -> R {
+    f(state.borrow().component.as_deref())
+}
+
 /// The `provenance` global's userdata.
 struct ProvenanceProxy(Rc<RefCell<ProvenanceState>>);
 

@@ -1148,13 +1148,29 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
+        /// Fails this component, and with it the process (exit code 2), once its Lua VM holds
+        /// more than this many bytes after a full garbage collection. Checked after each batch
+        /// and each `flush()`, so one call can briefly go over it. A quoted byte-count string
+        /// (`"256MiB"` or `"268435456"`). Omitted (the default) means no limit; `0` is rejected.
+        ///
+        /// Bounds the Lua VM heap only: an event a script retains keeps its payload in Rust
+        /// memory the cap does not see. Size it at least twice the script's steady working set
+        /// as read from `logit.script.vm.memory`; a lower cap forces a full collection on most
+        /// batches.
+        #[serde(default, with = "human_bytes::option")]
+        #[schemars(with = "Option<String>")]
+        max_memory: Option<u64>,
     },
-    /// A `.lua` file path, relative to the config file. Takes the same `interval` as `lua`.
+    /// A `.lua` file path, relative to the config file. Takes the same `interval` and
+    /// `max_memory` as `lua`.
     LuaFile {
         lua_file: String,
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
+        #[serde(default, with = "human_bytes::option")]
+        #[schemars(with = "Option<String>")]
+        max_memory: Option<u64>,
     },
     /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
     /// `0s` is rejected.
@@ -3610,9 +3626,10 @@ mod tests {
                 .unwrap();
         assert_eq!(component.sources, vec!["in".to_string()]);
         match component.kind {
-            ComponentKind::Lua { script, interval } => {
+            ComponentKind::Lua { script, interval, max_memory } => {
                 assert_eq!(script, "return event");
                 assert_eq!(interval, None);
+                assert_eq!(max_memory, None);
             }
             other => panic!("expected Lua, got {other:?}"),
         }
@@ -3639,11 +3656,50 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::LuaFile { lua_file, interval } => {
+            ComponentKind::LuaFile { lua_file, interval, max_memory } => {
                 assert_eq!(lua_file, "x.lua");
                 assert_eq!(interval, Some(Duration::from_secs(60)));
+                assert_eq!(max_memory, None);
             }
             other => panic!("expected LuaFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lua_max_memory_parses_a_byte_count_string() {
+        for (raw, want) in [("256MiB", 256 * 1024 * 1024), ("268435456", 268_435_456)] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "lua", "script": "x", "max_memory": "{raw}"}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::Lua { max_memory, .. } => assert_eq!(max_memory, Some(want)),
+                other => panic!("expected Lua, got {other:?}"),
+            }
+        }
+        // String-only, like every byte count: a bare integer contradicts the schema.
+        let bare: Result<Component, _> =
+            serde_json::from_str(r#"{"type": "lua", "script": "x", "max_memory": 1024}"#);
+        assert!(bare.is_err(), "a bare integer max_memory should be rejected");
+    }
+
+    #[test]
+    fn lua_file_max_memory_is_optional() {
+        let without: Component =
+            serde_json::from_str(r#"{"type": "lua_file", "lua_file": "x.lua"}"#).unwrap();
+        let with: Component = serde_json::from_str(
+            r#"{"type": "lua_file", "lua_file": "x.lua", "max_memory": "4MiB"}"#,
+        )
+        .unwrap();
+        match (without.kind, with.kind) {
+            (
+                ComponentKind::LuaFile { max_memory: none, .. },
+                ComponentKind::LuaFile { max_memory: some, .. },
+            ) => {
+                assert_eq!(none, None);
+                assert_eq!(some, Some(4 * 1024 * 1024));
+            }
+            other => panic!("expected two LuaFiles, got {other:?}"),
         }
     }
 
@@ -5873,6 +5929,7 @@ mod tests {
             kind: ComponentKind::Lua {
                 script: "x".to_string(),
                 interval: Some(Duration::from_secs(30)),
+                max_memory: None,
             },
         };
         let json = serde_json::to_string(&original).unwrap();

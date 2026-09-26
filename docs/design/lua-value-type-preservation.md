@@ -130,9 +130,8 @@ changes it on purpose.
   `Value::Array(vec![Value::Bytes(b"web-01")])` assigned back to itself unchanged comes back as
   `Array([Str(b"web-01")])`. The top-level assignment falls through to a full `lua_to_value`
   reconversion of the table, which has no memory of the nested element's variant. Closing this
-  would mean walking the incoming table to compare nested elements, but that walk
-  (`Table::get`/`pairs`) can trigger a script-supplied `__index` and reenter this proxy, so it
-  can't run while the event's `RefCell` is borrowed the way the top-level check is. Not pursued:
+  would mean walking the incoming table to compare nested elements while the event's `RefCell`
+  is borrowed, where the top-level check only compares one value. Not pursued:
   no concrete consequence of a *nested* variant collapse has been reported (unlike the top-level
   case, which changes InfluxDB tag output), so the complexity isn't justified yet. The same
   trade-off ruled out the userdata wrapper above.

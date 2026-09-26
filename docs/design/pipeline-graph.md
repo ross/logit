@@ -370,6 +370,7 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     or fragment, or ends in a HEC route rather than the `/services/collector` base, an empty or
     whitespace-padded `token`, `timeout: 0s`, an `ack_timeout` without `ack: true` or of `0s`, a
     `max_body_bytes` of `0`, or a bad `tls` (including any `tls` with an `http://` endpoint).
+71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -443,7 +444,38 @@ on one thread, because `PipelineConfig.transforms` guaranteed the stages were ad
 a Lua component's sources and consumers can be any components. The thread's exit (a normal return
 once its inbox closes, or a panic caught at the top of the thread) is reported over a oneshot that
 a small `JoinSet` task awaits for the node (`runtime.rs`'s `watch_lua_thread`), so readiness, the
-failure-triggered drain, and the exit code treat a Lua node exactly like any task.
+failure-triggered drain, and the exit code treat a Lua node as they treat any task.
+
+That watcher task also bounds a script that never returns
+([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
+
+- **Heartbeat.** The thread shares a `logit_script::Heartbeat` with its watcher: bit 0 is set
+  while it is inside a `process()` or `flush()` call, and a count above it advances on each call,
+  each `Event.new`, and each event taken from a returned table. The thread marks itself idle before
+  it sends, so a thread parked on a full downstream inbox is backpressure, never a stall.
+- **Stall.** Busy with the value unchanged for `stall_after` (10 s) sets the node to
+  `NodeState::Stalled` and logs `script_stalled`; `/readyz` reads `503 stalled` until the next
+  change sets `Running` again. The phase never moves, so a stall recovers on its own.
+- **Revocable I/O.** The thread's inbox, own `Fanout`, and target `Fanout`s live in one
+  `Arc<Mutex<Option<LuaIo>>>`, locked by the thread only around a receive and around a send,
+  never while busy.
+- **Wedge.** Once shutdown has begun, busy with the value unchanged for `shutdown_grace` (2 s),
+  measured from the later of the signal and the last change, is a wedge. A node already `Stalled`
+  is measured from its last change alone; with the defaults (10 s to stall, 2 s of grace) that
+  means the next tick after the signal. The grace is shorter than a sink's 5 s
+  `buffer.shutdown_grace`, so a downstream window flushed after the revocation still reaches its
+  sink. The watcher takes the `LuaIo` out of the mutex, counts the batches still in its inbox as
+  dropped with reason `shutdown`, drops it, and returns `Err` naming the node. Dropping it closes
+  every downstream inbox, so those nodes drain on their own graces and flush their own windows as
+  on any shutdown, and every upstream send fails as `closed_consumer`.
+  Nothing is aborted: the join loop's first-error path marks the node `Failed` and the run exits
+  `2`. The thread itself is left running until `main` exits; if its call ever returns, it finds
+  `None` and stops. A node that isn't busy is never blamed, whatever its downstream is doing.
+
+There is no wall-clock bound on the drain as a whole. A slow `flush()` that keeps producing events
+is progress however long it takes, and graces don't add up along a chain of Lua nodes, because
+each wedge is judged on its own node's heartbeat. The cost: a script looping over `Event.new`
+forever is progress too, and is never stalled or wedged.
 
 Everything else runs as an ordinary tokio task: listeners, sinks, native `Send` transforms
 (`logit-transforms::Aggregator` and every other native transform in that crate), and **native
