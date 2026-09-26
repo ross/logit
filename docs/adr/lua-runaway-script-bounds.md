@@ -43,11 +43,13 @@ sources, found:
   call N+1, returning the same handle twice, or `return {e}` beside a live alias to `e`.
   `into_inner`'s `Err(rc)` clone fallback is reachable, not merely theoretical: `lua_newuserdata`
   (used by `attrs_userdata`, `log_userdata`, `metrics_userdata`, and `span_userdata` alike) runs
-  `lj_gc_check`, which can run a script's `__gc` finalizer while the accessor's cache is still
-  unset, and a finalizer that reads the same sub-proxy fills the cache first. A probe script
-  (`newproxy(true)` with a re-armed `__gc`, `collectgarbage("setpause", 0)`/`setstepmul`) silently
-  cloned 14 of 20 returned events this way, with writes through the orphaned handle changing
-  nothing.
+  `lj_gc_check`, which can run a script's `__gc` finalizer while an mlua call is mid-allocation.
+  `newproxy` is the only way a script gets a finalizer on LuaJIT — `setmetatable({}, {__gc = ..})`
+  never fires, and `ffi` is absent — so a probe built on `newproxy(true)` (a re-armed `__gc`,
+  `collectgarbage("setpause", 0)`/`setstepmul`) is what found it: a finalizer that runs during
+  `AttrsProxy::__index`'s `value_to_lua` allocation SIGSEGVs reproducibly (3/3 in a debug build,
+  2/3 in release), and one that runs during `EventProxy::to_table`'s hits an "already borrowed"
+  `RefCell` panic, caught and silently lost, instead.
 - The sandbox exposes `coroutine` (registered by `luaopen_base` itself), `print` (writes to
   process stdout, which corrupts `stdio_out` on stdout and is fatal under `format: native`),
   `collectgarbage`, `newproxy`, and `gcinfo`. No test enumerates `_G`. `bit`, `jit`, `debug`,
@@ -123,21 +125,23 @@ sources, found:
    never touches process stdout. A leftover debug `print` is the accidental case this cluster's
    threat model names, and a self-log line is more useful to an operator than corrupted
    `stdio_out` output.
-7. **`collectgarbage`, `setmetatable`, `newproxy`, and `coroutine` stay in the sandbox.** None of
-   the four reaches the host filesystem, network, or process, and each has an ordinary use in a
-   transform script (freeing memory early, building a read-only wrapper table, closing over a
-   resource with a finalizer, or structuring control flow). Removing them would narrow the
-   scripting surface for no bound gained; a script that misuses one is covered by the memory cap
-   (`collectgarbage`), the depth cap (`setmetatable`-driven aliasing still converts through the
-   same raw path), or is left as a documented non-goal below (`newproxy` and `coroutine`'s crafted
-   cases).
-8. **A re-entrant `__gc` finalizer can't orphan a returned event's cache.** Every sub-proxy
-   accessor (`attrs_userdata`, `log_userdata`, `metrics_userdata`, `span_userdata`) re-checks its
-   cache immediately after `create_userdata`: if a finalizer that ran during that call's
-   `lj_gc_check` already filled the cache, the accessor takes the new userdata's proxy back out
-   and returns the cached one instead of overwriting it. One branch, so it is built rather than
-   left as a non-goal; `into_inner`'s `Err(rc)` arm keeps its `debug_assert!(false)` in a debug
-   build and its clone fallback in release, for whatever this doesn't catch.
+7. **`collectgarbage`, `setmetatable`, and `coroutine` stay in the sandbox, and `print` stays
+   rerouted rather than removed (decision 6).** None of the three reaches the host filesystem,
+   network, or process, and each has an ordinary use in a transform script (freeing memory early,
+   building a read-only wrapper table, or structuring control flow). Removing them would narrow
+   the scripting surface for no bound gained; a script that misuses one is covered by the memory
+   cap (`collectgarbage`) or the depth cap (`setmetatable`-driven aliasing still converts through
+   the same raw path), or is left as a documented non-goal below (`coroutine`'s crafted cases).
+8. **`newproxy` is removed from the sandbox.** `remove_unsandboxed_base_globals` nils it, and the
+   `_G` allowlist test pins it absent. It was the only way a script could reach the SIGSEGV and
+   the borrow panic in the Context section above, because it is the only way a script gets a
+   `__gc` finalizer on LuaJIT at all. Removing it establishes the invariant the rest of the
+   boundary depends on: **no script code runs during an mlua allocation.** That invariant is what
+   makes `EventProxy::to_table` and `AttrsProxy::__index` sound holding a `RefCell` borrow across
+   a call that allocates — a re-entrant write reaching either during that borrow has no path left
+   to fire from, rather than a path defended at each site. `into_inner`'s `Err(rc)` arm keeps its
+   `debug_assert!(false)` in a debug build and its clone fallback in release, for whatever else
+   might reach it.
 9. **The registry is expired on a schedule, not left to mlua.** mlua 0.9.9's `RegistryKey::drop`
    only queues its id for reuse; the slot, and the `Rc<RefCell<Event>>` a sub-proxy handle holds
    through it, stays live until `create_registry_value` reuses the id or `expire_registry_values`
@@ -152,6 +156,17 @@ sources, found:
     `Lua::load(source).set_name("=script")`, so a traceback cites the script, not a
     `crates/logit-script/src/lib.rs` line. A script's own `pcall` still sees mlua's raw
     destructed-userdata wording for a stale handle; documented, not changed.
+11. **A count round-trips past 2^53, like an attribute already does.** `to_table` and the
+    `MetricProxy` read arms (`count`, `zero_count`, and each bucket row) emit a `u64` count as an
+    ordinary Lua integer up to 2^53 and as a decimal-digit string above it, the same convention
+    `exact_i64_to_lua` already uses for an attribute; `Event.new`'s `count` field accepts either
+    form. [ADR `lua-event-constructor`](lua-event-constructor.md)'s residual list, which names
+    this gap, is corrected in `luab/w1`.
+12. **The Lua OS thread gets an 8 MiB stack.** Pure-Lua recursion through Rust/C frames — a
+    `string.gsub` callback recursing into itself — aborts the default 2 MiB thread at around 233
+    levels, regardless of build profile. The thread `run_lua` spawns sets `std::thread::Builder::
+    stack_size` to 8 MiB. The extra is virtual address space, committed only as the stack grows,
+    so an ordinary script pays nothing for it.
 
 ## Alternatives considered
 
@@ -188,6 +203,10 @@ sources, found:
   `Fanout` senders open, so a downstream native node's own inbox never closes and it never
   finishes its own shutdown. Diagnosing the wedge without acting on its I/O would report the
   problem without ever letting the process exit.
+- **Keeping `newproxy` and defending only the returned-event cache.** Rejected: the SIGSEGV and
+  the borrow panic both happen inside the mlua allocation call that runs the finalizer, before any
+  accessor cache exists to re-check. A defense placed at the cache could not have prevented either
+  one; only removing the one path to a finalizer closes both.
 
 ## Consequences
 
@@ -200,7 +219,8 @@ sources, found:
   script-derived strings (`Event.new`'s and the proxy setters' `name`/`unit`/`description`/
   `event_name` fields, and nested attribute keys) is accepted the way `telemetry`'s own tag values
   already are. A `newproxy(true)` finalizer touching a stashed handle during collection is no
-  longer on this list: decision 8 defends it, because the defense is one branch.
+  longer possible to write at all: decision 8 removes `newproxy`, closing the class rather than
+  defending each site against it.
 - A downstream `aggregate` window in flight when a Lua node wedges is not lost: revoking the
   wedged node's I/O (decision 2) closes every downstream inbox, so each downstream node drains on
   its own `shutdown_grace` the way it would on an ordinary shutdown, flushing its own window and
@@ -210,6 +230,14 @@ sources, found:
   `admin-readiness-endpoint`](admin-readiness-endpoint.md): the admin server itself is healthy, and
   an orchestrator restart would not clear a script wedge on its own — the container's
   `HEALTHCHECK` failing `/readyz` is what prompts one.
+- Three residuals the depth cap and the larger stack don't close. A 128-deep value a script builds
+  does not survive a relay through `otlp_out → otlp_in`: OTLP's own JSON and protobuf nesting
+  limits are 41 and 49 levels, both under native's 128. The depth cap bounds a table's nesting,
+  not its size, so a DAG a script builds by sharing table references (`t = {a = t, b = t}`
+  repeated k times) still converts, at 2^k nodes. And pure-Lua recursion through Rust/C frames can
+  still abort the process past the larger stack from decision 12, at a higher level than 233. The
+  last two are recorded in `docs/known-gaps.md`'s Lua entry, citing [ADR
+  `deployment-threat-model`](deployment-threat-model.md).
 
 ## Running it
 
