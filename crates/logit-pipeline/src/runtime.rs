@@ -828,7 +828,6 @@ enum Delivery {
 /// backoff sleep. So when [`write_loop`] drops this future for the shutdown grace, `true` means
 /// `send` was polled at least once and hadn't completed. A grace that lands during a backoff
 /// sleep leaves it `false`.
-#[allow(clippy::too_many_arguments)]
 async fn deliver_with_retry(
     output: &mut (dyn Output + Send),
     batch: &EventBatch,
