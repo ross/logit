@@ -11,6 +11,10 @@ logit-core.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 mlua = { version = "0.9", features = ["luajit", "vendored"] }
+# A script's `print` goes to the self-log (docs/adr/tracing-for-self-logging.md), never stdout.
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# `print_writes_to_the_self_log_not_stdout` captures the self-log line `print` emits.
+tracing-subscriber.workspace = true

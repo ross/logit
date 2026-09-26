@@ -203,48 +203,62 @@ impl EventProxy {
     /// Unwraps back to the owned `Event` and its routing mark.
     ///
     /// No clone in the ordinary case, because [`take_event`]'s [`AnyUserData::take`] leaves this
-    /// the only reference. It falls back to cloning if something else still holds one, and never
-    /// panics.
-    ///
-    /// The cached sub-proxies are emptied with `take` and removed from the registry first, before
-    /// `Rc::try_unwrap`: each holds an `Rc` to the event, and waiting for the GC would make nearly
-    /// every script pay the clone.
+    /// the only reference once [`Self::release_sub_proxies`] has run. It falls back to cloning if
+    /// something else still holds one; a debug build asserts instead, since no known path reaches
+    /// that arm (the sandbox has no `newproxy`, so no script code runs inside a sub-proxy's
+    /// creation to leave an orphan holding the event).
     pub fn into_inner(self, lua: &Lua) -> (Event, Option<u16>) {
-        if let Some(key) = self.attrs.into_inner() {
+        self.release_sub_proxies(lua);
+        let event = match Rc::try_unwrap(self.event) {
+            Ok(cell) => cell.into_inner(),
+            Err(rc) => {
+                debug_assert!(
+                    false,
+                    "a sub-proxy still held the event after teardown; the no-clone fast path was \
+                     defeated"
+                );
+                rc.borrow().clone()
+            }
+        };
+        (event, self.target.get())
+    }
+
+    /// Empties each cached sub-proxy's Lua box and removes it from the registry, dropping the `Rc`
+    /// it holds, so a stashed alias of one is destructed with its event.
+    ///
+    /// [`Self::into_inner`] runs this before `Rc::try_unwrap`: each cached sub-proxy holds an `Rc`
+    /// to the event, and waiting for the GC would make nearly every script pay the clone.
+    pub(crate) fn release_sub_proxies(&self, lua: &Lua) {
+        if let Some(key) = self.attrs.take() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<AttrsProxy>();
             }
             let _ = lua.remove_registry_value(key);
         }
-        if let Some(key) = self.log.into_inner() {
+        if let Some(key) = self.log.take() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<LogProxy>();
             }
             let _ = lua.remove_registry_value(key);
         }
-        if let Some(key) = self.metrics.into_inner() {
+        if let Some(key) = self.metrics.take() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<MetricsProxy>();
             }
             let _ = lua.remove_registry_value(key);
         }
-        if let Some(key) = self.span.into_inner() {
+        if let Some(key) = self.span.take() {
             if let Ok(ud) = lua.registry_value::<AnyUserData>(&key) {
                 let _ = ud.take::<SpanProxy>();
             }
             let _ = lua.remove_registry_value(key);
         }
-        let event = match Rc::try_unwrap(self.event) {
-            Ok(cell) => cell.into_inner(),
-            Err(rc) => rc.borrow().clone(),
-        };
-        (event, self.target.get())
     }
 
     /// The event's strong count, which `into_inner`'s `Rc::try_unwrap` needs to be 1; an
     /// uncollected `MetricProxy` must not raise it.
     #[cfg(test)]
-    fn strong_count(&self) -> usize {
+    pub(crate) fn strong_count(&self) -> usize {
         Rc::strong_count(&self.event)
     }
 }
@@ -1495,38 +1509,18 @@ pub(crate) fn clarify_destructed_handle_use(err: mlua::Error) -> mlua::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::{ProcessOutcome, ScriptWorker};
+    use crate::tests::{emitted, process_err, worker};
     use bytes::Bytes;
     use logit_core::{
         AttrMap, BodyFormat, DdSketch, ExpHistogram, Histogram, HyperLogLog, Samples, Severity,
         SpanExt, SpanKind, SpanStatus, Sum, Summary, Value,
     };
 
-    fn worker(source: &str) -> ScriptWorker {
-        ScriptWorker::new(source).expect("script should load")
-    }
-
-    fn emitted(outcome: ProcessOutcome) -> Event {
-        match outcome {
-            ProcessOutcome::Emit(e, _) => *e,
-            _ => panic!("expected Emit"),
-        }
-    }
-
-    /// As `lib.rs`'s own `process_err` helper -- `ProcessOutcome` isn't `Debug`, so
-    /// `Result::unwrap_err` doesn't work directly on `ScriptWorker::process`'s return value.
-    fn process_err(w: &ScriptWorker, event: Event) -> String {
-        match w.process(event) {
-            Err(err) => err.to_string(),
-            Ok(_) => panic!("expected process() to reject this script"),
-        }
-    }
-
     // -- fixtures -----------------------------------------------------------------------------
 
-    fn log_record_with_everything() -> LogRecord {
+    pub(crate) fn log_record_with_everything() -> LogRecord {
         LogRecord {
             message: Value::str("GET /widgets"),
             severity: Some(Severity::Warn),
@@ -1538,13 +1532,13 @@ mod tests {
         }
     }
 
-    fn log_event() -> Event {
+    pub(crate) fn log_event() -> Event {
         Event::log(1_700_000_000_000_000_000, AttrMap::new(), log_record_with_everything())
     }
 
     /// A metric record carrying non-default values on every kind-independent field (unit,
     /// description, start_timestamp, flags, one exemplar) -- callers fill in `kind`.
-    fn metric_record(kind: MetricKind) -> MetricRecord {
+    pub(crate) fn metric_record(kind: MetricKind) -> MetricRecord {
         let mut record = MetricRecord::new(intern("test.metric"), kind);
         record.unit = Some(intern("ms"));
         record.description = Some(intern("a test metric"));
@@ -1563,11 +1557,11 @@ mod tests {
         record
     }
 
-    fn metric_event(kind: MetricKind) -> Event {
+    pub(crate) fn metric_event(kind: MetricKind) -> Event {
         Event::metric(1_700_000_000_000_000_000, AttrMap::new(), metric_record(kind))
     }
 
-    fn sum_kind() -> MetricKind {
+    pub(crate) fn sum_kind() -> MetricKind {
         MetricKind::Sum(Sum { value: 12.5, temporality: Temporality::Cumulative, monotonic: false })
     }
 
@@ -1629,7 +1623,7 @@ mod tests {
         })
     }
 
-    fn span_record_with_everything() -> SpanRecord {
+    pub(crate) fn span_record_with_everything() -> SpanRecord {
         SpanRecord {
             trace_id: [1; 16],
             span_id: [2; 8],
@@ -1671,7 +1665,7 @@ mod tests {
         }
     }
 
-    fn span_event_full() -> Event {
+    pub(crate) fn span_event_full() -> Event {
         Event::span(1_700_000_000_000_000_000, AttrMap::new(), span_record_with_everything())
     }
 
