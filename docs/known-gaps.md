@@ -2062,6 +2062,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   To keep exemplars, route the records around `aggregate`. See
   [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s "Amendment: series
   identity, merge laws, and accounting as a stated contract (2026-09-26)".
+- **A `GaugeDelta` whose series holds another kind is forwarded unresolved, and can reach a
+  sink.** `aggregate` forwards any kind conflict untouched, counted
+  `logit.transform.metrics.passed_through{reason="kind_conflict"}`; for a `GaugeDelta` sharing a
+  name, unit, and attribute set with a counter series, that means a delta no sink can encode, and
+  every sink skips and counts it (the "Cross-protocol mappings" section's `GaugeDelta` rows). Give
+  the gauge its own name or tags upstream.
+- **A clamped sample rate held raw under `distributions: samples` is reported only if the series
+  falls back to a sketch.** `logit.transform.samples.weight_clamped` counts a record when its weight
+  is applied. A raw series that stays under `max_samples_per_series` with one rate is emitted as
+  `Samples`, and the encoder that later sketches it clamps the weight without a report.
+- **`DdSketch::merge` treats a sketch whose count and zero count are both 0 as empty, even when it
+  carries bins.** Only a decoded sketch can be in that state (`DdSketch::from_parts` with summary
+  stats claiming a zero count over non-empty bins), and merging it into a series drops those bins
+  without a counter.
 - **A cumulative series re-created after a cap eviction can report a `start_timestamp` earlier
   than the last point it emitted.** The new `first_seen` comes from the re-opening event's source
   timestamp, while the previous point carries the flush clock. The start time still changes, so a

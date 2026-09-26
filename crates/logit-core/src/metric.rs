@@ -202,7 +202,7 @@ impl Samples {
     }
 
     /// Whether [`Samples::weight`] clamps this record: `round(1 / sample_rate)` exceeds
-    /// [`Samples::MAX_WEIGHT`] and there is at least one value to under-weight. A rate of exactly
+    /// [`Samples::MAX_WEIGHT`] and there is at least one value to under-weight. A rate of
     /// `1 / MAX_WEIGHT` (`@0.001`) isn't clamped, and neither is a non-finite or non-positive rate,
     /// which `weight` degrades to `1` rather than clamps. Consumers that report a clamp decide it
     /// here, not by comparing `weight()` against `MAX_WEIGHT`.

@@ -351,9 +351,9 @@ impl Opener<'_> {
 }
 
 /// Per-`process`-call totals behind `logit.transform.metrics.absorbed` and
-/// `logit.transform.metrics.passed_through{reason}`: every record `process` receives lands in
-/// exactly one field. Reported once per non-zero field after the loop, because
-/// `Telemetry::count` locks and hashes on every call.
+/// `logit.transform.metrics.passed_through{reason}`: every record `process` receives lands in one
+/// field. Reported once per non-zero field after the loop, because `Telemetry::count` locks and
+/// hashes on every call.
 #[derive(Default)]
 struct Tally {
     absorbed: u32,
