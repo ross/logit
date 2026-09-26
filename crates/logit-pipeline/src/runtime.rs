@@ -1086,11 +1086,7 @@ async fn write_loop(
             Delivery::Delivered => {
                 store.commit();
                 telemetry.count("logit.component.batches.delivered", 1.0, &[]);
-                telemetry.count(
-                    "logit.component.events.delivered",
-                    batch.events.len() as f64,
-                    &[],
-                );
+                telemetry.count("logit.component.events.delivered", batch.events.len() as f64, &[]);
                 last_success = Some(tokio::time::Instant::now());
                 permanent_streak_since = None;
                 if degraded {
@@ -5497,6 +5493,9 @@ mod tests {
         DrainFirst,
         /// The sink fails forever; shutdown grace expires with the store full and a push parked.
         GraceExpiry,
+        /// The sink never completes a send; shutdown grace cuts the in-flight send off with the
+        /// store full and a push parked.
+        GraceCutsInFlightSend,
         /// The sink fails permanently for `PERMANENT_FAILURE_WINDOW`: `write_loop` returns `Err`
         /// with the store full and a push parked.
         PermanentError,
@@ -5504,6 +5503,9 @@ mod tests {
         ClosedAndEmpty,
     }
 
+    /// The sink's side of `docs/adr/shutdown-accounting-and-cancellation-safety.md`'s decision 1,
+    /// read from telemetry: `received == delivered + Σ dropped{reason} + spooled`, with the
+    /// `drain complete` total equal to `dropped{reason="shutdown"}`.
     #[tokio::test(start_paused = true)]
     async fn every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled()
     {
@@ -5511,105 +5513,156 @@ mod tests {
         for path in [
             ExitPath::DrainFirst,
             ExitPath::GraceExpiry,
+            ExitPath::GraceCutsInFlightSend,
             ExitPath::PermanentError,
             ExitPath::ClosedAndEmpty,
         ] {
-            for disk in [false, true] {
-                let at = format!("{path:?}, disk={disk}");
-                let dir = crate::disk_queue::test_support::scratch_dir("exit-path-reconcile");
-                // Two batches fill the store on the paths that leave some undelivered, so the
-                // rest wait in `drain_inbox`'s parked push and in the inbox.
-                let small = matches!(path, ExitPath::GraceExpiry | ExitPath::PermanentError);
-                let store_config = match (disk, small) {
-                    (true, true) => {
-                        SinkStoreConfig::Disk(disk_store_config(&dir, 2 * one_counter_record_len()))
-                    }
-                    (true, false) => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
-                    (false, true) => SinkStoreConfig::Memory(SinkQueueConfig {
-                        max_batches: 2,
-                        max_bytes: u64::MAX,
-                        overflow: OverflowPolicy::Block,
-                    }),
-                    (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                };
-                let delivered = Arc::new(AtomicU64::new(0));
-                let (delay, fail) = match path {
-                    ExitPath::DrainFirst => (Duration::from_millis(10), None),
-                    ExitPath::GraceExpiry => (Duration::from_millis(10), Some(Fault::Clean)),
-                    ExitPath::PermanentError => (Duration::from_secs(20), Some(Fault::Permanent)),
-                    ExitPath::ClosedAndEmpty => (Duration::ZERO, None),
-                };
-                let output = PacedOutput { delay, fail, delivered: Arc::clone(&delivered) };
-                let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let registry = Registry::new();
-                let run = tokio::spawn(run_output(
-                    "out".to_string(),
-                    Box::new(output),
-                    inbox_rx,
-                    registry.telemetry_for("out", "influxdb_out", "sink"),
-                    store_config,
-                    slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
-                    shutdown_rx,
-                    Arc::new(AtomicU64::new(0)),
-                ));
+            for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
+                for disk in [false, true] {
+                    let at = format!("{path:?}, {posture:?}, disk={disk}");
+                    let dir = crate::disk_queue::test_support::scratch_dir("exit-path-reconcile");
+                    // Two batches fill the store on the paths that leave some undelivered, so
+                    // the rest wait in `drain_inbox`'s parked push and in the inbox.
+                    let small = matches!(
+                        path,
+                        ExitPath::GraceExpiry
+                            | ExitPath::GraceCutsInFlightSend
+                            | ExitPath::PermanentError
+                    );
+                    let store_config = match (disk, small) {
+                        (true, true) => SinkStoreConfig::Disk(disk_store_config(
+                            &dir,
+                            2 * one_counter_record_len(),
+                        )),
+                        (true, false) => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+                        (false, true) => SinkStoreConfig::Memory(SinkQueueConfig {
+                            max_batches: 2,
+                            max_bytes: u64::MAX,
+                            overflow: OverflowPolicy::Block,
+                        }),
+                        (false, false) => SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                    };
+                    let double_delivered = Arc::new(AtomicU64::new(0));
+                    let paced = |delay, fail| {
+                        Box::new(PacedOutput {
+                            delay,
+                            fail,
+                            delivered: Arc::clone(&double_delivered),
+                        }) as Box<dyn Output + Send>
+                    };
+                    let output = match path {
+                        ExitPath::DrainFirst => paced(Duration::from_millis(10), None),
+                        ExitPath::GraceExpiry => {
+                            paced(Duration::from_millis(10), Some(Fault::Clean))
+                        }
+                        ExitPath::GraceCutsInFlightSend => Box::new(NeverOutput),
+                        ExitPath::PermanentError => {
+                            paced(Duration::from_secs(20), Some(Fault::Permanent))
+                        }
+                        ExitPath::ClosedAndEmpty => paced(Duration::ZERO, None),
+                    };
+                    let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    let registry = Registry::new();
+                    let drain_total = Arc::new(AtomicU64::new(0));
+                    let run = tokio::spawn(run_output(
+                        "out".to_string(),
+                        output,
+                        inbox_rx,
+                        registry.telemetry_for("out", "influxdb_out", "sink"),
+                        store_config,
+                        WriteLoopConfig {
+                            delivery_override: Some(posture),
+                            ..slow_retry_write_config(
+                                Duration::from_secs(3600),
+                                Duration::from_millis(100),
+                            )
+                        },
+                        shutdown_rx,
+                        Arc::clone(&drain_total),
+                    ));
 
-                for value in 1..=SENT {
-                    inbox_tx.send(counter_batch(value as f64)).await.unwrap();
-                }
-                // Lets `drain_inbox` fill the store and park on its next push.
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                // `PermanentError` keeps the inbox open, as a live listener would: only the
-                // permanent streak ends it.
-                let held_open = match path {
-                    ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
-                        drop(inbox_tx);
-                        None
+                    for value in 1..=SENT {
+                        inbox_tx.send(counter_batch(value as f64)).await.unwrap();
                     }
-                    ExitPath::GraceExpiry => {
-                        shutdown_tx.send(true).unwrap();
-                        drop(inbox_tx);
-                        None
-                    }
-                    ExitPath::PermanentError => Some(inbox_tx),
-                };
+                    // Lets `drain_inbox` fill the store and park on its next push.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    // `PermanentError` keeps the inbox open, as a live listener would: only the
+                    // permanent streak ends it.
+                    let held_open = match path {
+                        ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
+                            drop(inbox_tx);
+                            None
+                        }
+                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                            shutdown_tx.send(true).unwrap();
+                            drop(inbox_tx);
+                            None
+                        }
+                        ExitPath::PermanentError => Some(inbox_tx),
+                    };
 
-                let result = tokio::time::timeout(Duration::from_secs(600), run)
-                    .await
-                    .unwrap_or_else(|_| panic!("{at}: run_output stopped responding"))
-                    .expect("the task must not panic");
-                assert_eq!(
-                    result.is_err(),
-                    matches!(path, ExitPath::PermanentError),
-                    "{at}: exit result {result:?}"
-                );
-                drop(held_open);
-                drop(shutdown_tx);
+                    let result = tokio::time::timeout(Duration::from_secs(600), run)
+                        .await
+                        .unwrap_or_else(|_| panic!("{at}: run_output stopped responding"))
+                        .expect("the task must not panic");
+                    assert_eq!(
+                        result.is_err(),
+                        matches!(path, ExitPath::PermanentError),
+                        "{at}: exit result {result:?}"
+                    );
+                    drop(held_open);
+                    drop(shutdown_tx);
 
-                let events = registry.drain(0);
-                let delivered = delivered.load(std::sync::atomic::Ordering::SeqCst) as f64;
-                let send_failed = batches_dropped(&events, "send_failed");
-                let shutdown = batches_dropped(&events, "shutdown");
-                let spooled = if disk { reopen_and_drain(&dir).await.len() as f64 } else { 0.0 };
-                assert_eq!(
-                    SENT as f64,
-                    delivered + send_failed + shutdown + spooled,
-                    "{at}: received == delivered ({delivered}) + send_failed ({send_failed}) + \
-                     shutdown ({shutdown}) + spooled ({spooled})"
-                );
-                if disk {
-                    assert_eq!(shutdown, 0.0, "{at}: a disk-backed sink drops nothing at shutdown");
-                }
-                match path {
-                    ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
-                        assert_eq!(delivered, SENT as f64, "{at}")
+                    let events = registry.drain(0);
+                    let count = |name: &str| counter_sum(&events, "out", name, None);
+                    let received = count("logit.component.batches.received");
+                    let delivered = count("logit.component.batches.delivered");
+                    let send_failed = batches_dropped(&events, "send_failed");
+                    let shutdown = batches_dropped(&events, "shutdown");
+                    let spooled =
+                        if disk { reopen_and_drain(&dir).await.len() as f64 } else { 0.0 };
+                    assert_eq!(received, SENT as f64, "{at}: every batch sent is received");
+                    assert_eq!(
+                        received,
+                        delivered + send_failed + shutdown + spooled,
+                        "{at}: received == delivered ({delivered}) + send_failed ({send_failed}) \
+                         + shutdown ({shutdown}) + spooled ({spooled})"
+                    );
+                    assert_eq!(
+                        drain_total.load(std::sync::atomic::Ordering::Relaxed) as f64,
+                        shutdown,
+                        "{at}: drain complete's total is the shutdown drop count"
+                    );
+                    assert_eq!(
+                        delivered,
+                        double_delivered.load(std::sync::atomic::Ordering::SeqCst) as f64,
+                        "{at}: batches.delivered agrees with the sink's own count"
+                    );
+                    // A disk sink drops for shutdown only a send the grace cut off, and only
+                    // under at-most-once.
+                    if disk {
+                        match (path, posture) {
+                            (ExitPath::GraceCutsInFlightSend, DeliveryPosture::AtMostOnce) => {
+                                assert_eq!(shutdown, 1.0, "{at}")
+                            }
+                            (_, DeliveryPosture::AtMostOnce) => assert!(shutdown <= 1.0, "{at}"),
+                            (_, DeliveryPosture::AtLeastOnce) => assert_eq!(shutdown, 0.0, "{at}"),
+                        }
                     }
-                    ExitPath::GraceExpiry => assert_eq!(delivered, 0.0, "{at}"),
-                    ExitPath::PermanentError => {
-                        assert!(send_failed >= 4.0 && send_failed < SENT as f64, "{at}")
+                    match path {
+                        ExitPath::DrainFirst | ExitPath::ClosedAndEmpty => {
+                            assert_eq!(delivered, SENT as f64, "{at}")
+                        }
+                        ExitPath::GraceExpiry | ExitPath::GraceCutsInFlightSend => {
+                            assert_eq!(delivered, 0.0, "{at}")
+                        }
+                        ExitPath::PermanentError => {
+                            assert!(send_failed >= 4.0 && send_failed < SENT as f64, "{at}")
+                        }
                     }
+                    std::fs::remove_dir_all(&dir).ok();
                 }
-                std::fs::remove_dir_all(&dir).ok();
             }
         }
     }
@@ -5703,6 +5756,583 @@ mod tests {
     // `run_with_telemetry`'s join loop: drain every task on the first error instead of aborting
     // (`docs/adr/buffered-sink-delivery.md`)
     // -----------------------------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------------------------
+    // Shutdown accounting (`docs/adr/shutdown-accounting-and-cancellation-safety.md`)
+    // -----------------------------------------------------------------------------------------
+
+    /// The `fault` tags on every `deliver` span in `events` that carries one.
+    fn deliver_fault_tags(events: &[Event]) -> Vec<(SpanStatus, String)> {
+        span_events(events)
+            .filter(|e| span_op(e) == Some("deliver"))
+            .filter_map(|e| {
+                let fault = e.attributes.get("fault").and_then(|v| v.as_str())?;
+                Some((e.span.as_ref().expect("a span event").status, fault.to_string()))
+            })
+            .collect()
+    }
+
+    /// Runs `run_output` over a `NeverOutput` under `posture`, sends `batches` batches, lets the
+    /// first one's send go in flight, then signals shutdown. Returns the registry's telemetry and
+    /// the `drain complete` total.
+    async fn run_never_delivering_sink(
+        store_config: SinkStoreConfig,
+        posture: DeliveryPosture,
+        batches: u64,
+    ) -> (Vec<Event>, u64) {
+        let registry = Registry::with_span_sampling(1.0);
+        let drain_total = Arc::new(AtomicU64::new(0));
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(NeverOutput),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            store_config,
+            WriteLoopConfig {
+                delivery_override: Some(posture),
+                ..slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100))
+            },
+            shutdown_rx,
+            Arc::clone(&drain_total),
+        ));
+        for value in 1..=batches {
+            inbox_tx.send(counter_batch(value as f64)).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await; // the first send is in flight
+        shutdown_tx.send(true).unwrap();
+        drop(inbox_tx);
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output ends within its grace")
+            .expect("the task must not panic")
+            .expect("grace expiry is not a failure");
+        (registry.drain(0), drain_total.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_cut_off_by_shutdown_grace_is_committed_and_counted_under_at_most_once() {
+        for disk in [false, true] {
+            let dir = crate::disk_queue::test_support::scratch_dir("grace-cut-at-most-once");
+            let store_config = match disk {
+                true => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+                false => SinkStoreConfig::Memory(SinkQueueConfig::default()),
+            };
+            let (events, drain_total) =
+                run_never_delivering_sink(store_config, DeliveryPosture::AtMostOnce, 1).await;
+
+            assert_eq!(batches_dropped(&events, "shutdown"), 1.0, "disk={disk}");
+            assert_eq!(drain_total, 1, "disk={disk}");
+            assert_eq!(
+                deliver_fault_tags(&events),
+                vec![(SpanStatus::Error, "ambiguous".to_string())],
+                "disk={disk}: the cut-off send's span is an ambiguous error"
+            );
+            if disk {
+                assert!(
+                    reopen_and_drain(&dir).await.is_empty(),
+                    "a batch committed at the grace cut never replays"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_cut_off_by_shutdown_grace_stays_queued_for_replay_under_at_least_once() {
+        for disk in [false, true] {
+            let dir = crate::disk_queue::test_support::scratch_dir("grace-cut-at-least-once");
+            let store_config = match disk {
+                true => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
+                false => SinkStoreConfig::Memory(SinkQueueConfig::default()),
+            };
+            let (events, drain_total) =
+                run_never_delivering_sink(store_config, DeliveryPosture::AtLeastOnce, 1).await;
+
+            assert_eq!(
+                deliver_fault_tags(&events),
+                vec![(SpanStatus::Error, "ambiguous".to_string())],
+                "disk={disk}"
+            );
+            if disk {
+                assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
+                assert_eq!(drain_total, 0);
+                assert_eq!(reopen_and_drain(&dir).await, vec![1.0], "the batch replays");
+            } else {
+                // Left uncommitted, so `SinkStore::finish` counts it: once, not twice.
+                assert_eq!(batches_dropped(&events, "shutdown"), 1.0);
+                assert_eq!(drain_total, 1);
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The head a grace-cut delivery leaves reserved, and the batch behind it, are each counted
+    /// once by `finish_and_flush`.
+    #[tokio::test(start_paused = true)]
+    async fn a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish() {
+        let (events, drain_total) = run_never_delivering_sink(
+            SinkStoreConfig::Memory(SinkQueueConfig::default()),
+            DeliveryPosture::AtLeastOnce,
+            2,
+        )
+        .await;
+        assert_eq!(counter_sum(&events, "out", "logit.component.batches.received", None), 2.0);
+        assert_eq!(batches_dropped(&events, "shutdown"), 2.0);
+        assert_eq!(
+            counter_sum(
+                &events,
+                "out",
+                "logit.component.events.dropped",
+                Some(("reason", "shutdown"))
+            ),
+            2.0
+        );
+        assert_eq!(drain_total, 2);
+    }
+
+    /// A grace that lands in the backoff sleep after a clean failure cuts off no send, so even
+    /// under at-most-once the batch stays queued for `finish_and_flush` and carries no
+    /// ambiguous fault.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once(
+    ) {
+        let (mut output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig::default(),
+            telemetry.clone(),
+        )));
+        store.push((one_event_batch(1.0), TraceContext::new_root().into())).await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let write_config = WriteLoopConfig {
+            retry: RetryConfig {
+                total_budget: Duration::from_secs(3600),
+                base_delay: Duration::from_secs(10),
+                max_delay: Duration::from_secs(10),
+            },
+            shutdown_grace: Duration::from_millis(100),
+            delivery_override: Some(DeliveryPosture::AtMostOnce),
+        };
+        let drain_total = Arc::new(AtomicU64::new(0));
+        let store_for_task = Arc::clone(&store);
+        let total_for_task = Arc::clone(&drain_total);
+        let handle = tokio::spawn(async move {
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                store_for_task,
+                telemetry,
+                write_config,
+                shutdown_rx,
+                &total_for_task,
+            )
+            .await
+        });
+        handles.attempted.recv().await.expect("the first attempt happened");
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("write_loop ends within its grace")
+            .unwrap()
+            .expect("grace expiry is Ok");
+
+        assert_eq!(handles.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(store.commit().is_some(), "the batch is still queued for finish_and_flush");
+        let events = registry.drain(0);
+        assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
+        assert_eq!(drain_total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(deliver_fault_tags(&events).is_empty(), "no send was cut off: no fault tag");
+    }
+
+    /// Completes its send at `at`, and counts it.
+    struct DeadlineOutput {
+        at: tokio::time::Instant,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for DeadlineOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            tokio::time::sleep_until(self.at).await;
+            Ok(())
+        }
+    }
+
+    /// A send resolving at the grace deadline wakes in the same timer turn as the grace arm.
+    /// Deterministic only because `write_loop`'s deliver `select!` is biased toward the send;
+    /// unbiased, about half of these iterations would read it as cut off.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_completes_in_the_same_wake_as_the_grace_deadline_is_counted_delivered() {
+        let grace = Duration::from_millis(100);
+        for iteration in 0..16 {
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+            let store = Arc::new(SinkStore::Memory(SinkQueue::new(
+                SinkQueueConfig::default(),
+                telemetry.clone(),
+            )));
+            store.push((one_event_batch(1.0), TraceContext::new_root().into())).await;
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            shutdown_tx.send(true).unwrap();
+            let signalled = tokio::time::Instant::now();
+            let mut output = DeadlineOutput { at: signalled + grace };
+            let write_config = WriteLoopConfig {
+                shutdown_grace: grace,
+                delivery_override: Some(DeliveryPosture::AtMostOnce),
+                ..WriteLoopConfig::default()
+            };
+            let drain_total = AtomicU64::new(0);
+            write_loop(
+                "out".to_string(),
+                &mut output,
+                Arc::clone(&store),
+                telemetry,
+                write_config,
+                shutdown_rx,
+                &drain_total,
+            )
+            .await
+            .expect("grace expiry is Ok");
+
+            assert_eq!(tokio::time::Instant::now(), signalled + grace, "iteration {iteration}");
+            let events = registry.drain(0);
+            assert_eq!(
+                counter_sum(&events, "out", "logit.component.batches.delivered", None),
+                1.0,
+                "iteration {iteration}"
+            );
+            assert_eq!(batches_dropped(&events, "shutdown"), 0.0, "iteration {iteration}");
+            assert_eq!(drain_total.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(store.commit().is_none(), "iteration {iteration}: delivered and committed");
+        }
+    }
+
+    /// The `batches_dropped` field of the last `drain complete` line in the global capture.
+    fn logged_drain_complete_batches_dropped() -> Option<u64> {
+        let text = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
+        let line = text.lines().rev().find(|l| l.contains("drain complete"))?;
+        let value = line.split("batches_dropped=").nth(1)?;
+        value.split_whitespace().next()?.parse().ok()
+    }
+
+    /// Sums `logit.component.batches.dropped{reason="shutdown"}` across every component.
+    fn shutdown_batches_dropped_everywhere(events: &[Event]) -> f64 {
+        events
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
+            .filter_map(|m| match &m.kind {
+                MetricKind::Sum(s) => Some(s.value),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Six batches into a two-batch store whose sink never delivers, under at-most-once: the
+    /// grace-cut send (1), `finish` (1), and the sweep (the parked push and the three in the inbox)
+    /// all reach `drain complete`.
+    #[tokio::test(start_paused = true)]
+    async fn drain_complete_reports_every_batch_dropped_for_shutdown_including_those_finish_drops()
+    {
+        global_logs();
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components
+            .insert("out".to_string(), plain_component(vec!["in".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(BurstInput { batches: (0..6).map(|_| counter_batch_of(1)).collect() }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(NeverOutput),
+                SinkStoreConfig::Memory(SinkQueueConfig {
+                    max_batches: 2,
+                    max_bytes: u64::MAX,
+                    overflow: OverflowPolicy::Block,
+                }),
+                WriteLoopConfig {
+                    shutdown_grace: Duration::from_millis(100),
+                    delivery_override: Some(DeliveryPosture::AtMostOnce),
+                    ..WriteLoopConfig::default()
+                },
+            ),
+        );
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+        let (readiness, _rx) = Readiness::channel();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_with_telemetry(
+                g,
+                specs,
+                telemetry,
+                readiness,
+                tokio::time::sleep(Duration::from_secs(1)),
+            ),
+        )
+        .await
+        .expect("the run ends within the sink's grace")
+        .expect("a grace-cut drain is not a failure");
+
+        let events = registry.drain(0);
+        let dropped = shutdown_batches_dropped_everywhere(&events);
+        assert_eq!(dropped, 6.0, "every batch is dropped for shutdown");
+        assert_eq!(logged_drain_complete_batches_dropped(), Some(6));
+        let text = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
+        for site in ["cut off mid-send", "still queued when this sink", "never handed to"] {
+            assert!(
+                text.lines().any(|l| l.contains("component=out") && l.contains(site)),
+                "the {site:?} site dropped something"
+            );
+        }
+    }
+
+    /// A sink whose `send` never completes and whose `flush` reports it started, then waits for
+    /// the test to release it.
+    struct GatedFlushOutput {
+        flushing: mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Output for GatedFlushOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn flush(&mut self) -> anyhow::Result<()> {
+            let _ = self.flushing.send(());
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    /// Batch 1 is in flight, batch 2 parked in `drain_inbox`'s push, batch 3 fills the
+    /// one-slot inbox, and the producer is parked sending batch 4 when the grace expires. Were
+    /// the inbox left open, the sweep taking batch 3 would let batch 4 land while `flush` is
+    /// pending, and it would die with the `Receiver`, received by no one and dropped by no one.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_sent_into_the_inbox_after_the_sweep_began_is_counted_not_silently_lost() {
+        const SENT: usize = 5;
+        let registry = Registry::new();
+        let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(1);
+        let producer = Fanout::new(vec![inbox_tx])
+            .with_component("up")
+            .with_telemetry(registry.telemetry_for("up", "x", "x"));
+        let (flushing_tx, mut flushing_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let run = tokio::spawn(run_output(
+            "out".to_string(),
+            Box::new(GatedFlushOutput { flushing: flushing_tx, release: Arc::clone(&release) }),
+            inbox_rx,
+            registry.telemetry_for("out", "influxdb_out", "sink"),
+            SinkStoreConfig::Memory(SinkQueueConfig {
+                max_batches: 1,
+                max_bytes: u64::MAX,
+                overflow: OverflowPolicy::Block,
+            }),
+            slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
+            shutdown_rx,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let produce = tokio::spawn(async move {
+            for _ in 0..SENT {
+                producer.send(counter_batch_of(1)).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await; // the producer parks on batch 4
+        assert!(!produce.is_finished(), "the producer is parked on the full inbox");
+        shutdown_tx.send(true).unwrap();
+        flushing_rx.recv().await.expect("run_output reaches flush");
+        // The producer gets every chance to land a send while `flush` is pending.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run_output ends")
+            .unwrap()
+            .expect("grace expiry is Ok");
+        produce.await.unwrap();
+
+        let events = registry.drain(0);
+        let sent = counter_sum(&events, "up", "logit.component.batches.sent", None);
+        let refused = counter_sum(
+            &events,
+            "up",
+            "logit.component.events.dropped",
+            Some(("reason", "closed_consumer")),
+        );
+        let received = counter_sum(&events, "out", "logit.component.batches.received", None);
+        let delivered = counter_sum(&events, "out", "logit.component.batches.delivered", None);
+        let dropped = counter_sum(&events, "out", "logit.component.batches.dropped", None);
+        assert_eq!(sent, SENT as f64);
+        assert!(refused > 0.0, "the parked send fails upstream once the inbox closes");
+        assert_eq!(sent, received + refused, "every batch sent is received or refused upstream");
+        assert_eq!(received, delivered + dropped, "every batch received is accounted for");
+    }
+
+    /// Waits for shutdown, then sends into its sink forever, never returning.
+    struct BusyAfterShutdownInput;
+
+    #[async_trait::async_trait]
+    impl Input for BusyAfterShutdownInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            loop {
+                sink.send(counter_batch_of(1)).await;
+            }
+        }
+    }
+
+    /// Each send spends coop budget, so every poll of the input exhausts it and returns
+    /// `Pending`. The grace arm polled after it must still fire. Paused, with the clock advanced
+    /// by hand: a runtime that never idles never auto-advances.
+    #[tokio::test(start_paused = true)]
+    async fn an_input_that_burns_its_coop_budget_after_the_signal_is_still_cancelled_at_the_grace_deadline(
+    ) {
+        // Deep enough that the input never parks on capacity: it runs out of budget first.
+        let (tx, mut rx) = mpsc::channel::<Delivered>(4096);
+        let consumer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let grace = Duration::from_millis(100);
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            Box::new(BusyAfterShutdownInput),
+            Fanout::new(vec![tx]),
+            shutdown_rx,
+            grace,
+        ));
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).unwrap();
+        let signalled = tokio::time::Instant::now();
+        for _ in 0..100 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        assert!(handle.is_finished(), "the backstop never fired against a busy input");
+        handle.await.unwrap().expect("grace expiry is Ok");
+        assert!(tokio::time::Instant::now().duration_since(signalled) >= grace);
+        consumer.await.unwrap();
+    }
+
+    /// Waits for shutdown, sleeps `grace`, then fails: ready in the same wake as the backstop.
+    struct ErrAtGraceInput {
+        grace: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for ErrAtGraceInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            _sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            tokio::time::sleep(self.grace).await;
+            anyhow::bail!("failed while draining")
+        }
+    }
+
+    /// Unbiased, about half of these iterations would discard the error.
+    #[tokio::test(start_paused = true)]
+    async fn an_input_error_at_the_grace_deadline_is_never_swallowed_by_the_backstop() {
+        let grace = Duration::from_millis(100);
+        for iteration in 0..32 {
+            let (tx, _rx) = mpsc::channel(1);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let handle = tokio::spawn(run_input(
+                "in".to_string(),
+                Box::new(ErrAtGraceInput { grace }),
+                Fanout::new(vec![tx]),
+                shutdown_rx,
+                grace,
+            ));
+            tokio::task::yield_now().await;
+            shutdown_tx.send(true).unwrap();
+            let err = handle
+                .await
+                .unwrap()
+                .expect_err(&format!("iteration {iteration}: the input's error is returned"));
+            assert!(format!("{err:#}").contains("failed while draining"), "{err:#}");
+        }
+    }
+
+    /// Polls `future` once with a no-op waker.
+    fn poll_once<F: Future>(future: F) -> std::task::Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_grace_expired_call_polled_after_the_signal_then_dropped_keeps_its_anchor() {
+        let grace = Duration::from_secs(1);
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        let mut deadline = None;
+        shutdown_tx.send(true).unwrap();
+        let first_poll = tokio::time::Instant::now();
+        assert!(poll_once(shutdown_grace_expired(&mut shutdown, &mut deadline, grace)).is_pending());
+        assert_eq!(deadline, Some(first_poll + grace));
+
+        tokio::time::advance(Duration::from_millis(400)).await;
+        shutdown_grace_expired(&mut shutdown, &mut deadline, grace).await;
+        assert_eq!(tokio::time::Instant::now(), first_poll + grace);
+    }
+
+    /// The anchor is the first poll that sees the signal, not the signal: a call last polled
+    /// before it, and dropped unpolled after it, leaves no deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_grace_expired_call_never_polled_after_the_signal_anchors_nothing() {
+        let grace = Duration::from_secs(1);
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        let mut deadline = None;
+        {
+            let mut call =
+                std::pin::pin!(shutdown_grace_expired(&mut shutdown, &mut deadline, grace));
+            let waker = std::task::Waker::noop();
+            assert!(call.as_mut().poll(&mut std::task::Context::from_waker(waker)).is_pending());
+            shutdown_tx.send(true).unwrap();
+            tokio::time::advance(Duration::from_millis(400)).await;
+        }
+        assert_eq!(deadline, None, "no poll saw the signal");
+
+        let polled = tokio::time::Instant::now();
+        shutdown_grace_expired(&mut shutdown, &mut deadline, grace).await;
+        assert_eq!(tokio::time::Instant::now(), polled + grace);
+    }
 
     /// Forwards each batch the test sends on `rx`; returns once the test drops the sender.
     struct ChannelInput {
@@ -7540,6 +8170,11 @@ mod tests {
             received + swept + refused,
             (BATCHES * PER_BATCH) as f64,
             "every event is delivered or counted"
+        );
+        // The `max_memory` failure's inbox sweep reaches `drain complete` like any shutdown drop.
+        assert_eq!(
+            logged_drain_complete_batches_dropped().map(|n| n as f64),
+            Some(shutdown_batches_dropped_everywhere(&run.telemetry)),
         );
     }
 
