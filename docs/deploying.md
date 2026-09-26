@@ -170,8 +170,8 @@ configured).
   means a script made no progress for 2 s after the signal (or after its last progress, whichever
   is later); a script already `stalled` when the signal arrives has been quiet longer than that,
   and is let go at once. `logit` closes that component's channels, so everything downstream of it
-  still drains and flushes normally and anything sent to it afterwards is counted as dropped, then
-  exits without it. 2 s is shorter than a sink's 5 s `buffer.shutdown_grace`, so a window flushed
+  still drains and flushes normally; what was waiting for it, and anything sent to it afterwards,
+  is counted as dropped. It then exits without it. 2 s is shorter than a sink's 5 s `buffer.shutdown_grace`, so a window flushed
   downstream of the script still reaches its sink.
 - **`/readyz` never returning `200` within the orchestrator's startup timeout** means a listener,
   or a listening sink like `prometheus_out`, can't bind, or a Lua script fails to load. Check the

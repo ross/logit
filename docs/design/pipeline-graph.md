@@ -443,7 +443,7 @@ on one thread, because `PipelineConfig.transforms` guaranteed the stages were ad
 a Lua component's sources and consumers can be any components. The thread's exit (a normal return
 once its inbox closes, or a panic caught at the top of the thread) is reported over a oneshot that
 a small `JoinSet` task awaits for the node (`runtime.rs`'s `watch_lua_thread`), so readiness, the
-failure-triggered drain, and the exit code treat a Lua node exactly like any task.
+failure-triggered drain, and the exit code treat a Lua node as they treat any task.
 
 That watcher task also bounds a script that never returns
 ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)):
@@ -463,9 +463,10 @@ That watcher task also bounds a script that never returns
   is measured from its last change alone; with the defaults (10 s to stall, 2 s of grace) that
   means the next tick after the signal. The grace is shorter than a sink's 5 s
   `buffer.shutdown_grace`, so a downstream window flushed after the revocation still reaches its
-  sink. The watcher takes the `LuaIo` out of the mutex and drops it, then returns `Err` naming the
-  node. Dropping it closes every downstream inbox, so those nodes drain on their own graces and
-  flush their own windows as on any shutdown, and every upstream send fails as `closed_consumer`.
+  sink. The watcher takes the `LuaIo` out of the mutex, counts the batches still in its inbox as
+  dropped with reason `shutdown`, drops it, and returns `Err` naming the node. Dropping it closes
+  every downstream inbox, so those nodes drain on their own graces and flush their own windows as
+  on any shutdown, and every upstream send fails as `closed_consumer`.
   Nothing is aborted: the join loop's first-error path marks the node `Failed` and the run exits
   `2`. The thread itself is left running until `main` exits; if its call ever returns, it finds
   `None` and stops. A node that isn't busy is never blamed, whatever its downstream is doing.

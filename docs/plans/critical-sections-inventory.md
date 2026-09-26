@@ -3377,7 +3377,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     case where `span.events` is never called.
 - **Observed concerns (unverified):**
   - ~~**A Lua thread can block the drain on `blocking_send`.** If a downstream inbox is full and shutdown fires,
-    the Lua thread parks in `blocking_send` until the downstream actually closes its receiver. That does happen
+    the Lua thread parks in `blocking_send` until the downstream closes its receiver. That does happen
     (`run_output` drops `inbox` when it returns), so it unblocks — but the ordering is implicit and unargued in
     the code, and `run_with_telemetry`'s join loop waits on `watch_lua_thread` for it. Medium confidence this is
     fine; low confidence it is *guaranteed* for every downstream node kind.~~ **Verified (luab/w3):** a parked
@@ -3405,6 +3405,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `docs/adr/lua-event-constructor.md`, `docs/design/lua-api.md`. **Added in `luab/w3`:**
   `an_infinite_loop_script_is_reported_stalled_and_degrades_readyz`,
   `shutdown_with_a_wedged_script_revokes_its_io_and_returns_runtime_naming_it`,
+  `batches_queued_in_a_revoked_inbox_are_counted_not_silently_lost`,
   `a_progressing_flush_emitting_many_events_is_never_stalled`,
   `a_loop_that_keeps_constructing_events_is_progress_not_a_stall`,
   `a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok`,
@@ -3417,7 +3418,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Suggested verification approach:** targeted review of the thread-lifecycle state machine (every exit path
   × every oneshot); a shutdown-under-load test with a Lua node feeding a wedged sink; confirm the runtime cannot
   be dropped while a Lua thread is inside `block_on`.
-- **Verdict (luab/w3, #386): findings, fixed.** A script that never returns hung the drain forever: the thread
+- **Verified 2026-09-26 (#386), findings fixed:** A script that never returns hung the drain forever: the thread
   never read its closed inbox, so the watcher never resolved and `run` never returned. Checked by review of
   every exit path and by the tests above, each seen failing against a stub of the part it pins. The thread now
   shares a `logit_script::Heartbeat` and its channels (`LuaIo`, behind a mutex it holds only while idle) with
@@ -3426,7 +3427,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   exit `2` naming the node ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). A
   revoked thread outlives the run; it takes the `io` lock before any `block_on`, finds `None`, and returns, so
   it never enters a dropped runtime. The thread's stack is 8 MiB, since pure-Lua recursion through C frames
-  aborted the 2 MiB default.
+  aborted the 2 MiB default. Batches still queued in a revoked inbox are counted
+  `dropped{reason="shutdown"}` before the inbox is dropped, so the upstream's `sent` reconciles
+  (`batches_queued_in_a_revoked_inbox_are_counted_not_silently_lost`).
 - **Priority:** **P0** — a thread that never reports, or a `block_on` against a dead runtime, hangs or crashes the
   process; the whole bridge is hand-built.
 
@@ -5822,7 +5825,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Invariants to verify:**
   - **The sandbox is actually closed.** `loadfile`/`dofile` were reachable despite `StdLib::TABLE|STRING|MATH` (reproduced in review; recorded in `remove_unsandboxed_base_globals`'s doc comment). Re-audit the full `_G` of a constructed worker for anything else that reaches the host: `os`, `io`, `debug`, `require`, `package`, `collectgarbage`, `newproxy`, `rawset`/`rawget` on protected tables, and LuaJIT's `ffi`/`jit`/`bit` in particular. Confirm `ffi` is genuinely absent, not merely not-requested.
   - **There is no instruction-count or memory limit.** Nothing here sets an `mlua` hook, a debug hook, or `Lua::set_memory_limit`. A script with `while true do end` hangs its worker thread forever; a script that accumulates a table across `flush()` calls grows the VM without bound (`ScriptWorker::used_memory` is *observation*, not a limit, and nothing appears to read it). Verify whether the per-`lua`-node dedicated OS thread ([`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)) bounds the blast radius to that node, and whether shutdown can still proceed.
-    **Addendum (luab/w3, #386), time half:** it bounded the blast radius to the node's thread, but shutdown could not proceed past it (RT-11's verdict). There is still no instruction hook, by the ADR's decision; `ScriptWorker::with_heartbeat` now ticks a `Heartbeat` once per `Event.new` and once per returned-table element, the runtime marks each call busy, and a busy heartbeat that stops moving is a stall, then a wedge after shutdown. Checked by the RT-11 tests, including a 100 000-event `flush()` under a 200 ms `stall_after` that is never reported stalled. The memory half is `luab/w4`'s `max_memory`.
+    **Verified 2026-09-26 (#386), time half:** it bounded the blast radius to the node's thread, but shutdown could not proceed past it (RT-11's verdict). There is still no instruction hook, by the ADR's decision; `ScriptWorker::with_heartbeat` now ticks a `Heartbeat` once per `Event.new` and once per returned-table element, the runtime marks each call busy, and a busy heartbeat that stops moving is a stall, then a wedge after shutdown. Checked by the RT-11 tests, including a 100 000-event `flush()` under a 200 ms `stall_after` that is never reported stalled. The memory half is `luab/w4`'s `max_memory`.
   - A panic inside a Rust callback cannot unwind through the Lua C frames (mlua catches these, but confirm for the `.expect()`s in `LogProxy::with_log`/`SpanProxy::with_span`).
   - `PhantomData<*const ()>` is present and nothing `unsafe impl Send`s around it.
   - `events_from_table` rejects a non-sequence table (the `{[2] = event}` silently-empty bug recorded in its doc comment) and an empty table means zero events.

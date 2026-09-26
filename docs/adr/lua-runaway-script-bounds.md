@@ -190,6 +190,7 @@ Filled in as each workstream lands.
   watcher's revocable `LuaIo`, pinned in `crates/logit-pipeline/src/runtime.rs` by
   `an_infinite_loop_script_is_reported_stalled_and_degrades_readyz`,
   `shutdown_with_a_wedged_script_revokes_its_io_and_returns_runtime_naming_it`,
+  `batches_queued_in_a_revoked_inbox_are_counted_not_silently_lost`,
   `a_progressing_flush_emitting_many_events_is_never_stalled`,
   `a_loop_that_keeps_constructing_events_is_progress_not_a_stall`,
   `a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok`,

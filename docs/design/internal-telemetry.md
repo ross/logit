@@ -440,7 +440,9 @@ alert. A node wedged at shutdown fails the run with an error naming it, not a di
 A script looping over `Event.new` forever advances the heartbeat and is never stalled or
 wedged: telling it from a large `flush()` would take a time limit, which the ADR declines.
 Events it produced after its channels were revoked count as
-`events.dropped{reason="closed_consumer"}` under its own id.
+`events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
+inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under
+its own id, as a sink's abandoned inbox does.
 
 **`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
 `Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
