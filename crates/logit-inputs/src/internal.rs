@@ -106,8 +106,8 @@ impl Input for InternalInput {
         // Skip `interval`'s immediate first tick, so the first drain is one interval in.
         ticker.tick().await;
         loop {
-            // Both arms are cancel-safe: a losing `Interval::tick` consumes no tick, and
-            // `wait_for` re-checks the current value on its next call.
+            // Both arm bodies await a send: see `docs/design/pipeline-graph.md`'s
+            // "Cancellation points".
             tokio::select! {
                 _ = ticker.tick() => self.tick(started, &sink).await,
                 () = shutdown_due(&mut shutdown) => {

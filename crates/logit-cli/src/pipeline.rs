@@ -1262,7 +1262,6 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
         batch_max_events: receive.batch_max_events,
         batch_max_bytes: receive.batch_max_bytes,
         batch_flush_interval: receive.batch_flush_interval,
-        shutdown_grace: receive.shutdown_grace,
         read_batch: receive.read_batch,
     }
 }
@@ -1271,7 +1270,8 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
 /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 ///
 /// The queue fields don't cross: a TCP listener has no receive queue, flow control being its
-/// backpressure, and graph rule 17 rejects them. The batching fields apply per connection.
+/// backpressure, and graph rule 17 rejects them. The batching fields apply per connection;
+/// `shutdown_grace` reaches the listener through `input_runtime_config`.
 fn tcp_receive_config(
     receive: &logit_config::ReceiveConfig,
 ) -> logit_inputs::tcp::TcpListenerConfig {
@@ -1279,7 +1279,6 @@ fn tcp_receive_config(
         batch_max_events: receive.batch_max_events,
         batch_max_bytes: receive.batch_max_bytes,
         batch_flush_interval: receive.batch_flush_interval,
-        shutdown_grace: receive.shutdown_grace,
     }
 }
 
@@ -1306,7 +1305,7 @@ fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeCo
 }
 
 /// A tailing listener's `TailConfig` from its `TailOptions` plus the `receive:` block, whose
-/// `batch_*` fields and `shutdown_grace` become `TailBatching`
+/// `batch_*` fields become `TailBatching` (`shutdown_grace` goes to `input_runtime_config`)
 /// (`docs/adr/file-tailing-and-docker-json-logs.md`). A relative `checkpoint_path` resolves
 /// against the config file's directory.
 fn tail_config(
@@ -1332,7 +1331,6 @@ fn tail_config(
             max_events: receive.batch_max_events,
             max_bytes: receive.batch_max_bytes,
             flush_interval: receive.batch_flush_interval,
-            shutdown_grace: receive.shutdown_grace,
         },
     }
 }
@@ -2599,14 +2597,12 @@ mod tests {
             batch_max_events: 250,
             batch_max_bytes: 1_000_000,
             batch_flush_interval: Duration::from_millis(250),
-            shutdown_grace: Duration::from_secs(7),
             ..logit_config::ReceiveConfig::default()
         };
         let cfg = tail_config(&logit_config::TailOptions::default(), &receive, Path::new(""));
         assert_eq!(cfg.batching.max_events, 250);
         assert_eq!(cfg.batching.max_bytes, 1_000_000);
         assert_eq!(cfg.batching.flush_interval, Duration::from_millis(250));
-        assert_eq!(cfg.batching.shutdown_grace, Duration::from_secs(7));
     }
 
     #[test]
@@ -2844,22 +2840,20 @@ mod tests {
         ));
     }
 
-    /// `tcp_receive_config` carries the batching and shutdown fields, not the queue ones.
+    /// `tcp_receive_config` carries the batching fields, not the queue ones.
     #[test]
-    fn tcp_receive_config_carries_only_the_batch_and_shutdown_fields() {
+    fn tcp_receive_config_carries_only_the_batch_fields() {
         let receive = logit_config::ReceiveConfig {
             max_datagrams: 4096,
             batch_max_events: 7,
             batch_max_bytes: 99,
             batch_flush_interval: Duration::from_millis(25),
-            shutdown_grace: Duration::from_secs(3),
             ..logit_config::ReceiveConfig::default()
         };
         let cfg = tcp_receive_config(&receive);
         assert_eq!(cfg.batch_max_events, 7);
         assert_eq!(cfg.batch_max_bytes, 99);
         assert_eq!(cfg.batch_flush_interval, Duration::from_millis(25));
-        assert_eq!(cfg.shutdown_grace, Duration::from_secs(3));
     }
 
     #[test]

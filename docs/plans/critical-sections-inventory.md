@@ -24,12 +24,15 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-26, at `luab/w4`'s head, `d80f616`):** 33 of 135
-  entries done (20 P0, 12 P1, 1 P2): 31 with findings and two reviewed clean. The four finished
+- **Progress (2026-09-26, at `drain/w5`'s head):** 44 of 135
+  entries done (27 P0, 16 P1, 1 P2): 40 with findings and four reviewed clean. The five finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
-  re-reviewed CORE-05's stale entry, and the Lua boundary (#383, #385, #386, #388, #391, #392),
-  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean. The rest of the
+  re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
+  which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, and the shared
+  queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
+  NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
+  clean. The rest of the
   list is `unreviewed`. The index's **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
@@ -54,7 +57,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
-| 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done** (#333); the rest of RT-03 is unreviewed |
+| 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
@@ -72,11 +75,25 @@ Repo-wide gaps that cut across entries:
   Prometheus remote-write decoders, run out of CI (ADR `out-of-ci-fuzzing`). statsd, syslog, the
   Prometheus text parser, the TCP `Framer`, json/logfmt/csv tokenizers, disk-spool segments, and
   tail checkpoints still have none (cluster 9).
-- **Cancellation is the least-tested axis.** The runtime drops `send`/`push` futures mid-flight by
-  design; no test drops one inside `write_all`, the UDP datagram loop, or a parked `store.push`.
+- **Cancellation is the least-tested axis.** ~~No test drops a future inside `write_all`, the UDP
+  datagram loop, or a parked `store.push`.~~ **Partly fixed (cluster 3):** every production
+  `select!` and `timeout` on a node's run path is a row of `docs/design/pipeline-graph.md`'s
+  "Cancellation points" table, naming what a losing arm drops and what counts it. Tests now drop
+  futures mid-flight in the queues (the `queue_stress` harness and the batched-versus-single
+  proptest), the UDP read and decode loops (`read_loop` at its push and at a coop-budget yield,
+  `decode_loop` mid-batch, the whole listener at the grace backstop), a parked `store.push`, a
+  grace-cut `Output::send`, and the tail driver parked in its final flush. Still untested: a
+  sink's own state after a dropped `send` (`stdio_out`/`file_out` can leave a torn line, in
+  `docs/known-gaps.md`; the pooled TCP sinks are cluster 6), and the uncounted losses the table
+  names (a batch dropped inside `Fanout::send`, pinned only for a partial fan-out).
 - **Dependency bumps are re-verification triggers**: `logit-inputs/src/http.rs`'s idle/graceful
   shutdown driver is pinned by reference to hyper 1.11.1 / hyper-util 0.1.20 internals;
-  `BoundedQueue::close` leans on a tokio `notify_waiters` internal; `logit_out`'s `Clean` vs
+  the queues lean on tokio 1.53.1 internals, now pinned by tests (ADR
+  `shutdown-accounting-and-cancellation-safety`, decision 5): `notify_waiters` wakes only a
+  `Notified` constructed before the call, `drop_notified` forwards a `notify_one` permit, a stored
+  permit is one permit, `select!` returns on the first `Ready` branch and checks
+  `poll_budget_available` before polling any arm, `wait_for` spends the coop budget
+  (`cooperative`), and the initial budget is 128 units; `logit_out`'s `Clean` vs
   `Ambiguous` fault split rests on an unverified `tokio-rustls` write-semantics assumption; the HLL
   codec's soundness rests on serde's `with_capacity(size_hint)` behaviour.
 - ~~**Connection gauges are decremented by a bare statement, not a drop guard**, in all three stream
@@ -92,9 +109,10 @@ Entries that share a mechanism and should be verified together, in suggested ord
    CODEC-16, CODEC-17. Mostly fuzz targets + size/depth caps; highest severity, most mechanical.
 2. **Durability (done, #322–#337)** — DISK-01..06, DISK-09, DISK-13, TAIL-05, DISK-10. One crash-injection harness
    serves all of it; settle the fsync policy (tmp file + directory) once for spool *and* checkpoints.
-3. **Shared queue + shutdown (started: RT-03 lead 11 via #333)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
-   One loom/shuttle model of `BoundedQueue` (incl. the `peek`/`commit` head reservation), then a
-   cancellation-safety audit of every `select!`.
+3. **Shared queue + shutdown (done, #401, #403, #404, #406, #408, #409)** — NET-06, NET-07, RT-07, DISK-08, RT-02..04, NET-02/03, TAIL-06/08.
+   A multi-thread randomized stress harness, a sequential proptest, and tokio-source pins for the
+   queues (incl. the `peek`/`commit` head reservation), then a cancellation-safety audit of every
+   `select!`, recorded as `docs/design/pipeline-graph.md`'s "Cancellation points" table.
 4. **Tail bookkeeping** — TAIL-01..04, TAIL-09, TAIL-10. Proptest state machine against a model
    filesystem (rename/copytruncate/delete/transient-error), then a real `logrotate` run.
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
@@ -177,10 +195,10 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | ID | Pri | Section | Primary location | Status |
 |---|---|---|---|---|
 | [NET-01](#net-01--recvmmsg2-batched-udp-read-hand-built-mmsghdriovec-arrays-over-vecu64-storage) | P0 | `recvmmsg(2)` batched UDP read: hand-built `mmsghdr`/`iovec` arrays over `Vec<u64>` storage | `crates/logit-inputs/src/udp.rs` (`BatchReader`, `build_headers`/`recvmmsg_into`/`harvest_headers`) | findings → #281 |
-| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | unreviewed |
-| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | unreviewed |
-| [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | unreviewed |
-| [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | unreviewed |
+| [NET-02](#net-02--udp-read_loop-shutdown-race-queue-close-contract-and-per-batch-telemetry) | P0 | UDP `read_loop`: shutdown race, queue-close contract, and per-batch telemetry | `crates/logit-inputs/src/udp.rs` (`read_loop`) | findings → #406 |
+| [NET-03](#net-03--udp-decode_loop-pop_many-batching-interval-flush-deadline-race-and-final-flush-ordering) | P0 | UDP `decode_loop`: `pop_many` batching, interval-flush deadline race, and final flush ordering | `crates/logit-inputs/src/udp.rs` (`decode_loop`) | findings → #406 |
+| [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
+| [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | unreviewed |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | unreviewed |
@@ -194,9 +212,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs` (`roll_read_cursor`, `advance_read_cursor`) | findings → #333, #337 |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs` (`run_output`, `finish_and_flush`) | findings → #333 |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs` (`run_with_telemetry`) | unreviewed |
-| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | unreviewed |
-| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | unreviewed (lead 11 fixed in #333) |
-| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | unreviewed |
+| [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs` (`run_with_telemetry`'s shutdown driver and join loop, `shutdown_grace_expired`) | findings → #404 |
+| [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs` (`run_output`, `drain_inbox`, `finish_and_flush`) | findings → #404 (lead 11 fixed in #333) |
+| [RT-04](#rt-04--write_loop-peekcommit-delivery-permanent-failure-window-degradedrecovered-edges) | P0 | `write_loop`: peek/commit delivery, permanent-failure window, degraded/recovered edges | `runtime.rs` (`write_loop`) | findings → #404 |
 | [RT-11](#rt-11--lua-node-hosting-os-thread-two-oneshot-handshake-catch_unwind-handleblock_on) | P0 | Lua node hosting: OS thread, two-oneshot handshake, `catch_unwind`, `Handle::block_on` | `runtime.rs` (`run_lua`, `watch_lua_thread`, `run_lua_loop`) | findings → #386 |
 | [WIRE-01](#wire-01--frame-envelope-24-byte-header-crc-32c-over-compressed-bytes-lz4-bounds-resync) | P0 | Frame envelope: 24-byte header, CRC-32C over compressed bytes, lz4 bounds, resync | `crates/logit-proto/src/frame.rs` (`MAX_SANE_UNCOMPRESSED_LEN`, `read_frame_with_header`) | findings → #370 |
 | [WIRE-02](#wire-02--dictionary-first-symbol-table-and-value-tlv-decode-untrusted-counts-depth-interning) | P0 | Dictionary-first symbol table and `Value` TLV decode (untrusted counts, depth, interning) | `crates/logit-proto/src/native/dict.rs` (`DictBuilder`, `Dict::read`) | findings → #370 |
@@ -224,19 +242,19 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs` (`TcpListener`'s `Input::run_until_shutdown`) | findings → #377 |
 | [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs` (`meminfo`/`listen_queue`) | findings → #282 |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs` (`sample_while`, `ReceiveBufferSampler`), `crates/logit-inputs/src/tcp.rs` (`AcceptQueueSampler`) | findings → #281, #282 |
-| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | unreviewed |
+| [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #408 |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs` (`InotifyWatcher`, `parse_events`) | findings → #283 |
-| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | unreviewed |
+| [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #408 |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | unreviewed |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs` (`peek`, `read_record_at`, `read_at`) | unreviewed (partly fixed in #328) |
-| [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | unreviewed |
+| [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | reviewed @510291b1 |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
-| [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | unreviewed |
+| [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | findings → #403 |
 | [RT-08](#rt-08--run_transform-flush-deadline-race-close-time-flush-and-cadence-math) | P1 | `run_transform`: flush-deadline race, close-time flush, and cadence math | `runtime.rs` (`run_transform`, `run_flush`, `advance_flush_deadline`) | unreviewed |
 | [RT-10](#rt-10--run_router--route_batch-the-four-pass-partition-and-routerscratch-reuse) | P1 | `run_router` / `route_batch`: the four-pass partition and `RouterScratch` reuse | `runtime.rs` (`run_router`, `route_batch`) | unreviewed |
 | [RT-12](#rt-12--batchaccumulator-incremental-weight-tracking-and-the-resource-scope-key) | P1 | `BatchAccumulator`: incremental weight tracking and the `(resource, scope)` key | `crates/logit-pipeline/src/accumulator.rs` (`BatchAccumulator::absorb`) | unreviewed |
@@ -490,15 +508,15 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     before this loop iteration".
   - The reused `Vec` keeps its capacity across iterations (allocation pin).
 - **Observed concerns (unverified):**
-  - *Documented, not a surprise:* a `push_many` cancelled by the shutdown arm (the second `select!`)
+  - ~~*Documented, not a surprise:* a `push_many` cancelled by the shutdown arm (the second `select!`)
     drops its remainder uncounted — named in ADR `udp-intake-batching-and-socket-visibility` and in
-    `push_many`'s own doc. Listed here only so a verifier knows it is intentional.
-  - *Low confidence:* `udp.rs` races `shutdown.wait_for` inside a future that must be `Send`
+    `push_many`'s own doc. Listed here only so a verifier knows it is intentional.~~
+  - ~~*Low confidence:* `udp.rs` races `shutdown.wait_for` inside a future that must be `Send`
     (`#[async_trait]` `run_until_shutdown`), while `tcp.rs` (`read_step`'s doc) states that `wait_for`'s
     `Ref` guard makes a combined future `!Send` and therefore uses `changed()` + an explicit
     `*shutdown.borrow()` check. The two drivers reach the same behavior by different means; worth
     confirming the UDP side really is immune (it compiles, so it is — but the asymmetry suggests one
-    of the two comments is imprecise).
+    of the two comments is imprecise).~~
 - **Existing coverage:** `udp.rs` tests `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing`,
   `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered`,
   `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue`,
@@ -511,6 +529,22 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `datagrams sent == delivered + dropped + (bounded shutdown loss)`; `--verify` perf scenario.
 - **Priority:** P0 — the close contract is the only thing keeping `decode_loop` from hanging, and
   the accounting is the basis for every loss claim the ADR makes.
+- **Verified (drain/w3, #406):** The close contract held, and the loss was wider than the entry
+  said. The second `select!` is unbiased and `wait_for` is `Ready` at once after the signal, so
+  about half the time `push_many` is never polled and its whole batch was dropped uncounted, not
+  a cancelled call's remainder alone. `read_loop`'s batch and queue now live in a `ReadHalf` guard
+  whose `Drop` counts what the batch holds as `datagrams.dropped{reason="shutdown"}` and closes the
+  queue, on a return and on the future being dropped (the coop-budget yield between read and push,
+  reachable under `receive.shutdown_grace: 0s`); a polled `push_many` counts its own remainder
+  through `CountedDrain`. `tcp.rs`'s `read_step` doc was the imprecise one: `wait_for`'s `Ref` is
+  only returned, so `wait_for` would compile there; `changed()` matches `crate::logit`, whose
+  shutdown arm does await. Tests: the extended
+  `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue`,
+  `a_read_loop_whose_push_many_was_never_polled_before_shutdown_counts_its_whole_batch`,
+  `a_read_loop_dropped_mid_iteration_counts_what_its_batch_held_and_closes_the_queue` (drives the
+  coop-budget yield directly), `read_loop_closes_the_queue_even_when_its_future_is_dropped`, and
+  `a_zero_shutdown_grace_never_breaks_the_datagram_contract` (50 iterations of a grace-0 backstop).
+  Removing the guard's count fails three of them.
 
 ---
 
@@ -562,6 +596,20 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   drifts; fault injection dropping the future mid-decode to bound the loss.
 - **Priority:** P0 — a wrong `0`-means-closed reading or a lost `popped` vec is silent data loss on
   the main path, and the deadline math is hand-rolled.
+- **Verified (drain/w3, #406):** `pop_many`'s `0` and the `timeout` arm checked out, and two
+  findings were real. The popped-but-undecoded datagrams of a grace-backstop drop were uncounted:
+  `decode_loop` now iterates its batch through a `CountedDrain`, and `UdpListener::drive`'s
+  `ResidualOnDrop` counts what the receive queue still holds once both halves are gone, through a
+  one-lock `BoundedQueue::take_all`. The deadline could go stale: `now_instant` was read before an
+  interval `emit`, so an `emit` parked past the next deadline left it already due, and the next pop
+  batch flushed at once. The clock is re-read after the `emit`, here and in `tcp.rs`'s
+  `serve_connection`. The events already decoded when the backstop fires (the accumulator, a
+  parked `emit`, a partial fan-out) stay uncounted, recorded in `docs/known-gaps.md`'s UDP intake
+  section. Tests: `a_decode_loop_dropped_mid_batch_counts_every_popped_but_undecoded_datagram`,
+  `a_udp_listener_cancelled_by_the_grace_backstop_counts_what_its_queue_still_held`,
+  `an_interval_emit_that_parks_past_the_deadline_does_not_flush_once_per_pop_batch` (and its
+  `tcp.rs` twin), each failing with its fix removed, and
+  `a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers`, which pins the partial fan-out gap.
 
 ---
 
@@ -657,7 +705,7 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
 - **Why sensitive:** hot-path (one call per `recvmmsg` batch); concurrency (the `Notify` condvar
   pattern, permit vs. broadcast semantics); cancellation (the `Drain` is held across every
   `.await`); backpressure (`Block` is the operator-selectable mode that makes the reader stop);
-  data-loss (the cancelled remainder is dropped uncounted, by design); accounting
+  data-loss (~~the cancelled remainder is dropped uncounted, by design~~ the cancelled remainder is counted `shutdown`); accounting
   (`logit.component.datagrams.dropped` / `.bytes.dropped` must reconcile);
   nontrivial-3p-use(tokio::sync::Notify — the code depends on documented-but-subtle
   `notified()`-constructed-before-state-check ordering and on `notify_one` storing a permit where
@@ -675,17 +723,19 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
     after each accepted item).
   - `items` is always left empty with capacity intact, on the ordinary path *and* on cancellation.
   - The cancelled-mid-wait case leaves: accepted prefix queued, fully accounted, and announced;
-    remainder dropped uncounted; caller's `Vec` empty.
+    ~~remainder dropped uncounted~~ remainder counted `reason="shutdown"`; caller's `Vec` empty.
   - `dropped` is drained and counted *outside* the lock, per iteration, so evicted datagrams are
     freed promptly rather than held for the whole `Block` wait (the `dropped.drain(..)` loop after each lock release).
   - Mutex poisoning is swallowed (`unwrap_or_else(|p| p.into_inner())`) at every lock site — verify
     a poisoned queue can't serve corrupted state.
 - **Observed concerns (unverified):**
-  - *Low confidence:* `would_overflow` is `inner.len() >= max_items || inner.weight()
+  - ~~*Low confidence:* `would_overflow` is `inner.len() >= max_items || inner.weight()
     + weight > max_weight`; `inner.weight() + weight` is a plain `u64` add with no overflow guard.
-    `Datagram::weight()` is ≤ ~65 KB so unreachable today, but the type is generic.
-  - *Documented:* the uncounted cancellation remainder (`push_many`'s "Cancellation" doc paragraph) is an accepted,
-    shutdown-only loss; listed for context, not as a finding.
+    `Datagram::weight()` is ≤ ~65 KB so unreachable today, but the type is generic.~~ **fixed in
+    #403:** saturating, along with `InMemoryBuffer`'s add and subtract.
+  - ~~*Documented:* the uncounted cancellation remainder (`push_many`'s "Cancellation" doc paragraph) is an accepted,
+    shutdown-only loss; listed for context, not as a finding.~~ **Counted since #403** (ADR
+    `shutdown-accounting-and-cancellation-safety`, decision 4).
 - **Existing coverage:** `queue.rs` tests: the block of eleven `push_many_*` tests (including
   `a_cancelled_push_many_leaves_the_prefix_queued_the_vec_empty_and_accounting_exact`),
   `a_consumer_parked_before_a_blocking_push_many_is_woken_by_the_prefix_it_admits`,
@@ -696,13 +746,20 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `any_interleaving_of_batched_and_single_calls_agrees_with_the_single_call_sequence`.
   ADR: `udp-intake-batching-and-socket-visibility` ("`push_many`/`pop_many` live on `BoundedQueue`
   itself"), `decoupled-listener-io`.
-- **Suggested verification approach:** loom or shuttle model of push/push_many/pop/pop_many/close
+- **Suggested verification approach:** ~~loom or shuttle model of push/push_many/pop/pop_many/close
   interleavings with 1–2 producers and 1–2 consumers — the `Notify` permit reasoning is exactly
-  what a model checker is for; supplement with a proptest comparing batched vs. single-call
+  what a model checker is for;~~ (neither can instrument `tokio::sync::Notify`; ADR
+  `shutdown-accounting-and-cancellation-safety`, decision 5) supplement with a proptest comparing batched vs. single-call
   sequences (`any_interleaving_of_batched_and_single_calls_agrees_with_the_single_call_sequence` already
   exists — extend it to cover `close()` racing).
 - **Priority:** P0 — a lost wakeup here wedges a listener permanently, and the drop accounting is
   the source of truth for every "logit counted the loss" claim.
+- **Verified (drain/w1, #403):** findings. A cancelled `push_many` now counts its remainder through
+  `CountedDrain`, a never-polled one leaves its `Vec` for the caller to count, and weight
+  arithmetic saturates. `queue_stress`'s `BoundedQueue` ledger (1–3 producers, 1–2 consumers,
+  every policy, random cancellation and close; 64 seeds in CI, 20,000 once locally) and the
+  batched-vs-single proptest under `close()` and cancellation found no lost wakeup or unaccounted
+  item; each fails on a planted bug (the remainder uncounted, the pre-wait `notify_one` removed).
 
 ---
 
@@ -744,10 +801,17 @@ against commit `2f387ee`; later paragraphs say which workstream they were writte
   `a_notify_waiters_call_between_constructing_a_notified_and_polling_it_is_never_lost`,
   `pop_many_with_max_zero_trips_a_debug_assert` / `…_is_clamped_to_one_rather_than_hanging`,
   plus `pop_is_fifo_and_returns_none_once_closed_and_empty`.
-- **Suggested verification approach:** loom/shuttle (same model as `push_many`); re-run the
+- **Suggested verification approach:** ~~loom/shuttle (same model as `push_many`);~~ re-run the
   tokio-internals pin test on any `tokio` bump; targeted review of the `Ordering` choices.
 - **Priority:** P0 — same lock/notify protocol as `push_many`; a lost `not_empty` wakeup hangs a
   listener's decode loop with a non-empty queue.
+- **Verified (drain/w1, #403):** reviewed @510291b1, no change to `pop`/`pop_many`/`close`. Every
+  `closed` access is Acquire/Release, and `pop_many` awaits only on an iteration that removed
+  nothing. `queue_stress` runs `pop`/`pop_many` consumers cut off at random against concurrent
+  producers and `close()`, `a_close_while_every_producer_and_consumer_is_parked_wakes_all_of_them`
+  checks the closed-and-empty signal reaches every parked waiter, and
+  `a_notify_one_delivered_to_a_registered_notified_that_is_dropped_unpolled_is_passed_on` pins the
+  permit forwarding a cut-off `pop_many` relies on.
 
 ---
 
@@ -1648,15 +1712,36 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     is never lost.
   - `emit`'s `sink.send().await` inside the shutdown path can block; confirm what the runtime does
     when the grace expires there, and that nothing is half-sent.
-- **Observed concerns (unverified):** `TailBatching::shutdown_grace` (`crates/logit-inputs/src/tail/mod.rs`) is carried
+- **Observed concerns (unverified):** ~~`TailBatching::shutdown_grace` (`crates/logit-inputs/src/tail/mod.rs`) is carried
   into `TailConfig` but never read inside the tail driver — the grace is enforced only externally
   by the runtime. That's consistent with other listeners, but means the driver has no internal
-  bound on how long the final flush may block. Low-medium confidence that it matters.
+  bound on how long the final flush may block. Low-medium confidence that it matters.~~ Retired:
+  the field is removed (see "Verified" below).
 - **Existing coverage:** `shutdown_flushes_every_accumulator_and_writes_the_checkpoint_within_grace`
   (`driver.rs`), `an_unterminated_last_line_is_held_until_its_newline_arrives_and_emitted_on_close`
   (`driver.rs`), `a_partial_entry_is_emitted_on_close_rather_than_lost` (`docker.rs`).
 - **Priority:** P1 — correct in the tested paths; the untested interaction is an abort during a
   blocked final send.
+- **Verified (drain/w4, #408):** The close → flush → checkpoint ordering held: a final flush
+  parked on a full downstream and cut by the grace backstop leaves the last interval checkpoint in
+  place, so the restart duplicates and never skips
+  (`a_grace_cut_final_flush_leaves_the_checkpoint_at_the_last_checkpointed_offset`, which passed
+  before the change). Two ways the checkpoint could get ahead of delivery were real. `docker_in`'s
+  held fragments of an entry over 16 KiB are line-complete, so `pending_bytes()` excluded nothing
+  and an interval checkpoint covered them. The driver now records the offset of the oldest held
+  line (`TailDecoder::holds_entry`), and `write_checkpoint` persists the smaller of it and the
+  splitter's line boundary, so a rejected or oversized line after the held run can't move the
+  checkpoint into it (`an_interval_checkpoint_never_covers_a_held_fragment_line`,
+  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`,
+  `a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run`,
+  `an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start`). `reap_drained`
+  never dirtied the store, so a reaped inode's entry outlived it on disk and a reused inode could
+  resume past its first bytes; a reap now dirties it
+  (`a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it`). The
+  three dead `shutdown_grace` copies are removed; `InputRuntimeConfig::shutdown_grace` is the one.
+  Two gaps are documented, not fixed: the checkpoint is at-least-once only up to the downstream
+  in-memory queues (a sink's grace drop isn't replayed), and a rotated file still draining at
+  shutdown whose new name matches no pattern is orphaned on restart (`docs/known-gaps.md`).
 
 ### TAIL-07 — Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area
 - **Location:** `crates/logit-inputs/src/tail/watch.rs`, `mod inotify` (the module roughly doubled
@@ -1809,6 +1894,23 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   test that drives a long drain and asserts the checkpoint tick still lands.
 - **Priority:** P1 — correctness of the loop shape is well argued; the residual risk is timer
   starvation and cancel-safety of the hand-rolled wake future.
+- **Verified (drain/w4, #408):** Timer starvation was real. `drain` looped while any file made
+  progress, so a backlog against a slow downstream ran no poll, flush, or checkpoint tick until it
+  was done, and a grace-cut shutdown then replayed the whole backlog read so far. `drain` now takes
+  the earliest deadline and returns `DrainEnd::TimerDue` after a completed pass that finds it past,
+  and the run loop runs every due flush or checkpoint tick before the next pass, so a poll tick due
+  again after each long pass can't keep winning the random pick. Tests (paused time):
+  `a_checkpoint_tick_lands_while_a_long_backlog_is_still_being_drained`,
+  `a_flush_tick_lands_while_a_long_backlog_is_still_being_drained`, and
+  `shutdown_during_a_backlog_drain_with_a_parked_downstream_replays_at_most_one_chunk`; all three
+  fail without the fix. The cancel-safety invariants checked out: `InotifyWatcher::next_wake`
+  parses a whole `read` into `pending` before returning and awaits only readiness, a dropped
+  `wait_for` leaves the value `true` for the next poll and for `drain`'s `borrow()`, and each
+  deadline is loop state re-armed on the next iteration. `bind()`'s `expect` is unreachable:
+  `run_until_shutdown` calls `bind()` first, which leaves a watcher or returns `Err`. The one
+  shutdown bound left is documented in `docs/known-gaps.md`: shutdown is noticed only between two
+  files' reads, so a parked `emit` can hold it until the backstop. The `select!` and the `drain`
+  shutdown check have rows in `docs/design/pipeline-graph.md`'s "Cancellation points".
 
 ### TAIL-09 — Docker json-file envelope decode and 16 KiB partial-line reassembly
 - **Location:** `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder` and its
@@ -2498,9 +2600,10 @@ surveyor's.
     least one segment")` appears in `push`, `write_record` (several times), `rotate_segment`, and `open` — any of
     those firing poisons the mutex and the next lock proceeds on inconsistent state.
   - `Ordering::Acquire`/`Release` on `closed` is sufficient given the `Mutex` also synchronizes.
-- **Observed concerns (unverified):** the `expect("always at least one segment")` family is the invariant a
+- **Observed concerns (unverified):** ~~the `expect("always at least one segment")` family is the invariant a
   poisoned-mutex-ignored design leans on hardest; `rotate_segment` can fail to create a new segment, and
-  `roll_read_cursor` can remove entries — worth proving `segments` is never emptied. Medium confidence it holds.
+  `roll_read_cursor` can remove entries — worth proving `segments` is never emptied. Medium confidence it holds.~~
+  **Holds:** `State::segments`' doc lists the mutation sites and why each keeps it non-empty.
 - **Existing coverage:** `close_then_peek_returns_none_when_empty`, and the two roll-forward tests that
   assert `peek` doesn't hang (`the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away`,
   `live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes`, with explicit `tokio::time::timeout`). No dedicated concurrency
@@ -2508,6 +2611,16 @@ surveyor's.
 - **Suggested verification approach:** a loom-style or high-iteration randomized concurrency test (producer +
   consumer + close) under `tokio::time::pause`, plus targeted review of the notify/re-check ordering.
 - **Priority:** P1 — a lost wakeup is a hang, not corruption, and the roll-forward tests already caught one.
+- **Verified (drain/w1, #403):** reviewed @510291b1, no behavior change. `State::segments`' doc
+  states the never-empty invariant at its mutation sites, with `debug_assert!`s after `open`'s
+  `leaked` loop and `roll_read_cursor`'s removals. `DiskQueue`'s doc states the same-task contract:
+  `commit` and `evict_oldest` each check under one lock and act under another, safe only because
+  `drain_inbox` and `write_loop` are two futures in one task. `queue_stress` drives a producer and
+  consumer that way under random bounds, policies, cancellation, and close, then finishes and
+  reopens (16 seeds in CI, 1,000 once locally), and
+  `a_block_push_whose_make_room_rotation_fails_writes_over_bound_rather_than_parking` covers the
+  failed make-room create. Follow-up: make each of those two pairs one lock acquisition, so the
+  contract no longer rests on task placement.
 
 ---
 
@@ -2984,6 +3097,14 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `batches.dropped{reason="shutdown"}`.
 - **Priority:** **P0** — this is the drain-ordering machinery for the whole process; wrong here means silent
   loss or a hang at every shutdown.
+- **Verified (drain/w2, #404):** Both concerns were real. `count_shutdown_drop` is now the one site
+  that counts `dropped{reason="shutdown"}` and feeds `drain complete`, and
+  `drain_complete_reports_every_batch_dropped_for_shutdown_including_those_finish_drops` checks the logged
+  total against the telemetry sum through a full run (a `max_memory` Lua revoke is checked the same way).
+  `run_input`'s `select!` is `biased` toward the listener, and its backstop runs `unconstrained`, pinned by
+  `an_input_error_at_the_grace_deadline_is_never_swallowed_by_the_backstop` (32 iterations) and
+  `an_input_that_burns_its_coop_budget_after_the_signal_is_still_cancelled_at_the_grace_deadline`. Two
+  paused-time tests pin the grace anchor: first poll after the signal, kept across a dropped call.
 
 ---
 
@@ -3045,6 +3166,15 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
 - **Lead 11 fixed in #333** (verified under DISK-09): `drain_inbox` records the batch it is pushing in an
   `in_hand` slot that the sweep takes first, so a cancelled `push` under `overflow: block` no longer loses it
   uncounted. The rest of this entry is unreviewed, and its description of `drain_inbox` predates #333.
+- **Verified (drain/w2, #404):** The `received` gap was real and is fixed: the sweep counts
+  `received` for every batch it takes from the inbox, not for `in_hand`, which `drain_inbox` already counted.
+  A second loss turned up: `run_output` never closed `inbox`, so a producer parked on the full channel sent
+  into the capacity the sweep freed while `finish_and_flush` awaited, and that batch died with the
+  `Receiver`. The inbox is now closed before the sweep, which drains it with a bounded `recv`.
+  `a_batch_sent_into_the_inbox_after_the_sweep_began_is_counted_not_silently_lost` pins it, and
+  `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled` now reads
+  `received` and the new `delivered` counter from telemetry across five exit paths, both postures, and both
+  stores.
 
 ---
 
@@ -3076,7 +3206,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   - The sink span's parent is `ctx.trace.span_id` (the batch's own), and `ctx.trace.child()` is used only as this
     span's identity, never propagated.
 - **Observed concerns (unverified):**
-  - **A `peek` reservation can be left standing when the grace arm wins the first `select!`.**
+  - ~~**A `peek` reservation can be left standing when the grace arm wins the first `select!`.**
     `BoundedQueue::peek` (`queue.rs`) calls `InMemoryBuffer::peek`, which sets `head_reserved = true`
     (`crates/logit-proto/src/buffer.rs`, `InMemoryBuffer::peek`). In `tokio::select!`, a branch whose future
     completed can still
@@ -3084,7 +3214,9 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     `Ok(())` on the `NextBatch::ShutdownExpired` arm. Today nothing breaks: `SinkStore::finish` drains with
     `commit()`, which clears it. But the
     invariant is accidental, not argued anywhere, and `BoundedQueue::pop`'s doc comment explicitly names a
-    dangling reservation as the hazard `pop` exists to avoid. Medium-high confidence the window is real; low severity today.
+    dangling reservation as the hazard `pop` exists to avoid. Medium-high confidence the window is real; low severity today.~~
+    Refuted: `select!` returns on the first `Ready` branch, and both `peek`s reserve only in the poll that
+    returns. The standing reservation comes from `DeliverStep::ShutdownExpired`, and it's benign.
   - **Cancelling `deliver_with_retry` mid-`send` at grace expiry is an ambiguous outcome silently recorded as a
     clean shutdown drop.** The batch stays uncommitted, so `finish_and_flush` counts it
     `dropped{reason="shutdown"}` — but the destination may have received it. No `Fault::Ambiguous` is recorded.
@@ -3111,6 +3243,19 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   the reservation state; review of whether a grace-cancelled `send` should be recorded as `Ambiguous`.
 - **Priority:** **P0** — every batch a sink ever emits goes through here, the drop decision is made here, and
   the classification plumbing is custom.
+- **Verified (drain/w2, #404):** The grace-cut send is now `Fault::Ambiguous`, decided by
+  `is_retryable`: the span is tagged `fault=ambiguous`, and at-most-once commits the batch and counts it
+  `dropped{reason="shutdown"}`. A `sending` flag set only across the `send` await tells a cut-off send from a
+  grace landing in backoff or before the deliver arm ran; the deliver `select!` is `biased`, so a send
+  completing in the grace's wake counts as delivered. Pinned by
+  `a_send_cut_off_by_shutdown_grace_is_committed_and_counted_under_at_most_once`,
+  `a_send_cut_off_by_shutdown_grace_stays_queued_for_replay_under_at_least_once`,
+  `a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once`,
+  `a_send_that_completes_in_the_same_wake_as_the_grace_deadline_is_counted_delivered`, and
+  `a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish`; the benign reservation is
+  argued at the `ShutdownExpired` arm. A deadline already past never starts a send: `deliver_with_retry`
+  checks it before every attempt (`a_batch_queued_behind_a_send_that_completes_at_the_grace_deadline_is_not_started_and_stays_uncommitted`,
+  `a_backoff_ending_at_the_grace_deadline_does_not_start_another_attempt`).
 
 ---
 
@@ -3230,11 +3375,17 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `crates/logit-proto/src/buffer.rs`'s `tests` module for `InMemoryBuffer`'s reservation semantics. Governed by
   `docs/adr/buffered-sink-delivery.md`, `docs/adr/decoupled-listener-io.md`,
   `docs/adr/udp-intake-batching-and-socket-visibility.md`.
-- **Suggested verification approach:** a loom or shuttle model over `push`/`commit`/`close` with one producer and
-  one consumer (the sink shape), asserting no lost wakeup and no permanent park; a re-check of the tokio
+- **Suggested verification approach:** ~~a loom or shuttle model over `push`/`commit`/`close` with one producer and
+  one consumer (the sink shape), asserting no lost wakeup and no permanent park;~~ a re-check of the tokio
   `Notify` internals against the currently pinned tokio version.
 - **Priority:** **P1** — a lost wakeup here hangs a sink permanently, but the argument is explicit, the pattern is
   standard, and a regression test already guards the tokio dependency.
+- **Verified (drain/w1, #403):** findings. `would_overflow` and `InMemoryBuffer`'s weight
+  arithmetic saturate on add and subtract (`commit_after_saturated_weights_never_underflows_and_an_empty_queue_has_zero_weight`).
+  `peek`'s doc now states the one-consumer contract (a second consumer delivers one item twice and
+  loses the next), and `update_gauges`' doc the stale last write under parallel callers, benign
+  because each queue's halves share one task; `queue_stress` checks the gauges read 0 once drained.
+  Its `peek`→`commit` consumer checks `commit` removes the item `peek` reserved, under every policy.
 
 ---
 
