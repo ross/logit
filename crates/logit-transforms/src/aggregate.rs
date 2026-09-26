@@ -13,7 +13,10 @@
 //! stage absorbs every mergeable metric off an event and forwards what's left (the unmergeable
 //! metrics, plus any log or span). Two functions decide by kind, each alone: [`opener_for`] whether
 //! a record merges and what a new series opens with, and [`Accumulator::retained_kind`] whether a
-//! series survives a flush.
+//! series survives a flush. A delta `Sum` whose value is `NaN` or infinite passes through too, so a
+//! cumulative total stays finite. Every record is counted once, as
+//! `logit.transform.metrics.absorbed` or `logit.transform.metrics.passed_through{reason}` (see
+//! [`Tally`]).
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -339,6 +342,43 @@ impl Opener<'_> {
     }
 }
 
+/// Per-`process`-call totals behind `logit.transform.metrics.absorbed` and
+/// `logit.transform.metrics.passed_through{reason}`: every record `process` receives lands in
+/// exactly one field. Reported once per non-zero field after the loop, because
+/// `Telemetry::count` locks and hashes on every call.
+#[derive(Default)]
+struct Tally {
+    absorbed: u32,
+    no_recorded_value: u32,
+    no_merge_rule: u32,
+    kind_conflict: u32,
+    histogram_bounds_mismatch: u32,
+    non_finite: u32,
+}
+
+impl Tally {
+    fn report(&self, telemetry: &Telemetry) {
+        if self.absorbed > 0 {
+            telemetry.count("logit.transform.metrics.absorbed", f64::from(self.absorbed), &[]);
+        }
+        for (reason, n) in [
+            ("no_recorded_value", self.no_recorded_value),
+            ("no_merge_rule", self.no_merge_rule),
+            ("kind_conflict", self.kind_conflict),
+            ("histogram_bounds_mismatch", self.histogram_bounds_mismatch),
+            ("non_finite", self.non_finite),
+        ] {
+            if n > 0 {
+                telemetry.count(
+                    "logit.transform.metrics.passed_through",
+                    f64::from(n),
+                    &[("reason", reason)],
+                );
+            }
+        }
+    }
+}
+
 /// Whether two histograms have the same bucket layout, and so can be added bucket by bucket.
 /// Compared bitwise, like `SeriesKey`'s `f64` attributes: a bound is an identity, not a
 /// measurement, so a `NaN` bound must equal itself rather than mismatch on every record.
@@ -479,23 +519,39 @@ impl Aggregator {
         // `self.group_for` needs `&mut self`. Anything not absorbed is pushed back in its original
         // relative order.
         let metrics = std::mem::take(&mut event.metrics);
+        let mut tally = Tally::default();
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
             if record.is_no_recorded_value() {
-                self.telemetry.count(
-                    "logit.transform.metrics.passed_through",
-                    1.0,
-                    &[("reason", "no_recorded_value")],
-                );
+                tally.no_recorded_value += 1;
                 event.metrics.push(record);
                 continue;
             }
 
             let Some(opener) = opener_for(&record.kind, distributions, sets, temporality) else {
+                tally.no_merge_rule += 1;
                 event.metrics.push(record);
                 continue;
             };
+
+            // Checked before the series key, so no series opens for it. A non-finite increment
+            // would pin a cumulative total at `NaN` or infinity for the series' whole life.
+            // Only a delta `Sum` gets here: `opener_for` passed a cumulative one through.
+            let non_finite =
+                matches!(record.kind, MetricKind::Sum(Sum { value, .. }) if !value.is_finite());
+            if non_finite {
+                tally.non_finite += 1;
+                self.diag.warn_throttled(
+                    "sum_non_finite",
+                    format_args!(
+                        "sum '{}' has a non-finite value -- forwarding it untouched",
+                        logit_core::interner::resolve(record.name)
+                    ),
+                );
+                event.metrics.push(record);
+                continue;
+            }
 
             let key = SeriesKey {
                 name: record.name,
@@ -715,6 +771,7 @@ impl Aggregator {
                 _ => false,
             };
             if accumulated {
+                tally.absorbed += 1;
                 // Only on a real merge: a kind-conflicted metric isn't a contributor.
                 state.contexts.observe(ctx);
                 state.updated_this_window = true;
@@ -789,6 +846,7 @@ impl Aggregator {
             }
             if !accumulated {
                 if histogram_bounds_mismatch {
+                    tally.histogram_bounds_mismatch += 1;
                     // Its own key, not `kind_conflict`: the kind matches and only the bounds differ
                     // (a producer that re-bucketed mid-run).
                     self.diag.warn_throttled(
@@ -801,6 +859,7 @@ impl Aggregator {
                         ),
                     );
                 } else {
+                    tally.kind_conflict += 1;
                     self.diag.warn_throttled(
                         "kind_conflict",
                         format_args!(
@@ -813,6 +872,7 @@ impl Aggregator {
                 event.metrics.push(record);
             }
         }
+        tally.report(&self.telemetry);
 
         !(event.metrics.is_empty() && event.log.is_none() && event.span.is_none())
     }
@@ -3493,8 +3553,9 @@ mod tests {
                 MetricKind::SetMembers(m.iter().map(|m| Bytes::from_static(m)).collect())
             };
 
-            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped.
+            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped, sum_non_finite.
             let mut agg = Aggregator::new(Duration::from_secs(10));
+            feed(&mut agg, &resource, metric_event("n", MetricKind::counter(f64::NAN), 0));
             feed(&mut agg, &resource, metric_event("g", MetricKind::GaugeDelta(1.0), 0));
             feed(&mut agg, &resource, metric_event("g", MetricKind::counter(1.0), 0));
             feed(&mut agg, &resource, metric_event("s", samples(0.0001, &[1.0]), 0));
@@ -3521,10 +3582,108 @@ mod tests {
         });
 
         let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        assert_eq!(messages.len(), 8, "one report per diagnostic key: {messages:#?}");
+        assert_eq!(messages.len(), 9, "one report per diagnostic key: {messages:#?}");
         for message in &messages {
             assert!(!message.contains("  "), "a run of spaces in {message:?}");
         }
+    }
+
+    fn passed_through(events: &[Event], reason: &str) -> f64 {
+        counter_with_tag(events, "logit.transform.metrics.passed_through", "reason", reason)
+            .unwrap_or(0.0)
+    }
+
+    fn absorbed(events: &[Event]) -> f64 {
+        events
+            .iter()
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.transform.metrics.absorbed")
+            .map(|m| counter_value(&m.kind))
+            .sum()
+    }
+
+    /// Every record `process` receives is absorbed or passed through under one reason, and the
+    /// counters total per call.
+    #[test]
+    fn every_record_is_counted_absorbed_or_passed_through_once() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = cumulative_agg().with_telemetry(telemetry);
+        let resource = default_resource();
+
+        let mut no_value = MetricRecord::new(intern("nv"), MetricKind::Gauge(0.0));
+        no_value.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let histogram = |bound: f64| {
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(bound, 1)],
+                temporality: Temporality::Delta,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        };
+        let mut records = vec![
+            no_value,
+            MetricRecord::new(
+                intern("cum"),
+                MetricKind::Sum(Sum {
+                    value: 1.0,
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+            ),
+            MetricRecord::new(
+                intern("q"),
+                MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
+            ),
+            MetricRecord::new(intern("g"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("g"), MetricKind::counter(1.0)),
+            MetricRecord::new(intern("h"), histogram(1.0)),
+            MetricRecord::new(intern("h"), histogram(2.0)),
+            MetricRecord::new(intern("h"), histogram(1.0)),
+            MetricRecord::new(intern("n"), MetricKind::counter(f64::NAN)),
+            MetricRecord::new(intern("n"), MetricKind::counter(f64::NEG_INFINITY)),
+            MetricRecord::new(intern("n"), MetricKind::counter(2.0)),
+        ];
+        let metrics_in = records.len() as f64;
+        let first = records.remove(0);
+        let mut event = Event::metric(0, AttrMap::new(), first);
+        event.metrics.extend(records);
+        assert!(agg.process(&resource, &mut event));
+        assert_eq!(event.metrics.len(), 7, "the passed-through records stay on the event");
+
+        let events = registry.drain(0);
+        assert_eq!(absorbed(&events), 4.0);
+        assert_eq!(passed_through(&events, "no_recorded_value"), 1.0);
+        assert_eq!(passed_through(&events, "no_merge_rule"), 2.0);
+        assert_eq!(passed_through(&events, "kind_conflict"), 1.0);
+        assert_eq!(passed_through(&events, "histogram_bounds_mismatch"), 1.0);
+        assert_eq!(passed_through(&events, "non_finite"), 2.0);
+        let reasons = [
+            "no_recorded_value",
+            "no_merge_rule",
+            "kind_conflict",
+            "histogram_bounds_mismatch",
+            "non_finite",
+        ];
+        let passed: f64 = reasons.iter().map(|r| passed_through(&events, r)).sum();
+        assert_eq!(metrics_in, absorbed(&events) + passed);
+    }
+
+    /// A statsd `1e308|c|@0.5` extrapolates to infinity. It passes through instead of merging, so
+    /// a cumulative total stays finite for the rest of the series' life.
+    #[test]
+    fn a_non_finite_delta_sum_passes_through_and_leaves_the_total_finite() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        for bad in [f64::INFINITY, f64::NAN] {
+            let forwarded =
+                feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(bad), 0));
+            assert!(forwarded.is_some(), "a non-finite delta sum is forwarded");
+        }
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 0));
+        assert_eq!(sum_of(&flush_events(&mut agg, 10)[0].1[0]).value, 3.0);
     }
 }
 
