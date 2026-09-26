@@ -2055,8 +2055,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   than the last point it emitted.** The new `first_seen` comes from the re-opening event's source
   timestamp, while the previous point carries the flush clock. The start time still changes, so a
   consumer still sees the reset and re-bases; it can't assume the new start is later than the old
-  point. Raise `max_retained_series` if evictions show in
-  `logit.transform.series.evicted{reason="cardinality"}`. Same amendment as above.
+  point. The amendment cited above settles the fix (`agg/w3`): the start will be clamped between
+  the window the series opened in and the flush that emits it.
 
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 

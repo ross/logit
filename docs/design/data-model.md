@@ -427,13 +427,6 @@ shaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-tr
 ones, temporality and monotonicity on `Sum`, and sum/count/min/max on
 `Histogram`/`ExponentialHistogram`/`Summary`.
 
-Under `aggregate`, a metric series' identity is structural: name, unit, and attribute set, with
-`f64` values compared by bit pattern (`NaN` equals itself, `-0.0` doesn't equal `0.0`) and numeric
-variants kept distinct (`I64(1)`, `U64(1)`, and `F64(1.0)` are three series). [ADR
-`aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment: series
-identity, merge laws, and accounting as a stated contract (2026-09-26)" has the full rule and the
-merge laws built on it.
-
 - `Distribution` uses **DDSketch** (`logit_core::sketch`, hand-rolled with the Datadog Agent's
   own bin mapping so a sketch relays to and from Datadog bin-for-bin, [ADR
   `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)), which merges with
@@ -470,6 +463,13 @@ merge laws built on it.
   configured; for a delta `Sum` that is opt-in (`temporality: cumulative`). See
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s gauge-retention
   amendment for why.
+
+Under `aggregate`, a metric series' identity is structural: name, unit, and attribute set, with
+`f64` values compared by bit pattern (`NaN` equals itself, `-0.0` doesn't equal `0.0`) and numeric
+variants kept distinct (`I64(1)`, `U64(1)`, and `F64(1.0)` are three series). [ADR
+`aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment: series
+identity, merge laws, and accounting as a stated contract (2026-09-26)" has the full rule and the
+merge laws built on it.
 
 **A `Distribution`'s `count()` is a population estimate**, not a count of retained raw observations,
 wherever a sample rate applies. `aggregate`'s default `distributions: sketch` mode inserts
