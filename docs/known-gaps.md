@@ -261,8 +261,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   of this gap; see "`prometheus_out` has no TLS and no auth either" under [Prometheus](#prometheus).)
 - **Readiness is per-process, not per-sink.** A single sink stuck retrying (`degraded`, in the
   self-logging sense) does not flip `/readyz` to unready; a sink's own `buffer:` block (retry
-  budget, queue depth) exists to absorb that. `/readyz`'s `degraded` phase is reserved for a node
-  that has exited with an error, not one that's merely behind. A richer per-sink probe would be
+  budget, queue depth) exists to absorb that. `/readyz`'s `degraded` is reserved for a node that
+  has exited with an error, not one that's merely behind. The one non-exited not-ready answer is
+  `503 stalled`, for a `lua`/`lua_file` component inside a script call with no progress
+  ([ADR `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md)), which clears when the
+  script resumes, with no phase change. A richer per-sink probe would be
   additive to `PipelineState.components` (already keyed by component id); not built because nothing
   has asked for it.
 - **The published `ghcr.io/ross/logit` image is `latest` only, amd64 only, unsigned, and
@@ -282,7 +285,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   fail-fast-for-the-supervisor posture ADR `service-lifecycle-and-output-retry` takes for every
   node. Unchanged: a script's *own* `process()`/`flush()` errors are logged and counted, never
   fatal, so only a Rust panic can kill the thread; a `lua_file`/`Lua` script that fails to *load* is
-  still a startup failure (exit `1`), caught by the ready handshake.
+  still a startup failure (exit `1`), caught by the ready handshake. A script that never *returns*
+  is the same watcher's job too ([ADR `lua-runaway-script-bounds`](adr/lua-runaway-script-bounds.md)):
+  no progress for 10 s inside one call reads `stalled` (`/readyz` `503 stalled`, a
+  `script_stalled` diagnostic), and still no progress 2 s into a shutdown is a wedge, where the
+  watcher revokes the node's channels and fails the run with exit `2` naming it, leaving the thread
+  behind for `main`'s exit to reclaim.
 
 ## Native wire format, `logit_in`/`logit_out`, and buffering
 
@@ -2141,6 +2149,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   unguarded re-entrancy; a no-allocation infinite loop is caught only by the stall heartbeat; and
   interner growth from script-derived strings (`Event.new`'s and the proxy setters'
   name/unit/description fields, and nested attribute keys) is accepted like `telemetry`'s tags.
+  A script looping over `Event.new` forever advances the heartbeat, so it is never stalled or
+  wedged; telling it from a large `flush()` would need a time limit, which the ADR declines.
+  Each Lua thread runs on an 8 MiB stack (virtual, committed on touch) so pure-Lua recursion through
+  C frames (`string.gsub` callbacks a few hundred deep) doesn't abort the process; recursion deeper
+  still through C frames can overflow it and abort, a crafted-script case under
+  [ADR `deployment-threat-model`](adr/deployment-threat-model.md).
 
 ## Internal telemetry and self-logging
 

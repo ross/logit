@@ -428,6 +428,20 @@ The last two rows are Lua-specific (recorded in `run_lua`, not shared with
 `run_transform`/`run_output`), because only a Lua node has a VM to sample or a script return value
 to classify. Every other row applies uniformly across component kinds.
 
+**A Lua node's watcher adds two diagnostic keys and no metric**
+([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)). `watch_lua_thread`
+reads the thread's heartbeat and reports `script_stalled` through `Diagnostics::warn_throttled`
+once per stall, when the thread has sat inside one `process()`/`flush()` call with no progress
+for its `stall_after` (10 s), so a stall also counts
+`logit.component.diagnostics{key="script_stalled"}`.
+It reports `script_resumed` through `Diagnostics::info` when progress returns, which counts
+nothing. The node's `/readyz` state (`stalled`) is the durable signal; the diagnostic is the
+alert. A node wedged at shutdown fails the run with an error naming it, not a diagnostic key.
+A script looping over `Event.new` forever advances the heartbeat and is never stalled or
+wedged: telling it from a large `flush()` would take a time limit, which the ADR declines.
+Events it produced after its channels were revoked count as
+`events.dropped{reason="closed_consumer"}` under its own id.
+
 **`unrouted` is counted explicitly** ([ADR `target-components`](../adr/target-components.md)).
 `Fanout` returns early on zero consumers and counts nothing, and the ADR's rule is that unrouted
 events are dropped and counted, never silently. A router *with* ordinary consumers never emits
@@ -1334,6 +1348,10 @@ leaking stateful script) and `logit.script.events.emitted{outcome}`, both from t
 layer 2). Uniquely, a script can also call a **script-facing** `telemetry` global
 (`telemetry.count(...)`/`.gauge(...)`) for domain facts only the script knows. See
 [Metrics from Lua scripts](#metrics-from-lua-scripts) and `docs/design/lua-api.md`.
+
+The runtime's stall watcher adds the `script_stalled` (`warn_throttled`, so counted in
+`logit.component.diagnostics{key}`) and `script_resumed` (`info`) diagnostic keys; see layer 2's
+[receive and processing side](#receive-and-processing-side-the-node-loops).
 
 #### Outputs
 

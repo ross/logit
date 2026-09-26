@@ -186,6 +186,21 @@ Filled in as each workstream lands.
 
 - `luab/w1` (CORE-17, CORE-18): pending.
 - `luab/w2` (CORE-16, CORE-15 sandbox half): pending.
-- `luab/w3` (RT-11, CORE-15 limits half): pending.
+- `luab/w3` (RT-11, CORE-15 limits half): `logit_script::Heartbeat`, `NodeState::Stalled`, and the
+  watcher's revocable `LuaIo`, pinned in `crates/logit-pipeline/src/runtime.rs` by
+  `an_infinite_loop_script_is_reported_stalled_and_degrades_readyz`,
+  `shutdown_with_a_wedged_script_revokes_its_io_and_returns_runtime_naming_it`,
+  `a_progressing_flush_emitting_many_events_is_never_stalled`,
+  `a_loop_that_keeps_constructing_events_is_progress_not_a_stall`,
+  `a_lua_node_blocked_on_a_full_sink_inbox_unparks_within_the_sinks_grace_and_returns_ok`,
+  `a_later_script_failing_to_load_returns_startup_promptly`,
+  `an_interval_tick_runs_flush_through_the_elapsed_branch`, and the paused-time watcher tests
+  `watch_lua_thread_maps_each_outcome`, `a_busy_heartbeat_that_stops_advancing_is_stalled_and_resumes`,
+  `an_idle_heartbeat_is_never_stalled`, `a_wedged_node_after_shutdown_has_its_io_revoked_and_fails`,
+  `a_node_already_stalled_at_shutdown_is_revoked_on_the_next_tick`;
+  `readiness.rs`'s `has_stalled_node_reflects_any_stalled_component`; `admin.rs`'s
+  `readyz_wire_matches_the_spec_table` and `a_stalled_node_turns_ready_into_stalled_and_back`;
+  `heartbeat.rs`'s `enter_tick_leave_keep_the_busy_bit_and_advance`. RT-11 findings; CORE-15's time
+  half addended.
 - `luab/w4` (CORE-15 close, `max_memory`): pending.
 - `luab/w5` (CORE-19 close, docs): pending.
