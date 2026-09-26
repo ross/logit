@@ -710,7 +710,7 @@ PROBES = [probe_version, probe_endpoint, probe_body_cap, probe_gzip, probe_code6
 def write_spl():
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(SINCE)))
     lines = [f"# SPL for a manual search pass over this run, whose events were indexed from {SINCE} ({since}).",
-             f"# Run each over all time, adding index_earliest={SINCE} to a `search` query to leave out",
+             f"# Run each over all time, adding _index_earliest={SINCE} to a `search` query to leave out",
              "# earlier runs: the relay leg's events carry their recorded timestamps, so an event-time",
              "# range misses them."]
     label = None
