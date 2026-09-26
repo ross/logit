@@ -316,7 +316,8 @@ impl ScriptWorker {
 ///
 /// Validates a contiguous `1..=n` sequence rather than using `Table::sequence_values`, which
 /// stops at the first gap: `return {[2] = event}` would silently emit nothing. An empty table is
-/// valid and emits nothing.
+/// valid and emits nothing. Every read is raw, as in `crate::value`'s conversion, so a returned
+/// table's metatable runs no code here.
 fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
@@ -329,7 +330,7 @@ fn events_from_table(
     };
     let mut events = Vec::with_capacity(len);
     for i in 1..=len {
-        events.push(proxy::take_event(lua, table.get(i)?)?);
+        events.push(proxy::take_event(lua, table.raw_get(i)?)?);
     }
     Ok(events)
 }

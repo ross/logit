@@ -14,7 +14,10 @@
 //! Every sub-proxy shares its parent's `Rc<RefCell<Event>>`, so a write through one is visible
 //! through all, matching Lua's reference semantics (`local e2 = event` aliases the event).
 
-use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
+use crate::value::{
+    attribute_error, attrmap_to_lua_table, exact_u64_to_lua, lua_to_value, lua_value_matches,
+    value_to_lua,
+};
 use logit_core::interner::{intern, resolve};
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
 use logit_core::{
@@ -405,9 +408,9 @@ impl UserData for AttrsProxy {
                 let key = key.to_str()?;
                 // If `value` is what `value_to_lua` gave for the current content, keep the stored
                 // `Value`, so its variant (`Bytes` vs. `Str`, `U64` vs. `I64`) survives
-                // `event.attributes.x = event.attributes.x` (`lua_value_matches`). The borrow is
-                // released before `lua_to_value`, whose `pairs()` walk over a table can call back
-                // into Lua and re-enter this proxy.
+                // `event.attributes.x = event.attributes.x` (`lua_value_matches`). Conversion
+                // reads the table raw and runs no metamethod, so nothing re-enters this proxy
+                // during it; the borrow is still released first, the cheap ordering.
                 let is_noop = this
                     .0
                     .borrow()
@@ -417,7 +420,8 @@ impl UserData for AttrsProxy {
                 if is_noop {
                     return Ok(());
                 }
-                let value = lua_to_value(value)?;
+                let value = lua_to_value(value)
+                    .map_err(|err| attribute_error("event.attributes", key, err))?;
                 this.0.borrow_mut().attributes.insert(key, value);
                 Ok(())
             },
@@ -863,7 +867,7 @@ fn exp_buckets_table<'lua>(lua: &'lua Lua, bucket: &(i32, Vec<u64>)) -> mlua::Re
     table.set("offset", *offset as i64)?;
     let counts_table = lua.create_table()?;
     for (i, count) in counts.iter().enumerate() {
-        counts_table.set(i + 1, *count as i64)?;
+        counts_table.set(i + 1, exact_u64_to_lua(lua, *count)?)?;
     }
     table.set("counts", counts_table)?;
     Ok(table)
@@ -954,7 +958,7 @@ impl UserData for MetricProxy {
                     _ => Ok(LuaValue::Nil),
                 },
                 "estimate" => match &m.kind {
-                    MetricKind::Set(hll) => Ok(LuaValue::Integer(hll.estimate() as i64)),
+                    MetricKind::Set(hll) => exact_u64_to_lua(lua, hll.estimate()),
                     _ => Ok(LuaValue::Nil),
                 },
                 "buckets" => match &m.kind {
@@ -963,7 +967,7 @@ impl UserData for MetricProxy {
                         for (i, (bound, count)) in h.buckets.iter().enumerate() {
                             let row = lua.create_table()?;
                             row.set("bound", *bound)?;
-                            row.set("count", *count as i64)?;
+                            row.set("count", exact_u64_to_lua(lua, *count)?)?;
                             t.set(i + 1, row)?;
                         }
                         Ok(LuaValue::Table(t))
@@ -990,10 +994,10 @@ impl UserData for MetricProxy {
                 // `distribution`'s is `DdSketch::count()`.
                 "count" => match &m.kind {
                     MetricKind::Distribution(sketch) => {
-                        Ok(LuaValue::Integer(sketch.count() as i64))
+                        exact_u64_to_lua(lua, sketch.count() as u64)
                     }
-                    MetricKind::ExponentialHistogram(e) => Ok(LuaValue::Integer(e.count as i64)),
-                    MetricKind::Summary(s) => Ok(LuaValue::Integer(s.count as i64)),
+                    MetricKind::ExponentialHistogram(e) => exact_u64_to_lua(lua, e.count),
+                    MetricKind::Summary(s) => exact_u64_to_lua(lua, s.count),
                     _ => Ok(LuaValue::Nil),
                 },
                 "scale" => match &m.kind {
@@ -1001,9 +1005,7 @@ impl UserData for MetricProxy {
                     _ => Ok(LuaValue::Nil),
                 },
                 "zero_count" => match &m.kind {
-                    MetricKind::ExponentialHistogram(e) => {
-                        Ok(LuaValue::Integer(e.zero_count as i64))
-                    }
+                    MetricKind::ExponentialHistogram(e) => exact_u64_to_lua(lua, e.zero_count),
                     _ => Ok(LuaValue::Nil),
                 },
                 "zero_threshold" => match &m.kind {
@@ -1220,7 +1222,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
             table.set("sample_rate", s.sample_rate)?;
         }
         MetricKind::Distribution(sketch) => {
-            table.set("count", sketch.count() as i64)?;
+            table.set("count", exact_u64_to_lua(lua, sketch.count() as u64)?)?;
         }
         MetricKind::SetMembers(members) => {
             let t = lua.create_table()?;
@@ -1229,13 +1231,13 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
             }
             table.set("members", t)?;
         }
-        MetricKind::Set(hll) => table.set("estimate", hll.estimate() as i64)?,
+        MetricKind::Set(hll) => table.set("estimate", exact_u64_to_lua(lua, hll.estimate())?)?,
         MetricKind::Histogram(h) => {
             let buckets = lua.create_table()?;
             for (i, (bound, count)) in h.buckets.iter().enumerate() {
                 let row = lua.create_table()?;
                 row.set("bound", *bound)?;
-                row.set("count", *count as i64)?;
+                row.set("count", exact_u64_to_lua(lua, *count)?)?;
                 buckets.set(i + 1, row)?;
             }
             table.set("buckets", buckets)?;
@@ -1246,12 +1248,12 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
         }
         MetricKind::ExponentialHistogram(e) => {
             table.set("scale", e.scale as i64)?;
-            table.set("zero_count", e.zero_count as i64)?;
+            table.set("zero_count", exact_u64_to_lua(lua, e.zero_count)?)?;
             table.set("zero_threshold", e.zero_threshold)?;
             table.set("positive", exp_buckets_table(lua, &e.positive)?)?;
             table.set("negative", exp_buckets_table(lua, &e.negative)?)?;
             table.set("temporality", e.temporality.as_str())?;
-            table.set("count", e.count as i64)?;
+            table.set("count", exact_u64_to_lua(lua, e.count)?)?;
             table.set("sum", opt_number(e.sum))?;
             table.set("min", opt_number(e.min))?;
             table.set("max", opt_number(e.max))?;
@@ -1265,7 +1267,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
                 quantiles.set(i + 1, row)?;
             }
             table.set("quantiles", quantiles)?;
-            table.set("count", s.count as i64)?;
+            table.set("count", exact_u64_to_lua(lua, s.count)?)?;
             table.set("sum", s.sum)?;
         }
     }
@@ -2002,6 +2004,59 @@ mod tests {
             "#,
         );
         w.process(metric_event(sum_kind())).unwrap();
+    }
+
+    /// A count reads the way a `U64` attribute does: an integer up to 2^53, a decimal string past
+    /// it, never a rounded number. Covers the `MetricProxy` fields and `to_table()` alike.
+    #[test]
+    fn a_metric_count_above_two_to_the_53_reads_as_a_decimal_string() {
+        let w = worker(
+            r#"
+            function process(event)
+                local m = event.metrics[1]
+                assert(m.count == "9007199254740993", tostring(m.count))
+                assert(m.zero_count == 9007199254740992, tostring(m.zero_count))
+                assert(m.positive.counts[1] == "18446744073709551615")
+                assert(m.positive.counts[2] == 1)
+                local t = event:to_table().metrics[1]
+                assert(t.count == "9007199254740993", tostring(t.count))
+                assert(t.zero_count == 9007199254740992, tostring(t.zero_count))
+                assert(t.positive.counts[1] == "18446744073709551615")
+                return event
+            end
+            "#,
+        );
+        let kind = MetricKind::ExponentialHistogram(ExpHistogram {
+            scale: 0,
+            zero_count: 1 << 53,
+            zero_threshold: 0.0,
+            positive: (0, vec![u64::MAX, 1]),
+            negative: (0, vec![]),
+            temporality: Temporality::Delta,
+            count: (1 << 53) + 1,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        w.process(metric_event(kind)).unwrap();
+
+        let histogram = worker(
+            r#"
+            function process(event)
+                assert(event.metrics[1].buckets[1].count == "9223372036854775808")
+                assert(event:to_table().metrics[1].buckets[1].count == "9223372036854775808")
+                return event
+            end
+            "#,
+        );
+        let kind = MetricKind::Histogram(Histogram {
+            buckets: vec![(f64::INFINITY, 1 << 63)],
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
+        });
+        histogram.process(metric_event(kind)).unwrap();
     }
 
     #[test]
