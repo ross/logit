@@ -1137,10 +1137,9 @@ never ticks, the same as a script with no `flush()`. Config validation rejects a
 either kind of component.
 
 **`max_memory`** is optional and caps the component's Lua VM heap, as a quoted byte-count string
-(`"256MiB"`). After each batch and each `flush()`, a VM holding more than the cap runs full
-garbage collections, and one still over it after them fails the component and, with it, the
-process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config validation
-rejects `0`. "Costs" below says what the cap covers and how to size it.
+(`"256MiB"`). A VM still over it after full garbage collection fails the component and, with it,
+the process (exit code 2), logging `memory_limit_exceeded`. Omitted means no limit; config
+validation rejects `0`. "Costs" below says what the cap covers and how to size it.
 
 **`targets:`** is optional and lists the `target` components this one may direct events into:
 what `event:to(id)` resolves against ("Routing to a target" above). It sits beside `sources:` on
@@ -1230,15 +1229,13 @@ reaches the host, and each has an ordinary use in a transform script.
 deliberately carries none, so it can't drift when a benchmark changes; see
 [`memory.md`](memory.md) §2 for the current figures.
 
-**`max_memory` bounds the Lua VM heap only.** An event a script retains costs the VM about 150
-bytes while its payload stays in the Rust heap, which the cap doesn't see, so a script that hoards
-events shows in process RSS long before it trips the cap. Size the cap at
-least twice the script's steady working set, read from `logit.script.vm.memory`: LuaJIT's
-incremental collector lets garbage grow to about the live size before a cycle ends, so a tighter
-cap reads over on most batches. Each over-cap reading forces a full collection, rate-limited to
-one per second (or ten times the last collection's duration, if longer) and counted as
-`logit.script.vm.gc.forced`; a reading the limit skips is rechecked when the window ends. A call
-that keeps building and retaining events never returns to that post-call check, so `Event.new`
-checks the cap too: over it after one collection, it raises `Event.new: over max_memory`, and
-every later `Event.new` in that call raises the same error, `pcall` or not, until the call
-returns.
+**`max_memory` bounds the Lua VM heap only** ([ADR
+`lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md), decision 3). An event a script
+retains costs the VM about 150 bytes while its payload stays in the Rust heap, which the cap
+doesn't see, so a script that hoards events shows in process RSS long before it trips the cap.
+Size the cap at least twice the script's steady working set, read from `logit.script.vm.memory`;
+a tighter cap forces a full collection on most batches (`logit.script.vm.gc.forced`). The check
+runs after each batch and `flush()`, and inside a call in `Event.new`, which raises
+`Event.new: over max_memory (<used> > <cap>)` for the rest of the call once the VM is over it.
+`MemoryVerdict` in `crates/logit-pipeline/src/runtime.rs` and the module doc of
+`crates/logit-script/src/memory.rs` have the algorithm.

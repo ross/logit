@@ -425,7 +425,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.script.events.emitted{outcome="emit"\|"emit_many"}` | count | `run_lua`, per `ProcessOutcome` — distinguishes a 1:1 script from a fan-out one |
 | `logit.script.vm.gc.forced` / `.gc.duration` | count / timing | `run_lua`, per `max_memory` verdict: the full collections forced by a VM over its cap, rate-limited to about one a second. A steady count means the cap sits too close to the working set |
 
-The last four rows are Lua-specific (recorded in `run_lua`, not shared with
+The last three rows are Lua-specific (recorded in `run_lua`, not shared with
 `run_transform`/`run_output`), because only a Lua node has a VM to sample or a script return value
 to classify. Every other row applies uniformly across component kinds.
 
