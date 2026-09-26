@@ -398,8 +398,8 @@ fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
 /// Unions `incoming` into the raw members `held` under `sets: members`: insertion-ordered and
 /// deduplicated by linear scan, which the cap keeps affordable. Once `held` passes `cap`, the scan
 /// stops and every held member plus the rest of `incoming` goes into the returned `HyperLogLog`,
-/// so the union survives the conversion. One oversized record then costs O(cap²) compares and
-/// cap-bounded memory, not its own size squared.
+/// so the union survives the conversion. The scan makes at most `cap` compares per member, so
+/// one oversized record costs O(n·cap) compares and cap-bounded memory, not its own size squared.
 ///
 /// Also returns how many member compares the scan made, so a test can bound the cost without a
 /// clock.

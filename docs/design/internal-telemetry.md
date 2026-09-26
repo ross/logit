@@ -1150,7 +1150,7 @@ amendment.
 unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
 and `sample_rate_clamped` (mirroring the raw-retention counters); `kind_conflict` (a metric whose
 kind conflicts with an already-accumulating series under the same name/unit/tags, forwarded
-untouched); and `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
+untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
 accumulating series', also forwarded untouched, under its own key so an operator knows it's a
 producer that re-bucketed rather than two kinds colliding); and `sum_non_finite` (a delta `Sum`
 whose value is `NaN` or infinite, forwarded untouched).
