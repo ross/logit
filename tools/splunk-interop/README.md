@@ -109,8 +109,9 @@ is `FAIL`, with the request counts by class (`network_error` included), the drop
 reason, the batches dropped, and the retries in its detail. The row carries the SPL that would
 confirm arrival. `search.spl` collects those
 queries and the probes', each under a `# <leg or probe>` comment, for a search pass by hand or in
-a browser afterward: run each over all time, adding `index_earliest` set to the epoch in the
-file's header to a `search` query, since the relay leg's events carry their recorded timestamps.
+a browser afterward: run each over all time, adding the SPL modifier `_index_earliest=<epoch>`,
+with the epoch in the file's header, to a `search` query, since the relay leg's events carry their
+recorded timestamps.
 The probes still post and record what the stack answered, with `not searched` where they would
 have checked indexing. `max_content_length` needs the REST API and is `SKIP`; `[tcpout]` needs
 the local `rawcap` and is `SKIP` in cloud mode.
