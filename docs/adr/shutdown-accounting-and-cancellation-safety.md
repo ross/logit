@@ -482,9 +482,13 @@ amendment:
   checkpoint tick before the next pass. Before, a backlog read against a slow downstream ran no tick
   until it was done, so a grace-cut shutdown replayed the whole backlog read so far. Now it replays
   at most one 64 KiB chunk per file.
-- `TailDecoder::held_bytes` reports the complete lines a decoder holds, and `write_checkpoint`
-  subtracts them. `docker_in` holds the fragments of an entry over 16 KiB, which an interval
-  checkpoint used to cover, so a crash before the closing fragment lost the message's head.
+- `read_one` records `held_from`, the file offset of the oldest line the decoder still holds
+  (`TailDecoder::holds_entry`), and `write_checkpoint` persists the smaller of that and the
+  splitter's line boundary. `docker_in` holds the fragments of an entry over 16 KiB, which an
+  interval checkpoint used to cover, so a crash before the closing fragment lost the message's
+  head. It's a position, not a byte count to subtract: a line the decoder rejects, or one the
+  splitter drops as oversized, can follow the held run and advance the offset without clearing
+  it, and a subtracted count would then land inside the held run.
 - `reap_drained` dirties the checkpoint, so the next interval write drops a reaped inode's entry
   instead of leaving it for a new file reusing the inode to resume from.
 
@@ -511,9 +515,12 @@ auto-advance while a blocking-pool task runs, so `tokio::fs` reads and checkpoin
   that a restart resumes there.
 - `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` sees an
   interval write, not shutdown's, drop a removed file's entry.
-- `docker.rs`: `an_interval_checkpoint_never_covers_a_held_fragment_line` and
-  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`, plus the unit test
-  `held_bytes_counts_each_held_fragment_line_until_the_closing_fragment`.
+- `docker.rs`: `an_interval_checkpoint_never_covers_a_held_fragment_line`,
+  `a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart`,
+  `a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run`,
+  and `an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start`,
+  plus the unit test `holds_entry_from_the_first_fragment_until_the_closing_fragment`.
+  `tail/line.rs`'s `push_reports_where_each_line_starts` pins the line starts `read_one` records.
 
 Every test but the grace-cut pin failed with its fix removed. The existing
 `a_draining_file_with_more_than_one_chunk_of_backlog_is_fully_read_before_close` now reaches

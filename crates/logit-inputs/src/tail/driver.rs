@@ -126,6 +126,11 @@ struct TrackedFile<D> {
     decoder: D,
     accumulator: BatchAccumulator,
     state: FileState,
+    /// The file offset where the oldest line the decoder still holds starts
+    /// ([`TailDecoder::holds_entry`]), or `None` while it holds nothing. Set by `read_one` when a
+    /// line starts a held run, cleared once the decoder holds nothing, and on a truncation or
+    /// close.
+    held_from: Option<u64>,
     /// This file's `inotify` watch, added in `Tailer::open_tracked` and removed in
     /// `Tailer::reap_drained`. `None` under `WatchMode::Poll`, or if `inotify_add_watch` failed
     /// (diagnosed `watch_error`; the file then relies on `poll_interval`). Not re-registered on a
@@ -514,6 +519,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // reassembly); see `TailDecoder::reset`.
         tracked.splitter = LineSplitter::new(max_line_bytes);
         tracked.decoder.reset();
+        tracked.held_from = None;
         let path = tracked.path.clone();
         self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
@@ -635,6 +641,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             decoder,
             accumulator: BatchAccumulator::new(batching.max_events, batching.max_bytes),
             state: FileState::Active,
+            held_from: None,
             watch,
         };
         self.by_path.insert(path, id);
@@ -649,8 +656,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// read without waiting for another wake and a backlog still yields to the run loop's timers.
     /// Closes `Draining` and `Deselected` files that made no progress.
     ///
-    /// Shutdown is checked between files; one chunk's read and decode is bounded, but its `emit`s
-    /// wait on the downstream. `due` is checked only after a whole pass and its `reap_drained`:
+    /// Where shutdown is checked, and what that bounds, is in `docs/design/pipeline-graph.md`'s
+    /// "Cancellation points". `due` is checked only after a whole pass and its `reap_drained`:
     /// `at_eof` is the set of files a pass read to EOF, and stopping mid-pass would leave files
     /// that were never read looking like they had reached it. At least one pass always runs, so a
     /// `select!` that keeps picking a ready wake still reads.
@@ -710,13 +717,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let read_at = now_nanos();
         let bytes = Bytes::copy_from_slice(&chunk[..n]);
 
-        let mut lines: Vec<Bytes> = Vec::new();
+        // Each line with the file offset it starts at, for `TrackedFile::held_from`.
+        let mut lines: Vec<(Bytes, u64)> = Vec::new();
         let dropped = {
             let tracked = match self.files.get_mut(&id) {
                 Some(t) => t,
                 None => return false,
             };
-            let stats = tracked.splitter.push(bytes, |line| lines.push(line));
+            let chunk_start = tracked.offset;
+            let partial_start = chunk_start - tracked.splitter.pending_bytes();
+            let stats = tracked.splitter.push(bytes, |line, start| {
+                let start = start.map_or(partial_start, |i| chunk_start + i as u64);
+                lines.push((line, start));
+            });
             tracked.offset += n as u64;
             stats.dropped_lines
         };
@@ -728,12 +741,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
 
         let mut scratch: Vec<Event> = Vec::new();
-        for line in lines {
+        for (line, line_start) in lines {
             let line = ensure_utf8(line, &mut self.diag);
             let Some(tracked) = self.files.get_mut(&id) else { return false };
             self.telemetry.count("logit.input.lines", 1.0, &[]);
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
-            match tracked.decoder.decode_line(line, read_at, &mut scratch) {
+            let decoded = tracked.decoder.decode_line(line, read_at, &mut scratch);
+            // A rejected line leaves the held run as it was, so `held_from` keeps its start.
+            if !tracked.decoder.holds_entry() {
+                tracked.held_from = None;
+            } else if tracked.held_from.is_none() {
+                tracked.held_from = Some(line_start);
+            }
+            match decoded {
                 Ok(resource) => {
                     // No scope: a tailed line has no instrumentation scope.
                     if let Some((batch, reason)) =
@@ -831,15 +851,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ///
     /// `offset` advances per chunk, so it also covers bytes that haven't produced an event yet:
     /// the splitter's held partial line ([`LineSplitter::pending_bytes`]) and the complete lines
-    /// the decoder holds across lines ([`TailDecoder::held_bytes`], `docker_in`'s fragments of a
-    /// split entry). Both are subtracted. A file mid-drop holds no partial, so its offset lands
-    /// inside the dropped line, and a restart there treats the rest of it as a new line. At
-    /// shutdown `close_all_for_shutdown` has already emitted both, so both are `0`.
+    /// the decoder holds (`docker_in`'s fragments of a split entry). The persisted offset is the
+    /// smaller of the splitter's line boundary and `held_from`, the start of the oldest line the
+    /// decoder still holds. A line rejected or dropped after that held run advances `offset`
+    /// without clearing it, which is why it's a position and not a byte count to subtract. A file
+    /// mid-drop holds no partial, so its offset lands inside the dropped line, and a restart there
+    /// treats the rest of it as a new line. At shutdown `close_all_for_shutdown` has already
+    /// emitted both, so the offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let entries = self.files.values().map(|f| {
-            let held = f.splitter.pending_bytes() + f.decoder.held_bytes();
-            (f.id, f.path.as_path(), f.offset.saturating_sub(held))
+            let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
+            (f.id, f.path.as_path(), boundary.min(f.held_from.unwrap_or(u64::MAX)))
         });
         checkpoint.write(entries, force, &mut self.diag, &self.telemetry).await;
     }
@@ -874,6 +897,7 @@ async fn close_decoder<D: TailDecoder>(
     }
 
     tracked.decoder.close(&mut scratch);
+    tracked.held_from = None;
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();
         if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {

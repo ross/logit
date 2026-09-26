@@ -29,11 +29,11 @@ pub trait TailDecoder: Send {
     /// [`LineSplitter::take_partial`]'s job, not this. Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
 
-    /// The on-disk bytes of the complete lines this decoder holds without having produced their
-    /// events yet: what [`TailDecoder::close`] would emit. `Tailer::write_checkpoint` subtracts
-    /// it, so a checkpoint never covers a held line. Default: nothing held.
-    fn held_bytes(&self) -> u64 {
-        0
+    /// Whether this decoder holds complete lines it hasn't produced events for yet: what
+    /// [`TailDecoder::close`] would emit. The driver records where the oldest such line starts
+    /// and never checkpoints past it. Default: nothing held.
+    fn holds_entry(&self) -> bool {
+        false
     }
 
     /// The file was truncated in place: drop, **not** emit, everything held across lines.
@@ -83,9 +83,13 @@ impl LineSplitter {
 
     /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, no trailing `\r`).
     ///
+    /// `emit`'s second argument is where the line starts: `Some(i)` at index `i` of `chunk`, or
+    /// `None` when it began in an earlier chunk, at the start of the partial
+    /// [`LineSplitter::pending_bytes`] counted before this call.
+    ///
     /// A line over `max_line_bytes` (measured before the `\r` strip) is dropped whole, never
     /// truncated, and counted in the returned [`LineStats`].
-    pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes)) -> LineStats {
+    pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes, Option<usize>)) -> LineStats {
         let mut stats = LineStats::default();
         let mut start = 0usize;
         while start < chunk.len() {
@@ -104,7 +108,7 @@ impl LineSplitter {
                     if seg.len() > self.max_line_bytes {
                         stats.dropped_lines += 1;
                     } else {
-                        emit(strip_cr(seg));
+                        emit(strip_cr(seg), Some(start));
                     }
                 } else if seg.len() > self.max_line_bytes {
                     stats.dropped_lines += 1;
@@ -120,7 +124,7 @@ impl LineSplitter {
                 self.partial.extend_from_slice(&seg);
                 if nl.is_some() {
                     let line = self.partial.split().freeze();
-                    emit(strip_cr(line));
+                    emit(strip_cr(line), None);
                 }
             }
 
@@ -219,8 +223,21 @@ mod tests {
 
     fn lines_of(splitter: &mut LineSplitter, chunk: &[u8]) -> (Vec<Vec<u8>>, LineStats) {
         let mut out = Vec::new();
-        let stats = splitter.push(Bytes::copy_from_slice(chunk), |line| out.push(line.to_vec()));
+        let stats = splitter.push(Bytes::copy_from_slice(chunk), |line, _| out.push(line.to_vec()));
         (out, stats)
+    }
+
+    /// `push` reports an in-chunk line's start index, and `None` for a line continued from a
+    /// previous chunk's partial.
+    #[test]
+    fn push_reports_where_each_line_starts() {
+        let mut s = LineSplitter::new(1024);
+        let mut starts = Vec::new();
+        s.push(Bytes::from_static(b"ab\ncd\nef"), |_, start| starts.push(start));
+        assert_eq!(starts, vec![Some(0), Some(3)]);
+        starts.clear();
+        s.push(Bytes::from_static(b"g\nhi\n"), |_, start| starts.push(start));
+        assert_eq!(starts, vec![None, Some(2)]);
     }
 
     #[test]
@@ -315,7 +332,7 @@ mod tests {
         let chunk = Bytes::copy_from_slice(b"hello\n");
         let chunk_ptr = chunk.as_ptr();
         let mut emitted = None;
-        s.push(chunk, |line| emitted = Some(line));
+        s.push(chunk, |line, _| emitted = Some(line));
         let line = emitted.expect("should have emitted one line");
         let offset = line.as_ptr() as usize - chunk_ptr as usize;
         assert_eq!(offset, 0);
