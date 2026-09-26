@@ -38,7 +38,7 @@
 //! `event.span` is read-only (`crate::proxy`'s `SpanProxy`).
 
 use crate::proxy::{EventProxy, TargetTable};
-use crate::value::{lua_to_value, validated_sequence_len};
+use crate::value::{lua_to_value, prefixed_error, validated_sequence_len};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
@@ -1201,12 +1201,8 @@ fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Val
         | LuaValue::Integer(_)
         | LuaValue::Number(_)
         | LuaValue::String(_) => lua_to_value(value),
-        LuaValue::Table(_) => lua_to_value(value).map_err(|err| match err {
-            mlua::Error::RuntimeError(msg) => {
-                runtime_error(format!("Event.new: {}: {msg}", field()))
-            }
-            other => other,
-        }),
+        LuaValue::Table(_) => lua_to_value(value)
+            .map_err(|err| prefixed_error(&format!("Event.new: {}", field()), err)),
         other => Err(runtime_error(format!(
             "Event.new: {} can't be a Lua {}",
             field(),
@@ -2966,6 +2962,8 @@ mod tests {
         assert!(err.contains("nested more than 128 levels deep"), "got: {err}");
     }
 
+    /// Pins the raw-read guarantee rather than reproducing a regression: `Table::get` consults
+    /// `__index` only for a nil raw value, and every index here is present.
     #[test]
     fn event_new_with_a_nested_metatable_array_reads_raw() {
         let w = worker(

@@ -196,10 +196,17 @@ ADR's shape symmetry holds: `Event.new` accepts every form `to_table()` emits.
 `crates/logit-script/tests/event_new_fixed_point.rs` checks the fixed point over generated
 events, full-range counts included, against the residual list above.
 
-That test found one residual the list above lacked: a nonzero number smaller than `f64::EPSILON`
-in magnitude reads back from Lua as `0`, because mlua 0.9.9's LuaJIT conversion reads any number
-within `f64::EPSILON` of an integer as that integer. A metric value, bound, or float attribute of
-`1e-20` comes back `0` through `Event.new`, and so does one written back through a proxy
-(`event.attributes.x = event.attributes.x` stores `I64(0)`). The test's
-number generator leaves such values out; closing it needs a number read that bypasses mlua's
-`Value` conversion.
+Three residuals the list above lacked, each of which the test's generator leaves out:
+
+- A nonzero number smaller than 2^-52 in magnitude reads back from Lua as `0`. mlua 0.9.9's
+  LuaJIT number read (`pop_value`/`stack_value`) truncates toward zero with `num_traits::cast`
+  and keeps that integer when `(n - i as f64).abs() < f64::EPSILON`, so only `0 < |x| < 2^-52`
+  (and `-0.0`) collapse; `1 - 2^-53` truncates to `0` and stays a number. A metric value, bound,
+  or float attribute of `1e-20` comes back `0` through `Event.new`, and so does one written back
+  through a proxy (`event.attributes.x = event.attributes.x` stores `I64(0)`). Closing it needs
+  a number read that bypasses mlua's `Value` conversion.
+- A `Value::Null` attribute or array element. `to_table()` emits it as `nil`, which is an absent
+  key, so a `Null` attribute disappears and `Array([I64(1), Null, I64(2)])` comes back as
+  `Map{"1": 1, "3": 2}`.
+- An empty `Array` comes back an empty `Map`, the flattening Decision's "an empty table becomes
+  an empty `Map`" names.
