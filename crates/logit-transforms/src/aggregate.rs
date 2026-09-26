@@ -778,28 +778,33 @@ impl Aggregator {
                         }
                         true
                     }
-                    // `sets: members`: an insertion-ordered union, deduplicated by linear scan
-                    // (fine at the cap size). Past the cap, every held and incoming member goes
-                    // into a `HyperLogLog`, so the union survives the conversion.
+                    // `sets: members`: an insertion-ordered union, deduplicated by linear scan,
+                    // which the cap keeps affordable. The scan stops once the union passes the
+                    // cap: every held member and the rest of the record go into a
+                    // `HyperLogLog`, so the union survives the conversion, and one oversized
+                    // record costs O(cap²) compares and cap-bounded memory, not its own size
+                    // squared.
                     Accumulator::SetMembers(held) => {
-                        let mut merged = std::mem::take(held);
-                        for m in incoming {
-                            if !merged.contains(m) {
-                                merged.push(m.clone());
+                        let mut rest = incoming.iter();
+                        let mut overflowed = false;
+                        for m in rest.by_ref() {
+                            if !held.contains(m) {
+                                held.push(m.clone());
+                                if held.len() > max_set_members_per_series {
+                                    overflowed = true;
+                                    break;
+                                }
                             }
                         }
-                        if merged.len() > max_set_members_per_series {
+                        if overflowed {
                             let mut hll = logit_core::HyperLogLog::new();
-                            for m in &merged {
+                            for m in held.iter().chain(rest) {
                                 hll.insert(m);
                             }
                             state.accumulator = Accumulator::Set(hll);
                             set_members_fallback = true;
-                            true
-                        } else {
-                            *held = merged;
-                            true
                         }
+                        true
                     }
                     _ => false,
                 },
@@ -3862,6 +3867,41 @@ mod tests {
             }
             other => panic!("expected raw Samples, got {other:?}"),
         }
+    }
+
+    /// One record far past `max_set_members_per_series` stops the deduplicating scan at the cap
+    /// and streams the rest into the `HyperLogLog`, instead of unioning the whole record first
+    /// (quadratic in the record's own size).
+    #[test]
+    fn a_set_members_record_past_the_cap_falls_back_without_a_quadratic_union() {
+        const CAP: usize = 1000;
+        const MEMBERS: usize = 20 * CAP;
+        let resource = default_resource();
+        let (agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, CAP));
+        let mut agg = agg;
+        let members: Vec<Bytes> = (0..MEMBERS).map(|i| Bytes::from(i.to_string())).collect();
+
+        let started = std::time::Instant::now();
+        feed(&mut agg, &resource, metric_event("u", MetricKind::SetMembers(members), 0));
+        let elapsed = started.elapsed();
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_with_tag(&events, "logit.transform.set_members.fallback", "reason", "cap"),
+            Some(1.0)
+        );
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Set(hll) => {
+                let estimate = hll.estimate() as f64;
+                let error = (estimate - MEMBERS as f64).abs() / MEMBERS as f64;
+                assert!(error < 0.05, "estimate {estimate} for {MEMBERS} members");
+            }
+            other => panic!("expected a Set, got {other:?}"),
+        }
+        // A union of the whole record is about MEMBERS² / 2 = 2e8 compares, about 3 s in a debug
+        // build; stopping at the cap is about CAP² / 2 = 5e5.
+        assert!(elapsed < Duration::from_millis(1500), "absorb took {elapsed:?}");
     }
 }
 
