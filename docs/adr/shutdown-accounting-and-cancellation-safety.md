@@ -132,9 +132,10 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    drops `deliver_with_retry`. `write_loop` will track whether a send is in flight with a flag set
    immediately before the `timeout(remaining, output.send(batch))` await and cleared as soon as it
    returns. A grace
-   expiry while the flag is clear leaves the batch uncommitted under either posture. That covers
-   a `select!` that never polled the deliver arm, and a grace that lands during a backoff sleep:
-   neither is a send in flight.
+   expiry while the flag is clear leaves the batch uncommitted under either posture, as for a
+   grace that lands during a backoff sleep. `deliver_with_retry` also checks the anchored
+   deadline before every attempt and starts none once it has passed (`Delivery::GraceExpired`),
+   so a send never starts after the deadline to be read as cut off.
 4. **The UDP shutdown remainders are counted** as `datagrams.dropped` and
    `bytes.dropped{reason="shutdown"}`. There are four:
    - **A cancelled `push_many`'s remainder.** A new `CountedDrain` wrapper around a `Vec`'s drain
@@ -182,8 +183,9 @@ was missing was executable evidence under real concurrency, and the shutdown acc
      defer the backstop.
 
    `shutdown_grace_expired` anchors its deadline at the first poll of a grace arm after the
-   signal, not at the signal itself. `unconstrained` keeps that first poll within one poll of the
-   signal.
+   signal, not at the signal itself. `unconstrained` keeps that first poll within a few wakes of
+   the signal, not one: `run_output`'s outer `select!` is unbiased, and `drain_inbox` can spend
+   the coop budget before `write_loop` is polled.
 7. **A listener's shutdown grace is enforced only by the runtime.**
    `InputRuntimeConfig::shutdown_grace`, read by `run_input`, is the one copy. The three
    per-listener copies (`TailBatching`, `UdpListenerConfig`, `TcpListenerConfig`) will be removed
@@ -346,7 +348,65 @@ proptest and the `BoundedQueue` ledger; removing `push_many`'s pre-wait `notify_
 
 ### `drain/w2`: runtime shutdown accounting (RT-02, RT-03, RT-04)
 
-Filled in by `drain/w2`.
+`drain/w2` lands decisions 2, 3, 6, and 9 in `crates/logit-pipeline/src/runtime.rs`, and the new
+`batches.delivered`/`events.delivered` counters. `deliver_with_retry` returns
+`Delivery::GraceExpired`, starting no send, before any attempt that would begin at or past the
+anchored grace deadline. `count_shutdown_drop` counts every
+`reason="shutdown"` batch drop at `run_output`'s sweep, `finish_and_flush`, `write_loop`'s
+grace-cut send, and both of `revoke_lua_io`'s callers. `run_output` closes its inbox before the
+sweep and bounds its `recv` loop with `SWEEP_DRAIN_TIMEOUT` (250 ms); the sweep counts `received`
+for each batch it takes from the inbox. The runtime's rows in `docs/design/pipeline-graph.md`'s
+"Cancellation points" table land with it.
+
+Tests in `runtime.rs`, on a paused clock unless noted:
+
+- `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled` covers
+  five exit paths (the drain finishing first, a grace expiring during retries, a grace cutting off
+  an in-flight send, a permanent-failure exit, and a clean close), under both postures and both
+  stores. It reads `received` and `delivered` from telemetry and checks `received == delivered +
+  Σ dropped + spooled`, that the `drain complete` total equals `dropped{reason="shutdown"}`, and
+  that a disk sink drops for shutdown only a send the grace cut off under `at_most_once`.
+- `a_send_cut_off_by_shutdown_grace_is_committed_and_counted_under_at_most_once` (memory and disk)
+  checks one `shutdown` drop, an error span tagged `fault=ambiguous`, and no replay on reopen.
+- `a_send_cut_off_by_shutdown_grace_stays_queued_for_replay_under_at_least_once` checks that a disk
+  spool replays the batch and a memory store's `finish` counts it once.
+- `a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish` checks that the
+  reserved head and the batch behind it are each counted once.
+- `a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once`
+  checks that a grace landing in a backoff sleep commits nothing, counts nothing, and tags no
+  fault. `shutdown_grace_expiry_ends_write_loop_promptly_leaving_the_remainder_for_run_output`
+  passes unchanged.
+- `a_send_that_completes_in_the_same_wake_as_the_grace_deadline_is_counted_delivered` resolves the
+  send at the grace deadline, 16 times; unbiased, about half would read as cut off.
+- `a_batch_queued_behind_a_send_that_completes_at_the_grace_deadline_is_not_started_and_stays_uncommitted`
+  (memory and disk, at-most-once, 16 times) checks that the next batch starts no send: no
+  `ambiguous` tag, a memory store's `shutdown` count comes only from `finish`, and a disk spool
+  replays it.
+- `a_backoff_ending_at_the_grace_deadline_does_not_start_another_attempt` ends a clean failure's
+  backoff at the deadline and checks that no second attempt starts, nothing is tagged, and a disk
+  spool replays the batch.
+- `drain_complete_reports_every_batch_dropped_for_shutdown_including_those_finish_drops` runs a
+  full pipeline into a sink that never delivers and checks the logged `batches_dropped` against
+  the telemetry sum, with drops from the sweep, `finish`, and the `at_most_once` cut.
+  `a_lua_node_over_max_memory_fails_the_run_as_runtime_naming_it` (multi-thread, real time) checks
+  the same for a `max_memory` revoke.
+- `a_batch_sent_into_the_inbox_after_the_sweep_began_is_counted_not_silently_lost` parks a
+  producer on a one-slot inbox and holds the sink's `flush()` open, then checks that the producer's
+  `batches.sent` equals the sink's `received` plus the sends refused upstream as
+  `closed_consumer`.
+- `an_input_that_burns_its_coop_budget_after_the_signal_is_still_cancelled_at_the_grace_deadline`
+  runs an input that sends forever after the signal, advancing the clock by hand because a busy
+  runtime never auto-advances, and bounds the wait so a regression fails.
+- `an_input_error_at_the_grace_deadline_is_never_swallowed_by_the_backstop` returns an `Err` in the
+  backstop's wake, 32 times, and expects every one.
+- `a_shutdown_grace_expired_call_polled_after_the_signal_then_dropped_keeps_its_anchor` and
+  `a_shutdown_grace_expired_call_never_polled_after_the_signal_anchors_nothing` pin the anchor at
+  the first poll after the signal.
+
+Each new ordering was checked against its removal: dropping `biased` from `run_input` fails the
+input-error test, dropping it from the deliver `select!` fails the same-wake test, dropping
+`inbox.close()` fails the late-send test, dropping `run_input`'s `unconstrained` fails the
+coop-budget test, and dropping the pre-attempt deadline check fails both `GraceExpired` tests.
 
 ### `drain/w3`: UDP read and decode loops (NET-02, NET-03)
 
