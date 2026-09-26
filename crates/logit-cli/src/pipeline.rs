@@ -582,20 +582,16 @@ fn build_spec(
 
         // The runtime reads a Lua router's `targets:` off the `ResolvedComponent`, not
         // `NodeSpec::Lua` (`docs/adr/target-components.md`).
-        Lua { script, interval } => NodeSpec::Lua {
+        Lua { script, interval, max_memory } => NodeSpec::Lua {
             script: script.clone(),
             interval: *interval,
-            runtime: logit_pipeline::LuaRuntimeConfig::default(),
+            runtime: lua_runtime_config(*max_memory),
         },
-        LuaFile { lua_file, interval } => {
+        LuaFile { lua_file, interval, max_memory } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
-            NodeSpec::Lua {
-                script,
-                interval: *interval,
-                runtime: logit_pipeline::LuaRuntimeConfig::default(),
-            }
+            NodeSpec::Lua { script, interval: *interval, runtime: lua_runtime_config(*max_memory) }
         }
         Aggregate {
             interval,
@@ -1276,6 +1272,15 @@ fn tcp_receive_config(
     }
 }
 
+/// A `lua`/`lua_file`'s `LuaRuntimeConfig`: only `max_memory` is config-exposed. A cap past
+/// `usize::MAX` saturates, which on a 64-bit target is never.
+fn lua_runtime_config(max_memory: Option<u64>) -> logit_pipeline::LuaRuntimeConfig {
+    logit_pipeline::LuaRuntimeConfig {
+        max_memory: max_memory.map(|cap| usize::try_from(cap).unwrap_or(usize::MAX)),
+        ..logit_pipeline::LuaRuntimeConfig::default()
+    }
+}
+
 /// Any listener's `InputRuntimeConfig` from its `ReceiveConfig`; safe on every `NodeSpec::Input`
 /// arm.
 ///
@@ -1793,7 +1798,11 @@ mod tests {
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
                     targets: Vec::new(),
-                    kind: ComponentKind::Lua { script: "".to_string(), interval: None },
+                    kind: ComponentKind::Lua {
+                        script: "".to_string(),
+                        interval: None,
+                        max_memory: None,
+                    },
                 },
             ),
             (
@@ -1803,7 +1812,11 @@ mod tests {
                     receive: logit_config::ReceiveConfig::default(),
                     sources: vec!["in".to_string()],
                     targets: Vec::new(),
-                    kind: ComponentKind::Lua { script: "".to_string(), interval: None },
+                    kind: ComponentKind::Lua {
+                        script: "".to_string(),
+                        interval: None,
+                        max_memory: None,
+                    },
                 },
             ),
             ("out", influxdb_out(vec!["branch_a", "branch_b"])),
@@ -1825,6 +1838,7 @@ mod tests {
                     kind: ComponentKind::LuaFile {
                         lua_file: "does-not-exist.lua".to_string(),
                         interval: None,
+                        max_memory: None,
                     },
                 },
             ),
@@ -2112,6 +2126,52 @@ mod tests {
             build_spec("t", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Target
         ));
+    }
+
+    #[test]
+    fn build_spec_carries_max_memory_into_the_lua_runtime_config() {
+        let dir = std::env::temp_dir().join(format!("logit-lua-spec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.lua"), "function process(event) return event end\n").unwrap();
+        let lua = |kind| ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind,
+        };
+        let cases = [
+            (ComponentKind::Lua { script: String::new(), interval: None, max_memory: None }, None),
+            (
+                ComponentKind::Lua {
+                    script: String::new(),
+                    interval: None,
+                    max_memory: Some(4 * 1024 * 1024),
+                },
+                Some(4 * 1024 * 1024),
+            ),
+            (
+                ComponentKind::LuaFile {
+                    lua_file: "x.lua".to_string(),
+                    interval: None,
+                    max_memory: Some(256 * 1024 * 1024),
+                },
+                Some(256 * 1024 * 1024),
+            ),
+        ];
+        for (kind, want) in cases {
+            match build_spec("script", &lua(kind), &dir, None).unwrap().0 {
+                NodeSpec::Lua { runtime, .. } => {
+                    assert_eq!(runtime.max_memory, want);
+                    let default = logit_pipeline::LuaRuntimeConfig::default();
+                    assert_eq!(runtime.stall_after, default.stall_after);
+                    assert_eq!(runtime.shutdown_grace, default.shutdown_grace);
+                }
+                _ => panic!("expected NodeSpec::Lua"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

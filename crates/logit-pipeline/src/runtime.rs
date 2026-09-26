@@ -337,6 +337,7 @@ pub async fn run_with_telemetry(
                     Diagnostics::new(id.clone()).with_telemetry(node_telemetry.clone());
                 let thread_heartbeat = heartbeat.clone();
                 let thread_io = io.clone();
+                let max_memory = runtime.max_memory;
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
                     // Script recursion through C frames (a `string.gsub` callback a few hundred
@@ -353,6 +354,7 @@ pub async fn run_with_telemetry(
                             done_tx,
                             thread_io,
                             thread_heartbeat,
+                            max_memory,
                             node_telemetry,
                             handle,
                         )
@@ -719,8 +721,9 @@ impl Default for WriteLoopConfig {
     }
 }
 
-/// A Lua node's stall and wedge thresholds (`docs/adr/lua-runaway-script-bounds.md`), read by
-/// [`watch_lua_thread`]. Not config-exposed.
+/// A Lua node's stall and wedge thresholds, read by [`watch_lua_thread`], and its memory cap, read
+/// by [`run_lua_loop`] (`docs/adr/lua-runaway-script-bounds.md`). Only `max_memory` is
+/// config-exposed.
 #[derive(Debug, Clone, Copy)]
 pub struct LuaRuntimeConfig {
     /// How long the thread may sit inside one `process()`/`flush()` with its [`Heartbeat`]
@@ -736,11 +739,18 @@ pub struct LuaRuntimeConfig {
     /// its downstream inboxes, and a downstream `aggregate`'s close-time flush must reach the sink
     /// before that sink's `write_loop` stops draining.
     pub shutdown_grace: Duration,
+    /// The component's `max_memory`: the VM bytes over which, after the full collections
+    /// [`MemoryVerdict`] runs, the node fails. `None` is no limit. The one config-exposed field.
+    pub max_memory: Option<usize>,
 }
 
 impl Default for LuaRuntimeConfig {
     fn default() -> Self {
-        Self { stall_after: Duration::from_secs(10), shutdown_grace: Duration::from_secs(2) }
+        Self {
+            stall_after: Duration::from_secs(10),
+            shutdown_grace: Duration::from_secs(2),
+            max_memory: None,
+        }
     }
 }
 
@@ -1449,7 +1459,8 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// `BatchContext`, as in `run_router`.
 ///
 /// Two handshakes report to `run_with_telemetry`: `ready_tx` carries the script-load outcome (a
-/// failure is `RunError::Startup`), and `done_tx` the post-ready outcome, `Err` only on a panic.
+/// failure is `RunError::Startup`), and `done_tx` the post-ready outcome, `Err` on a panic or on
+/// the VM staying over `max_memory` (see [`MemoryVerdict`]).
 /// [`watch_lua_thread`] awaits `done_rx` as the node's `JoinSet` entry, so the join loop treats a
 /// Lua exit like any task's. The loop runs under `catch_unwind` so a panic becomes a message, not
 /// a dropped sender; `AssertUnwindSafe` because `ScriptWorker` holds `Lua` and `Rc<RefCell>`s and
@@ -1471,6 +1482,7 @@ fn run_lua(
     done_tx: oneshot::Sender<Result<(), String>>,
     io: SharedLuaIo,
     heartbeat: Arc<Heartbeat>,
+    max_memory: Option<usize>,
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
 ) {
@@ -1488,6 +1500,7 @@ fn run_lua(
         }
     };
     let _ = ready_tx.send(Ok(()));
+    worker.set_memory_cap(max_memory);
 
     // Built here because the registry can't attach one to a `ScriptWorker` it never constructs.
     // Cloned so the panic report below has one after the loop's copy moves into the closure.
@@ -1499,28 +1512,49 @@ fn run_lua(
 
     let loop_io = io.clone();
     let heartbeat_for_report = heartbeat.clone();
+    let (sweep_telemetry, sweep_runtime) = (telemetry.clone(), runtime.clone());
+    let verdict = max_memory.map(MemoryVerdict::new);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        run_lua_loop(worker, me, configured_interval, loop_io, heartbeat, telemetry, runtime, diag)
+        run_lua_loop(
+            worker,
+            me,
+            configured_interval,
+            loop_io,
+            heartbeat,
+            verdict,
+            telemetry,
+            runtime,
+            diag,
+        )
     }));
     // A panic unwinds out of a script call with the busy bit still set; left set, a watcher tick
     // after shutdown could report a wedge before it reads the panic from `done_rx`.
     heartbeat_for_report.leave();
     // Dropped here, after a return or a panic alike, so the downstream cascade is underway
-    // before `done_tx` reports. `None` already if the watcher revoked it.
-    drop(lock_io(&io).take());
+    // before `done_tx` reports. `None` already if the watcher revoked it. A loop that failed the
+    // node left its inbox open with batches still queued, so those are swept and counted, as
+    // the watcher's revocation counts them.
+    let leftover = lock_io(&io).take();
+    let failed = matches!(outcome, Ok(Err(_)));
+    match leftover {
+        Some(io) if failed => sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry)),
+        leftover => drop(leftover),
+    }
+    let panicked = outcome.is_err();
     let report = thread_outcome(outcome);
-    if let Err(message) = &report {
+    if let (true, Err(message)) = (panicked, &report) {
         reporter.error("thread_panicked", format_args!("{message}"));
     }
     // The receiver is gone only if `run` already returned for an unrelated reason; nothing to do.
     let _ = done_tx.send(report);
 }
 
-/// A Lua thread's post-ready outcome as a message. A panic payload is a `&str` for a literal
+/// A Lua thread's post-ready outcome as a message: a loop's own failure (`max_memory`) as it
+/// returned it, a panic prefixed `thread panicked:`. A panic payload is a `&str` for a literal
 /// `panic!`, a `String` for a formatted one, and anything for `panic_any`, hence the fallback.
-fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
+fn thread_outcome(result: std::thread::Result<Result<(), String>>) -> Result<(), String> {
     match result {
-        Ok(()) => Ok(()),
+        Ok(returned) => returned,
         Err(payload) => {
             let message = if let Some(s) = payload.downcast_ref::<&str>() {
                 (*s).to_string()
@@ -1734,9 +1768,95 @@ async fn watch_lua_thread(
     }
 }
 
+/// The most full collections one `max_memory` verdict runs
+/// (`ScriptWorker::collect_until_under`).
+const MAX_VERDICT_PASSES: usize = 8;
+
+/// The least time between two forced `max_memory` verdicts; the spacing is also at least ten
+/// times the last verdict's own duration.
+const MIN_VERDICT_SPACING: Duration = Duration::from_secs(1);
+
+/// A Lua node's `max_memory` check, run after each batch's send and each `flush()`'s
+/// (`docs/adr/lua-runaway-script-bounds.md`, decision 3).
+///
+/// A VM over the cap runs full collections until it is under or a pass stops freeing much, and
+/// fails the node if it is still over. The collection runs with the heartbeat idle, after the
+/// send, so the batch that crossed the cap has already gone downstream.
+///
+/// Forced verdicts are rate-limited to one per [`MIN_VERDICT_SPACING`] or ten times the last
+/// one's duration, whichever is longer; an over-cap reading between them is skipped. A cap under
+/// about twice the script's working set would otherwise force a full collection on nearly every
+/// batch, since the incremental collector lets garbage reach that much before a cycle ends. A
+/// skipped reading defers the verdict to the end of the window ([`MemoryVerdict::deferred_until`]),
+/// which [`run_lua_loop`] wakes for even with no batch arriving, so a node left over the cap by
+/// its last batch still fails within the window.
+struct MemoryVerdict {
+    cap: usize,
+    next_allowed: Option<std::time::Instant>,
+    /// An over-cap reading was skipped and no verdict has run since.
+    deferred: bool,
+}
+
+impl MemoryVerdict {
+    fn new(cap: usize) -> Self {
+        Self { cap, next_allowed: None, deferred: false }
+    }
+
+    /// When a skipped verdict is due, if one is pending.
+    fn deferred_until(&self) -> Option<std::time::Instant> {
+        self.next_allowed.filter(|_| self.deferred)
+    }
+
+    /// `Err` with the node's failure message, already logged as `memory_limit_exceeded`, when
+    /// the VM stays over the cap; a failed collection fails the node with its own message.
+    fn check(
+        &mut self,
+        worker: &ScriptWorker,
+        telemetry: &Telemetry,
+        diag: &Diagnostics,
+    ) -> Result<(), String> {
+        if worker.used_memory() <= self.cap {
+            self.deferred = false;
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        if self.next_allowed.is_some_and(|next| started < next) {
+            self.deferred = true;
+            return Ok(());
+        }
+        self.deferred = false;
+        telemetry.count("logit.script.vm.gc.forced", 1.0, &[]);
+        let verdict = worker
+            .collect_until_under(self.cap, MAX_VERDICT_PASSES)
+            .map_err(|err| format!("a full garbage collection of the Lua VM failed: {err}"))?;
+        let took = started.elapsed();
+        telemetry.timing("logit.script.vm.gc.duration", took, &[]);
+        telemetry.gauge("logit.script.vm.memory", verdict.used as f64, &[]);
+        self.next_allowed = Some(started + MIN_VERDICT_SPACING.max(took * 10));
+        if verdict.used <= self.cap {
+            return Ok(());
+        }
+        let message = format!(
+            "Lua VM holds {} bytes after {} full collections, over max_memory {}",
+            verdict.used, verdict.passes, self.cap
+        );
+        diag.error("memory_limit_exceeded", &message);
+        Err(message)
+    }
+}
+
+/// What one `flush_now` in [`run_lua_loop`] left the loop to do.
+enum FlushOutcome {
+    Continue,
+    /// The watcher revoked `io`; the loop exits cleanly.
+    Revoked,
+    /// The node failed (see [`MemoryVerdict`]); the loop returns this message.
+    Failed(String),
+}
+
 /// The loop half of [`run_lua`]. Takes everything by value so `catch_unwind` has nothing borrowed.
 /// Returns once `inbox` closes, after a last `flush()` if the component has an interval, or once
-/// the watcher has revoked `io` (see [`LuaIo`]).
+/// the watcher has revoked `io` (see [`LuaIo`]). Returns `Err` only when `verdict` fails the node.
 ///
 /// The heartbeat is busy only inside a script call: `enter()` before each `process()` and around
 /// `flush()`, `leave()` before anything is sent. A thread parked in a send is therefore never
@@ -1748,10 +1868,11 @@ fn run_lua_loop(
     configured_interval: Option<Duration>,
     io: SharedLuaIo,
     heartbeat: Arc<Heartbeat>,
+    mut verdict: Option<MemoryVerdict>,
     telemetry: Telemetry,
     runtime: tokio::runtime::Handle,
     mut diag: Diagnostics,
-) {
+) -> Result<(), String> {
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     // A `flush()`'s root (see `run_lua`): one empty resource shared by every tick (an `Arc`
     // clone, not an allocation), and this node's id as both halves of the provenance. That's
@@ -1771,11 +1892,14 @@ fn run_lua_loop(
     // Mints its own root and records the `flush` span, as `run_flush` does: a Lua `flush()` has
     // no single parent batch (`docs/adr/lua-flush-root-context.md`). The script's batch-scoped
     // globals are reset to that root first, so `flush()` reads what its emission goes out as.
-    // Returns `false` once `io` has been revoked.
+    // The `max_memory` verdict runs after the send.
     //
-    // `diag` and `scratch` are parameters, not captures: the loop body also borrows both mutably,
-    // and a capture would hold the borrow for the closure's lifetime.
-    let flush_now = |diag: &mut Diagnostics, worker: &ScriptWorker, scratch: &mut RouterScratch| {
+    // `diag`, `scratch`, and `verdict` are parameters, not captures: the loop body also borrows
+    // them mutably, and a capture would hold the borrow for the closure's lifetime.
+    let flush_now = |diag: &mut Diagnostics,
+                     worker: &ScriptWorker,
+                     scratch: &mut RouterScratch,
+                     verdict: &mut Option<MemoryVerdict>| {
         let ctx = BatchContext { trace: TraceContext::new_root(), provenance: flush_provenance };
         let mut span = telemetry.span(
             "flush",
@@ -1802,6 +1926,7 @@ fn run_lua_loop(
         heartbeat.enter();
         let result = worker.flush(now_unix_nanos());
         heartbeat.leave();
+        worker.reset_memory_trip();
         drop(timer);
         worker.expire_registry_values();
         // A script that wrote `resource` in `flush()` gives the emission that identity; `None`
@@ -1826,7 +1951,7 @@ fn run_lua_loop(
                 let Some(io) = guard.as_ref() else {
                     drop(guard);
                     count_revoked(&mut scratch.dests, &telemetry);
-                    return false;
+                    return FlushOutcome::Revoked;
                 };
                 let sent = send_lua_partitions(
                     &mut scratch.dests,
@@ -1846,33 +1971,55 @@ fn run_lua_loop(
                 span.error();
             }
         }
-        true
+        match verdict.as_mut().map(|v| v.check(worker, &telemetry, diag)) {
+            Some(Err(message)) => FlushOutcome::Failed(message),
+            _ => FlushOutcome::Continue,
+        }
     };
 
     loop {
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                if !flush_now(&mut diag, &worker, &mut scratch) {
-                    return;
+                match flush_now(&mut diag, &worker, &mut scratch, &mut verdict) {
+                    FlushOutcome::Continue => {}
+                    FlushOutcome::Revoked => return Ok(()),
+                    FlushOutcome::Failed(message) => return Err(message),
                 }
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
             }
         }
+        // A verdict the rate limit skipped, now due (see `MemoryVerdict`).
+        if let Some(verdict) = verdict.as_mut() {
+            if verdict.deferred_until().is_some_and(|due| due <= std::time::Instant::now()) {
+                verdict.check(&worker, &telemetry, &diag)?;
+            }
+        }
+
+        // Wakes for whichever of the next flush and a deferred verdict comes first.
+        let flush_wait =
+            next_flush.map(|due| due.saturating_duration_since(tokio::time::Instant::now()));
+        let verdict_wait = verdict
+            .as_ref()
+            .and_then(MemoryVerdict::deferred_until)
+            .map(|due| due.saturating_duration_since(std::time::Instant::now()));
+        let wait = match (flush_wait, verdict_wait) {
+            (Some(flush), Some(verdict)) => Some(flush.min(verdict)),
+            (flush, verdict) => flush.or(verdict),
+        };
 
         // The lock is held across the wait. The heartbeat is idle here, and the watcher only
         // takes the lock from a busy node, so the two never contend.
         let batch = {
             let mut guard = lock_io(&io);
             let Some(io) = guard.as_mut() else {
-                return;
+                return Ok(());
             };
-            match next_flush {
+            match wait {
                 None => io.inbox.blocking_recv(),
-                Some(deadline) => {
-                    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                Some(wait) => {
                     // The `async` block is required: `tokio::time::timeout` builds its `Sleep`
                     // eagerly, which panics outside a runtime context. Inside the block it's
                     // built only once `block_on` has entered one.
@@ -1887,9 +2034,13 @@ fn run_lua_loop(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(&mut diag, &worker, &mut scratch);
+                if let FlushOutcome::Failed(message) =
+                    flush_now(&mut diag, &worker, &mut scratch, &mut verdict)
+                {
+                    return Err(message);
+                }
             }
-            return;
+            return Ok(());
         };
         // As in `run_transform`: this batch is the unambiguous parent of everything emitted
         // below, provenance passes through, and the context is minted once here so the span's
@@ -1931,7 +2082,9 @@ fn run_lua_loop(
         let slots = scratch.dests.len();
         for event in batch.events {
             heartbeat.enter();
-            match worker.process(event) {
+            let outcome = worker.process(event);
+            worker.reset_memory_trip();
+            match outcome {
                 Ok(ProcessOutcome::Emit(e, mark)) => {
                     scratch.dests[lua_slot_of(mark, slots)].push(*e);
                     telemetry.count("logit.script.events.emitted", 1.0, &[("outcome", "emit")]);
@@ -1984,7 +2137,7 @@ fn run_lua_loop(
         let Some(io) = guard.as_ref() else {
             drop(guard);
             count_revoked(&mut scratch.dests, &telemetry);
-            return;
+            return Ok(());
         };
         let sent = send_lua_partitions(
             &mut scratch.dests,
@@ -1998,6 +2151,9 @@ fn run_lua_loop(
         drop(guard);
         if sent > 0 {
             span.events(sent);
+        }
+        if let Some(verdict) = verdict.as_mut() {
+            verdict.check(&worker, &telemetry, &diag)?;
         }
     }
 }
@@ -2245,6 +2401,7 @@ mod tests {
                     script: r#"function process(event) event.attributes.tagged = "yes" return event end"#
                         .to_string(),
                     interval: None,
+                    max_memory: None,
                 },
             },
         );
@@ -3141,6 +3298,7 @@ mod tests {
                 kind: ComponentKind::Lua {
                     script: "function process(event) return {event, event:clone()} end".to_string(),
                     interval: None,
+                    max_memory: None,
                 },
             },
         );
@@ -3279,7 +3437,11 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 targets: Vec::new(),
-                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+                kind: ComponentKind::Lua {
+                    script: script.clone(),
+                    interval: None,
+                    max_memory: None,
+                },
             },
         );
         components.insert(
@@ -3380,7 +3542,11 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 targets: Vec::new(),
-                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+                kind: ComponentKind::Lua {
+                    script: script.clone(),
+                    interval: None,
+                    max_memory: None,
+                },
             },
         );
         components.insert(
@@ -3495,6 +3661,7 @@ mod tests {
                 kind: ComponentKind::Lua {
                     script: "function process(event) error('boom') end".to_string(),
                     interval: None,
+                    max_memory: None,
                 },
             },
         );
@@ -3602,7 +3769,11 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 targets: Vec::new(),
-                kind: ComponentKind::Lua { script: script.clone(), interval: None },
+                kind: ComponentKind::Lua {
+                    script: script.clone(),
+                    interval: None,
+                    max_memory: None,
+                },
             },
         );
         components.insert(
@@ -3704,6 +3875,7 @@ mod tests {
                 kind: ComponentKind::Lua {
                     script: "function process(event) return event end".to_string(),
                     interval: Some(Duration::from_secs(3600)),
+                    max_memory: None,
                 },
             },
         );
@@ -6029,6 +6201,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: "function process(event) return event end".to_string(),
                     interval: None,
+                    max_memory: None,
                 },
             ),
         );
@@ -6107,6 +6280,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: "function process(event) return event end".to_string(),
                     interval: None,
+                    max_memory: None,
                 },
             ),
         );
@@ -6172,7 +6346,9 @@ mod tests {
     /// Every panic payload shape (`&str`, `String`, other) becomes a "thread panicked" message.
     #[test]
     fn thread_outcome_reports_a_panic_payload_as_a_message() {
-        assert_eq!(thread_outcome(Ok(())), Ok(()));
+        assert_eq!(thread_outcome(Ok(Ok(()))), Ok(()));
+        // A loop's own failure passes through unprefixed: it isn't a panic.
+        assert_eq!(thread_outcome(Ok(Err("over".to_string()))), Err("over".to_string()));
 
         let literal = std::panic::catch_unwind(|| panic!("boom"));
         assert_eq!(thread_outcome(literal), Err("thread panicked: boom".to_string()));
@@ -6293,6 +6469,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_millis(100),
+            max_memory: None,
         };
         let (done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -6327,6 +6504,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(50),
+            max_memory: None,
         };
         let (done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -6353,6 +6531,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(200),
+            max_memory: None,
         };
         let (_done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -6386,6 +6565,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(100),
+            max_memory: None,
         };
         let registry = Registry::new();
         let (_done_tx, done_rx) = oneshot::channel();
@@ -6425,6 +6605,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
+            max_memory: None,
         };
         let (_done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -6512,7 +6693,7 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None },
+                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
             ),
         );
         components
@@ -6531,6 +6712,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(100),
+            max_memory: None,
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         let (tx, _out_rx) = std::sync::mpsc::channel();
@@ -6610,7 +6792,11 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: SPIN_ON_SECOND_EVENT.to_string(), interval: None },
+                ComponentKind::Lua {
+                    script: SPIN_ON_SECOND_EVENT.to_string(),
+                    interval: None,
+                    max_memory: None,
+                },
             ),
         );
         components.insert(
@@ -6759,6 +6945,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
+                    max_memory: None,
                 },
             ),
         );
@@ -6781,6 +6968,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(200),
             shutdown_grace: Duration::from_millis(50),
+            max_memory: None,
         };
         specs.insert(
             "enrich".to_string(),
@@ -6843,7 +7031,11 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: SPIN_ON_SECOND_EVENT.to_string(), interval: None },
+                ComponentKind::Lua {
+                    script: SPIN_ON_SECOND_EVENT.to_string(),
+                    interval: None,
+                    max_memory: None,
+                },
             ),
         );
         components
@@ -6863,6 +7055,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(100),
+            max_memory: None,
         };
         specs.insert("enrich".to_string(), lua_spec(SPIN_ON_SECOND_EVENT, None, runtime));
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -6953,7 +7146,7 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None },
+                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
             ),
         );
         components
@@ -6974,6 +7167,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_millis(20),
+            max_memory: None,
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -7008,6 +7202,342 @@ mod tests {
         assert!(!seen_stalled.await.unwrap(), "a loop constructing events was reported stalled");
     }
 
+    // -- `max_memory` (`docs/adr/lua-runaway-script-bounds.md`, decision 3). Real time: each
+    //    runs a real Lua thread, and the verdict's rate limit reads the wall clock.
+
+    /// Rendered self-log output from every thread.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A process-wide capture: a Lua node logs from its own OS thread, which a thread-local
+    /// `set_default` never sees. Callers tell their lines apart by component id.
+    fn global_logs() -> &'static CapturedLogs {
+        static LOGS: std::sync::OnceLock<CapturedLogs> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = CapturedLogs::default();
+            let subscriber =
+                tracing_subscriber::fmt().with_writer(logs.clone()).with_ansi(false).finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            logs
+        })
+    }
+
+    /// Sends `batches` one every `every`, then returns.
+    struct PacedInput {
+        batches: Vec<EventBatch>,
+        every: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for PacedInput {
+        async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
+            for batch in self.batches.drain(..) {
+                sink.send(batch).await;
+                tokio::time::sleep(self.every).await;
+            }
+            Ok(())
+        }
+    }
+
+    fn counter_batch_of(n: usize) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: (0..n).map(|_| counter_event("hits", 1.0)).collect(),
+        }
+    }
+
+    /// What one `in -> <id> (lua) -> out` run under `max_memory` left behind.
+    struct MaxMemoryRun {
+        id: &'static str,
+        result: Result<(), RunError>,
+        telemetry: Vec<Event>,
+        delivered: usize,
+        elapsed: Duration,
+        state: Option<NodeState>,
+    }
+
+    impl MaxMemoryRun {
+        /// Self-log lines this run's Lua node wrote under diagnostic `key`.
+        fn logged(&self, key: &str) -> usize {
+            let text = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
+            let component = format!("component={}", self.id);
+            text.lines().filter(|l| l.contains(&component) && l.contains(key)).count()
+        }
+
+        fn counter(&self, component: &str, name: &str, tag: Option<(&str, &str)>) -> f64 {
+            counter_sum(&self.telemetry, component, name, tag)
+        }
+
+        fn gc_forced(&self) -> f64 {
+            self.counter(self.id, "logit.script.vm.gc.forced", None)
+        }
+    }
+
+    async fn run_under_max_memory(
+        id: &'static str,
+        script: &str,
+        interval: Option<Duration>,
+        max_memory: usize,
+        input: Box<dyn Input + Send>,
+    ) -> MaxMemoryRun {
+        global_logs();
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            id.to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval,
+                    max_memory: Some(max_memory as u64),
+                },
+            ),
+        );
+        components.insert("out".to_string(), plain_component(vec![id.to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert("in".to_string(), NodeSpec::Input(input, InputRuntimeConfig::default()));
+        let runtime = LuaRuntimeConfig { max_memory: Some(max_memory), ..Default::default() };
+        specs.insert(id.to_string(), lua_spec(script, interval, runtime));
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let registry = Registry::new();
+        let telemetry: HashMap<String, Telemetry> = ["in", id, "out"]
+            .into_iter()
+            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .collect();
+        let (readiness, rx) = Readiness::channel();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_with_telemetry(g, specs, telemetry, readiness, std::future::pending()),
+        )
+        .await
+        .expect("the run ends on its own");
+        let elapsed = started.elapsed();
+        let state = rx.borrow().components.get(id).cloned();
+        MaxMemoryRun {
+            id,
+            result,
+            telemetry: registry.drain(0),
+            delivered: out_rx.try_iter().map(|b| b.events.len()).sum(),
+            elapsed,
+            state,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lua_node_over_max_memory_fails_the_run_as_runtime_naming_it() {
+        // A unique ~1 KiB Lua string kept per event: ~2.5 MiB per batch, so the first batch ends
+        // under the 4 MiB cap and the second ends over it with live data alone, and the first
+        // verdict fails while the last two batches wait in the inbox.
+        const BATCHES: usize = 4;
+        const PER_BATCH: usize = 2500;
+        let script = r#"
+            kept = {}
+            function process(event)
+                kept[#kept + 1] = string.rep(string.format("%10d", #kept), 100)
+                return event
+            end
+        "#;
+        // Never finishes by itself: only the failure ends the run.
+        let input =
+            BurstInput { batches: (0..BATCHES).map(|_| counter_batch_of(PER_BATCH)).collect() };
+        let run = run_under_max_memory("mem_retains", script, None, 4 << 20, Box::new(input)).await;
+
+        let err = run.result.as_ref().expect_err("10 MB retained against a 4 MiB cap fails");
+        assert!(matches!(err, RunError::Runtime(_)), "a memory failure is a runtime one: {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("component 'mem_retains'"), "{message}");
+        assert!(message.contains("over max_memory 4194304"), "{message}");
+        assert!(!message.contains("panicked"), "{message}");
+        assert_eq!(run.logged("memory_limit_exceeded"), 1);
+        assert_eq!(run.logged("thread_panicked"), 0, "a memory failure isn't a panic");
+        assert_eq!(run.state, Some(NodeState::Failed));
+
+        let received = run.counter(run.id, "logit.component.events.received", None);
+        let swept =
+            run.counter(run.id, "logit.component.events.dropped", Some(("reason", "shutdown")));
+        let refused = run.counter(
+            "in",
+            "logit.component.events.dropped",
+            Some(("reason", "closed_consumer")),
+        );
+        assert!(received > 0.0 && received < (BATCHES * PER_BATCH) as f64, "{received}");
+        // The batch that crossed the cap was sent before the verdict, so everything the script
+        // returned reached the sink.
+        assert_eq!(run.delivered as f64, received);
+        assert!(swept > 0.0, "batches queued behind the failure are counted");
+        assert_eq!(
+            received + swept + refused,
+            (BATCHES * PER_BATCH) as f64,
+            "every event is delivered or counted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn garbage_over_max_memory_is_collected_before_the_node_is_failed() {
+        // ~100 KiB live; each call leaves a ~4 MiB table that becomes garbage at return, so the
+        // reading after every batch is over a 2 MiB cap until a full collection runs.
+        let script = r#"
+            live = {}
+            for i = 1, 100 do live[i] = string.rep(string.format("%10d", i), 100) end
+            function process(event)
+                local t = {}
+                for i = 1, 4000 do t[i] = string.rep(string.format("%10d", i), 100) end
+                return event
+            end
+        "#;
+        let input = FiniteBurstInput { batches: (0..100).map(|_| counter_batch_of(1)).collect() };
+        let run = run_under_max_memory("mem_garbage", script, None, 2 << 20, Box::new(input)).await;
+
+        run.result.as_ref().expect("garbage is collected, not counted against the cap");
+        assert_eq!(run.delivered, 100);
+        assert_eq!(run.logged("memory_limit_exceeded"), 0);
+        let forced = run.gc_forced();
+        assert!(forced >= 1.0, "the first over-cap reading forces a collection");
+        let allowed = run.elapsed.as_secs_f64().ceil() + 1.0;
+        assert!(forced <= allowed, "{forced} forced collections in {:?}", run.elapsed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_memory_is_checked_after_flush_too() {
+        // `process()` keeps nothing; each `flush()` keeps 10k ~1 KiB strings.
+        let script = r#"
+            kept = {}
+            function process(event) return nil end
+            function flush(now)
+                for i = 1, 10000 do kept[#kept + 1] = string.rep(string.format("%10d", #kept), 100) end
+            end
+        "#;
+        // An interval tick: the input never finishes, so only the tick's verdict ends the run.
+        let input = BurstInput { batches: vec![counter_batch_of(1)] };
+        let run = run_under_max_memory(
+            "mem_tick",
+            script,
+            Some(Duration::from_millis(50)),
+            4 << 20,
+            Box::new(input),
+        )
+        .await;
+        let err = run.result.as_ref().expect_err("a tick's flush() over the cap fails the node");
+        assert!(matches!(err, RunError::Runtime(_)), "{err:?}");
+        assert!(err.to_string().contains("component 'mem_tick'"), "{err}");
+        assert_eq!(run.logged("memory_limit_exceeded"), 1);
+        assert_eq!(run.logged("thread_panicked"), 0);
+
+        // The close-time flush: the input finishes, and the last `flush()` crosses the cap.
+        let input = FiniteInput { batch: Some(counter_batch_of(1)) };
+        let run = run_under_max_memory(
+            "mem_close",
+            script,
+            Some(Duration::from_secs(3600)),
+            4 << 20,
+            Box::new(input),
+        )
+        .await;
+        let err = run.result.as_ref().expect_err("the close-time flush() is checked too");
+        assert!(err.to_string().contains("over max_memory"), "{err}");
+        assert_eq!(run.logged("memory_limit_exceeded"), 1);
+        assert_eq!(run.state, Some(NodeState::Failed));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_verdict_is_rate_limited() {
+        // Each call leaves ~1 MiB of garbage; the cap sits 512 KiB above the VM's collected
+        // size, so every batch ends over it and passes once collected.
+        let script = r#"
+            function process(event)
+                local t = {}
+                for i = 1, 1000 do t[i] = string.rep(string.format("%10d", i), 100) end
+                return event
+            end
+        "#;
+        let base = {
+            let w =
+                ScriptWorker::new(script).unwrap().with_telemetry(Telemetry::default()).unwrap();
+            w.collect_until_under(0, 8).unwrap().used
+        };
+        let input = PacedInput {
+            batches: (0..100).map(|_| counter_batch_of(1)).collect(),
+            every: Duration::from_millis(20),
+        };
+        let run =
+            run_under_max_memory("mem_paced", script, None, base + (512 << 10), Box::new(input))
+                .await;
+
+        run.result.as_ref().expect("every verdict collects back under the cap");
+        let forced = run.gc_forced();
+        let allowed = run.elapsed.as_secs_f64().ceil() + 1.0;
+        assert!(forced >= 1.0, "every batch ends over the cap");
+        assert!(
+            forced <= allowed,
+            "100 over-cap batches in {:?} forced {forced} collections",
+            run.elapsed
+        );
+    }
+
+    /// A reading the rate limit skipped is not forgotten when no batch follows it: the loop
+    /// wakes when the window ends and runs the verdict then.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skipped_verdict_runs_once_the_window_ends_with_no_batch_arriving() {
+        // The first batch leaves ~4 MiB of garbage (its verdict passes and opens a window); the
+        // second keeps ~4 MiB, over the cap inside that window.
+        let script = r#"
+            kept = {}
+            calls = 0
+            function process(event)
+                calls = calls + 1
+                local t = calls == 1 and {} or kept
+                for i = 1, 4000 do t[#t + 1] = string.rep(string.format("%10d", i), 100) end
+                return event
+            end
+        "#;
+        // Two batches, then silence: the input never finishes.
+        let input = BurstInput { batches: vec![counter_batch_of(1), counter_batch_of(1)] };
+        let run =
+            run_under_max_memory("mem_deferred", script, None, 2 << 20, Box::new(input)).await;
+
+        let err = run.result.as_ref().expect_err("the deferred verdict fails the node");
+        assert!(err.to_string().contains("component 'mem_deferred'"), "{err}");
+        assert_eq!(run.delivered, 2);
+        assert_eq!(run.gc_forced(), 2.0, "the first batch's verdict, then the deferred one");
+        assert!(
+            run.elapsed >= MIN_VERDICT_SPACING.mul_f64(0.9),
+            "the second verdict waits out the window: {:?}",
+            run.elapsed
+        );
+    }
+
     /// Never completes a send, so its store fills and its inbox backs up.
     struct NeverOutput;
 
@@ -7029,7 +7559,7 @@ mod tests {
             "enrich".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: script.to_string(), interval: None },
+                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
             ),
         );
         components
@@ -7047,6 +7577,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(50),
+            max_memory: None,
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         specs.insert(
@@ -7121,14 +7652,14 @@ mod tests {
             "a_ok".to_string(),
             plain_component(
                 vec!["in".to_string()],
-                ComponentKind::Lua { script: good.to_string(), interval: None },
+                ComponentKind::Lua { script: good.to_string(), interval: None, max_memory: None },
             ),
         );
         components.insert(
             "b_bad".to_string(),
             plain_component(
                 vec!["a_ok".to_string()],
-                ComponentKind::Lua { script: bad.to_string(), interval: None },
+                ComponentKind::Lua { script: bad.to_string(), interval: None, max_memory: None },
             ),
         );
         components
@@ -7189,6 +7720,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: script.to_string(),
                     interval: Some(Duration::from_millis(50)),
+                    max_memory: None,
                 },
             ),
         );
@@ -7846,7 +8378,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -7932,7 +8464,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("sink_a", vec!["a"], vec![], influxdb_out()),
@@ -7995,7 +8527,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("sink_a", vec!["a"], vec![], influxdb_out()),
@@ -8083,7 +8615,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             (
@@ -8202,7 +8734,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -8278,13 +8810,13 @@ mod tests {
                 "split_a",
                 vec!["in"],
                 vec!["shared"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             (
                 "split_b",
                 vec!["in"],
                 vec!["shared"],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("shared", vec![], vec![], ComponentKind::Target {}),
             ("sink", vec!["shared"], vec![], influxdb_out()),
@@ -8441,7 +8973,11 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+                ComponentKind::Lua {
+                    script: SPLIT_SCRIPT.to_string(),
+                    interval: None,
+                    max_memory: None,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -8530,7 +9066,11 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a", "b"],
-                ComponentKind::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
+                ComponentKind::Lua {
+                    script: SPLIT_SCRIPT.to_string(),
+                    interval: None,
+                    max_memory: None,
+                },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("b", vec![], vec![], ComponentKind::Target {}),
@@ -8606,7 +9146,7 @@ mod tests {
                 "split",
                 vec!["in"],
                 vec!["a"],
-                ComponentKind::Lua { script: script.to_string(), interval: None },
+                ComponentKind::Lua { script: script.to_string(), interval: None, max_memory: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
             ("sink_a", vec!["a"], vec![], influxdb_out()),
@@ -8736,6 +9276,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
+                    max_memory: None,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
@@ -8840,13 +9381,14 @@ mod tests {
                 ComponentKind::Lua {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
+                    max_memory: None,
                 },
             ),
             (
                 "watcher",
                 vec!["windowed"],
                 vec![],
-                ComponentKind::Lua { script: String::new(), interval: None },
+                ComponentKind::Lua { script: String::new(), interval: None, max_memory: None },
             ),
             ("out", vec!["watcher"], vec![], influxdb_out()),
         ]);
@@ -9074,6 +9616,7 @@ mod tests {
                 ComponentKind::Lua {
                     script: script.to_string(),
                     interval: Some(Duration::from_secs(3600)),
+                    max_memory: None,
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
