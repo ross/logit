@@ -464,6 +464,13 @@ ones, temporality and monotonicity on `Sum`, and sum/count/min/max on
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s gauge-retention
   amendment for why.
 
+Under `aggregate`, a metric series' identity is structural: name, unit, and attribute set, with
+`f64` values compared by bit pattern (`NaN` equals itself, `-0.0` doesn't equal `0.0`) and numeric
+variants kept distinct (`I64(1)`, `U64(1)`, and `F64(1.0)` are three series). [ADR
+`aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment: series
+identity, merge laws, and accounting as a stated contract (2026-09-26)" has the full rule and the
+merge laws built on it.
+
 **A `Distribution`'s `count()` is a population estimate**, not a count of retained raw observations,
 wherever a sample rate applies. `aggregate`'s default `distributions: sketch` mode inserts
 `(1.0 / sample_rate).round()` weighted samples per absorbed `Samples` record via

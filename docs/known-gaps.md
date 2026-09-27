@@ -2106,6 +2106,66 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   about is only half visible: a 20-attribute resource of short enums reads the same as one of long
   ARNs and a nested label map.
 
+## `aggregate`
+
+- **Nothing bounds how many series one window holds.** `max_retained_series` caps only what
+  survives a flush; within a window every distinct `(name, unit, attribute set)` opens a series,
+  and memory grows with that count until the flush drains it. The bound is upstream: a `keep`
+  ahead of `aggregate` limits which attributes reach it, and `keep_values` limits the values one
+  attribute can take. `logit.transform.series.active` shows the peak each window.
+- **Nothing bounds how many `(resource, scope)` groups one window holds, and `group_for` scans them
+  linearly on every absorbed metric.** An `otlp_in` gateway or a `prometheus_in` with a resource
+  per scrape target can present thousands of distinct resources, so absorb cost can grow with the
+  group count. Measured with `crates/logit-bench`'s `aggregate_absorb_with_groups` (one gauge per
+  event, resources rotating, one core): 137 ns per absorbed event at 1 group, 877 ns at 100, and
+  8.6 µs at 1000, so the scan dominates from about 100 groups on. The candidates are a per-batch
+  `Arc::ptr_eq` cache and a hashed group index, decided by a measurement on the perf VM in its
+  own change. `logit.transform.resource.groups` shows the count.
+- **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
+  render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
+  non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, a `scale`d one `F64`)
+  can send `prometheus_out`, `influxdb_out`, or `graphite_out` two or three samples under one
+  label set in one window. `-0.0` and `0.0` are two series as well, but those sinks render them `-0` and `0`,
+  so they stay apart downstream. To merge the variants, convert the tag to one type in a `lua`
+  stage ahead of `aggregate`. See
+  [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s "Amendment: series
+  identity, merge laws, and accounting as a stated contract (2026-09-26)", "Series identity".
+- **`aggregate` drops every exemplar on the records it absorbs.** An exemplar is one observation,
+  and a summarized window has no per-observation data to attach it to. `aggregate` is the stage
+  that summarizes by stated purpose, so the loss falls under
+  [ADR `lossless-transit`](adr/lossless-transit.md)'s "summarization is opt-in and named" rule.
+  To keep exemplars, route the records around `aggregate`. See
+  [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s "Amendment: series
+  identity, merge laws, and accounting as a stated contract (2026-09-26)".
+- **A `GaugeDelta` whose series holds another kind is forwarded unresolved, and can reach a
+  sink.** `aggregate` forwards any kind conflict untouched, counted
+  `logit.transform.metrics.passed_through{reason="kind_conflict"}`; for a `GaugeDelta` sharing a
+  name, unit, and attribute set with a counter series, that means a delta no sink can encode, and
+  every sink skips and counts it (the "Cross-protocol mappings" section's `GaugeDelta` rows). Give
+  the gauge its own name or tags upstream.
+- **A clamped sample rate held raw under `distributions: samples` is reported only if the series
+  falls back to a sketch.** `logit.transform.samples.weight_clamped` counts a record when its weight
+  is applied. A raw series that stays under `max_samples_per_series` with one rate is emitted as
+  `Samples`, and the encoder that later sketches it clamps the weight without a report. To see
+  every clamp, run `distributions: sketch`, the default, where each record's weight is applied on
+  absorb. Revisit if an encoder gains its own `sample_rate_clamped` report.
+- **`DdSketch::merge` treats a sketch whose count and zero count are both 0 as empty, even when it
+  carries bins.** Only a decoded sketch can be in that state (`DdSketch::from_parts` with summary
+  stats claiming a zero count over non-empty bins), and merging it into a series drops those bins
+  without a counter. No encoder `logit` ships writes that shape, and the threat model treats a
+  crafted one as a non-goal. Revisit if a real producer's sketch is found carrying bins under a
+  zero count.
+- **`series_retention` counts flushes, not wall time.** The runtime coalesces missed flush ticks,
+  so a stalled or overloaded stage that flushes late stretches retention in wall time: a series
+  idle across one late flush has lost one flush of retention, however long the gap. The same holds
+  for a cumulative series' lifetime between restarts.
+- **`aggregate`'s flush clock is `SystemTime`, which can step backwards.** A retained series' start
+  time is clamped between the previous flush's clock and this one's (ADR
+  `aggregation-window-semantics`'s "Start time after a cap eviction"). After a backwards step the
+  new start can precede the previous point, and emitted points stop being monotonic in time. A
+  consumer still sees a changed start and re-bases. A monotonic clock would need its own mapping to
+  wall time on every emitted point, which nothing else in the pipeline does.
+
 ## HTTP access logs: nginx, HAProxy, and `http_access`
 
 - **`http_access` has no per-server presets** (2026-09-22). It never learns a server's native
@@ -2378,7 +2438,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
       and `run_output` already borrows the incoming `Delivered`. `Transform::flush`/`Aggregator`
       keep a bounded, best-effort `ContributingContexts` set per series
       (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8; overflow dropped and counted as
-      `logit.transform.links.dropped{reason="cardinality"}`) and pair each flushed `Event` with the
+      `logit.transform.links.dropped{reason="contexts"}`) and pair each flushed `Event` with the
       resulting `SpanLink`s. Lua's `flush()` has no inspectable accumulator, so it runs in a
       link-less root context ([ADR `lua-flush-root-context`](adr/lua-flush-root-context.md)), with
       `trace.trace_id`/`trace.span_id` (`docs/design/lua-api.md`) exposed to the script's own

@@ -11,7 +11,12 @@
 //! A cumulative `Sum`, `ExponentialHistogram`, and `Summary` have no merge rule here and pass
 //! through untouched rather than being dropped. Pass-through is per *metric*, not per *event*: this
 //! stage absorbs every mergeable metric off an event and forwards what's left (the unmergeable
-//! metrics, plus any log or span).
+//! metrics, plus any log or span). Two functions decide by kind, each alone: [`opener_for`] whether
+//! a record merges and what a new series opens with, and [`Accumulator::retained_kind`] whether a
+//! series survives a flush. A delta `Sum` whose value is `NaN` or infinite passes through too, so a
+//! cumulative total stays finite. Every record is counted once, as
+//! `logit.transform.metrics.absorbed` or `logit.transform.metrics.passed_through{reason}` (see
+//! [`Tally`]).
 //!
 //! # Temporality: what a flushed `Sum`/`Histogram` means
 //!
@@ -23,10 +28,15 @@
 //! `temporality: cumulative` keeps a delta `Sum`'s and a delta `Histogram`'s accumulator alive
 //! across the flush, under the same two bounds a retained gauge uses
 //! (`series_retention`/`max_retained_series`), and emits the running total every window as
-//! `Cumulative`, with `MetricRecord::start_timestamp` set to the series' first-seen event
-//! timestamp. That stamp is the reset signal OTLP and Prometheus consumers detect a counter restart
-//! with: it never changes while the series lives, and a series evicted (TTL or cardinality cap) and
-//! later re-created gets a new one.
+//! `Cumulative`, with `MetricRecord::start_timestamp` set to the series' start time (its first
+//! event's timestamp, clamped into the window it opened in; see `SeriesState::first_seen`). That
+//! stamp is the reset signal OTLP and Prometheus consumers detect a counter restart with: it never
+//! changes while the series lives, and a series evicted (TTL or cardinality cap) and later
+//! re-created gets a new one.
+//!
+//! A histogram's `sum`, `min`, and `max` each become `None` once a contributing record lacks one,
+//! because a value over part of the observations is a wrong number a consumer can't detect. For
+//! `min`/`max`, a record whose buckets total zero observed nothing and doesn't count.
 //!
 //! A histogram's bucket counts add with `saturating_add`, not `+`: they are wire-supplied `u64`s,
 //! so a producer sending `u64::MAX` twice pins the bucket at `u64::MAX` (wrong but still monotonic)
@@ -127,7 +137,8 @@ impl ContributingContexts {
     }
 
     /// Consumes the tracked set into the `SpanLink`s `flush` pairs with this series' emitted
-    /// event, plus how many distinct contexts the cap rejected.
+    /// event, plus how many observations the cap rejected: one per observation of a context the
+    /// full set doesn't link, so a context seen in two batches counts twice.
     fn into_links(self) -> (Vec<SpanLink>, u64) {
         let links = self
             .seen
@@ -168,8 +179,8 @@ pub struct Aggregator {
     series_retention: u32,
     /// Cap on retained series across all resource groups: a cardinality guard, not a tuning knob.
     /// `series_retention` bounds how long one series survives; this bounds how many can be retained
-    /// at once, against a stream of never-repeating series names. Evicts least-recently-updated
-    /// first. Meaningless while `series_retention` is `0`.
+    /// at once, against a stream of never-repeating series names. Evicts the most idle first, then
+    /// the newest among equally idle series. Meaningless while `series_retention` is `0`.
     max_retained_series: usize,
     /// Whether a flushed `Sum`/`Histogram` is this window's increment (the default) or a running
     /// total that survives the flush.
@@ -188,6 +199,12 @@ pub struct Aggregator {
     /// a value that never changes within one batch (`Transform::observe_batch_context`'s doc makes
     /// the same argument). `None` until the first batch arrives.
     current_scope: Option<Arc<Scope>>,
+    /// The previous flush's `now`: the start of the window being filled, and the earliest start
+    /// time a series opened in it takes. `None` before the first flush.
+    window_start: Option<i64>,
+    /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
+    /// series this `Aggregator` has held, across groups and flushes.
+    next_open_seq: u64,
 }
 
 /// Keyed by `(resource, scope)` value, not `Arc` identity (as `group_for` does for resource): two
@@ -208,16 +225,28 @@ struct SeriesState {
     /// incremented for a retained series; compared against `Aggregator::series_retention` at flush
     /// to decide eviction.
     idle_windows: u32,
-    /// Unix-nanos timestamp of the first event absorbed into this series, emitted as
-    /// `MetricRecord::start_timestamp` on every cumulative-mode `Sum`/`Histogram` flush. A series
-    /// evicted and re-created gets a fresh `SeriesState` and so a fresh value: that's the restart
-    /// signal. Taken from `event.timestamp`, not `SystemTime::now()`, which would put a syscall on
-    /// the open-a-series path and make this untestable. Recorded in both modes so the field has one
-    /// meaning regardless of config.
+    /// This series' place in the order the `Aggregator` opened series, from
+    /// `Aggregator::next_open_seq`. The cardinality cap evicts the highest first among equally idle
+    /// series, so a series updated every window outlives one-off series opened after it.
+    open_seq: u64,
+    /// This series' start time in Unix nanos, emitted as `MetricRecord::start_timestamp` on every
+    /// cumulative-mode `Sum`/`Histogram` flush. A series evicted and re-created gets a fresh
+    /// `SeriesState` and so a fresh value: that's the restart signal.
+    ///
+    /// Opened as the opening event's timestamp, raised to `Aggregator::window_start`, and lowered
+    /// to the flush clock at the first flush that emits it, so it lies between the previous
+    /// incarnation's last point and this one's first. A source timestamp alone can precede the
+    /// point it replaces, run ahead of the flush, or be `0`. Both bounds are clocks the stage
+    /// already has, so opening a series costs no `SystemTime::now()` syscall. Recorded in both
+    /// modes so the field has one meaning regardless of config.
     first_seen: i64,
     /// Whether any event touched this series since the last flush. Not derived from `contexts.seen`
     /// being non-empty: that correlates today, but ties retention to a set built for span linking.
     updated_this_window: bool,
+    /// The opening record's `description`, emitted on every flush of this series. A later record's
+    /// is ignored. Exemplars aren't carried: a summarized window has no single observation to
+    /// attach one to.
+    description: Option<Symbol>,
 }
 
 enum Accumulator {
@@ -251,22 +280,126 @@ enum Accumulator {
     SetMembers(Vec<Bytes>),
 }
 
-/// Whether `kind` has no merge rule in this stage and must be forwarded untouched.
+/// The accumulator a new series opens with, decided from the record that opens it without building
+/// anything: [`opener_for`] runs on every merged record, and only a vacant series calls
+/// [`Opener::open`]. Borrows a `Histogram` record so the decision doesn't clone its bucket `Vec`.
+#[derive(Clone, Copy)]
+enum Opener<'k> {
+    Sum {
+        monotonic: bool,
+    },
+    Gauge,
+    Distribution,
+    /// `sample_rate` comes from the opening record, or the first merge would look like a
+    /// `rate_mismatch` against a made-up default.
+    RawSamples {
+        sample_rate: f64,
+    },
+    Set,
+    RawSetMembers,
+    Histogram(&'k logit_core::Histogram),
+}
+
+/// How a record of `kind` opens a series under this stage's modes, or `None` when the kind has no
+/// merge rule here and the record is forwarded untouched. The one place pass-through is decided.
 ///
-/// `process` and `Accumulator::new_for`'s `unreachable!` arm both depend on this answer; a
-/// disagreement is a runtime panic. Mode-dependent for `Histogram` only: a delta one merges under
-/// [`AggregateTemporality::Cumulative`] and passes through under `Delta`. A cumulative `Histogram`
-/// passes through in both modes, as a cumulative `Sum` does: re-accumulating a running total
-/// double-counts it.
-fn passes_through(kind: &MetricKind, temporality: AggregateTemporality) -> bool {
+/// A cumulative `Sum` passes through in both modes: re-accumulating a running total double-counts
+/// it. `Histogram` is mode-dependent: a delta one merges under
+/// [`AggregateTemporality::Cumulative`] and passes through under `Delta`, and a cumulative one
+/// passes through in both, as a cumulative `Sum` does. `distributions`/`sets` pick the opened shape
+/// for `Samples`/`SetMembers`: raw only when the mode asks for it. An already-summarized
+/// `Distribution`/`Set` opens summarized in any mode.
+fn opener_for(
+    kind: &MetricKind,
+    distributions: Distributions,
+    sets: Sets,
+    temporality: AggregateTemporality,
+) -> Option<Opener<'_>> {
     match kind {
-        MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
-        | MetricKind::ExponentialHistogram(_)
-        | MetricKind::Summary(_) => true,
-        MetricKind::Histogram(h) => {
-            h.temporality == Temporality::Cumulative || temporality == AggregateTemporality::Delta
+        MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
+            Some(Opener::Sum { monotonic: *monotonic })
         }
-        _ => false,
+        MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. }) => None,
+        // `Gauge` and `GaugeDelta` share one accumulator: two ways to update one running value,
+        // not a kind conflict (`docs/adr/relative-gauge-adjustments.md`).
+        MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => Some(Opener::Gauge),
+        MetricKind::Distribution(_) => Some(Opener::Distribution),
+        MetricKind::Samples(s) => Some(match distributions {
+            Distributions::Sketch => Opener::Distribution,
+            Distributions::Samples => Opener::RawSamples { sample_rate: s.sample_rate },
+        }),
+        MetricKind::Set(_) => Some(Opener::Set),
+        MetricKind::SetMembers(_) => Some(match sets {
+            Sets::Estimate => Opener::Set,
+            Sets::Members => Opener::RawSetMembers,
+        }),
+        MetricKind::Histogram(h) => (h.temporality == Temporality::Delta
+            && temporality == AggregateTemporality::Cumulative)
+            .then_some(Opener::Histogram(h)),
+        MetricKind::ExponentialHistogram(_) | MetricKind::Summary(_) => None,
+    }
+}
+
+impl Opener<'_> {
+    /// The empty accumulator; `process` merges the opening record into it right after.
+    fn open(self) -> Accumulator {
+        match self {
+            Opener::Sum { monotonic } => Accumulator::Sum { total: 0.0, monotonic },
+            Opener::Gauge => Accumulator::Gauge { value: 0.0, at: i64::MIN },
+            Opener::Distribution => Accumulator::Distribution(logit_core::DdSketch::new()),
+            Opener::RawSamples { sample_rate } => {
+                Accumulator::Samples(Samples { values: SmallVec::new(), sample_rate })
+            }
+            Opener::Set => Accumulator::Set(logit_core::HyperLogLog::new()),
+            Opener::RawSetMembers => Accumulator::SetMembers(Vec::new()),
+            // This record's bounds with zero counts. `sum` starts `Some(0.0)` when the record has
+            // one, so the both-sides-or-`None` merge rule keeps it on the first merge. Stamped
+            // `Cumulative`: that's the only shape it's emitted as.
+            Opener::Histogram(h) => Accumulator::Histogram(logit_core::Histogram {
+                buckets: h.buckets.iter().map(|(bound, _)| (*bound, 0)).collect(),
+                temporality: Temporality::Cumulative,
+                sum: h.sum.map(|_| 0.0),
+                min: None,
+                max: None,
+            }),
+        }
+    }
+}
+
+/// Per-`process`-call totals behind `logit.transform.metrics.absorbed` and
+/// `logit.transform.metrics.passed_through{reason}`: every record `process` receives lands in one
+/// field. Reported once per non-zero field after the loop, because `Telemetry::count` locks and
+/// hashes on every call.
+#[derive(Default)]
+struct Tally {
+    absorbed: u32,
+    no_recorded_value: u32,
+    no_merge_rule: u32,
+    kind_conflict: u32,
+    histogram_bounds_mismatch: u32,
+    non_finite: u32,
+}
+
+impl Tally {
+    fn report(&self, telemetry: &Telemetry) {
+        if self.absorbed > 0 {
+            telemetry.count("logit.transform.metrics.absorbed", f64::from(self.absorbed), &[]);
+        }
+        for (reason, n) in [
+            ("no_recorded_value", self.no_recorded_value),
+            ("no_merge_rule", self.no_merge_rule),
+            ("kind_conflict", self.kind_conflict),
+            ("histogram_bounds_mismatch", self.histogram_bounds_mismatch),
+            ("non_finite", self.non_finite),
+        ] {
+            if n > 0 {
+                telemetry.count(
+                    "logit.transform.metrics.passed_through",
+                    f64::from(n),
+                    &[("reason", reason)],
+                );
+            }
+        }
     }
 }
 
@@ -278,17 +411,77 @@ fn bucket_bounds_match(held: &[(f64, u64)], incoming: &[(f64, u64)]) -> bool {
         && held.iter().zip(incoming).all(|((a, _), (b, _))| a.to_bits() == b.to_bits())
 }
 
-/// Folds an optional `min`/`max` across a merge: the side with a value wins when only one has one,
-/// `pick` decides when both do. More forgiving than the `sum` rule; see the `Histogram` merge arm.
+/// Unions `incoming` into the raw members `held` under `sets: members`: insertion-ordered and
+/// deduplicated by linear scan, which the cap keeps affordable. Once `held` passes `cap`, the scan
+/// stops and every held member plus the rest of `incoming` goes into the returned `HyperLogLog`,
+/// so the union survives the conversion. The scan makes at most `cap` compares per member, so
+/// one oversized record costs O(n·cap) compares and cap-bounded memory, not its own size squared.
+///
+/// Also returns how many member compares the scan made, so a test can bound the cost without a
+/// clock.
+fn union_members(
+    held: &mut Vec<Bytes>,
+    incoming: &[Bytes],
+    cap: usize,
+) -> (Option<logit_core::HyperLogLog>, usize) {
+    let mut compares = 0;
+    let mut rest = incoming.iter();
+    for m in rest.by_ref() {
+        match held.iter().position(|h| h == m) {
+            Some(i) => compares += i + 1,
+            None => {
+                compares += held.len();
+                held.push(m.clone());
+                if held.len() > cap {
+                    let mut hll = logit_core::HyperLogLog::new();
+                    for m in held.iter().chain(rest) {
+                        hll.insert(m);
+                    }
+                    return (Some(hll), compares);
+                }
+            }
+        }
+    }
+    (None, compares)
+}
+
+/// Adds `samples` to `sketch` value by value at [`Samples::weight`], the fold [`Samples::sketch`]
+/// does, without building a temporary `DdSketch`. Returns how many values were non-finite:
+/// `DdSketch::add_count` drops those, since a `NaN` or infinite observation has no bin.
+fn sketch_samples(sketch: &mut logit_core::DdSketch, samples: &Samples) -> u32 {
+    let weight = samples.weight();
+    let mut non_finite = 0;
+    for v in &samples.values {
+        if v.is_finite() {
+            sketch.add_weighted(*v, weight);
+        } else {
+            non_finite += 1;
+        }
+    }
+    non_finite
+}
+
+/// Whether a histogram's buckets hold any observation. A record that observed nothing has no
+/// `min`/`max` to contribute, so [`fold_extreme`] skips it.
+fn observed(buckets: &[(f64, u64)]) -> bool {
+    buckets.iter().any(|(_, count)| *count > 0)
+}
+
+/// Folds a histogram's `min`/`max` across a merge under the `sum` rule: once both sides observed
+/// something, a side missing the value makes the result `None`, because an extreme taken over
+/// part of the observations can pair one window's `min` with another's `max` and give
+/// `min > max`. A side that observed nothing is ignored, so the empty accumulator a series opens
+/// with takes the first observed record's value. `pick` decides when both sides have one.
 fn fold_extreme(
-    held: Option<f64>,
-    incoming: Option<f64>,
+    held: (bool, Option<f64>),
+    incoming: (bool, Option<f64>),
     pick: fn(f64, f64) -> f64,
 ) -> Option<f64> {
     match (held, incoming) {
-        (Some(held), Some(incoming)) => Some(pick(held, incoming)),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
+        (held, (false, _)) => held.1,
+        ((false, _), incoming) => incoming.1,
+        ((true, Some(held)), (true, Some(incoming))) => Some(pick(held, incoming)),
+        _ => None,
     }
 }
 
@@ -308,6 +501,8 @@ impl Aggregator {
             sets: Sets::default(),
             max_set_members_per_series: 1000,
             current_scope: None,
+            window_start: None,
+            next_open_seq: 0,
         }
     }
 
@@ -322,10 +517,10 @@ impl Aggregator {
     /// Selects what a flushed `Sum`/`Histogram` means (see this module's "Temporality" section).
     /// Defaults to `Delta`.
     ///
-    /// `Cumulative` is only useful with both `with_series_retention` bounds non-zero: a running
-    /// total that can't survive a flush is this window's delta labeled `Cumulative`. Graph
-    /// validation rejects that combination (`crates/logit-pipeline/src/graph.rs`, rule 39); this
-    /// builder doesn't check it.
+    /// `Cumulative` needs both `with_series_retention` bounds non-zero: a running total that can't
+    /// survive a flush is this window's delta labeled `Cumulative`. Graph validation rejects that
+    /// combination (`crates/logit-pipeline/src/graph.rs`, rule 39); this builder doesn't check it,
+    /// and `flush` asserts it in debug builds.
     pub fn with_temporality(mut self, temporality: AggregateTemporality) -> Self {
         self.temporality = temporality;
         self
@@ -386,8 +581,11 @@ impl Aggregator {
     /// touches window state.
     ///
     /// Grouped by `(resource, scope)` value, not `Arc` identity: two inputs that each build an
-    /// empty `Resource` describe the same origin and aggregate together. One input's batches share
-    /// one `Arc` in practice, so the common case is one group found by a linear scan.
+    /// empty `Resource` describe the same origin and aggregate together. The lookup is a linear
+    /// scan that compares every earlier group before it reaches the match. `statsd_in` holds one
+    /// `Arc<Resource>` per listener, so its match is an `Arc::ptr_eq` hit in `resource_key_eq`.
+    /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
+    /// resource write one per batch, so each of those pays a full field compare at the match too.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
@@ -402,27 +600,42 @@ impl Aggregator {
         let max_samples_per_series = self.max_samples_per_series;
         let sets = self.sets;
         let max_set_members_per_series = self.max_set_members_per_series;
+        let window_start = self.window_start;
 
         // Taken, not filtered with `retain`: a `retain` closure would borrow `event` while
         // `self.group_for` needs `&mut self`. Anything not absorbed is pushed back in its original
         // relative order.
         let metrics = std::mem::take(&mut event.metrics);
+        let mut tally = Tally::default();
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
             if record.is_no_recorded_value() {
-                self.telemetry.count(
-                    "logit.transform.metrics.passed_through",
-                    1.0,
-                    &[("reason", "no_recorded_value")],
-                );
+                tally.no_recorded_value += 1;
                 event.metrics.push(record);
                 continue;
             }
 
-            // No merge rule: leave it on the event. Must agree with `Accumulator::new_for`'s
-            // `unreachable!` arm (see `passes_through`).
-            if passes_through(&record.kind, temporality) {
+            let Some(opener) = opener_for(&record.kind, distributions, sets, temporality) else {
+                tally.no_merge_rule += 1;
+                event.metrics.push(record);
+                continue;
+            };
+
+            // Checked before the series key, so no series opens for it. A non-finite increment
+            // would pin a cumulative total at `NaN` or infinity for the series' whole life.
+            // Only a delta `Sum` gets here: `opener_for` passed a cumulative one through.
+            let non_finite =
+                matches!(record.kind, MetricKind::Sum(Sum { value, .. }) if !value.is_finite());
+            if non_finite {
+                tally.non_finite += 1;
+                self.diag.warn_throttled(
+                    "sum_non_finite",
+                    format_args!(
+                        "sum '{}' has a non-finite value -- forwarding it untouched",
+                        logit_core::interner::resolve(record.name)
+                    ),
+                );
                 event.metrics.push(record);
                 continue;
             }
@@ -432,6 +645,7 @@ impl Aggregator {
                 unit: record.unit,
                 attributes: event.attributes.clone(),
             };
+            let open_seq = self.next_open_seq;
             let group = self.group_for(resource, &scope);
             let entry = group.series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
@@ -439,15 +653,21 @@ impl Aggregator {
             // `GaugeDelta` uses it.
             let was_vacant = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
             let state = entry.or_insert_with(|| SeriesState {
-                accumulator: Accumulator::new_for(&record.kind, distributions, sets, temporality),
+                accumulator: opener.open(),
                 contexts: ContributingContexts::default(),
                 idle_windows: 0,
-                first_seen: event.timestamp,
+                open_seq,
+                first_seen: window_start
+                    .map_or(event.timestamp, |start| event.timestamp.max(start)),
                 updated_this_window: false,
+                description: record.description,
             });
 
             // Set inside the merge match, reported after it: the match can't borrow `self`.
-            let mut samples_weight_clamped = false;
+            // Records whose sample rate `Samples::is_clamped`, held or incoming, and values a
+            // sketch dropped as non-finite.
+            let mut samples_clamped: u32 = 0;
+            let mut samples_non_finite: u32 = 0;
             let mut samples_fallback_reason: Option<&'static str> = None;
             let mut set_members_fallback = false;
             let mut histogram_bounds_mismatch = false;
@@ -472,6 +692,8 @@ impl Aggregator {
                             histogram_bounds_mismatch = true;
                             false
                         } else {
+                            let held_observed = observed(&held.buckets);
+                            let incoming_observed = observed(&incoming.buckets);
                             for (held_bucket, incoming_bucket) in
                                 held.buckets.iter_mut().zip(incoming.buckets.iter())
                             {
@@ -481,16 +703,24 @@ impl Aggregator {
                             }
                             // `sum` adds only when both sides have one: a total missing a window's
                             // contribution is a wrong number, and a consumer can tell `None` from
-                            // that. `min`/`max` fold across whichever sides have one: an extreme
-                            // seen over some windows is still a real observation.
+                            // that. `min`/`max` follow the same rule over the records that
+                            // observed something (`fold_extreme`).
                             held.sum = match (held.sum, incoming.sum) {
                                 (Some(held_sum), Some(incoming_sum)) => {
                                     Some(held_sum + incoming_sum)
                                 }
                                 _ => None,
                             };
-                            held.min = fold_extreme(held.min, incoming.min, f64::min);
-                            held.max = fold_extreme(held.max, incoming.max, f64::max);
+                            held.min = fold_extreme(
+                                (held_observed, held.min),
+                                (incoming_observed, incoming.min),
+                                f64::min,
+                            );
+                            held.max = fold_extreme(
+                                (held_observed, held.max),
+                                (incoming_observed, incoming.max),
+                                f64::max,
+                            );
                             true
                         }
                     }
@@ -529,7 +759,9 @@ impl Aggregator {
                     // an upstream `aggregate`): sketch what's held and merge.
                     Accumulator::Samples(held) => {
                         let held_owned = std::mem::take(held);
-                        let mut sketch = held_owned.sketch();
+                        let mut sketch = logit_core::DdSketch::new();
+                        samples_non_finite += sketch_samples(&mut sketch, &held_owned);
+                        samples_clamped += u32::from(held_owned.is_clamped());
                         sketch.merge(incoming);
                         state.accumulator = Accumulator::Distribution(sketch);
                         true
@@ -544,49 +776,39 @@ impl Aggregator {
                     // Per-value `add_weighted`, not `sketch.merge(&incoming.sketch())`, which
                     // would allocate a temporary `DdSketch` only to fold it in.
                     Accumulator::Distribution(sketch) => {
-                        let weight = incoming.weight();
-                        for v in &incoming.values {
-                            sketch.add_weighted(*v, weight);
-                        }
-                        if weight == Samples::MAX_WEIGHT {
-                            samples_weight_clamped = true;
-                        }
+                        samples_non_finite += sketch_samples(sketch, incoming);
+                        samples_clamped += u32::from(incoming.is_clamped());
                         true
                     }
                     // `distributions: samples`: concatenate while the rate agrees and the cap
-                    // holds; otherwise sketch `held` plus `incoming` and record why.
+                    // holds; otherwise sketch `held` plus `incoming` and record why. A clamp on
+                    // the held records is reported here, when their weight is first applied.
                     Accumulator::Samples(held) => {
-                        if held.sample_rate != incoming.sample_rate {
-                            let held_owned = std::mem::take(held);
-                            let mut sketch = held_owned.sketch();
-                            let weight = incoming.weight();
-                            for v in &incoming.values {
-                                sketch.add_weighted(*v, weight);
-                            }
-                            if weight == Samples::MAX_WEIGHT {
-                                samples_weight_clamped = true;
-                            }
-                            state.accumulator = Accumulator::Distribution(sketch);
-                            samples_fallback_reason = Some("rate_mismatch");
-                            true
+                        // Bitwise, like a series key's `f64`: a `NaN` rate must match itself.
+                        let fallback = if held.sample_rate.to_bits()
+                            != incoming.sample_rate.to_bits()
+                        {
+                            Some("rate_mismatch")
                         } else if held.values.len() + incoming.values.len() > max_samples_per_series
                         {
-                            let held_owned = std::mem::take(held);
-                            let mut sketch = held_owned.sketch();
-                            let weight = incoming.weight();
-                            for v in &incoming.values {
-                                sketch.add_weighted(*v, weight);
-                            }
-                            if weight == Samples::MAX_WEIGHT {
-                                samples_weight_clamped = true;
-                            }
-                            state.accumulator = Accumulator::Distribution(sketch);
-                            samples_fallback_reason = Some("cap");
-                            true
+                            Some("cap")
                         } else {
-                            held.values.extend(incoming.values.iter().copied());
-                            true
+                            None
+                        };
+                        match fallback {
+                            None => held.values.extend(incoming.values.iter().copied()),
+                            Some(reason) => {
+                                let held_owned = std::mem::take(held);
+                                let mut sketch = logit_core::DdSketch::new();
+                                for side in [&held_owned, incoming] {
+                                    samples_non_finite += sketch_samples(&mut sketch, side);
+                                    samples_clamped += u32::from(side.is_clamped());
+                                }
+                                state.accumulator = Accumulator::Distribution(sketch);
+                                samples_fallback_reason = Some(reason);
+                            }
                         }
+                        true
                     }
                     _ => false,
                 },
@@ -617,34 +839,22 @@ impl Aggregator {
                         }
                         true
                     }
-                    // `sets: members`: an insertion-ordered union, deduplicated by linear scan
-                    // (fine at the cap size). Past the cap, every held and incoming member goes
-                    // into a `HyperLogLog`, so the union survives the conversion.
+                    // `sets: members`: see `union_members`.
                     Accumulator::SetMembers(held) => {
-                        let mut merged = std::mem::take(held);
-                        for m in incoming {
-                            if !merged.contains(m) {
-                                merged.push(m.clone());
-                            }
-                        }
-                        if merged.len() > max_set_members_per_series {
-                            let mut hll = logit_core::HyperLogLog::new();
-                            for m in &merged {
-                                hll.insert(m);
-                            }
+                        let (overflow, _) =
+                            union_members(held, incoming, max_set_members_per_series);
+                        if let Some(hll) = overflow {
                             state.accumulator = Accumulator::Set(hll);
                             set_members_fallback = true;
-                            true
-                        } else {
-                            *held = merged;
-                            true
                         }
+                        true
                     }
                     _ => false,
                 },
                 _ => false,
             };
             if accumulated {
+                tally.absorbed += 1;
                 // Only on a real merge: a kind-conflicted metric isn't a contributor.
                 state.contexts.observe(ctx);
                 state.updated_this_window = true;
@@ -658,19 +868,32 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "gauge_delta_unseeded",
                         format_args!(
-                            "gauge delta for '{}' opened a new series and resolved against 0.0                              -- no prior absolute value seen for this series",
+                            "gauge delta for '{}' opened a new series and resolved against 0.0 \
+                             -- no prior absolute value seen for this series",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
                 }
-                if samples_weight_clamped {
+                if samples_non_finite > 0 {
+                    self.telemetry.count(
+                        "logit.transform.samples.non_finite_dropped",
+                        f64::from(samples_non_finite),
+                        &[],
+                    );
+                }
+                if samples_clamped > 0 {
                     // The one place a sample rate implying more than `Samples::MAX_WEIGHT`
                     // observations per value is noticed: `statsd_in` doesn't sketch or clamp.
-                    self.telemetry.count("logit.transform.samples.weight_clamped", 1.0, &[]);
+                    self.telemetry.count(
+                        "logit.transform.samples.weight_clamped",
+                        f64::from(samples_clamped),
+                        &[],
+                    );
                     self.diag.warn_throttled(
                         "sample_rate_clamped",
                         format_args!(
-                            "sample_rate for '{}' implies a weight beyond Samples::MAX_WEIGHT                              ({}); clamping",
+                            "sample_rate for '{}' implies a weight beyond Samples::MAX_WEIGHT \
+                             ({}); clamping",
                             logit_core::interner::resolve(record.name),
                             Samples::MAX_WEIGHT
                         ),
@@ -685,7 +908,8 @@ impl Aggregator {
                     let (key, why) = if reason == "rate_mismatch" {
                         (
                             "samples_rate_mismatch",
-                            "an incoming record's sample_rate disagreed with this series' first                              record",
+                            "an incoming record's sample_rate disagreed with this series' first \
+                             record",
                         )
                     } else {
                         ("samples_cap_exceeded", "max_samples_per_series was exceeded")
@@ -707,7 +931,8 @@ impl Aggregator {
                     self.diag.warn_throttled(
                         "set_members_cap_exceeded",
                         format_args!(
-                            "raw set members for '{}' fell back to a HyperLogLog estimate:                              max_set_members_per_series was exceeded",
+                            "raw set members for '{}' fell back to a HyperLogLog estimate: \
+                             max_set_members_per_series was exceeded",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
@@ -715,6 +940,7 @@ impl Aggregator {
             }
             if !accumulated {
                 if histogram_bounds_mismatch {
+                    tally.histogram_bounds_mismatch += 1;
                     // Its own key, not `kind_conflict`: the kind matches and only the bounds differ
                     // (a producer that re-bucketed mid-run).
                     self.diag.warn_throttled(
@@ -727,17 +953,23 @@ impl Aggregator {
                         ),
                     );
                 } else {
+                    tally.kind_conflict += 1;
                     self.diag.warn_throttled(
                         "kind_conflict",
                         format_args!(
-                            "metric '{}' has a kind that conflicts with an already-accumulating                          series under the same name/unit/tags -- forwarding it untouched",
+                            "metric '{}' has a kind that conflicts with an already-accumulating \
+                             series under the same name/unit/tags -- forwarding it untouched",
                             logit_core::interner::resolve(record.name)
                         ),
                     );
                 }
                 event.metrics.push(record);
             }
+            if was_vacant {
+                self.next_open_seq += 1;
+            }
         }
+        tally.report(&self.telemetry);
 
         !(event.metrics.is_empty() && event.log.is_none() && event.span.is_none())
     }
@@ -750,7 +982,7 @@ impl Aggregator {
         if let Some(i) = self
             .groups
             .iter()
-            .position(|g| g.resource.as_ref() == resource.as_ref() && scope_key_eq(&g.scope, scope))
+            .position(|g| resource_key_eq(&g.resource, resource) && scope_key_eq(&g.scope, scope))
         {
             &mut self.groups[i]
         } else {
@@ -770,6 +1002,11 @@ impl Aggregator {
     /// `Sum`/`Histogram` under `temporality: cumulative`) survives into the next window when
     /// `series_retention > 0`, subject to `max_retained_series`.
     pub fn flush(&mut self, now: i64) -> FlushOutput {
+        debug_assert!(
+            self.temporality == AggregateTemporality::Delta
+                || (self.series_retention > 0 && self.max_retained_series > 0),
+            "temporality: cumulative without both retention bounds, which graph rule 39 rejects"
+        );
         // Sampled before any series is touched: the peak-of-window value. `SeriesKey` includes the
         // event's whole attribute set, so an unpruned high-cardinality attribute shows up here
         // first (`crate::keep`'s module doc warns about this).
@@ -805,33 +1042,28 @@ impl Aggregator {
             // At most one event per series, and exactly one each on the default path.
             let mut events = Vec::with_capacity(series.len());
             for (key, mut state) in series {
-                // A gauge's value is sticky by protocol; a cumulative `Sum`/`Histogram`'s running
-                // total is what the mode emits. `Distribution`/`Samples`/`Set`/`SetMembers` never
-                // survive: each window's summary is self-contained.
-                let retain = self.series_retention > 0
-                    && match &state.accumulator {
-                        Accumulator::Gauge { .. } => true,
-                        Accumulator::Sum { .. } | Accumulator::Histogram(_) => {
-                            self.temporality == AggregateTemporality::Cumulative
-                        }
-                        _ => false,
-                    };
                 if state.updated_this_window {
                     let (links, dropped) = std::mem::take(&mut state.contexts).into_links();
                     total_dropped_links += dropped;
 
-                    if retain {
-                        // Read without consuming the accumulator (one bucket-`Vec` clone for a
-                        // `Histogram`, free otherwise). `key.attributes` is cloned only on this
-                        // path because `key` goes back into the map.
-                        let mut record = MetricRecord::new(
-                            key.name,
-                            state.accumulator.kind_for_retained(self.temporality),
-                        );
+                    // Asked only of an updated series: an idle one is here because it was
+                    // retained, and asking would clone a `Histogram`'s buckets for nothing.
+                    let retained = if self.series_retention > 0 {
+                        state.accumulator.retained_kind(self.temporality)
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = retained {
+                        // `key.attributes` is cloned only on this path because `key` goes back
+                        // into the map.
+                        let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
-                        // The reset signal (`SeriesState::first_seen`). A `Gauge` has no start
-                        // time and keeps `0`, OTLP's "unknown".
+                        record.description = state.description;
+                        // The reset signal (`SeriesState::first_seen`), kept once lowered so
+                        // it never moves while the series lives. A `Gauge` has no start time and
+                        // keeps `0`, OTLP's "unknown".
                         if matches!(record.kind, MetricKind::Sum(_) | MetricKind::Histogram(_)) {
+                            state.first_seen = state.first_seen.min(now);
                             record.start_timestamp = state.first_seen;
                         }
                         // An accumulated value is never a `NO_RECORDED_VALUE` point: `process`
@@ -852,6 +1084,7 @@ impl Aggregator {
                         let kind = state.accumulator.into_kind(self.temporality);
                         let mut record = MetricRecord::new(key.name, kind);
                         record.unit = key.unit;
+                        record.description = state.description;
                         record.flags = 0;
                         events.push((Event::metric(now, key.attributes, record), links));
                     }
@@ -876,28 +1109,41 @@ impl Aggregator {
             }
         }
 
-        // Cardinality cap, evicting the most idle first. Without it, C never-repeating series
-        // names per window would hold C * series_retention series indefinitely.
-        let mut evicted_cardinality: u64 = 0;
+        // Cardinality cap, evicting the most idle first and the newest among equally idle. Without
+        // it, C never-repeating series names per window would hold C * series_retention series
+        // indefinitely. Newest first keeps a series updated every window ahead of the one-off
+        // series opened after it. `open_seq` is unique, so the key is total and an unstable sort
+        // gives one order.
+        let mut evicted_active: u64 = 0;
+        let mut evicted_cardinality_idle: u64 = 0;
         if survivors.len() > self.max_retained_series {
             let excess = survivors.len() - self.max_retained_series;
-            // Stable, so ties among equally idle series evict deterministically.
-            survivors.sort_by_key(|(_, _, state)| std::cmp::Reverse(state.idle_windows));
-            survivors.drain(0..excess);
-            evicted_cardinality = excess as u64;
+            survivors.sort_unstable_by_key(|(_, _, state)| {
+                (std::cmp::Reverse(state.idle_windows), std::cmp::Reverse(state.open_seq))
+            });
+            for (_, _, state) in survivors.drain(0..excess) {
+                // An updated survivor left the loop above with `idle_windows == 0`.
+                if state.idle_windows == 0 {
+                    evicted_active += 1;
+                } else {
+                    evicted_cardinality_idle += 1;
+                }
+            }
         }
+        let evicted_cardinality = evicted_active + evicted_cardinality_idle;
 
         // Survivors go back to their group; a group left empty is dropped.
         for (gi, key, state) in survivors {
             self.groups[gi].series.insert(key, state);
         }
         self.groups.retain(|g| !g.series.is_empty());
+        self.window_start = Some(now);
 
         if total_dropped_links > 0 {
             self.telemetry.count(
                 "logit.transform.links.dropped",
                 total_dropped_links as f64,
-                &[("reason", "cardinality")],
+                &[("reason", "contexts")],
             );
         }
         if evicted_idle > 0 {
@@ -907,12 +1153,18 @@ impl Aggregator {
                 &[("reason", "idle")],
             );
         }
+        // Split by whether the series was updated this window: an active one was emitted this
+        // flush and is then lost, the loss worth alerting on.
+        for (state, n) in [("active", evicted_active), ("idle", evicted_cardinality_idle)] {
+            if n > 0 {
+                self.telemetry.count(
+                    "logit.transform.series.evicted",
+                    n as f64,
+                    &[("reason", "cardinality"), ("state", state)],
+                );
+            }
+        }
         if evicted_cardinality > 0 {
-            self.telemetry.count(
-                "logit.transform.series.evicted",
-                evicted_cardinality as f64,
-                &[("reason", "cardinality")],
-            );
             // Warned: a later gauge delta against an evicted series resolves against 0.0, and an
             // evicted cumulative series restarts from zero with a new `start_timestamp`.
             self.diag.warn_throttled(
@@ -955,62 +1207,6 @@ impl Transform for Aggregator {
 }
 
 impl Accumulator {
-    /// The empty accumulator a new series of `kind` opens with; `process` merges the record into
-    /// it right after. Panics on a kind [`passes_through`] should have filtered out.
-    ///
-    /// `distributions`/`sets` pick the opened shape for `Samples`/`SetMembers`: raw only when the
-    /// mode asks for it. An already-summarized `Distribution`/`Set` opens summarized in any mode.
-    fn new_for(
-        kind: &MetricKind,
-        distributions: Distributions,
-        sets: Sets,
-        temporality: AggregateTemporality,
-    ) -> Self {
-        match kind {
-            MetricKind::Sum(Sum { temporality: Temporality::Delta, monotonic, .. }) => {
-                Accumulator::Sum { total: 0.0, monotonic: *monotonic }
-            }
-            // `Gauge` and `GaugeDelta` share one accumulator: two ways to update one running
-            // value, not a kind conflict (`docs/adr/relative-gauge-adjustments.md`).
-            MetricKind::Gauge(_) | MetricKind::GaugeDelta(_) => {
-                Accumulator::Gauge { value: 0.0, at: i64::MIN }
-            }
-            MetricKind::Distribution(_) => Accumulator::Distribution(logit_core::DdSketch::new()),
-            // `sample_rate` comes from this record, or the first merge would look like a
-            // `rate_mismatch` against a made-up default.
-            MetricKind::Samples(s) => match distributions {
-                Distributions::Sketch => Accumulator::Distribution(logit_core::DdSketch::new()),
-                Distributions::Samples => Accumulator::Samples(Samples {
-                    values: SmallVec::new(),
-                    sample_rate: s.sample_rate,
-                }),
-            },
-            MetricKind::Set(_) => Accumulator::Set(logit_core::HyperLogLog::new()),
-            MetricKind::SetMembers(_) => match sets {
-                Sets::Estimate => Accumulator::Set(logit_core::HyperLogLog::new()),
-                Sets::Members => Accumulator::SetMembers(Vec::new()),
-            },
-            // This record's bounds with zero counts. `sum` starts `Some(0.0)` when the record has
-            // one, so the both-sides-or-`None` merge rule keeps it on the first merge. Stamped
-            // `Cumulative`: that's the only shape it's emitted as.
-            MetricKind::Histogram(h) if temporality == AggregateTemporality::Cumulative => {
-                Accumulator::Histogram(logit_core::Histogram {
-                    buckets: h.buckets.iter().map(|(bound, _)| (*bound, 0)).collect(),
-                    temporality: Temporality::Cumulative,
-                    sum: h.sum.map(|_| 0.0),
-                    min: None,
-                    max: None,
-                })
-            }
-            MetricKind::Sum(Sum { temporality: Temporality::Cumulative, .. })
-            | MetricKind::Histogram(_)
-            | MetricKind::ExponentialHistogram(_)
-            | MetricKind::Summary(_) => {
-                unreachable!("process() never creates an accumulator for a pass-through kind")
-            }
-        }
-    }
-
     /// Consumes this accumulator into the `MetricKind` a tumbling flush emits. A `Sum` is labeled
     /// with the stage's mode, not the (always delta) records that fed it.
     fn into_kind(self, temporality: AggregateTemporality) -> MetricKind {
@@ -1029,30 +1225,38 @@ impl Accumulator {
         }
     }
 
-    /// [`Accumulator::into_kind`]'s non-consuming twin, for a retained series: emits a copy of the
-    /// running value. One bucket-`Vec` clone for a `Histogram`, free otherwise.
-    fn kind_for_retained(&self, temporality: AggregateTemporality) -> MetricKind {
+    /// What a series holding this accumulator emits when it survives the flush, or `None` when it
+    /// doesn't survive (the one place retention by kind is decided). `flush` asks only when
+    /// `series_retention > 0`.
+    ///
+    /// A gauge's value is sticky by protocol, and a cumulative `Sum`/`Histogram`'s running total
+    /// is what that mode emits. `Distribution`/`Samples`/`Set`/`SetMembers` never survive: each
+    /// window's summary is self-contained. Reads without consuming: one bucket-`Vec` clone for a
+    /// `Histogram`, free otherwise.
+    fn retained_kind(&self, temporality: AggregateTemporality) -> Option<MetricKind> {
+        let cumulative = temporality == AggregateTemporality::Cumulative;
         match self {
-            Accumulator::Gauge { value, .. } => MetricKind::Gauge(*value),
-            Accumulator::Sum { total, monotonic } => MetricKind::Sum(Sum {
+            Accumulator::Gauge { value, .. } => Some(MetricKind::Gauge(*value)),
+            Accumulator::Sum { total, monotonic } if cumulative => Some(MetricKind::Sum(Sum {
                 value: *total,
                 temporality: record_temporality(temporality),
                 monotonic: *monotonic,
-            }),
-            Accumulator::Histogram(histogram) => MetricKind::Histogram(histogram.clone()),
-            // Must agree with `flush`'s `retain` predicate.
-            Accumulator::Distribution(_)
+            })),
+            Accumulator::Histogram(histogram) if cumulative => {
+                Some(MetricKind::Histogram(histogram.clone()))
+            }
+            Accumulator::Sum { .. }
+            | Accumulator::Histogram(_)
+            | Accumulator::Distribution(_)
             | Accumulator::Samples(_)
             | Accumulator::Set(_)
-            | Accumulator::SetMembers(_) => {
-                unreachable!("flush() only ever retains a Gauge, or a cumulative Sum/Histogram")
-            }
+            | Accumulator::SetMembers(_) => None,
         }
     }
 }
 
 /// The `logit_core::Temporality` a flushed record carries under a stage mode; one mapping so
-/// `into_kind` and `kind_for_retained` can't disagree.
+/// `into_kind` and `retained_kind` can't disagree.
 fn record_temporality(temporality: AggregateTemporality) -> Temporality {
     match temporality {
         AggregateTemporality::Delta => Temporality::Delta,
@@ -1097,6 +1301,19 @@ impl Hash for SeriesKey {
     }
 }
 
+/// Field-wise equality for a `group_for` resource key, comparing `Value::F64` bitwise, the rule
+/// `SeriesKey` and [`scope_key_eq`] follow. `Resource`'s derived `PartialEq` judges a `NaN`
+/// attribute unequal to itself, even through one `Arc`, which would open a new `ResourceGroup` per
+/// metric carrying it; and it judges `-0.0` equal to `0.0`, which series identity keeps apart.
+///
+/// `Arc::ptr_eq` first: an input that reuses one `Arc<Resource>` skips the field walk.
+fn resource_key_eq(a: &Arc<Resource>, b: &Arc<Resource>) -> bool {
+    Arc::ptr_eq(a, b)
+        || (a.schema_url == b.schema_url
+            && a.dropped_attributes_count == b.dropped_attributes_count
+            && attr_map_key_eq(&a.attributes, &b.attributes))
+}
+
 /// Field-wise equality for a `group_for` scope key, comparing `Value::F64` bitwise. `Scope`'s
 /// derived `PartialEq` judges a `NaN` attribute unequal to itself, which would open a new
 /// `ResourceGroup` per event carrying it (the failure `SeriesKey` avoids the same way).
@@ -1118,8 +1335,9 @@ fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     }
 }
 
-/// `AttrMap` equality with bitwise floats, for [`scope_key_eq`]. `AttrMap::iter()` yields `Symbol`
-/// order, so a length check plus a zipped walk is order-independent.
+/// `AttrMap` equality with bitwise floats, for [`resource_key_eq`] and [`scope_key_eq`].
+/// `AttrMap::iter()` yields `Symbol` order, so a length check plus a zipped walk is
+/// order-independent.
 fn attr_map_key_eq(a: &AttrMap, b: &AttrMap) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| k1 == k2 && value_key_eq(v1, v2))
@@ -1391,6 +1609,145 @@ mod tests {
             );
         }
         assert!(agg.flush(100).is_empty());
+    }
+
+    /// One record of every `MetricKind` variant, in both temporalities where the kind carries one.
+    fn every_kind() -> Vec<MetricKind> {
+        let histogram = |temporality| {
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(1.0, 1), (f64::INFINITY, 0)],
+                temporality,
+                sum: Some(0.5),
+                min: Some(0.5),
+                max: Some(0.5),
+            })
+        };
+        let exp_histogram = |temporality| {
+            MetricKind::ExponentialHistogram(logit_core::ExpHistogram {
+                scale: 0,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: (0, vec![1]),
+                negative: (0, vec![]),
+                temporality,
+                count: 1,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        };
+        let mut hll = logit_core::HyperLogLog::new();
+        hll.insert(b"a");
+        let sum = |temporality| MetricKind::Sum(Sum { value: 1.0, temporality, monotonic: true });
+        vec![
+            sum(Temporality::Delta),
+            sum(Temporality::Cumulative),
+            MetricKind::Gauge(1.0),
+            MetricKind::GaugeDelta(1.0),
+            MetricKind::Samples(Samples::new([1.0])),
+            MetricKind::Distribution(Samples::new([1.0]).sketch()),
+            MetricKind::SetMembers(vec![Bytes::from_static(b"a")]),
+            MetricKind::Set(hll),
+            histogram(Temporality::Delta),
+            histogram(Temporality::Cumulative),
+            exp_histogram(Temporality::Delta),
+            exp_histogram(Temporality::Cumulative),
+            MetricKind::Summary(logit_core::Summary {
+                quantiles: vec![(0.5, 1.0)],
+                count: 1,
+                sum: 1.0,
+            }),
+        ]
+    }
+
+    fn every_mode() -> Vec<(AggregateTemporality, Distributions, Sets)> {
+        let mut modes = Vec::new();
+        for t in [AggregateTemporality::Delta, AggregateTemporality::Cumulative] {
+            for d in [Distributions::Sketch, Distributions::Samples] {
+                for s in [Sets::Estimate, Sets::Members] {
+                    modes.push((t, d, s));
+                }
+            }
+        }
+        modes
+    }
+
+    #[test]
+    fn opener_for_is_none_iff_process_forwards_the_record() {
+        let resource = default_resource();
+        for kind in every_kind() {
+            for (t, d, s) in every_mode() {
+                let mut agg = Aggregator::new(Duration::from_secs(10))
+                    .with_temporality(t)
+                    .with_distributions(d, 1000)
+                    .with_sets(s, 1000);
+                let passes = opener_for(&kind, d, s, t).is_none();
+                let forwarded = feed(&mut agg, &resource, metric_event("m", kind.clone(), 0));
+                assert_eq!(forwarded.is_some(), passes, "{kind:?} under {t:?}/{d:?}/{s:?}");
+                assert_eq!(agg.groups.len(), usize::from(!passes), "{kind:?} under {t:?}");
+            }
+        }
+    }
+
+    /// One accumulator of every `Accumulator` variant.
+    fn accumulator(variant: usize) -> Accumulator {
+        match variant {
+            0 => Accumulator::Sum { total: 1.0, monotonic: true },
+            1 => Accumulator::Histogram(logit_core::Histogram {
+                buckets: vec![(1.0, 1)],
+                temporality: Temporality::Cumulative,
+                sum: None,
+                min: None,
+                max: None,
+            }),
+            2 => Accumulator::Gauge { value: 1.0, at: 0 },
+            3 => Accumulator::Distribution(Samples::new([1.0]).sketch()),
+            4 => Accumulator::Samples(Samples::new([1.0])),
+            5 => Accumulator::Set(logit_core::HyperLogLog::new()),
+            _ => Accumulator::SetMembers(vec![Bytes::from_static(b"a")]),
+        }
+    }
+
+    #[test]
+    fn retained_kind_is_some_iff_the_series_survives_a_flush() {
+        for variant in 0..7 {
+            for (t, _, _) in every_mode() {
+                for retention in [0, 1, 3] {
+                    if retention == 0 && t == AggregateTemporality::Cumulative {
+                        continue; // rule 39 rejects it, and `flush` asserts so
+                    }
+                    let mut agg = Aggregator::new(Duration::from_secs(10))
+                        .with_temporality(t)
+                        .with_series_retention(retention, 10);
+                    let retained = accumulator(variant).retained_kind(t).is_some();
+                    let key =
+                        SeriesKey { name: intern("m"), unit: None, attributes: AttrMap::new() };
+                    let state = SeriesState {
+                        accumulator: accumulator(variant),
+                        contexts: ContributingContexts::default(),
+                        idle_windows: 0,
+                        open_seq: 0,
+                        first_seen: 0,
+                        updated_this_window: true,
+                        description: None,
+                    };
+                    agg.groups.push(ResourceGroup {
+                        resource: default_resource(),
+                        scope: None,
+                        series: HashMap::from([(key, state)]),
+                    });
+
+                    let emitted = flush_events(&mut agg, 10);
+                    assert_eq!(emitted.len(), 1, "an updated series emits once");
+                    let survived = agg.groups.iter().map(|g| g.series.len()).sum::<usize>();
+                    assert_eq!(
+                        survived,
+                        usize::from(retention > 0 && retained),
+                        "variant {variant} under {t:?}, retention {retention}"
+                    );
+                }
+            }
+        }
     }
 
     /// A `Samples` metric is absorbed, not passed through.
@@ -1988,17 +2345,11 @@ mod tests {
         assert_eq!(links.len(), 8, "capped at MAX_CONTRIBUTING_CONTEXTS_PER_SERIES");
 
         let drained = registry.drain(0);
-        let dropped = drained.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| match &m.kind {
-                MetricKind::Sum(sum)
-                    if logit_core::interner::resolve(m.name) == "logit.transform.links.dropped" =>
-                {
-                    Some(sum.value)
-                }
-                _ => None,
-            })
-        });
-        assert_eq!(dropped, Some(1.0), "the 9th distinct context should be dropped and counted");
+        assert_eq!(
+            counter_with_tag(&drained, "logit.transform.links.dropped", "reason", "contexts"),
+            Some(1.0),
+            "the 9th distinct context should be dropped and counted under reason=contexts"
+        );
     }
 
     /// A series' contributing contexts reset at flush along with its value.
@@ -2047,18 +2398,20 @@ mod tests {
         counter_with_tag(events, "logit.component.diagnostics", "key", key)
     }
 
+    /// The total over every point carrying `tag_value` under `tag`, which may also carry other
+    /// tags (`series.evicted{reason="cardinality"}` splits by `state`), or `None` without one.
     fn counter_with_tag(events: &[Event], name: &str, tag: &str, tag_value: &str) -> Option<f64> {
-        events.iter().find_map(|e| {
-            if e.attributes.get(tag).and_then(|v| v.as_str()) != Some(tag_value) {
-                return None;
-            }
-            e.metrics.iter().find_map(|m| match &m.kind {
+        events
+            .iter()
+            .filter(|e| e.attributes.get(tag).and_then(|v| v.as_str()) == Some(tag_value))
+            .flat_map(|e| &e.metrics)
+            .filter_map(|m| match &m.kind {
                 MetricKind::Sum(sum) if logit_core::interner::resolve(m.name) == name => {
                     Some(sum.value)
                 }
                 _ => None,
             })
-        })
+            .reduce(|a, b| a + b)
     }
 
     #[test]
@@ -2159,9 +2512,9 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
         feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        assert_eq!(agg.flush(100).len(), 1, "window 1: emits, idle_windows resets to 0");
-        assert!(agg.flush(200).is_empty(), "window 2: idle_windows -> 1, still under retention 2");
-        assert!(agg.flush(300).is_empty(), "window 3: idle_windows -> 2, now evicted");
+        assert_eq!(agg.flush(100).len(), 1, "flush 1: emits, idle_windows resets to 0");
+        assert!(agg.flush(200).is_empty(), "flush 2: idle_windows -> 1, still under retention 2");
+        assert!(agg.flush(300).is_empty(), "flush 3: idle_windows -> 2, now evicted");
 
         feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
         let flushed = flush_events(&mut agg, 400);
@@ -2183,6 +2536,36 @@ mod tests {
             })
         });
         assert_eq!(unseeded, Some(1.0), "the post-eviction delta should count as unseeded");
+    }
+
+    /// With `series_retention: N`, a series survives N idle flushes after the one that emitted it
+    /// and is evicted, counted `idle`, at the flush that closes the Nth.
+    #[test]
+    fn a_series_survives_series_retention_idle_flushes() {
+        for retention in 1..=3u32 {
+            let registry = logit_core::Registry::new();
+            let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+            let mut agg = Aggregator::new(Duration::from_secs(10))
+                .with_series_retention(retention, 100)
+                .with_telemetry(telemetry);
+            let resource = default_resource();
+            feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+            assert_eq!(agg.flush(100).len(), 1);
+            for idle in 1..=retention {
+                assert!(agg.flush(100 + i64::from(idle) * 100).is_empty());
+                let held = series_count(&agg);
+                let evicted = evicted_count(&registry.drain(0), "idle");
+                if idle < retention {
+                    assert_eq!((held, evicted), (1, None), "retention {retention}, idle {idle}");
+                } else {
+                    assert_eq!(
+                        (held, evicted),
+                        (0, Some(1.0)),
+                        "retention {retention}, idle {idle}"
+                    );
+                }
+            }
+        }
     }
 
     /// `series_retention: 0` retains nothing across flushes.
@@ -2295,6 +2678,306 @@ mod tests {
             })
         });
         assert_eq!(evicted_cardinality, Some(1.0), "exactly one series should exceed the cap");
+    }
+
+    /// `logit.transform.series.evicted{reason="cardinality", state}`'s value in drained telemetry,
+    /// or 0.
+    fn evicted_cardinality(events: &[Event], state: &str) -> f64 {
+        events
+            .iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("cardinality")
+                    && e.attributes.get("state").and_then(|v| v.as_str()) == Some(state)
+            })
+            .flat_map(|e| &e.metrics)
+            .filter_map(|m| match &m.kind {
+                MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name)
+                        == "logit.transform.series.evicted" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn series_count(agg: &Aggregator) -> usize {
+        agg.groups.iter().map(|g| g.series.len()).sum()
+    }
+
+    /// Among equally idle series the newest goes first, and an idle series before an active one.
+    #[test]
+    fn the_cardinality_cap_evicts_the_most_idle_then_the_newest() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(5, 2)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        let names = |agg: &Aggregator| {
+            let mut names: Vec<&str> = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .map(|k| logit_core::interner::resolve(k.name))
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        feed(&mut agg, &resource, metric_event("a", MetricKind::Gauge(1.0), 0));
+        feed(&mut agg, &resource, metric_event("b", MetricKind::Gauge(1.0), 0));
+        agg.flush(100);
+        registry.drain(0);
+
+        // `a` and `b` are idle for one flush and `c` is active: one of the idle pair goes, the
+        // newer.
+        feed(&mut agg, &resource, metric_event("c", MetricKind::Gauge(1.0), 150));
+        agg.flush(200);
+        assert_eq!(names(&agg), ["a", "c"]);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "idle"), 1.0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 0.0);
+
+        // All three active: the newest goes.
+        for name in ["d", "c", "a"] {
+            feed(&mut agg, &resource, metric_event(name, MetricKind::Gauge(1.0), 250));
+        }
+        agg.flush(300);
+        assert_eq!(names(&agg), ["a", "c"]);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "idle"), 0.0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 1.0);
+    }
+
+    /// One flush of [`cap_soak`].
+    #[derive(Debug, PartialEq)]
+    struct SoakFlush {
+        stable_kept: usize,
+        evicted_active: f64,
+        evicted_idle: f64,
+    }
+
+    const SOAK_STABLE: usize = 20;
+    const SOAK_FRESH: usize = 1000;
+    const SOAK_CAP: usize = 100;
+
+    /// Runs 20 windows of 20 stable series, updated every window, and 1000 one-off series against
+    /// `series_retention: 3` and `max_retained_series: 100`, and returns what each flush evicted.
+    /// A warm-up window opens the stable series first; with `churn_first` it opens one one-off
+    /// series before them, so `churn`'s group comes first in `groups`, and every later window feeds
+    /// the one-off series before the stable ones.
+    ///
+    /// The warm-up is what lets the stable series survive: newest first protects a series that has
+    /// survived one flush. Without it, stable series fed after the churn are the newest in every
+    /// window (`a_stable_series_arriving_after_the_churn_is_evicted_every_flush`).
+    ///
+    /// Checks at every flush: at most 100 series held, every eviction counted, one group per
+    /// resource, and under `Cumulative` an unchanged `start_timestamp` on every stable series.
+    fn cap_soak(
+        kind: fn(usize) -> MetricKind,
+        temporality: AggregateTemporality,
+        stable: &Arc<Resource>,
+        churn: &Arc<Resource>,
+        churn_first: bool,
+    ) -> Vec<SoakFlush> {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("soak", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(temporality)
+            .with_series_retention(3, SOAK_CAP)
+            .with_telemetry(telemetry);
+        let groups = if Arc::ptr_eq(stable, churn) { 1 } else { 2 };
+        let feed_stable = |agg: &mut Aggregator, ts: i64| {
+            for i in 0..SOAK_STABLE {
+                let id = i.to_string();
+                let event = metric_event_with_tags("stable", kind(i), ts, &[("id", &id)]);
+                assert!(feed(agg, stable, event).is_none());
+            }
+        };
+        let feed_churn = |agg: &mut Aggregator, w: usize, n: usize, ts: i64| {
+            for j in 0..n {
+                let id = format!("{w}-{j}");
+                let event = metric_event_with_tags("fresh", kind(j), ts, &[("id", &id)]);
+                assert!(feed(agg, churn, event).is_none());
+            }
+        };
+
+        if churn_first {
+            feed_churn(&mut agg, 0, 1, 1);
+        }
+        feed_stable(&mut agg, 1);
+        agg.flush(1_000);
+        registry.drain(0);
+
+        let mut flushes = Vec::new();
+        for w in 1..=20 {
+            let ts = w as i64 * 1_000 + 1;
+            if churn_first {
+                feed_churn(&mut agg, w, SOAK_FRESH, ts);
+                feed_stable(&mut agg, ts);
+            } else {
+                feed_stable(&mut agg, ts);
+                feed_churn(&mut agg, w, SOAK_FRESH, ts);
+            }
+            let before = series_count(&agg);
+            let flushed = agg.flush(ts + 999);
+            let after = series_count(&agg);
+            let drained = registry.drain(0);
+
+            assert!(after <= SOAK_CAP, "flush {w} holds {after} series");
+            let evicted_active = evicted_cardinality(&drained, "active");
+            let evicted_idle = evicted_cardinality(&drained, "idle");
+            let evicted_total = evicted_count(&drained, "cardinality").unwrap_or(0.0);
+            let evicted_ttl = evicted_count(&drained, "idle").unwrap_or(0.0);
+            // Every series here is retainable, so the only exits are the two evictions.
+            assert_eq!(
+                evicted_total + evicted_ttl,
+                (before - after) as f64,
+                "flush {w}: every series that left is counted"
+            );
+            assert_eq!(agg.groups.len(), groups, "flush {w}");
+            if temporality == AggregateTemporality::Cumulative {
+                for (_, _, events) in &flushed {
+                    for (event, _) in events {
+                        if logit_core::interner::resolve(event.metrics[0].name) == "stable" {
+                            assert_eq!(start_timestamp_of(event), 1, "flush {w}: {event:?}");
+                        }
+                    }
+                }
+            }
+            let stable_kept = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .filter(|k| logit_core::interner::resolve(k.name) == "stable")
+                .count();
+            flushes.push(SoakFlush { stable_kept, evicted_active, evicted_idle });
+        }
+        flushes
+    }
+
+    /// What every soak flush evicts once the tie-break holds: the one-off series left idle by the
+    /// previous flush (80, or the warm-up's one), then the newest active ones down to the cap.
+    fn soak_expected(churn_first: bool) -> Vec<SoakFlush> {
+        let kept_fresh = (SOAK_CAP - SOAK_STABLE) as f64;
+        (1..=20)
+            .map(|w| SoakFlush {
+                stable_kept: SOAK_STABLE,
+                evicted_active: (SOAK_STABLE + SOAK_FRESH - SOAK_CAP) as f64,
+                evicted_idle: match w {
+                    1 if churn_first => 1.0,
+                    1 => 0.0,
+                    _ => kept_fresh,
+                },
+            })
+            .collect()
+    }
+
+    /// The tie-break's limit: with no warm-up and the stable series fed after the churn in every
+    /// window, each flush re-creates them newest and evicts them all, counted `state="active"`.
+    #[test]
+    fn a_stable_series_arriving_after_the_churn_is_evicted_every_flush() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("soak", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(3, SOAK_CAP)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        for w in 0..20 {
+            let ts = w as i64 * 1_000 + 1;
+            for j in 0..SOAK_FRESH {
+                let id = format!("{w}-{j}");
+                let event =
+                    metric_event_with_tags("fresh", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                feed(&mut agg, &resource, event);
+            }
+            for i in 0..SOAK_STABLE {
+                let id = i.to_string();
+                let event =
+                    metric_event_with_tags("stable", MetricKind::Gauge(1.0), ts, &[("id", &id)]);
+                feed(&mut agg, &resource, event);
+            }
+            agg.flush(ts + 999);
+            let stable_kept = agg
+                .groups
+                .iter()
+                .flat_map(|g| g.series.keys())
+                .filter(|k| logit_core::interner::resolve(k.name) == "stable")
+                .count();
+            assert_eq!(stable_kept, 0, "flush {w}");
+            let drained = registry.drain(0);
+            assert_eq!(
+                evicted_cardinality(&drained, "active"),
+                (SOAK_STABLE + SOAK_FRESH - SOAK_CAP) as f64,
+                "flush {w}"
+            );
+        }
+    }
+
+    fn soak_gauge(i: usize) -> MetricKind {
+        MetricKind::Gauge(i as f64)
+    }
+
+    fn soak_counter(_: usize) -> MetricKind {
+        MetricKind::counter(1.0)
+    }
+
+    /// A series updated every window survives a cap that one-off series overflow every window.
+    #[test]
+    fn stable_series_survive_a_cardinality_cap_soak() {
+        let resource = default_resource();
+        let flushes =
+            cap_soak(soak_gauge, AggregateTemporality::Delta, &resource, &resource, false);
+        assert_eq!(flushes, soak_expected(false));
+    }
+
+    /// The same soak under `temporality: cumulative`: stable counters keep their start time.
+    #[test]
+    fn stable_cumulative_series_keep_their_start_time_through_a_cap_soak() {
+        let resource = default_resource();
+        let flushes =
+            cap_soak(soak_counter, AggregateTemporality::Cumulative, &resource, &resource, false);
+        assert_eq!(flushes, soak_expected(false));
+    }
+
+    /// Many one-off resources in one window open as many groups, and the flush drops every group
+    /// with nothing retained.
+    #[test]
+    fn a_flush_drops_every_group_without_a_retained_series() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_series_retention(3, 100)
+            .with_telemetry(telemetry);
+        for i in 0..2000 {
+            let mut attributes = AttrMap::new();
+            attributes.insert("host", i.to_string().as_str());
+            let resource = Arc::new(Resource { attributes, ..Default::default() });
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        }
+        assert_eq!(agg.groups.len(), 2000);
+        assert_eq!(agg.flush(1_000).len(), 2000);
+        assert!(agg.groups.is_empty(), "a delta counter is never retained");
+        let drained = registry.drain(0);
+        assert_eq!(gauge_value(&drained, "logit.transform.resource.groups"), Some(2000.0));
+    }
+
+    /// The cap is global across groups: stable series in one group survive churn in another,
+    /// whichever group `groups` holds first.
+    #[test]
+    fn stable_series_in_one_group_survive_churn_in_another() {
+        let resource = |host: &str| {
+            let mut attributes = AttrMap::new();
+            attributes.insert("host", host);
+            Arc::new(Resource { attributes, ..Default::default() })
+        };
+        let (a, b) = (resource("a"), resource("b"));
+        for churn_first in [false, true] {
+            let flushes = cap_soak(soak_gauge, AggregateTemporality::Delta, &a, &b, churn_first);
+            assert_eq!(flushes, soak_expected(churn_first), "churn_first: {churn_first}");
+        }
     }
 
     /// A retained gauge's contributing contexts still reset at every flush.
@@ -2818,6 +3501,89 @@ mod tests {
         assert_eq!(counter_value(kind_of(&events[0])), 2.0);
     }
 
+    fn resource_with_attr(key: &str, value: Value) -> Arc<Resource> {
+        let mut attributes = AttrMap::new();
+        attributes.insert(key, value);
+        Arc::new(Resource { attributes, ..Resource::default() })
+    }
+
+    /// A `NaN` resource attribute through one `Arc` is one group across records and windows, so a
+    /// cumulative `Sum` keeps its running total instead of restarting per record.
+    #[test]
+    fn a_nan_resource_attribute_through_one_arc_is_one_group_across_windows() {
+        let mut agg = cumulative_agg();
+        let resource = resource_with_attr("temp", Value::F64(f64::NAN));
+
+        for ts in 0..10 {
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+        }
+        assert_eq!(agg.groups.len(), 1, "ten records under one NaN-bearing Arc");
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1.len(), 1);
+        assert_eq!(sum_of(&flushed[0].1[0]).value, 10.0);
+
+        for ts in 100..105 {
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+        }
+        assert_eq!(agg.groups.len(), 1, "the retained series' group is found again");
+        let flushed = flush_events(&mut agg, 200);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1.len(), 1);
+        let second = &flushed[0].1[0];
+        assert_eq!(sum_of(second).value, 15.0, "the running total carries across the window");
+        assert_eq!(start_timestamp_of(second), 0);
+    }
+
+    /// Two `Arc`s with equal content, a `NaN` attribute included, are one group.
+    #[test]
+    fn resources_with_a_nan_attribute_but_distinct_arcs_fold_into_one_group() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let a = resource_with_attr("temp", Value::F64(f64::NAN));
+        let b = resource_with_attr("temp", Value::F64(f64::NAN));
+        assert!(!Arc::ptr_eq(&a, &b), "test setup: must be distinct Arcs");
+
+        feed(&mut agg, &a, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(2.0), 1));
+        assert_eq!(agg.groups.len(), 1);
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(counter_value(kind_of(&flushed[0].1[0])), 3.0);
+    }
+
+    /// `-0.0` and `0.0` are distinct resources, as they are distinct series attributes.
+    #[test]
+    fn resources_differing_only_in_the_sign_of_zero_are_two_groups() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let negative = resource_with_attr("host", Value::F64(-0.0));
+        let positive = resource_with_attr("host", Value::F64(0.0));
+
+        feed(&mut agg, &negative, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &positive, metric_event("hits", MetricKind::counter(1.0), 1));
+        assert_eq!(agg.groups.len(), 2);
+        assert_eq!(flush_events(&mut agg, 100).len(), 2);
+    }
+
+    /// `schema_url` and `dropped_attributes_count` are part of a resource's identity.
+    #[test]
+    fn resources_differing_only_in_schema_url_or_dropped_count_are_distinct_groups() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let plain = Arc::new(Resource::default());
+        let with_schema = Arc::new(Resource {
+            schema_url: Some(Bytes::from_static(b"https://opentelemetry.io/schemas/1.26.0")),
+            ..Resource::default()
+        });
+        let with_dropped =
+            Arc::new(Resource { dropped_attributes_count: 1, ..Resource::default() });
+
+        for (ts, resource) in [&plain, &with_schema, &with_dropped].into_iter().enumerate() {
+            feed(&mut agg, resource, metric_event("hits", MetricKind::counter(1.0), ts as i64));
+        }
+        assert_eq!(agg.groups.len(), 3);
+        assert_eq!(flush_events(&mut agg, 100).len(), 3);
+    }
+
     // -- `temporality: cumulative` -------------------------------------------------------------
 
     /// `cumulative` mode with both retention bounds set, the only combination rule 39 allows.
@@ -2981,9 +3747,9 @@ mod tests {
         assert_eq!(start_timestamp_of(second), 500, "start_timestamp is still the first-seen time");
     }
 
-    /// A window with no `sum` makes the running `sum` `None` but leaves `min`/`max` standing.
+    /// A window with observations but no `sum`, `min`, or `max` makes each running value `None`.
     #[test]
-    fn a_histogram_window_without_a_sum_drops_the_running_sum_but_keeps_min_and_max() {
+    fn a_histogram_window_without_sum_min_or_max_drops_all_three() {
         let mut agg = cumulative_agg();
         let resource = default_resource();
         let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
@@ -2998,8 +3764,8 @@ mod tests {
         let emitted = histogram_of(&flushed[0].1[0]);
         assert_eq!(emitted.buckets, vec![(1.0, 2), (f64::INFINITY, 2)]);
         assert_eq!(emitted.sum, None, "a sum missing one window's contribution is no sum at all");
-        assert_eq!(emitted.min, Some(0.5), "the extremes observed so far still stand");
-        assert_eq!(emitted.max, Some(2.0));
+        assert_eq!(emitted.min, None, "a min missing one window's observations is no min");
+        assert_eq!(emitted.max, None);
     }
 
     /// Two `u64::MAX` bucket counts saturate at `u64::MAX` rather than panic or wrap.
@@ -3089,9 +3855,9 @@ mod tests {
         let resource = default_resource();
 
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(5.0), 100));
-        assert_eq!(agg.flush(1_000).len(), 1, "window 1: emits 5, idle_windows resets to 0");
-        assert!(agg.flush(2_000).is_empty(), "window 2: idle_windows -> 1, still under retention");
-        assert!(agg.flush(3_000).is_empty(), "window 3: idle_windows -> 2, now evicted");
+        assert_eq!(agg.flush(1_000).len(), 1, "flush 1: emits 5, idle_windows resets to 0");
+        assert!(agg.flush(2_000).is_empty(), "flush 2: idle_windows -> 1, still under retention");
+        assert!(agg.flush(3_000).is_empty(), "flush 3: idle_windows -> 2, now evicted");
 
         feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
         let flushed = flush_events(&mut agg, 4_000);
@@ -3109,6 +3875,67 @@ mod tests {
             Some(1.0),
             "TTL eviction of a cumulative series fires series.evicted with reason=idle"
         );
+    }
+
+    /// A series the cap evicts while active and a later event re-creates starts inside the window
+    /// it reopened in, whatever the reopening event's source timestamp: never before the point it
+    /// replaces, never after its own first point, never `0`.
+    #[test]
+    fn a_re_created_cumulative_series_starts_inside_its_window() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10))
+            .with_temporality(AggregateTemporality::Cumulative)
+            .with_series_retention(5, 1)
+            .with_telemetry(telemetry);
+        let resource = default_resource();
+        let hits_of = |flushed: Vec<(Arc<Resource>, Vec<Event>)>| {
+            flushed
+                .into_iter()
+                .flat_map(|(_, events)| events)
+                .find(|e| logit_core::interner::resolve(e.metrics[0].name) == "hits")
+                .expect("hits is emitted before the cap evicts it")
+        };
+
+        // Before any flush there's no window start: the event timestamp stands. `anchor` opens
+        // first, so the cap keeps it and evicts the newer `hits` at every flush.
+        feed(&mut agg, &resource, metric_event("anchor", MetricKind::counter(1.0), 100));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 100));
+        let first = hits_of(flush_events(&mut agg, 1_000));
+        assert_eq!(start_timestamp_of(&first), 100);
+        let drained = registry.drain(0);
+        assert_eq!(evicted_cardinality(&drained, "active"), 1.0);
+
+        // Source timestamps before the previous flush, after this one, and 0.
+        let mut previous_point = first.timestamp;
+        for (ts, now, start) in [(500, 2_000, 1_000), (9_999, 3_000, 3_000), (0, 4_000, 3_000)] {
+            feed(&mut agg, &resource, metric_event("anchor", MetricKind::counter(1.0), ts));
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), ts));
+            let hits = hits_of(flush_events(&mut agg, now));
+            assert_eq!(sum_of(&hits).value, 1.0, "re-created at ts {ts}");
+            let got = start_timestamp_of(&hits);
+            assert!(
+                previous_point <= got && got <= hits.timestamp,
+                "ts {ts}: start {got} outside [{previous_point}, {}]",
+                hits.timestamp
+            );
+            assert_eq!(got, start, "ts {ts}");
+            previous_point = hits.timestamp;
+        }
+    }
+
+    /// In the first window a source timestamp past the flush clock is capped at the flush.
+    #[test]
+    fn a_first_window_start_time_is_at_most_the_flush_clock() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 5_000));
+        let flushed = flush_events(&mut agg, 1_000);
+        assert_eq!(start_timestamp_of(&flushed[0].1[0]), 1_000);
+        // The series keeps the capped value: a start time that moved would read as a reset.
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 5_000));
+        let flushed = flush_events(&mut agg, 2_000);
+        assert_eq!(start_timestamp_of(&flushed[0].1[0]), 1_000);
     }
 
     /// The cardinality cap evicts cumulative series too, counted and diagnosed.
@@ -3196,4 +4023,371 @@ mod tests {
         assert_eq!(agg.flush(100).len(), 1, "the first flush emits the sketch");
         assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
     }
+
+    /// Every `warn` message a `tracing` subscriber sees, by its `message` field.
+    #[derive(Clone, Default)]
+    struct CapturedWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut messages = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            event.record(&mut Message(&mut messages));
+        }
+    }
+
+    /// Each diagnostic `process` and `flush` report reads as one sentence: a `\` lost from a
+    /// wrapped string literal leaves a run of the source's indentation inside the message.
+    #[test]
+    fn no_diagnostic_message_carries_a_run_of_spaces() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let captured = CapturedWarnings::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let resource = default_resource();
+            let samples = |rate: f64, values: &[f64]| {
+                MetricKind::Samples(Samples {
+                    values: values.iter().copied().collect(),
+                    sample_rate: rate,
+                })
+            };
+            let members = |m: &[&'static [u8]]| {
+                MetricKind::SetMembers(m.iter().map(|m| Bytes::from_static(m)).collect())
+            };
+
+            // gauge_delta_unseeded, kind_conflict, sample_rate_clamped, sum_non_finite.
+            let mut agg = Aggregator::new(Duration::from_secs(10));
+            feed(&mut agg, &resource, metric_event("n", MetricKind::counter(f64::NAN), 0));
+            feed(&mut agg, &resource, metric_event("g", MetricKind::GaugeDelta(1.0), 0));
+            feed(&mut agg, &resource, metric_event("g", MetricKind::counter(1.0), 0));
+            feed(&mut agg, &resource, metric_event("s", samples(0.0001, &[1.0]), 0));
+
+            // samples_rate_mismatch and samples_cap_exceeded.
+            let mut agg = Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 2);
+            feed(&mut agg, &resource, metric_event("r", samples(1.0, &[1.0]), 0));
+            feed(&mut agg, &resource, metric_event("r", samples(0.5, &[1.0]), 0));
+            feed(&mut agg, &resource, metric_event("c", samples(1.0, &[1.0, 2.0]), 0));
+            feed(&mut agg, &resource, metric_event("c", samples(1.0, &[3.0]), 0));
+
+            // set_members_cap_exceeded.
+            let mut agg = Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, 1);
+            feed(&mut agg, &resource, metric_event("u", members(&[b"a", b"b"]), 0));
+
+            // histogram_bounds_mismatch, and series_retention_full from the flush.
+            let mut agg = cumulative_agg().with_series_retention(5, 1);
+            let h = |bounds: &[(f64, u64)]| delta_histogram_event("h", bounds, None, None, None, 0);
+            feed(&mut agg, &resource, h(&[(1.0, 1)]));
+            feed(&mut agg, &resource, h(&[(2.0, 1)]));
+            feed(&mut agg, &resource, metric_event("other", MetricKind::counter(1.0), 0));
+            agg.flush(100);
+        });
+
+        let messages = captured.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(messages.len(), 9, "one report per diagnostic key: {messages:#?}");
+        for message in &messages {
+            assert!(!message.contains("  "), "a run of spaces in {message:?}");
+        }
+    }
+
+    fn passed_through(events: &[Event], reason: &str) -> f64 {
+        counter_with_tag(events, "logit.transform.metrics.passed_through", "reason", reason)
+            .unwrap_or(0.0)
+    }
+
+    /// Every `name` counter in drained telemetry, whatever its tags, summed.
+    fn counter_total(events: &[Event], name: &str) -> f64 {
+        events
+            .iter()
+            .flat_map(|e| &e.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .map(|m| counter_value(&m.kind))
+            .sum()
+    }
+
+    fn absorbed(events: &[Event]) -> f64 {
+        counter_total(events, "logit.transform.metrics.absorbed")
+    }
+
+    /// Every record `process` receives is absorbed or passed through under one reason, and the
+    /// counters total per call.
+    #[test]
+    fn every_record_is_counted_absorbed_or_passed_through_once() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = cumulative_agg().with_telemetry(telemetry);
+        let resource = default_resource();
+
+        let mut no_value = MetricRecord::new(intern("nv"), MetricKind::Gauge(0.0));
+        no_value.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let histogram = |bound: f64| {
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(bound, 1)],
+                temporality: Temporality::Delta,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        };
+        let mut records = vec![
+            no_value,
+            MetricRecord::new(
+                intern("cum"),
+                MetricKind::Sum(Sum {
+                    value: 1.0,
+                    temporality: Temporality::Cumulative,
+                    monotonic: true,
+                }),
+            ),
+            MetricRecord::new(
+                intern("q"),
+                MetricKind::Summary(logit_core::Summary { quantiles: vec![], count: 0, sum: 0.0 }),
+            ),
+            MetricRecord::new(intern("g"), MetricKind::Gauge(1.0)),
+            MetricRecord::new(intern("g"), MetricKind::counter(1.0)),
+            MetricRecord::new(intern("h"), histogram(1.0)),
+            MetricRecord::new(intern("h"), histogram(2.0)),
+            MetricRecord::new(intern("h"), histogram(1.0)),
+            MetricRecord::new(intern("n"), MetricKind::counter(f64::NAN)),
+            MetricRecord::new(intern("n"), MetricKind::counter(f64::NEG_INFINITY)),
+            MetricRecord::new(intern("n"), MetricKind::counter(2.0)),
+        ];
+        let metrics_in = records.len() as f64;
+        let first = records.remove(0);
+        let mut event = Event::metric(0, AttrMap::new(), first);
+        event.metrics.extend(records);
+        assert!(agg.process(&resource, &mut event));
+        assert_eq!(event.metrics.len(), 7, "the passed-through records stay on the event");
+
+        let events = registry.drain(0);
+        assert_eq!(absorbed(&events), 4.0);
+        assert_eq!(passed_through(&events, "no_recorded_value"), 1.0);
+        assert_eq!(passed_through(&events, "no_merge_rule"), 2.0);
+        assert_eq!(passed_through(&events, "kind_conflict"), 1.0);
+        assert_eq!(passed_through(&events, "histogram_bounds_mismatch"), 1.0);
+        assert_eq!(passed_through(&events, "non_finite"), 2.0);
+        let reasons = [
+            "no_recorded_value",
+            "no_merge_rule",
+            "kind_conflict",
+            "histogram_bounds_mismatch",
+            "non_finite",
+        ];
+        let passed: f64 = reasons.iter().map(|r| passed_through(&events, r)).sum();
+        assert_eq!(metrics_in, absorbed(&events) + passed);
+    }
+
+    /// A statsd `1e308|c|@0.5` extrapolates to infinity. It passes through instead of merging, so
+    /// a cumulative total stays finite for the rest of the series' life.
+    #[test]
+    fn a_non_finite_delta_sum_passes_through_and_leaves_the_total_finite() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        for bad in [f64::INFINITY, f64::NAN] {
+            let forwarded =
+                feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(bad), 0));
+            assert!(forwarded.is_some(), "a non-finite delta sum is forwarded");
+        }
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 0));
+        assert_eq!(sum_of(&flush_events(&mut agg, 10)[0].1[0]).value, 3.0);
+    }
+
+    /// `min` and `max` follow the `sum` rule: a record with observations but no `min` (or `max`)
+    /// makes the accumulated one `None`, so a series never pairs one window's `min` with another's
+    /// `max`.
+    #[test]
+    fn a_histogram_min_or_max_missing_from_an_observed_window_becomes_none() {
+        let mut agg = cumulative_agg();
+        let resource = default_resource();
+        let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
+        feed(&mut agg, &resource, delta_histogram_event("h", &bounds, None, Some(5.0), None, 0));
+        feed(&mut agg, &resource, delta_histogram_event("h", &bounds, None, None, Some(1.0), 1));
+
+        let flushed = flush_events(&mut agg, 100);
+        let emitted = histogram_of(&flushed[0].1[0]);
+        assert_eq!((emitted.min, emitted.max), (None, None), "never min 5 above max 1");
+    }
+
+    /// A record whose buckets total zero observed nothing, so its missing `min`/`max` doesn't
+    /// erase the series' extremes, in either arrival order.
+    #[test]
+    fn a_zero_count_histogram_record_is_ignored_for_min_and_max() {
+        let observed = [(1.0, 1u64), (f64::INFINITY, 1)];
+        let empty = [(1.0, 0u64), (f64::INFINITY, 0)];
+        for empty_first in [false, true] {
+            let mut agg = cumulative_agg();
+            let resource = default_resource();
+            let a = delta_histogram_event("h", &observed, Some(3.0), Some(0.5), Some(2.0), 0);
+            let z = delta_histogram_event("h", &empty, Some(0.0), None, None, 0);
+            let (first, second) = if empty_first { (z, a) } else { (a, z) };
+            feed(&mut agg, &resource, first);
+            feed(&mut agg, &resource, second);
+
+            let flushed = flush_events(&mut agg, 100);
+            let emitted = histogram_of(&flushed[0].1[0]);
+            assert_eq!(emitted.min, Some(0.5), "empty first: {empty_first}");
+            assert_eq!(emitted.max, Some(2.0), "empty first: {empty_first}");
+            assert_eq!(emitted.sum, Some(3.0));
+        }
+    }
+
+    fn samples_at(rate: f64, values: &[f64]) -> MetricKind {
+        MetricKind::Samples(Samples { values: values.iter().copied().collect(), sample_rate: rate })
+    }
+
+    fn with_registry(agg: Aggregator) -> (Aggregator, Arc<logit_core::Registry>) {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let diag = Diagnostics::default().with_telemetry(telemetry.clone());
+        (agg.with_diagnostics(diag).with_telemetry(telemetry), registry)
+    }
+
+    fn weight_clamped(events: &[Event]) -> f64 {
+        counter_total(events, "logit.transform.samples.weight_clamped")
+    }
+
+    /// `@0.001` is weight 1000, the largest unclamped one; `@0.00099` rounds to 1010 and clamps;
+    /// a record with no values under-weights nothing.
+    #[test]
+    fn weight_clamped_fires_only_past_max_weight_and_with_values() {
+        let resource = default_resource();
+        for (rate, values, expected) in
+            [(0.001, &[1.0][..], 0.0), (0.00099, &[1.0][..], 1.0), (0.0001, &[][..], 0.0)]
+        {
+            let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+            feed(&mut agg, &resource, metric_event("t", samples_at(rate, values), 0));
+            let events = registry.drain(0);
+            assert_eq!(weight_clamped(&events), expected, "rate {rate}, values {values:?}");
+        }
+    }
+
+    /// A clamped record held raw under `distributions: samples` is reported when the series falls
+    /// back and its weight is first applied.
+    #[test]
+    fn a_held_clamped_record_is_reported_at_fallback() {
+        let resource = default_resource();
+        let (agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 100),
+        );
+        let mut agg = agg;
+        feed(&mut agg, &resource, metric_event("t", samples_at(0.0001, &[1.0]), 0));
+        feed(&mut agg, &resource, metric_event("t", samples_at(0.5, &[1.0]), 0));
+        let events = registry.drain(0);
+        assert_eq!(weight_clamped(&events), 1.0, "the held @0.0001 record");
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1000 + 2),
+            other => panic!("expected a Distribution, got {other:?}"),
+        }
+    }
+
+    /// A non-finite sample has no bin; the sketch drops it and `aggregate` counts it.
+    #[test]
+    fn non_finite_samples_are_dropped_from_the_sketch_and_counted() {
+        let resource = default_resource();
+        let (mut agg, registry) = with_registry(Aggregator::new(Duration::from_secs(10)));
+        let values = [1.0, f64::NAN, f64::INFINITY];
+        feed(&mut agg, &resource, metric_event("t", samples_at(1.0, &values), 0));
+        let events = registry.drain(0);
+        assert_eq!(counter_total(&events, "logit.transform.samples.non_finite_dropped"), 2.0);
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Distribution(sketch) => assert_eq!(sketch.count(), 1),
+            other => panic!("expected a Distribution, got {other:?}"),
+        }
+    }
+
+    /// Sample rates compare by bit pattern, so a `NaN` rate (which only the native decoder
+    /// produces) matches itself and the series stays raw.
+    #[test]
+    fn a_nan_sample_rate_matches_itself_under_distributions_samples() {
+        let resource = default_resource();
+        let (agg, registry) = with_registry(
+            Aggregator::new(Duration::from_secs(10))
+                .with_distributions(Distributions::Samples, 100),
+        );
+        let mut agg = agg;
+        feed(&mut agg, &resource, metric_event("t", samples_at(f64::NAN, &[1.0]), 0));
+        feed(&mut agg, &resource, metric_event("t", samples_at(f64::NAN, &[2.0]), 0));
+        let events = registry.drain(0);
+        assert_eq!(counter_total(&events, "logit.transform.samples.fallback"), 0.0);
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Samples(s) => {
+                assert_eq!(&s.values[..], &[1.0, 2.0]);
+                assert!(s.sample_rate.is_nan());
+            }
+            other => panic!("expected raw Samples, got {other:?}"),
+        }
+    }
+
+    /// The union stops scanning at member `cap + 1`: one record of 20 times the cap costs the
+    /// compares of filling the cap once, `(cap + 1)(cap + 2) / 2` at most, not the record's own
+    /// size squared.
+    #[test]
+    fn union_members_converts_at_cap_plus_one_with_bounded_compares() {
+        const CAP: usize = 1000;
+        let members: Vec<Bytes> = (0..20 * CAP).map(|i| Bytes::from(i.to_string())).collect();
+
+        let mut held = Vec::new();
+        let (overflow, compares) = union_members(&mut held, &members[..CAP], CAP);
+        assert!(overflow.is_none(), "cap members fit");
+        assert_eq!(held.len(), CAP);
+
+        let mut held = Vec::new();
+        let (overflow, compares_past_cap) = union_members(&mut held, &members, CAP);
+        let hll = overflow.expect("the record passes the cap");
+        assert!(compares_past_cap <= (CAP + 1) * (CAP + 2) / 2, "{compares_past_cap} compares");
+        assert_eq!(held.len(), CAP + 1, "the scan stops at member cap + 1");
+        assert!(compares <= compares_past_cap);
+        let error = (hll.estimate() as f64 - members.len() as f64).abs() / members.len() as f64;
+        assert!(error < 0.05, "estimate {} for {} members", hll.estimate(), members.len());
+    }
+
+    /// One record far past `max_set_members_per_series` falls back to a `HyperLogLog` holding
+    /// every member, counted once.
+    #[test]
+    fn a_set_members_record_past_the_cap_falls_back_with_every_member() {
+        const CAP: usize = 1000;
+        const MEMBERS: usize = 20 * CAP;
+        let resource = default_resource();
+        let (agg, registry) =
+            with_registry(Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, CAP));
+        let mut agg = agg;
+        let members: Vec<Bytes> = (0..MEMBERS).map(|i| Bytes::from(i.to_string())).collect();
+
+        feed(&mut agg, &resource, metric_event("u", MetricKind::SetMembers(members), 0));
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_with_tag(&events, "logit.transform.set_members.fallback", "reason", "cap"),
+            Some(1.0)
+        );
+        match kind_of(&flush_events(&mut agg, 10)[0].1[0]) {
+            MetricKind::Set(hll) => {
+                let estimate = hll.estimate() as f64;
+                let error = (estimate - MEMBERS as f64).abs() / MEMBERS as f64;
+                assert!(error < 0.05, "estimate {estimate} for {MEMBERS} members");
+            }
+            other => panic!("expected a Set, got {other:?}"),
+        }
+    }
 }
+
+#[cfg(test)]
+mod verification;

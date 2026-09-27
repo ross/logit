@@ -317,7 +317,10 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     An id isn't checked against this graph: it may name a component in another process.
 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, or a `collectd_out`
     value outside `1024..=65535`.
-39. A cumulative `aggregate` with a `series_retention` or `max_retained_series` of `0`.
+39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
+    `series_retention` or `max_retained_series` of `0`; in either mode, `series_retention` above `0`
+    with `max_retained_series: 0`, and a `max_samples_per_series` or `max_set_members_per_series` of
+    `0`.
 40. A scrape-mode `prometheus_in` with a bad target URL, `timeout: 0s`, a bad `scrape_tls:`, or a
     reserved or colliding header.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.

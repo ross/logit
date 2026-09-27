@@ -1130,12 +1130,15 @@ dependencies = [
  "logit-config",
  "logit-core",
  "logit-pipeline",
+ "proptest",
  "regex",
  "serde",
  "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
