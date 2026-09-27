@@ -1,0 +1,41 @@
+# The `(resource, scope)` group scan at G=1000, batch-coherent: generate_in stamps a fresh
+# resource per batch (cycling 1000 distinct resources, one per batch, `GenerateIn::resource`'s
+# "batch-level, not per event" rule -- `seq` here is the batch ordinal, not the event counter, so
+# this is 1000 resources rotating one per batch of 100 events, not one per event, and each batch's
+# resource is a fresh `Arc`). The resources share a `service.namespace`/`deployment.environment`/
+# `cloud.provider`/`cloud.region`/`service.name` prefix, so they look like a real fleet's, and vary
+# on `host.name`/`service.instance.id`. One gauge per event, fixed name and value, fixed event
+# attributes, so every event lands in the same one series per group. The scenario exists to
+# measure how the group lookup's cost grows with the group count --
+# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section. The corresponding row in
+# docs/design/performance.md §1 is added once this scenario is measured on the perf VM.
+#
+#   script/perf run --scenario aggregate-groups
+components:
+  gen:
+    type: generate_in
+    count: 5000000
+    resource:
+      service.namespace: shop
+      deployment.environment: prod
+      cloud.provider: aws
+      cloud.region: us-east-1
+      service.name: checkout
+      host.name: "h{seq%1000}"
+      service.instance.id: "i{seq%1000}"
+    event:
+      attributes:
+        endpoint: /cart
+      metric:
+        name: req.duration
+        kind: gauge
+        value: 12.5
+
+  windowed:
+    type: aggregate
+    sources: [gen]
+    interval: 1s
+
+  out:
+    type: null_out
+    sources: [windowed]

@@ -2113,14 +2113,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   and memory grows with that count until the flush drains it. The bound is upstream: a `keep`
   ahead of `aggregate` limits which attributes reach it, and `keep_values` limits the values one
   attribute can take. `logit.transform.series.active` shows the peak each window.
-- **Nothing bounds how many `(resource, scope)` groups one window holds, and `group_for` scans them
-  linearly on every absorbed metric.** An `otlp_in` gateway or a `prometheus_in` with a resource
-  per scrape target can present thousands of distinct resources, so absorb cost can grow with the
-  group count. Measured with `crates/logit-bench`'s `aggregate_absorb_with_groups` (one gauge per
-  event, resources rotating, one core): 137 ns per absorbed event at 1 group, 877 ns at 100, and
-  8.6 µs at 1000, so the scan dominates from about 100 groups on. The candidates are a per-batch
-  `Arc::ptr_eq` cache and a hashed group index, decided by a measurement on the perf VM in its
-  own change. `logit.transform.resource.groups` shows the count.
+- **Nothing bounds how many `(resource, scope)` groups one window holds, and a lookup that misses
+  `group_for`'s memo walks all of them.** The memo answers every event of a batch after the first,
+  and the walk compares one stored 64-bit hash per group, about half a nanosecond each, before any
+  full compare. So absorb cost still grows with the group count once it reaches tens of thousands
+  and batches are small. A map from hash to group index is the next step if that shape shows up in
+  a profile. `logit.transform.resource.groups` shows the count. `docs/design/performance.md` has no
+  `aggregate-groups` row yet; it waits for a perf VM run. `docs/adr/aggregation-window-semantics.md`'s
+  "The groups bound" section has the mechanism and the measurements.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
   non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, a `scale`d one `F64`)
