@@ -221,8 +221,8 @@ fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
 
 /// [`aggregate_absorb_with_groups`]'s batch-coherent counterpart: `B = 10` events absorbed under
 /// one resource, then the resource advances to the next of `groups` for the next batch of `B`.
-/// This is what every listener hands `aggregate` -- `Transform::process` takes the
-/// batch's resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
+/// This is the shape every listener hands `aggregate` -- `Transform::process` takes the batch's
+/// resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
 /// rotating per event (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section).
 /// Only the batch's first event scans the groups; every later event in the batch shares that same
 /// `Arc`, so `group_for` answers it from its memo. The first event hashes its resource and scope,
@@ -257,10 +257,10 @@ fn aggregate_absorb_with_groups_batched_10(bencher: Bencher, groups: usize) {
 }
 
 /// [`aggregate_absorb_with_groups_batched_10`] at `B = 100`, the reference example's default
-/// `generate_in`/listener batch size. At `groups = 1000` one sample already covers a million
-/// absorbed events, so `sample_count` is lowered to keep this arm under about ten seconds; the
-/// `groups = 100` arm runs the same reduced count for consistency between the two arguments of one
-/// function, not because it needs it.
+/// `generate_in`/listener batch size. At `groups = 1000`, one sample (`sample_size = 1000`
+/// iterations of `B` events) already covers 100,000 absorbed events, so `sample_count` is lowered
+/// to keep this arm under about ten seconds; the `groups = 100` arm runs the same reduced count
+/// for consistency between the two arguments of one function, not because it needs it.
 #[divan::bench(args = [100, 1000], sample_count = 10, sample_size = 1000)]
 fn aggregate_absorb_with_groups_batched_100(bencher: Bencher, groups: usize) {
     const B: usize = 100;
