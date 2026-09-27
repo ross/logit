@@ -480,15 +480,16 @@ fn take_returned(
 /// table's metatable runs no code here. An element that isn't an event fails the whole return,
 /// naming its index; the events taken before it are dropped.
 ///
-/// Ticks `heartbeat` once per element: a `flush()` returning a very large table spends its time
-/// here, after the script returned, and must still read as progress.
+/// Ticks `heartbeat` once per key while validating the sequence and once per element while
+/// taking the events: a `flush()` returning a very large table spends its time here, after the
+/// script returned, and must still read as progress.
 fn events_from_table(
     lua: &Lua,
     table: mlua::Table,
     returner: Returner,
     heartbeat: Option<&Heartbeat>,
 ) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
-    let Some(len) = value::validated_sequence_len(&table)? else {
+    let Some(len) = value::validated_sequence_len_ticking(&table, heartbeat)? else {
         return Err(ScriptError::Lua(mlua::Error::RuntimeError(format!(
             "{}() must return a contiguous array-like table of events (found non-sequence keys)",
             returner.name()
@@ -1502,6 +1503,28 @@ mod tests {
         );
         emitted(w.process(counter_event("hits", 1.0)).unwrap());
         assert_eq!(w.flush(0).unwrap().len(), 1);
+    }
+
+    /// Every pass over a returned table ticks the heartbeat, the sequence check included: a
+    /// pass that doesn't reads as a stall once the table is large enough.
+    #[test]
+    fn flush_ticks_the_heartbeat_per_construction_key_and_element() {
+        let heartbeat = Arc::new(Heartbeat::new());
+        let w = worker(
+            r#"
+            function process(event) return nil end
+            function flush(now)
+                local out = {}
+                for i = 1, 5 do out[i] = Event.new{timestamp = now} end
+                return out
+            end
+            "#,
+        )
+        .with_heartbeat(heartbeat.clone());
+        assert_eq!(w.flush(0).unwrap().len(), 5);
+        // Idle throughout, so the value is the step count times two: five `Event.new` calls,
+        // five keys validated, five elements taken.
+        assert_eq!(heartbeat.read(), 2 * 15);
     }
 
     #[test]

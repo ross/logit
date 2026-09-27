@@ -17,6 +17,7 @@
 //! A Lua string or number can't carry which variant it came from, so an identity assignment
 //! would change the variant; [`lua_value_matches`] is how `AttrsProxy::__newindex` keeps it.
 
+use crate::Heartbeat;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Value};
@@ -222,8 +223,21 @@ fn lua_to_value_at(value: LuaValue, depth: usize) -> mlua::Result<Value> {
 /// is undefined for a table with holes, and LuaJIT returns 4 for
 /// `{[1]="a", [2]="b", [4]="d", extra="c"}`, which would pass a count check.
 pub(crate) fn validated_sequence_len(table: &Table) -> mlua::Result<Option<usize>> {
+    validated_sequence_len_ticking(table, None)
+}
+
+/// [`validated_sequence_len`], ticking `heartbeat` once per key walked. The walk is a pass over
+/// the whole table before any element is converted, so a large returned table would otherwise
+/// sit this long with its heartbeat unchanged.
+pub(crate) fn validated_sequence_len_ticking(
+    table: &Table,
+    heartbeat: Option<&Heartbeat>,
+) -> mlua::Result<Option<usize>> {
     let mut keys: Vec<i64> = Vec::new();
     for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.tick();
+        }
         let (key, _value) = pair?;
         match key {
             LuaValue::Integer(i) if i >= 1 => keys.push(i),
