@@ -772,8 +772,12 @@ the laptop's Zen 5 cores:
 
 `cache` alone fails the rule at 10 events per batch, at about 4.5x one group: each batch's first
 event still walks every group with the full compare, and only 10 events share that cost. `hash`
-passes both shapes, at 1.05x and 1.5x, and costs about a thirtieth of `base` at 1000 groups. Both
-arms cut the one-group case by about 15%, which comes from resolving the group once per call.
+passes both shapes, at 1.05x and 1.5x, and costs about a thirtieth of `base` at 1000 groups and 100
+events per batch, about a twentieth at 10. Both arms cut the one-group case by about 15%. The
+scenario carries one gauge per event, so once-per-call and once-per-record resolve the group the
+same number of times; the gain instead comes from the memo. The scenario mints a fresh `Arc` per
+batch, so `base` runs `resource_key_eq`'s full field compare on every event, while `cache` and
+`hash` answer 99 of each batch's 100 events straight from the memo.
 
 `crates/logit-bench`'s `aggregate_absorb_with_groups` rotates the resource per event, the worst
 case, which misses the memo on every event. Before this change it measured about 137 ns per event
@@ -789,10 +793,11 @@ advantage over the stored-hash scan appears only at tens of thousands of groups 
 batches, and it adds a map per `Aggregator`, an allocation-strategy change that needs a VM
 measurement first.
 
-**What remains**: a memo miss still walks the group list comparing one `u64` per group, about 1 ns
-each, so absorb cost grows with the group count at tens of thousands of groups and small batches.
-The map is the next step if that shape shows up in a profile. `logit.transform.resource.groups`
-shows the count, and `docs/known-gaps.md`'s `aggregate` entries track the residual.
+**What remains**: a memo miss still walks the group list comparing one `u64` per group, about half
+a nanosecond each, so absorb cost grows with the group count at tens of thousands of groups and
+small batches. The map is the next step if that shape shows up in a profile.
+`logit.transform.resource.groups` shows the count, and `docs/known-gaps.md`'s `aggregate` entries
+track the residual.
 
 ### Start time after a cap eviction
 

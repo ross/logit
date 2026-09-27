@@ -225,9 +225,11 @@ fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
 /// resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
 /// rotating per event (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section).
 /// Only the batch's first event scans the groups; every later event in the batch shares that same
-/// `Arc`, so `group_for` answers it from its memo. The first event hashes its resource and scope,
-/// then compares every earlier group's stored hash before the full compare at the matching group.
-/// Every group is opened before timing starts, so the list has a fixed length.
+/// `Arc`, so `group_for` answers it from its memo. This bench hands `group_for` the same `Arc`s
+/// that opened the groups, so the first event hashes its resource and scope, compares every
+/// earlier group's stored hash, and takes the pointer hit at its own group: `resource_key_eq`'s
+/// `Arc::ptr_eq` succeeds there, and no field compare runs. Every group is opened before timing
+/// starts, so the list has a fixed length.
 ///
 /// One divan iteration is one batch, timed as a whole; `ItemsCount` reports the per-event share.
 /// `sample_size` is a multiple of every `groups` argument, for the reason

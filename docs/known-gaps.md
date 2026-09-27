@@ -2115,10 +2115,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   attribute can take. `logit.transform.series.active` shows the peak each window.
 - **Nothing bounds how many `(resource, scope)` groups one window holds, and a lookup that misses
   `group_for`'s memo walks all of them.** The memo answers every event of a batch after the first,
-  and the walk compares one stored 64-bit hash per group, about 1 ns each, before any full compare.
-  So absorb cost still grows with the group count once it reaches tens of thousands and batches
-  are small. A map from hash to group index is the next step if that shape shows up in a profile.
-  `logit.transform.resource.groups` shows the count. `docs/design/performance.md` has no
+  and the walk compares one stored 64-bit hash per group, about half a nanosecond each, before any
+  full compare. So absorb cost still grows with the group count once it reaches tens of thousands
+  and batches are small. A map from hash to group index is the next step if that shape shows up in
+  a profile. `logit.transform.resource.groups` shows the count. `docs/design/performance.md` has no
   `aggregate-groups` row yet; it waits for a perf VM run. `docs/adr/aggregation-window-semantics.md`'s
   "The groups bound" section has the mechanism and the measurements.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
