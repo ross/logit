@@ -280,6 +280,7 @@ line.
 | `has_attributes`, resource match, cache miss (distinct input `Arc`) | **0** | unlike `set.map_resource`'s miss, nothing is rebuilt -- a miss only re-evaluates `get_sym` against the `Arc` already in hand, see below |
 | `aggregate` absorb (after `keep`) | **0** | `SeriesKey` clone stays inline |
 | `aggregate` absorb (no `keep`) | **4** | one per metric — the map no longer fits inline |
+| `aggregate` open a group (2nd resource, 4 metrics) | **4** | 2 for the new group's series `HashMap` (first table, then a regrow crossing the fourth distinct series) + 1 each for the two distribution metrics' `DdSketch`, whose `positive` bin `Vec` grows on its first absorbed value — see `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section |
 | `aggregate` flush 4 series | **6** | +4 since flush-side trace linking landed (ADR `trace-context-propagation-on-delivered`) — one `Vec<SpanLink>` per series, see below |
 | `aggregate` flush 100 retained gauge series (spilled attrs) | **209** | `series_retention > 0` only — see below; the default (`0`) tumbling path above is unaffected |
 | `aggregate` flush 100 cumulative sum series (spilled attrs) | **209** | `temporality: cumulative` — identical to the retained-gauge row above, on purpose: see below |
