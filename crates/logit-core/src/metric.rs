@@ -287,6 +287,13 @@ pub use crate::sketch::DdSketch;
 /// combines edge nodes' aggregates downstream. See `docs/design/data-model.md`. Don't replace it
 /// with a non-mergeable shortcut.
 ///
+/// **Merge order can move the estimate by one.** Up to 128 distinct members the estimate is the
+/// count of distinct member hashes, whatever the order. Past that, `merge` takes the per-register
+/// maximum, so any merge or insertion order reaches the same registers and zero-register count,
+/// but the harmonic sum the estimate divides by is an `f32` updated one register raise at a time,
+/// and a different update order can round its last bit differently. Two nodes merging the same
+/// estimators in different orders can then report estimates one apart.
+///
 /// **`from_bytes` depends on a capacity invariant as well as a byte layout.**
 /// `cardinality-estimator` 1.0.3's `Array::from_vec` frees its buffer with a `Layout` computed
 /// from a rounded length; a `Vec` with more spare capacity than that is undefined behavior on
@@ -398,9 +405,10 @@ impl std::fmt::Debug for HyperLogLog {
 /// Compares [`HyperLogLog::to_bytes`], which strips the allocation pointer from the `data` word
 /// so equal estimators produce equal bytes.
 ///
-/// Still insertion-order-dependent: the small `data` encoding and the array/HLL `members` order
-/// aren't canonical, so the same members inserted in a different order can compare unequal while
-/// [`HyperLogLog::estimate`] agrees. Tests that check equality control insertion order.
+/// Still order-dependent: the small `data` encoding and the array `members` order follow insertion
+/// order, and the HLL representation's `f32` harmonic sum follows register-update order (see
+/// [`HyperLogLog`]'s merge-order note), so the same members inserted or merged in a different
+/// order can compare unequal. Tests that check equality control insertion order.
 impl PartialEq for HyperLogLog {
     fn eq(&self, other: &Self) -> bool {
         self.to_bytes() == other.to_bytes()
@@ -1406,13 +1414,13 @@ mod tests {
         assert_eq!(members.expect("HLL representation").capacity(), 771);
     }
 
-    /// Set-union laws on `estimate`: idempotent, commutative, associative, and a merge of two
-    /// estimators estimates what one fed both populations does. Byte-level commutativity does not
-    /// hold (the array representation keeps insertion order), which `HyperLogLog`'s `PartialEq`
-    /// doc records; these compare estimates.
+    /// Set-union laws: idempotent, commutative, associative, and a merge of two estimators
+    /// reaches what one fed both populations does. Compared on `order_free_state` and on
+    /// `estimate` rather than bytes, since [`HyperLogLog`]'s `PartialEq` is order-dependent.
     mod properties {
         use super::*;
         use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
 
         fn members() -> impl Strategy<Value = Vec<u32>> {
             prop_oneof![
@@ -1436,6 +1444,71 @@ mod tests {
             out
         }
 
+        /// The representation tag and the part of the state no insertion or merge order can
+        /// change: the sorted member hashes (small, array), or the zero-register count and the
+        /// packed registers (HLL). The HLL's `f32` harmonic sum (`data[1]`) is left out; see
+        /// [`HyperLogLog`]'s merge-order note.
+        fn order_free_state(hll: &HyperLogLog) -> (u8, Vec<u32>) {
+            let bytes = hll.to_bytes();
+            let tag = bytes[0] & 0x3;
+            let mut words: Vec<u32> = match tag {
+                CE_REPRESENTATION_ARRAY | CE_REPRESENTATION_HLL => bytes[HLL_MEMBERS_OFFSET..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| u32::from_le_bytes(*w))
+                    .collect(),
+                // Small: up to two 31-bit hashes in the `data` word, at bits 2 and 33.
+                _ => {
+                    let data = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
+                    [data >> 2, data >> 33]
+                        .into_iter()
+                        .map(|h| (h & 0x7fff_ffff) as u32)
+                        .filter(|&h| h != 0)
+                        .collect()
+                }
+            };
+            if tag == CE_REPRESENTATION_HLL {
+                words.remove(1);
+            } else {
+                words.sort_unstable();
+            }
+            (tag, words)
+        }
+
+        /// `x` and `y` hold the same set. Their estimates are equal below the HLL threshold,
+        /// and within one above it: the harmonic sums differ in their last bits at most, which
+        /// moves the unrounded estimate by far less than one, so rounding it to an integer can
+        /// land one apart and no further.
+        fn assert_same_set(x: &HyperLogLog, y: &HyperLogLog) -> Result<(), TestCaseError> {
+            let state = order_free_state(x);
+            prop_assert_eq!(&state, &order_free_state(y));
+            let (ex, ey) = (x.estimate(), y.estimate());
+            if state.0 == CE_REPRESENTATION_HLL {
+                prop_assert!(
+                    ex.abs_diff(ey) <= 1,
+                    "estimates {} and {} from one register state",
+                    ex,
+                    ey
+                );
+            } else {
+                prop_assert_eq!(ex, ey);
+            }
+            Ok(())
+        }
+
+        /// A commutativity case whose two merge orders round the harmonic sum differently and
+        /// estimate 5045 and 5046.
+        #[test]
+        fn hll_merge_order_moves_the_estimate_by_at_most_one() {
+            let base = 63_963_136u32;
+            let a = hll_of(&(base..base + 3000).collect::<Vec<_>>());
+            let b = hll_of(&(base + 4096..base + 4096 + 2108).collect::<Vec<_>>());
+            let (ab, ba) = (union(&a, &b), union(&b, &a));
+            assert_eq!((ab.estimate(), ba.estimate()), (5045, 5046));
+            assert_eq!(order_free_state(&ab), order_free_state(&ba));
+        }
+
         proptest! {
             #[test]
             fn hll_merge_is_idempotent_commutative_and_associative(
@@ -1444,18 +1517,18 @@ mod tests {
                 c in members(),
             ) {
                 let (a, b, c) = (hll_of(&a), hll_of(&b), hll_of(&c));
-                prop_assert_eq!(union(&a, &a).estimate(), a.estimate());
-                prop_assert_eq!(union(&a, &b).estimate(), union(&b, &a).estimate());
-                prop_assert_eq!(
-                    union(&union(&a, &b), &c).estimate(),
-                    union(&a, &union(&b, &c)).estimate()
-                );
+                // A self-merge raises no register, so the harmonic sum doesn't move either.
+                let aa = union(&a, &a);
+                prop_assert_eq!(order_free_state(&aa), order_free_state(&a));
+                prop_assert_eq!(aa.estimate(), a.estimate());
+                assert_same_set(&union(&a, &b), &union(&b, &a))?;
+                assert_same_set(&union(&union(&a, &b), &c), &union(&a, &union(&b, &c)))?;
             }
 
             #[test]
             fn hll_merge_estimates_what_inserting_both_does(a in members(), b in members()) {
                 let both: Vec<u32> = a.iter().chain(&b).copied().collect();
-                prop_assert_eq!(union(&hll_of(&a), &hll_of(&b)).estimate(), hll_of(&both).estimate());
+                assert_same_set(&union(&hll_of(&a), &hll_of(&b)), &hll_of(&both))?;
             }
         }
 
