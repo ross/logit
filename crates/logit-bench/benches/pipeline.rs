@@ -224,10 +224,10 @@ fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
 /// This is what every listener hands `aggregate` -- `Transform::process` takes the
 /// batch's resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
 /// rotating per event (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section).
-/// Only the batch's first event's scan can miss every group by pointer; every later event in the
-/// batch shares that same `Arc`, so `resource_key_eq`'s `Arc::ptr_eq` fast path succeeds once the
-/// scan reaches the matching group -- it still walks every earlier group's full field compare
-/// first. Every group is opened before timing starts, so the list has a fixed length.
+/// Only the batch's first event scans the groups; every later event in the batch shares that same
+/// `Arc`, so `group_for` answers it from its memo. The first event's scan walks every earlier
+/// group's full field compare before `resource_key_eq`'s `Arc::ptr_eq` fast path succeeds at the
+/// matching group. Every group is opened before timing starts, so the list has a fixed length.
 ///
 /// One divan iteration is one batch, timed as a whole; `ItemsCount` reports the per-event share.
 /// `sample_size` is a multiple of every `groups` argument, for the reason
@@ -289,9 +289,9 @@ fn aggregate_absorb_with_groups_batched_100(bencher: Bencher, groups: usize) {
 /// an *equal* [`Resource`](logit_core::Resource) behind a fresh `Arc`, built outside the timed
 /// region. This is `otlp_in`'s shape: one freshly decoded `Arc<Resource>` per request, equal by
 /// value to a resource `aggregate` has already grouped but never the same allocation. `group_for`
-/// never updates a group's stored `Arc` once opened, so every comparison against it, including the
-/// batch's first event, falls through `Arc::ptr_eq` to the full field compare, for every event of
-/// every batch; a per-batch pointer cache would buy this shape nothing.
+/// never updates a group's stored `Arc` once opened, so a comparison against it falls through
+/// `Arc::ptr_eq` to the full field compare. Its memo keys on the incoming `Arc`, which every event
+/// of one batch shares, so only each batch's first event pays that scan.
 #[divan::bench(args = [1000], sample_count = 10, sample_size = 1000)]
 fn aggregate_absorb_with_groups_batched_100_fresh_arc(bencher: Bencher, groups: usize) {
     const B: usize = 100;

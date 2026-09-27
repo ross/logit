@@ -167,6 +167,13 @@ impl ContributingContexts {
 pub struct Aggregator {
     interval: Duration,
     groups: Vec<ResourceGroup>,
+    /// The last `group_for` answer, keyed by the `Arc`s it was asked with. It holds the incoming
+    /// `Arc`s, not the group's stored ones: `otlp_in`, `logit_in`, a Lua resource write, and `set`
+    /// hand every batch a fresh `Arc<Resource>` equal by value to an earlier one, so only the
+    /// incoming pointer repeats, across the events of one batch. Holding the clones keeps those
+    /// addresses from being reused by a different resource while memoized. Cleared at `flush`,
+    /// whose `retain` shifts or removes indices, which also releases a finished batch's `Arc`.
+    last_group: Option<GroupMemo>,
     diag: Diagnostics,
     telemetry: Telemetry,
     /// The most recent batch's `TraceContext`, per `observe_batch_context`. Not reset by `flush`:
@@ -205,6 +212,25 @@ pub struct Aggregator {
     /// The `SeriesState::open_seq` the next opened series gets. Never reused, so it orders every
     /// series this `Aggregator` has held, across groups and flushes.
     next_open_seq: u64,
+}
+
+/// `Aggregator::last_group`'s entry: the `Arc`s `group_for` was asked with, and the index of the
+/// group it answered.
+struct GroupMemo {
+    resource: Arc<Resource>,
+    scope: Option<Arc<Scope>>,
+    index: usize,
+}
+
+impl GroupMemo {
+    fn matches(&self, resource: &Arc<Resource>, scope: &Option<Arc<Scope>>) -> bool {
+        Arc::ptr_eq(&self.resource, resource)
+            && match (&self.scope, scope) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
 }
 
 /// Keyed by `(resource, scope)` value, not `Arc` identity (as `group_for` does for resource): two
@@ -490,6 +516,7 @@ impl Aggregator {
         Self {
             interval,
             groups: Vec::new(),
+            last_group: None,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             current_batch_context: TraceContext::default(),
@@ -581,11 +608,14 @@ impl Aggregator {
     /// touches window state.
     ///
     /// Grouped by `(resource, scope)` value, not `Arc` identity: two inputs that each build an
-    /// empty `Resource` describe the same origin and aggregate together. The lookup is a linear
-    /// scan that compares every earlier group before it reaches the match. `statsd_in` holds one
-    /// `Arc<Resource>` per listener, so its match is an `Arc::ptr_eq` hit in `resource_key_eq`.
+    /// empty `Resource` describe the same origin and aggregate together. The group is resolved
+    /// once per call, on the first absorbable record, so a multi-record event pays one lookup.
+    /// `group_for` answers from `last_group` when the incoming `Arc`s are the ones it last saw,
+    /// which holds for every event of a batch after the first. `statsd_in` holds one
+    /// `Arc<Resource>` per listener, so its memo hits across batches too, until a flush clears it.
     /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
-    /// resource write one per batch, so each of those pays a full field compare at the match too.
+    /// resource write one per batch, so each batch's first event misses the memo and pays a linear
+    /// scan that compares every earlier group, and a full field compare at the match.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
@@ -607,6 +637,10 @@ impl Aggregator {
         // relative order.
         let metrics = std::mem::take(&mut event.metrics);
         let mut tally = Tally::default();
+        // An index, not a `&mut ResourceGroup`, so the loop's other `self` uses don't conflict.
+        // Only `group_for` pushes to `groups` and nothing in the loop removes one, so it stays
+        // valid for the whole call.
+        let mut group_index: Option<usize> = None;
         for record in metrics {
             // An OTLP `NO_RECORDED_VALUE` record has no reading to fold in; its default numeric
             // payload would count as a real sample (`MetricRecord::flags`'s doc).
@@ -646,8 +680,11 @@ impl Aggregator {
                 attributes: event.attributes.clone(),
             };
             let open_seq = self.next_open_seq;
-            let group = self.group_for(resource, &scope);
-            let entry = group.series.entry(key);
+            let gi = match group_index {
+                Some(gi) => gi,
+                None => *group_index.insert(self.group_for(resource, &scope)),
+            };
+            let entry = self.groups[gi].series.entry(key);
             // Whether this metric opened a new series. Not derivable afterward: a real
             // `Gauge(0.0)` at `at: i64::MIN` looks identical to an unseeded delta's result. Only
             // `GaugeDelta` uses it.
@@ -974,25 +1011,28 @@ impl Aggregator {
         !(event.metrics.is_empty() && event.log.is_none() && event.span.is_none())
     }
 
-    fn group_for(
-        &mut self,
-        resource: &Arc<Resource>,
-        scope: &Option<Arc<Scope>>,
-    ) -> &mut ResourceGroup {
-        if let Some(i) = self
-            .groups
-            .iter()
-            .position(|g| resource_key_eq(&g.resource, resource) && scope_key_eq(&g.scope, scope))
-        {
-            &mut self.groups[i]
-        } else {
-            self.groups.push(ResourceGroup {
-                resource: resource.clone(),
-                scope: scope.clone(),
-                series: HashMap::new(),
-            });
-            self.groups.last_mut().expect("just pushed")
+    /// The index in `groups` of the `(resource, scope)` group, opening it if absent.
+    fn group_for(&mut self, resource: &Arc<Resource>, scope: &Option<Arc<Scope>>) -> usize {
+        if let Some(memo) = self.last_group.as_ref().filter(|m| m.matches(resource, scope)) {
+            return memo.index;
         }
+        let index =
+            match self.groups.iter().position(|g| {
+                resource_key_eq(&g.resource, resource) && scope_key_eq(&g.scope, scope)
+            }) {
+                Some(i) => i,
+                None => {
+                    self.groups.push(ResourceGroup {
+                        resource: resource.clone(),
+                        scope: scope.clone(),
+                        series: HashMap::new(),
+                    });
+                    self.groups.len() - 1
+                }
+            };
+        self.last_group =
+            Some(GroupMemo { resource: resource.clone(), scope: scope.clone(), index });
+        index
     }
 
     /// Emits one event per series updated this window, stamped with `now` and paired with its
@@ -1137,6 +1177,7 @@ impl Aggregator {
             self.groups[gi].series.insert(key, state);
         }
         self.groups.retain(|g| !g.series.is_empty());
+        self.last_group = None;
         self.window_start = Some(now);
 
         if total_dropped_links > 0 {
@@ -3582,6 +3623,94 @@ mod tests {
         }
         assert_eq!(agg.groups.len(), 3);
         assert_eq!(flush_events(&mut agg, 100).len(), 3);
+    }
+
+    // -- `group_for`'s memo --------------------------------------------------------------------
+
+    /// A flush that removes the memoized group shifts the groups after it down; the memo must not
+    /// send the next absorb under that group's `Arc` to whichever group took its index.
+    #[test]
+    fn a_memoized_group_removed_by_flush_is_reopened_not_confused_with_its_successor() {
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(1, 10);
+        let b = resource_with_attr("host", Value::from("b"));
+        let a = resource_with_attr("host", Value::from("a"));
+
+        // `b` opens first, at index 0, and is memoized last; `a` holds a retained gauge.
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &a, metric_event("temp", MetricKind::Gauge(20.0), 0));
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(1.0), 1));
+        assert_eq!(agg.groups.len(), 2);
+
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(agg.groups.len(), 1, "`b`'s delta counter tumbles, so its group is dropped");
+        assert!(Arc::ptr_eq(&agg.groups[0].resource, &a), "`a` now holds index 0");
+
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(5.0), 101));
+        assert_eq!(agg.groups.len(), 2, "`b` reopens its own group");
+        let a_group = agg.groups.iter().find(|g| Arc::ptr_eq(&g.resource, &a)).unwrap();
+        assert_eq!(a_group.series.len(), 1, "only the retained gauge is under `a`");
+
+        let flushed = flush_events(&mut agg, 200);
+        let b_events = &flushed.iter().find(|(r, _)| Arc::ptr_eq(r, &b)).unwrap().1;
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(counter_value(kind_of(&b_events[0])), 5.0);
+    }
+
+    /// Batches that each carry a fresh `Arc` of an equal resource miss the memo on their first
+    /// event and still land in the one group.
+    #[test]
+    fn equal_resources_behind_fresh_arcs_per_batch_share_one_group() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("windowed", "aggregate", "transform");
+        let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
+
+        for batch in 0..3 {
+            let resource = resource_with_attr("host", Value::from("a"));
+            for ts in 0..4 {
+                feed(
+                    &mut agg,
+                    &resource,
+                    metric_event("hits", MetricKind::counter(1.0), batch + ts),
+                );
+            }
+            assert_eq!(agg.groups.len(), 1, "batch {batch}");
+        }
+        let flushed = flush_events(&mut agg, 100);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(counter_value(kind_of(&flushed[0].1[0])), 12.0);
+        let events = registry.drain(0);
+        assert_eq!(gauge_value(&events, "logit.transform.resource.groups"), Some(1.0));
+    }
+
+    /// The memo keys on the scope `Arc` as well as the resource `Arc`: a scope change between
+    /// `process` calls under one resource `Arc` resolves the group afresh.
+    #[test]
+    fn a_scope_change_under_one_resource_arc_opens_a_distinct_group() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let resource = default_resource();
+        let scope = Arc::new(Scope { name: Bytes::from_static(b"scope"), ..Scope::default() });
+
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        agg.observe_scope(Some(scope.clone()));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 1));
+        assert_eq!(agg.groups.len(), 2, "`None` and `Some` scopes are distinct groups");
+        agg.observe_scope(None);
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(4.0), 2));
+        assert_eq!(agg.groups.len(), 2, "back to the unscoped group");
+
+        let flushed = agg.flush(100);
+        let total = |want: Option<&Arc<Scope>>| {
+            let (_, _, events) = flushed
+                .iter()
+                .find(|(_, s, _)| {
+                    s.as_ref().map(|s| s.name.clone()) == want.map(|s| s.name.clone())
+                })
+                .unwrap();
+            counter_value(kind_of(&events[0].0))
+        };
+        assert_eq!(total(None), 5.0);
+        assert_eq!(total(Some(&scope)), 2.0);
     }
 
     // -- `temporality: cumulative` -------------------------------------------------------------
