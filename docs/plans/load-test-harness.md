@@ -75,6 +75,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing | 25M | ~3.58M/s |
 | `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 19M | ~2.07M/s |
 | `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~3.09M/s |
+| `aggregate-groups` | `generate_in` (one gauge per event, a fresh resource per batch of 100 cycling 1000 distinct resources) → `aggregate` (1s window) → `null_out` | `group_for`'s lookup across 1000 `(resource, scope)` groups, read against `aggregate` | 5M | pending VM run |
 | `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.60M/s |
 | `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 25M | ~2.59M/s |
 | `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.88M/s |

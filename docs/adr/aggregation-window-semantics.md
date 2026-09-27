@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-26
+updated: 2026-09-27
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -727,21 +727,72 @@ rule that summarization is opt-in and named.
 ### The groups bound
 
 `max_retained_series` bounds series, not groups. The number of distinct `(resource, scope)`
-groups within one window is unbounded, and `group_for` scans them linearly with a full resource
-compare on every absorbed metric. A realistic count reaches the thousands (an `otlp_in` gateway,
-or `prometheus_in` with a resource per scrape target).
+groups within one window is unbounded, and a realistic count reaches the thousands (an `otlp_in`
+gateway, or `prometheus_in` with a resource per scrape target). Finding a metric's group has to
+stay cheap as that count grows.
 
-`crates/logit-bench`'s `aggregate_absorb_with_groups` measures it, one gauge per event with the
-resource rotating per event, on one core: about 137 ns per event at 1 group, 877 ns at 100, and
-8.6 µs at 1000. The scan dominates from 100 groups on, at about 7.5 ns per group compared. The
-`Arc::ptr_eq` fast path saves about 10%, because only the matching group takes it. The
-candidates are a per-batch `Arc::ptr_eq` cache and a hashed group index. A measurement on the perf
-VM decides, in its own change with its own allocation pins.
+**`group_for` answers from a one-entry memo, and on a miss compares a stored hash before the full
+compare.** Three parts make that up:
 
-That per-event rotation is the worst case; every listener hands `aggregate` one resource per batch
-(`Transform::process` takes the batch's resource), so the same crate's
-`aggregate_absorb_with_groups_batched_10`/`_100`/`_100_fresh_arc` benches and
-`perf/scenarios/aggregate-groups.yaml` measure the batch-coherent shape instead.
+- `Aggregator::process` resolves the group once per call, on the first absorbable record, not once
+  per metric record.
+- `Aggregator::last_group` memoizes the last answer, keyed by pointer on the incoming
+  `Arc<Resource>` and `Arc<Scope>`. It holds the incoming `Arc`s, not the group's stored ones,
+  because `otlp_in`, `logit_in`, a Lua resource write, and `set` mint a fresh `Arc` per batch,
+  equal by value to an earlier one: the group's own `Arc` never repeats, and the incoming one
+  repeats for every event of a batch. `Aggregator::flush` clears the memo, because its `retain`
+  shifts and removes group indices.
+- Each `ResourceGroup` stores `group_hash` of the fields `resource_key_eq` and `scope_key_eq`
+  compare. On a memo miss, `group_for` hashes the incoming pair once and scans the groups comparing
+  that `u64`. It runs the full compare only where the hashes match, so a collision can't merge two
+  groups.
+
+None of the three allocates, and no allocation pin in `docs/design/memory.md` moved.
+
+**The rule that chose this was fixed before measuring**: land the simplest arm that keeps 1000
+groups within about 1.5x of one group on the batch-coherent shapes (100 and 10 events per
+resource, with a fresh `Arc` per batch, which is `otlp_in`'s shape) and doesn't regress one group.
+An arm that adds no allocation may land on laptop evidence, labeled as such; one that changes
+allocation strategy needs the perf VM
+([ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md)).
+
+Three arms were measured: `base`, the linear scan with a full compare per metric record; `cache`,
+the memo and once-per-call resolution; and `hash`, `cache` plus the stored hash. The numbers below
+are from a laptop, not the perf VM, so they aren't reference numbers:
+`docs/design/performance.md` records VM numbers only, and its `aggregate-groups` row waits for the
+next VM session. Scenario CPU µs per event, median of three, two rounds, with the child pinned to
+the laptop's Zen 5 cores:
+
+| Shape | `base` | `cache` | `hash` |
+|---|---|---|---|
+| 1000 groups, 100 events per batch (`perf/scenarios/aggregate-groups.yaml`) | 13.0–13.5 | 0.54 | 0.43 |
+| 1000 groups, 10 events per batch | 13.5–13.6 | 1.82–1.87 | 0.62 |
+| One group, 100 events per batch | 0.48 | 0.41–0.42 | 0.41–0.42 |
+| `passthrough` (control) | 0.59–0.60 | 0.60–0.63 | 0.60–0.61 |
+
+`cache` alone fails the rule at 10 events per batch, at about 4.5x one group: each batch's first
+event still walks every group with the full compare, and only 10 events share that cost. `hash`
+passes both shapes, at 1.05x and 1.5x, and costs about a thirtieth of `base` at 1000 groups. Both
+arms cut the one-group case by about 15%, which comes from resolving the group once per call.
+
+`crates/logit-bench`'s `aggregate_absorb_with_groups` rotates the resource per event, the worst
+case, which misses the memo on every event. Before this change it measured about 137 ns per event
+at one group, 877 ns at 100, and 8.6 µs at 1000, on one core: about 7.5 ns per group compared.
+The laptop's bench runs were power-capped, at about 2.4x those absolute values, so only their
+ratios carry: at 1000 groups, `hash` takes that worst case from 19.6 µs to 1.18 µs per event, and
+the 10-per-batch shape from 19.9 µs to 441 ns, where `cache` reaches 2.3 µs. The batch-coherent
+benches are `aggregate_absorb_with_groups_batched_10`, `_batched_100`, and
+`_batched_100_fresh_arc`.
+
+**A map from hash to group index wasn't built.** It would make a memo miss constant-time, but its
+advantage over the stored-hash scan appears only at tens of thousands of groups with small
+batches, and it adds a map per `Aggregator`, an allocation-strategy change that needs a VM
+measurement first.
+
+**What remains**: a memo miss still walks the group list comparing one `u64` per group, about 1 ns
+each, so absorb cost grows with the group count at tens of thousands of groups and small batches.
+The map is the next step if that shape shows up in a profile. `logit.transform.resource.groups`
+shows the count, and `docs/known-gaps.md`'s `aggregate` entries track the residual.
 
 ### Start time after a cap eviction
 

@@ -627,9 +627,9 @@ impl Aggregator {
     /// which holds for every event of a batch after the first. `statsd_in` holds one
     /// `Arc<Resource>` per listener, so its memo hits across batches too, until a flush clears it.
     /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
-    /// resource write one per batch, so each batch's first event misses the memo. It hashes the
-    /// pair once and scans the groups comparing each stored hash, taking the full field compare
-    /// only where the hashes match.
+    /// resource write one per batch, so each batch's first event misses the memo. That lookup
+    /// hashes the pair once and scans the groups comparing each stored hash, taking the full field
+    /// compare only where the hashes match.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
