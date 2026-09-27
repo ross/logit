@@ -323,7 +323,7 @@ whichever stream is first. Every other Dynatrace field already has a home.
 ### 2. One runtime dependency: a `delta` transform (outside this stream)
 
 Dynatrace rejects a cumulative monotonic `Sum` and doesn't ingest a cumulative `Histogram`, and
-nothing in `logit` converts cumulative to delta: `aggregate`'s `passes_through` lets both kinds
+nothing in `logit` converts cumulative to delta: `aggregate`'s `opener_for` lets both kinds
 through untouched ([ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
 cumulative amendment goes the other way). Any pipeline that relays `prometheus_in`, `otlp_in`
 with cumulative producers, or `internal -> aggregate (temporality: cumulative)` into Dynatrace

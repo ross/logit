@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-11
+updated: 2026-09-26
 ---
 
 # Relative gauge adjustments (`+`/`-` in statsd)
@@ -43,7 +43,7 @@ A new variant forces every exhaustive match over `MetricKind` to make an explici
 relative adjustment, rather than letting a `Gauge { value, .. }` pattern silently treat a delta as
 an absolute value — the exact bug class this feature exists to avoid. The four exhaustive matches
 this touches: `logit-core::event::metric_record_heap_bytes`, `logit-outputs::influxdb::render_fields`,
-`logit-outputs::stdio::render_metric`, and `logit-transforms::aggregate`'s `Accumulator::new_for` /
+`logit-outputs::stdio::render_metric`, and `logit-transforms::aggregate`'s `opener_for` /
 `into_kind` / merge match.
 
 Size is safe to add: `MetricKind` is 176 bytes, almost entirely the `Distribution` variant's inlined

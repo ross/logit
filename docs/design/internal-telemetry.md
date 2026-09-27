@@ -1127,13 +1127,19 @@ counts what it sent, so a native equality match has nothing further worth a coun
 | `logit.transform.series.active` | gauge | series updated this window, sampled at the top of `flush` before it touches its own state: the peak-of-window series count, and the visible signal for the cardinality blow-up `crate::keep`'s module doc warns `aggregate` is exposed to |
 | `logit.transform.resource.groups` | gauge | resource groups, sampled with `.series.active` |
 | `logit.transform.series.retained` | gauge | the idle-but-carried population. `.active` keeps its "series updated this window" meaning and doesn't include these |
-| `logit.transform.series.evicted{reason="idle"\|"cardinality"}` | count | a TTL expiry versus the hard `max_retained_series` cap. A non-zero `cardinality` count means a later delta is about to resolve against 0.0, or a cumulative series is about to restart from zero with a new `start_timestamp` |
+| `logit.transform.series.evicted{reason="idle"\|"cardinality"}` | count | a TTL expiry versus the hard `max_retained_series` cap. A non-zero `cardinality` count means a later delta is about to resolve against 0.0, or a cumulative series is about to restart from zero with a new `start_timestamp`. `cardinality` also carries `state="active"\|"idle"`: `active` counts series updated this window, emitted and then dropped, so more active series arrive per window than the cap holds |
 | `logit.transform.gauge.delta.unseeded` | count | a `GaugeDelta` opened a brand-new series and resolved against 0.0 (statsd's own rule for an unseeded gauge), indistinguishable from a real 0.0 without this |
 | `logit.transform.samples.fallback{reason="rate_mismatch"\|"cap"}` | count | a `samples`-mode series gave up raw retention and became a sketch |
 | `logit.transform.set_members.fallback{reason="cap"}` | count | a `members`-mode series gave up raw retention and became an estimate |
-| `logit.transform.samples.weight_clamped` | count | a sample rate implied more than `Samples::MAX_WEIGHT` observations per value |
-| `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no genuine reading to fold into a series |
-| `logit.transform.links.dropped{reason="cardinality"}` | count | contributing span contexts past the per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry |
+| `logit.transform.samples.weight_clamped` | count | a record's sample rate implied more than `Samples::MAX_WEIGHT` observations per value (`Samples::is_clamped`), counted when its weight is applied: on absorb into a sketch, or when a raw `distributions: samples` series falls back |
+| `logit.transform.samples.non_finite_dropped` | count | `NaN` or infinite `Samples` values dropped while sketching, since they have no bin |
+| `logit.transform.metrics.absorbed` | count | metric records merged into a series. With `.passed_through` it accounts for every record `process` receives: `metrics_in == absorbed + passed_through` summed over every reason |
+| `logit.transform.metrics.passed_through{reason="no_recorded_value"}` | count | an OTLP `NO_RECORDED_VALUE`-flagged record forwarded unmerged, because it has no reading to fold into a series |
+| `logit.transform.metrics.passed_through{reason="no_merge_rule"}` | count | a record of a kind this stage doesn't merge, forwarded: a cumulative `Sum`, an `ExponentialHistogram`, a `Summary`, and a `Histogram` outside `temporality: cumulative` or already cumulative |
+| `logit.transform.metrics.passed_through{reason="kind_conflict"}` | count | a record forwarded because its series holds another kind |
+| `logit.transform.metrics.passed_through{reason="histogram_bounds_mismatch"}` | count | a histogram forwarded because its bucket bounds differ from its series' |
+| `logit.transform.metrics.passed_through{reason="non_finite"}` | count | a delta `Sum` whose value is `NaN` or infinite, forwarded so a cumulative total stays finite |
+| `logit.transform.links.dropped{reason="contexts"}` | count | contributing span contexts past the fixed per-series cap (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8) that a flushed event's links can't carry, one per merged record whose context the full series doesn't link, so a context seen in two batches counts twice. Unrelated to `max_retained_series`: no series is lost |
 
 Series retention across the window boundary comes from
 `docs/adr/aggregation-window-semantics.md`'s gauge-retention amendment and its cumulative
@@ -1145,9 +1151,10 @@ amendment.
 unseeded counters); `samples_rate_mismatch`, `samples_cap_exceeded`, `set_members_cap_exceeded`,
 and `sample_rate_clamped` (mirroring the raw-retention counters); `kind_conflict` (a metric whose
 kind conflicts with an already-accumulating series under the same name/unit/tags, forwarded
-untouched); and `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
+untouched); `histogram_bounds_mismatch` (a histogram whose bucket bounds differ from the
 accumulating series', also forwarded untouched, under its own key so an operator knows it's a
-producer that re-bucketed rather than two kinds colliding).
+producer that re-bucketed rather than two kinds colliding); and `sum_non_finite` (a delta `Sum`
+whose value is `NaN` or infinite, forwarded untouched).
 
 ##### `kv_metrics`
 
