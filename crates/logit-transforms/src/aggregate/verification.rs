@@ -497,6 +497,93 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// Resources and scopes equal by `resource_key_eq`/`scope_key_eq` have one `group_hash`: a
+    /// clone, a structural copy in no shared allocation (floats bitwise, `-0.0` and `NaN`
+    /// included), and a copy built by inserting the same entries in another order, at sizes past
+    /// `AttrMap`'s inline capacity.
+    #[test]
+    fn key_equal_resources_and_scopes_hash_equal(
+        (resource, resource_shuffled) in entries_and_shuffled(12),
+        (scope, scope_shuffled) in entries_and_shuffled(10),
+        schema_url in prop_oneof![Just(None), Just(Some(&b"s"[..]))],
+        dropped in 0u32..2,
+        scoped in any::<bool>(),
+    ) {
+        let build_resource = |entries: &[(&'static str, Value)]| {
+            Arc::new(Resource {
+                attributes: attrs_of(entries),
+                dropped_attributes_count: dropped,
+                schema_url: schema_url.map(Bytes::copy_from_slice),
+            })
+        };
+        let build_scope = |entries: &[(&'static str, Value)]| {
+            scoped.then(|| {
+                Arc::new(Scope {
+                    name: Bytes::copy_from_slice(b"scope"),
+                    version: Bytes::copy_from_slice(b"1"),
+                    attributes: attrs_of(entries),
+                    dropped_attributes_count: dropped,
+                    schema_url: schema_url.map(Bytes::copy_from_slice),
+                })
+            })
+        };
+        let copied = |entries: &[(&'static str, Value)]| {
+            entries.iter().map(|(k, v)| (*k, copy(v))).collect::<Vec<_>>()
+        };
+
+        let original = (build_resource(&resource), build_scope(&scope));
+        let cloned = (
+            Arc::new((*original.0).clone()),
+            original.1.as_ref().map(|s| Arc::new((**s).clone())),
+        );
+        let variants = [
+            ("clone", cloned),
+            ("copy", (build_resource(&copied(&resource)), build_scope(&copied(&scope)))),
+            ("reordered", (build_resource(&resource_shuffled), build_scope(&scope_shuffled))),
+        ];
+        let expected = group_hash(&original.0, &original.1);
+        for (how, (r, s)) in &variants {
+            prop_assert!(resource_key_eq(&original.0, r), "{} resource is key-equal", how);
+            prop_assert!(scope_key_eq(&original.1, s), "{} scope is key-equal", how);
+            prop_assert_eq!(group_hash(r, s), expected, "{} hashes equal", how);
+        }
+    }
+}
+
+const ATTR_KEYS: [&str; 12] =
+    ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10", "a11"];
+
+/// Entries and the same entries shuffled, for [`key_equal_resources_and_scopes_hash_equal`].
+type EntryPair = (Vec<(&'static str, Value)>, Vec<(&'static str, Value)>);
+
+/// Up to `max` distinct keys with generated values, plus one float from [`float`] under `f`, in a
+/// shuffled order, and the same entries in a second shuffled order.
+fn entries_and_shuffled(max: usize) -> impl Strategy<Value = EntryPair> {
+    (prop::sample::subsequence(ATTR_KEYS[..max].to_vec(), 0..=max), float())
+        .prop_flat_map(|(keys, f)| {
+            let n = keys.len();
+            (Just(keys), Just(f), prop::collection::vec(value(), n))
+        })
+        .prop_map(|(keys, f, values)| {
+            let mut entries: Vec<(&'static str, Value)> = keys.into_iter().zip(values).collect();
+            entries.push(("f", Value::F64(f)));
+            entries
+        })
+        .prop_shuffle()
+        .prop_flat_map(|entries| (Just(entries.clone()), Just(entries).prop_shuffle()))
+}
+
+fn attrs_of(entries: &[(&'static str, Value)]) -> AttrMap {
+    let mut map = AttrMap::new();
+    for (k, v) in entries {
+        map.insert(k, v.clone());
+    }
+    map
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Batch(usize, usize, usize),

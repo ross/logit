@@ -55,6 +55,7 @@ use logit_core::{
 };
 use logit_pipeline::{FlushOutput, TraceContext, Transform};
 use smallvec::SmallVec;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -239,7 +240,19 @@ impl GroupMemo {
 struct ResourceGroup {
     resource: Arc<Resource>,
     scope: Option<Arc<Scope>>,
+    /// [`group_hash`] of `resource` and `scope`, which `group_for` compares before the full field
+    /// compare. It can't go stale: the group holds both `Arc`s, and the values behind them are
+    /// immutable.
+    hash: u64,
     series: HashMap<SeriesKey, SeriesState>,
+}
+
+impl ResourceGroup {
+    #[cfg(test)]
+    fn new(resource: Arc<Resource>, scope: Option<Arc<Scope>>) -> Self {
+        let hash = group_hash(&resource, &scope);
+        Self { resource, scope, hash, series: HashMap::new() }
+    }
 }
 
 /// One series' accumulated value, paired with which batches contributed to it since the last
@@ -614,8 +627,9 @@ impl Aggregator {
     /// which holds for every event of a batch after the first. `statsd_in` holds one
     /// `Arc<Resource>` per listener, so its memo hits across batches too, until a flush clears it.
     /// `otlp_in` builds one `Arc` per `ResourceMetrics`, `logit_in` one per frame, and a Lua
-    /// resource write one per batch, so each batch's first event misses the memo and pays a linear
-    /// scan that compares every earlier group, and a full field compare at the match.
+    /// resource write one per batch, so each batch's first event misses the memo. It hashes the
+    /// pair once and scans the groups comparing each stored hash, taking the full field compare
+    /// only where the hashes match.
     pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
             return true;
@@ -1016,20 +1030,25 @@ impl Aggregator {
         if let Some(memo) = self.last_group.as_ref().filter(|m| m.matches(resource, scope)) {
             return memo.index;
         }
-        let index =
-            match self.groups.iter().position(|g| {
-                resource_key_eq(&g.resource, resource) && scope_key_eq(&g.scope, scope)
-            }) {
-                Some(i) => i,
-                None => {
-                    self.groups.push(ResourceGroup {
-                        resource: resource.clone(),
-                        scope: scope.clone(),
-                        series: HashMap::new(),
-                    });
-                    self.groups.len() - 1
-                }
-            };
+        // The hash only rules a group out; a match still takes the full compare, so a collision
+        // can't merge two groups.
+        let hash = group_hash(resource, scope);
+        let index = match self.groups.iter().position(|g| {
+            g.hash == hash
+                && resource_key_eq(&g.resource, resource)
+                && scope_key_eq(&g.scope, scope)
+        }) {
+            Some(i) => i,
+            None => {
+                self.groups.push(ResourceGroup {
+                    resource: resource.clone(),
+                    scope: scope.clone(),
+                    hash,
+                    series: HashMap::new(),
+                });
+                self.groups.len() - 1
+            }
+        };
         self.last_group =
             Some(GroupMemo { resource: resource.clone(), scope: scope.clone(), index });
         index
@@ -1373,6 +1392,39 @@ fn scope_key_eq(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
                     && attr_map_key_eq(&a.attributes, &b.attributes))
         }
         (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+/// A `(resource, scope)` group's hash, over the fields [`resource_key_eq`] and [`scope_key_eq`]
+/// compare, with floats by bit pattern, so key-equal pairs hash equal. A fresh
+/// `DefaultHasher::new()` has fixed keys, so a stored hash and a lookup hash agree within the
+/// process.
+fn group_hash(resource: &Resource, scope: &Option<Arc<Scope>>) -> u64 {
+    let mut state = DefaultHasher::new();
+    resource.schema_url.hash(&mut state);
+    resource.dropped_attributes_count.hash(&mut state);
+    hash_attr_map(&resource.attributes, &mut state);
+    match scope {
+        None => 0u8.hash(&mut state),
+        Some(scope) => {
+            1u8.hash(&mut state);
+            scope.name.hash(&mut state);
+            scope.version.hash(&mut state);
+            scope.schema_url.hash(&mut state);
+            scope.dropped_attributes_count.hash(&mut state);
+            hash_attr_map(&scope.attributes, &mut state);
+        }
+    }
+    state.finish()
+}
+
+/// The length first, so the resource's attributes can't run into the scope fields after them.
+/// `AttrMap::iter()` yields `Symbol` order, so insertion order doesn't change the hash.
+fn hash_attr_map<H: Hasher>(map: &AttrMap, state: &mut H) {
+    map.len().hash(state);
+    for (k, v) in map.iter() {
+        k.hash(state);
+        hash_value(v, state);
     }
 }
 
@@ -1772,11 +1824,9 @@ mod tests {
                         updated_this_window: true,
                         description: None,
                     };
-                    agg.groups.push(ResourceGroup {
-                        resource: default_resource(),
-                        scope: None,
-                        series: HashMap::from([(key, state)]),
-                    });
+                    let mut group = ResourceGroup::new(default_resource(), None);
+                    group.series.insert(key, state);
+                    agg.groups.push(group);
 
                     let emitted = flush_events(&mut agg, 10);
                     assert_eq!(emitted.len(), 1, "an updated series emits once");
@@ -3711,6 +3761,32 @@ mod tests {
         };
         assert_eq!(total(None), 5.0);
         assert_eq!(total(Some(&scope)), 2.0);
+    }
+
+    /// An absent scope and an all-default scope are distinct groups, and their hashes differ.
+    #[test]
+    fn a_default_scope_and_no_scope_hash_differently() {
+        let resource = Resource::default();
+        assert_ne!(
+            group_hash(&resource, &None),
+            group_hash(&resource, &Some(Arc::new(Scope::default())))
+        );
+    }
+
+    /// A stored hash that collides with a different resource's doesn't merge the two groups.
+    #[test]
+    fn a_group_hash_collision_opens_a_distinct_group() {
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        let a = resource_with_attr("host", Value::from("a"));
+        let b = resource_with_attr("host", Value::from("b"));
+        let mut group = ResourceGroup::new(a.clone(), None);
+        group.hash = group_hash(&b, &None);
+        agg.groups.push(group);
+
+        feed(&mut agg, &b, metric_event("hits", MetricKind::counter(1.0), 0));
+        assert_eq!(agg.groups.len(), 2);
+        assert!(agg.groups[0].series.is_empty(), "nothing lands under `a`");
+        assert!(Arc::ptr_eq(&agg.groups[1].resource, &b));
     }
 
     // -- `temporality: cumulative` -------------------------------------------------------------
