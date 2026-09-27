@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-09-26
+updated: 2026-09-27
 ---
 
 # Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
@@ -74,8 +74,9 @@ sources, found:
    (`logit_script::Heartbeat`, an `AtomicU64`: bit 0 is a busy flag, the upper bits a
    call/progress count; `Relaxed` load and store, one writer). `ScriptWorker::with_heartbeat`
    ticks it around each `process()`/`flush()` call, and inside a call too — once per `Event.new`
-   and once per element `events_from_table` builds from a returned table — so a `flush()` that
-   emits many events stays a run of progress ticks, never a stall, however long it takes. A
+   and, for a returned table, once per key `events_from_table` validates and once per element
+   it builds — so a `flush()` that emits many events stays a run of progress ticks, never a
+   stall, however long it takes. A
    watcher task polls the heartbeat on the interval decision 2 sets; a busy bit that stops
    advancing for `stall_after` (default 10s) diagnoses `script_stalled` and moves the node to a
    `NodeState::Stalled` state. `Stalled` is reversible: the heartbeat advancing again moves the
