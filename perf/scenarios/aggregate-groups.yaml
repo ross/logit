@@ -1,14 +1,18 @@
 # The `(resource, scope)` group scan at G=1000, batch-coherent: generate_in stamps a fresh
 # resource per batch (cycling 1000 distinct resources, one per batch, `GenerateIn::resource`'s
 # "batch-level, not per event" rule -- `seq` here is the batch ordinal, not the event counter, so
-# this is 1000 resources rotating one per batch of 100 events, not one per event), each carrying a
-# shared five-attribute prefix ahead of the two that vary, so a non-matching `group_for` compare
-# walks that prefix first, the way `crates/logit-bench::fixtures::resources_for_groups` does. One
-# gauge per event, fixed name and value, fixed event attributes, so every event lands in the same
-# one series per group and the per-record cost is dominated by `group_for`'s linear scan rather
-# than series-map work.
-# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section; numbers:
-# docs/design/performance.md §1.
+# this is 1000 resources rotating one per batch of 100 events, not one per event). Resource keys
+# are interned in `BTreeMap` (lexicographic) order, and `group_for`'s scan compares them in
+# `Symbol` order, so a non-matching compare on this resource's seven attributes walks
+# `cloud.provider`, `cloud.region`, `deployment.environment`, `host.name`, `service.instance.id`,
+# `service.name`, `service.namespace`: three of the five shared attributes precede the first of
+# the two that vary (`crates/logit-bench::fixtures::resources_for_groups` puts its four shared
+# attributes first by insertion order, not by this scan order). One gauge per event, fixed name
+# and value, fixed event attributes, so every event lands in the same one series per group and the
+# per-record cost is dominated by the `(resource, scope)` group lookup rather than series-map
+# work.
+# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section. The corresponding row in
+# docs/design/performance.md §1 is added once this scenario is measured on the perf VM.
 #
 #   script/perf run --scenario aggregate-groups
 components:

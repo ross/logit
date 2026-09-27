@@ -221,13 +221,14 @@ fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
 
 /// [`aggregate_absorb_with_groups`]'s batch-coherent counterpart: `B = 10` events absorbed under
 /// one resource, then the resource advances to the next of `groups` for the next batch of `B`.
-/// This is what every listener hands `aggregate` -- `Transform::process` takes the
-/// batch's resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
+/// This is the shape every listener hands `aggregate` -- `Transform::process` takes the batch's
+/// resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
 /// rotating per event (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section).
-/// Only the batch's first event's scan can miss every group by pointer; every later event in the
-/// batch shares that same `Arc`, so `resource_key_eq`'s `Arc::ptr_eq` fast path succeeds once the
-/// scan reaches the matching group -- it still walks every earlier group's full field compare
-/// first. Every group is opened before timing starts, so the list has a fixed length.
+/// `group_for` is a linear scan with no per-batch memo, so every event pays the same scan
+/// regardless of its position in the batch: this bench and `aggregate_absorb_with_groups` read
+/// the same per-event cost. The batched shape here is what a per-batch memo in `group_for` would
+/// change, per that same section. Every group is opened before timing starts, so the list has a
+/// fixed length.
 ///
 /// One divan iteration is one batch, timed as a whole; `ItemsCount` reports the per-event share.
 /// `sample_size` is a multiple of every `groups` argument, for the reason
@@ -257,10 +258,10 @@ fn aggregate_absorb_with_groups_batched_10(bencher: Bencher, groups: usize) {
 }
 
 /// [`aggregate_absorb_with_groups_batched_10`] at `B = 100`, the reference example's default
-/// `generate_in`/listener batch size. At `groups = 1000` one sample already covers a million
-/// absorbed events, so `sample_count` is lowered to keep this arm under about ten seconds; the
-/// `groups = 100` arm runs the same reduced count for consistency between the two arguments of one
-/// function, not because it needs it.
+/// `generate_in`/listener batch size. At `groups = 1000`, one sample (`sample_size = 1000`
+/// iterations of `B` events) already covers 100,000 absorbed events, so `sample_count` is lowered
+/// to keep this arm under about ten seconds; the `groups = 100` arm runs the same reduced count
+/// for consistency between the two arguments of one function, not because it needs it.
 #[divan::bench(args = [100, 1000], sample_count = 10, sample_size = 1000)]
 fn aggregate_absorb_with_groups_batched_100(bencher: Bencher, groups: usize) {
     const B: usize = 100;
@@ -289,9 +290,10 @@ fn aggregate_absorb_with_groups_batched_100(bencher: Bencher, groups: usize) {
 /// an *equal* [`Resource`](logit_core::Resource) behind a fresh `Arc`, built outside the timed
 /// region. This is `otlp_in`'s shape: one freshly decoded `Arc<Resource>` per request, equal by
 /// value to a resource `aggregate` has already grouped but never the same allocation. `group_for`
-/// never updates a group's stored `Arc` once opened, so every comparison against it, including the
-/// batch's first event, falls through `Arc::ptr_eq` to the full field compare, for every event of
-/// every batch; a per-batch pointer cache would buy this shape nothing.
+/// never updates a group's stored `Arc` once opened, so on this branch every event falls through
+/// `resource_key_eq`'s `Arc::ptr_eq` to the full field compare. All `B` events of one batch share
+/// the same fresh `Arc`, so a memo keyed on the incoming `Arc` would miss only on the batch's
+/// first event and hit for the other 99.
 #[divan::bench(args = [1000], sample_count = 10, sample_size = 1000)]
 fn aggregate_absorb_with_groups_batched_100_fresh_arc(bencher: Bencher, groups: usize) {
     const B: usize = 100;
