@@ -14,6 +14,7 @@
 //! full multi-node graph costs across the worker and OS threads `run_with_shutdown` spawns is
 //! `logit-perf`'s job (`docs/adr/load-test-harness.md`), not a microbenchmark's.
 
+use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher};
 use logit_bench::fixtures;
 use logit_outputs::influxdb::InfluxLineEncoder;
@@ -23,6 +24,7 @@ use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
 use logit_pipeline::Transform;
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_script::ScriptWorker;
+use std::sync::Arc;
 
 /// divan's counting allocator, so every bench reports allocation count and bytes beside its
 /// timing. The counting runs inside the timed region, so the timings are slightly pessimistic:
@@ -215,6 +217,106 @@ fn aggregate_absorb_with_groups(bencher: Bencher, groups: usize) {
         next = (next + 1) % resources.len();
         agg.process(resource, event)
     });
+}
+
+/// [`aggregate_absorb_with_groups`]'s batch-coherent counterpart: `B = 10` events absorbed under
+/// one resource, then the resource advances to the next of `groups` for the next batch of `B`.
+/// This is what every listener hands `aggregate` -- `Transform::process` takes the
+/// batch's resource, so consecutive records share one `&Arc<Resource>` until the next batch, never
+/// rotating per event (`docs/adr/aggregation-window-semantics.md`'s "The groups bound" section).
+/// Only the batch's first event's scan can miss every group by pointer; every later event in the
+/// batch shares that same `Arc`, so `resource_key_eq`'s `Arc::ptr_eq` fast path succeeds once the
+/// scan reaches the matching group -- it still walks every earlier group's full field compare
+/// first. Every group is opened before timing starts, so the list has a fixed length.
+///
+/// One divan iteration is one batch, timed as a whole; `ItemsCount` reports the per-event share.
+/// `sample_size` is a multiple of every `groups` argument, for the reason
+/// [`aggregate_absorb_with_groups`]'s doc gives.
+#[divan::bench(args = [100, 1000], sample_count = 100, sample_size = 1000)]
+fn aggregate_absorb_with_groups_batched_10(bencher: Bencher, groups: usize) {
+    const B: usize = 10;
+    let resources = fixtures::resources_for_groups(groups);
+    let prototype = fixtures::gauge_event_after_keep();
+    let mut agg = fixtures::aggregator();
+    for resource in &resources {
+        let mut event = prototype.clone();
+        agg.process(resource, &mut event);
+        assert!(event.metrics.is_empty(), "the gauge is absorbed");
+    }
+    let mut next = 0;
+    bencher
+        .counter(ItemsCount::new(B))
+        .with_inputs(|| (0..B).map(|_| prototype.clone()).collect::<Vec<_>>())
+        .bench_local_refs(|events| {
+            let resource = &resources[next];
+            next = (next + 1) % resources.len();
+            for event in events.iter_mut() {
+                agg.process(resource, event);
+            }
+        });
+}
+
+/// [`aggregate_absorb_with_groups_batched_10`] at `B = 100`, the reference example's default
+/// `generate_in`/listener batch size. At `groups = 1000` one sample already covers a million
+/// absorbed events, so `sample_count` is lowered to keep this arm under about ten seconds; the
+/// `groups = 100` arm runs the same reduced count for consistency between the two arguments of one
+/// function, not because it needs it.
+#[divan::bench(args = [100, 1000], sample_count = 10, sample_size = 1000)]
+fn aggregate_absorb_with_groups_batched_100(bencher: Bencher, groups: usize) {
+    const B: usize = 100;
+    let resources = fixtures::resources_for_groups(groups);
+    let prototype = fixtures::gauge_event_after_keep();
+    let mut agg = fixtures::aggregator();
+    for resource in &resources {
+        let mut event = prototype.clone();
+        agg.process(resource, &mut event);
+        assert!(event.metrics.is_empty(), "the gauge is absorbed");
+    }
+    let mut next = 0;
+    bencher
+        .counter(ItemsCount::new(B))
+        .with_inputs(|| (0..B).map(|_| prototype.clone()).collect::<Vec<_>>())
+        .bench_local_refs(|events| {
+            let resource = &resources[next];
+            next = (next + 1) % resources.len();
+            for event in events.iter_mut() {
+                agg.process(resource, event);
+            }
+        });
+}
+
+/// [`aggregate_absorb_with_groups_batched_100`] at `groups = 1000`, but each batch's resource is
+/// an *equal* [`Resource`](logit_core::Resource) behind a fresh `Arc`, built outside the timed
+/// region. This is `otlp_in`'s shape: one freshly decoded `Arc<Resource>` per request, equal by
+/// value to a resource `aggregate` has already grouped but never the same allocation. `group_for`
+/// never updates a group's stored `Arc` once opened, so every comparison against it, including the
+/// batch's first event, falls through `Arc::ptr_eq` to the full field compare, for every event of
+/// every batch; a per-batch pointer cache would buy this shape nothing.
+#[divan::bench(args = [1000], sample_count = 10, sample_size = 1000)]
+fn aggregate_absorb_with_groups_batched_100_fresh_arc(bencher: Bencher, groups: usize) {
+    const B: usize = 100;
+    let resources = fixtures::resources_for_groups(groups);
+    let prototype = fixtures::gauge_event_after_keep();
+    let mut agg = fixtures::aggregator();
+    for resource in &resources {
+        let mut event = prototype.clone();
+        agg.process(resource, &mut event);
+        assert!(event.metrics.is_empty(), "the gauge is absorbed");
+    }
+    let mut next = 0;
+    bencher
+        .counter(ItemsCount::new(B))
+        .with_inputs(|| {
+            let resource = Arc::new((*resources[next]).clone());
+            next = (next + 1) % resources.len();
+            let events = (0..B).map(|_| prototype.clone()).collect::<Vec<_>>();
+            (events, resource)
+        })
+        .bench_local_refs(|(events, resource)| {
+            for event in events.iter_mut() {
+                agg.process(resource, event);
+            }
+        });
 }
 
 /// The interner's probes in isolation, on the six nginx keys cycled in order: what one key of one

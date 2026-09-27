@@ -1361,6 +1361,41 @@ fn aggregate_absorb_one_event() {
     expect_allocs("aggregate: absorb 1 event (after keep)", stats, 0);
 }
 
+/// Opening a second `(resource, scope)` group (`docs/adr/aggregation-window-semantics.md`'s "The
+/// groups bound" section, `crate::group_for`). One resource is already warm with its four series
+/// (the same shape [`aggregate_absorb_one_event`] absorbs into); the event measured here arrives
+/// under a second, distinct `Arc<Resource>`, so `group_for`'s scan misses the existing group and
+/// pushes a new, empty one, and all four of the event's metrics open their series inside it for
+/// the first time.
+///
+/// 4: two for the new group's series `HashMap` (its first table, then a regrow crossing the
+/// fourth distinct series), and one each for `nginx.request_time`/`nginx.upstream_response_time`'s
+/// `DdSketch`, whose `positive` bin `Vec` starts empty and grows on its first absorbed value.
+/// Isolated by variant: two counters alone cost 1 (the table, no regrow), four counters alone
+/// cost 2 (the table plus its regrow), and two distributions alone cost 3 (the table plus one
+/// `Vec` growth each).
+#[test]
+fn aggregate_open_group() {
+    let mut agg = fixtures::aggregator();
+    let resource = fixtures::resource();
+    let mut keep = fixtures::keep();
+    let mut trimmed = |resource: &Arc<Resource>| {
+        let mut event = fixtures::nginx_event();
+        assert!(keep.process(resource, &mut event), "keep forwards");
+        event
+    };
+
+    for _ in 0..4 {
+        let mut event = trimmed(&resource);
+        agg.process(&resource, &mut event);
+    }
+
+    let other = fixtures::resources_for_groups(1).pop().expect("one resource");
+    let mut event = trimmed(&other);
+    let (_, stats) = measure(|| agg.process(&other, &mut event));
+    expect_allocs("aggregate: open a group", stats, 4);
+}
+
 /// The measurement behind "put `keep` before `aggregate`" (`logit_transforms::keep`'s docs). Same
 /// events with `keep` removed: 4, one `SeriesKey` clone of the spilled 10-attribute map per metric
 /// per event.

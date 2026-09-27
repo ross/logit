@@ -2120,7 +2120,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   event, resources rotating, one core): 137 ns per absorbed event at 1 group, 877 ns at 100, and
   8.6 µs at 1000, so the scan dominates from about 100 groups on. The candidates are a per-batch
   `Arc::ptr_eq` cache and a hashed group index, decided by a measurement on the perf VM in its
-  own change. `logit.transform.resource.groups` shows the count.
+  own change. The batch-coherent shape every listener produces is measured separately, by
+  `aggregate_absorb_with_groups_batched_10`/`_100`/`_100_fresh_arc` and
+  `perf/scenarios/aggregate-groups.yaml`. `logit.transform.resource.groups` shows the count.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
   non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, a `scale`d one `F64`)

@@ -1,0 +1,41 @@
+# The `(resource, scope)` group scan at G=1000, batch-coherent: generate_in stamps a fresh
+# resource per batch (cycling 1000 distinct resources, one per batch, `GenerateIn::resource`'s
+# "batch-level, not per event" rule -- `seq` here is the batch ordinal, not the event counter, so
+# this is 1000 resources rotating one per batch of 100 events, not one per event), each carrying a
+# shared five-attribute prefix ahead of the two that vary, so a non-matching `group_for` compare
+# walks that prefix first, the way `crates/logit-bench::fixtures::resources_for_groups` does. One
+# gauge per event, fixed name and value, fixed event attributes, so every event lands in the same
+# one series per group and the per-record cost is dominated by `group_for`'s linear scan rather
+# than series-map work.
+# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section; numbers:
+# docs/design/performance.md §1.
+#
+#   script/perf run --scenario aggregate-groups
+components:
+  gen:
+    type: generate_in
+    count: 5000000
+    resource:
+      service.namespace: shop
+      deployment.environment: prod
+      cloud.provider: aws
+      cloud.region: us-east-1
+      service.name: checkout
+      host.name: "h{seq%1000}"
+      service.instance.id: "i{seq%1000}"
+    event:
+      attributes:
+        endpoint: /cart
+      metric:
+        name: req.duration
+        kind: gauge
+        value: 12.5
+
+  windowed:
+    type: aggregate
+    sources: [gen]
+    interval: 1s
+
+  out:
+    type: null_out
+    sources: [windowed]

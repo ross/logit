@@ -738,6 +738,11 @@ resource rotating per event, on one core: about 137 ns per event at 1 group, 877
 candidates are a per-batch `Arc::ptr_eq` cache and a hashed group index. A measurement on the perf
 VM decides, in its own change with its own allocation pins.
 
+That per-event rotation is the worst case; every listener hands `aggregate` one resource per batch
+(`Transform::process` takes the batch's resource), so the same crate's
+`aggregate_absorb_with_groups_batched_10`/`_100`/`_100_fresh_arc` benches and
+`perf/scenarios/aggregate-groups.yaml` measure the batch-coherent shape instead.
+
 ### Start time after a cap eviction
 
 **A re-created series' start time lies between its previous incarnation's last point and its own
