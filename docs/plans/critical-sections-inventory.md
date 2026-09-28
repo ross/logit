@@ -215,7 +215,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
-| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | in-progress (tailbk/w2) |
+| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | findings → #PRNUM |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::open`) | findings → #328 |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `parse_record`, `walk_segment`) | findings → #328, #367 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`, `write_record`) | findings → #331 |
@@ -1956,14 +1956,18 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   - `max_line_bytes` is applied twice (per-fragment in the `!is_complete` branch, on the
     completed message after reassembly) and the two agree.
   - `strip_suffix('\n')` is total given `is_complete`.
-  - Unknown `stream` returns `Malformed` and emits nothing — the driver counts it as
-    `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).
+  - ~~Unknown `stream` returns `Malformed` and emits nothing — the driver counts it as
+    `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).~~ **fixed (#PRNUM):**
+    a `Malformed` entry flushes the held fragments first, and the driver absorbs them before it
+    counts `bad_line`.
 - **Observed concerns (unverified):**
-  - **A malformed entry in the middle of a reassembly silently splices across the gap.**
+  - ~~**A malformed entry in the middle of a reassembly silently splices across the gap.**
     `decode_line` returns `Err` before touching `self.partial`/`self.dropping` (the envelope parse and stream match come first), so a
     held fragment survives and the next closing entry joins it to content from a different logical
     line, with only a throttled `bad_line` to show for it. Medium confidence it is reachable (a
-    torn read of the json-file, or a `stream` value Docker adds later).
+    torn read of the json-file, or a `stream` value Docker adds later).~~ **fixed (#PRNUM):**
+    confirmed, and wider: one `partial` served both streams, which dockerd interleaves. Design in
+    the ADR's 2026-09-28 amendment.
   - **Interner growth from container-supplied `attrs` keys.** `emit` interns every key of the
     envelope's `attrs` object (`DockerDecoder::emit` → `AttrMap::insert`), and the interner is process-wide
     and permanent (`docs/design/memory.md` §4 is the reason `labels:` is opt-in for the *resource*
@@ -1984,6 +1988,20 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
 - **Suggested verification approach:** proptest over fragment sequences (including interleaved
   malformed entries and truncations) against a model reassembler; a real `docker run` emitting
   >16 KiB lines on both streams.
+- **Verified (tailbk/w2, #PRNUM):** findings, all fixed per [ADR
+  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment: reassembly per stream; a `Malformed` entry (bad JSON or unknown `stream`) flushes
+  both streams' held fragments, and `read_one`/`close_decoder` absorb them; the splitter takes
+  `envelope_cap(max_line_bytes)` and the decoder alone bounds the message, checked before the
+  append; `holds_entry` covers a drop in progress, so no checkpoint (interval, shutdown, or a
+  de-selected file's resume offset) lands inside a dropped line; `stream`, `time`, and `attrs`
+  keys decode as `Cow`, so an escaped key no longer rejects every line; `log.iostream` wins over
+  an `attrs` key of that name; `bad_time` and the `attrs` copy are skipped for a discarded
+  entry. `docker_verification.rs`'s proptest checks the decoder against a per-stream model
+  through the real `LineSplitter` under arbitrary chunking (2000 cases clean), plus 19 new or
+  rewritten named tests in `docker.rs`. The real `docker run` capture wasn't done; the
+  interleaving is from moby's `copier.go` and `jsonfilelog`. Open gaps are in
+  `docs/known-gaps.md`.
 - **Priority:** P0 — per-line parsing of container-controlled input with cross-line state; a
   reassembly bug silently corrupts message content.
 
