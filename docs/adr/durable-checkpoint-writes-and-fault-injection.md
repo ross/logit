@@ -554,6 +554,6 @@ where every failure is a write step. The tail scan is the first path whose failu
 and its tests need the same errno control.
 
 **Consequences.** Decision 8's "every filesystem mutation" rule widens for the tail scan path:
-every `read_dir` or `metadata` call there needs a `fault::check` before it, or the proptest's
-failure operations miss it. The seam still has no `Read` op for `File::read`, so a read error on
+every discovery syscall there (`read_dir`, each iteration step, `file_type`, and `metadata`)
+needs a `fault::check` before it, or the proptest's failure operations miss it. The seam still has no `Read` op for `File::read`, so a read error on
 an open file stays untested by injection; `docs/known-gaps.md` records what that leaves.

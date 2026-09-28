@@ -1967,8 +1967,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
   and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
   ordinary append: the tailer reads from the old offset in the new content, and the bytes before
-  it are never emitted. The inode doesn't change under `copytruncate`, so no other signal exists.
-  A writer that rotates by rename has no such window. See [ADR
+  it aren't emitted during the run. The inode doesn't change under `copytruncate`, so nothing
+  signals it while `logit` runs. With a checkpoint, a restart replays the file through the head fingerprint, so the
+  bytes are recovered late, not lost. A writer that rotates by rename has no such window. See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
 - **A resume verifies only the first `min(256, offset)` bytes of a file, so a recycled inode

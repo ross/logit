@@ -498,7 +498,8 @@ draining at shutdown whose new name matches no pattern, which the restart never 
 Verifying TAIL-01, TAIL-02, TAIL-03, TAIL-09, and TAIL-11 (`docs/plans/critical-sections-inventory.md`)
 corrects six points. Each is named by the section it amends. [ADR
 `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md) is
-canonical for the scan, fingerprint, and eviction rules, and this amendment points at it.
+canonical for the scan, fingerprint, eviction, and verification rules (decisions 1, 2, 4, and 5),
+and this amendment points at it.
 
 **"Rotation and truncation": a removal is a path a successful listing no longer names.** "A
 previously-tracked path no longer matched by any pattern is a removal" holds only for a listing
@@ -509,9 +510,9 @@ rule.
 **"Rotation and truncation": truncation detection is size-only.** A truncation is `len < offset`
 where a scan or a read sees the length. A `copytruncate` that the writer refills past the old
 offset before that check isn't detected: the tailer keeps its offset and reads from the middle of
-the new content, so the bytes before that offset are never emitted. A size comparison can't tell
-the two apart, and the inode is unchanged. A restart catches it through the head fingerprint
-(decision 2). The window is one `poll_interval` or one wake, and it's a documented gap
+the new content, so the bytes before that offset aren't emitted during the run. A size comparison can't tell
+the two apart, and the inode is unchanged. A restart replays the file through the head fingerprint
+(decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's a documented gap
 (`docs/known-gaps.md`); a writer that rotates by rename has no such window.
 
 **"Checkpoints": unconsumed entries are persisted.** "A checkpoint write only persists the tailer's
@@ -540,10 +541,8 @@ stream: one partial and one `dropping` flag for each.
   `attrs` (`--log-opt labels`, `env`, and `tag`). The decoder alone enforces `max_line_bytes`,
   over the reassembled message, and checks the length before it appends a fragment, so a held
   reassembly never exceeds it.
-- A checkpoint never lands inside a line being dropped for `max_line_bytes`: `pending_bytes`
-  covers the plain splitter's consumed bytes of it, and `holds_entry` stays true while a stream
-  is dropping. A restart re-drops the line whole instead of emitting its tail. The cost is a
-  checkpoint pinned at the line's start until its newline arrives.
+- A checkpoint never lands inside a line being dropped for `max_line_bytes`, so a restart re-drops
+  the line whole. Decision 5 has the property and its cost.
 
 **`read_one` and `drain` (TAIL-03): a read error on a `Draining` file is its EOF.** A `Draining`
 (or `Deselected`) file has left the matched set, and `drain` reaps it at EOF. `read_one` reports

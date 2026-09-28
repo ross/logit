@@ -112,9 +112,10 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      it. A file opened at `End` or at a `Resume` offset has not read its own first bytes, so
      `open_tracked` reads the first `min(256, target offset)` bytes once, from position 0, and
      then seeks. For `Resume` it hashes them against the retained head; either way they seed
-     `TrackedFile`'s head. The head is therefore always from the same generation of the file as
-     the offset it is paired with, and a checkpoint write reads nothing and needs no second
-     descriptor.
+     `TrackedFile`'s head. The head and the offset are from the same generation of the file
+     unless a `copytruncate` and refill went undetected: the old head then stays paired with a
+     newer offset, and that mismatch is what the restart check catches. A checkpoint write reads
+     nothing and needs no second descriptor.
 
    - **Resume accepts iff all three hold:** the current file is at least `head_len` long, its
      first `head_len` bytes hash to `head_hash` (the open-time read above), and the offset is at most the current
@@ -232,8 +233,9 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **A file's head costs a small buffer per tracked file,** one read of at most 256 bytes when a
   file opens at `End` or `Resume`, and one hash per checkpoint write. A measurement on many
   thousands of tracked files belongs to the perf follow-up.
-- **The fault seam is no longer mutation-only.** Every new `read_dir` or `metadata` call on the
-  tail scan path needs a `fault::check` before it.
+- **The fault seam is no longer mutation-only.** Every discovery syscall on the tail scan path
+  (`read_dir`, each iteration step, `file_type`, and `metadata`) needs a `fault::check` before
+  it.
 - **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps.md`'s "File tailing and
   Docker logs" record what this stream leaves open, so a later workstream that closes one can
   see it was expected:
