@@ -213,7 +213,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | in-progress (tailbk/w3) |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | in-progress (tailbk/w4) |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
-| [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #PRNUM |
+| [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | in-progress (tailbk/w2) |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::open`) | findings → #328 |
@@ -1610,7 +1610,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     counted drop — no byte silently vanishes and none is emitted twice.
   - `pending_bytes()` equals exactly the bytes consumed-but-not-emitted, including in the
     `dropping` state ~~(where it is 0 by design — see the comment in `Tailer::write_checkpoint`
-    in `driver.rs`)~~ **fixed (#PRNUM):** `pending_bytes` covers the dropped line.
+    in `driver.rs`)~~ **fixed (#440):** `pending_bytes` covers the dropped line.
   - The boundary is consistent: a line of exactly `max_line_bytes` is kept in both the
     single-chunk and spanning branches of `push`.
   - `dropped_lines` counts each oversized line exactly once, not once per chunk (`push`'s
@@ -1631,7 +1631,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   that `pending_bytes()` matches the model at every step.
 - **Priority:** P0 — pure, self-contained, per-byte, and the source of the checkpoint's safety
   margin; an off-by-one here is silent loss on restart.
-- **Verified (tailbk/w1, #PRNUM):** findings. A proptest checks `LineSplitter` against an
+- **Verified (tailbk/w1, #440):** findings. A proptest checks `LineSplitter` against an
   independent model (`tail/line_verification.rs`: lines, starts, file offsets, drop counts,
   `pending_bytes`, zero-copy slices, and a full-input reconstruction), beside 13 named edge-case
   tests. One real bug: while dropping, `pending_bytes` was 0, so a checkpoint landed inside the
