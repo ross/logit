@@ -203,15 +203,22 @@ struct TrackedFile<D> {
     /// When the file became [`FileState::Draining`], set by [`TrackedFile::start_draining`] and
     /// cleared by a rebind. `None` in every other state. `Tailer::reap_drained` reads it.
     draining_since: Option<tokio::time::Instant>,
+    /// The `Tailer::scan_generation` of the scan that made the file `Draining`.
+    draining_scan: u64,
+    /// Whether a scan after `draining_scan` completed with a listing that could have named this
+    /// file's path, and so could have rebound it. `Tailer::reap_drained` requires it.
+    rescanned: bool,
 }
 
 impl<D> TrackedFile<D> {
-    /// Marks the file `Draining`. A file already draining keeps its original start, so a second
-    /// retirement can't postpone its reap.
-    fn start_draining(&mut self) {
+    /// Marks the file `Draining` in the scan numbered `scan`. A file already draining keeps its
+    /// original start, so a second retirement can't postpone its reap.
+    fn start_draining(&mut self, scan: u64) {
         if self.state != FileState::Draining {
             self.state = FileState::Draining;
             self.draining_since = Some(tokio::time::Instant::now());
+            self.draining_scan = scan;
+            self.rescanned = false;
         }
     }
 }
@@ -237,6 +244,8 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     diag: Diagnostics,
     telemetry: Telemetry,
     watched_dirs: HashSet<PathBuf>,
+    /// Counts completed scans; `TrackedFile::draining_scan` records it.
+    scan_generation: u64,
     /// Set by [`Tailer::bind`] and taken into a local by [`Tailer::run_until_shutdown`].
     /// `Option` because `Watcher` has no "not yet opened" value.
     watcher: Option<super::watch::Watcher>,
@@ -256,6 +265,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
+            scan_generation: 0,
             watcher: None,
         }
     }
@@ -509,7 +519,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         for path in stale {
             if let Some(id) = self.by_path.remove(&path) {
                 if let Some(tracked) = self.files.get_mut(&id) {
-                    tracked.start_draining();
+                    tracked.start_draining(self.scan_generation);
                 }
             }
         }
@@ -537,6 +547,20 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 cp.mark_dirty();
             }
         }
+
+        // A file that started draining in an earlier scan, and whose path this listing could
+        // have named, had its chance to be rebound under a new name.
+        let generation = self.scan_generation;
+        let patterns = &self.patterns;
+        for f in self.files.values_mut() {
+            if f.state == FileState::Draining
+                && f.draining_scan < generation
+                && listing.listed(patterns, &f.path)
+            {
+                f.rescanned = true;
+            }
+        }
+        self.scan_generation += 1;
 
         self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
@@ -591,7 +615,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             Some(existing_id) => {
                 if let Some(tracked) = self.files.get_mut(&existing_id) {
-                    tracked.start_draining();
+                    tracked.start_draining(self.scan_generation);
                 }
                 self.by_path.remove(&path);
                 self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
@@ -728,7 +752,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let Some(tracked) = self.files.get_mut(&id) else { return };
         match tracked.file.metadata().await {
             Ok(meta) if meta.nlink() == 0 => {
-                tracked.start_draining();
+                tracked.start_draining(self.scan_generation);
                 self.by_path.remove(&path);
                 return;
             }
@@ -839,6 +863,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             let old_path = std::mem::replace(&mut tracked.path, path.clone());
             tracked.state = FileState::Active;
             tracked.draining_since = None;
+            tracked.rescanned = false;
             // Remove the old binding only if this inode still owns it. `discovered` iterates in
             // no fixed order, so the rotation replacement may already have claimed `old_path`.
             // Removing its binding would orphan a live inode: `scan`'s stale check walks only
@@ -975,6 +1000,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             watch,
             head,
             draining_since: None,
+            draining_scan: 0,
+            rescanned: false,
         };
         if let Some(off) = rejected {
             self.telemetry.count("logit.input.files.resume_rejected", 1.0, &[]);
@@ -1010,6 +1037,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         due: tokio::time::Instant,
     ) -> DrainEnd {
         loop {
+            // Before the reads: a pass parked on the downstream mustn't reap on an EOF it saw
+            // before the grace ran out.
+            let pass_start = tokio::time::Instant::now();
             let mut any_progress = false;
             let mut at_eof: Vec<FileId> = Vec::new();
             let ids: Vec<FileId> = self.files.keys().copied().collect();
@@ -1023,7 +1053,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     at_eof.push(id);
                 }
             }
-            self.reap_drained(&at_eof, sink, watcher).await;
+            self.reap_drained(&at_eof, pass_start, sink, watcher).await;
             if !any_progress {
                 return DrainEnd::Idle;
             }
@@ -1124,8 +1154,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// (`at_eof`):
     ///
     /// - a [`FileState::Deselected`] file, at once;
-    /// - a [`FileState::Draining`] file once `now - draining_since >= poll_interval`, with `now`
-    ///   read once per call (`tokio::time::Instant`).
+    /// - a [`FileState::Draining`] file once both hold:
+    ///   - `pass_start - draining_since >= poll_interval`, where `pass_start` is when this pass
+    ///     began, before its reads, so the EOF it saw was seen after the grace ran out;
+    ///   - `rescanned`: a scan after the one that retired it completed with a listing that could
+    ///     have named its path (not unknown, and not under a failed listing), so a rename it
+    ///     raced has been rebound instead.
     ///
     /// Only files at EOF: a draining file with a backlog gets as many passes as it takes to reach
     /// EOF, since reaping it earlier loses the rest for good (it also leaves the next checkpoint).
@@ -1135,11 +1169,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// logrotate renamed and then HUPs keeps appending to the renamed inode until it reopens, and
     /// under an exact pattern that inode is reachable only through this handle. A path whose
     /// `stat` raced a rename (`read_dir` listed it, `stat` got `ENOENT`) retires an inode a later
-    /// scan finds under its new name; reaped at once, it would be reopened there as a new file
-    /// and replayed from `0`, where kept it is rebound by `open_tracked`. The poll tick runs under
-    /// every `WatchMode`, so a file with no other wake is reaped within two poll intervals of
-    /// starting to drain. A `Deselected` file is still being written and is never at a final EOF,
-    /// so waiting would gain nothing.
+    /// scan finds under its new name; reaped first, it would be reopened there as a new file and
+    /// replayed from `0`. Time alone doesn't order that scan first: a `drain` follows a data wake
+    /// or a flush tick too, and the run loop's `select!` may pick one over an overdue poll tick,
+    /// hence `rescanned`. The poll tick runs under every `WatchMode`, so a file with no other wake
+    /// is reaped within about two poll intervals of starting to drain, unless every later listing
+    /// covering its path fails, which pins it. A `Deselected` file is still being written and is
+    /// never at a final EOF, so waiting would gain nothing.
     ///
     /// Each reap emits held decoder state, flushes the accumulator (`FlushReason::Closed`), and
     /// drops the file.
@@ -1150,10 +1186,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     async fn reap_drained(
         &mut self,
         at_eof: &[FileId],
+        pass_start: tokio::time::Instant,
         sink: &Fanout,
         watcher: &mut super::watch::Watcher,
     ) {
-        let now = tokio::time::Instant::now();
         let grace = self.config.poll_interval;
         let draining: Vec<FileId> = self
             .files
@@ -1162,9 +1198,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 let due = match f.state {
                     FileState::Active => false,
                     FileState::Deselected => true,
-                    FileState::Draining => f
-                        .draining_since
-                        .is_some_and(|since| now.saturating_duration_since(since) >= grace),
+                    FileState::Draining => {
+                        f.rescanned
+                            && f.draining_since.is_some_and(|since| {
+                                pass_start.saturating_duration_since(since) >= grace
+                            })
+                    }
                 };
                 due && at_eof.contains(id)
             })
@@ -3092,7 +3131,7 @@ mod tests {
     /// `/proc/self/fdinfo/<fd>`) matches the watcher's and the driver's bookkeeping; a leak in
     /// either direction grows with the cycle count.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping() {
         let dir = scratch_dir("inotify-watch-leak");
         let probe = TelemetryProbe::new();
@@ -3109,10 +3148,14 @@ mod tests {
             tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
 
             // Rotate out of `*.log`'s reach, reap, then delete: one watch added and one removed
-            // per cycle, plus a queued `IN_IGNORED`.
+            // per cycle, plus a queued `IN_IGNORED`. The reap needs the grace to pass and a scan
+            // after the retiring one.
             std::fs::rename(&path, dir.join("app.log.1")).unwrap();
             tailer.scan(false, &mut watcher).await;
+            tokio::time::advance(tailer.config.poll_interval).await;
+            tailer.scan(false, &mut watcher).await;
             tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
+            assert_eq!(tailer.tracked_len(), 0, "cycle {i}: the rotated file is reaped");
             std::fs::remove_file(dir.join("app.log.1")).unwrap();
         }
 
@@ -3622,9 +3665,12 @@ mod tests {
         assert_eq!(tick(&mut tailer, false).await, vec!["two"], "read to EOF before the reap");
         assert!(tailer.by_path.is_empty());
         assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        // No listing since it started draining could have rebound it, so it stays.
         assert!(after_grace(&mut tailer).await.is_empty());
-        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(tailer.tracked_len(), 1, "pinned while the listing fails");
         drop(scope);
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 0, "reaped after a clean listing");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4568,8 +4614,12 @@ mod tests {
         assert_eq!(probe.sum("logit.input.lines", &[]), 3.0);
 
         tokio::time::advance(tailer.config.poll_interval).await;
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(drain_by_hand(&mut tailer).await, vec!["late-1", "late-2"]);
-        assert!(!tailer.files.contains_key(&old), "reaped once at EOF for a poll interval");
+        assert!(
+            !tailer.files.contains_key(&old),
+            "reaped: draining for a poll interval, rescanned since, and at EOF"
+        );
         assert_eq!(closed_flushes(&mut probe), 1.0);
         assert_eq!(tailer.tracked_len(), 1, "the new app.log stays tracked");
         std::fs::remove_dir_all(&dir).ok();
@@ -4577,8 +4627,8 @@ mod tests {
 
     /// `read_dir` lists `app.log.1`, logrotate renames it to `app.log.2`, and the `stat` gets
     /// `ENOENT`: the path is absent and its inode starts draining. The next scan finds that inode
-    /// under its new name and rebinds it, even a full poll interval later, because `scan` runs
-    /// before the `drain` that could reap it.
+    /// under its new name and rebinds it, even a full poll interval later: no reap happens until a
+    /// scan after the retiring one has completed, and that scan is the one that rebinds it.
     #[tokio::test(start_paused = true)]
     async fn a_path_whose_stat_raced_a_rename_is_rebound_on_the_next_scan_not_replayed() {
         let dir = scratch_dir("reap-grace-stat-race");
@@ -4617,7 +4667,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_draining_file_is_reaped_once_it_has_stayed_at_eof_for_a_poll_interval() {
+    async fn a_draining_file_is_reaped_once_it_has_been_draining_for_a_poll_interval_and_is_at_eof()
+    {
         let dir = scratch_dir("reap-grace-boundary");
         let path = dir.join("app.log");
         std::fs::write(&path, b"one\n").unwrap();
@@ -4968,6 +5019,7 @@ mod tests {
         tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(tailer.files.values().next().map(|f| f.state), Some(FileState::Draining));
         tokio::time::advance(tailer.config.poll_interval).await;
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
 
         let scope = fault::scope(&dir);
         scope.fail_nth(READ, 1, errno::EIO);
