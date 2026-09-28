@@ -583,7 +583,7 @@
               ]
             },
             "max_line_bytes": {
-              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
               "default": "1048576",
               "type": "string"
             },
@@ -664,7 +664,7 @@
               }
             },
             "max_line_bytes": {
-              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
               "default": "1048576",
               "type": "string"
             },

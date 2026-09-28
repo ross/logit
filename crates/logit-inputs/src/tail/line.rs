@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 /// Turns one split line into zero or more [`Event`]s appended to `out`.
 ///
-/// The line has no `\n`, no trailing `\r`, and is valid UTF-8 (the driver's `ensure_utf8`).
-/// `read_at` is when the line was read, not necessarily the event's timestamp: `docker_in` uses
-/// the envelope's own `time` and falls back to `read_at` only when that's unparseable.
+/// The line has no `\n`, has had one trailing `\r` stripped (a second one stays), and is valid
+/// UTF-8 (the driver's `ensure_utf8`). `read_at` is when the line was read, not necessarily the
+/// event's timestamp: `docker_in` uses the envelope's own `time` and falls back to `read_at` only
+/// when that's unparseable.
 pub trait TailDecoder: Send {
     fn decode_line(
         &mut self,
@@ -61,7 +62,7 @@ pub struct LineStats {
     pub dropped_lines: u32,
 }
 
-/// Splits read chunks into `\n`-terminated lines with a trailing `\r` stripped, carrying an
+/// Splits read chunks into `\n`-terminated lines with one trailing `\r` stripped, carrying an
 /// incomplete line across chunks.
 ///
 /// A line inside one chunk is a zero-copy `Bytes::slice` of it; only a line spanning chunks is
@@ -74,21 +75,27 @@ pub struct LineSplitter {
     /// Skipping the rest of an oversized line, across as many `push` calls as it takes to reach
     /// its `\n`. The line is counted dropped once, when detected.
     dropping: bool,
+    /// While `dropping`, how many of the dropped line's bytes have been consumed so far: a count,
+    /// not held bytes, so memory stays bounded by `max_line_bytes`.
+    dropping_len: u64,
 }
 
 impl LineSplitter {
     pub fn new(max_line_bytes: usize) -> Self {
-        Self { partial: BytesMut::new(), max_line_bytes, dropping: false }
+        Self { partial: BytesMut::new(), max_line_bytes, dropping: false, dropping_len: 0 }
     }
 
-    /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, no trailing `\r`).
+    /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, one `\r` stripped).
     ///
     /// `emit`'s second argument is where the line starts: `Some(i)` at index `i` of `chunk`, or
     /// `None` when it began in an earlier chunk, at the start of the partial
     /// [`LineSplitter::pending_bytes`] counted before this call.
     ///
     /// A line over `max_line_bytes` (measured before the `\r` strip) is dropped whole, never
-    /// truncated, and counted in the returned [`LineStats`].
+    /// truncated, and counted in the returned [`LineStats`]. That holds across a restart too:
+    /// while dropping, [`LineSplitter::pending_bytes`] covers the dropped line, so a checkpoint
+    /// stays at its start and a restart drops it whole again (counted a second time) rather than
+    /// emitting its tail as a line.
     pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes, Option<usize>)) -> LineStats {
         let mut stats = LineStats::default();
         let mut start = 0usize;
@@ -99,9 +106,12 @@ impl LineSplitter {
 
             if self.dropping {
                 if nl.is_some() {
-                    self.dropping = false; // this segment's newline closes the oversized line
+                    // This segment's newline closes the oversized line.
+                    self.dropping = false;
+                    self.dropping_len = 0;
+                } else {
+                    self.dropping_len += seg.len() as u64;
                 }
-                // No newline: the whole segment is still part of the dropped line.
             } else if self.partial.is_empty() {
                 if let Some(_i) = nl {
                     // Zero-copy path: the whole line is in this chunk.
@@ -113,13 +123,17 @@ impl LineSplitter {
                 } else if seg.len() > self.max_line_bytes {
                     stats.dropped_lines += 1;
                     self.dropping = true;
+                    self.dropping_len = seg.len() as u64;
                 } else {
                     self.partial.extend_from_slice(&seg);
                 }
             } else if self.partial.len() + seg.len() > self.max_line_bytes {
-                self.partial.clear();
                 stats.dropped_lines += 1;
-                self.dropping = nl.is_none();
+                if nl.is_none() {
+                    self.dropping = true;
+                    self.dropping_len = (self.partial.len() + seg.len()) as u64;
+                }
+                self.partial.clear();
             } else {
                 self.partial.extend_from_slice(&seg);
                 if nl.is_some() {
@@ -140,16 +154,23 @@ impl LineSplitter {
     /// `\n` is still data. An oversized line already being dropped isn't returned.
     pub fn take_partial(&mut self) -> Option<Bytes> {
         self.dropping = false;
+        self.dropping_len = 0;
         if self.partial.is_empty() {
             return None;
         }
         Some(strip_cr(self.partial.split().freeze()))
     }
 
-    /// Bytes read (so already in the tailer's offset) but held as an incomplete line.
-    /// `Tailer::write_checkpoint` subtracts this so a checkpoint never covers an unemitted line.
+    /// Bytes read (so already in the tailer's offset) since the current line's start: the held
+    /// partial, or, while dropping an oversized line, the bytes of it consumed so far.
+    /// `Tailer::write_checkpoint` subtracts this, so a checkpoint always lands on a line start:
+    /// never covering an unemitted line, and never inside a dropped one.
     pub fn pending_bytes(&self) -> u64 {
-        self.partial.len() as u64
+        if self.dropping {
+            self.dropping_len
+        } else {
+            self.partial.len() as u64
+        }
     }
 }
 
@@ -301,12 +322,183 @@ mod tests {
         assert_eq!(stats2.dropped_lines, 0, "already counted -- not counted again on resolution");
     }
 
+    /// Config rejects `0`, but the splitter accepts it: every non-empty line is dropped, and an
+    /// empty one is kept because the limit is exclusive. A bare `\r\n` is one byte, so dropped.
     #[test]
-    fn zero_max_line_bytes_drops_every_line() {
+    fn zero_max_line_bytes_still_emits_empty_lines() {
         let mut s = LineSplitter::new(0);
         let (lines, stats) = lines_of(&mut s, b"a\nb\n");
         assert!(lines.is_empty());
         assert_eq!(stats.dropped_lines, 2);
+        let (lines, stats) = lines_of(&mut s, b"\n");
+        assert_eq!(lines, vec![Vec::<u8>::new()]);
+        assert_eq!(stats.dropped_lines, 0);
+        let (lines, stats) = lines_of(&mut s, b"\r\n");
+        assert!(lines.is_empty());
+        assert_eq!(stats.dropped_lines, 1);
+    }
+
+    type Emitted = Vec<(Vec<u8>, Option<usize>)>;
+
+    fn push_starts(splitter: &mut LineSplitter, chunk: &[u8]) -> (Emitted, u32) {
+        let mut out = Vec::new();
+        let stats =
+            splitter.push(Bytes::copy_from_slice(chunk), |line, at| out.push((line.to_vec(), at)));
+        (out, stats.dropped_lines)
+    }
+
+    /// The limit is inclusive in the in-chunk branch and in both spanning branches (the partial
+    /// grows, then the `\n` arrives in a later chunk or alone).
+    #[test]
+    fn a_line_of_exactly_max_line_bytes_is_kept_in_both_branches() {
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcd\n"), (vec![(b"abcd".to_vec(), Some(0))], 0));
+
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"ab"), (vec![], 0));
+        assert_eq!(push_starts(&mut s, b"cd\n"), (vec![(b"abcd".to_vec(), None)], 0));
+
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcd"), (vec![], 0));
+        assert_eq!(s.pending_bytes(), 4);
+        assert_eq!(push_starts(&mut s, b"\n"), (vec![(b"abcd".to_vec(), None)], 0));
+    }
+
+    /// One byte over is dropped in every branch, and the `\r` of a CRLF ending counts toward the
+    /// limit.
+    #[test]
+    fn a_line_one_byte_over_max_is_dropped_in_both_branches() {
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcde\nok\n"), (vec![(b"ok".to_vec(), Some(6))], 1));
+
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"ab"), (vec![], 0));
+        assert_eq!(push_starts(&mut s, b"cde\nok\n"), (vec![(b"ok".to_vec(), Some(4))], 1));
+
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcde"), (vec![], 1));
+        assert_eq!(push_starts(&mut s, b"\nok\n"), (vec![(b"ok".to_vec(), Some(1))], 0));
+
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcd\r\nok\n"), (vec![(b"ok".to_vec(), Some(6))], 1));
+    }
+
+    #[test]
+    fn a_cr_at_a_chunk_edge_followed_by_lf_is_stripped() {
+        let mut s = LineSplitter::new(1024);
+        assert_eq!(push_starts(&mut s, b"ab\r"), (vec![], 0));
+        assert_eq!(s.pending_bytes(), 3, "the held `\r` is part of the pending line");
+        assert_eq!(push_starts(&mut s, b"\n"), (vec![(b"ab".to_vec(), None)], 0));
+        assert_eq!(s.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn an_empty_chunk_changes_nothing() {
+        // At a line boundary.
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b""), (vec![], 0));
+        assert_eq!(s.pending_bytes(), 0);
+        assert_eq!(push_starts(&mut s, b"ab\n"), (vec![(b"ab".to_vec(), Some(0))], 0));
+
+        // Mid-line: the line still continues from the partial.
+        let mut s = LineSplitter::new(4);
+        push_starts(&mut s, b"ab");
+        assert_eq!(push_starts(&mut s, b""), (vec![], 0));
+        assert_eq!(s.pending_bytes(), 2);
+        assert_eq!(push_starts(&mut s, b"c\n"), (vec![(b"abc".to_vec(), None)], 0));
+
+        // Mid-drop: still dropping, and not counted again.
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abcdef"), (vec![], 1));
+        assert_eq!(push_starts(&mut s, b""), (vec![], 0));
+        assert_eq!(s.pending_bytes(), 6);
+        assert_eq!(push_starts(&mut s, b"g\nok\n"), (vec![(b"ok".to_vec(), Some(2))], 0));
+    }
+
+    #[test]
+    fn an_oversized_line_spanning_many_chunks_is_counted_once() {
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"aaaaa"), (vec![], 1));
+        assert_eq!(push_starts(&mut s, b"aaaa"), (vec![], 0));
+        assert_eq!(push_starts(&mut s, b"aa"), (vec![], 0));
+        assert_eq!(push_starts(&mut s, b"a\nok\n"), (vec![(b"ok".to_vec(), Some(2))], 0));
+    }
+
+    /// The partial fits, and the chunk carrying the `\n` pushes it over: counted in that push,
+    /// with nothing left dropping.
+    #[test]
+    fn an_overflow_detected_on_the_newline_chunk_is_counted_there() {
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"abc"), (vec![], 0));
+        assert_eq!(push_starts(&mut s, b"de\nok\n"), (vec![(b"ok".to_vec(), Some(3))], 1));
+        assert_eq!(s.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn only_one_trailing_cr_is_stripped() {
+        let mut s = LineSplitter::new(1024);
+        assert_eq!(push_starts(&mut s, b"a\r\r\n"), (vec![(b"a\r".to_vec(), Some(0))], 0));
+    }
+
+    #[test]
+    fn a_bare_crlf_line_is_emitted_empty() {
+        let mut s = LineSplitter::new(1024);
+        assert_eq!(
+            push_starts(&mut s, b"\r\nx\n"),
+            (vec![(vec![], Some(0)), (b"x".to_vec(), Some(2))], 0)
+        );
+    }
+
+    #[test]
+    fn take_partial_of_a_lone_cr_yields_an_empty_line() {
+        let mut s = LineSplitter::new(1024);
+        push_starts(&mut s, b"\r");
+        assert_eq!(s.take_partial(), Some(Bytes::new()));
+        assert_eq!(s.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn take_partial_mid_drop_returns_none_and_the_next_push_starts_a_new_line() {
+        let mut s = LineSplitter::new(4);
+        assert_eq!(push_starts(&mut s, b"toolo"), (vec![], 1));
+        assert_eq!(s.take_partial(), None);
+        assert_eq!(s.pending_bytes(), 0);
+        assert_eq!(
+            push_starts(&mut s, b"ng\nok\n"),
+            (vec![(b"ng".to_vec(), Some(0)), (b"ok".to_vec(), Some(3))], 0)
+        );
+    }
+
+    /// `Tailer::write_checkpoint` subtracts `pending_bytes`, so while dropping it must cover the
+    /// dropped line back to its start, whichever branch started the drop.
+    #[test]
+    fn pending_bytes_covers_the_dropped_line_while_dropping() {
+        let mut s = LineSplitter::new(4);
+        push_starts(&mut s, b"toolo");
+        assert_eq!(s.pending_bytes(), 5);
+        push_starts(&mut s, b"ng");
+        assert_eq!(s.pending_bytes(), 7);
+        push_starts(&mut s, b"\n");
+        assert_eq!(s.pending_bytes(), 0);
+
+        let mut s = LineSplitter::new(4);
+        push_starts(&mut s, b"abc");
+        assert_eq!(s.pending_bytes(), 3);
+        assert_eq!(push_starts(&mut s, b"de"), (vec![], 1));
+        assert_eq!(s.pending_bytes(), 5);
+    }
+
+    #[test]
+    fn a_usize_max_limit_never_drops() {
+        let mut s = LineSplitter::new(usize::MAX);
+        let long = vec![b'x'; 70_000];
+        assert_eq!(push_starts(&mut s, &long), (vec![], 0));
+        assert_eq!(push_starts(&mut s, &long), (vec![], 0));
+        let (lines, dropped) = push_starts(&mut s, b"\n");
+        assert_eq!(dropped, 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0.len(), 140_000);
+        assert_eq!(lines[0].1, None);
     }
 
     #[test]
