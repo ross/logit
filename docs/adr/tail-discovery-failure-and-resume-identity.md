@@ -60,7 +60,7 @@ made to recycle on demand on tmpfs.
 ## Decision
 
 A failed listing retires nothing. A resume trusts an inode only after the file's head matches what
-the checkpoint recorded. The verification is a state-machine proptest on the real filesystem, with
+the checkpoint recorded. A draining file's first EOF isn't final. The verification is a state-machine proptest on the real filesystem, with
 the fault seam extended to reads. Each numbered item is one decision a reviewer can check.
 
 1. **A failed listing is no information.** `PathPattern::scan` returns `Result<Scan, io::Error>`,
@@ -192,6 +192,32 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      syscall sequence and the line multiset recorded in TAIL-01's inventory entry, and the
      proptest's rotation operations reproduce that sequence.
 
+6. **A draining file is reaped only after it has been at EOF and draining for at least one
+   `poll_interval`.** Decided from the recorded `logrotate` run (TAIL-01's inventory entry).
+   `TrackedFile` records when it became `Draining` (the stale pass, the rotation arm, and a kept
+   file whose handle shows a link count of 0), and a rebind back to `Active` clears it.
+   `Tailer::reap_drained` reaps a `Draining` file when a `drain` pass finds it at EOF and at least
+   one `poll_interval` has passed since it started draining. Its doc comment is the canonical
+   statement of the rule. A `Deselected` file is still reaped at its first EOF.
+
+   - **Why.** A first EOF isn't final for two reasons the run showed:
+     - logrotate's `create` mode renames the file and HUPs the writer, which keeps appending to
+       the renamed inode for 4.5 to 36 ms before it reopens. Under an exact pattern, that inode is
+       reachable only through the tracked handle, and a reap at the first EOF loses those lines.
+       A writer that never reopens loses everything after the first rotation.
+     - A `read_dir`, then a rename, then an `ENOENT` from the `stat` makes a scan see a tracked
+       path as absent. Its inode starts draining, and the next scan finds it under its new name.
+       Reaped in between, it's reopened there as a new file and replayed from `0`.
+
+     With the grace, the next scan (a `Discover` wake or the poll tick) rebinds the renamed inode
+     through `open_tracked`, and a writer that reopens within the grace has its late lines read.
+     The poll tick runs under every `WatchMode`, so a draining file with no other wake is reaped
+     within two poll intervals.
+   - **Cost.** A rotated or removed file's descriptor is held one `poll_interval` longer. A
+     writer that reopens later than that still loses what it writes after the reap. The shutdown
+     path is unchanged: a file still draining at shutdown stays in the checkpoint, and the known
+     orphan gap applies.
+
 ## Alternatives considered
 
 - **Skip the whole stale pass when any listing fails.** Rejected. One persistently failing
@@ -216,6 +242,9 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   recycled inode (F2).
 - **Keep a version 1 reader.** Rejected. Pre-release, and the fallback already exists: an
   unusable checkpoint replays.
+- **A separate, configurable reap grace.** Rejected. `poll_interval` already bounds when the next
+  scan runs, and that scan is what rebinds a renamed inode, so a second knob would only let the
+  two disagree.
 
 ## Consequences
 
@@ -233,6 +262,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **A file's head costs a small buffer per tracked file,** one read of at most 256 bytes when a
   file opens at `End` or `Resume`, and one hash per checkpoint write. A measurement on many
   thousands of tracked files belongs to the perf follow-up.
+- **A draining file's descriptor is held one `poll_interval` longer** (decision 6). A
+  `Deselected` file is unaffected.
 - **The fault seam is no longer mutation-only.** Every discovery syscall on the tail scan path
   (`read_dir`, each iteration step, `file_type`, and `metadata`) needs a `fault::check` before
   it.
@@ -328,6 +359,35 @@ and XXH64 test vectors. `checkpoint_is_written_on_interval_only_when_dirty_and_r
 and `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` pass
 unchanged.
 
-### `tailbk/w5`: driver state machine, `logrotate` run, close-out (TAIL-01..03, TAIL-10, TAIL-12)
+### `tailbk/w5`: reap grace and tail accounting fixes (TAIL-01, TAIL-03, TAIL-10, TAIL-12)
+
+Decision 6, from the recorded `logrotate` run, and five fixes found reviewing the driver for the
+state-machine proptest:
+
+- **`logit.input.files.rotated` is counted before any discovered path is reconciled**: one per
+  discovered path whose binding names another inode. Counted in the rotation arm, it depended on
+  `discovered`'s order under a wildcard, since a rebind that ran first removed the old binding.
+- **A truncation dirties the checkpoint**, so an interval write with no read since doesn't keep
+  the pre-truncation offset.
+- **`logit.input.lines` and `line.bytes` count the unterminated line `close_decoder` offers the
+  decoder**, as they count every other line the decoder is offered.
+- **`open_tracked` calls `DecoderFactory::retain` on its rebind branch and its `Deselected`
+  return**, so `end_scan` keeps `docker_in`'s cached identity for both. `docker_in` never rebinds:
+  a rotated `<id>-json.log.1` matches no pattern.
+- **The fault seam gains `tail.read`**, checked before `read_one` reads a chunk. The head read
+  `open_tracked` does for a resume stays at `tail.scan`.
+
+Tests, in `driver.rs` unless noted, hand-drive `scan` and `drain` under `Watcher::Poll`, with
+`start_paused` and `tokio::time::advance` where the grace matters: a writer appending to the
+renamed inode after the rotation, a `stat` that races a rename rebinding a full poll interval
+later, the reap at the grace boundary, a `Deselected` file reaped with no time passing,
+`files.rotated` for a two-inode swap and a rotation chain in every discovery order, a truncation
+dirtying the checkpoint, `lines` for the close-time partial and against a decoder that rejects
+lines, every discovered path offered to the factory once per scan, and a read error on an
+`Active` file (kept) and on a `Draining` one (reaped, its unread tail lost). `docker.rs` covers a
+de-selected container's cache entry surviving until its reap. Five tests that expected a reap in
+the same pass as the retiring scan advance the clock past the grace first.
+
+### `tailbk/w6`: driver state-machine proptest, close-out (TAIL-01..03, TAIL-10, TAIL-12)
 
 To be filled by the PR that lands it.

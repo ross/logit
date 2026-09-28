@@ -530,10 +530,11 @@ and their reopen without `finish` discards every job the worker hadn't started a
 unlink a segment under the reopened queue. Before the helper existed, one generated case failed
 with a peek that stopped responding while draining, which is consistent with that race.
 
-## Amendment: the seam gains read operations, and a tail scan site (2026-09-28)
+## Amendment: the seam gains read operations, and tail scan and read sites (2026-09-28)
 
-**The seam's operations are no longer mutations only.** `Op` gains `ReadDir` and `Stat`, and
-`sites` gains `TAIL_SCAN` (`"tail.scan"`). `fault::check` runs at these points:
+**The seam's operations are no longer mutations only.** `Op` gains `ReadDir`, `Stat`, and `Read`,
+and `sites` gains `TAIL_SCAN` (`"tail.scan"`) and `TAIL_READ` (`"tail.read"`). `fault::check` runs
+at these points:
 
 - `Op::ReadDir`, before each `read_dir` in `crates/logit-inputs/src/tail/pattern.rs`, and again
   per iterated entry, so an error part-way through a listing can be injected.
@@ -544,6 +545,12 @@ with a peek that stopped responding while draining, which is consistent with tha
   open that follows a good `stat`.
 - `Op::Read`, before `Tailer::open_tracked` reads a resumed file's head, so a test can fail that
   read with an errno other than a short file.
+- `Op::Read` at `tail.read`, before `Tailer::read_one` reads a tracked file's next chunk, so a
+  test can fail a read on an open file.
+
+The head read stays at `tail.scan`: it's part of opening a discovered file, and a test that fails
+it shouldn't also fail every chunk read under the same directory. `tail.read` is the steady-state
+read, one per chunk, and its failure decides what `drain` reaps.
 
 The call rule, the disarmed cost (one atomic load), the compiled-out form, and
 the scoping are decision 8's, unchanged. Freeze (the crash model) doesn't apply to a read: a rule
@@ -559,5 +566,6 @@ and its tests need the same errno control.
 
 **Consequences.** Decision 8's "every filesystem mutation" rule widens for the tail scan path:
 every discovery syscall there (`read_dir`, each iteration step, `file_type`, and `metadata`)
-needs a `fault::check` before it, or the proptest's failure operations miss it. The seam still has no `Read` op for `File::read`, so a read error on
-an open file stays untested by injection; `docs/known-gaps.md` records what that leaves.
+needs a `fault::check` before it, or the proptest's failure operations miss it. So does each
+read of an open tail file, which is what lets a test pin the documented loss of a `Draining`
+file's unread tail on a read error (`docs/known-gaps.md`).

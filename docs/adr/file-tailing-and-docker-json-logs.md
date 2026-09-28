@@ -183,8 +183,11 @@ any production path.
 A file's identity across a `scan` is its `(st_dev, st_ino)` pair (`tail/checkpoint.rs::FileId`),
 not its path — the only thing that survives both a rotation (the path keeps its name, the inode
 doesn't) and a checkpoint resume (the inode is what's persisted). Each `scan`: a path whose inode
-changed since the last scan is a rotation — the old handle drains to EOF, flushes, and closes; the
-new one opens at its own beginning, regardless of `read_from`. A path whose length is now less than
+changed since the last scan is a rotation — the old handle drains to EOF, flushes, and closes once
+it has stayed at EOF for one `poll_interval` (amended 2026-09-28: decision 6 of [ADR
+`tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md), so a
+writer still appending to the renamed inode until it reopens isn't cut off); the new one opens at
+its own beginning, regardless of `read_from`. A path whose length is now less than
 the tracked offset is a truncation — seek to `0`, diagnosed (`truncated`), same inode. The line
 splitter is reset along with the offset, so an unterminated fragment held from the pre-truncation
 generation is dropped rather than spliced onto the first line of the new one — and so is each
@@ -192,7 +195,8 @@ decoder's own cross-line state (`TailDecoder::reset`), for the same reason: a no
 stateless `LineDecoder`, but real for `docker_in`'s `DockerDecoder`, whose own reassembly state
 (`partial`, `dropping`) would otherwise either splice a stale fragment onto the new generation's
 first entry, or silently swallow it clearing a stale `dropping` flag. A
-previously-tracked path no longer matched by any pattern is a removal — drain and close. A rotated
+previously-tracked path no longer matched by any pattern is a removal — drain and close, after the
+same `poll_interval` at EOF. A rotated
 `.1`-suffixed file is never matched in the first place, though for different reasons per kind:
 `tail_in`'s wildcard is anchored (prefix/suffix), so `access.log.1` never satisfies a `*.log`
 pattern; `docker_in`'s own two-position discovery (`PathPattern::docker_containers`) isn't a glob at
@@ -208,7 +212,8 @@ so no duplicate re-emission occurs.
 `read_from` to every file as if newly discovered). When set: a JSON document
 (`{version, files: [{dev, ino, path, offset}]}`), written atomically (tmp file + rename) every
 `checkpoint_interval` (default 5s) **only if something changed since the last write**, plus
-unconditionally on a file's own close and on shutdown. Resume is by `(dev, ino)`, not path; an
+unconditionally on shutdown. A file's own close marks the checkpoint changed, so the next interval
+write drops its entry (the 2026-09-26 amendment below says why it isn't a write). Resume is by `(dev, ino)`, not path; an
 offset past the file's current size (truncated between the checkpoint write and this restart)
 restarts at `0` rather than seeking past EOF. A checkpoint write only persists the tailer's
 *currently tracked* files, so a removed or rotated-away file's entry simply isn't reproduced on the
@@ -546,7 +551,8 @@ stream: one partial and one `dropping` flag for each.
   the line whole. Decision 5 has the property and its cost.
 
 **`read_one` and `drain` (TAIL-03): a read error on a `Draining` file is its EOF.** A `Draining`
-(or `Deselected`) file has left the matched set, and `drain` reaps it at EOF. `read_one` reports
+(or `Deselected`) file has left the matched set, and `drain` reaps it at EOF (a `Draining` one
+once it has been draining for a `poll_interval`). `read_one` reports
 a read error as EOF, because a handle that keeps erroring would never be reaped otherwise, so the
 reap drops the file's unread tail. The error is diagnosed `read_error`, and the loss is a
 documented gap (`docs/known-gaps.md`). An `Active` file is never reaped on a read error.
