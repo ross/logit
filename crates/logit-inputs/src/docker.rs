@@ -1702,6 +1702,43 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A de-selected container's log is found by every scan until a `drain` reaps it, and each
+    /// such scan offers it to the factory only through `retain`, which keeps its cache entry.
+    /// A `docker_in` file is never rebound: a rotated `<id>-json.log.1` matches no pattern, so
+    /// this is the one `retain` path besides a failed listing that `docker_in` reaches.
+    #[tokio::test]
+    async fn a_deselected_containers_cache_entry_survives_until_its_reap() {
+        let root = scratch_dir("docker-deselect-cache");
+        let id = "e".repeat(64);
+        let log = container(&root, &id, "wanted", "nginx:1.25");
+        std::fs::write(&log, json_file_line("one\n")).unwrap();
+        let dir = root.join(&id);
+        let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
+        let mut input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
+        input.inner.bind().await.unwrap();
+        assert!(input.inner.factory_mut().meta.contains_key(&dir));
+
+        std::fs::write(
+            dir.join("config.v2.json"),
+            r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+        input.inner.scan_after_bind().await;
+        let identity = |input: &mut DockerInput| {
+            input.inner.factory_mut().meta[&dir].identity.as_ref().unwrap().resource.clone()
+        };
+        let before = identity(&mut input);
+
+        input.inner.scan_after_bind().await;
+        assert_eq!(input.inner.tracked_len(), 1, "no drain has reaped it");
+        assert!(
+            input.inner.factory_mut().meta.contains_key(&dir),
+            "end_scan must not evict a container awaiting its reap"
+        );
+        assert!(Arc::ptr_eq(&before, &identity(&mut input)));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[tokio::test]
     async fn rotated_json_log_1_is_never_opened_and_the_fresh_json_log_is_followed() {
         let root = scratch_dir("docker-rotate");

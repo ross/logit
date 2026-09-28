@@ -44,13 +44,15 @@ pub(crate) trait DecoderFactory<D: TailDecoder>: Send {
         Refresh::Unchanged
     }
 
-    /// Called for a tracked path `scan` kept because its listing failed or its stat was unknown,
-    /// so a factory that evicts per-scan state keeps this path's. Default: nothing cached.
+    /// Called for a tracked path `scan` offers neither `accept` nor `refresh`, so a factory that
+    /// evicts per-scan state keeps this path's: one kept because its listing failed or its stat
+    /// was unknown, an inode rebound under this new path, and a de-selected file not yet reaped.
+    /// Default: nothing cached.
     fn retain(&mut self, _path: &Path) {}
 
-    /// End of one `scan`: every discovered path has had one `accept` or `refresh` call since the
-    /// previous `end_scan`, and every kept one a `retain` call, so a caching factory can evict the
-    /// rest. Default: nothing cached.
+    /// End of one `scan`: every discovered path has had one `accept`, `refresh`, or `retain`
+    /// call since the previous `end_scan`, and every kept one a `retain` call, so a caching
+    /// factory can evict the rest. Default: nothing cached.
     fn end_scan(&mut self) {}
 }
 
@@ -277,6 +279,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     #[cfg(test)]
     pub(crate) fn tracked_len(&self) -> usize {
         self.files.len()
+    }
+
+    /// One `scan` after [`Tailer::bind`], with no `drain`, for a test outside this module.
+    #[cfg(test)]
+    pub(crate) async fn scan_after_bind(&mut self) {
+        let mut watcher = self.watcher.take().expect("bind() leaves a watcher behind");
+        self.scan(false, &mut watcher).await;
+        self.watcher = Some(watcher);
     }
 
     /// Loads the checkpoint, opens the watcher, and runs the initial scan, so
@@ -816,7 +826,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             if tracked.state == FileState::Deselected {
                 // Not reaped yet, but must not be revived like a rebind below: after
                 // `reap_drained` removes it, a later scan's `accept` re-admits it if the rename
-                // is reversed.
+                // is reversed. Offered to the factory all the same, which calls neither `accept`
+                // nor `refresh` for it this scan, so `end_scan` keeps its cached state.
+                self.factory.retain(&path);
                 return;
             }
             // Same inode, new name. A `Draining` entry goes back to `Active`: a pattern reaches
@@ -831,6 +843,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             if self.by_path.get(&old_path) == Some(&id) {
                 self.by_path.remove(&old_path);
             }
+            // Neither `accept` nor `refresh` runs for a rebind, and the factory keys its cache by
+            // the new path.
+            self.factory.retain(&path);
             self.by_path.insert(path, id);
             self.diag.warn_throttled(
                 "renamed",
@@ -4826,6 +4841,82 @@ mod tests {
         assert_eq!(probe.sum("logit.input.line.bytes", &[]), 18.0);
         assert_eq!(diag.occurrences("long_line"), 1);
         assert_eq!(diag.occurrences("bad_line"), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A factory that records every path `scan` offers it (`accept`, `refresh`, `retain`), and
+    /// de-selects one path on request.
+    struct RecordingFactory {
+        offered: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        deselect: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+
+    impl DecoderFactory<LineDecoder> for RecordingFactory {
+        fn accept(&mut self, path: &Path) -> bool {
+            self.offered.lock().unwrap().push(path.to_path_buf());
+            self.deselect.lock().unwrap().as_deref() != Some(path)
+        }
+
+        fn open(&mut self, path: &Path) -> anyhow::Result<LineDecoder> {
+            Ok(LineDecoder::new(path, Arc::new(Resource::default())))
+        }
+
+        fn refresh(&mut self, path: &Path, _decoder: &mut LineDecoder) -> Refresh {
+            self.offered.lock().unwrap().push(path.to_path_buf());
+            if self.deselect.lock().unwrap().as_deref() == Some(path) {
+                Refresh::Deselected
+            } else {
+                Refresh::Unchanged
+            }
+        }
+
+        fn retain(&mut self, path: &Path) {
+            self.offered.lock().unwrap().push(path.to_path_buf());
+        }
+    }
+
+    /// `end_scan` evicts what no call touched, so a path missing from one scan's calls loses its
+    /// cached state: a rebind and a de-selected file awaiting its reap included.
+    #[tokio::test]
+    async fn every_discovered_path_is_offered_to_the_factory_once_per_scan() {
+        let dir = scratch_dir("factory-offers");
+        let plain = dir.join("plain.log");
+        let moved = dir.join("moved.log");
+        let gone = dir.join("gone.log");
+        for p in [&plain, &moved, &gone] {
+            std::fs::write(p, b"x\n").unwrap();
+        }
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deselect = Arc::new(std::sync::Mutex::new(None));
+        let factory = RecordingFactory { offered: offered.clone(), deselect: deselect.clone() };
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(dir.join("*"))],
+            factory,
+            fast_config(ReadFrom::Beginning),
+        )
+        .await;
+        let take = || {
+            let mut paths = std::mem::take(&mut *offered.lock().unwrap());
+            paths.sort();
+            paths
+        };
+        let sorted = |mut paths: Vec<PathBuf>| {
+            paths.sort();
+            paths
+        };
+        assert_eq!(take(), sorted(vec![plain.clone(), moved.clone(), gone.clone()]));
+
+        // `moved.log` is rebound under `moved.log.1`, and `gone.log` is de-selected.
+        let renamed = dir.join("moved.log.1");
+        std::fs::rename(&moved, &renamed).unwrap();
+        *deselect.lock().unwrap() = Some(gone.clone());
+        hand.scan().await;
+        assert_eq!(take(), sorted(vec![plain.clone(), renamed.clone(), gone.clone()]));
+
+        // No `drain` has reaped `gone.log`, so it reaches `open_tracked`'s de-selected return.
+        hand.scan().await;
+        assert_eq!(hand.tailer.files.len(), 3);
+        assert_eq!(take(), sorted(vec![plain.clone(), renamed.clone(), gone.clone()]));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
