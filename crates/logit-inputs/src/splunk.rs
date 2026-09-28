@@ -1133,6 +1133,7 @@ impl Query {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_pipeline::test_util::{recv_batch, Totals};
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1157,14 +1158,6 @@ mod tests {
 
     async fn start_default() -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
         start(SplunkHecInput::new("127.0.0.1:0"), 16).await
-    }
-
-    async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a batch within 5s")
-            .expect("the channel is open");
-        logit_pipeline::unwrap_batch(delivered)
     }
 
     /// One request on a fresh connection, `Connection: close`, returning the raw response.
@@ -1343,14 +1336,11 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
         assert_eq!(body_of(&response), r#"{"text":"Data channel is missing","code":10}"#);
 
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.acks.issued", ("", "")), Some(3.0));
-        assert_eq!(sum_of(&events, "logit.input.acks.polled", ("result", "acked")), Some(3.0));
-        assert_eq!(sum_of(&events, "logit.input.acks.polled", ("result", "unknown")), Some(4.0));
-        assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "no_channel")),
-            Some(1.0)
-        );
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.acks.issued", &[]), 3.0);
+        assert_eq!(events.sum("logit.input.acks.polled", &[("result", "acked")]), 3.0);
+        assert_eq!(events.sum("logit.input.acks.polled", &[("result", "unknown")]), 4.0);
+        assert_eq!(events.sum("logit.input.requests.rejected", &[("reason", "no_channel")]), 1.0);
     }
 
     /// Past `max_ack_channels`, the least recently used channel is evicted with its ids; past
@@ -1380,10 +1370,10 @@ mod tests {
         let response = post_raw(&addr, ack, b, br#"{"acks":[0]}"#).await;
         assert_eq!(body_of(&response), r#"{"acks":{"0":false}}"#);
 
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.ack_channels.evicted", ("", "")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.acks.dropped", ("reason", "evicted")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.acks.dropped", ("reason", "expired")), Some(1.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.ack_channels.evicted", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.acks.dropped", &[("reason", "evicted")]), 1.0);
+        assert_eq!(events.sum("logit.input.acks.dropped", &[("reason", "expired")]), 1.0);
     }
 
     /// `/health` answers on `GET` and `HEAD` with no token, even when tokens are configured.
@@ -1435,8 +1425,9 @@ mod tests {
         }
         assert!(rx.is_empty());
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.requests.rejected", ("reason", "encoding")),
-            Some(3.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.requests.rejected", &[("reason", "encoding")]),
+            3.0
         );
     }
 
@@ -1488,8 +1479,9 @@ mod tests {
 
         assert!(rx.is_empty());
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.requests.rejected", ("reason", "oversize")),
-            Some(3.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.requests.rejected", &[("reason", "oversize")]),
+            3.0
         );
     }
 
@@ -1563,10 +1555,10 @@ mod tests {
             "a later accepted post clears it: {response}"
         );
 
-        let events = registry.drain(0);
+        let events = Totals::of(registry.drain(0));
         // The `503` post and the two busy `/health` answers.
-        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(3.0));
-        assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 3.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
     }
 
     #[tokio::test]
@@ -1625,15 +1617,12 @@ mod tests {
             r#"{"text":"Query string authorization is not enabled","code":16}"#
         );
 
-        let events = registry.drain(0);
+        let events = Totals::of(registry.drain(0));
         assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "auth")),
-            Some(rejected.len() as f64)
+            events.sum("logit.input.requests.rejected", &[("reason", "auth")]),
+            rejected.len() as f64
         );
-        assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "query_token")),
-            Some(1.0)
-        );
+        assert_eq!(events.sum("logit.input.requests.rejected", &[("reason", "query_token")]), 1.0);
     }
 
     #[tokio::test]
@@ -1687,16 +1676,13 @@ mod tests {
             );
             assert_eq!(body_of(&response), r#"{"text":"Method Not Allowed","code":405}"#);
         }
-        let events = registry.drain(0);
+        let events = Totals::of(registry.drain(0));
         assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "unknown_route")),
-            Some(3.0)
+            events.sum("logit.input.requests.rejected", &[("reason", "unknown_route")]),
+            3.0
         );
-        assert_eq!(sum_of(&events, "logit.input.requests", ("route", "unknown")), Some(3.0));
-        assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "method")),
-            Some(3.0)
-        );
+        assert_eq!(events.sum("logit.input.requests", &[("route", "unknown")]), 3.0);
+        assert_eq!(events.sum("logit.input.requests.rejected", &[("reason", "method")]), 3.0);
     }
 
     /// A syntax error in an object, or a number the model can't hold, is `400` code 6 naming that
@@ -1773,12 +1759,9 @@ mod tests {
         assert_eq!(bodies(&recv_batch(&mut rx).await), ["b"], "then h2's");
         assert!(rx.try_recv().is_err());
 
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "rejected")), Some(3.0));
-        assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "malformed")),
-            Some(3.0)
-        );
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("class", "rejected")]), 3.0);
+        assert_eq!(events.sum("logit.input.requests.rejected", &[("reason", "malformed")]), 3.0);
     }
 
     /// With a channel, a code 6 after a delivered prefix carries the `ackId` a `200` would, drawn
@@ -1877,13 +1860,10 @@ mod tests {
         post_raw(&addr, "/services/collector/event", "", ONE_EVENT).await;
         recv_batch(&mut rx).await;
         request_raw(&addr, "GET", "/services/collector/health", "", b"").await;
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("route", "event")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.requests", ("route", "health")), Some(1.0));
-        assert_eq!(
-            sum_of(&events, "logit.input.request.bytes", ("", "")),
-            Some(ONE_EVENT.len() as f64)
-        );
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("route", "event")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("route", "health")]), 1.0);
+        assert_eq!(events.sum("logit.input.request.bytes", &[]), ONE_EVENT.len() as f64);
     }
 
     #[tokio::test]
@@ -1895,7 +1875,8 @@ mod tests {
         let (addr, _rx) = start(input, 16).await;
         let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
         first.write_all(b"P").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The accept loop takes a connection's permit as it accepts it, one accept at a time and in
+        // the kernel queue's order, so `first` holds it before `second` is accepted.
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let mut buf = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf))
@@ -1903,8 +1884,9 @@ mod tests {
             .expect("the past-the-cap connection is closed");
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.connections.rejected", ("reason", "limit")),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.rejected", &[("reason", "limit")]),
+            1.0
         );
         drop(first);
     }
@@ -2068,15 +2050,20 @@ mod tests {
 
     #[test]
     fn health_is_busy_only_within_its_window() {
-        let health = BusyHealth::new(Duration::from_millis(50));
+        // A 1s window: a descheduled thread between `mark_busy` and `is_busy` only shortens what
+        // is left of it, and the check still lands inside.
+        let health = BusyHealth::new(Duration::from_secs(1));
         assert!(!health.is_busy());
         health.mark_busy();
         assert!(health.is_busy());
         health.mark_accepted();
         assert!(!health.is_busy());
-        health.mark_busy();
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(!health.is_busy(), "past the window");
+
+        // Expiry on a 1ms window: the sleep only overshoots, so the check is always past it.
+        let short = BusyHealth::new(Duration::from_millis(1));
+        short.mark_busy();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!short.is_busy(), "past the window");
     }
 
     #[test]
@@ -2101,27 +2088,5 @@ mod tests {
         assert_eq!(Query::parse(None), Query::default());
         let q = Query::parse(Some("channel=&channel=x%2Dy&channel=z"));
         assert_eq!(q.channel.as_deref(), Some("x-y"), "the first non-empty channel");
-    }
-
-    /// The value of `metric`'s `Sum` in a drained snapshot, restricted to the point carrying
-    /// `tag`; an empty tag key matches any point.
-    fn sum_of(events: &[logit_core::Event], metric: &str, tag: (&str, &str)) -> Option<f64> {
-        let mut total = None;
-        for event in events {
-            if !tag.0.is_empty()
-                && event.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1)
-            {
-                continue;
-            }
-            for record in &event.metrics {
-                if logit_core::interner::resolve(record.name) != metric {
-                    continue;
-                }
-                if let logit_core::MetricKind::Sum(sum) = record.kind {
-                    *total.get_or_insert(0.0) += sum.value;
-                }
-            }
-        }
-        total
     }
 }

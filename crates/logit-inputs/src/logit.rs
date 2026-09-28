@@ -1012,8 +1012,9 @@ impl ControlEncode for control::Reject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{
-        AttrMap, Event, EventBatch, LogRecord, MetricKind, Registry, Resource, Severity, Value,
+    use logit_core::{AttrMap, Event, EventBatch, LogRecord, Registry, Resource, Severity, Value};
+    use logit_pipeline::test_util::{
+        expect_closed, expect_still_open, recv_batch, TelemetryProbe, Totals,
     };
     use logit_proto::native::NativeEncoder;
     use logit_proto::Encoder;
@@ -1055,14 +1056,6 @@ mod tests {
             .await
             .expect("should receive within 5s")
             .expect("channel should still be open")
-    }
-
-    async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("should receive within 5s")
-            .expect("channel should still be open");
-        logit_pipeline::unwrap_batch(delivered)
     }
 
     fn sample_batch() -> EventBatch {
@@ -1156,23 +1149,6 @@ mod tests {
             control::ControlMessage::Ack(ack) => ack,
             other => panic!("expected Ack, got {other:?}"),
         }
-    }
-
-    fn drained_counter(registry: &Registry, metric: &str, tag: (&str, &str)) -> Option<f64> {
-        registry.drain(0).into_iter().find_map(|e| {
-            if e.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1) {
-                return None;
-            }
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) != metric {
-                    return None;
-                }
-                match m.kind {
-                    MetricKind::Sum(sum) => Some(sum.value),
-                    _ => None,
-                }
-            })
-        })
     }
 
     // ---- binding ----------------------------------------------------------------------------
@@ -1506,9 +1482,13 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
 
-        // The server task records the counter after closing the socket.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(drained_counter(&registry, "logit.proto.errors", ("reason", "crc")), Some(1.0));
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the crc error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "crc")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "crc")]), 1.0);
     }
 
     /// A frame well under `max_frame_bytes` whose batch decodes past 4x that cap closes the
@@ -1543,11 +1523,19 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            drained_counter(&registry, "logit.proto.errors", ("reason", "decode_budget")),
-            Some(1.0)
-        );
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the decode_budget error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "decode_budget")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "decode_budget")]), 1.0);
+        // The diagnostic is reported by the accept loop's task after the connection returns, so
+        // it can follow both the count and the close.
+        logit_pipeline::test_util::wait_until("the decode_budget diagnostic", || {
+            listener_diag.occurrences("decode_budget") >= 1
+        })
+        .await;
         assert_eq!(listener_diag.occurrences("decode_budget"), 1);
         assert_eq!(listener_diag.occurrences("connection_error"), 0);
     }
@@ -1590,15 +1578,16 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let events = registry.drain(0);
-        assert_eq!(
-            metric_value(&events, "logit.proto.errors", Some(("reason", "decode_budget"))),
-            Some(1.0)
-        );
-        assert_eq!(
-            metric_value(&events, "logit.proto.errors", Some(("reason", "too_large"))),
-            None
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the decode_budget error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "decode_budget")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "decode_budget")]), 1.0);
+        assert!(
+            !totals.has("logit.proto.errors", &[("reason", "too_large")]),
+            "counted once, as decode_budget"
         );
         assert!(rx.try_recv().is_err(), "nothing was forwarded");
     }
@@ -1633,8 +1622,8 @@ mod tests {
 
         // Holds the one permit without ever handshaking.
         let _first = connect(&addr).await;
-        // Not a readiness wait: lets the accept loop take `_first`'s permit before the next.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The accept loop takes a connection's permit as it accepts it, one accept at a time and in
+        // the kernel queue's order, so `_first` holds it before the next is accepted.
 
         let mut second = connect(&addr).await;
         match read_control_response(&mut second).await {
@@ -1774,8 +1763,8 @@ mod tests {
 
         // Holds the one permit for the default 5s handshake timeout.
         let _first = connect(&addr).await;
-        // Not a readiness wait: lets the accept loop take `_first`'s permit before the next.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The accept loop takes a connection's permit as it accepts it, one accept at a time and in
+        // the kernel queue's order, so `_first` holds it before the next is accepted.
 
         // Past the cap, yet the TLS handshake completes and the Reject arrives decodable over it.
         let connector = tls_connector().await;
@@ -1801,7 +1790,7 @@ mod tests {
     //
     // Real durations, never `tokio::time::pause()`: these tests race a timer against a socket
     // read, and paused time would advance straight past the read the listener is parked in.
-    // "Closed" assertions wait up to 2s against deadlines of at most 300ms; "still open" ones
+    // "Closed" assertions wait up to 2s against idle deadlines of at most 500ms; "still open" ones
     // assert `timeout(50ms, read)` elapses, which scheduler lag can only make more true.
 
     /// Asserts the next frame is the idle close's `Reject{GOING_AWAY, "idle for <dur>"}`.
@@ -1819,18 +1808,6 @@ mod tests {
                 );
             }
             other => panic!("{what}: expected Reject{{GOING_AWAY}}, got {other:?}"),
-        }
-    }
-
-    /// Asserts nothing is readable for 50ms. The listener writes only in response to something,
-    /// so on a connection given nothing to answer, any byte would be a close's `Reject`.
-    async fn expect_still_open(stream: &mut TcpStream, what: &str) {
-        let mut buf = [0u8; 1];
-        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
-            Err(_elapsed) => {}
-            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
-            Ok(Ok(_)) => panic!("{what}: expected no bytes, got a frame"),
-            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
         }
     }
 
@@ -1865,8 +1842,9 @@ mod tests {
         assert_eq!(n, 0, "the Reject is the last thing on this connection");
 
         assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            Some(1.0),
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
             "an idle close is counted"
         );
         assert_eq!(
@@ -1915,18 +1893,21 @@ mod tests {
         assert_eq!(read_ack(&mut client).await.seq, 2, "and the second, after the drain");
         recv_batch(&mut rx).await;
 
-        assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            None,
+        assert!(
+            !Totals::of(registry.drain(0))
+                .has("logit.input.connections.closed", &[("reason", "idle")]),
             "nothing was closed as idle, so the counter was never touched"
         );
     }
 
-    /// Every `Ack` re-arms the clock: frames 100ms apart outlast a 200ms timeout until they stop.
+    /// Every `Ack` re-arms the clock: eight frames 100ms apart outlast a 500ms timeout until they
+    /// stop.
+    /// The 400ms margin covers scheduler lag between an `Ack` and the next frame, the one gap
+    /// that separates an ack-driven clock from an idle close.
     #[tokio::test]
     async fn the_idle_clock_restarts_from_each_ack() {
         let (addr, input) = bound_input().await;
-        let mut input = input.with_idle_timeout(Some(Duration::from_millis(200)));
+        let mut input = input.with_idle_timeout(Some(Duration::from_millis(500)));
         let (sink, mut rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1934,7 +1915,7 @@ mod tests {
         client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
         let _ = read_control_response(&mut client).await;
 
-        for expected_seq in 1..=4u64 {
+        for expected_seq in 1..=8u64 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             send_data_frame(&mut client, &sample_batch(), Compression::None).await;
             assert_eq!(read_ack(&mut client).await.seq, expected_seq);
@@ -1983,9 +1964,9 @@ mod tests {
             "a frame whose header started arriving before the deadline must be acked"
         );
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
-        assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            None,
+        assert!(
+            !Totals::of(registry.drain(0))
+                .has("logit.input.connections.closed", &[("reason", "idle")]),
             "and nothing closed as idle"
         );
     }
@@ -2010,9 +1991,13 @@ mod tests {
         client.write_all(&framed[..1]).await.unwrap();
 
         expect_reject_going_away_for_idleness(&mut client, "a header that stopped arriving").await;
+        // `close_idle` counts after writing the `Reject` and before the stream drops, so the
+        // close, not the `Reject`, is what says the count is in.
+        expect_closed(&mut client, "a header that stopped arriving").await;
         assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0
         );
         assert!(rx.try_recv().is_err(), "a one-byte header must never produce a batch");
     }
@@ -2040,9 +2025,13 @@ mod tests {
 
         expect_reject_going_away_for_idleness(&mut client, "a frame body that stopped arriving")
             .await;
+        // `close_idle` counts after writing the `Reject` and before the stream drops, so the
+        // close, not the `Reject`, is what says the count is in.
+        expect_closed(&mut client, "a frame body that stopped arriving").await;
         assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            Some(1.0),
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
             "a stalled body is counted exactly like an idle gap between frames"
         );
         assert!(rx.try_recv().is_err(), "a half-arrived frame must never be decoded or forwarded");
@@ -2063,15 +2052,20 @@ mod tests {
         let _ = read_control_response(&mut client).await;
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        expect_still_open(&mut client, "a quiet connection with no idle_timeout").await;
+        expect_still_open(
+            &mut client,
+            Duration::from_millis(50),
+            "a quiet connection with no idle_timeout",
+        )
+        .await;
 
         send_data_frame(&mut client, &sample_batch(), Compression::None).await;
         assert_eq!(read_ack(&mut client).await.seq, 1, "and still serving frames");
         recv_batch(&mut rx).await;
 
-        assert_eq!(
-            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
-            None,
+        assert!(
+            !Totals::of(registry.drain(0))
+                .has("logit.input.connections.closed", &[("reason", "idle")]),
             "nothing was closed as idle, so the counter was never touched"
         );
     }
@@ -2098,32 +2092,6 @@ mod tests {
         frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &msg.encode())
             .unwrap()
             .len()
-    }
-
-    /// The value of `metric` in `events` (a `Sum`'s or a `Gauge`'s), filtered by `tag` if given.
-    /// A drained registry holds a gauge's last write, so this reads its final value.
-    fn metric_value(
-        events: &[logit_core::Event],
-        metric: &str,
-        tag: Option<(&str, &str)>,
-    ) -> Option<f64> {
-        events.iter().rev().find_map(|e| {
-            if let Some((key, value)) = tag {
-                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
-                    return None;
-                }
-            }
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) != metric {
-                    return None;
-                }
-                match m.kind {
-                    MetricKind::Sum(sum) => Some(sum.value),
-                    MetricKind::Gauge(value) => Some(value),
-                    _ => None,
-                }
-            })
-        })
     }
 
     /// A handshaken peer that keeps writing frames but never reads its `Ack`s fills this
@@ -2195,12 +2163,9 @@ mod tests {
         assert_eq!(limit.available_permits(), 1, "the permit came back");
         assert_eq!(live.count(), 0, "the live-connection count came back to 0");
 
-        let events = registry.drain(0);
-        assert_eq!(
-            metric_value(&events, "logit.proto.errors", Some(("reason", "ack_write_stalled"))),
-            Some(1.0)
-        );
-        assert_eq!(metric_value(&events, "logit.input.connections", None), Some(0.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.proto.errors", &[("reason", "ack_write_stalled")]), 1.0);
+        assert_eq!(events.gauge("logit.input.connections", &[]), Some(0.0));
 
         spam.abort();
         drain.abort();
@@ -2235,9 +2200,8 @@ mod tests {
         client.write_all(&frame).await.unwrap();
         recv_batch(&mut rx).await;
         recv_batch(&mut rx).await;
-        // Lets the second `Ack` land; the task then parks at the next header read.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
+        // Whether or not the second `Ack` is written yet: it fits the buffer, and no shutdown check
+        // precedes it, so the task writes it and then meets the shutdown with the buffer full.
         shutdown_tx.send(true).unwrap();
         let result = tokio::time::timeout(BOUND + Duration::from_secs(2), task)
             .await
@@ -2245,12 +2209,9 @@ mod tests {
             .unwrap();
         assert!(result.is_ok(), "a shutdown close is policy, not a fault: {result:?}");
         assert_eq!(
-            metric_value(
-                &registry.drain(0),
-                "logit.proto.errors",
-                Some(("reason", "reject_write_stalled"))
-            ),
-            Some(1.0),
+            Totals::of(registry.drain(0))
+                .sum("logit.proto.errors", &[("reason", "reject_write_stalled")]),
+            1.0,
             "the discarded GOING_AWAY is counted"
         );
         drop(client);
@@ -2445,11 +2406,13 @@ mod tests {
             .expect("the connection closes right behind the Reject")
             .unwrap();
         assert_eq!(n, 0);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            drained_counter(&registry, "logit.proto.errors", ("reason", "too_large")),
-            Some(1.0)
-        );
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the too_large error counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "too_large")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "too_large")]), 1.0);
         assert!(rx.try_recv().is_err());
     }
 
@@ -2534,19 +2497,23 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{name}: expected a close within 2s"));
             assert!(matches!(read, Ok(0) | Err(_)), "{name}: expected a close, got {read:?}");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            drained_counter(&registry, "logit.proto.errors", ("reason", "handshake")),
-            Some(2.0)
-        );
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("both strays counted as handshake errors", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 2.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 2.0);
     }
 
     /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected
     /// connection still open, and the first one closed, a third handshakes.
     #[tokio::test]
     async fn a_past_the_cap_connection_holds_no_permit() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("logit_in", "logit_in", "listener");
         let (addr, input) = bound_input().await;
-        let mut input = input.with_max_connections(1);
+        let mut input = input.with_telemetry(telemetry).with_max_connections(1);
         let (sink, _rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
@@ -2563,7 +2530,14 @@ mod tests {
         }
 
         drop(first);
-        tokio::time::sleep(Duration::from_millis(50)).await; // the first task ends
+        // The gauge counts only permit holders. The first task drops its gauge guard and then its
+        // permit with no `.await` between, so on this current-thread runtime a 0 means the permit
+        // is back.
+        probe
+            .wait_for("the first connection to end", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
         let mut third = connect(&addr).await;
         client_hello(&mut third, vec![native::CODEC_NATIVE_V1], vec![0]).await;
         match read_control_response(&mut third).await {

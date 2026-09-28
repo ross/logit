@@ -1711,8 +1711,10 @@ pub(crate) fn far_future() -> tokio::time::Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, MetricKind, Registry, Resource, Value};
-    use logit_pipeline::unwrap_batch;
+    use logit_core::{AttrMap, Registry, Resource, Value};
+    use logit_pipeline::test_util::{
+        expect_closed, expect_still_open, recv_batch, wait_until, TelemetryProbe, Totals,
+    };
     use logit_proto::CodecError;
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -2224,67 +2226,12 @@ mod tests {
         (Fanout::new(vec![tx]), rx)
     }
 
-    async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a batch should be delivered within 5s")
-            .expect("the fanout should not have closed");
-        unwrap_batch(delivered)
-    }
-
     fn payloads(batch: &EventBatch) -> Vec<String> {
         batch.events.iter().map(payload).collect()
     }
 
     async fn connect(addr: &str) -> TcpStream {
         TcpStream::connect(addr).await.expect("connecting to the bound listener should succeed")
-    }
-
-    /// Reads one byte, expecting the peer to have closed instead.
-    async fn expect_closed<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
-        match result {
-            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
-            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN
-            // (Linux `tcp_close`), and a read after RST is `ECONNRESET`: still a close. The
-            // oversize-frame test gets either, depending on socket-buffer sizes.
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(err) => panic!("{what}: read failed outright: {err}"),
-        }
-    }
-
-    /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
-    /// the point carrying `tag`. Drain-then-query, so one test can check several metrics.
-    fn sum_of(events: &[Event], metric: &str, tag: Option<(&str, &str)>) -> Option<f64> {
-        events.iter().find_map(|e| {
-            if let Some((key, value)) = tag {
-                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
-                    return None;
-                }
-            }
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) != metric {
-                    return None;
-                }
-                match m.kind {
-                    MetricKind::Sum(sum) => Some(sum.value),
-                    _ => None,
-                }
-            })
-        })
-    }
-
-    /// The single value of gauge `name` (last-write-wins per drain), or `None` if never recorded.
-    fn gauge_of(events: &[Event], name: &str) -> Option<f64> {
-        events.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| match m.kind {
-                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(v),
-                _ => None,
-            })
-        })
     }
 
     fn testdata_dir() -> std::path::PathBuf {
@@ -2436,13 +2383,10 @@ mod tests {
         let batch = recv_batch(&mut rx).await;
         assert_eq!(payloads(&batch), vec!["<13>alone"]);
 
-        let events = registry.drain(0);
-        assert_eq!(
-            sum_of(&events, "logit.component.receive.flushed", Some(("reason", "interval"))),
-            Some(1.0)
-        );
-        assert_eq!(sum_of(&events, "logit.input.frames", None), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.frame.bytes", None), Some(9.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.component.receive.flushed", &[("reason", "interval")]), 1.0);
+        assert_eq!(events.sum("logit.input.frames", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.frame.bytes", &[]), 9.0);
 
         handle.abort();
     }
@@ -2473,12 +2417,9 @@ mod tests {
         let batch = recv_batch(&mut rx).await;
         assert_eq!(payloads(&batch), vec!["<13>one", "<13>two"]);
         assert_eq!(
-            sum_of(
-                &registry.drain(0),
-                "logit.component.receive.flushed",
-                Some(("reason", "closed"))
-            ),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.component.receive.flushed", &[("reason", "closed")]),
+            1.0
         );
 
         handle.abort();
@@ -2514,20 +2455,18 @@ mod tests {
         let handle =
             tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
 
-        // The first connection holds the one permit.
+        // The first connection holds the one permit. The accept loop takes a permit as it accepts
+        // a connection, one accept at a time and in the kernel queue's order, so `_first` holds
+        // it before `second` is accepted.
         let _first = connect(&addr).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut second = connect(&addr).await;
         expect_closed(&mut second, "a past-the-cap connection").await;
 
         assert_eq!(
-            sum_of(
-                &registry.drain(0),
-                "logit.input.connections.rejected",
-                Some(("reason", "limit"))
-            ),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.rejected", &[("reason", "limit")]),
+            1.0
         );
 
         handle.abort();
@@ -2594,8 +2533,9 @@ mod tests {
         );
         // Holds either way; confirms the classification.
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "malformed"))),
-            Some(3.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.frames.dropped", &[("reason", "malformed")]),
+            3.0
         );
 
         handle.abort();
@@ -2621,6 +2561,8 @@ mod tests {
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
 
         client.write_all(b"<13>unterminated").await.unwrap();
+        // Covers the listener's read of the partial frame into its framer. Nothing counts bytes
+        // before a frame completes, so there is no observable to wait on instead.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // `SO_LINGER 0` makes the close an RST, not a FIN, so the server's read fails
@@ -2631,11 +2573,16 @@ mod tests {
         drop(client);
 
         // The count lands on the connection's own task, after its read fails.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the partial frame counted truncated", |t| {
+                t.sum("logit.input.frames.dropped", &[("reason", "truncated")]) >= 1.0
+            })
+            .await;
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
-            Some(1.0),
-            "the partial frame the RST discarded must still be counted"
+            totals.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            1.0,
+            "the partial frame the RST discarded is counted once"
         );
 
         handle.abort();
@@ -2658,6 +2605,8 @@ mod tests {
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>complete"]);
 
         client.write_all(b"<13>half a mes").await.unwrap();
+        // Covers the listener's read of the partial frame into its framer. Nothing counts bytes
+        // before a frame completes, so there is no observable to wait on instead.
         tokio::time::sleep(Duration::from_millis(100)).await;
         shutdown_tx.send(true).expect("the receiver should still be alive");
 
@@ -2667,8 +2616,9 @@ mod tests {
             "nothing complete was pending, so no batch should follow"
         );
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "truncated"))),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            1.0
         );
 
         handle.await.expect("the task should not panic").expect("shutdown should be clean");
@@ -2700,8 +2650,9 @@ mod tests {
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>still here"]);
 
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.frames.dropped", Some(("reason", "oversize"))),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.frames.dropped", &[("reason", "oversize")]),
+            1.0
         );
 
         handle.abort();
@@ -2930,9 +2881,11 @@ mod tests {
         let handle =
             tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
 
-        // Held (not dropped) past the timeout, so only the timeout can free the permit.
-        let _silent = connect(&addr).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Held (not dropped) past the timeout, so only the timeout can free the permit. The
+        // connection's task drops the stream and then its permit with no `.await` between, so on
+        // this current-thread runtime the close means the permit is back.
+        let mut silent = connect(&addr).await;
+        expect_closed(&mut silent, "a TLS connection that sent no ClientHello").await;
 
         let connector = tls_connector("ca.pem", None).await;
         let mut client = tls_connect(&connector, &addr).await;
@@ -2940,27 +2893,16 @@ mod tests {
         client.flush().await.unwrap();
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>permit came back"]);
 
+        drop(silent);
         handle.abort();
     }
 
     // ---- driver: idle timeout -----------------------------------------------------------------
     //
-    // Real durations (50-200ms), never `tokio::time::pause()`: these tests race a timer against
+    // Real durations (50-500ms), never `tokio::time::pause()`: these tests race a timer against
     // a socket read, and paused time would advance past the read. "Closed" assertions have
-    // `expect_closed`'s 2s ceiling against deadlines of at most 200ms; "still open" ones assert
+    // `expect_closed`'s 5s ceiling against deadlines of at most 500ms; "still open" ones assert
     // `timeout(50ms, read) == Err(Elapsed)`, which scheduler lag only makes more true.
-
-    /// Asserts a client connection is still open: this driver never writes to a peer, so a
-    /// blocked read means live, while a closed one returns `Ok(0)` or `ECONNRESET` immediately.
-    async fn expect_still_open<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
-        let mut buf = [0u8; 1];
-        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
-            Err(_elapsed) => {}
-            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
-            Ok(Ok(n)) => panic!("{what}: expected no bytes, got {n}"),
-            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
-        }
-    }
 
     /// An idle connection is closed, counted but not diagnosed, and its permit comes back.
     #[tokio::test]
@@ -2987,10 +2929,10 @@ mod tests {
 
         expect_closed(&mut quiet, "a connection quiet past its idle_timeout").await;
 
-        let drained = registry.drain(0);
+        let drained = Totals::of(registry.drain(0));
         assert_eq!(
-            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
-            Some(1.0),
+            drained.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
             "an idle close is counted"
         );
         assert_eq!(
@@ -3026,7 +2968,12 @@ mod tests {
 
         // Long enough that a clock running across the blocked send would have fired three times.
         tokio::time::sleep(idle * 3).await;
-        expect_still_open(&mut client, "a connection blocked on a full downstream").await;
+        expect_still_open(
+            &mut client,
+            Duration::from_millis(50),
+            "a connection blocked on a full downstream",
+        )
+        .await;
 
         // Written while the task is parked in `Fanout::send`; these bytes sit in the socket
         // buffer.
@@ -3068,20 +3015,14 @@ mod tests {
         );
         expect_closed(&mut client, "a connection quiet past its idle_timeout").await;
 
-        let drained = registry.drain(0);
+        let drained = Totals::of(registry.drain(0));
         assert_eq!(
-            sum_of(&drained, "logit.input.frames.dropped", Some(("reason", "truncated"))),
-            Some(1.0),
+            drained.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+            1.0,
             "the partial frame the idle close discarded must still be counted"
         );
-        assert_eq!(
-            sum_of(&drained, "logit.component.receive.flushed", Some(("reason", "closed"))),
-            Some(1.0)
-        );
-        assert_eq!(
-            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
-            Some(1.0)
-        );
+        assert_eq!(drained.sum("logit.component.receive.flushed", &[("reason", "closed")]), 1.0);
+        assert_eq!(drained.sum("logit.input.connections.closed", &[("reason", "idle")]), 1.0);
 
         handle.abort();
     }
@@ -3116,7 +3057,9 @@ mod tests {
     #[tokio::test]
     async fn bytes_that_complete_no_frame_still_reset_the_idle_clock() {
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let mut listener = listener.with_idle_timeout(Some(Duration::from_millis(200)));
+        // A 500ms idle timeout against 100ms gaps: 400ms of margin for scheduler lag between one
+        // byte and the next, which is all that separates a byte-driven clock from an idle close.
+        let mut listener = listener.with_idle_timeout(Some(Duration::from_millis(500)));
         let (sink, mut rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle =
@@ -3124,12 +3067,13 @@ mod tests {
 
         let mut client = connect(&addr).await;
         client.write_all(b"<13>").await.unwrap();
-        for byte in b"drib" {
+        for byte in b"dribble" {
             tokio::time::sleep(Duration::from_millis(100)).await;
             client.write_all(&[*byte]).await.unwrap();
         }
-        // 500ms of wall clock has passed on a 200ms idle timeout, with no frame ever completed.
-        client.write_all(b"ble\n").await.unwrap();
+        // At least 700ms of wall clock has passed on a 500ms idle timeout, with no frame ever
+        // completed.
+        client.write_all(b"\n").await.unwrap();
 
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>dribble"]);
 
@@ -3204,13 +3148,18 @@ mod tests {
 
         // Fifteen flush ticks of silence.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        expect_still_open(&mut client, "a quiet connection with no idle_timeout").await;
+        expect_still_open(
+            &mut client,
+            Duration::from_millis(50),
+            "a quiet connection with no idle_timeout",
+        )
+        .await;
         client.write_all(b"<13>much later\n").await.unwrap();
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>much later"]);
 
-        assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
-            None,
+        assert!(
+            !Totals::of(registry.drain(0))
+                .has("logit.input.connections.closed", &[("reason", "idle")]),
             "nothing was closed as idle, so the counter was never touched"
         );
 
@@ -3237,12 +3186,15 @@ mod tests {
         client.write_all(b"<13>hello\n").await.unwrap();
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>hello"]);
 
-        let events = registry.drain(0);
-        let depth = gauge_of(&events, "logit.input.accept_queue.depth")
+        let events = Totals::of(registry.drain(0));
+        let depth = events
+            .gauge("logit.input.accept_queue.depth", &[])
             .expect("the accept-queue depth should be gauged before each accept");
-        let limit = gauge_of(&events, "logit.input.accept_queue.limit")
+        let limit = events
+            .gauge("logit.input.accept_queue.limit", &[])
             .expect("the backlog ceiling should be gauged in its own right, not left implicit");
-        let utilization = gauge_of(&events, "logit.input.accept_queue.utilization")
+        let utilization = events
+            .gauge("logit.input.accept_queue.utilization", &[])
             .expect("the utilization gauge's presence means the kernel reported a real backlog");
         assert!(depth >= 0.0, "a queue depth is never negative, got {depth}");
         assert!(limit > 0.0, "a listening socket always has a backlog ceiling, got {limit}");
@@ -3290,10 +3242,10 @@ mod tests {
         client.await.expect("the connect task should not panic").expect("connect should succeed");
         assert!(sampler.tick.is_none(), "a disabled sampler arms no timer at all");
 
-        let events = registry.drain(0);
-        assert_eq!(gauge_of(&events, "logit.input.accept_queue.depth"), None);
-        assert_eq!(gauge_of(&events, "logit.input.accept_queue.limit"), None);
-        assert_eq!(gauge_of(&events, "logit.input.accept_queue.utilization"), None);
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.gauge("logit.input.accept_queue.depth", &[]), None);
+        assert_eq!(events.gauge("logit.input.accept_queue.limit", &[]), None);
+        assert_eq!(events.gauge("logit.input.accept_queue.utilization", &[]), None);
     }
 
     /// A `listen(1)` socket's queue overshoots its ceiling and the gauge reports it unclamped.
@@ -3359,12 +3311,15 @@ mod tests {
         );
 
         sampler.sample_once(&listener);
-        let events = registry.drain(0);
-        let reported_depth = gauge_of(&events, "logit.input.accept_queue.depth")
+        let events = Totals::of(registry.drain(0));
+        let reported_depth = events
+            .gauge("logit.input.accept_queue.depth", &[])
             .expect("the depth should have been gauged");
-        let reported_limit = gauge_of(&events, "logit.input.accept_queue.limit")
+        let reported_limit = events
+            .gauge("logit.input.accept_queue.limit", &[])
             .expect("the ceiling should have been gauged");
-        let utilization = gauge_of(&events, "logit.input.accept_queue.utilization")
+        let utilization = events
+            .gauge("logit.input.accept_queue.utilization", &[])
             .expect("the utilization should have been gauged");
         assert_eq!(reported_limit, 1.0);
         assert!(
@@ -3437,19 +3392,15 @@ mod tests {
             Ok((0, 1))
         };
 
-        // Nothing ever connects, so this only returns by timing out.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(250),
-            sampler.accept_every(&listener, Duration::from_millis(20)),
-        )
-        .await;
-
-        let samples = SAMPLES.load(Ordering::SeqCst);
-        assert!(
-            samples >= 4,
-            "250 ms at a 20 ms interval must sample many times over with no connection at all, \
-             got {samples}"
-        );
+        // Nothing ever connects, so `accept_every` never returns; only the interval can sample.
+        tokio::select! {
+            accepted = sampler.accept_every(&listener, Duration::from_millis(20)) => {
+                panic!("nothing connects, yet accept_every returned {accepted:?}")
+            }
+            () = wait_until("four samples of an idle listener at a 20ms interval", || {
+                SAMPLES.load(Ordering::SeqCst) >= 4
+            }) => {}
+        }
     }
 
     /// A steady accept rate faster than the interval does not starve the interval tick
@@ -3582,10 +3533,10 @@ mod tests {
         client.write_all(b"<13>after\n").await.unwrap();
         let batch = recv_batch(&mut rx).await;
         assert_eq!(payloads(&batch), vec!["<13>after"]);
-        let events = registry.drain(0);
-        let resource = sum_of(&events, "logit.input.accept.errors", Some(("reason", "resource")));
-        assert!(resource.is_some_and(|n| n >= 2.0), "resource accept errors counted: {resource:?}");
-        assert_eq!(sum_of(&events, "logit.input.accept.errors", Some(("reason", "fatal"))), None);
+        let events = Totals::of(registry.drain(0));
+        let resource = events.sum("logit.input.accept.errors", &[("reason", "resource")]);
+        assert!(resource >= 2.0, "resource accept errors counted: {resource:?}");
+        assert!(!events.has("logit.input.accept.errors", &[("reason", "fatal")]),);
 
         handle.abort();
     }
@@ -3631,12 +3582,8 @@ mod tests {
 
         let mut flushes = 0.0;
         let mut interval_flushes = |registry: &Registry| {
-            flushes += sum_of(
-                &registry.drain(0),
-                "logit.component.receive.flushed",
-                Some(("reason", "interval")),
-            )
-            .unwrap_or(0.0);
+            flushes += Totals::of(registry.drain(0))
+                .sum("logit.component.receive.flushed", &[("reason", "interval")]);
             flushes
         };
         let mut line = 0usize;

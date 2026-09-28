@@ -2043,6 +2043,17 @@ mod tests {
         async fn connect(&self) -> TcpStream {
             TcpStream::connect(self.addr).await.expect("the listener should accept")
         }
+
+        /// Waits for the `logit.input.connections` gauge to read 0. A connection's task drops
+        /// its gauge guard and then its permit with no `.await` between, so on a current-thread
+        /// runtime a 0 means every permit is back. Drains the registry.
+        async fn wait_for_no_connections(&self) {
+            logit_pipeline::test_util::TelemetryProbe::with_registry(self.registry.clone())
+                .wait_for("the connections gauge to read 0", |t| {
+                    t.gauge("logit.input.connections", &[]) == Some(0.0)
+                })
+                .await;
+        }
     }
 
     /// Binds `build`'s listener on an ephemeral port and runs it, one event per batch with no
@@ -2282,6 +2293,7 @@ mod tests {
             .expect("a silent connection is closed within the handshake timeout, not left hanging")
             .expect("reading a closed socket is Ok(0), not an error");
         assert_eq!(read, 0, "the listener hung up on a connection that said nothing");
+        running.wait_for_no_connections().await;
 
         let mut client = running.connect().await;
         client.write_all(b"permit.came.back:1|c\n").await.unwrap();
@@ -2315,6 +2327,7 @@ mod tests {
             .expect("a connection quiet past its idle_timeout is closed, not left hanging")
             .expect("reading a closed socket is Ok(0), not an error");
         assert_eq!(read, 0, "the listener hung up on a connection that went quiet");
+        running.wait_for_no_connections().await;
 
         let mut client = running.connect().await;
         client.write_all(b"permit.came.back:1|c\n").await.unwrap();

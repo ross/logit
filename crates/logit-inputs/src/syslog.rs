@@ -2067,7 +2067,7 @@ mod tests {
     async fn an_idle_tcp_connection_releases_its_permit_after_the_idle_timeout() {
         const LINE: &[u8] = b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\n";
 
-        let mut input = SyslogInput::tcp("127.0.0.1:0")
+        let input = SyslogInput::tcp("127.0.0.1:0")
             .with_tcp_receive(TcpListenerConfig {
                 batch_max_events: 1,
                 batch_flush_interval: Duration::ZERO,
@@ -2075,6 +2075,8 @@ mod tests {
             })
             .with_max_connections(1)
             .with_idle_timeout(Some(Duration::from_millis(50)));
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let mut input = input.with_telemetry(probe.telemetry("syslog_in", "syslog_in", "listener"));
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -2099,6 +2101,13 @@ mod tests {
         .expect("a connection quiet past its idle_timeout is closed, not left hanging")
         .expect("reading a closed socket is Ok(0), not an error");
         assert_eq!(read, 0, "the listener hung up on a connection that went quiet");
+        // The connection's task drops its gauge guard and then its permit with no `.await`
+        // between, so on this current-thread runtime a 0 means the permit is back.
+        probe
+            .wait_for("the connections gauge to read 0", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut client, LINE).await.unwrap();
