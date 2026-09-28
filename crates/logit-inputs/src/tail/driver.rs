@@ -1251,6 +1251,9 @@ async fn close_decoder<D: TailDecoder>(
     let partial_start = tracked.offset - tracked.splitter.pending_bytes();
     if let Some(partial) = tracked.splitter.take_partial() {
         let partial = ensure_utf8(partial, diag);
+        // Offered to the decoder like any line `read_one` splits, so counted the same way.
+        telemetry.count("logit.input.lines", 1.0, &[]);
+        telemetry.count("logit.input.line.bytes", partial.len() as f64, &[]);
         let decoded = tracked.decoder.decode_line(partial, now_nanos(), &mut scratch);
         // `read_one`'s rule: this line can start a drop (a `docker_in` fragment over the bound),
         // and the checkpoint must then stay at its start.
@@ -4733,6 +4736,96 @@ mod tests {
         assert_eq!(hand.probe.sum("logit.input.files.truncated", &[]), 1.0);
         hand.tailer.write_checkpoint(false).await;
         assert_eq!(checkpointed_entry(&dir), (0, 0, Head::of(b"").hash));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn lines_counts_the_partial_line_emitted_at_close() {
+        let dir = scratch_dir("lines-partial-at-close");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"a\nbcd").unwrap();
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["a"]);
+        assert_eq!(hand.probe.sum("logit.input.lines", &[]), 1.0);
+        assert_eq!(hand.probe.sum("logit.input.line.bytes", &[]), 1.0);
+
+        hand.tailer.close_all_for_shutdown(&hand.fanout).await;
+        hand.tailer.flush_all(&hand.fanout, FlushReason::Shutdown).await;
+        let mut closed = Vec::new();
+        while let Ok(delivered) = hand.rx.try_recv() {
+            closed.extend(messages(&unwrap_batch(delivered).events));
+        }
+        assert_eq!(closed, vec!["bcd"]);
+        assert_eq!(hand.probe.sum("logit.input.lines", &[]), 2.0);
+        assert_eq!(hand.probe.sum("logit.input.line.bytes", &[]), 4.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `logit.input.lines` counts what the decoder is offered: a rejected line is counted, a line
+    /// the splitter dropped for length isn't, and the unterminated tail is counted at close.
+    #[tokio::test]
+    async fn lines_counts_lines_offered_to_the_decoder_not_events_emitted() {
+        /// Rejects every line that starts with `bad`, and decodes the rest as `tail_in` does.
+        struct RejectingDecoder(LineDecoder);
+        impl TailDecoder for RejectingDecoder {
+            fn decode_line(
+                &mut self,
+                line: Bytes,
+                read_at: i64,
+                out: &mut Vec<Event>,
+            ) -> Result<Arc<Resource>, logit_proto::CodecError> {
+                if line.starts_with(b"bad") {
+                    return Err(logit_proto::CodecError::Malformed("rejected".to_string()));
+                }
+                self.0.decode_line(line, read_at, out)
+            }
+            fn resource(&self) -> Arc<Resource> {
+                self.0.resource()
+            }
+        }
+        struct RejectingFactory;
+        impl DecoderFactory<RejectingDecoder> for RejectingFactory {
+            fn accept(&mut self, _path: &Path) -> bool {
+                true
+            }
+            fn open(&mut self, path: &Path) -> anyhow::Result<RejectingDecoder> {
+                Ok(RejectingDecoder(LineDecoder::new(path, Arc::new(Resource::default()))))
+            }
+        }
+
+        let dir = scratch_dir("lines-offered");
+        let path = dir.join("app.log");
+        let long = "x".repeat(40);
+        std::fs::write(&path, format!("ok1\n{long}\nbad1\nbad2\nok2\ntail")).unwrap();
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.max_line_bytes = 16;
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("test");
+        let mut tailer = Tailer::new(vec![PathPattern::new(&path)], RejectingFactory, config)
+            .with_diagnostics(diag.clone())
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        tailer.bind().await.unwrap();
+        let mut watcher = tailer.watcher.take().unwrap();
+        let (fanout, mut rx) = fanout_channel(64);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        tailer.drain(&fanout, &shutdown, &mut watcher, no_timer_due()).await;
+        tailer.close_all_for_shutdown(&fanout).await;
+        tailer.flush_all(&fanout, FlushReason::Shutdown).await;
+        let mut events = Vec::new();
+        while let Ok(delivered) = rx.try_recv() {
+            events.extend(unwrap_batch(delivered).events);
+        }
+
+        assert_eq!(messages(&events), vec!["ok1", "ok2", "tail"]);
+        assert_eq!(probe.sum("logit.input.lines", &[]), 5.0, "ok1, bad1, bad2, ok2, tail");
+        assert_eq!(probe.sum("logit.input.line.bytes", &[]), 18.0);
+        assert_eq!(diag.occurrences("long_line"), 1);
+        assert_eq!(diag.occurrences("bad_line"), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
