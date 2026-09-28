@@ -128,8 +128,8 @@ struct TrackedFile<D> {
     state: FileState,
     /// The file offset where the oldest line the decoder still holds starts
     /// ([`TailDecoder::holds_entry`]), or `None` while it holds nothing. Set by `read_one` when a
-    /// line starts a held run, cleared once the decoder holds nothing, and on a truncation or
-    /// close.
+    /// line starts a held run, cleared once the decoder holds nothing (asked after every line and
+    /// after `close`), and on a truncation.
     held_from: Option<u64>,
     /// This file's `inotify` watch, added in `Tailer::open_tracked` and removed in
     /// `Tailer::reap_drained`. `None` under `WatchMode::Poll`, or if `inotify_add_watch` failed
@@ -736,7 +736,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         for _ in 0..dropped {
             self.diag.warn_throttled(
                 "long_line",
-                "a line exceeded max_line_bytes and was dropped whole",
+                "a line exceeded the line-length bound and was dropped whole",
             );
         }
 
@@ -747,25 +747,24 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.telemetry.count("logit.input.lines", 1.0, &[]);
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
             let decoded = tracked.decoder.decode_line(line, read_at, &mut scratch);
-            // A rejected line leaves the held run as it was, so `held_from` keeps its start.
+            // Asked after every line, rejected ones included: a rejected line can flush the held
+            // run (its events are in `scratch`) or leave it, and `held_from` follows either way.
             if !tracked.decoder.holds_entry() {
                 tracked.held_from = None;
             } else if tracked.held_from.is_none() {
                 tracked.held_from = Some(line_start);
             }
-            match decoded {
-                Ok(resource) => {
-                    // No scope: a tailed line has no instrumentation scope.
-                    if let Some((batch, reason)) =
-                        tracked.accumulator.absorb(resource, None, &mut scratch)
-                    {
-                        emit(sink, &self.telemetry, batch, reason).await;
-                    }
-                }
+            let resource = match decoded {
+                Ok(resource) => resource,
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
-                    scratch.clear();
+                    tracked.decoder.resource()
                 }
+            };
+            // No scope: a tailed line has no instrumentation scope.
+            if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch)
+            {
+                emit(sink, &self.telemetry, batch, reason).await;
             }
         }
         if let Some(cp) = &mut self.checkpoint {
@@ -813,10 +812,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             if deselected {
                 // This inode is alive, only unselected (a `Draining` one may be gone and its
                 // number reused), so keep its offset for a rename back into the selection.
-                // `close_decoder` already emitted the held partial, so `pending_bytes` is left
-                // only for a line being dropped, and subtracting it resumes at that line's start.
-                let offset = tracked.offset - tracked.splitter.pending_bytes();
-                self.resume.insert(id, (tracked.path.clone(), offset));
+                // `close_decoder` emitted the held partial and the decoder's held lines. What it
+                // leaves is a line still being dropped: by the splitter (`pending_bytes`, so the
+                // boundary is that line's start) or by the decoder (`held_from`). Resume at the
+                // earlier of the two, so a rename back drops that line whole again.
+                let boundary = tracked.offset - tracked.splitter.pending_bytes();
+                let resume_at = tracked.held_from.map_or(boundary, |h| h.min(boundary));
+                self.resume.insert(id, (tracked.path.clone(), resume_at));
             }
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -857,10 +859,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// smaller of the splitter's line boundary and `held_from`, the start of the oldest line the
     /// decoder still holds. A line rejected or dropped after that held run advances `offset`
     /// without clearing it, which is why it's a position and not a byte count to subtract. A file
-    /// mid-drop checkpoints at the dropped line's start ([`LineSplitter::pending_bytes`]), so a
-    /// restart drops it whole again, at shutdown too. Otherwise, at shutdown
-    /// `close_all_for_shutdown` has already emitted both, so the offset is the file's full
-    /// `offset`.
+    /// mid-drop checkpoints at the dropped line's start ([`LineSplitter::pending_bytes`] for the
+    /// splitter, `held_from` for the decoder), so a restart drops it whole again, at shutdown
+    /// too. Otherwise, at shutdown `close_all_for_shutdown` has already emitted both, so the
+    /// offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let entries = self.files.values().map(|f| {
@@ -884,23 +886,24 @@ async fn close_decoder<D: TailDecoder>(
 
     if let Some(partial) = tracked.splitter.take_partial() {
         let partial = ensure_utf8(partial, diag);
-        match tracked.decoder.decode_line(partial, now_nanos(), &mut scratch) {
-            Ok(resource) => {
-                if let Some((batch, reason)) =
-                    tracked.accumulator.absorb(resource, None, &mut scratch)
-                {
-                    emit(sink, telemetry, batch, reason).await;
-                }
-            }
+        let resource = match tracked.decoder.decode_line(partial, now_nanos(), &mut scratch) {
+            Ok(resource) => resource,
             Err(err) => {
+                // Whatever the decoder flushed before rejecting the line is still emitted.
                 diag.warn_throttled("bad_line", err);
-                scratch.clear();
+                tracked.decoder.resource()
             }
+        };
+        if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {
+            emit(sink, telemetry, batch, reason).await;
         }
     }
 
     tracked.decoder.close(&mut scratch);
-    tracked.held_from = None;
+    // A line still being dropped survives `close`, and the checkpoint stays at its start.
+    if !tracked.decoder.holds_entry() {
+        tracked.held_from = None;
+    }
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();
         if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {

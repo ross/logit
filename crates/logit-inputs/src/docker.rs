@@ -140,46 +140,95 @@ fn split_image_ref(image: &str) -> (String, Option<String>) {
     }
 }
 
-/// A container-log line Docker's json-file driver split across entries (it writes in ~16 KiB
-/// chunks; an entry whose `log` doesn't end in `\n` is a fragment), held across
-/// [`DockerDecoder::decode_line`] calls. The emitted `timestamp`/`stream`/`attrs` are the latest
-/// entry's; one daemon call writes all the fragments in immediate succession.
+/// Where dockerd cuts a long line into json-file entries: `daemon/logger/copier.go`'s
+/// `defaultBufSize`. The json-file driver isn't a `SizedLogger`, so the copier's default applies.
+const DOCKERD_FRAGMENT_BYTES: usize = 16 * 1024;
+
+/// An envelope's bytes beyond its escaped `log`: 75 fixed (`{"log":"`, the escaped `\n`,
+/// `","stream":"stdout"`, `,"time":"`, an RFC 3339 time of at most 35 bytes, `"}`), and the
+/// container's `attrs` object (`--log-opt labels`, `env`, and `tag`) in the rest.
+const ENVELOPE_SLACK_BYTES: usize = 64 * 1024;
+
+/// The `LineSplitter` bound on one json-file line, for a message bounded by `max_line_bytes`.
+///
+/// The splitter measures the envelope, and an envelope it drops never reaches the decoder, so
+/// the bound has to pass every entry the decoder could keep: a dockerd fragment (at most
+/// [`DOCKERD_FRAGMENT_BYTES`] raw) and any entry whose `log` fits `max_line_bytes`. JSON escaping
+/// writes a raw byte as at most six (`\u00XX`), which gives `6 × max(max_line_bytes, 16 KiB)`
+/// plus [`ENVELOPE_SLACK_BYTES`].
+pub(crate) const fn envelope_cap(max_line_bytes: usize) -> usize {
+    let m = if max_line_bytes > DOCKERD_FRAGMENT_BYTES {
+        max_line_bytes
+    } else {
+        DOCKERD_FRAGMENT_BYTES
+    };
+    m.saturating_mul(6).saturating_add(ENVELOPE_SLACK_BYTES)
+}
+
+/// `stream` values by [`DockerDecoder::streams`] index.
+const STREAMS: [&str; 2] = ["stdout", "stderr"];
+
+/// A logical line dockerd cut into several json-file entries (an entry whose `log` doesn't end in
+/// `\n` is a fragment), held across [`DockerDecoder::decode_line`] calls until the entry that
+/// ends it.
+///
+/// Held per stream: dockerd copies stdout and stderr on separate goroutines
+/// (`daemon/logger/copier.go`), and json-file records no partial id or ordinal, so a stdout
+/// line's fragments and a stderr line's interleave at entry granularity. The stream is the only
+/// thing in the file that tells them apart. The emitted `timestamp` and `attrs` are the latest
+/// entry's.
 #[derive(Default)]
 struct PartialEntry {
     message: String,
     timestamp: i64,
-    stream: &'static str,
     attrs: Vec<(String, String)>,
 }
 
+/// One stream's reassembly state.
+#[derive(Default)]
+struct StreamState {
+    partial: Option<PartialEntry>,
+    /// Set once a reassembly is dropped for exceeding `max_line_bytes`: the stream's later
+    /// fragments are discarded uncounted until the entry that ends the line clears it, as in
+    /// `LineSplitter`'s `dropping`.
+    dropping: bool,
+}
+
 /// `docker_in`'s [`TailDecoder`]: decodes Docker's json-file envelope, reassembles split lines
-/// (see [`PartialEntry`]), and stamps every event with the container's resource, which
+/// per stream (see [`PartialEntry`]), and stamps every event with the container's resource, which
 /// `DockerDecoderFactory::refresh` swaps in place on an identity change. Never parses the inner
 /// application line in `log`; that is a downstream `json` transform's job.
+///
+/// `max_line_bytes` bounds the reassembled message and is checked before each append, so a held
+/// reassembly never exceeds it. A `Malformed` entry flushes every stream's held fragment as its
+/// own event before the error, so a fragment is never spliced across a rejected line; a drop in
+/// progress stays in progress.
 pub struct DockerDecoder {
     resource: Arc<Resource>,
-    partial: Option<PartialEntry>,
-    /// Set once a reassembly is dropped for exceeding `max_line_bytes`: later fragments are
-    /// discarded uncounted until the closing one clears it, as in `LineSplitter`'s `dropping`.
-    dropping: bool,
+    /// Indexed as [`STREAMS`].
+    streams: [StreamState; 2],
     max_line_bytes: usize,
     diag: Diagnostics,
 }
 
 impl DockerDecoder {
     pub(crate) fn new(resource: Arc<Resource>, max_line_bytes: usize) -> Self {
-        Self {
-            resource,
-            partial: None,
-            dropping: false,
-            max_line_bytes,
-            diag: Diagnostics::default(),
-        }
+        Self { resource, streams: Default::default(), max_line_bytes, diag: Diagnostics::default() }
     }
 
     pub(crate) fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
+    }
+
+    /// Emits every stream's held fragment as its own event, stdout first. A drop in progress is
+    /// left as it is.
+    fn flush_held(&mut self, out: &mut Vec<Event>) {
+        for (index, stream) in STREAMS.iter().enumerate() {
+            if let Some(partial) = self.streams[index].partial.take() {
+                self.emit(partial.timestamp, stream, &partial.attrs, partial.message, out);
+            }
+        }
     }
 
     fn emit(
@@ -191,10 +240,11 @@ impl DockerDecoder {
         out: &mut Vec<Event>,
     ) {
         let mut event_attrs = AttrMap::new();
-        event_attrs.insert("log.iostream", stream);
         for (k, v) in attrs {
             event_attrs.insert(k, v.as_str());
         }
+        // After `attrs`: an `attrs` key named `log.iostream` must not replace the entry's stream.
+        event_attrs.insert("log.iostream", stream);
         out.push(Event::log(
             timestamp,
             event_attrs,
@@ -211,14 +261,19 @@ impl DockerDecoder {
     }
 }
 
+/// One json-file entry. Every string is a `Cow`: `serde_json` borrows a string only when it has
+/// no escapes, and dockerd writes `<`, `>`, `&`, and control bytes as `\u00XX` in `attrs` keys and
+/// values as well as in `log`.
 #[derive(serde::Deserialize)]
 struct JsonFileLine<'a> {
     #[serde(borrow)]
     log: Cow<'a, str>,
-    stream: &'a str,
-    time: &'a str,
+    #[serde(borrow)]
+    stream: Cow<'a, str>,
+    #[serde(borrow)]
+    time: Cow<'a, str>,
     #[serde(default, borrow)]
-    attrs: Option<BTreeMap<&'a str, Cow<'a, str>>>,
+    attrs: Option<BTreeMap<Cow<'a, str>, Cow<'a, str>>>,
 }
 
 impl TailDecoder for DockerDecoder {
@@ -228,19 +283,52 @@ impl TailDecoder for DockerDecoder {
         read_at: i64,
         out: &mut Vec<Event>,
     ) -> Result<Arc<Resource>, logit_proto::CodecError> {
-        let entry: JsonFileLine = serde_json::from_slice(&line).map_err(|err| {
-            logit_proto::CodecError::Malformed(format!("docker json-file entry: {err}"))
-        })?;
-        let stream: &'static str = match entry.stream {
-            "stdout" => "stdout",
-            "stderr" => "stderr",
-            other => {
+        let entry: JsonFileLine = match serde_json::from_slice(&line) {
+            Ok(entry) => entry,
+            Err(err) => {
+                self.flush_held(out);
                 return Err(logit_proto::CodecError::Malformed(format!(
-                    "unknown docker log stream {other:?}"
-                )))
+                    "docker json-file entry: {err}"
+                )));
             }
         };
-        let timestamp = match logit_core::parse_rfc3339_to_nanos(entry.time) {
+        let index = match &*entry.stream {
+            "stdout" => 0,
+            "stderr" => 1,
+            other => {
+                let err = logit_proto::CodecError::Malformed(format!(
+                    "unknown docker log stream {other:?}"
+                ));
+                self.flush_held(out);
+                return Err(err);
+            }
+        };
+        let (text, is_complete) = match entry.log.strip_suffix('\n') {
+            Some(text) => (text, true),
+            None => (&*entry.log, false),
+        };
+
+        // Length before `time` and `attrs`: an entry discarded here never becomes an event, so it
+        // pays for neither and can't report `bad_time`.
+        let state = &mut self.streams[index];
+        if state.dropping {
+            if is_complete {
+                state.dropping = false;
+            }
+            return Ok(self.resource.clone());
+        }
+        let held_len = state.partial.as_ref().map_or(0, |p| p.message.len());
+        if held_len + text.len() > self.max_line_bytes {
+            state.partial = None;
+            state.dropping = !is_complete;
+            self.diag.warn_throttled(
+                "long_line",
+                "a docker log line exceeded max_line_bytes and was dropped whole",
+            );
+            return Ok(self.resource.clone());
+        }
+
+        let timestamp = match logit_core::parse_rfc3339_to_nanos(&entry.time) {
             Ok(ts) => ts,
             Err(_) => {
                 self.diag.warn_throttled(
@@ -252,64 +340,35 @@ impl TailDecoder for DockerDecoder {
         };
         let attrs: Vec<(String, String)> = entry
             .attrs
-            .map(|m| m.into_iter().map(|(k, v)| (k.to_string(), v.into_owned())).collect())
+            .map(|m| m.into_iter().map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
             .unwrap_or_default();
-        let is_complete = entry.log.ends_with('\n');
 
-        if self.dropping {
-            if is_complete {
-                self.dropping = false;
-            }
-            return Ok(self.resource.clone());
-        }
-
+        let state = &mut self.streams[index];
         if !is_complete {
-            let held = self.partial.get_or_insert_with(PartialEntry::default);
-            held.message.push_str(&entry.log);
+            let held = state.partial.get_or_insert_with(PartialEntry::default);
+            held.message.push_str(text);
             held.timestamp = timestamp;
-            held.stream = stream;
             held.attrs = attrs;
-            if held.message.len() > self.max_line_bytes {
-                self.diag.warn_throttled(
-                    "long_line",
-                    "a docker log line exceeded max_line_bytes and was dropped whole",
-                );
-                self.partial = None;
-                self.dropping = true;
-            }
             return Ok(self.resource.clone());
         }
-
-        let mut message = self.partial.take().map(|p| p.message).unwrap_or_default();
-        // `strip_suffix` cannot fail: `is_complete` above is exactly this check.
-        message.push_str(entry.log.strip_suffix('\n').unwrap_or(&entry.log));
-        if message.len() > self.max_line_bytes {
-            self.diag.warn_throttled(
-                "long_line",
-                "a docker log line exceeded max_line_bytes and was dropped whole",
-            );
-            return Ok(self.resource.clone());
-        }
-        self.emit(timestamp, stream, &attrs, message, out);
+        let mut message = state.partial.take().map(|p| p.message).unwrap_or_default();
+        message.push_str(text);
+        self.emit(timestamp, STREAMS[index], &attrs, message, out);
         Ok(self.resource.clone())
     }
 
     fn close(&mut self, out: &mut Vec<Event>) {
-        if let Some(partial) = self.partial.take() {
-            // Every fragment append is bounds-checked, so a held partial always fits.
-            self.emit(partial.timestamp, partial.stream, &partial.attrs, partial.message, out);
-        }
+        self.flush_held(out);
     }
 
     fn holds_entry(&self) -> bool {
-        self.partial.is_some()
+        self.streams.iter().any(|s| s.partial.is_some() || s.dropping)
     }
 
     fn reset(&mut self) {
         // Both halves: a stale `dropping` would swallow the new generation's first complete
         // entry, as a stale `partial` would splice into it.
-        self.partial = None;
-        self.dropping = false;
+        self.streams = Default::default();
     }
 
     fn resource(&self) -> Arc<Resource> {
@@ -506,6 +565,8 @@ impl DockerInput {
         config: TailConfig,
     ) -> Self {
         let pattern = PathPattern::docker_containers(root);
+        // The decoder bounds the reassembled message; the splitter only has to pass every
+        // envelope that could carry part of one.
         let factory = DockerDecoderFactory {
             filter,
             labels,
@@ -514,6 +575,7 @@ impl DockerInput {
             meta: BTreeMap::new(),
             generation: 0,
         };
+        let config = TailConfig { max_line_bytes: envelope_cap(config.max_line_bytes), ..config };
         Self { inner: Tailer::new(vec![pattern], factory, config) }
     }
 
@@ -528,7 +590,8 @@ impl DockerInput {
         self
     }
 
-    /// The configured knobs, for tests.
+    /// The driver's knobs, for tests. `max_line_bytes` is the splitter's envelope bound, which
+    /// `envelope_cap` derives from the operator's `max_line_bytes`.
     pub fn config(&self) -> &TailConfig {
         self.inner.config()
     }
@@ -795,6 +858,225 @@ mod tests {
             )
             .unwrap();
         assert!(Arc::ptr_eq(&r1, &r2), "no resource_change should ever fire within one container");
+    }
+
+    // -- per-stream reassembly, Malformed flushes, and the bound -------------------------------
+
+    /// One json-file entry on `stream` whose `log` is `log`.
+    fn entry(stream: &str, log: &str) -> Bytes {
+        Bytes::from(serde_json::json!({"log": log, "stream": stream, "time": TIME}).to_string())
+    }
+
+    const TIME: &str = "2026-08-17T19:35:46.000000000Z";
+
+    /// Each event's message and `log.iostream`.
+    fn message_streams(events: &[Event]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e.log.as_ref().unwrap().message.as_str().unwrap().to_string(),
+                    e.attributes.get("log.iostream").unwrap().as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(m, s)| (m.to_string(), s.to_string())).collect()
+    }
+
+    #[test]
+    fn a_malformed_entry_mid_reassembly_flushes_the_held_fragment_as_its_own_event() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "head-"), 0, &mut out).unwrap();
+        assert!(d.decode_line(line("not json"), 0, &mut out).is_err());
+        assert_eq!(message_streams(&out), pairs(&[("head-", "stdout")]));
+        assert!(!d.holds_entry());
+
+        out.clear();
+        d.decode_line(entry("stdout", "tail\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("tail", "stdout")]), "nothing is spliced");
+    }
+
+    #[test]
+    fn an_unknown_stream_mid_reassembly_flushes_the_held_fragment() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(entry("stderr", "head-"), 0, &mut out).unwrap();
+        let err = d.decode_line(entry("stdin", "x\n"), 0, &mut out).unwrap_err();
+        assert!(matches!(err, logit_proto::CodecError::Malformed(_)));
+        assert_eq!(message_streams(&out), pairs(&[("head-", "stderr")]));
+        assert!(!d.holds_entry());
+    }
+
+    #[test]
+    fn a_malformed_entry_flushes_both_streams_held_fragments_stdout_first() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(entry("stderr", "e-"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "o-"), 0, &mut out).unwrap();
+        assert!(d.decode_line(line("{\"log\":"), 0, &mut out).is_err());
+        assert_eq!(message_streams(&out), pairs(&[("o-", "stdout"), ("e-", "stderr")]));
+    }
+
+    #[test]
+    fn a_malformed_entry_while_dropping_leaves_the_drop_in_place() {
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "0123456789ABCDEF"), 0, &mut out).unwrap();
+        assert!(d.decode_line(line("not json"), 0, &mut out).is_err());
+        assert!(out.is_empty());
+        assert!(d.holds_entry(), "the drop is still in progress");
+        d.decode_line(entry("stdout", "rest\n"), 0, &mut out).unwrap();
+        assert!(out.is_empty(), "the dropped line's closing entry is discarded, not emitted");
+        d.decode_line(entry("stdout", "ok\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("ok", "stdout")]));
+    }
+
+    /// dockerd copies stdout and stderr on separate goroutines, so their fragments interleave.
+    #[test]
+    fn interleaved_stdout_and_stderr_fragments_reassemble_per_stream() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "a"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "b\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "c\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("b", "stderr"), ("ac", "stdout")]));
+    }
+
+    #[test]
+    fn an_oversized_stdout_reassembly_does_not_swallow_a_stderr_line() {
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "0123456789ABCDEF"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "err\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "still dropping\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "ok\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("err", "stderr"), ("ok", "stdout")]));
+    }
+
+    #[test]
+    fn a_completed_message_over_max_line_bytes_is_dropped_on_the_closing_entry() {
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "12345"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "678901\n"), 0, &mut out).unwrap();
+        assert!(out.is_empty(), "11 bytes reassembled is over the 10-byte bound");
+        assert!(!d.holds_entry(), "the closing entry ends the line: nothing left to drop");
+        d.decode_line(entry("stdout", "1234567890\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("1234567890", "stdout")]), "10 bytes fits");
+    }
+
+    #[test]
+    fn an_attrs_key_named_log_iostream_does_not_override_the_stream() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(
+            line(&format!(
+                r#"{{"log":"hi\n","stream":"stderr","time":"{TIME}","attrs":{{"log.iostream":"stdout","k":"v"}}}}"#
+            )),
+            0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("hi", "stderr")]));
+        assert_eq!(out[0].attributes.get("k").and_then(|v| v.as_str()), Some("v"));
+    }
+
+    /// dockerd writes `&`, `<`, and `>` as `\u00XX`, and `serde_json` can't borrow an escaped
+    /// string, so a borrowed `&str` key would reject every line of such a container.
+    #[test]
+    fn an_escaped_attrs_key_decodes_instead_of_rejecting_the_line() {
+        let mut d = decoder();
+        let mut out = Vec::new();
+        d.decode_line(
+            line(&format!(
+                r#"{{"log":"hi\n","stream":"stdout","time":"{TIME}","attrs":{{"a&b":"<v>","a\"b":"q","a\nb":"n"}}}}"#
+            )),
+            0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("hi", "stdout")]));
+        let attrs = &out[0].attributes;
+        assert_eq!(attrs.get("a&b").and_then(|v| v.as_str()), Some("<v>"));
+        assert_eq!(attrs.get("a\"b").and_then(|v| v.as_str()), Some("q"));
+        assert_eq!(attrs.get("a\nb").and_then(|v| v.as_str()), Some("n"));
+    }
+
+    /// While a line is being dropped, a checkpoint must not land inside it, so the decoder still
+    /// reports it as held.
+    #[test]
+    fn holds_entry_stays_true_while_dropping_until_the_closing_fragment() {
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "0123456789ABCDEF"), 0, &mut out).unwrap();
+        assert!(d.holds_entry());
+        d.decode_line(entry("stdout", "more"), 0, &mut out).unwrap();
+        assert!(d.holds_entry());
+        d.decode_line(entry("stdout", "end\n"), 0, &mut out).unwrap();
+        assert!(!d.holds_entry());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn close_emits_held_fragments_but_keeps_a_drop_in_progress() {
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), 10);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "0123456789ABCDEF"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "e-"), 0, &mut out).unwrap();
+        d.close(&mut out);
+        assert_eq!(message_streams(&out), pairs(&[("e-", "stderr")]));
+        assert!(d.holds_entry(), "the stdout drop outlives close");
+    }
+
+    #[test]
+    fn bad_time_is_not_reported_for_entries_discarded_while_dropping() {
+        let diag = Diagnostics::new("test");
+        let mut d =
+            DockerDecoder::new(Arc::new(Resource::default()), 10).with_diagnostics(diag.clone());
+        let mut out = Vec::new();
+        let bad = |log: &str| {
+            Bytes::from(
+                serde_json::json!({"log": log, "stream": "stdout", "time": "nope"}).to_string(),
+            )
+        };
+        d.decode_line(bad("0123456789ABCDEF"), 0, &mut out).unwrap();
+        d.decode_line(bad("more"), 0, &mut out).unwrap();
+        d.decode_line(bad("end\n"), 0, &mut out).unwrap();
+        assert_eq!(diag.occurrences("bad_time"), 0);
+        assert_eq!(diag.occurrences("long_line"), 1);
+        d.decode_line(bad("ok\n"), 7, &mut out).unwrap();
+        assert_eq!(diag.occurrences("bad_time"), 1);
+        assert_eq!(out[0].timestamp, 7);
+    }
+
+    /// The worst envelope dockerd can write for one fragment fits the splitter's bound: 16 KiB of
+    /// bytes it escapes six to one, the longest RFC 3339 time, `stderr`, and `attrs` filling the
+    /// slack.
+    #[test]
+    fn envelope_cap_covers_a_fully_escaped_dockerd_fragment() {
+        let time = "2026-08-17T19:35:46.529536683+05:00";
+        assert_eq!(time.len(), 35);
+        let log = format!("{}\n", "<".repeat(DOCKERD_FRAGMENT_BYTES));
+        let bare = crate::docker_verification::envelope("stderr", &log, time, &[]);
+        assert_eq!(bare.len(), 6 * DOCKERD_FRAGMENT_BYTES + 75);
+        // `,"attrs":{"k":"<value>"}` is 17 bytes around the value.
+        let value = "v".repeat(ENVELOPE_SLACK_BYTES - 77 - 17);
+        let full = crate::docker_verification::envelope("stderr", &log, time, &[("k", &value)]);
+        assert_eq!(full.len(), bare.len() + ENVELOPE_SLACK_BYTES - 77);
+        assert!(full.len() <= envelope_cap(1), "{} > {}", full.len(), envelope_cap(1));
+
+        let mut splitter = crate::tail::LineSplitter::new(envelope_cap(1));
+        let mut lines = Vec::new();
+        let stats = splitter.push(Bytes::from(format!("{full}\n")), |l, _| lines.push(l));
+        assert_eq!(stats.dropped_lines, 0);
+        let mut d = DockerDecoder::new(Arc::new(Resource::default()), DOCKERD_FRAGMENT_BYTES);
+        let mut out = Vec::new();
+        d.decode_line(lines.pop().unwrap(), 0, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
     }
 
     // -- split_image_ref / ContainerMeta / ContainerFilter -------------------------------------
@@ -1657,15 +1939,14 @@ mod tests {
         let id = "9".repeat(64);
         let log_path = container(&root, &id, "web", "nginx:1.25");
 
-        // Three unterminated fragments, each under 200 bytes so the splitter passes them, whose
-        // reassembly passes `max_line_bytes` (200) and leaves the decoder `dropping`.
+        // Three unterminated fragments whose reassembly passes `max_line_bytes` (200) and leaves
+        // the decoder `dropping`.
         let fragment = "y".repeat(80);
         let mut gen1 = String::new();
         for i in 0..3 {
             let entry = format!(
                 r#"{{"log":"{fragment}-{i}","stream":"stdout","time":"2026-08-17T19:35:46.00000000{i}Z"}}"#
             );
-            assert!(entry.len() < 200, "one envelope line must stay under max_line_bytes: {entry}");
             gen1.push_str(&entry);
             gen1.push('\n');
         }
@@ -1824,36 +2105,53 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A line the decoder rejects, read after a held fragment, advances the file offset past the
-    /// held run without clearing it. The checkpoint still stops at the fragment's start, and the
-    /// closing fragment then emits the whole message once.
+    /// A line the decoder rejects, read after a held fragment, flushes the fragment as its own
+    /// event, and the checkpoint moves past both once nothing is held. The closing fragment then
+    /// arrives alone and is emitted as its own message.
     #[tokio::test]
-    async fn a_rejected_line_between_held_fragments_and_the_tail_never_moves_the_checkpoint_into_the_held_run(
-    ) {
-        let (root, log, checkpoint, head_start, config) =
-            fragment_fixture("docker-held-rejected", "this is not a json-file entry\n");
-        assert_held_run_bounds_the_checkpoint(root, log, checkpoint, head_start, config).await;
+    async fn a_rejected_line_after_a_held_fragment_emits_it_and_releases_the_checkpoint() {
+        let rejected = "this is not a json-file entry\n";
+        let (root, log, checkpoint, whole_len, config) =
+            fragment_fixture("docker-held-rejected", rejected);
+        let head_len = json_file_line("head-").len() as u64;
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let running = spawn_input(input, fanout).await;
+
+        assert_eq!(messages(&recv_events(&mut rx, 2).await), vec!["whole", "head-"]);
+        assert_eq!(
+            first_nonzero_checkpoint(&checkpoint).await,
+            whole_len + head_len + rejected.len() as u64,
+            "nothing is held once the rejected line flushed the fragment"
+        );
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(json_file_line("tail\n").as_bytes())
+            .unwrap();
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["tail"]);
+
+        running.stop().await;
+        std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A line the splitter drops for exceeding `max_line_bytes`, read after a held fragment, never
-    /// reaches the decoder. The checkpoint still stops at the fragment's start.
+    /// A json-file line the splitter drops as over `envelope_cap`, read after a held fragment,
+    /// never reaches the decoder, and the checkpoint still stops at the fragment's start. It pins
+    /// the gap in `docs/known-gaps.md`'s "An envelope over the cap is dropped by the splitter"
+    /// entry: a splitter-dropped envelope is invisible to the decoder, so the held fragment and
+    /// the next closing entry are joined across it.
     #[tokio::test]
     async fn an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start(
     ) {
-        let oversized = format!("{}\n", "x".repeat(300));
+        let oversized = format!("{}\n", "x".repeat(envelope_cap(200) + 1));
         let (root, log, checkpoint, head_start, mut config) =
             fragment_fixture("docker-held-oversized", &oversized);
         config.max_line_bytes = 200;
-        assert_held_run_bounds_the_checkpoint(root, log, checkpoint, head_start, config).await;
-    }
 
-    async fn assert_held_run_bounds_the_checkpoint(
-        root: PathBuf,
-        log: PathBuf,
-        checkpoint: PathBuf,
-        head_start: u64,
-        config: TailConfig,
-    ) {
         let (fanout, mut rx) = fanout_channel(8);
         let input =
             DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
@@ -1878,6 +2176,176 @@ mod tests {
             .await;
 
         running.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- the envelope bound and a drop in progress, end to end --
+
+    /// One json-file line (with its `\n`) as dockerd escapes it.
+    fn docker_line(stream: &str, log: &str) -> String {
+        format!("{}\n", crate::docker_verification::envelope(stream, log, TIME, &[]))
+    }
+
+    /// Appends `text` to `path`.
+    fn append(path: &Path, text: &str) {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+
+    /// `max_line_bytes` bounds the message, not the envelope: three fragments of 300 `<`, each
+    /// escaped to an 1.8 KiB envelope, reassemble into one 900-byte message under a 1 KiB bound.
+    #[tokio::test]
+    async fn a_fragment_envelope_larger_than_max_line_bytes_still_reaches_the_decoder() {
+        let root = scratch_dir("docker-envelope-cap");
+        let log = container(&root, &"c".repeat(64), "esc", "nginx:1.25");
+        let piece = "<".repeat(300);
+        let fragment = docker_line("stdout", &piece);
+        assert!(fragment.len() > 1024, "each envelope must exceed max_line_bytes");
+        std::fs::write(
+            &log,
+            format!("{fragment}{fragment}{}", docker_line("stdout", &format!("{piece}\n"))),
+        )
+        .unwrap();
+
+        let mut config = fast_tail_config();
+        config.max_line_bytes = 1024;
+        let (fanout, mut rx) = fanout_channel(8);
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+        let running = spawn_input(input, fanout).await;
+
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["<".repeat(900)]);
+
+        running.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A 16 KiB fragment over a 1 KiB bound drops the whole line in the decoder, closing entry
+    /// included. Were the splitter to drop the fragment's envelope, the decoder would never see it
+    /// and would emit the closing `xyz` as a line of its own.
+    #[tokio::test]
+    async fn a_16_kib_dockerd_fragment_over_a_small_max_line_bytes_drops_the_whole_line_not_just_its_tail(
+    ) {
+        let root = scratch_dir("docker-envelope-drop");
+        let log = container(&root, &"d".repeat(64), "big", "nginx:1.25");
+        std::fs::write(
+            &log,
+            format!(
+                "{}{}",
+                docker_line("stdout", &"a".repeat(DOCKERD_FRAGMENT_BYTES)),
+                docker_line("stdout", "xyz\n")
+            ),
+        )
+        .unwrap();
+
+        let mut config = fast_tail_config();
+        config.max_line_bytes = 1024;
+        let diag = Diagnostics::new("docker-envelope-drop");
+        let (fanout, mut rx) = fanout_channel(8);
+        let input =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_diagnostics(diag.clone());
+        let running = spawn_input(input, fanout).await;
+
+        wait_until("the oversized line to be dropped", || diag.occurrences("long_line") >= 1).await;
+        append(&log, &docker_line("stdout", "ok\n"));
+        assert_eq!(
+            messages(&recv_events(&mut rx, 1).await),
+            vec!["ok"],
+            "the dropped line's closing entry must not be emitted ahead of the next line"
+        );
+        assert_eq!(diag.occurrences("long_line"), 1, "one line dropped, once");
+
+        running.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A crash while a line is being dropped, then its closing entry, then a restart: the
+    /// checkpoint stayed at the dropped line's start, so the restart drops it whole again instead
+    /// of emitting its closing entry as a message.
+    #[tokio::test]
+    async fn a_crash_mid_drop_does_not_emit_the_dropped_lines_tail_after_restart() {
+        let root = scratch_dir("docker-crash-mid-drop");
+        let log = container(&root, &"e".repeat(64), "drop", "nginx:1.25");
+        let whole = json_file_line("whole\n");
+        let fragment = json_file_line(&"y".repeat(80));
+        std::fs::write(&log, format!("{whole}{fragment}{fragment}{fragment}")).unwrap();
+        let checkpoint = root.join("checkpoint.json");
+        let mut config = fast_tail_config();
+        config.checkpoint_path = Some(checkpoint.clone());
+        config.checkpoint_interval = Duration::from_millis(30);
+        config.max_line_bytes = 200;
+
+        let diag = Diagnostics::new("docker-crash-mid-drop");
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        )
+        .with_diagnostics(diag.clone());
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        wait_until("the third fragment to start the drop", || diag.occurrences("long_line") >= 1)
+            .await;
+        assert_eq!(
+            first_nonzero_checkpoint(&checkpoint).await,
+            whole.len() as u64,
+            "the checkpoint must stay at the dropped line's first fragment"
+        );
+        running.handle.abort();
+        let _ = running.handle.await;
+
+        append(&log, &json_file_line("end\n"));
+
+        let diag2 = Diagnostics::new("docker-crash-mid-drop-2");
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_diagnostics(diag2.clone());
+        let running2 = spawn_input(input2, fanout2).await;
+        wait_until("the restart to drop the line again", || diag2.occurrences("long_line") >= 1)
+            .await;
+        append(&log, &json_file_line("ok\n"));
+        assert_eq!(
+            messages(&recv_events(&mut rx2, 1).await),
+            vec!["ok"],
+            "the dropped line's closing entry must not surface as a message"
+        );
+        running2.stop().await;
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// At shutdown the splitter hands the decoder a torn last envelope, which it rejects; the
+    /// fragment held before it is still emitted.
+    #[tokio::test]
+    async fn a_torn_envelope_at_shutdown_still_emits_the_held_fragment() {
+        let root = scratch_dir("docker-torn-shutdown");
+        let log = container(&root, &"7".repeat(64), "torn", "nginx:1.25");
+        std::fs::write(&log, format!("{}{{\"log\":\"ta", json_file_line("head-"))).unwrap();
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            fast_tail_config(),
+        )
+        .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
+        probe
+            .wait_for("the fragment's line to be read", |t| t.sum("logit.input.lines", &[]) >= 1.0)
+            .await;
+
+        running.stop().await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-"]);
         std::fs::remove_dir_all(&root).ok();
     }
 }

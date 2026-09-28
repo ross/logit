@@ -17,6 +17,10 @@ use std::sync::Arc;
 /// UTF-8 (the driver's `ensure_utf8`). `read_at` is when the line was read, not necessarily the
 /// event's timestamp: `docker_in` uses the envelope's own `time` and falls back to `read_at` only
 /// when that's unparseable.
+///
+/// A decoder may push events to `out` and then return `Err`: held state it flushed because the
+/// rejected line ended a run. The driver still emits those events, under
+/// [`TailDecoder::resource`].
 pub trait TailDecoder: Send {
     fn decode_line(
         &mut self,
@@ -27,12 +31,13 @@ pub trait TailDecoder: Send {
 
     /// The file is closing (rotated away, removed, or shutdown): emit anything held across lines,
     /// such as `docker_in`'s unfinished partial-entry reassembly. An unterminated last line is
-    /// [`LineSplitter::take_partial`]'s job, not this. Default: nothing held.
+    /// [`LineSplitter::take_partial`]'s job, not this. A line being dropped stays dropped: `close`
+    /// emits held lines only. Default: nothing held.
     fn close(&mut self, _out: &mut Vec<Event>) {}
 
-    /// Whether this decoder holds complete lines it hasn't produced events for yet: what
-    /// [`TailDecoder::close`] would emit. The driver records where the oldest such line starts
-    /// and never checkpoints past it. Default: nothing held.
+    /// Whether this decoder holds lines it hasn't produced events for yet, or is discarding the
+    /// rest of a line it began dropping. The driver records where the oldest such line starts and
+    /// never checkpoints past it. Default: nothing held.
     fn holds_entry(&self) -> bool {
         false
     }

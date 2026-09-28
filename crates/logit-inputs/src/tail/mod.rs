@@ -18,6 +18,8 @@ mod line_verification;
 mod pattern;
 mod watch;
 
+#[cfg(test)]
+pub(crate) use line::LineSplitter;
 pub use line::{LineDecoder, TailDecoder};
 pub use pattern::PathPattern;
 
