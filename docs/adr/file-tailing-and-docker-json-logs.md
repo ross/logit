@@ -506,8 +506,15 @@ of a pattern's directory, or a `stat` failure other than `NotFound` on a discove
 nothing: the file keeps its state, the failure is counted
 `logit.input.scan.errors{op="read_dir"|"stat"}` and diagnosed `scan_error`, and the next scan
 decides. Read as a removal, the failure would drain every file under the pattern, reap it at EOF, and
-replay it from `0` on the next good scan. The per-operation rule, including
+replay it from `0` on the next good scan. A directory that doesn't exist is an empty listing, not a failure. A kept file is still checked
+through its open handle for removal and truncation. The per-operation rule, including
 `docker_in`'s per-entry unknowns, is decision 1 of the new ADR.
+
+**Unconsumed checkpoint entries are persisted.** "Checkpoints" says a write persists only the
+tracked files, so pruning "falls out of the write contract". A write now also persists every
+resume entry no scan has consumed, until the ADR's per-entry rule prunes it. Otherwise a listing
+that fails at startup, followed by one checkpoint write, would drop the entry of a file that was
+never opened, and a restart under `read_from: end` would skip its data.
 
 **Truncation detection is size-only.** A truncation is `len < offset` at the moment a scan or a
 read sees the length. A `copytruncate` that the writer refills past the old offset before that

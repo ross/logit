@@ -63,89 +63,101 @@ A failed listing retires nothing. A resume trusts an inode only after the file's
 the checkpoint recorded. The verification is a state-machine proptest on the real filesystem, with
 the fault seam extended to reads. Each numbered item is one decision a reviewer can check.
 
-1. **A failed listing is no information.** `PathPattern::scan` returns `Result<Scan, io::Error>`.
-   The rule, per operation:
+1. **A failed listing is no information.** `PathPattern::scan` returns `Result<Scan, io::Error>`,
+   and `pattern.rs`'s module doc holds the canonical error-to-outcome table. The rule, in prose:
 
-   - **`read_dir` of a pattern's directory fails (either matcher).** `scan` returns `Err`.
-     `Tailer::scan` records the pattern's directory in `failed_dirs`. No path under that
-     directory (`tail_in`) or that `root` (`docker_in`) is retired in this scan.
-   - **`docker_in`'s per-entry work fails.** In `scan_docker_containers`, a `file_type()` error
-     on a `root` entry, or a `metadata` error other than `NotFound` on the built log path, pushes
-     the path to `Scan::unknown` instead of skipping it. A `NotFound` `metadata` is an ordinary
-     absence: the container has no log file, and the path is in neither list.
-   - **`stat` of a discovered path fails in `Tailer::scan`.** A `NotFound` is an ordinary
-     absence and the path is treated as not discovered. Any other error puts the path in
-     `unknown`.
+   - **A directory that isn't there is an empty listing, not an error.** A `read_dir` that fails
+     `NotFound` or `NotADirectory` is the "not there yet" case `docs/deploying.md` describes. It
+     is a successful empty listing and counts nothing.
+   - **Any other `read_dir` failure fails that pattern's listing.** So does an error from the
+     `ReadDir` iterator part-way through. `scan` returns `Err`, and `Tailer::scan` records the
+     pattern's directory in `failed_dirs`. No path under that directory (`tail_in`) or that
+     `root` (`docker_in`) is retired in this scan.
+   - **A per-path `stat` has three outcomes.** `NotFound` or `NotADirectory` means absent. Any
+     other error means unknown, and an unknown path retires nothing.
+   - **`docker_in`'s per-entry work.** In `scan_docker_containers`, a `file_type()` error on a
+     `root` entry, or a `metadata` error other than absent on the built log path, pushes the
+     path to `Scan::unknown` instead of skipping it. `ELOOP` on a container directory is
+     unknown: the file stays tracked and the error is diagnosed.
 
-   `Tailer::scan` builds `discovered` as before and an `unknown: HashSet<PathBuf>` holding every
-   path from a pattern's `Scan::unknown` plus every discovered path whose `stat` failed with
-   anything but `NotFound`. The stale pass retires a `by_path` key only if it isn't in `unknown`
-   and its parent (`tail_in`) or its `root` prefix (`docker_in`) isn't in `failed_dirs`. A file
-   that isn't retired stays in its current state: `Active` keeps being read, and `Draining` keeps
-   draining.
+   `Tailer::scan` builds `discovered` and an `unknown: HashSet<PathBuf>` holding every path from
+   a pattern's `Scan::unknown` plus every discovered path whose `stat` was unknown. The stale
+   pass retires a `by_path` key only if it isn't in `unknown` and its parent (`tail_in`) or its
+   `root` prefix (`docker_in`) isn't in `failed_dirs`. Each failure is counted once per scan per
+   operation, as `logit.input.scan.errors{op="read_dir"|"stat"}`, and diagnosed `scan_error`
+   through `warn_throttled`.
 
-   Each failure is counted once per scan per operation, as
-   `logit.input.scan.errors{op="read_dir"|"stat"}`, and diagnosed `scan_error` through
-   `warn_throttled`. A scan that had any failure doesn't prune `resume` (decision 4).
+   - **A file kept only because its listing failed or its stat was unknown is still checked
+     through its open handle.** The driver runs `fstat` on it: a link count of 0 means it was
+     removed, so it drains; otherwise its length is checked for truncation. Without the check, a
+     `copytruncate` under an unreadable directory goes unseen and the refilled file's first bytes
+     are skipped.
+   - **`docker_in` keeps the metadata-cache entry of a container kept this way**
+     (`DecoderFactory::retain`), so recovery reports no spurious identity change.
+   - **`read_from: end` applies only to files found by the bind-time scan.** A file first listed
+     after that listing failed starts at its beginning: duplicates over loss, the choice the
+     2026-09-24 amendment to the tailing ADR makes for an unusable checkpoint.
 
    The rule is per pattern and per path, not "skip the whole stale pass on any error". One
    persistently unreadable directory under one pattern would then block retirement under every
    other pattern, and a removed file under a healthy pattern would stay open for as long as
    the other directory failed.
 
-2. **Resume identity is `(dev, ino)` plus a head fingerprint.** A checkpoint entry and a
-   de-selection retention each carry a `Head { len, hash }`: `len` is the number of leading bytes
-   hashed, `min(256, file length)`, and `hash` is XXH64 with seed 0 (`twox-hash`, already
-   pinned in the workspace) over them. `head_of(&std::fs::File)` reads them with one
-   `read_at(0, 256)`; a positional read doesn't move the file's cursor.
+2. **Resume identity is `(dev, ino)` plus a head fingerprint the tailer captures as it reads.**
+   `TrackedFile` keeps the file's first `min(256, offset)` bytes as it reads them, and clears
+   them on a truncation. A checkpoint entry and a de-selection retention carry `head_len` (at
+   most 256) and `head_hash`, XXH64 with seed 0 (`twox-hash`, already pinned in the workspace)
+   over those bytes. Nothing reads the file for the fingerprint: no second descriptor and no
+   extra read, and the head is from the same generation of the file as the offset it is paired
+   with.
 
-   - **Where the head comes from.** `TrackedFile` keeps a `std::fs::File` from `try_clone()`
-     taken at open, so `write_checkpoint` and the `Deselected` branch of `reap_drained` compute
-     the head without touching the read handle.
-   - **Where it's checked.** `open_tracked`, for `StartOffset::Resume`, computes `head_of` on
-     the file it opened and compares it with the retained head before the seek. Equal
-     means resume at the offset. Not equal means start at `0`, count
-     `logit.input.files.resume_rejected`, and diagnose `resume_rejected`. An offset past the
-     file's length stays a plain restart at `0`, unchanged.
-   - **What it proves.** The fingerprint covers `min(offset, 256)` bytes of the skipped range.
-     For a file at most 256 bytes long, every byte a resume would skip is verified. Past that,
-     two different files that share 256 identical leading bytes on a recycled inode are the
-     accepted residual, recorded in `docs/known-gaps.md`. Log files that start with a
-     timestamp or a per-file header make the case unlikely, and the failure is bounded to one
-     file's skipped range.
-   - **Why the head.** A file that only grows never changes its first bytes, so an appended
-     file keeps its fingerprint across every checkpoint and the check has no false rejection.
-     The head changes only when the file's content was replaced or truncated and refilled,
-     which is a resume that must not seek.
+   - **Resume accepts iff all three hold:** the current file is at least `head_len` long, its
+     first `head_len` bytes hash to `head_hash`, and the offset is at most the current length.
+     Any one failing is a single `logit.input.files.resume_rejected`, diagnosed
+     `resume_rejected`, and the file starts at `0`. An offset past the file's length is
+     therefore counted. The check runs in `open_tracked` before the seek.
+   - **What it proves.** An append-only file never changes its first bytes and only grows, so
+     it is never falsely rejected. A recycled inode is accepted only if its new content shares
+     the first `min(256, offset)` bytes with the old file. For an offset of at most 256, that
+     means every skipped byte is identical content. Past 256, two files that share their first
+     256 bytes on a recycled inode are the accepted residual in `docs/known-gaps.md`.
+   - **A copytruncate-and-refill that the size check missed fails this check at restart.** The
+     refilled file's head no longer matches, so it replays instead of skipping.
+   - **A resume entry is spent only once the file is tracked.** That is after the open, the
+     inode check, the head check, the seek, and the decoder open all succeed, so a transient
+     open failure doesn't replay. The opened descriptor's `(dev, ino)` is compared with the
+     scanned one, and a mismatch (a rotation between `stat` and `open`) leaves the entry for the
+     next scan.
    - **Why not the path.** A rotation while `logit` is down, under `app.log*`, is a supported
      resume: the inode's path is now `app.log.1`, and its offset is still right ([ADR
      `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md)'s "Rotation and
      truncation" section). A path-must-match rule would replay it.
 
-3. **Checkpoint format version 2, with no version 1 reader.** `CheckpointEntry` gains `head_len`
-   and `head_hash`, and `CHECKPOINT_VERSION` becomes `2`. The in-memory `resume` becomes a map
+3. **Checkpoint format version 2, with no version 1 reader.** An entry's fields are `dev`, `ino`,
+   `path`, `offset`, `head_len`, and `head_hash`, and `CHECKPOINT_VERSION` becomes `2`. The hash
+   and `HEAD_BYTES` (256) are part of the format: changing either is a version bump. The loader
+   probes the version before the full parse, so a version 1 file reads as "unsupported version
+   1", not "malformed"; a `head_len` over 256 is malformed. Either is `Loaded::Unusable`: every
+   file present at the first scan replays from `0`, the path the 2026-09-24 amendment defines,
+   counted `logit.input.checkpoint.errors{op="load"}`. Logit is pre-release, so no version 1
+   reader is kept, and upgrading replays every file once. The in-memory `resume` becomes a map
    from `FileId` to `Retained { path, offset, head, source }`, where `source` is `Checkpoint` or
-   `Deselected`. A version 1 file is `Loaded::Unusable`: every file present at the first scan
-   replays from `0`, the path the 2026-09-24 amendment to the tailing ADR already defines,
-   counted `logit.input.checkpoint.errors{op="load"}`. Logit is pre-release, so no reader
-   for version 1 is kept; one release replays once.
+   `Deselected`.
 
-4. **Eviction.** A retained entry lives only as long as something can still consume it.
+4. **Eviction is per entry.** A retained entry lives only as long as something can still
+   consume it, and a listing that failed can't say that it can't.
 
-   - **Checkpoint entries.** `Tailer` carries `checkpoint_pruned: bool`. At the end of the
-     first scan in which every listing succeeded (`failed_dirs` is empty, the first scan has
-     run, and `checkpoint_pruned` is clear), every `Retained` with `source: Checkpoint` still in
-     `resume` is removed and the flag is set. Such an entry names a file that no pattern
-     discovered, so nothing can consume it, and a later inode reuse must not find it. A
-     permanently failing directory keeps the entries unpruned, which is bounded by the
-     checkpoint's size at startup and never grows.
-   - **De-selection retentions.** Every scan removes each `Retained` with `source: Deselected`
-     whose `path` is in neither `discovered` nor `unknown`. A container that is renamed out of
-     `containers:` and back within the same process still resumes; one whose path is gone
-     (removed, or its directory failed to list and later listed clean without it) doesn't
-     leave an entry behind for a recycled inode.
-   - **Spent entries.** An entry is removed when `accept` takes it, before `File::open`. An
-     open failure therefore costs a replay, not a loss, and this ADR keeps it.
+   - **Unconsumed checkpoint entries persist.** Every checkpoint write persists them until they
+     are pruned, alongside the tracked files. A write that persisted only tracked files would
+     lose the entry of a file whose listing failed at startup, and a restart under
+     `read_from: end` would then skip data.
+   - **A checkpoint entry is dropped** when its stored path's listing succeeded, its `stat`
+     wasn't unknown, and its inode wasn't discovered in this scan. Checkpoint entries are pruned
+     after the discovery loop.
+   - **A de-selection retention is dropped** when its path is neither unknown nor under a failed
+     listing, and is either not discovered or discovered with a different inode. Retentions are
+     pruned before the discovery loop, so a container renamed out of `containers:` and back
+     within the process still resumes.
 
 5. **Verification method.**
 
@@ -180,8 +192,11 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **Resume only if the path matches.** Rejected. A rotation while `logit` is down under
   `app.log*` is a supported resume, and path-must-match would replay it (decision 2).
 - **A whole-file or offset-dependent fingerprint.** Rejected. Hashing the bytes up to the
-  offset re-reads the file at every checkpoint, and the hash changes on every append. A
-  `min(256, len)` head is one positional read and stable for an append-only file.
+  offset re-reads the file at every checkpoint, and the hash changes on every append. A head
+  capped at 256 bytes is stable for an append-only file.
+- **A fingerprint read from the file at checkpoint time (`pread` on a cloned descriptor).**
+  Rejected. It costs a second descriptor per tracked file and a blocking read per dirty tick,
+  and it can pair a head from one generation of the file with an offset from another.
 - **A filesystem trait for tests.** Rejected. The oracle for rotation and inode behavior is the
   real filesystem; `Watcher::Poll` and hand-driven `scan`/`drain` already are the seam.
 - **A committed test that shells out to `logrotate`.** Rejected. It adds a package to the dev
@@ -201,14 +216,15 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   `resume_rejected` are documented in `docs/design/internal-telemetry.md`. The same section
   gains the `truncated` key the driver already emits.
 - **A transient listing error costs one diagnostic, not a replay.** A file whose path is removed
-  while its directory can't be listed stays open until a listing succeeds and no longer names
-  it. A tail that was `Active` is still read.
-- **A recycled inode is a replay, not a skip.** Except for the 256-byte residual.
+  while its directory can't be listed stays open until a listing succeeds and no longer names it,
+  or until its handle shows a link count of 0. An `Active` file is still read.
+- **A recycled inode, or a truncate-and-refill, is a replay, not a skip.** Except for the
+  256-byte residual.
 - **One release replays once.** The checkpoint version bump makes every existing checkpoint
   `Unusable`, so every file present at the first scan after the upgrade replays from `0`.
-- **`write_checkpoint` does one more positional read per tracked file per write.** It runs on
-  the checkpoint interval and only when the store is dirty; a measurement on many thousands of
-  tracked files belongs to the perf follow-up.
+- **A file's head costs a small buffer per tracked file** and one hash per checkpoint write,
+  with no extra I/O. A measurement on many thousands of tracked files belongs to the perf
+  follow-up.
 - **The fault seam is no longer mutation-only.** Every new `read_dir` or `metadata` call on the
   tail scan path needs a `fault::check` before it.
 - **Documented gaps, not fixes.** Copytruncate fast refill, the 256-byte residual, the

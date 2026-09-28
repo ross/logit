@@ -1030,7 +1030,7 @@ own read-side counters:
 | `logit.input.files.open` | gauge | sampled after every `scan` |
 | `.files.rotated` / `.files.truncated` | count | a new inode at a known path, or the same inode shrinking |
 | `.scan.errors{op="read_dir"\|"stat"}` | count | a failed listing or `stat` in a `scan`, once per scan per operation. A failure retires no tracked file: `read_dir` is a pattern's directory, `stat` a discovered path that failed with anything but `NotFound`. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
-| `.files.resume_rejected` | count | a resume whose file's head no longer matches the fingerprint the checkpoint (or a de-selection retention) recorded, so the file starts at `0` instead. Decision 2 of the same ADR |
+| `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes hash differently, or the offset is past its length. The fingerprint comes from a checkpoint entry or a de-selection retention. Decision 2 of the same ADR |
 | `.checkpoint.writes` | count | only on an actual write; `checkpoint_interval` ticks that find nothing dirty record nothing |
 | `.checkpoint.errors{op="load"\|"write"}` | count | `load`: a checkpoint present but unusable at startup (unreadable, malformed, empty, wrong version, or missing beside a stray `.tmp`), after which every file present starts at its beginning; `write`: a failed durable write, retried on the next tick |
 | `.watch.wakes{source="inotify"\|"poll"}` | count | which wake source fired |
@@ -1053,7 +1053,7 @@ the property the minimal-watch-set design is for.
 | `open_error` / `read_error` | A file this driver is trying to track. |
 | `renamed` | A same-inode rebind following a *file* rename. Not the same as `docker_in`'s `container_renamed`, which is the same file with a new identity. |
 | `scan_error` | A `scan`'s `read_dir` or `stat` failed, carrying the path and the errno. One per `.scan.errors` point. |
-| `resume_rejected` | A resume whose head fingerprint didn't match, naming the path and the offset it would have sought to. One per `.files.resume_rejected` point. |
+| `resume_rejected` | A resume refused (a short file, a head mismatch, or an offset past the end), naming the path and the offset it would have sought to. One per `.files.resume_rejected` point. |
 | `truncated` | A tracked file whose length fell below the tracked offset, so it restarts at `0` with its splitter and decoder state reset. One per `.files.truncated` point; the message carries the pre-truncation offset. |
 | `checkpoint_error` | Loading or writing the checkpoint file itself, one per `.checkpoint.errors` point. A write failure names the step that failed. |
 | `watch_error` | The one-shot cases: `auto` falling back to polling; a *file* watch that failed, which isn't retried (the file is still tailed, at `poll_interval`); or the `inotify` wake source itself becoming unusable, after which the listener runs poll-only. |

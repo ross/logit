@@ -1971,15 +1971,24 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   A writer that rotates by rename has no such window. See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
-- **A resume verifies only the first 256 bytes of a file, so two files that share them and a
-  recycled inode still resume at a stale offset.** A checkpoint entry and a de-selection
-  retention carry a fingerprint of the file's head, and a resume whose head differs starts at
-  `0`. For a file at most 256 bytes long, every skipped byte is verified. Beyond that, a
-  recycled inode whose new file begins with the same 256 bytes as the old one skips the bytes
-  between there and the stale offset. Files that start with a timestamp or a per-file header
-  make it unlikely. See [ADR
+- **A resume verifies only the first `min(256, offset)` bytes of a file, so a recycled inode
+  whose new content shares them still resumes at a stale offset.** A checkpoint entry and a
+  de-selection retention carry a hash of the bytes the tailer read from the file's head, and a
+  resume whose file is shorter, differs in those bytes, or is shorter than the offset starts at
+  `0`. For an offset of at most 256, every skipped byte is identical content. Beyond that, a
+  new file with the same first 256 bytes skips the bytes between there and the stale offset.
+  Files that start with a timestamp or a per-file header make it unlikely. See [ADR
   `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
   decision 2.
+- **A directory unreadable at startup replays its files under `read_from: end` once it becomes
+  readable.** `read_from: end` applies only to files the bind-time scan found. A file first
+  listed after that listing failed starts at its beginning, which favors duplicates over loss.
+- **A file under a directory that stays unreadable stays tracked** until the listing recovers or
+  its inode is unlinked. A failed listing retires nothing, and the handle check catches removal
+  and truncation but not a rename. `ELOOP` on a `docker_in` container directory is treated the
+  same way: unknown, kept, and diagnosed. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 1.
 - **A read error on a `Draining` file loses its unread tail.** The driver reports a read error as
   EOF so that a handle that keeps failing is reaped, and the reap drops whatever the file still
   held. It's diagnosed `read_error`. An `Active` file is never reaped on a read error. The fault
