@@ -2338,10 +2338,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   no longer inlines `parse_object` into it, and the `SmallVec` insert and drop inside `parse_object`
   become out-of-line calls too; `AttrMap::insert_sym`'s self time rises from 10.1% to 14.9% of
   samples. Single-parser `json-parse` moves less (+1.9% at the same step) because contention on
-  the shared interner already dominates `x3`'s stage cost. **Fix:** move the retry into a `#[cold]`
-  helper so `process` keeps one parse call site, confirm `parse_object` inlines again, and
-  re-measure `json-parse-x3` on the perf VM against the base column in that section. A code
-  change, not a docs one, so it waits for its own PR.
+  the shared interner already dominates `x3`'s stage cost. **Fix, measured and open as its own
+  PR** (`fix/json-cold-utf8-retry`): the retry moves into a `#[cold]` helper so `process` keeps
+  one parse call site. On the perf VM, interleaved against the base, `json-parse-x3` returns from
+  2.481 to 2.275 µs/event, within 0.6% of the 2.262 base, and `json-parse` from 0.920 to 0.876
+  (`docs/design/performance.md` §1, "What moved since 2026-09-20"). Until that PR merges, §1's
+  `json-parse-x3` row carries the regressed number. **Still open:** `json-parse` keeps a +1.4%
+  residual that matches an unattributed +2.3% step at #298, a diff with no parse-path change.
 
 ## Lua
 

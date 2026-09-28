@@ -239,11 +239,20 @@ Bold marks a delta past `compare --threshold 5`.
   is codegen, not the retry: with a second parse call site in `JsonParser::process`, LLVM stops
   inlining `parse_object` into it (0% → 46% of samples under a `parse_object` frame, `process`'s
   own frame 49% → 0%), and the `SmallVec` insert and drop inside it become out-of-line calls too.
-  `AttrMap::insert_sym`'s self time rises from 10.1% to 14.9% of samples. The fix is a code
-  change (keep the retry out of the hot function, in a `#[cold]` helper, and re-check that
-  `parse_object` inlines), tracked in [`docs/known-gaps.md`](../known-gaps.md)'s transforms
-  section. `json-parse` also rises +2.3% at #298 (0.878 → 0.898, spread 1.0%) on a diff with no
-  parse-path change; that step is unattributed.
+  `AttrMap::insert_sym`'s self time rises from 10.1% to 14.9% of samples. The fix moves the retry
+  into a `#[cold]` helper so `process` keeps one parse call site (`fix/json-cold-utf8-retry`,
+  binary `86d7132a3368`). Measured the same day, interleaved against the same base, #283, and
+  `main`, median of 6:
+
+  | scenario | 09-20 base | #283 | `main` (#418) | fix |
+  |---|--:|--:|--:|--:|
+  | `json-parse-x3` | 2.262 | 2.274 | 2.481 | **2.275** |
+  | `json-parse` | 0.864 | 0.866 | 0.920 | **0.876** |
+
+  `json-parse-x3` returns to within 0.6% of the base, inside its spread. `json-parse` keeps
+  +1.4%, which matches the unattributed +2.3% step at #298 (0.878 → 0.898, spread 1.0%) on a
+  diff with no parse-path change. Once the fix merges, the next §1 refresh carries the restored
+  number; [`docs/known-gaps.md`](../known-gaps.md)'s entry tracks it until then.
   `json-parse` itself is +1.8% end to end against 2026-09-20. Net of the faster `passthrough`
   floor, its parse stage is about +6% (0.558 → 0.593 µs/event above the floor).
 - **`lua` +3.0%** is the `luab` stack's heartbeat: the script worker writes a busy flag and a
