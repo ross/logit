@@ -20,8 +20,7 @@
 # six-field body stays inline and logfmt-parse's nine sit one slot over. Read against json-parse,
 # this is the per-key parse cost at the width a real logging library produces.
 #
-# `count` is scaled to ~8 s from the first VM run's wall time and not yet re-measured at this
-# value (docs/plans/load-test-harness.md, "Scenarios").
+# `count` gives about 8-9 s of wall on the perf VM (docs/design/performance.md §1).
 components:
   gen:
     type: generate_in
