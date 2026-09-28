@@ -94,6 +94,9 @@ struct Placed {
     marker: String,
     start: u64,
     len: u64,
+    /// Its bytes differ from the original at its model position. An insert inside a record whose
+    /// run repeats the record's own bytes leaves it whole, before or after the run, so the model
+    /// compares bytes rather than trusting the insert offset.
     touched: bool,
     /// Removed entirely by a truncation.
     gone: bool,
@@ -112,7 +115,36 @@ struct Case {
     truncated_to: Option<u64>,
 }
 
-fn build(specs: &[RecordSpec], mutation: &Mutation) -> Case {
+/// A [`Mutation`] with its offsets resolved against one segment, so a deterministic test can name
+/// them directly.
+#[derive(Debug, Clone)]
+enum Resolved {
+    FlipBit { at: usize, bit: u8 },
+    Overwrite { at: usize, with: Vec<u8> },
+    Insert { at: usize, bytes: Vec<u8> },
+    Truncate { at: usize },
+    InCapLength { record: usize, extra: u32 },
+}
+
+/// Resolves `mutation` against a segment of `len` bytes holding `records` records.
+fn resolve(mutation: &Mutation, len: usize, records: usize) -> Resolved {
+    match mutation {
+        Mutation::FlipBit { at, bit } => Resolved::FlipBit { at: at.index(len), bit: *bit },
+        Mutation::Overwrite { at, with } => {
+            Resolved::Overwrite { at: at.index(len), with: with.clone() }
+        }
+        Mutation::Insert { at, bytes } => {
+            Resolved::Insert { at: at.index(len + 1), bytes: bytes.clone() }
+        }
+        Mutation::Truncate { at } => Resolved::Truncate { at: at.index(len) },
+        Mutation::InCapLength { record, extra } => {
+            Resolved::InCapLength { record: record.index(records), extra: *extra }
+        }
+    }
+}
+
+/// The unmutated segment `specs` describe, and each record's placement in it.
+fn encode(specs: &[RecordSpec]) -> (Vec<u8>, Vec<Placed>) {
     let mut bytes = Vec::new();
     let mut records = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
@@ -135,7 +167,16 @@ fn build(specs: &[RecordSpec], mutation: &Mutation) -> Case {
         });
         bytes.extend_from_slice(&record);
     }
+    (bytes, records)
+}
 
+fn build(specs: &[RecordSpec], mutation: &Mutation) -> Case {
+    let (bytes, _) = encode(specs);
+    build_resolved(specs, resolve(mutation, bytes.len(), specs.len()))
+}
+
+fn build_resolved(specs: &[RecordSpec], mutation: Resolved) -> Case {
+    let (mut bytes, mut records) = encode(specs);
     let touch = |records: &mut Vec<Placed>, from: u64, to: u64| {
         for r in records.iter_mut() {
             if r.start < to && from < r.start + r.len {
@@ -147,37 +188,53 @@ fn build(specs: &[RecordSpec], mutation: &Mutation) -> Case {
     let mut tail_garbage_at = None;
     let mut truncated_to = None;
     match mutation {
-        Mutation::FlipBit { at, bit } => {
-            let at = at.index(bytes.len());
+        Resolved::FlipBit { at, bit } => {
             bytes[at] ^= 1 << bit;
             touch(&mut records, at as u64, at as u64 + 1);
         }
-        Mutation::Overwrite { at, with } => {
-            let at = at.index(bytes.len());
+        Resolved::Overwrite { at, with } => {
             let end = (at + with.len()).min(bytes.len());
             bytes[at..end].copy_from_slice(&with[..end - at]);
             touch(&mut records, at as u64, end as u64);
         }
-        Mutation::Insert { at, bytes: inserted } => {
-            let at = at.index(bytes.len() + 1);
+        Resolved::Insert { at, bytes: inserted } => {
+            let original = bytes.clone();
             bytes.splice(at..at, inserted.iter().copied());
-            let at = at as u64;
-            let k = inserted.len() as u64;
+            let k = inserted.len();
+            // Where the inserted run sits once each record is placed by its bytes rather than by
+            // `at`: a run that repeats a record's own bytes can leave that record whole, before
+            // or after the run.
+            let mut run_at = Some(at);
             for r in records.iter_mut() {
-                if r.start < at && at < r.start + r.len {
+                let (start, len) = (r.start as usize, r.len as usize);
+                if start + len <= at {
+                    continue;
+                }
+                if start > at {
+                    r.start += k as u64;
+                    continue;
+                }
+                let was = &original[start..start + len];
+                if bytes[start..start + len] == *was {
+                    run_at = Some(start + len);
+                } else if bytes[start + k..start + k + len] == *was {
+                    r.start += k as u64;
+                    run_at = Some(start);
+                } else {
                     r.touched = true;
-                } else if r.start >= at {
-                    r.start += k;
+                    run_at = None;
                 }
             }
-            if at == bytes.len() as u64 - k {
-                tail_garbage_at = Some(at);
-            } else {
-                interior_garbage = records.iter().any(|r| r.start == at + k);
+            if let Some(run_at) = run_at {
+                if run_at + k == bytes.len() {
+                    tail_garbage_at = Some(run_at as u64);
+                } else {
+                    let after = (run_at + k) as u64;
+                    interior_garbage = records.iter().any(|r| r.start == after);
+                }
             }
         }
-        Mutation::Truncate { at } => {
-            let at = at.index(bytes.len());
+        Resolved::Truncate { at } => {
             bytes.truncate(at);
             let at = at as u64;
             for r in records.iter_mut() {
@@ -189,8 +246,8 @@ fn build(specs: &[RecordSpec], mutation: &Mutation) -> Case {
             }
             truncated_to = Some(at);
         }
-        Mutation::InCapLength { record, extra } => {
-            let r = &mut records[record.index(specs.len())];
+        Resolved::InCapLength { record, extra } => {
+            let r = &mut records[record];
             let body_start = r.start as usize + CONTEXT_LEN + frame::HEADER_LEN;
             let declared = (bytes.len() - body_start) as u32 + extra;
             let at = r.start as usize + COMPRESSED_LEN_AT;
@@ -296,6 +353,33 @@ fn check_recovered(
     })
 }
 
+/// Walks `case`'s bytes and checks the outcome against the model.
+fn check_walk(case: &Case) -> Result<(), TestCaseError> {
+    let (emitted, outcome) = walk_with_timeout(case.bytes.clone());
+    let expect = check_recovered(case, &emitted)?;
+
+    prop_assert_eq!(outcome.valid_count, emitted.len() as u64);
+    if expect.corrupt_required {
+        prop_assert!(outcome.corrupt_skipped >= 1, "corruption before a record went uncounted");
+    }
+    if expect.corrupt_forbidden || case.truncated_to.is_some() {
+        prop_assert_eq!(outcome.corrupt_skipped, 0, "nothing corrupt to count");
+    }
+    match (expect.good_len, expect.torn_tail_at) {
+        (Some(good_len), _) => prop_assert_eq!(outcome.good_len, good_len),
+        // A missing tail record reads either as a torn tail (the walk stops at its start) or
+        // as unrecoverable corruption (skipped to the end and counted).
+        (None, Some(torn_at)) => prop_assert!(
+            outcome.good_len == torn_at
+                || (outcome.good_len == case.bytes.len() as u64 && outcome.corrupt_skipped >= 1),
+            "good_len {} is neither the torn tail at {torn_at} nor the end",
+            outcome.good_len
+        ),
+        (None, None) => unreachable!("good_len is known whenever no tail record is missing"),
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -304,28 +388,7 @@ proptest! {
         specs in prop::collection::vec(record_spec(), 1..=12),
         mutation in mutation(),
     ) {
-        let case = build(&specs, &mutation);
-        let (emitted, outcome) = walk_with_timeout(case.bytes.clone());
-        let expect = check_recovered(&case, &emitted)?;
-
-        prop_assert_eq!(outcome.valid_count, emitted.len() as u64);
-        if expect.corrupt_required {
-            prop_assert!(outcome.corrupt_skipped >= 1, "corruption before a record went uncounted");
-        }
-        if expect.corrupt_forbidden || case.truncated_to.is_some() {
-            prop_assert_eq!(outcome.corrupt_skipped, 0, "nothing corrupt to count");
-        }
-        match (expect.good_len, expect.torn_tail_at) {
-            (Some(good_len), _) => prop_assert_eq!(outcome.good_len, good_len),
-            // A missing tail record reads either as a torn tail (the walk stops at its start) or
-            // as unrecoverable corruption (skipped to the end and counted).
-            (None, Some(torn_at)) => prop_assert!(
-                outcome.good_len == torn_at
-                    || (outcome.good_len == case.bytes.len() as u64 && outcome.corrupt_skipped >= 1),
-                "good_len {} is neither the torn tail at {torn_at} nor the end", outcome.good_len
-            ),
-            (None, None) => unreachable!("good_len is known whenever no tail record is missing"),
-        }
+        check_walk(&build(&specs, &mutation))?;
     }
 
     #[test]
@@ -381,6 +444,70 @@ proptest! {
                 "tail: truncated {truncated}, {on_disk} bytes left, torn tail at {torn_at}"
             ),
             (None, None) => unreachable!("good_len is known whenever no tail record is missing"),
+        }
+    }
+}
+
+/// The shrunk input from the persisted `walk_segment_recovers_every_record_outside_the_mutated_range`
+/// seed in `proptest-regressions/disk_queue_verification.txt`.
+fn seed_specs() -> Vec<RecordSpec> {
+    vec![
+        RecordSpec { trace_id: [0; 16], span_id: [0; 8], magic_at: None },
+        RecordSpec {
+            trace_id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 2, 117, 22, 84, 44],
+            span_id: [137, 223, 157, 213, 160, 39, 25, 45],
+            magic_at: Some(12),
+        },
+        RecordSpec {
+            trace_id: [34, 59, 57, 188, 113, 27, 160, 192, 0, 4, 234, 240, 137, 169, 141, 62],
+            span_id: [144, 231, 181, 251, 238, 87, 185, 53],
+            magic_at: None,
+        },
+        RecordSpec {
+            trace_id: [128, 127, 235, 80, 193, 215, 226, 0, 27, 18, 103, 190, 249, 14, 241, 249],
+            span_id: [0, 4, 196, 243, 44, 200, 16, 147],
+            magic_at: None,
+        },
+    ]
+}
+
+/// Inserting a run whose first bytes repeat a record's last bytes, ahead of those bytes, leaves
+/// the record whole where it was: the run reads as garbage after it.
+#[test]
+fn an_insert_that_reproduces_a_record_boundary_leaves_it_untouched() {
+    assert_eq!(encode(&seed_specs()).0.len(), 288, "the offset below was resolved for 288 bytes");
+    let case = build_resolved(
+        &seed_specs(),
+        // 143 is `Index(9137950036896871591).index(288 + 1)` for this 288-byte segment, as
+        // proptest 1.11's `Index::index` computes it: `(len * raw) >> 64`. It is one byte before
+        // the end of `r1` (72..144), and the run repeats that last byte.
+        Resolved::Insert { at: 143, bytes: vec![0, 129, 13, 44, 13] },
+    );
+    if let Err(err) = check_walk(&case) {
+        panic!("{err}\n{case:?}");
+    }
+}
+
+/// Every insert of one or two bytes that repeat a neighbor, at every offset of a three-record
+/// segment, including each record boundary and both ends.
+#[test]
+fn every_boundary_insert_agrees_with_the_walk() {
+    let specs = &seed_specs()[..3];
+    let (bytes, _) = encode(specs);
+    for at in 0..=bytes.len() {
+        let mut runs = Vec::new();
+        if at > 0 {
+            runs.push(vec![bytes[at - 1]]);
+            runs.push(vec![bytes[at - 1], 0xA5]);
+        }
+        if at < bytes.len() {
+            runs.push(vec![bytes[at]]);
+        }
+        for run in runs {
+            let case = build_resolved(specs, Resolved::Insert { at, bytes: run.clone() });
+            if let Err(err) = check_walk(&case) {
+                panic!("inserting {run:?} at {at}: {err}\n{:?}", case.records);
+            }
         }
     }
 }

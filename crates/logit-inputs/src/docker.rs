@@ -559,10 +559,12 @@ mod tests {
     use super::*;
     use crate::tail::test_support::scratch_dir;
     use crate::tail::{ReadFrom, TailBatching, WatchMode};
-    use logit_pipeline::{unwrap_batch, Delivered, Input};
+    use logit_pipeline::test_util::{
+        assert_no_batch, fanout_channel, recv_batch, recv_events, spawn_input, wait_until,
+        TelemetryProbe,
+    };
     use std::io::Write;
     use std::time::Duration;
-    use tokio::sync::mpsc;
 
     fn decoder() -> DockerDecoder {
         DockerDecoder::new(Arc::new(Resource::default()), 1024 * 1024)
@@ -919,44 +921,6 @@ mod tests {
 
     // -- DockerInput, end to end ----------------------------------------------------------------
 
-    fn recording_fanout(capacity: usize) -> (Fanout, mpsc::Receiver<Delivered>) {
-        let (tx, rx) = mpsc::channel(capacity);
-        (Fanout::new(vec![tx]), rx)
-    }
-
-    fn spawn(
-        mut input: DockerInput,
-        sink: Fanout,
-    ) -> (shutdown_watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
-        let (tx, rx) = shutdown_watch::channel(false);
-        let handle = tokio::spawn(async move { input.run_until_shutdown(sink, rx).await });
-        (tx, handle)
-    }
-
-    async fn shutdown(
-        tx: shutdown_watch::Sender<bool>,
-        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    ) {
-        let _ = tx.send(true);
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("should shut down within 5s")
-            .expect("should not panic")
-            .expect("should exit cleanly");
-    }
-
-    async fn expect_events(rx: &mut mpsc::Receiver<Delivered>, n: usize) -> Vec<Event> {
-        let mut events = Vec::new();
-        while events.len() < n {
-            let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("timed out waiting for events")
-                .expect("fanout channel closed unexpectedly");
-            events.extend(unwrap_batch(delivered).events);
-        }
-        events
-    }
-
     fn messages(events: &[Event]) -> Vec<String> {
         events
             .iter()
@@ -1015,26 +979,31 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["from a"]);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(rx.try_recv().is_err(), "an unlisted container must never be tailed");
-        shutdown(tx, handle).await;
+        // 4x the 15ms poll and flush ticks that would deliver an unlisted container's line.
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(60),
+            "an unlisted container must never be tailed",
+        )
+        .await;
+        running.stop().await;
 
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let filter2 = ContainerFilter::new(vec![], true);
         let input2 = DockerInput::new(root.clone(), filter2, vec![], fast_tail_config());
-        let (tx2, handle2) = spawn(input2, fanout2);
-        let events2 = expect_events(&mut rx2, 2).await;
+        let running2 = spawn_input(input2, fanout2).await;
+        let events2 = recv_events(&mut rx2, 2).await;
         let mut msgs = messages(&events2);
         msgs.sort();
         assert_eq!(msgs, vec!["from a", "from b"], "discover: true should follow every container");
-        shutdown(tx2, handle2).await;
+        running2.stop().await;
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1053,12 +1022,12 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec!["web".to_string()], false);
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["old"]);
 
         // Recreated: the old directory disappears and a new id appears under the same name.
@@ -1074,10 +1043,10 @@ mod tests {
         )
         .unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["new"]);
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1098,12 +1067,14 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        let batch1 = unwrap_batch(rx.recv().await.expect("first batch"));
+        let batch1 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch1.events), vec!["one"]);
         assert_eq!(
             batch1.resource.attributes.get("container.name").and_then(|v| v.as_str()),
@@ -1116,11 +1087,15 @@ mod tests {
             r#"{"Name":"/after","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Let a poll tick refresh the identity before the next line exists. Refresh happens only
-        // on a `scan`, but a flush-timer `drain` can decode a line first, under the stale
-        // identity. Refresh is bounded by `poll_interval`, so that isn't a bug, but this
-        // assertion needs the refresh to have landed.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Wait for a poll tick's `scan` to refresh the identity before the next line exists. A
+        // flush-timer `drain` can decode a line before any `scan` runs, under the stale identity.
+        // Refresh is bounded by `poll_interval`, so that isn't a bug, but this assertion needs the
+        // refresh to have landed. The counter is bumped in the same call that swaps the resource.
+        probe
+            .wait_for("a scan to swap in the renamed identity", |t| {
+                t.sum("logit.input.files.identity_changed", &[]) >= 1.0
+            })
+            .await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
@@ -1134,11 +1109,7 @@ mod tests {
             )
             .unwrap();
 
-        let batch2 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("second batch should arrive well within 3s")
-            .expect("channel open");
-        let batch2 = unwrap_batch(batch2);
+        let batch2 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch2.events), vec!["two"]);
         assert_eq!(
             batch2.resource.attributes.get("container.name").and_then(|v| v.as_str()),
@@ -1149,7 +1120,7 @@ mod tests {
             "a renamed container must get a fresh resource Arc, never share the old one"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1171,12 +1142,14 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        let batch1 = unwrap_batch(rx.recv().await.expect("first batch"));
+        let batch1 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch1.events), vec!["one"]);
         assert_eq!(batch1.resource.attributes.get("container.name"), None);
         assert_eq!(
@@ -1190,9 +1163,13 @@ mod tests {
             r#"{"Name":"/recovered","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Let a poll tick refresh the identity first; see the same sleep in
+        // Wait for a scan to swap in the recovered identity first; see the same wait in
         // `a_rewritten_config_v2_json_changes_the_name_on_a_fresh_batch_boundary`.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        probe
+            .wait_for("a scan to swap in the recovered identity", |t| {
+                t.sum("logit.input.files.identity_changed", &[]) >= 1.0
+            })
+            .await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
@@ -1206,18 +1183,14 @@ mod tests {
             )
             .unwrap();
 
-        let batch2 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("recovery should be noticed well within 3s")
-            .expect("channel open");
-        let batch2 = unwrap_batch(batch2);
+        let batch2 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch2.events), vec!["two"]);
         assert_eq!(
             batch2.resource.attributes.get("container.name").and_then(|v| v.as_str()),
             Some("recovered")
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1236,12 +1209,14 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        let batch1 = unwrap_batch(rx.recv().await.expect("first batch"));
+        let batch1 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch1.events), vec!["one"]);
 
         // Same name/image/labels: a daemon rewrite for an untracked field.
@@ -1250,8 +1225,20 @@ mod tests {
             r#"{"Name":"/steady","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Give at least one poll tick a chance to see the stat change and re-read.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Two poll wakes past the rewrite: `watch.wakes` is counted before its `scan` runs, so
+        // the second one means the first has finished its `scan`, which re-reads a changed
+        // `config.v2.json`.
+        let polls = probe.sum("logit.input.watch.wakes", &[("source", "poll")]);
+        probe
+            .wait_for("a full poll scan after the rewrite", |t| {
+                t.sum("logit.input.watch.wakes", &[("source", "poll")]) >= polls + 2.0
+            })
+            .await;
+        assert_eq!(
+            probe.sum("logit.input.files.identity_changed", &[]),
+            0.0,
+            "a rewrite reproducing the same resource is no identity change"
+        );
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
@@ -1265,7 +1252,7 @@ mod tests {
             )
             .unwrap();
 
-        let batch2 = unwrap_batch(rx.recv().await.expect("second batch"));
+        let batch2 = recv_batch(&mut rx).await;
         assert_eq!(messages(&batch2.events), vec!["two"]);
         assert!(
             Arc::ptr_eq(&batch1.resource, &batch2.resource),
@@ -1274,7 +1261,7 @@ mod tests {
              needed to split"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1295,12 +1282,14 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         // Renamed out of `containers: ["wanted"]`.
@@ -1309,8 +1298,14 @@ mod tests {
             r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Give it a couple of poll ticks to notice and close.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // `files.open` is set only at the end of a `scan`, and the reap happens in a `drain`
+        // after the `scan` that de-selects, so `0` is a later scan seeing the file gone. A line
+        // written before the reap would be read, since a de-selected file drains to EOF.
+        probe
+            .wait_for("a scan after the de-selected file is reaped", |t| {
+                t.gauge("logit.input.files.open", &[]) == Some(0.0)
+            })
+            .await;
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -1325,10 +1320,15 @@ mod tests {
             )
             .unwrap();
 
-        let nothing = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
-        assert!(nothing.is_err(), "a container renamed out of the selection must not keep flowing");
+        // 10x the 15ms poll and flush ticks that would pick the line up.
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(150),
+            "a container renamed out of the selection must not keep flowing",
+        )
+        .await;
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1347,12 +1347,14 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         // Renamed away, then back, with a line written while away.
@@ -1361,7 +1363,12 @@ mod tests {
             r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // See the same wait in `a_container_renamed_out_of_the_explicit_selection_stops_flowing`.
+        probe
+            .wait_for("a scan after the de-selected file is reaped", |t| {
+                t.gauge("logit.input.files.open", &[]) == Some(0.0)
+            })
+            .await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
@@ -1374,8 +1381,13 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
-        let nothing = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
-        assert!(nothing.is_err(), "still renamed away -- nothing should arrive yet");
+        // 6x the 15ms poll and flush ticks that would pick the line up.
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(100),
+            "still renamed away -- nothing should arrive yet",
+        )
+        .await;
 
         std::fs::write(
             root.join(&id).join("config.v2.json"),
@@ -1383,14 +1395,14 @@ mod tests {
         )
         .unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events2),
             vec!["two"],
             "must resume from the retained offset -- \"one\" must never be replayed"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1417,19 +1429,19 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec!["web".to_string()], false);
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events),
             vec!["fresh"],
             "only the real <id>-json.log should ever be tailed"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1450,16 +1462,16 @@ mod tests {
         )
         .unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         // discover mode: `accept` needs no metadata, so a missing config.v2.json can't stop it.
         let filter = ContainerFilter::new(vec![], true);
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["hi"]);
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1471,22 +1483,37 @@ mod tests {
         let root = scratch_dir("docker-inotify-new-log");
         let mut config = fast_tail_config();
         config.watch = WatchMode::Inotify;
-        config.poll_interval = Duration::from_millis(300);
+        // Past the negative window below by over 6x, so scheduler lag can't carry the window into
+        // the tick that is the only thing allowed to discover the log.
+        config.poll_interval = Duration::from_secs(1);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], config);
-        let (tx, handle) = spawn(input, fanout);
-
-        // Let the initial scan start watching an empty `root`.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], config)
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        // Bound before it returns: the initial scan has armed `root`'s watch.
+        let running = spawn_input(input, fanout).await;
+        // Drains the initial scan's `files.open` now, so the wait below sees only a later scan's.
+        let before = probe.poll().events.len();
 
         let id = "6".repeat(64);
         // Directory and config.v2.json only, as Docker creates them before the log file.
         let log_path = container(&root, &id, "web", "nginx:1.25");
 
-        // Let `root`'s IN_CREATE be handled; it finds no log file yet.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Wait for `root`'s IN_CREATE to be handled; its `scan` finds no log file yet. The wake is
+        // counted before its `scan` runs and `files.open` is set at the end of one, so the
+        // two together mean that `scan` has finished. Nothing else scans before the 1s tick.
+        probe
+            .wait_for("the scan for root's IN_CREATE", |t| {
+                t.sum("logit.input.watch.wakes", &[("source", "inotify")]) >= 1.0
+                    && t.events[before..].iter().any(|e| {
+                        e.metrics.iter().any(|m| {
+                            logit_core::interner::resolve(m.name) == "logit.input.files.open"
+                        })
+                    })
+            })
+            .await;
         std::fs::write(
             &log_path,
             format!(
@@ -1496,22 +1523,21 @@ mod tests {
         )
         .unwrap();
 
-        // Within the 300ms poll_interval and with nothing changed under `root`: not found yet.
-        let too_soon =
-            tokio::time::timeout(Duration::from_millis(100), expect_events(&mut rx, 1)).await;
-        assert!(
-            too_soon.is_err(),
+        // Within the 1s poll_interval and with nothing changed under `root`: not found yet. The
+        // window is 6x the 15ms flush tick that would deliver the line of a discovered log.
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(100),
             "must not be discovered before the poll tick -- the container's own subdirectory \
-             isn't watched any more, only root, and root saw no event"
-        );
+             isn't watched, only root, and root saw no event",
+        )
+        .await;
 
-        // The very next poll tick picks it up.
-        let events = tokio::time::timeout(Duration::from_secs(2), expect_events(&mut rx, 1))
-            .await
-            .expect("the poll tick should discover it shortly after");
+        // The next poll tick picks it up.
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["hello"]);
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1535,12 +1561,12 @@ mod tests {
         config.watch = WatchMode::Inotify;
         config.poll_interval = Duration::from_secs(30);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
         let input = DockerInput::new(root.clone(), filter, vec![], config);
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["first"]);
 
         // `std::fs::write` opens with `O_TRUNC`: same inode, shorter length, a truncation.
@@ -1554,13 +1580,13 @@ mod tests {
         .unwrap();
 
         let events2 =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+            tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1)).await.expect(
                 "inotify should notice the truncation well within 3s, nowhere near the 30s \
                  poll_interval",
             );
         assert_eq!(messages(&events2), vec!["new"]);
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1578,14 +1604,23 @@ mod tests {
         ) + "\n";
         std::fs::write(&log_path, &gen1).unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config())
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        // Let the tailer read and hold the fragment; nothing emits yet.
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(rx.try_recv().is_err(), "an unterminated fragment must not emit before its close");
+        // The tailer has read the fragment's line, then nothing emits for 4x the 15ms flush tick.
+        probe
+            .wait_for("the fragment's line to be read", |t| t.sum("logit.input.lines", &[]) >= 1.0)
+            .await;
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(60),
+            "an unterminated fragment must not emit before its close",
+        )
+        .await;
 
         let gen2 = format!(
             "{}\n",
@@ -1600,14 +1635,14 @@ mod tests {
         // `std::fs::write` opens with `O_TRUNC`: same inode, shorter length.
         std::fs::write(&log_path, &gen2).unwrap();
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events),
             vec!["restarted"],
             "the pre-truncation partial must not be spliced onto the first post-truncation entry"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         assert!(
             rx.try_recv().is_err(),
             "the discarded partial must not resurface on close -- proves reset() ran, not close()"
@@ -1642,13 +1677,25 @@ mod tests {
 
         let mut config = fast_tail_config();
         config.max_line_bytes = 200;
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let filter = ContainerFilter::new(vec![], true);
-        let input = DockerInput::new(root.clone(), filter, vec![], config);
-        let (tx, handle) = spawn(input, fanout);
+        let mut probe = TelemetryProbe::new();
+        let input = DockerInput::new(root.clone(), filter, vec![], config)
+            .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(rx.try_recv().is_err(), "a dropped oversized reassembly must never emit");
+        // All three fragment lines read, then nothing emits for 4x the 15ms flush tick.
+        probe
+            .wait_for("all three fragment lines to be read", |t| {
+                t.sum("logit.input.lines", &[]) >= 3.0
+            })
+            .await;
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(60),
+            "a dropped oversized reassembly must never emit",
+        )
+        .await;
 
         let gen2 = format!(
             "{}\n",
@@ -1657,14 +1704,14 @@ mod tests {
         assert!(gen2.len() < gen1.len(), "fixture must be a genuine truncation");
         std::fs::write(&log_path, &gen2).unwrap();
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events),
             vec!["ok"],
             "a stale dropping flag must not swallow the next generation's first complete entry"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1678,21 +1725,22 @@ mod tests {
         )
     }
 
+    /// The first file's offset in the checkpoint at `path`, if one is written.
+    fn checkpointed_offset(path: &Path) -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text).ok()?["files"][0]["offset"].as_u64()
+    }
+
     /// The first file's offset in the checkpoint at `path`, once one with a nonzero offset is
-    /// written (a tick before the first read records `0`). Waits up to 5s.
+    /// written (a tick before the first read records `0`).
     async fn first_nonzero_checkpoint(path: &Path) -> u64 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let offset = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| v["files"][0]["offset"].as_u64());
-            if let Some(offset) = offset.filter(|&o| o > 0) {
-                return offset;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for a checkpoint");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let mut found = None;
+        wait_until("a checkpoint with a nonzero offset", || {
+            found = checkpointed_offset(path).filter(|&offset| offset > 0);
+            found.is_some()
+        })
+        .await;
+        found.expect("the wait returns only once an offset is found")
     }
 
     /// A container log holding a complete entry, then a fragment line (one Docker writes for a
@@ -1719,19 +1767,19 @@ mod tests {
         let (root, _log, checkpoint, whole_len, config) =
             fragment_fixture("docker-held-checkpoint", "");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let input =
             DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
         assert_eq!(
             first_nonzero_checkpoint(&checkpoint).await,
             whole_len,
             "the checkpoint must end before the held fragment line"
         );
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1742,18 +1790,18 @@ mod tests {
     async fn a_crash_before_the_closing_fragment_replays_the_whole_message_after_restart() {
         let (root, log, checkpoint, whole_len, config) = fragment_fixture("docker-held-crash", "");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let input = DockerInput::new(
             root.clone(),
             ContainerFilter::new(vec![], true),
             vec![],
             config.clone(),
         );
-        let (_tx, handle) = spawn(input, fanout);
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
         assert_eq!(first_nonzero_checkpoint(&checkpoint).await, whole_len);
-        handle.abort();
-        let _ = handle.await;
+        running.handle.abort();
+        let _ = running.handle.await;
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -1762,16 +1810,16 @@ mod tests {
             .write_all(json_file_line("tail\n").as_bytes())
             .unwrap();
 
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let input2 =
             DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
-        let (tx2, handle2) = spawn(input2, fanout2);
+        let running2 = spawn_input(input2, fanout2).await;
         assert_eq!(
-            messages(&expect_events(&mut rx2, 1).await),
+            messages(&recv_events(&mut rx2, 1).await),
             vec!["head-tail"],
             "the restart must reassemble the message from its first fragment"
         );
-        shutdown(tx2, handle2).await;
+        running2.stop().await;
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1806,12 +1854,12 @@ mod tests {
         head_start: u64,
         config: TailConfig,
     ) {
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let input =
             DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
-        let (tx, handle) = spawn(input, fanout);
+        let running = spawn_input(input, fanout).await;
 
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["whole"]);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
         assert_eq!(
             first_nonzero_checkpoint(&checkpoint).await,
             head_start,
@@ -1824,11 +1872,12 @@ mod tests {
             .unwrap()
             .write_all(json_file_line("tail\n").as_bytes())
             .unwrap();
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["head-tail"]);
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(rx.try_recv().is_err(), "the message must be emitted once");
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-tail"]);
+        // 4x the 15ms flush tick that would deliver a second copy.
+        assert_no_batch(&mut rx, Duration::from_millis(60), "the message must be emitted once")
+            .await;
 
-        shutdown(tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 }
