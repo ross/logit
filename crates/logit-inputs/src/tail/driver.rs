@@ -772,6 +772,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let path = tracked.path.clone();
         self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
+        // The persisted offset is now past the file's end. A write before the next read must
+        // replace it with `0`: the head fingerprint would reject it at a restart, but only as a
+        // counted `resume_rejected`, and only if the head changed.
+        if let Some(cp) = &mut self.checkpoint {
+            cp.mark_dirty();
+        }
     }
 
     /// Handles a `Wake::Data` for a tracked `path`: a truncation check only. A write and an
@@ -4703,5 +4709,30 @@ mod tests {
             assert_eq!(tailer.tracked_len(), 3);
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// A truncation moves the offset back to `0`, so the next interval write must persist that
+    /// even if nothing is read in between.
+    #[tokio::test]
+    async fn a_truncation_dirties_the_checkpoint() {
+        let dir = scratch_dir("truncation-dirties-checkpoint");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"abcdef\n").unwrap();
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["abcdef"]);
+        hand.checkpoint().await;
+        assert_eq!(checkpointed_entry(&dir), (7, 7, Head::of(b"abcdef\n").hash));
+
+        copytruncate_and_refill(&path, b"");
+        hand.scan().await;
+        assert_eq!(hand.probe.sum("logit.input.files.truncated", &[]), 1.0);
+        hand.tailer.write_checkpoint(false).await;
+        assert_eq!(checkpointed_entry(&dir), (0, 0, Head::of(b"").hash));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
