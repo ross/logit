@@ -1901,7 +1901,7 @@ pub enum ComponentKind {
         /// How a log record's message renders under `format: human`: `escaped` (the default)
         /// keeps it on one line with newlines written as `\n`; `multiline` writes real line
         /// breaks, with each continuation line aligned under the message's first character.
-        /// `multiline` under `format: native` is rejected.
+        /// `multiline` under any other `format:` is rejected.
         #[serde(default)]
         message: MessageMode,
     },
@@ -1924,7 +1924,7 @@ pub enum ComponentKind {
         /// How a log record's message renders under `format: human`: `escaped` (the default)
         /// keeps it on one line with newlines written as `\n`; `multiline` writes real line
         /// breaks, with each continuation line aligned under the message's first character.
-        /// `multiline` under `format: native` is rejected.
+        /// `multiline` under any other `format:` is rejected.
         #[serde(default)]
         message: MessageMode,
     },

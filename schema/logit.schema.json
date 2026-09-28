@@ -2138,7 +2138,7 @@
               ]
             },
             "message": {
-              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under `format: native` is rejected.",
+              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under any other `format:` is rejected.",
               "default": "escaped",
               "allOf": [
                 {
@@ -2189,7 +2189,7 @@
               ]
             },
             "message": {
-              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under `format: native` is rejected.",
+              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under any other `format:` is rejected.",
               "default": "escaped",
               "allOf": [
                 {

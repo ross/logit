@@ -217,6 +217,8 @@
 //!     (`docs/adr/splunk-hec-relay.md`).
 //! 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that
 //!     (`docs/adr/lua-runaway-script-bounds.md`).
+//! 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`, where it
+//!     would do nothing (`docs/adr/human-render-block-format.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -3325,8 +3327,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 72: `message:` does nothing outside `format: human`, as rule 33's `compression:`
-    // does nothing outside `format: native` (`docs/adr/human-render-block-format.md`).
+    // Rule 72: `message:` does nothing under any `format:` but `human`, as rule 33's
+    // `compression:` does nothing under any `format:` but `native`
+    // (`docs/adr/human-render-block-format.md`).
     for (id, component) in &components {
         let stream = match &component.kind {
             ComponentKind::StdioOut { format, message, .. }
@@ -8200,6 +8203,24 @@ mod tests {
                 vec!["in"],
                 stdio_out_with_render(
                     StreamFormat::Native,
+                    Compression::None,
+                    MessageMode::Multiline,
+                ),
+            ),
+        ]));
+        assert!(err.contains("'message' only applies under 'format: human'"), "got: {err}");
+    }
+
+    /// Rule 72.
+    #[test]
+    fn stdio_out_with_message_multiline_under_format_json_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                stdio_out_with_render(
+                    StreamFormat::Json,
                     Compression::None,
                     MessageMode::Multiline,
                 ),

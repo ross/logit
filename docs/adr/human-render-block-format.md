@@ -59,7 +59,8 @@ canonical grammar; the decisions it follows:
    first character, and a tab as a tab. Every other control character, ESC above all, is escaped
    in both modes: any string the sink writes can be a peer's bytes, and a raw ESC would drive
    the viewer's terminal. The mode is a field on both kinds, and graph rule 72 rejects
-   `multiline` under `format: native`, as rule 33 rejects `compression` under `format: human`.
+   `multiline` under any format but `human`, as rule 33 rejects `compression` under any format but
+   `native`.
 6. **Sketches render as summary statistics.** A `Distribution` shows count, sum, min, max, mean,
    and p50/p90/p95/p99; a `Set` shows its estimate. Bins and registers are the sketch's internals,
    not observations, and a hundred bin lines per metric would bury the event.
