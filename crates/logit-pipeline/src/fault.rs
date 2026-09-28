@@ -82,8 +82,8 @@ pub mod sites {
     pub const FILE_OUT_STAGING: &str = "file_out.staging";
     /// `file_out`'s retained `.N` files.
     pub const FILE_OUT_RETAINED: &str = "file_out.retained";
-    /// `tail_in`/`docker_in` discovery: a pattern directory's listing and a discovered path's
-    /// stat.
+    /// `tail_in`/`docker_in` discovery: a pattern directory's listing, a discovered path's stat,
+    /// and the open of a file about to be tracked.
     pub const TAIL_SCAN: &str = "tail.scan";
 }
 

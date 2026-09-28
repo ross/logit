@@ -540,6 +540,8 @@ with a peek that stopped responding while draining, which is consistent with tha
 - `Op::Stat`, in `PathPattern::scan_container`, before the per-entry `file_type()` and before the
   log-path `metadata`.
 - `Op::Stat`, before the per-path `metadata` in `Tailer::scan`.
+- `Op::Open`, before `Tailer::open_tracked` opens a discovered file, so a test can fail the
+  open that follows a good `stat`.
 
 The call rule, the disarmed cost (one atomic load), the compiled-out form, and
 the scoping are decision 8's, unchanged. Freeze (the crash model) doesn't apply to a read: a rule

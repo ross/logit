@@ -158,15 +158,7 @@ impl Listing {
             && !self.failed.iter().any(|f| patterns[f.pattern].covers(path))
     }
 
-    /// Whether every listing and `stat` succeeded, so every path a pattern names is in
-    /// `discovered`.
-    #[allow(dead_code)] // the checkpoint's resume pruning is its first caller
-    pub fn is_complete(&self) -> bool {
-        self.failed.is_empty() && self.unknown.is_empty()
-    }
-
     /// The inode of every discovered path.
-    #[allow(dead_code)] // the checkpoint's resume pruning is its first caller
     pub fn discovered_ids(&self) -> impl Iterator<Item = FileId> + '_ {
         self.discovered.values().map(FileId::from_metadata)
     }
@@ -466,15 +458,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ///
     /// Only files found on the `first` scan follow `read_from` (`first_scan_start`, which an
     /// unusable checkpoint overrides to `Beginning`); a later discovery starts at the beginning,
-    /// since it has no "before startup" to skip. A checkpoint entry wins over both.
+    /// since it has no "before startup" to skip. A checkpoint entry wins over both. Each scan
+    /// also prunes the retained entries it shows nothing can consume
+    /// ([`Tailer::prune_deselected`], [`Tailer::prune_checkpoint_entries`]).
     ///
     /// A tracked path this scan shows is gone starts draining its file. One that a failed listing
     /// or `stat` could have named is kept (`pattern.rs`'s module doc has the rule), and its open
     /// handle is `fstat`ed instead, which still sees an unlinked file and a truncation.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
-        let listing = self.list();
+        let mut listing = self.list();
         self.report_scan_errors(&listing, first);
+        let mut pruned = self.prune_deselected(&listing);
 
         let stale: Vec<PathBuf> = self
             .by_path
@@ -499,7 +494,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.keep_unlisted(path, id).await;
         }
 
-        for (path, meta) in listing.discovered {
+        // Only needed while a checkpoint entry is unspent, which is rarely past the first scan.
+        let unspent = self.resume.values().any(|r| r.source == Source::Checkpoint);
+        let discovered_ids: HashSet<FileId> =
+            if !unspent { HashSet::new() } else { listing.discovered_ids().collect() };
+        for (path, meta) in std::mem::take(&mut listing.discovered) {
             let id = FileId::from_metadata(&meta);
             match self.by_path.get(&path).copied() {
                 Some(existing_id) if existing_id == id => {
@@ -528,6 +527,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
         }
+        pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
+        if pruned {
+            if let Some(cp) = &mut self.checkpoint {
+                cp.mark_dirty();
+            }
+        }
 
         self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
@@ -546,6 +551,39 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             (self.watched_dirs.len() + file_watches) as f64,
             &[],
         );
+    }
+
+    /// Drops each [`Source::Deselected`] entry this listing shows can't be re-selected: its path
+    /// is listed and either gone or another inode's. Runs before the discovery loop, so a file
+    /// re-selected in this scan resumes. Returns whether it dropped any.
+    fn prune_deselected(&mut self, listing: &Listing) -> bool {
+        let before = self.resume.len();
+        let patterns = &self.patterns;
+        self.resume.retain(|id, r| {
+            r.source != Source::Deselected
+                || !listing.listed(patterns, &r.path)
+                || listing.discovered.get(&r.path).is_some_and(|m| FileId::from_metadata(m) == *id)
+        });
+        self.resume.len() != before
+    }
+
+    /// Drops each unspent [`Source::Checkpoint`] entry this listing shows nothing can consume:
+    /// its stored path is listed and its inode wasn't discovered under any path. Runs after the
+    /// discovery loop, on every scan; an entry whose path a failed listing or `stat` covers stays,
+    /// and is persisted by every checkpoint write meanwhile. Returns whether it dropped any.
+    fn prune_checkpoint_entries(
+        &mut self,
+        listing: &Listing,
+        discovered_ids: &HashSet<FileId>,
+    ) -> bool {
+        let before = self.resume.len();
+        let patterns = &self.patterns;
+        self.resume.retain(|id, r| {
+            r.source != Source::Checkpoint
+                || !listing.listed(patterns, &r.path)
+                || discovered_ids.contains(id)
+        });
+        self.resume.len() != before
     }
 
     /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
@@ -752,7 +790,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if !self.factory.accept(&path) {
             return;
         }
-        let mut file = match tokio::fs::File::open(&path).await {
+        let opened = match fault::check(super::pattern::OPEN, &path, 0) {
+            Ok(()) => tokio::fs::File::open(&path).await,
+            Err(err) => Err(err),
+        };
+        let mut file = match opened {
             Ok(f) => f,
             Err(err) => {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
@@ -4087,6 +4129,222 @@ mod tests {
         assert_eq!(hand.pump().await, vec!["two"], "resumed at the entry, not replayed");
         assert!(hand.tailer.resume.is_empty());
         assert_eq!(hand.rejected(), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- retained entries are evicted per entry, and only when a listing says so
+
+    /// A de-selected file removed while de-selected can never be re-selected, so its retention
+    /// goes at the next scan that lists its directory.
+    #[tokio::test]
+    async fn a_deselected_retention_is_dropped_once_its_path_is_gone() {
+        let dir = scratch_dir("deselect-retention-gone");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(dir.join("*.log"))],
+            factory,
+            fast_config(ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        hand.scan().await;
+        assert!(hand.pump().await.is_empty());
+        hand.scan().await;
+        assert_eq!(hand.tailer.resume.len(), 1, "kept while its path is still there");
+
+        std::fs::remove_file(&path).unwrap();
+        hand.scan().await;
+        assert!(hand.tailer.resume.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_deselected_retention_is_dropped_when_its_path_now_names_another_inode() {
+        let dir = scratch_dir("deselect-retention-other-inode");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+        let mut hand =
+            Hand::bind(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
+                .await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        hand.scan().await;
+        assert!(hand.pump().await.is_empty());
+        assert_eq!(hand.tailer.resume.len(), 1);
+
+        // Renamed out of the pattern, so the old inode is alive and can't be reused.
+        std::fs::rename(&path, dir.join("app.log.old")).unwrap();
+        std::fs::write(&path, b"fresh\n").unwrap();
+        hand.scan().await;
+        assert!(hand.tailer.resume.is_empty());
+
+        deselected.store(false, std::sync::atomic::Ordering::SeqCst);
+        hand.scan().await;
+        assert_eq!(hand.pump().await, vec!["fresh"]);
+        assert_eq!(hand.rejected(), 0.0, "the new inode had no entry to reject");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An entry whose file is gone, or whose path no pattern names any more, is dropped by the
+    /// first scan and leaves the next checkpoint.
+    #[tokio::test]
+    async fn unconsumed_checkpoint_entries_are_dropped_after_a_clean_scan() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = scratch_dir("resume-prune-clean");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let entry = |ino: u64, name: &str, offset: u64, head: Head| {
+            format!(
+                r#"{{"dev":{},"ino":{ino},"path":"{}","offset":{offset},"head_len":{},"head_hash":{}}}"#,
+                meta.dev(),
+                dir.join(name).display(),
+                head.len,
+                head.hash
+            )
+        };
+        let files = [
+            entry(meta.ino(), "app.log", 4, Head::of(b"one\n")),
+            entry(meta.ino() + 1_000_000, "gone.log", 7, Head::of(b"x")),
+            entry(meta.ino() + 1_000_001, "elsewhere.txt", 9, Head::of(b"y")),
+        ];
+        std::fs::write(
+            dir.join("checkpoint.json"),
+            format!(r#"{{"version":2,"files":[{}]}}"#, files.join(",")),
+        )
+        .unwrap();
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(dir.join("*.log"))],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert!(hand.tailer.resume.is_empty(), "one spent, two pruned");
+        assert!(hand.pump().await.is_empty(), "app.log resumed at its end");
+        hand.shutdown().await;
+        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
+        assert!(text.contains("app.log"), "{text}");
+        assert!(!text.contains("gone.log") && !text.contains("elsewhere.txt"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_entry_is_kept_while_a_listing_still_fails() {
+        use crate::tail::pattern::READ_DIR;
+        use logit_pipeline::fault::{self, errno};
+
+        let dir = scratch_dir("resume-kept-read-dir");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        let mut hand =
+            Hand::bind(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config).await;
+        hand.scan().await;
+        assert!(hand.tailer.files.is_empty());
+        assert_eq!(hand.tailer.resume.len(), 1, "a failed listing can't say the file is gone");
+        drop(scope);
+
+        hand.scan().await;
+        assert_eq!(hand.pump().await, vec!["two"]);
+        assert!(hand.tailer.resume.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_entry_is_kept_while_a_stat_is_unknown() {
+        use crate::tail::pattern::STAT;
+        use logit_pipeline::fault::{self, errno};
+
+        let dir = scratch_dir("resume-kept-stat");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let scope = fault::scope(&dir);
+        scope.fail(STAT, errno::EIO);
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        hand.scan().await;
+        assert!(hand.tailer.files.is_empty());
+        assert_eq!(hand.tailer.resume.len(), 1, "an unknown stat can't say the file is gone");
+        drop(scope);
+
+        hand.scan().await;
+        assert_eq!(hand.pump().await, vec!["two"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A checkpoint written while an entry is unspent keeps it. Otherwise a restart would find
+    /// the file with no entry and, under `read_from: end`, skip what it gained.
+    #[tokio::test]
+    async fn an_unconsumed_checkpoint_entry_survives_a_checkpoint_write_while_its_listing_fails() {
+        use crate::tail::pattern::READ_DIR;
+        use logit_pipeline::fault::{self, errno};
+
+        let dir = scratch_dir("resume-persisted-while-failing");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+        let config = checkpointed(&dir, ReadFrom::End);
+        let patterns = || vec![PathPattern::new(dir.join("*.log"))];
+
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        let mut hand = Hand::bind(patterns(), LineFactory, config.clone()).await;
+        hand.checkpoint().await;
+        assert!(hand.shutdown().await.is_empty());
+        drop(scope);
+        assert_eq!(checkpointed_entry(&dir), (4, 4, Head::of(b"one\n").hash));
+
+        append(&path, b"three\n");
+        let mut hand = Hand::bind(patterns(), LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["two", "three"]);
+        assert_eq!(hand.rejected(), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An open that fails after the scan found the file leaves its entry, so the next scan
+    /// resumes instead of replaying.
+    #[tokio::test]
+    async fn a_resume_entry_is_spent_only_when_the_file_is_tracked() {
+        use crate::tail::pattern::OPEN;
+        use logit_pipeline::fault::{self, errno};
+
+        let dir = scratch_dir("resume-spent-when-tracked");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(OPEN, 1, errno::EACCES);
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert!(hand.tailer.files.is_empty());
+        assert_eq!(hand.diag.occurrences("open_error"), 1);
+        assert_eq!(hand.tailer.resume.len(), 1);
+
+        hand.scan().await;
+        drop(scope);
+        assert_eq!(hand.pump().await, vec!["two"], "resumed at the entry, not replayed");
+        assert!(hand.tailer.resume.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -37,6 +37,8 @@ pub(crate) const READ_DIR: Point = Point::new(sites::TAIL_SCAN, Op::ReadDir);
 /// entry's type and the log's `metadata`, both keyed on the built log path) and
 /// `Tailer::scan`'s per-path `metadata`.
 pub(crate) const STAT: Point = Point::new(sites::TAIL_SCAN, Op::Stat);
+/// The fault-seam point before `Tailer::open_tracked` opens a discovered file.
+pub(crate) const OPEN: Point = Point::new(sites::TAIL_SCAN, Op::Open);
 
 /// Whether a failed `read_dir` or `stat` means the path isn't there, rather than that it couldn't
 /// be looked at. See the module doc's table.
