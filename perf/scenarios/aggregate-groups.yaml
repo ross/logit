@@ -7,8 +7,8 @@
 # on `host.name`/`service.instance.id`. One gauge per event, fixed name and value, fixed event
 # attributes, so every event lands in the same one series per group. The scenario exists to
 # measure how the group lookup's cost grows with the group count --
-# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section. The corresponding row in
-# docs/design/performance.md §1 is added once this scenario is measured on the perf VM.
+# `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section. Its row is in
+# docs/design/performance.md §1.
 #
 #   script/perf run --scenario aggregate-groups
 components:
