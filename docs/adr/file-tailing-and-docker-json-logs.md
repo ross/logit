@@ -188,7 +188,8 @@ it has been draining for at least one `poll_interval`, a later scan has run, and
 (amended 2026-09-28: decision 6 of [ADR
 `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md), so a
 writer still appending to the renamed inode until it reopens isn't cut off); the new one opens at
-its own beginning, regardless of `read_from`. A path whose length is now less than
+its own beginning, regardless of `read_from`, unless a checkpoint entry for it is still unspent,
+which it resumes from as any newly found file does (amended 2026-09-28). A path whose length is now less than
 the tracked offset is a truncation — seek to `0`, diagnosed (`truncated`), same inode. The line
 splitter is reset along with the offset, so an unterminated fragment held from the pre-truncation
 generation is dropped rather than spliced onto the first line of the new one — and so is each
@@ -205,7 +206,10 @@ all and never looks for anything but the exact `<id>-json.log` name a container'
 implies, so `<id>-json.log.1` is simply never a name it looks for in the first place. A pattern
 that matches a file both before and after a rename (`app.log*` matching both `app.log` and
 `app.log.1`) rebinds the existing tracked entry to the new path rather than re-opening the inode,
-so no duplicate re-emission occurs.
+so no duplicate re-emission occurs. The rebind runs the same truncation check against the new
+path's length (amended 2026-09-28): an inode retired by a `stat` that raced a rename, then
+truncated in place before the scan that rebinds it, would otherwise keep its old offset and be
+read from mid-line once refilled past it.
 
 ### Checkpoints: optional, written on an interval, only when dirty
 

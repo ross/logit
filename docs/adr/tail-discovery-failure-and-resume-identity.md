@@ -297,6 +297,16 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   call, per-pass `Vec`s, byte-by-byte newline search) wait for a perf session with a tail
   scenario, because an allocation or sizing change needs a measurement on the perf VM
   ([ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md)).
+- **Follow-ups, not started.**
+  - TAIL-03 perf: reuse one read buffer per `Tailer` (no 64 KiB zeroing and copy per call),
+    `memchr` in `LineSplitter::push`, and `drain`'s per-pass `Vec`s hoisted. It needs a
+    `perf/scenarios/tail-*.yaml` scenario, a measurement on the perf VM, and an allocation pin.
+  - Per-stream drop state in the checkpoint, which removes the pin a never-ending line holds on
+    the checkpoint.
+  - A `TailDecoder` hook the splitter calls for an envelope it drops, so `docker_in` can release
+    a held fragment the drop would otherwise splice onto the next line.
+  - A decoder opt-out from `take_partial` at shutdown, so `docker_in` checkpoints before a torn
+    envelope instead of emitting it as a `bad_line`.
 
 ## Running it
 
@@ -324,13 +334,14 @@ Decision 1 as written. Because a failed pattern is tested with `PathPattern::cov
 by directory, two patterns sharing a directory, one of them failing, still retire what only the
 listed one names. `Tailer::scan`'s listing step returns a `Listing` (`discovered`, `unknown`,
 `failed`, and `listed`, which the resume pruning in decision 4 also uses). The fault seam checks
-three points at `tail.scan`: the `read_dir` in `PathPattern::scan`, the two per-container stats
+three points at `tail.scan`: the `read_dir` in `PathPattern::scan` and each entry it yields, the
+two per-container stats
 in `docker_in`'s walk, and the per-path `metadata` in `Tailer::scan`, which runs once per
 distinct matched path.
 
 Tests, all against a real scratch directory with the failure forced through the seam: `pattern.rs`
-covers each row of its module doc's table, `covers` against `scan` for both matchers, and a model
-proptest of `matches_name`; `driver.rs` covers a failed listing (at the call or part-way through)
+covers each row of its module doc's table but the iterator-item one, `covers` against `scan` for
+both matchers, and a model proptest of `matches_name`; `driver.rs` covers a failed listing (at the call, or part-way through: the iterator-item row)
 and a failed `stat` keeping the file with no replay, `ENOENT` still retiring it, a missing or
 removed directory, a deletion and a truncation seen through the handle while the listing fails, two
 patterns with one failing (separate and shared directories), one `stat` per distinct path, and a
@@ -349,7 +360,8 @@ the capture rule, the accept rule, and the residual. Three details the decisions
   `read_one`'s own chunks. A head read that fails other than as a short file (`EIO` on a flaky
   mount) is an open error, not a rejection: the entry stays for the next scan.
 - **The resume entry is removed once the file is tracked, whatever the start was**, so an entry
-  never outlives its inode being tracked (the rotation arm opens at `0` and still spends one).
+  never outlives its inode being tracked. The rotation arm resumes from an unspent entry as the
+  unbound arm does (a `tailbk/w6` fix; before it, the rotation arm opened at `0` and spent it).
 - **The fault seam's `tail.scan` site gains `Op::Open` and `Op::Read`**, checked before
   `open_tracked` opens a discovered file and before it reads a resumed file's head, so a test can
   fail either after a good `stat`.
@@ -404,4 +416,51 @@ does `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping`, so it 
 
 ### `tailbk/w6`: driver state-machine proptest, close-out (TAIL-01..03, TAIL-10, TAIL-12)
 
-To be filled by the PR that lands it.
+`crates/logit-inputs/src/tail/driver/verification.rs` is a state-machine proptest of `Tailer` on
+the real filesystem; its module doc is the canonical description. Each case tails one to three
+files under one pattern kind (`app.log` or `app.log*`), with `max_events` 1 or 3 and
+`max_line_bytes` 40 or 1 MiB, through 8 to 64 random ops on a current-thread runtime with paused
+time:
+
+- **Writes:** complete lines, a line's first bytes (completed by the slot's next file op), a
+  create, a delete, and a delete of the oldest rotated file.
+- **Rotations, as the recorded `logrotate` run did them:** `RenameRotate` (shift `.N` to `.N+1`,
+  rename to `.1`, create, with a scan free to land between steps), an append to the renamed
+  inode (the writer before its reopen), and `CopyTruncate` (a new `.1` copy, a truncation in
+  place, and a scan, whose listing may fail).
+- **Tailer ops:** a scan (clean, a failed listing, an `EIO` `stat`, or an `ENOENT` `stat` standing
+  in for a rename between the listing and the `stat`), a drain, a flush, a checkpoint tick, a
+  `poll_interval` of clock, a clean restart, and a crash, each restart's first scan free to fail.
+
+An independent model restates the driver's rules and, after every op, the test checks the batches
+received (content, boundaries, and per-inode order), every tracked file's offset, pending bytes,
+state, path, and head, `by_path`, the resume entries, the checkpoint on disk (and that each
+persisted offset is a line start, or the end of a prefix a clean stop emitted), and every counter
+and diagnostic key. At the end, every message is a written line or one side of a clean
+stop's split, and every complete line of an inode a pattern still reaches was received. 64 cases
+run in about 1.4 s, and 1000 in about 23 s. Seven driver mutations (the reap grace, the truncation
+dirtying the checkpoint, the rotation count, the head check, the pending-bytes subtraction, the
+rebind's ownership check, the link-count check) each fail it.
+
+The model found two driver bugs before it was committed, both fixed here, each with a
+hand-driven test in `driver.rs` and a replay through the harness:
+
+- **A rebind never checked for truncation.** A file retired by a `stat` that raced a rename, then
+  truncated in place (`copytruncate`) and refilled past its old offset before the scan that
+  rebinds it, was read from that offset: a mid-line fragment emitted as a line, and the refill's
+  first lines lost. The rebind now runs the same-path arm's truncation check against the scan's
+  `stat`.
+- **The rotation arm ignored an unspent checkpoint entry.** An inode whose entry survived a
+  restart unspent (its `stat` failed), then rotated onto a path still bound to another inode,
+  was opened at `0` and replayed, but only in the scan order where that path was reached before
+  the old inode's rebind released it. The rotation arm now resumes from the entry as the unbound
+  arm does.
+
+Named tests pin the refuter's cases one at a time: a rotation chain rebinding in all six scan
+orders, a two-inode swap in both, a `copytruncate` copy replayed under a wildcard, a clean stop
+splitting an unterminated line, a deleted file and a rotated file under an exact pattern losing
+their unread tails at a restart and a crash, a `copytruncate` before any read counting no
+truncation, and `files.open` sampled at the scan before a reap. `docker.rs` pins TAIL-10 at the
+factory: an in-place rewrite that keeps `config.v2.json`'s length and mtime is never re-read (a
+new mtime is), `end_scan` keeps only the containers a scan reached, and a 12-hex-character
+name matches as an id prefix (not uppercase, not 11 characters).
