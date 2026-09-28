@@ -1221,6 +1221,15 @@ see [ADR
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
+**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
+`copytruncate` or `compress`, don't use a pattern that matches the rotated names: `app.log*` reads
+every `copytruncate` copy from its beginning, re-emitting the whole file each rotation, and reads a
+`.gz` as lines of binary. With an exact pattern (`app.log`), the writer must reopen its file on
+HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its end at
+least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
+that is lost. `copytruncate` under an exact
+pattern loses what was written after the last read and before the truncate.
+
 ## Series retention
 
 `aggregate` normally drains every series on every flush (tumbling). Statsd gauges are the

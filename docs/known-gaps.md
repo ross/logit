@@ -1959,10 +1959,24 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   flush and no final checkpoint. Nothing is lost: the restart resumes from the last interval
   checkpoint, which lands between passes even under a backlog, so it replays at most one
   `checkpoint_interval` or one 64 KiB chunk per file.
-- **A rotated file still draining at shutdown is orphaned on restart if its new name matches no
-  pattern.** The shutdown checkpoint records its inode and offset, but the restart's scan never
-  finds the file, so the entry is never used and the file's unread tail is lost. A pattern that
-  also matches the rotated name (`app.log*`) avoids it.
+- **A file removed or rotated out of every pattern loses its unread tail at a clean stop or a
+  crash.** It doesn't matter whether a scan noticed first. After a clean stop, the checkpoint
+  records its inode and offset, but the restart's scan never finds the file, so the entry is never
+  used. After a crash, the lines it had read but not yet flushed are gone too. A pattern that also
+  matches the rotated name (`app.log*`) avoids it for a rename, but not for a removal.
+- **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
+  rotation, and `compress` tails `app.log.N.gz` as text.** The copy `copytruncate` writes is a new
+  inode, so `app.log*` reads it from `0`; a recorded run re-emitted about 1,600 to 2,000 lines per
+  three rotations. A `.gz` file is read as lines of binary, diagnosed `invalid_utf8`.
+  `docs/deploying.md`'s "What to watch for file tailing" has the guidance.
+- **Under an exact pattern, `copytruncate` loses the lines written after the tailer's last read
+  and before the truncate.** They exist only in the copy, which the pattern doesn't match. The
+  window is up to one `poll_interval` of writes (or one wake).
+- **`tail_in` splits a line held unterminated at a clean stop into two events.** Shutdown emits the
+  partial line as it stands, and the checkpoint records the end of what was read, so the rest of
+  the line, written later, arrives after the restart as a line of its own. A line being dropped
+  for `max_line_bytes` is the exception: its checkpoint stays at its start and it's dropped whole
+  again.
 - **A `copytruncate` that the writer refills past the old offset before the next check goes
   undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
   and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
@@ -1992,8 +2006,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   decision 1.
 - **A read error on a `Draining` file loses its unread tail.** The driver reports a read error as
   EOF so that a handle that keeps failing is reaped, and the reap drops whatever the file still
-  held. It's diagnosed `read_error`. An `Active` file is never reaped on a read error. The fault
-  seam has no read operation for `File::read`, so no test injects it. See [ADR
+  held. It's diagnosed `read_error`. An `Active` file is never reaped on a read error.
+  `a_read_error_on_a_draining_file_reaps_it_and_loses_its_unread_tail` pins it through the fault
+  seam's `tail.read` site. See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
 - **A `containers:` entry that is a container's *name* and also 12 or more hex characters selects

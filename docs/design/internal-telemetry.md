@@ -1026,9 +1026,9 @@ own read-side counters:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.lines` / `.line.bytes` | count | the read-side counterpart of `statsd_in`'s per-datagram pair, at line granularity |
+| `logit.input.lines` / `.line.bytes` | count | the read-side counterpart of `statsd_in`'s per-datagram pair, at line granularity: every line offered to the decoder, a rejected one and the unterminated line emitted at close included, and not a line dropped for `max_line_bytes` |
 | `logit.input.files.open` | gauge | sampled after every `scan` |
-| `.files.rotated` / `.files.truncated` | count | a new inode at a known path, or the same inode shrinking |
+| `.files.rotated` / `.files.truncated` | count | a known path now naming another inode (each such path in a scan, so a rotation chain under a wildcard counts every renamed name), or the same inode shrinking |
 | `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
 | `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes hash differently, or the offset is past its length. The fingerprint comes from a checkpoint entry or a de-selection retention. Decision 2 of the same ADR |
 | `.checkpoint.writes` | count | only on an actual write; `checkpoint_interval` ticks that find nothing dirty record nothing |
