@@ -689,6 +689,11 @@ Merged branches and PRs are never renamed to fit.
 - **A config file is always read through `logit_cli::config::load`**, never a bare
   `std::fs::read_to_string` + `serde_norway::from_str` — that's what resolves `!env` and rejects an
   unknown YAML tag (ADR `env-yaml-tag`); a call site that bypasses it silently loses both.
+- **A test waits on an observable, never a sleep, and uses the shared helpers** in
+  `logit_pipeline::test_util` (`wait_until`, `TelemetryProbe`, `recv_batch`, `spawn_input`,
+  `scratch_dir`, and the rest) rather than writing its own. A sleep only sizes a negative window.
+  The eight rules, bind-before-spawn and the 5 s `RECV_TIMEOUT` among them, are in
+  [ADR `test-timing-and-observables`](docs/adr/test-timing-and-observables.md).
 - **A comment says what a maintainer would otherwise get wrong**: an invariant, a hidden
   constraint, a workaround, a wire fact. It explains why, and what only when the code can't.
   Concretely:
