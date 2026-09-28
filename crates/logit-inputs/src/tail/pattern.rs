@@ -39,6 +39,8 @@ pub(crate) const READ_DIR: Point = Point::new(sites::TAIL_SCAN, Op::ReadDir);
 pub(crate) const STAT: Point = Point::new(sites::TAIL_SCAN, Op::Stat);
 /// The fault-seam point before `Tailer::open_tracked` opens a discovered file.
 pub(crate) const OPEN: Point = Point::new(sites::TAIL_SCAN, Op::Open);
+/// The fault-seam point before `Tailer::open_tracked` reads a resumed file's head.
+pub(crate) const HEAD_READ: Point = Point::new(sites::TAIL_SCAN, Op::Read);
 
 /// Whether a failed `read_dir` or `stat` means the path isn't there, rather than that it couldn't
 /// be looked at. See the module doc's table.

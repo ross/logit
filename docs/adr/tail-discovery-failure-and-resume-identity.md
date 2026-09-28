@@ -304,11 +304,13 @@ the capture rule, the accept rule, and the residual. Three details the decisions
   tracked file's head satisfies its invariant (`head.len() >= min(256, offset)`) without a second
   read, and the file is always sought afterwards, to `0` on a rejection. A file opened at its end
   reads its first `min(256, len)` bytes once, at open; every other head byte comes from
-  `read_one`'s own chunks.
+  `read_one`'s own chunks. A head read that fails other than as a short file (`EIO` on a flaky
+  mount) is an open error, not a rejection: the entry stays for the next scan.
 - **The resume entry is removed once the file is tracked, whatever the start was**, so an entry
   never outlives its inode being tracked (the rotation arm opens at `0` and still spends one).
-- **The fault seam's `tail.scan` site gains `Op::Open`**, checked before `open_tracked` opens a
-  discovered file, so a test can fail the open after a good `stat`.
+- **The fault seam's `tail.scan` site gains `Op::Open` and `Op::Read`**, checked before
+  `open_tracked` opens a discovered file and before it reads a resumed file's head, so a test can
+  fail either after a good `stat`.
 
 Tests, in `driver.rs` unless noted, drive `bind`/`scan`/`drain` by hand under `Watcher::Poll`
 against a real scratch directory: a hand-written format 2 entry with a wrong hash for a live

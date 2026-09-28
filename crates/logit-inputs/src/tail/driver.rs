@@ -835,7 +835,22 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // `TrackedFile::head` holds from here without re-reading.
                 let n = off.max(u64::from(retained.len)).min(HEAD_BYTES as u64);
                 let current = if off <= len && u64::from(retained.len) <= len {
-                    read_head(&mut file, n as usize).await.ok()
+                    let read = match fault::check(super::pattern::HEAD_READ, &path, 0) {
+                        Ok(()) => read_head(&mut file, n as usize).await,
+                        Err(err) => Err(err),
+                    };
+                    match read {
+                        Ok(bytes) => Some(bytes),
+                        // Shrank since the `metadata` above: the head can't match.
+                        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => None,
+                        // Says nothing about the file's identity, so keep the entry for the next
+                        // `scan` rather than reject it.
+                        Err(err) => {
+                            self.diag
+                                .warn_throttled("open_error", format!("{}: {err}", path.display()));
+                            return;
+                        }
+                    }
                 } else {
                     None
                 };
@@ -4344,6 +4359,40 @@ mod tests {
         hand.scan().await;
         drop(scope);
         assert_eq!(hand.pump().await, vec!["two"], "resumed at the entry, not replayed");
+        assert!(hand.tailer.resume.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A head read that fails for a reason other than a short file says nothing about the file's
+    /// identity: the entry is kept and the next scan resumes, rather than a counted rejection.
+    #[tokio::test]
+    async fn a_transient_head_read_error_on_resume_keeps_the_entry() {
+        use crate::tail::pattern::HEAD_READ;
+        use logit_pipeline::fault::{self, errno};
+
+        let dir = scratch_dir("resume-head-read-fails");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(HEAD_READ, 1, errno::EIO);
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert!(hand.tailer.files.is_empty());
+        assert_eq!(hand.diag.occurrences("open_error"), 1);
+        assert_eq!(hand.rejected(), 0.0);
+        assert_eq!(hand.diag.occurrences("resume_rejected"), 0);
+        assert_eq!(hand.tailer.resume.len(), 1, "the entry survives");
+
+        hand.scan().await;
+        drop(scope);
+        assert_eq!(hand.pump().await, vec!["two"], "resumed at the entry, not replayed");
+        assert_eq!(hand.rejected(), 0.0);
         assert!(hand.tailer.resume.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }

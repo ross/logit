@@ -51,6 +51,8 @@ pub enum Op {
     ReadDir,
     /// A `stat` (`metadata`) of a path.
     Stat,
+    /// A read from an open file.
+    Read,
 }
 
 /// One injectable operation: the call site (one of [`sites`]) and the operation it's about to run.
@@ -83,7 +85,7 @@ pub mod sites {
     /// `file_out`'s retained `.N` files.
     pub const FILE_OUT_RETAINED: &str = "file_out.retained";
     /// `tail_in`/`docker_in` discovery: a pattern directory's listing, a discovered path's stat,
-    /// and the open of a file about to be tracked.
+    /// and the open of a file about to be tracked, with its head read for a resume.
     pub const TAIL_SCAN: &str = "tail.scan";
 }
 
@@ -320,7 +322,7 @@ mod tests {
     use super::*;
     use crate::disk_queue::test_support::scratch_dir;
 
-    const EVERY_OP: [Op; 11] = [
+    const EVERY_OP: [Op; 12] = [
         Op::Create,
         Op::Open,
         Op::Write,
@@ -332,6 +334,7 @@ mod tests {
         Op::Unlink,
         Op::ReadDir,
         Op::Stat,
+        Op::Read,
     ];
 
     const EVERY_SITE: [&str; 8] = [
