@@ -514,34 +514,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let unspent = self.resume.values().any(|r| r.source == Source::Checkpoint);
         let discovered_ids: HashSet<FileId> =
             if !unspent { HashSet::new() } else { listing.discovered_ids().collect() };
+        self.count_rotations(&listing.discovered);
         for (path, meta) in std::mem::take(&mut listing.discovered) {
-            let id = FileId::from_metadata(&meta);
-            match self.by_path.get(&path).copied() {
-                Some(existing_id) if existing_id == id => {
-                    self.reconcile_truncation(id, meta.len()).await;
-                    self.refresh_identity(id, &path);
-                }
-                Some(existing_id) => {
-                    if let Some(tracked) = self.files.get_mut(&existing_id) {
-                        tracked.start_draining();
-                    }
-                    self.telemetry.count("logit.input.files.rotated", 1.0, &[]);
-                    self.by_path.remove(&path);
-                    self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
-                }
-                None => {
-                    // Peeked, not removed: `accept` may still reject this path (a de-selected
-                    // container not yet re-selected), or the open may fail, and removing here
-                    // would lose the retained offset. `open_tracked` removes it once the file is
-                    // tracked.
-                    let start = match self.resume.get(&id) {
-                        Some(retained) => StartOffset::Resume(retained.offset, retained.head),
-                        None if first => self.first_scan_start,
-                        None => StartOffset::Beginning,
-                    };
-                    self.open_tracked(path, id, start, watcher).await;
-                }
-            }
+            self.reconcile_discovered(path, &meta, first, watcher).await;
         }
         pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
         if pruned {
@@ -567,6 +542,59 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             (self.watched_dirs.len() + file_watches) as f64,
             &[],
         );
+    }
+
+    /// Counts `logit.input.files.rotated`: each discovered path bound to an inode other than the
+    /// one now there. Runs before [`Tailer::reconcile_discovered`] mutates `by_path`. Counted in
+    /// the loop instead, the total would depend on `discovered`'s order: a rebind that ran first
+    /// removes the old binding, and the path would then take the `None` arm uncounted.
+    fn count_rotations(&self, discovered: &HashMap<PathBuf, std::fs::Metadata>) {
+        let rotated = discovered
+            .iter()
+            .filter(|(path, meta)| {
+                self.by_path.get(*path).is_some_and(|old| *old != FileId::from_metadata(meta))
+            })
+            .count();
+        if rotated > 0 {
+            self.telemetry.count("logit.input.files.rotated", rotated as f64, &[]);
+        }
+    }
+
+    /// Reconciles one discovered `path` against what's tracked under it: the same inode is
+    /// checked for truncation and identity, another inode is a rotation, and an untracked path is
+    /// opened (or rebound, by `open_tracked`).
+    async fn reconcile_discovered(
+        &mut self,
+        path: PathBuf,
+        meta: &std::fs::Metadata,
+        first: bool,
+        watcher: &mut super::watch::Watcher,
+    ) {
+        let id = FileId::from_metadata(meta);
+        match self.by_path.get(&path).copied() {
+            Some(existing_id) if existing_id == id => {
+                self.reconcile_truncation(id, meta.len()).await;
+                self.refresh_identity(id, &path);
+            }
+            Some(existing_id) => {
+                if let Some(tracked) = self.files.get_mut(&existing_id) {
+                    tracked.start_draining();
+                }
+                self.by_path.remove(&path);
+                self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
+            }
+            None => {
+                // Peeked, not removed: `accept` may still reject this path (a de-selected
+                // container not yet re-selected), or the open may fail, and removing here would
+                // lose the retained offset. `open_tracked` removes it once the file is tracked.
+                let start = match self.resume.get(&id) {
+                    Some(retained) => StartOffset::Resume(retained.offset, retained.head),
+                    None if first => self.first_scan_start,
+                    None => StartOffset::Beginning,
+                };
+                self.open_tracked(path, id, start, watcher).await;
+            }
+        }
     }
 
     /// Drops each [`Source::Deselected`] entry this listing shows can't be re-selected: its path
@@ -4598,5 +4626,82 @@ mod tests {
         assert!(hand.tailer.files.is_empty(), "reaped by the drain after the scan");
         assert_eq!(tokio::time::Instant::now(), start, "with no time passing");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- accounting
+
+    /// Runs `count_rotations` and then `reconcile_discovered` over `order`, as `scan` does over
+    /// `discovered` in whatever order its `HashMap` yields. Returns `files.rotated`.
+    async fn rotated_in_order(
+        tailer: &mut Tailer<LineDecoder, LineFactory>,
+        probe: &mut TelemetryProbe,
+        order: &[PathBuf],
+    ) -> f64 {
+        let discovered: HashMap<PathBuf, std::fs::Metadata> =
+            order.iter().map(|p| (p.clone(), std::fs::metadata(p).unwrap())).collect();
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer.count_rotations(&discovered);
+        for path in order {
+            tailer.reconcile_discovered(path.clone(), &discovered[path], false, &mut watcher).await;
+        }
+        for path in order {
+            let id = FileId::from_metadata(&discovered[path]);
+            assert_eq!(tailer.by_path.get(path), Some(&id), "{path:?} is bound to its inode");
+            assert_eq!(tailer.files[&id].state, FileState::Active);
+        }
+        probe.sum("logit.input.files.rotated", &[])
+    }
+
+    /// `files.rotated` counts each discovered path whose inode changed, before any arm runs, so
+    /// the total doesn't depend on which of a rebind and a replacement `scan` reaches first.
+    #[tokio::test]
+    async fn files_rotated_counts_every_path_whose_inode_changed_in_any_discovery_order() {
+        // A two-inode swap: each name now names the other's inode.
+        for reversed in [false, true] {
+            let dir = scratch_dir("rotated-swap");
+            let (a, b) = (dir.join("app.log"), dir.join("app.log.1"));
+            std::fs::write(&a, b"a\n").unwrap();
+            std::fs::write(&b, b"b\n").unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            tick(&mut tailer, true).await;
+            std::fs::rename(&a, dir.join("tmp")).unwrap();
+            std::fs::rename(&b, &a).unwrap();
+            std::fs::rename(dir.join("tmp"), &b).unwrap();
+            let mut order = vec![a.clone(), b.clone()];
+            if reversed {
+                order.reverse();
+            }
+            assert_eq!(rotated_in_order(&mut tailer, &mut probe, &order).await, 2.0, "{order:?}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        // A rotation chain: `.1` -> `.2`, `app.log` -> `.1`, a new `app.log`. Two known paths now
+        // name another inode; `app.log.2` was never tracked under that name.
+        let names = ["app.log", "app.log.1", "app.log.2"];
+        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for order in orders {
+            let dir = scratch_dir("rotated-chain");
+            std::fs::write(dir.join("app.log"), b"a\n").unwrap();
+            std::fs::write(dir.join("app.log.1"), b"b\n").unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            tick(&mut tailer, true).await;
+            std::fs::rename(dir.join("app.log.1"), dir.join("app.log.2")).unwrap();
+            std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).unwrap();
+            std::fs::write(dir.join("app.log"), b"c\n").unwrap();
+            let order: Vec<PathBuf> = order.iter().map(|&i| dir.join(names[i])).collect();
+            assert_eq!(rotated_in_order(&mut tailer, &mut probe, &order).await, 2.0, "{order:?}");
+            assert_eq!(tailer.tracked_len(), 3);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }
