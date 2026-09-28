@@ -17,6 +17,7 @@ use hyper_util::rt::TokioIo;
 use logit_core::{Event, EventBatch, MetricKind, Registry, Value};
 use logit_inputs::splunk::SplunkHecInput;
 use logit_outputs::splunk::{SplunkCompression, SplunkHecOutput};
+use logit_pipeline::test_util::{assert_no_batch, recv_batch};
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::splunk::SplunkDecoder;
 use std::convert::Infallible;
@@ -48,19 +49,12 @@ fn sink(addr: SocketAddr, registry: &Registry) -> SplunkHecOutput {
         .with_telemetry(registry.telemetry_for("out", "splunk_hec_out", "sink"))
 }
 
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("splunk_hec_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
-}
-
+/// Asserts nothing more reaches `splunk_hec_in`. `splunk_hec_in` delivers a request's batches
+/// before it answers and the sink's `send` returns only after the answer, so nothing a send caused
+/// is still in flight; the 300ms window is a margin against a stray later batch, not a delivery
+/// interval.
 async fn assert_nothing_delivered(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) {
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "nothing more reaches splunk_hec_in"
-    );
+    assert_no_batch(rx, Duration::from_millis(300), "nothing more reaches splunk_hec_in").await;
 }
 
 /// The one batch `body` decodes to.
@@ -107,7 +101,7 @@ async fn every_signal_relays_its_batch_unchanged() {
         for (name, batch) in [("logs", logs()), ("metrics", metrics()), ("spans", spans())] {
             assert!(!batch.events.is_empty(), "{name}: the case carries events");
             out.send(&batch).await.unwrap_or_else(|err| panic!("{name}: {err:#}"));
-            assert_eq!(recv(&mut rx).await, batch, "{name} {compression:?}");
+            assert_eq!(recv_batch(&mut rx).await, batch, "{name} {compression:?}");
         }
     }
     assert_nothing_delivered(&mut rx).await;
@@ -142,7 +136,7 @@ async fn a_split_batch_arrives_in_order() {
 
     let mut delivered = Vec::new();
     while delivered.len() < batch.events.len() {
-        delivered.extend(recv(&mut rx).await.events);
+        delivered.extend(recv_batch(&mut rx).await.events);
     }
     assert_eq!(delivered, batch.events);
     assert_nothing_delivered(&mut rx).await;
@@ -173,7 +167,7 @@ async fn ack_true_is_acknowledged_by_the_listener() {
         sink(addr, &registry).with_ack(true, Duration::from_secs(10)).with_max_body_bytes(1_000);
     let batch = logs();
     out.send(&batch).await.expect("acknowledged");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 
     let mut split = logs();
     let template = split.events[0].clone();
@@ -181,7 +175,7 @@ async fn ack_true_is_acknowledged_by_the_listener() {
     out.send(&split).await.expect("acknowledged");
     let mut delivered = Vec::new();
     while delivered.len() < split.events.len() {
-        delivered.extend(recv(&mut rx).await.events);
+        delivered.extend(recv_batch(&mut rx).await.events);
     }
     assert_eq!(delivered, split.events);
 
@@ -296,8 +290,8 @@ async fn a_code_6_from_the_listener_leaves_every_valid_object_delivered_once() {
     let (addr, mut rx) = listener().await;
     let mut out = sink(addr, &registry).with_compression(SplunkCompression::None);
     out.send(&batch).await.expect("the resend is accepted");
-    let first = recv(&mut rx).await;
-    let resent = recv(&mut rx).await;
+    let first = recv_batch(&mut rx).await;
+    let resent = recv_batch(&mut rx).await;
     assert_nothing_delivered(&mut rx).await;
     assert_eq!(first.events, [batch.events[0].clone()], "the object before the bad one");
     assert_eq!(resent.events, [batch.events[2].clone()], "the object after it, resent");

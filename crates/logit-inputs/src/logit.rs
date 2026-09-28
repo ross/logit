@@ -1709,10 +1709,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_tls_client_that_sends_nothing_releases_its_permit_after_the_handshake_timeout() {
+        let diag = Diagnostics::new("logit_in");
+        let listener_diag = diag.clone();
         let (addr, input) = bound_input().await;
         let input = input
             .with_tls(&test_tls_settings(), &testdata_dir())
             .unwrap()
+            .with_diagnostics(listener_diag)
             .with_max_connections(1)
             .with_handshake_timeout(Duration::from_millis(200));
         let (sink, _rx) = fanout_into_channel(16);
@@ -1721,9 +1724,18 @@ mod tests {
 
         // Takes the one permit and never sends a ClientHello; held open, so only the TLS-accept
         // timeout can free the permit.
-        let _silent = connect(&addr).await;
+        let mut silent = connect(&addr).await;
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
 
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The close alone doesn't prove the permit is back: the connection's task drops the
+        // stream, then reports `connection_error`, then drops the permit, with no `.await` in
+        // between. The `logit.input.connections` gauge can't say either, since it counts only a
+        // connection whose TLS accept succeeded. The diagnostic is the task's last step, and on
+        // this current-thread runtime the permit drop runs in the same poll.
+        logit_pipeline::test_util::wait_until("the silent connection's task to end", || {
+            diag.occurrences("connection_error") >= 1
+        })
+        .await;
 
         // A `HelloAck` here, not `Reject{INTERNAL}`, proves the permit came back.
         let connector = tls_connector().await;
@@ -1936,16 +1948,20 @@ mod tests {
     /// A header whose first byte lands inside the idle deadline and whose rest lands outside it
     /// is read, not rejected ([`read_header`]'s [`IdleBounds`]).
     ///
-    /// 220ms then 160ms against a 300ms timeout: the first byte lands 80ms inside the absolute
-    /// deadline, the rest 80ms past it and 140ms inside the per-`read` budget. A `sleep` only
-    /// overshoots, so only the first margin is lag-sensitive; keep it wide.
+    /// A 1s `idle_timeout`, the first byte written at 700ms and the rest 500ms later. The first
+    /// byte lands 300ms inside the absolute deadline, which protects the case under test: past
+    /// it, the header is rejected before it starts. The rest lands 200ms past that deadline,
+    /// which proves the absolute bound no longer applies once a byte has arrived, and 500ms
+    /// inside the per-`read` budget (`idle_timeout` again, from the first byte), which keeps the
+    /// stall bound from firing instead. A `sleep` only overshoots, so lag can eat only the 300ms
+    /// and the 500ms margins; the 200ms one only grows.
     #[tokio::test]
     async fn a_frame_header_that_starts_arriving_at_the_idle_deadline_is_read_not_rejected() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
         let (addr, input) = bound_input().await;
         let mut input =
-            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(300)));
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_secs(1)));
         let (sink, mut rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1956,9 +1972,9 @@ mod tests {
         let mut encoder = NativeEncoder::new(Compression::None);
         let framed = encoder.encode(&sample_batch()).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(220)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
         client.write_all(&framed[..1]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(160)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         client.write_all(&framed[1..]).await.unwrap();
 
         assert_eq!(

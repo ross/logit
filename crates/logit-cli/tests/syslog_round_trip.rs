@@ -70,6 +70,7 @@ use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
 use logit_inputs::syslog::{SyslogDecoder, SyslogInput};
 use logit_outputs::syslog::{Format, SyslogEncoder, SyslogOutput};
+use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::Decoder;
 use std::net::SocketAddr;
@@ -162,21 +163,16 @@ impl Harness {
             SyslogOutput::udp(self.capture_addr.to_string()).unwrap().with_encoder(encoder());
         to_capture.send(batch).await.expect("send to the capture socket");
         let mut buf = vec![0u8; 65_536];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_millis(500), self.capture.recv_from(&mut buf))
-                .await
-                .expect("capture socket should receive the datagram")
-                .expect("recv_from should succeed");
+        let (n, _) = tokio::time::timeout(RECV_TIMEOUT, self.capture.recv_from(&mut buf))
+            .await
+            .expect("capture socket should receive the datagram")
+            .expect("recv_from should succeed");
         buf.truncate(n);
 
         let mut to_input =
             SyslogOutput::udp(self.input_addr.to_string()).unwrap().with_encoder(encoder());
         to_input.send(batch).await.expect("send to the live syslog_in");
-        let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
-            .await
-            .expect("syslog_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(&mut self.rx).await;
         normalize_receipt_time(&mut decoded);
         (buf, decoded)
     }
@@ -541,7 +537,7 @@ mod tcp {
                     .with_encoder(encoder());
             to_capture.send(batch).await.expect("send to the capture listener");
             drop(to_capture); // closes the connection, EOFing the capture task's read_to_end
-            let framed = tokio::time::timeout(Duration::from_millis(500), self.capture_rx.recv())
+            let framed = tokio::time::timeout(RECV_TIMEOUT, self.capture_rx.recv())
                 .await
                 .expect("capture listener should receive the frame")
                 .expect("the capture channel should not have closed");
@@ -551,11 +547,7 @@ mod tcp {
                     .with_encoder(encoder());
             to_input.send(batch).await.expect("send to the live syslog_in");
             drop(to_input);
-            let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
-                .await
-                .expect("syslog_in should decode and forward the batch")
-                .expect("the Fanout channel should not have closed");
-            let mut decoded = logit_pipeline::unwrap_batch(delivered);
+            let mut decoded = recv_batch(&mut self.rx).await;
             normalize_receipt_time(&mut decoded);
             (framed, decoded)
         }
@@ -662,11 +654,7 @@ mod tcp {
             .expect("writing the LF-framed message");
         drop(stream); // the message already ended in its own LF
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("syslog_in should decode and forward the message")
-            .expect("the Fanout channel should not have closed");
-        let batch = logit_pipeline::unwrap_batch(delivered);
+        let batch = recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1);
         let event = &batch.events[0];
         assert_eq!(event.attributes.get("syslog.hostname").and_then(Value::as_str), Some("myhost"));
@@ -696,11 +684,7 @@ mod tcp {
         stream.write_all(&frame).await.expect("writing the octet-counted frame");
         drop(stream);
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("syslog_in should decode and forward the message")
-            .expect("the Fanout channel should not have closed");
-        let batch = logit_pipeline::unwrap_batch(delivered);
+        let batch = recv_batch(&mut rx).await;
         assert_eq!(
             batch.events.len(),
             1,
@@ -793,11 +777,7 @@ mod tls {
         let batch = sample_batch();
         output.send(&batch).await.expect("send over server TLS should succeed");
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("syslog_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(&mut rx).await;
         normalize_receipt_time(&mut decoded);
         assert_eq!(decoded.events.len(), 1);
         assert_eq!(
@@ -833,11 +813,7 @@ mod tls {
         let batch = sample_batch();
         output.send(&batch).await.expect("mutual TLS should succeed");
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("syslog_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(&mut rx).await;
         normalize_receipt_time(&mut decoded);
         assert_eq!(
             decoded.events[0].log.as_ref().unwrap().message.as_str(),
