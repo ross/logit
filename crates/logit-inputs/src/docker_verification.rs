@@ -6,7 +6,8 @@
 //!
 //! Random stdout and stderr entries, freely interleaved, with `Malformed` entries, resets, and
 //! closes among them, are written as dockerd would escape them ([`envelope`]) and fed through the
-//! real `LineSplitter` and [`DockerDecoder`] in arbitrary chunks. After every line the decoder's
+//! real `LineSplitter` and [`DockerDecoder`] in arbitrary chunks. A close can follow an
+//! unterminated last line, which reaches `decode_line` through `take_partial` as at shutdown. After every line the decoder's
 //! events, result, `holds_entry`, and `bad_time` count must equal [`Model`]'s. Two checks don't
 //! trust the model: every message starts with its writer line's tag and carries no other, and a
 //! writer line seen whole with nothing between its first and last entries and within the bound is
@@ -122,13 +123,15 @@ enum Op {
     UnknownStream,
     /// The file was truncated: `TailDecoder::reset`, and a fresh splitter.
     Reset,
-    /// The file is closing: `TailDecoder::close`. The decoder is used again after it, as a stand-in
-    /// for the next file's decoder starting clean except for a drop in progress.
-    Close,
+    /// The file is closing: `TailDecoder::close`, after the splitter's unterminated last line (an
+    /// `Entry`, `BadJson`, or `UnknownStream` written without its `\n`), if any, goes through
+    /// `decode_line` as the driver's `close_decoder` does. The decoder is used again after it, as
+    /// a stand-in for the next file's decoder starting clean except for a drop in progress.
+    Close(Option<Box<Op>>),
 }
 
-fn op() -> impl Strategy<Value = Op> {
-    let entry = (0..2usize, any::<bool>(), text(), attrs(), prop::bool::weighted(0.1)).prop_map(
+fn entry() -> impl Strategy<Value = Op> {
+    (0..2usize, any::<bool>(), text(), attrs(), prop::bool::weighted(0.1)).prop_map(
         |(stream, complete, text, attrs, bad_time)| Op::Entry {
             stream,
             complete,
@@ -136,13 +139,21 @@ fn op() -> impl Strategy<Value = Op> {
             attrs,
             bad_time,
         },
-    );
+    )
+}
+
+fn op() -> impl Strategy<Value = Op> {
+    let torn = prop_oneof![
+        8 => entry(),
+        1 => Just(Op::BadJson),
+        1 => Just(Op::UnknownStream),
+    ];
     prop_oneof![
-        20 => entry,
+        20 => entry(),
         1 => Just(Op::BadJson),
         1 => Just(Op::UnknownStream),
         1 => Just(Op::Reset),
-        1 => Just(Op::Close),
+        1 => prop::option::of(torn).prop_map(|tail| Op::Close(tail.map(Box::new))),
     ]
 }
 
@@ -337,6 +348,51 @@ impl Harness {
 
     fn op(&mut self, index: usize, op: Op) -> Result<(), TestCaseError> {
         match op {
+            Op::Entry { .. } | Op::BadJson | Op::UnknownStream => {
+                let written = self.write(index, op)?;
+                self.pending.push(written);
+            }
+            Op::Reset => {
+                self.feed(None)?;
+                self.interrupt();
+                self.decoder.reset();
+                self.splitter = LineSplitter::new(envelope_cap(self.model.max));
+                self.model.streams = Default::default();
+                prop_assert!(!self.decoder.holds_entry());
+            }
+            Op::Close(tail) => {
+                let tail = match tail {
+                    Some(tail) => Some(self.write(index, *tail)?),
+                    None => None,
+                };
+                self.feed(tail.as_ref().map(|t| t.bytes.as_str()))?;
+                let partial = self.splitter.take_partial();
+                match tail {
+                    Some(tail) => {
+                        prop_assert_eq!(partial.as_deref(), Some(tail.bytes.as_bytes()));
+                        self.line(partial.unwrap(), tail.expect)?;
+                    }
+                    None => prop_assert_eq!(partial, None),
+                }
+                self.interrupt();
+                let mut out = Vec::new();
+                self.decoder.close(&mut out);
+                let mut want = Vec::new();
+                self.model.flush(&mut want);
+                self.check(&out, want)?;
+                prop_assert_eq!(
+                    self.decoder.holds_entry(),
+                    self.model.streams.iter().any(|s| s.dropping),
+                    "after close, only a drop in progress is held"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes one line op as dockerd would, and records its writer line.
+    fn write(&mut self, index: usize, op: Op) -> Result<Written, TestCaseError> {
+        Ok(match op {
             Op::Entry { stream, complete, text, attrs, bad_time } => {
                 let line = match self.open[stream] {
                     Some(line) => line,
@@ -366,55 +422,36 @@ impl Harness {
                     attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let bytes = envelope(STREAMS[stream], &log, &time, &pairs);
                 prop_assert!(bytes.len() <= envelope_cap(self.model.max));
-                self.pending.push(Written {
+                Written {
                     bytes,
                     expect: Expect::Entry { stream, complete, text, timestamp, attrs },
-                });
+                }
             }
             Op::BadJson => {
                 self.interrupt();
-                self.pending.push(Written {
-                    bytes: "{\"log\":\"torn".to_string(),
-                    expect: Expect::Malformed,
-                });
+                Written { bytes: "{\"log\":\"torn".to_string(), expect: Expect::Malformed }
             }
             Op::UnknownStream => {
                 self.interrupt();
-                self.pending.push(Written {
+                Written {
                     bytes: envelope("stdin", "x\n", "2026-08-17T19:35:46.000000000Z", &[]),
                     expect: Expect::Malformed,
-                });
+                }
             }
-            Op::Reset => {
-                self.feed()?;
-                self.interrupt();
-                self.decoder.reset();
-                self.splitter = LineSplitter::new(envelope_cap(self.model.max));
-                self.model.streams = Default::default();
-                prop_assert!(!self.decoder.holds_entry());
-            }
-            Op::Close => {
-                self.feed()?;
-                self.interrupt();
-                prop_assert_eq!(self.splitter.take_partial(), None);
-                let mut out = Vec::new();
-                self.decoder.close(&mut out);
-                let mut want = Vec::new();
-                self.model.flush(&mut want);
-                self.check(&out, want)?;
-            }
-        }
-        Ok(())
+            Op::Reset | Op::Close(_) => unreachable!("not a line"),
+        })
     }
 
-    /// Writes every pending line through the splitter in the next chunk sizes, decoding each line
-    /// the splitter yields and checking it against the model.
-    fn feed(&mut self) -> Result<(), TestCaseError> {
+    /// Writes every pending line, then `torn` with no `\n`, through the splitter in the next chunk
+    /// sizes, decoding each line the splitter yields and checking it against the model. `torn`
+    /// stays in the splitter for `take_partial`.
+    fn feed(&mut self, torn: Option<&str>) -> Result<(), TestCaseError> {
         let mut stream = String::new();
         for written in &self.pending {
             stream.push_str(&written.bytes);
             stream.push('\n');
         }
+        stream.push_str(torn.unwrap_or_default());
         let expects: Vec<Expect> = self.pending.drain(..).map(|w| w.expect).collect();
         let mut expects = expects.into_iter();
         let bytes = Bytes::from(stream);
@@ -505,7 +542,7 @@ fn run(max: usize, chunks: Vec<usize>, ops: Vec<Op>) -> Result<(), TestCaseError
     for (index, op) in ops.into_iter().enumerate() {
         harness.op(index, op)?;
     }
-    harness.feed()?;
+    harness.feed(None)?;
     harness.check_emitted_once()
 }
 

@@ -156,6 +156,9 @@ const ENVELOPE_SLACK_BYTES: usize = 64 * 1024;
 /// [`DOCKERD_FRAGMENT_BYTES`] raw) and any entry whose `log` fits `max_line_bytes`. JSON escaping
 /// writes a raw byte as at most six (`\u00XX`), which gives `6 × max(max_line_bytes, 16 KiB)`
 /// plus [`ENVELOPE_SLACK_BYTES`].
+///
+/// The canonical copy of these numbers: `docs/adr/file-tailing-and-docker-json-logs.md`'s
+/// 2026-09-28 amendment and `docs/known-gaps.md` state the property and point here.
 pub(crate) const fn envelope_cap(max_line_bytes: usize) -> usize {
     let m = if max_line_bytes > DOCKERD_FRAGMENT_BYTES {
         max_line_bytes
@@ -2346,6 +2349,125 @@ mod tests {
 
         running.stop().await;
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A json-file envelope with no `\n` yet, whose `log` is a fragment over a 10-byte bound.
+    fn oversized_partial_envelope() -> String {
+        json_file_line(&"y".repeat(40)).trim_end_matches('\n').to_string()
+    }
+
+    /// A clean stop whose unterminated last line is a well-formed envelope that starts a drop:
+    /// the shutdown checkpoint stays at that line's start, so after restart the line is dropped
+    /// whole again, not ended by its closing entry as a message.
+    #[tokio::test]
+    async fn a_drop_that_starts_in_the_shutdown_partial_pins_the_checkpoint_at_its_start() {
+        let root = scratch_dir("docker-shutdown-partial-drop");
+        let log = container(&root, &"6".repeat(64), "drop", "nginx:1.25");
+        let whole = json_file_line("whole\n");
+        std::fs::write(&log, format!("{whole}{}", oversized_partial_envelope())).unwrap();
+        let checkpoint = root.join("checkpoint.json");
+        let mut config = fast_tail_config();
+        config.checkpoint_path = Some(checkpoint.clone());
+        config.max_line_bytes = 10;
+
+        let diag = Diagnostics::new("docker-shutdown-partial-drop");
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            config.clone(),
+        )
+        .with_diagnostics(diag.clone());
+        let running = spawn_input(input, fanout).await;
+        // One read takes the whole file, the partial envelope with it.
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        running.stop().await;
+        assert_eq!(diag.occurrences("long_line"), 1, "shutdown decodes the partial and drops it");
+        assert_eq!(
+            checkpointed_offset(&checkpoint),
+            Some(whole.len() as u64),
+            "the shutdown checkpoint must stay at the dropped line's start"
+        );
+
+        append(&log, &format!("\n{}", json_file_line("tail\n")));
+        let diag2 = Diagnostics::new("docker-shutdown-partial-drop-2");
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let input2 =
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_diagnostics(diag2.clone());
+        let running2 = spawn_input(input2, fanout2).await;
+        wait_until("the restart to drop the line again", || diag2.occurrences("long_line") >= 1)
+            .await;
+        append(&log, &json_file_line("ok\n"));
+        assert_eq!(
+            messages(&recv_events(&mut rx2, 1).await),
+            vec!["ok"],
+            "the dropped line's closing entry must not surface as a message"
+        );
+        running2.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The de-selection twin: a file reaped by a rename out of the selection, whose unterminated
+    /// last line starts a drop, keeps its resume offset at that line's start.
+    #[tokio::test]
+    async fn a_drop_that_starts_in_a_deselected_files_partial_pins_its_resume_offset() {
+        let root = scratch_dir("docker-deselect-partial-drop");
+        let id = "5".repeat(64);
+        let log = container(&root, &id, "wanted", "nginx:1.25");
+        std::fs::write(
+            &log,
+            format!("{}{}", json_file_line("one\n"), oversized_partial_envelope()),
+        )
+        .unwrap();
+        let mut config = fast_tail_config();
+        config.max_line_bytes = 10;
+
+        let diag = Diagnostics::new("docker-deselect-partial-drop");
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
+        let input = DockerInput::new(
+            root.clone(),
+            ContainerFilter::new(vec!["wanted".to_string()], false),
+            vec![],
+            config,
+        )
+        .with_diagnostics(diag.clone())
+        .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["one"]);
+
+        std::fs::write(
+            root.join(&id).join("config.v2.json"),
+            r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+        probe
+            .wait_for("a scan after the de-selected file is reaped", |t| {
+                t.gauge("logit.input.files.open", &[]) == Some(0.0)
+            })
+            .await;
+        assert_eq!(diag.occurrences("long_line"), 1, "the reap decodes the partial and drops it");
+
+        append(&log, &format!("\n{}", json_file_line("tail\n")));
+        std::fs::write(
+            root.join(&id).join("config.v2.json"),
+            r#"{"Name":"/wanted","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+        wait_until("the resumed file to drop the line again", || {
+            diag.occurrences("long_line") >= 2
+        })
+        .await;
+        append(&log, &json_file_line("ok\n"));
+        assert_eq!(
+            messages(&recv_events(&mut rx, 1).await),
+            vec!["ok"],
+            "the dropped line's closing entry must not surface as a message"
+        );
+        running.stop().await;
         std::fs::remove_dir_all(&root).ok();
     }
 }

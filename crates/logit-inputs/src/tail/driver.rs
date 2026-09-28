@@ -127,9 +127,10 @@ struct TrackedFile<D> {
     accumulator: BatchAccumulator,
     state: FileState,
     /// The file offset where the oldest line the decoder still holds starts
-    /// ([`TailDecoder::holds_entry`]), or `None` while it holds nothing. Set by `read_one` when a
-    /// line starts a held run, cleared once the decoder holds nothing (asked after every line and
-    /// after `close`), and on a truncation.
+    /// ([`TailDecoder::holds_entry`]), or `None` while it holds nothing. Set by `read_one` (and
+    /// by `close_decoder`, for the unterminated last line) when a line starts a held run,
+    /// cleared once the decoder holds nothing (asked after every line and after `close`), and on
+    /// a truncation.
     held_from: Option<u64>,
     /// This file's `inotify` watch, added in `Tailer::open_tracked` and removed in
     /// `Tailer::reap_drained`. `None` under `WatchMode::Poll`, or if `inotify_add_watch` failed
@@ -884,9 +885,19 @@ async fn close_decoder<D: TailDecoder>(
 ) {
     let mut scratch = Vec::new();
 
+    // Read before `take_partial` empties the splitter: where the unterminated last line starts.
+    let partial_start = tracked.offset - tracked.splitter.pending_bytes();
     if let Some(partial) = tracked.splitter.take_partial() {
         let partial = ensure_utf8(partial, diag);
-        let resource = match tracked.decoder.decode_line(partial, now_nanos(), &mut scratch) {
+        let decoded = tracked.decoder.decode_line(partial, now_nanos(), &mut scratch);
+        // `read_one`'s rule: this line can start a drop (a `docker_in` fragment over the bound),
+        // and the checkpoint must then stay at its start.
+        if !tracked.decoder.holds_entry() {
+            tracked.held_from = None;
+        } else if tracked.held_from.is_none() {
+            tracked.held_from = Some(partial_start);
+        }
+        let resource = match decoded {
             Ok(resource) => resource,
             Err(err) => {
                 // Whatever the decoder flushed before rejecting the line is still emitted.
@@ -900,7 +911,8 @@ async fn close_decoder<D: TailDecoder>(
     }
 
     tracked.decoder.close(&mut scratch);
-    // A line still being dropped survives `close`, and the checkpoint stays at its start.
+    // `close` emits held lines but not a line being dropped, so `held_from` survives only for a
+    // drop in progress, and the checkpoint stays at that line's start.
     if !tracked.decoder.holds_entry() {
         tracked.held_from = None;
     }
