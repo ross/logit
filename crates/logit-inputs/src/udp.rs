@@ -2447,10 +2447,13 @@ mod tests {
     /// reading `SK_MEMINFO_BACKLOG` (7) or `SK_MEMINFO_OPTMEM` (6) instead would pass every
     /// nonzero-drops assertion elsewhere.
     ///
-    /// **Ordering.** The blast finishes before anything is read and nothing else sends here, so
-    /// `sk_drops` is frozen. The socket stays open (procfs lists only live sockets), and the row is
-    /// found by inode (`/proc/self/fd/<fd>` reads `socket:[<inode>]`), not address, so another
-    /// test's loopback socket can't be mistaken for it.
+    /// **Ordering.** `send_to` returning doesn't mean the datagram reached the socket: loopback
+    /// delivery runs in softirq, and under load `ksoftirqd` can still be draining the blast after
+    /// the blaster returns, raising `sk_drops` between the three reads. So the test first waits
+    /// for `sk_drops` to hold still for 20ms (nothing else sends here), then takes all three
+    /// reads. The socket stays open (procfs lists only live sockets), and the row is found by
+    /// inode (`/proc/self/fd/<fd>` reads `socket:[<inode>]`), not address, so another test's
+    /// loopback socket can't be mistaken for it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_kernels_drop_counter_agrees_with_proc_net_udp_to_the_packet() {
@@ -2463,8 +2466,24 @@ mod tests {
                 .expect("binding an ephemeral port should succeed");
         let addr = socket.local_addr().expect("a bound socket has an address");
 
-        // The blaster is awaited to completion, so nothing is still in flight below.
         blast(addr, OVERRUN_DATAGRAMS).await;
+
+        let fd = logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor");
+        let drops_now = || {
+            logit_pipeline::sockstat::meminfo(fd)
+                .expect("SO_MEMINFO on a socket this process just opened")
+                .drops
+        };
+        let mut last = (drops_now(), std::time::Instant::now());
+        logit_pipeline::test_util::wait_until("sk_drops to hold still for 20ms", || {
+            let drops = drops_now();
+            if drops != last.0 {
+                last = (drops, std::time::Instant::now());
+            }
+            last.1.elapsed() >= Duration::from_millis(20)
+        })
+        .await;
+        let settled = u64::from(last.0);
 
         let Some(procfs_drops) = proc_net_udp_drops(&socket) else {
             println!("skipping: /proc/net/udp is not readable in this environment");
@@ -2477,24 +2496,21 @@ mod tests {
         assert!(sampler.enabled, "SO_MEMINFO is available on this kernel -- test premise");
 
         // A third reading, straight off the fd, bypassing the sampler.
-        let direct = logit_pipeline::sockstat::meminfo(
-            logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor"),
-        )
-        .expect("SO_MEMINFO on a socket this process just opened");
+        let direct = u64::from(drops_now());
 
         let reported = kernel_drops(&registry.drain(0));
-        assert!(
-            procfs_drops > 0,
-            "the flood must have overrun a {TINY_RECEIVE_BUFFER}-byte buffer"
+        assert!(settled > 0, "the flood must have overrun a {TINY_RECEIVE_BUFFER}-byte buffer");
+        assert_eq!(
+            procfs_drops, settled,
+            "/proc/net/udp's drops column must equal the settled SO_MEMINFO count: both read the \
+             same sk_drops field"
         );
         assert_eq!(
-            reported, procfs_drops as f64,
-            "logit.input.kernel.drops must equal /proc/net/udp's drops column for this socket \
-             exactly -- it is literally the same sk_drops field"
+            reported, settled as f64,
+            "logit.input.kernel.drops must equal the settled count for this socket, to the packet"
         );
         assert_eq!(
-            u64::from(direct.drops),
-            procfs_drops,
+            direct, settled,
             "and so must a direct SO_MEMINFO read, which is what rules out the counter's \
              first-sample arithmetic hiding an index mistake"
         );
