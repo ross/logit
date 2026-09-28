@@ -344,6 +344,7 @@ pub async fn run_with_telemetry(
                 let thread_io = io.clone();
                 let thread_dropped = shutdown_dropped_batches.clone();
                 let max_memory = runtime.max_memory;
+                let verdict_spacing = runtime.min_verdict_spacing;
                 std::thread::Builder::new()
                     .name(format!("logit-{id}"))
                     // Script recursion through C frames (a `string.gsub` callback a few hundred
@@ -361,6 +362,7 @@ pub async fn run_with_telemetry(
                             thread_io,
                             thread_heartbeat,
                             max_memory,
+                            verdict_spacing,
                             node_telemetry,
                             thread_dropped,
                             handle,
@@ -785,6 +787,9 @@ pub struct LuaRuntimeConfig {
     /// The component's `max_memory`: the VM bytes over which, after the full collections
     /// [`MemoryVerdict`] runs, the node fails. `None` is no limit. The one config-exposed field.
     pub max_memory: Option<usize>,
+    /// The least time between two forced `max_memory` verdicts; the spacing is also at least ten
+    /// times the last verdict's own duration. Not config-exposed.
+    pub min_verdict_spacing: Duration,
 }
 
 impl Default for LuaRuntimeConfig {
@@ -793,6 +798,7 @@ impl Default for LuaRuntimeConfig {
             stall_after: Duration::from_secs(10),
             shutdown_grace: Duration::from_secs(2),
             max_memory: None,
+            min_verdict_spacing: MIN_VERDICT_SPACING,
         }
     }
 }
@@ -1597,6 +1603,7 @@ fn run_lua(
     io: SharedLuaIo,
     heartbeat: Arc<Heartbeat>,
     max_memory: Option<usize>,
+    verdict_spacing: Duration,
     telemetry: Telemetry,
     shutdown_dropped: Arc<AtomicU64>,
     runtime: tokio::runtime::Handle,
@@ -1628,7 +1635,7 @@ fn run_lua(
     let loop_io = io.clone();
     let heartbeat_for_report = heartbeat.clone();
     let (sweep_telemetry, sweep_runtime) = (telemetry.clone(), runtime.clone());
-    let verdict = max_memory.map(MemoryVerdict::new);
+    let verdict = max_memory.map(|cap| MemoryVerdict::new(cap, verdict_spacing));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         run_lua_loop(
             worker,
@@ -1884,8 +1891,7 @@ async fn watch_lua_thread(
 /// (`ScriptWorker::collect_until_under`).
 const MAX_VERDICT_PASSES: usize = 8;
 
-/// The least time between two forced `max_memory` verdicts; the spacing is also at least ten
-/// times the last verdict's own duration.
+/// The default [`LuaRuntimeConfig::min_verdict_spacing`].
 const MIN_VERDICT_SPACING: Duration = Duration::from_secs(1);
 
 /// A Lua node's `max_memory` check, run after each batch's send and each `flush()`'s
@@ -1895,7 +1901,8 @@ const MIN_VERDICT_SPACING: Duration = Duration::from_secs(1);
 /// fails the node if it is still over. The collection runs with the heartbeat idle, after the
 /// send, so the batch that crossed the cap has already gone downstream.
 ///
-/// Forced verdicts are rate-limited to one per [`MIN_VERDICT_SPACING`] or ten times the last
+/// Forced verdicts are rate-limited to one per [`LuaRuntimeConfig::min_verdict_spacing`] or ten
+/// times the last
 /// one's duration, whichever is longer; an over-cap reading between them is skipped. A cap under
 /// about twice the script's working set would otherwise force a full collection on nearly every
 /// batch, since the incremental collector lets garbage reach that much before a cycle ends. A
@@ -1906,14 +1913,15 @@ const MIN_VERDICT_SPACING: Duration = Duration::from_secs(1);
 /// node.
 struct MemoryVerdict {
     cap: usize,
+    spacing: Duration,
     next_allowed: Option<std::time::Instant>,
     /// An over-cap reading was skipped and no verdict has run since.
     deferred: bool,
 }
 
 impl MemoryVerdict {
-    fn new(cap: usize) -> Self {
-        Self { cap, next_allowed: None, deferred: false }
+    fn new(cap: usize, spacing: Duration) -> Self {
+        Self { cap, spacing, next_allowed: None, deferred: false }
     }
 
     /// When a skipped verdict is due, if one is pending.
@@ -1970,7 +1978,7 @@ impl MemoryVerdict {
         let took = started.elapsed();
         telemetry.timing("logit.script.vm.gc.duration", took, &[]);
         telemetry.gauge("logit.script.vm.memory", verdict.used as f64, &[]);
-        self.next_allowed = Some(started + MIN_VERDICT_SPACING.max(took * 10));
+        self.next_allowed = Some(started + self.spacing.max(took * 10));
         if verdict.used <= self.cap {
             return Ok(());
         }
@@ -7409,7 +7417,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_millis(100),
-            max_memory: None,
+            ..Default::default()
         };
         let (done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -7444,7 +7452,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(50),
-            max_memory: None,
+            ..Default::default()
         };
         let (done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -7471,7 +7479,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(200),
-            max_memory: None,
+            ..Default::default()
         };
         let (_done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -7505,7 +7513,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_secs(10),
             shutdown_grace: Duration::from_millis(100),
-            max_memory: None,
+            ..Default::default()
         };
         let registry = Registry::new();
         let (_done_tx, done_rx) = oneshot::channel();
@@ -7545,7 +7553,7 @@ mod tests {
         let config = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_secs(2),
-            max_memory: None,
+            ..Default::default()
         };
         let (_done_tx, done_rx) = oneshot::channel();
         let watcher = spawn_watcher(&rig, done_rx, config);
@@ -7652,7 +7660,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(100),
-            max_memory: None,
+            ..Default::default()
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         let (tx, _out_rx) = std::sync::mpsc::channel();
@@ -7908,7 +7916,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(200),
             shutdown_grace: Duration::from_millis(50),
-            max_memory: None,
+            ..Default::default()
         };
         specs.insert(
             "enrich".to_string(),
@@ -7995,7 +8003,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(100),
-            max_memory: None,
+            ..Default::default()
         };
         specs.insert("enrich".to_string(), lua_spec(SPIN_ON_SECOND_EVENT, None, runtime));
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -8107,7 +8115,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(100),
             shutdown_grace: Duration::from_millis(20),
-            max_memory: None,
+            ..Default::default()
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         let (tx, out_rx) = std::sync::mpsc::channel();
@@ -8236,6 +8244,7 @@ mod tests {
         script: &str,
         interval: Option<Duration>,
         max_memory: usize,
+        spacing: Duration,
         input: Box<dyn Input + Send>,
     ) -> MaxMemoryRun {
         global_logs();
@@ -8258,7 +8267,11 @@ mod tests {
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert("in".to_string(), NodeSpec::Input(input, InputRuntimeConfig::default()));
-        let runtime = LuaRuntimeConfig { max_memory: Some(max_memory), ..Default::default() };
+        let runtime = LuaRuntimeConfig {
+            max_memory: Some(max_memory),
+            min_verdict_spacing: spacing,
+            ..Default::default()
+        };
         specs.insert(id.to_string(), lua_spec(script, interval, runtime));
         let (tx, out_rx) = std::sync::mpsc::channel();
         specs.insert(
@@ -8312,7 +8325,15 @@ mod tests {
         // Never finishes by itself: only the failure ends the run.
         let input =
             BurstInput { batches: (0..BATCHES).map(|_| counter_batch_of(PER_BATCH)).collect() };
-        let run = run_under_max_memory("mem_retains", script, None, 4 << 20, Box::new(input)).await;
+        let run = run_under_max_memory(
+            "mem_retains",
+            script,
+            None,
+            4 << 20,
+            MIN_VERDICT_SPACING,
+            Box::new(input),
+        )
+        .await;
 
         let err = run.result.as_ref().expect_err("10 MB retained against a 4 MiB cap fails");
         assert!(matches!(err, RunError::Runtime(_)), "a memory failure is a runtime one: {err:?}");
@@ -8363,7 +8384,15 @@ mod tests {
             end
         "#;
         let input = FiniteBurstInput { batches: (0..100).map(|_| counter_batch_of(1)).collect() };
-        let run = run_under_max_memory("mem_garbage", script, None, 2 << 20, Box::new(input)).await;
+        let run = run_under_max_memory(
+            "mem_garbage",
+            script,
+            None,
+            2 << 20,
+            MIN_VERDICT_SPACING,
+            Box::new(input),
+        )
+        .await;
 
         run.result.as_ref().expect("garbage is collected, not counted against the cap");
         assert_eq!(run.delivered, 100);
@@ -8391,6 +8420,7 @@ mod tests {
             script,
             Some(Duration::from_millis(50)),
             4 << 20,
+            MIN_VERDICT_SPACING,
             Box::new(input),
         )
         .await;
@@ -8407,6 +8437,7 @@ mod tests {
             script,
             Some(Duration::from_secs(3600)),
             4 << 20,
+            MIN_VERDICT_SPACING,
             Box::new(input),
         )
         .await;
@@ -8436,9 +8467,15 @@ mod tests {
             batches: (0..100).map(|_| counter_batch_of(1)).collect(),
             every: Duration::from_millis(20),
         };
-        let run =
-            run_under_max_memory("mem_paced", script, None, base + (512 << 10), Box::new(input))
-                .await;
+        let run = run_under_max_memory(
+            "mem_paced",
+            script,
+            None,
+            base + (512 << 10),
+            MIN_VERDICT_SPACING,
+            Box::new(input),
+        )
+        .await;
 
         run.result.as_ref().expect("every verdict collects back under the cap");
         let forced = run.gc_forced();
@@ -8469,8 +8506,15 @@ mod tests {
         "#;
         // Two batches, then silence: the input never finishes.
         let input = BurstInput { batches: vec![counter_batch_of(1), counter_batch_of(1)] };
-        let run =
-            run_under_max_memory("mem_deferred", script, None, 2 << 20, Box::new(input)).await;
+        let run = run_under_max_memory(
+            "mem_deferred",
+            script,
+            None,
+            2 << 20,
+            MIN_VERDICT_SPACING,
+            Box::new(input),
+        )
+        .await;
 
         let err = run.result.as_ref().expect_err("the deferred verdict fails the node");
         assert!(err.to_string().contains("component 'mem_deferred'"), "{err}");
@@ -8501,12 +8545,16 @@ mod tests {
             end
             function flush(now) end
         "#;
+        // A window far past the bound below, so a run that waited it out can't pass, while two
+        // forced collections over ~14 MiB in a debug build under load stay well inside the bound.
+        const WINDOW: Duration = Duration::from_secs(60);
         for (id, interval) in
             [("mem_close_plain", None), ("mem_close_flush", Some(Duration::from_secs(3600)))]
         {
             let input =
                 FiniteBurstInput { batches: vec![counter_batch_of(1), counter_batch_of(1)] };
-            let run = run_under_max_memory(id, script, interval, 4 << 20, Box::new(input)).await;
+            let run =
+                run_under_max_memory(id, script, interval, 4 << 20, WINDOW, Box::new(input)).await;
 
             let err = run.result.as_ref().expect_err("the deferred verdict runs at close");
             assert!(matches!(err, RunError::Runtime(_)), "{id}: {err:?}");
@@ -8514,7 +8562,7 @@ mod tests {
             assert!(err.to_string().contains("over max_memory 4194304"), "{err}");
             assert_eq!(run.delivered, 2, "{id}");
             assert_eq!(run.gc_forced(), 2.0, "{id}: the first batch's verdict, then the close one");
-            assert!(run.elapsed < MIN_VERDICT_SPACING, "{id}: no wait for the window");
+            assert!(run.elapsed < Duration::from_secs(10), "{id}: no wait for the window");
             assert_eq!(run.state, Some(NodeState::Failed), "{id}");
         }
     }
@@ -8558,7 +8606,7 @@ mod tests {
         let runtime = LuaRuntimeConfig {
             stall_after: Duration::from_millis(50),
             shutdown_grace: Duration::from_millis(50),
-            max_memory: None,
+            ..Default::default()
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
         specs.insert(
