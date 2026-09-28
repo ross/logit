@@ -1,6 +1,8 @@
-//! A fault-injection seam for the filesystem operations that decide what survives a crash: the
-//! disk spool, the tail checkpoint, and `file_out` rotation
-//! (`docs/adr/durable-checkpoint-writes-and-fault-injection.md`).
+//! A fault-injection seam for filesystem operations whose failure a test must be able to force:
+//! the mutations that decide what survives a crash (the disk spool, the tail checkpoint, and
+//! `file_out` rotation), and the reads that decide what a tail scan retires
+//! (`docs/adr/durable-checkpoint-writes-and-fault-injection.md`,
+//! `docs/adr/tail-discovery-failure-and-resume-identity.md`).
 //!
 //! Each such operation is preceded by [`check`] (or wrapped in [`fault_io!`]), naming a [`Point`]
 //! (a call site and the [`Op`] about to run), a path the caller already holds, and an `arg` (a
@@ -45,6 +47,10 @@ pub enum Op {
     SyncDir,
     Rename,
     Unlink,
+    /// A directory listing (`read_dir`) or one entry of it.
+    ReadDir,
+    /// A `stat` (`metadata`) of a path.
+    Stat,
 }
 
 /// One injectable operation: the call site (one of [`sites`]) and the operation it's about to run.
@@ -76,6 +82,9 @@ pub mod sites {
     pub const FILE_OUT_STAGING: &str = "file_out.staging";
     /// `file_out`'s retained `.N` files.
     pub const FILE_OUT_RETAINED: &str = "file_out.retained";
+    /// `tail_in`/`docker_in` discovery: a pattern directory's listing and a discovered path's
+    /// stat.
+    pub const TAIL_SCAN: &str = "tail.scan";
 }
 
 /// Runs `$op` (an expression of type `io::Result<T>`, which may contain `.await`) unless
@@ -117,8 +126,11 @@ pub use armed::{scope, Hit, Scope};
 /// code that inspects `raw_os_error()` (the spool's `ENOSPC` check) sees it as real.
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod errno {
+    pub const ENOENT: i32 = 2;
     pub const EIO: i32 = 5;
     pub const EACCES: i32 = 13;
+    pub const ENOTDIR: i32 = 20;
+    pub const EMFILE: i32 = 24;
     pub const ENOSPC: i32 = 28;
     pub const EROFS: i32 = 30;
 }
@@ -308,7 +320,7 @@ mod tests {
     use super::*;
     use crate::disk_queue::test_support::scratch_dir;
 
-    const EVERY_OP: [Op; 9] = [
+    const EVERY_OP: [Op; 11] = [
         Op::Create,
         Op::Open,
         Op::Write,
@@ -318,9 +330,11 @@ mod tests {
         Op::SyncDir,
         Op::Rename,
         Op::Unlink,
+        Op::ReadDir,
+        Op::Stat,
     ];
 
-    const EVERY_SITE: [&str; 7] = [
+    const EVERY_SITE: [&str; 8] = [
         sites::SPOOL_SEGMENT,
         sites::SPOOL_CURSOR,
         sites::SPOOL_DIR,
@@ -328,6 +342,7 @@ mod tests {
         sites::FILE_OUT_ACTIVE,
         sites::FILE_OUT_STAGING,
         sites::FILE_OUT_RETAINED,
+        sites::TAIL_SCAN,
     ];
 
     const POINT: Point = Point::new(sites::SPOOL_SEGMENT, Op::SyncFile);
