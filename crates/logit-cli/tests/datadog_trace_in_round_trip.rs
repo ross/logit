@@ -13,6 +13,7 @@ use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
 use logit_inputs::datadog_trace::DatadogTraceInput;
+use logit_pipeline::test_util::recv_batch;
 use logit_pipeline::{Fanout, Input};
 use logit_proto::datadog::generated::trace::{AgentPayload, Span, TraceChunk, TracerPayload};
 use logit_proto::datadog::stats::{
@@ -95,14 +96,6 @@ async fn send(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     (status, version, response.text().await.unwrap_or_default())
-}
-
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("datadog_trace_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -253,7 +246,7 @@ async fn v04_and_v05_deliver_the_encoded_batch_with_the_headers_as_its_resource(
             assert_eq!(status, reqwest::StatusCode::OK, "{path}");
             assert_eq!(version.as_deref(), Some("logit-1"), "{path}");
             assert_eq!(text, RATE_REPLY, "{path}");
-            assert_eq!(recv(&mut rx).await, with_headers(batch.clone()), "{path} put={put}");
+            assert_eq!(recv_batch(&mut rx).await, with_headers(batch.clone()), "{path} put={put}");
         }
     }
 }
@@ -271,7 +264,7 @@ async fn v07_delivers_the_encoded_batch_with_its_own_fields_winning_over_the_hea
     let (status, _, text) = send(addr.unwrap(), "/v0.7/traces", false, &body).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(text, RATE_REPLY);
-    let delivered = recv(&mut rx).await;
+    let delivered = recv_batch(&mut rx).await;
     assert_eq!(delivered, with_headers(batch));
     assert_eq!(
         delivered.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
@@ -290,7 +283,7 @@ async fn v06_stats_deliver_the_encoded_batch() {
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(version, None, "the rates header is the trace reply's alone");
     assert_eq!(text, "{}");
-    assert_eq!(recv(&mut rx).await, with_stats_headers(batch));
+    assert_eq!(recv_batch(&mut rx).await, with_stats_headers(batch));
 }
 
 /// A stats `batch` with the three [`TRACER_HEADERS`] its payload has fields for filled in, each
@@ -363,12 +356,12 @@ async fn the_unix_socket_delivers_end_to_end() {
     let response = unix_request(&path, "PUT", "/v0.4/traces", &body).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.ends_with(RATE_REPLY), "{response}");
-    assert_eq!(recv(&mut rx).await, with_headers(batch));
+    assert_eq!(recv_batch(&mut rx).await, with_headers(batch));
 
     let (batch, body) = stats();
     let response = unix_request(&path, "POST", "/v0.6/stats", &body).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-    assert_eq!(recv(&mut rx).await, with_stats_headers(batch));
+    assert_eq!(recv_batch(&mut rx).await, with_stats_headers(batch));
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -410,7 +403,7 @@ async fn every_recorded_tracer_request_is_answered_200() {
         if path == "/info" {
             continue;
         }
-        let batch = recv(&mut rx).await;
+        let batch = recv_batch(&mut rx).await;
         assert!(!batch.events.is_empty(), "{stem}: delivered nothing");
         assert_eq!(
             batch.resource.attributes.get(RESOURCE_ATTR_TRACER_LANGUAGE_NAME),

@@ -953,7 +953,10 @@ mod tests {
     use crate::tail::line::LineDecoder;
     use crate::tail::test_support::scratch_dir;
     use crate::tail::{ReadFrom, TailBatching, WatchMode};
-    use logit_core::{MetricKind, Registry, Resource};
+    use logit_core::Resource;
+    use logit_pipeline::test_util::{
+        assert_no_batch, fanout_channel, recv_events, wait_until, Running, TelemetryProbe,
+    };
     use logit_pipeline::{unwrap_batch, Delivered};
     use std::io::Write;
     use std::sync::Arc;
@@ -1003,11 +1006,6 @@ mod tests {
         tokio::time::Instant::now() + Duration::from_secs(3600)
     }
 
-    fn recording_fanout(capacity: usize) -> (Fanout, mpsc::Receiver<Delivered>) {
-        let (tx, rx) = mpsc::channel(capacity);
-        (Fanout::new(vec![tx]), rx)
-    }
-
     /// Poll/checkpoint/flush intervals short enough for a test to see real ticks within a couple
     /// hundred milliseconds.
     fn fast_config(read_from: ReadFrom) -> TailConfig {
@@ -1026,39 +1024,15 @@ mod tests {
         }
     }
 
+    /// Runs `tailer` on its own task without binding it first; `run_until_shutdown` binds it
+    /// there. `test_util::spawn_input` binds first, but takes an `Input`, which `Tailer` isn't.
     fn spawn_tailer<F: DecoderFactory<LineDecoder> + 'static>(
         mut tailer: Tailer<LineDecoder, F>,
         sink: Fanout,
-    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
-        let (tx, rx) = watch::channel(false);
+    ) -> Running {
+        let (shutdown, rx) = watch::channel(false);
         let handle = tokio::spawn(async move { tailer.run_until_shutdown(sink, rx).await });
-        (tx, handle)
-    }
-
-    /// Signals shutdown and waits up to 5s, so a hang fails the test rather than the suite.
-    async fn shutdown(
-        tx: watch::Sender<bool>,
-        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
-    ) {
-        let _ = tx.send(true);
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("tailer should shut down within 5s")
-            .expect("tailer task should not panic")
-            .expect("tailer should exit cleanly");
-    }
-
-    /// Receives at least `n` events in arrival order, waiting up to 5s per batch.
-    async fn expect_events(rx: &mut mpsc::Receiver<Delivered>, n: usize) -> Vec<Event> {
-        let mut events = Vec::new();
-        while events.len() < n {
-            let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("timed out waiting for events")
-                .expect("fanout channel closed unexpectedly");
-            events.extend(unwrap_batch(delivered).events);
-        }
-        events
+        Running { shutdown, handle }
     }
 
     fn messages(events: &[Event]) -> Vec<String> {
@@ -1066,36 +1040,6 @@ mod tests {
             .iter()
             .map(|e| e.log.as_ref().unwrap().message.as_str().unwrap().to_string())
             .collect()
-    }
-
-    /// The latest buffered value of gauge `name`. Drains `registry`, so it's a one-shot check.
-    fn gauge_value(registry: &Registry, name: &str) -> Option<f64> {
-        registry.drain(0).into_iter().rev().find_map(|e| {
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) == name {
-                    match m.kind {
-                        MetricKind::Gauge(v) => Some(v),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-        })
-    }
-
-    /// The sum of every buffered `Sum` point of counter `name`. Drains `registry`.
-    fn counter_total(registry: &Registry, name: &str) -> f64 {
-        registry
-            .drain(0)
-            .iter()
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == name)
-            .map(|m| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
-                _ => 0.0,
-            })
-            .sum()
     }
 
     // -- `Tailer::bind` --
@@ -1145,18 +1089,18 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"line one\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["line one"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1166,16 +1110,16 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"line one\nline two\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
         let before = now_nanos();
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 2).await;
+        let events = recv_events(&mut rx, 2).await;
         let after = now_nanos();
         assert_eq!(messages(&events), vec!["line one", "line two"]);
         for event in &events {
@@ -1189,7 +1133,7 @@ mod tests {
             );
         }
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1199,12 +1143,12 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"old line\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer =
             Tailer::new(vec![PathPattern::new(&path)], LineFactory, fast_config(ReadFrom::End));
         // Bound first: the initial scan must open the file at its end before the append, or the
         // append could be skipped.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         std::fs::OpenOptions::new()
             .append(true)
@@ -1213,21 +1157,21 @@ mod tests {
             .write_all(b"new line\n")
             .unwrap();
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["new line"], "the pre-existing line must be skipped");
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
 
         // A fresh tailer over the same file, `read_from: beginning`, must replay everything.
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let tailer2 = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
-        let events2 = expect_events(&mut rx2, 2).await;
+        let running2 = spawn_tailer(tailer2, fanout2);
+        let events2 = recv_events(&mut rx2, 2).await;
         assert_eq!(messages(&events2), vec!["old line", "new line"]);
-        shutdown(shutdown_tx2, handle2).await;
+        running2.stop().await;
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1235,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_created_after_startup_is_discovered_and_read_from_the_beginning() {
         let dir = scratch_dir("new-file");
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         // `read_from: end` governs only files present at startup.
         let tailer = Tailer::new(
             vec![PathPattern::new(dir.join("*.log"))],
@@ -1244,14 +1188,14 @@ mod tests {
         );
         // Bound first: a file already present at the initial scan would be skipped by
         // `read_from: end`.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         std::fs::write(dir.join("app.log"), b"first\nsecond\n").unwrap();
 
-        let events = expect_events(&mut rx, 2).await;
+        let events = recv_events(&mut rx, 2).await;
         assert_eq!(messages(&events), vec!["first", "second"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1261,29 +1205,29 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"before\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["before"]);
 
         // Both land within one scan, so the driver sees a new inode at the path, not a removal.
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events2),
             vec!["after"],
             "the new inode should be followed from its own beginning"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1305,7 +1249,7 @@ mod tests {
     async fn spawn_bound_tailer(
         mut tailer: Tailer<LineDecoder, LineFactory>,
         sink: Fanout,
-    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    ) -> Running {
         tailer.bind().await.expect("bind should succeed");
         spawn_tailer(tailer, sink)
     }
@@ -1323,12 +1267,12 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, inotify_only_config());
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         append(&path, b"before\n");
-        let events = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+        let events = tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1))
             .await
             .expect("the original file's own watch should deliver this well within 3s");
         assert_eq!(messages(&events), vec!["before"]);
@@ -1336,20 +1280,20 @@ mod tests {
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
-        let events2 = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+        let events2 = tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1))
             .await
             .expect("the directory watch should discover the replacement well within 3s");
         assert_eq!(messages(&events2), vec!["after"]);
 
         append(&path, b"more\n");
         let events3 =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+            tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1)).await.expect(
                 "the new inode's own watch should deliver this well within 3s, nowhere near the \
                  30s poll_interval",
             );
         assert_eq!(messages(&events3), vec!["more"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1359,24 +1303,24 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"aaaaaaaaaa\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["aaaaaaaaaa"]);
 
         // `O_TRUNC` on the existing path: same inode, shorter length.
         std::fs::write(&path, b"new\n").unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["new"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1386,29 +1330,29 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"only line\n").unwrap();
 
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("tail_in", "tail_in", "listener");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         )
         .with_telemetry(telemetry);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["only line"]);
-        assert_eq!(gauge_value(&registry, "logit.input.files.open"), Some(1.0));
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0));
 
         std::fs::remove_file(&path).unwrap();
         wait_until("files.open to drop to 0 once the removed file is reaped", || {
-            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+            probe.gauge("logit.input.files.open", &[]) == Some(0.0)
         })
         .await;
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1419,20 +1363,20 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"line\n").unwrap();
 
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("tail_in", "tail_in", "listener");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let mut config = fast_config(ReadFrom::Beginning);
         config.watch = WatchMode::Inotify;
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config)
             .with_telemetry(telemetry);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["line"]);
         assert_eq!(
-            gauge_value(&registry, "logit.input.watch.watches"),
+            probe.gauge("logit.input.watch.watches", &[]),
             Some(2.0),
             "the watched directory plus the one open file"
         );
@@ -1440,11 +1384,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         wait_until(
             "watches to fall back to just the watched directory once the removed file is reaped",
-            || gauge_value(&registry, "logit.input.watch.watches") == Some(1.0),
+            || probe.gauge("logit.input.watch.watches", &[]) == Some(1.0),
         )
         .await;
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1459,20 +1403,20 @@ mod tests {
 
         let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let factory = SelectiveFactory { deselected: deselected.clone() };
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(8);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer =
             Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
-                .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+                .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         deselected.store(true, std::sync::atomic::Ordering::SeqCst);
         // Written before the reap, the append would be read and fail the negative assertion.
         wait_until("the next scan to notice the de-selection and reap the file", || {
-            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+            probe.gauge("logit.input.files.open", &[]) == Some(0.0)
         })
         .await;
 
@@ -1487,7 +1431,7 @@ mod tests {
             "a de-selected file must not emit anything further, even while still being written to"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1501,19 +1445,19 @@ mod tests {
 
         let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let factory = SelectiveFactory { deselected: deselected.clone() };
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(8);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer =
             Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
-                .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+                .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
         deselected.store(true, std::sync::atomic::Ordering::SeqCst);
         wait_until("the next scan to notice the de-selection and reap the file", || {
-            gauge_value(&registry, "logit.input.files.open") == Some(0.0)
+            probe.gauge("logit.input.files.open", &[]) == Some(0.0)
         })
         .await;
 
@@ -1527,14 +1471,14 @@ mod tests {
 
         deselected.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events2),
             vec!["two"],
             "must resume from the retained offset -- \"one\" must never be replayed"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1549,11 +1493,11 @@ mod tests {
         config.checkpoint_path = Some(checkpoint_path.clone());
         config.checkpoint_interval = Duration::from_millis(25);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["line one"]);
 
         // "line one\n" is 9 bytes; an offset of 0 would be a tick that landed before the read.
@@ -1562,7 +1506,7 @@ mod tests {
         })
         .await;
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
 
         // A fresh tailer resumes from the checkpoint: only the appended line arrives.
         std::fs::OpenOptions::new()
@@ -1571,12 +1515,12 @@ mod tests {
             .unwrap()
             .write_all(b"line two\n")
             .unwrap();
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
-        let events2 = expect_events(&mut rx2, 1).await;
+        let running2 = spawn_tailer(tailer2, fanout2);
+        let events2 = recv_events(&mut rx2, 1).await;
         assert_eq!(messages(&events2), vec!["line two"]);
-        shutdown(shutdown_tx2, handle2).await;
+        running2.stop().await;
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1604,14 +1548,14 @@ mod tests {
         let mut config = fast_config(ReadFrom::End); // ignored: the resume entry wins
         config.checkpoint_path = Some(checkpoint_path);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["short"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1628,17 +1572,17 @@ mod tests {
         config.checkpoint_path = Some(checkpoint_path.clone());
         config.checkpoint_interval = Duration::from_millis(20);
 
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(8);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
             LineFactory,
             config,
         )
-        .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_tailer(tailer, fanout);
 
-        let _ = expect_events(&mut rx, 2).await;
+        let _ = recv_events(&mut rx, 2).await;
         wait_until("a checkpoint tick to record both files", || {
             std::fs::read_to_string(&checkpoint_path)
                 .is_ok_and(|text| text.contains("a.log") && text.contains("b.log"))
@@ -1648,11 +1592,11 @@ mod tests {
         std::fs::remove_file(&b_path).unwrap();
         // Shutdown's forced write drops `b.log` too, but only if the reap came first.
         wait_until("the removed file to be reaped", || {
-            gauge_value(&registry, "logit.input.files.open") == Some(1.0)
+            probe.gauge("logit.input.files.open", &[]) == Some(1.0)
         })
         .await;
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
 
         let text = std::fs::read_to_string(&checkpoint_path).unwrap();
         assert!(text.contains("a.log"), "a.log should still be checkpointed");
@@ -1676,26 +1620,25 @@ mod tests {
         config.checkpoint_interval = Duration::from_secs(60);
         config.checkpoint_path = Some(checkpoint_path.clone());
 
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(8);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
-            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_tailer(tailer, fanout);
 
         // Shutdown before the read would leave nothing to flush and make the negative assertion
-        // vacuous. `counter_total` drains, so the total accumulates across polls.
-        let mut lines = 0.0;
-        wait_until("the initial scan and read to take all three lines", || {
-            lines += counter_total(&registry, "logit.input.lines");
-            lines >= 3.0
-        })
-        .await;
+        // vacuous.
+        probe
+            .wait_for("the initial scan and read to take all three lines", |t| {
+                t.sum("logit.input.lines", &[]) >= 3.0
+            })
+            .await;
         assert!(
             rx.try_recv().is_err(),
             "nothing should have flushed yet -- both intervals are 60s away"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
 
         let delivered = rx.try_recv().expect("shutdown should have flushed the buffered batch");
         let events = unwrap_batch(delivered).events;
@@ -1703,30 +1646,6 @@ mod tests {
         assert!(checkpoint_path.exists(), "shutdown should force a checkpoint write");
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Sums counter `name` tagged `tag`. Drains `registry`, so it's a one-shot check.
-    fn counter_sum(registry: &Registry, name: &str, tag: (&str, &str)) -> f64 {
-        registry
-            .drain(0)
-            .iter()
-            .filter(|e| e.attributes.get(tag.0).and_then(logit_core::Value::as_str) == Some(tag.1))
-            .flat_map(|e| &e.metrics)
-            .filter(|m| logit_core::interner::resolve(m.name) == name)
-            .map(|m| match &m.kind {
-                MetricKind::Sum(sum) => sum.value,
-                other => panic!("{name} must be a counter, got {other:?}"),
-            })
-            .sum()
-    }
-
-    /// Polls `cond` every 5ms for up to 5s.
-    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !cond() {
-            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
     }
 
     /// The offset the on-disk checkpoint records for its first file, once one is written.
@@ -1765,10 +1684,10 @@ mod tests {
 
             let mut config = fast_config(ReadFrom::End);
             config.checkpoint_path = Some(checkpoint_path.clone());
-            let registry = Registry::new();
-            let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("tail_in", "tail_in", "listener");
             let diag = Diagnostics::new("test");
-            let (fanout, mut rx) = recording_fanout(8);
+            let (fanout, mut rx) = fanout_channel(8);
             let tailer = Tailer::new(
                 vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
                 LineFactory,
@@ -1776,15 +1695,15 @@ mod tests {
             )
             .with_diagnostics(diag.clone())
             .with_telemetry(telemetry);
-            let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+            let running = spawn_tailer(tailer, fanout);
 
-            let mut got = messages(&expect_events(&mut rx, 3).await);
+            let mut got = messages(&recv_events(&mut rx, 3).await);
             got.sort();
             assert_eq!(got, vec!["a1", "a2", "b1"], "{label}: every pre-existing line replays");
-            shutdown(shutdown_tx, handle).await;
+            running.stop().await;
 
             assert_eq!(
-                counter_sum(&registry, "logit.input.checkpoint.errors", ("op", "load")),
+                probe.sum("logit.input.checkpoint.errors", &[("op", "load")]),
                 1.0,
                 "{label}"
             );
@@ -1805,17 +1724,17 @@ mod tests {
         std::fs::write(&path, b"old line\n").unwrap();
         let mut config = fast_config(ReadFrom::End);
         config.checkpoint_path = Some(dir.join("checkpoint.json"));
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("tail_in", "tail_in", "listener");
         let diag = Diagnostics::new("test");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
             .with_diagnostics(diag.clone())
             .with_telemetry(telemetry);
         // Bound first: the initial scan must open the file at its end before the append, or the
         // append could be skipped.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -1823,11 +1742,11 @@ mod tests {
             .write_all(b"new line\n")
             .unwrap();
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["new line"], "the pre-existing line must be skipped");
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
 
-        assert_eq!(counter_sum(&registry, "logit.input.checkpoint.errors", ("op", "load")), 0.0);
+        assert_eq!(probe.sum("logit.input.checkpoint.errors", &[("op", "load")]), 0.0);
         assert_eq!(diag.occurrences("checkpoint_error"), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1848,10 +1767,10 @@ mod tests {
         config.checkpoint_path = Some(checkpoint_path.clone());
         config.checkpoint_interval = Duration::from_millis(20);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["one"]);
+        let running = spawn_tailer(tailer, fanout);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["one"]);
         wait_until("the first checkpoint to cover \"one\"", || {
             std::fs::read_to_string(&checkpoint_path).is_ok_and(|t| t.contains("\"offset\": 4"))
         })
@@ -1860,10 +1779,10 @@ mod tests {
         let scope = fault::scope(&dir);
         scope.crash_at(Point::new(sites::TAIL_CHECKPOINT, Op::Rename), 1);
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"two\n").unwrap();
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["two"]);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["two"]);
         wait_until("the next checkpoint write to reach its rename", || scope.crashed()).await;
         // The process is dead from here on: shutdown's forced write fails under the freeze too.
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         scope.revive();
         drop(scope);
 
@@ -1877,15 +1796,15 @@ mod tests {
             .write_all(b"three\n")
             .unwrap();
         config.read_from = ReadFrom::End; // the resume entry wins over it
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
+        let running2 = spawn_tailer(tailer2, fanout2);
         assert_eq!(
-            messages(&expect_events(&mut rx2, 2).await),
+            messages(&recv_events(&mut rx2, 2).await),
             vec!["two", "three"],
             "\"two\" is delivered again, \"one\" is not, and nothing is skipped"
         );
-        shutdown(shutdown_tx2, handle2).await;
+        running2.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1895,15 +1814,15 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"complete\nno newline yet").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["complete"]);
 
         // Held while unterminated.
@@ -1911,7 +1830,7 @@ mod tests {
         assert!(more.is_err(), "an unterminated line must not be emitted before it closes");
 
         // Shutdown emits the held partial.
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         let delivered = rx.try_recv().expect("the held partial line should flush on shutdown");
         let events2 = unwrap_batch(delivered).events;
         assert_eq!(messages(&events2), vec!["no newline yet"]);
@@ -1926,15 +1845,22 @@ mod tests {
         let content: String = (0..50).map(|i| format!("line-{i}\n")).collect();
         std::fs::write(&path, content.as_bytes()).unwrap();
 
-        let (tx, mut rx) = mpsc::channel(1); // tiny capacity forces backpressure
-        let fanout = Fanout::new(vec![tx]);
+        let (fanout, mut rx) = fanout_channel(1); // tiny capacity forces backpressure
         let mut config = fast_config(ReadFrom::Beginning);
         config.batching.max_events = 1; // one event per batch -- easy to force a stall
-        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let mut probe = TelemetryProbe::new();
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_tailer(tailer, fanout);
 
-        // Don't read `rx` yet: the tailer must stall, not drop.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Don't read `rx` yet: the tailer must stall, not drop. The first line's batch fills the
+        // channel, so a second line read means the tailer is parked in `emit` with the rest of
+        // the file behind it.
+        probe
+            .wait_for("the tailer to read a second line and park on the full channel", |t| {
+                t.sum("logit.input.lines", &[]) >= 2.0
+            })
+            .await;
 
         let mut received = Vec::new();
         while received.len() < 50 {
@@ -1950,7 +1876,7 @@ mod tests {
             "every line should still arrive, in order, once downstream drains"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1962,15 +1888,15 @@ mod tests {
         content.extend_from_slice(b"\xff\xfebad\n"); // invalid UTF-8 before the newline
         std::fs::write(&path, &content).unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 2).await;
+        let events = recv_events(&mut rx, 2).await;
         assert_eq!(events[0].log.as_ref().unwrap().message.as_str(), Some("good"));
         let second = events[1].log.as_ref().unwrap().message.as_str().unwrap().to_string();
         assert!(
@@ -1979,7 +1905,7 @@ mod tests {
         );
         assert!(second.ends_with("bad"));
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1995,7 +1921,7 @@ mod tests {
         std::fs::write(&busy_path, busy_content.as_bytes()).unwrap();
         std::fs::write(&quick_path, b"quick line\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(64);
+        let (fanout, mut rx) = fanout_channel(64);
         let mut config = fast_config(ReadFrom::Beginning);
         config.batching.max_events = 1;
         let tailer = Tailer::new(
@@ -2003,7 +1929,7 @@ mod tests {
             LineFactory,
             config,
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
         // Consume everything: stopping at "quick line" would leave the tailer blocked on a full
         // channel.
@@ -2032,7 +1958,7 @@ mod tests {
              (saw {seen_before_quick} busy events first)"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2042,24 +1968,24 @@ mod tests {
     async fn under_inotify_a_new_file_is_discovered_well_before_the_poll_interval() {
         let dir = scratch_dir("inotify-latency");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let mut config = fast_config(ReadFrom::End);
         config.watch = WatchMode::Inotify;
         config.poll_interval = Duration::from_secs(30);
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
         // Bound first: the initial scan must arm the directory watch before the write.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
         let events =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+            tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1)).await.expect(
                 "inotify should discover the new file well within 3s, nowhere near the 30s \
                  poll_interval",
             );
         assert_eq!(messages(&events), vec!["woke"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2069,28 +1995,31 @@ mod tests {
     async fn under_poll_a_new_file_is_discovered_only_after_the_poll_interval() {
         let dir = scratch_dir("poll-latency");
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let mut config = fast_config(ReadFrom::End);
         config.watch = WatchMode::Poll;
-        config.poll_interval = Duration::from_millis(300);
+        config.poll_interval = Duration::from_secs(1);
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
         // Bound first: a file already present at the initial scan would be skipped by
         // `read_from: end`.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
-        // Nothing before the 300ms tick.
-        let too_soon = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
-        assert!(
-            too_soon.is_err(),
-            "poll mode must not discover a new file before its own poll_interval tick"
-        );
+        // Nothing before the 1s tick. The 150ms window is 10x the 15ms flush tick that would
+        // deliver a wrongly discovered file, and the tick is over 6x the window away, so
+        // scheduler lag can't carry the window into it.
+        assert_no_batch(
+            &mut rx,
+            Duration::from_millis(150),
+            "poll mode must not discover a new file before its own poll_interval tick",
+        )
+        .await;
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["woke"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2104,29 +2033,29 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(dir.join("*.log"))],
             LineFactory,
             inotify_only_config(),
         );
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         append(&path, b"first\n");
-        let first = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+        let first = tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1))
             .await
             .expect("the file's own watch should deliver this well within 3s");
         assert_eq!(messages(&first), vec!["first"]);
 
         append(&path, b"second\n");
         let second =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+            tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1)).await.expect(
                 "a write to an already-tracked file should be delivered well within 3s, nowhere \
                  near the 30s poll_interval, via the file's own watch",
             );
         assert_eq!(messages(&second), vec!["second"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2145,35 +2074,33 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"").unwrap();
 
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(8);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(dir.join("*.log"))],
             LineFactory,
             inotify_only_config(),
         )
-        .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let running = spawn_bound_tailer(tailer, fanout).await;
 
         append(&path, b"first\n");
-        let first = tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1))
+        let first = tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1))
             .await
             .expect("the file's own watch should deliver this well within 3s");
         assert_eq!(messages(&first), vec!["first"]);
 
         // `ftruncate(2)`: same inode, length 0, one `IN_MODIFY`.
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
-        // `counter_total` drains, so the total accumulates across polls.
-        let mut truncated = 0.0;
-        wait_until("the truncation's own wake to be handled before the replacement", || {
-            truncated += counter_total(&registry, "logit.input.files.truncated");
-            truncated >= 1.0
-        })
-        .await;
+        probe
+            .wait_for("the truncation's own wake to be handled before the replacement", |t| {
+                t.sum("logit.input.files.truncated", &[]) >= 1.0
+            })
+            .await;
         append(&path, b"a-much-longer-replacement-line\n");
 
         let second =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
+            tokio::time::timeout(Duration::from_secs(3), recv_events(&mut rx, 1)).await.expect(
                 "the replacement should be delivered well within 3s via the file's own watch, \
                  nowhere near the 30s poll_interval",
             );
@@ -2182,10 +2109,9 @@ mod tests {
             vec!["a-much-longer-replacement-line"],
             "the truncation's own wake should have rewound the file to 0"
         );
-        truncated += counter_total(&registry, "logit.input.files.truncated");
-        assert_eq!(truncated, 1.0);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2199,7 +2125,7 @@ mod tests {
         // Longer than the replacement, so a stale-`id` reconcile would see `len < offset`.
         std::fs::write(&path, b"a-longer-first-line\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut watcher = crate::tail::watch::Watcher::Poll;
         let mut tailer = Tailer::new(
@@ -2210,7 +2136,7 @@ mod tests {
         tailer.scan(true, &mut watcher).await;
         let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
         tailer.flush_all(&fanout, FlushReason::Interval).await;
-        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["a-longer-first-line"]);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["a-longer-first-line"]);
 
         let old = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
         let read_offset = tailer.files.get(&old).unwrap().offset;
@@ -2253,19 +2179,27 @@ mod tests {
 
         // A capacity-1 fanout and one event per batch stall the driver in `emit` almost at once,
         // so most of the file is unread when it's removed.
-        let (tx, mut rx) = mpsc::channel(1);
-        let fanout = Fanout::new(vec![tx]);
+        let (fanout, mut rx) = fanout_channel(1);
         let mut config = fast_config(ReadFrom::Beginning);
         config.batching.max_events = 1;
+        let mut probe = TelemetryProbe::new();
         // A glob, so the removal is what drives the file into `FileState::Draining`.
-        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
+        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config)
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
         // Bound first: the initial scan must open the file before it's removed, or the glob never
         // finds it. `rx` stays unconsumed.
-        let (shutdown_tx, handle) = spawn_bound_tailer(tailer, fanout).await;
+        let running = spawn_bound_tailer(tailer, fanout).await;
         std::fs::remove_file(&path).unwrap();
-        // The first poll tick marks the file `Draining`. `drain` yields to a due tick after its
-        // first pass at the latest, so at least one chunk is still unread when that happens.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // A second line read means the tailer is parked in `emit` on the full channel, inside
+        // its first chunk. The first poll tick after the test starts consuming marks the file
+        // `Draining`, and `drain` yields to that tick after its first pass at the latest, so the
+        // second chunk is still unread when it lands. The assertion below holds whichever pass
+        // the tick lands in; the wait makes the stall, not a sleep, set up that order.
+        probe
+            .wait_for("the tailer to read a second line and park on the full channel", |t| {
+                t.sum("logit.input.lines", &[]) >= 2.0
+            })
+            .await;
 
         let mut received = Vec::new();
         while received.len() < 8_000 {
@@ -2282,7 +2216,7 @@ mod tests {
              reaped after a single 64KiB chunk"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2294,28 +2228,28 @@ mod tests {
         // post-truncation length (10), so `scan` sees a truncation.
         std::fs::write(&path, b"a\nb\npartialpartial").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&path)],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 2).await;
+        let events = recv_events(&mut rx, 2).await;
         assert_eq!(messages(&events), vec!["a", "b"]);
 
         // `O_TRUNC` on the existing path: same inode, 10 < 18 bytes.
         std::fs::write(&path, b"restarted\n").unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(
             messages(&events2),
             vec!["restarted"],
             "the pre-truncation partial must not be spliced onto the first post-truncation line"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         assert!(rx.try_recv().is_err(), "the discarded partial must not resurface on close");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2327,22 +2261,22 @@ mod tests {
         let path = dir.join("app.log");
         std::fs::write(&path, b"before\n").unwrap();
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(dir.join("app.log*"))],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let events = expect_events(&mut rx, 1).await;
+        let events = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["before"]);
 
         // `app.log*` now matches both the rotated-away file and its replacement.
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
-        let events2 = expect_events(&mut rx, 1).await;
+        let events2 = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["after"]);
 
         // `app.log.1` must be rebound, not reopened at byte 0 (re-emitting "before").
@@ -2356,10 +2290,10 @@ mod tests {
             .unwrap()
             .write_all(b"late\n")
             .unwrap();
-        let events3 = expect_events(&mut rx, 1).await;
+        let events3 = recv_events(&mut rx, 1).await;
         assert_eq!(messages(&events3), vec!["late"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2429,15 +2363,15 @@ mod tests {
         config.checkpoint_interval = Duration::from_millis(25);
         config.checkpoint_path = Some(dir.join("checkpoint.json"));
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
         // The flush timer is 60s out, so only the checkpoint tick can deliver within 5s.
-        let events = expect_events(&mut rx, 3).await;
+        let events = recv_events(&mut rx, 3).await;
         assert_eq!(messages(&events), vec!["one", "two", "three"]);
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2453,10 +2387,10 @@ mod tests {
         config.checkpoint_path = Some(dir.join("checkpoint.json"));
         let checkpoint_path = config.checkpoint_path.clone().unwrap();
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (fanout, mut rx) = recording_fanout(8);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let (fanout, mut rx) = fanout_channel(8);
+        let running = spawn_tailer(tailer, fanout);
 
-        let _ = expect_events(&mut rx, 3).await;
+        let _ = recv_events(&mut rx, 3).await;
         // A tick can land before the first read and write offset 0, so wait for a nonzero one.
         wait_until("a checkpoint written after the read", || {
             checkpointed_offset(&checkpoint_path).is_some_and(|offset| offset > 0)
@@ -2470,7 +2404,7 @@ mod tests {
             "the checkpoint must not cover the unterminated trailing line"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2488,15 +2422,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn inotify_tailer(
         pattern: PathPattern,
-        registry: &Registry,
+        probe: &TelemetryProbe,
     ) -> (Tailer<LineDecoder, LineFactory>, crate::tail::watch::Watcher) {
         let diag = Diagnostics::new("tail_in")
-            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
         let mut config = fast_config(ReadFrom::Beginning);
         config.watch = WatchMode::Inotify;
         config.poll_interval = Duration::from_secs(30);
         let tailer = Tailer::new(vec![pattern], LineFactory, config)
-            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"))
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"))
             .with_diagnostics(diag);
         let watcher =
             crate::tail::watch::Watcher::new(WatchMode::Inotify, &mut Diagnostics::default())
@@ -2507,14 +2441,8 @@ mod tests {
     /// Whether a `Diagnostics` key was reported; `warn_throttled` counts
     /// `logit.component.diagnostics{key}` on every occurrence, logged or not.
     #[cfg(target_os = "linux")]
-    fn diagnosed(registry: &Registry, key: &str) -> bool {
-        registry.drain(0).into_iter().any(|event| {
-            event
-                .metrics
-                .iter()
-                .any(|m| logit_core::interner::resolve(m.name) == "logit.component.diagnostics")
-                && event.attributes.get("key").and_then(|v| v.as_str()) == Some(key)
-        })
+    fn diagnosed(probe: &mut TelemetryProbe, key: &str) -> bool {
+        probe.poll().has("logit.component.diagnostics", &[("key", key)])
     }
 
     /// Proves a directory watch is live: creating `path` must yield its `Wake::Discover` off the
@@ -2543,9 +2471,8 @@ mod tests {
     async fn under_inotify_a_pattern_directory_missing_at_bind_is_armed_once_it_exists() {
         let dir = scratch_dir("inotify-late-dir");
         let sub = dir.join("sub"); // not created yet
-        let registry = Registry::new();
-        let (mut tailer, mut watcher) =
-            inotify_tailer(PathPattern::new(sub.join("*.log")), &registry);
+        let mut probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(sub.join("*.log")), &probe);
 
         tailer.scan(true, &mut watcher).await;
         assert_eq!(
@@ -2555,7 +2482,7 @@ mod tests {
         );
         assert!(tailer.watched_dirs.is_empty(), "{:?}", tailer.watched_dirs);
         assert!(
-            diagnosed(&registry, "watch_dir_error"),
+            diagnosed(&mut probe, "watch_dir_error"),
             "a directory that could not be watched must say so, not fail silently"
         );
 
@@ -2575,9 +2502,8 @@ mod tests {
     #[tokio::test]
     async fn under_inotify_a_watched_directory_deleted_and_recreated_is_rearmed() {
         let dir = scratch_dir("inotify-dir-recreated");
-        let registry = Registry::new();
-        let (mut tailer, mut watcher) =
-            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
+        let probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(dir.join("*.log")), &probe);
 
         tailer.scan(true, &mut watcher).await;
         assert_eq!(watcher.tracked_watch_count(), 1);
@@ -2604,9 +2530,8 @@ mod tests {
         let parent = scratch_dir("inotify-dir-renamed");
         let dir = parent.join("live");
         std::fs::create_dir_all(&dir).unwrap();
-        let registry = Registry::new();
-        let (mut tailer, mut watcher) =
-            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
+        let probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(dir.join("*.log")), &probe);
 
         tailer.scan(true, &mut watcher).await;
         expect_discover(&mut watcher, &dir.join("first.log")).await;
@@ -2628,10 +2553,9 @@ mod tests {
     #[tokio::test]
     async fn the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping() {
         let dir = scratch_dir("inotify-watch-leak");
-        let registry = Registry::new();
-        let (mut tailer, mut watcher) =
-            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
-        let (fanout, _rx) = recording_fanout(256);
+        let probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(dir.join("*.log")), &probe);
+        let (fanout, _rx) = fanout_channel(256);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let path = dir.join("app.log");
 
@@ -2724,15 +2648,15 @@ mod tests {
         config.checkpoint_interval = Duration::from_secs(1);
         config.batching.flush_interval = Duration::from_secs(3600);
 
-        let registry = Registry::new();
-        let (fanout, mut rx) = recording_fanout(1);
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(1);
         let filler = fanout.clone();
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
-            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
-        let (shutdown_tx, mut handle) = spawn_tailer(tailer, fanout);
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let mut running = spawn_tailer(tailer, fanout);
 
         // The first checkpoint tick flushes both lines, then records their 8 bytes.
-        assert_eq!(messages(&expect_events(&mut rx, 2).await), vec!["one", "two"]);
+        assert_eq!(messages(&recv_events(&mut rx, 2).await), vec!["one", "two"]);
         wait_until("the interval checkpoint to record the first two lines", || {
             checkpointed_offset(&checkpoint_path) == Some(8)
         })
@@ -2741,27 +2665,25 @@ mod tests {
         // Fill the channel before appending: with it full, the next flush parks, and a run loop
         // parked in a flush never observes shutdown.
         filler.send(filler_batch()).await;
-        let _ = counter_total(&registry, "logit.input.lines"); // count only the appended lines
+        let before = probe.sum("logit.input.lines", &[]);
         append(&path, b"three\nfour\n");
-        let mut lines = 0.0;
-        wait_until("the appended lines to be read into the accumulator", || {
-            lines += counter_total(&registry, "logit.input.lines");
-            lines >= 2.0
-        })
-        .await;
+        probe
+            .wait_for("the appended lines to be read into the accumulator", |t| {
+                t.sum("logit.input.lines", &[]) >= before + 2.0
+            })
+            .await;
 
-        let _ = shutdown_tx.send(true);
+        let _ = running.shutdown.send(true);
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), &mut handle).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(2), &mut running.handle).await.is_err(),
             "the final flush should be parked on the full channel"
         );
         // `run_input`'s grace backstop drops the task here.
-        handle.abort();
-        let _ = handle.await;
+        running.handle.abort();
+        let _ = running.handle.await;
 
         assert!(
-            counter_sum(&registry, "logit.component.receive.flushed", ("reason", "shutdown"))
-                >= 1.0,
+            probe.sum("logit.component.receive.flushed", &[("reason", "shutdown")]) >= 1.0,
             "the final flush is counted before its send parks"
         );
         assert_eq!(
@@ -2790,9 +2712,9 @@ mod tests {
         config.checkpoint_interval = Duration::from_millis(100);
         config.batching.max_events = 1;
 
-        let (fanout, mut rx) = recording_fanout(1);
+        let (fanout, mut rx) = fanout_channel(1);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
         let mut mid_backlog: Option<(usize, u64)> = None;
         let events = consume_slowly(&mut rx, Duration::from_millis(1), |events| {
@@ -2816,7 +2738,7 @@ mod tests {
             "every line should still arrive, in order, after the mid-backlog checkpoint"
         );
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2834,13 +2756,13 @@ mod tests {
         config.batching.max_events = 50;
         config.batching.flush_interval = Duration::from_millis(100);
 
-        let (fanout, mut rx) = recording_fanout(1);
+        let (fanout, mut rx) = fanout_channel(1);
         let tailer = Tailer::new(
             vec![PathPattern::new(&busy), PathPattern::new(&quiet)],
             LineFactory,
             config,
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
         let is_quiet = |e: &Event| e.log.as_ref().unwrap().message.as_str() == Some("quiet line");
         let events = consume_slowly(&mut rx, Duration::from_millis(50), |events| {
@@ -2856,7 +2778,7 @@ mod tests {
         );
 
         drop(rx); // the rest of the backlog then fails fast as closed_consumer
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2876,20 +2798,20 @@ mod tests {
         config.checkpoint_interval = Duration::from_millis(100);
         config.batching.max_events = 1;
 
-        let (fanout, mut rx) = recording_fanout(1);
+        let (fanout, mut rx) = fanout_channel(1);
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
-        let (shutdown_tx, mut handle) = spawn_tailer(tailer, fanout);
+        let mut running = spawn_tailer(tailer, fanout);
 
         // Into the second chunk, then the downstream stops.
         let delivered =
             consume_slowly(&mut rx, Duration::from_millis(1), |e| e.len() >= 6_000).await.len();
-        let _ = shutdown_tx.send(true);
+        let _ = running.shutdown.send(true);
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), &mut handle).await.is_err(),
+            tokio::time::timeout(Duration::from_secs(2), &mut running.handle).await.is_err(),
             "the run loop should be parked in emit"
         );
-        handle.abort();
-        let _ = handle.await;
+        running.handle.abort();
+        let _ = running.handle.await;
         drop(rx);
 
         let offset = checkpointed_offset(&checkpoint_path)
@@ -2904,14 +2826,14 @@ mod tests {
         assert_eq!(offset % BACKLOG_LINE_BYTES, 0, "the checkpoint must sit on a line boundary");
 
         // A restart resumes at the checkpointed line: at or before the last one delivered.
-        let (fanout2, mut rx2) = recording_fanout(8);
+        let (fanout2, mut rx2) = fanout_channel(8);
         let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let (shutdown_tx2, handle2) = spawn_tailer(tailer2, fanout2);
-        let first = expect_events(&mut rx2, 1).await;
+        let running2 = spawn_tailer(tailer2, fanout2);
+        let first = recv_events(&mut rx2, 1).await;
         let resumed_at = offset / BACKLOG_LINE_BYTES;
         assert_eq!(messages(&first[..1]), vec![format!("backlog-{resumed_at:05}")]);
         drop(rx2);
-        shutdown(shutdown_tx2, handle2).await;
+        running2.stop().await;
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2933,15 +2855,15 @@ mod tests {
         config.checkpoint_path = Some(checkpoint_path.clone());
         config.checkpoint_interval = Duration::from_millis(20);
 
-        let (fanout, mut rx) = recording_fanout(8);
+        let (fanout, mut rx) = fanout_channel(8);
         let tailer = Tailer::new(
             vec![PathPattern::new(&a_path), PathPattern::new(&b_path)],
             LineFactory,
             config,
         );
-        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+        let running = spawn_tailer(tailer, fanout);
 
-        let _ = expect_events(&mut rx, 2).await;
+        let _ = recv_events(&mut rx, 2).await;
         wait_until("a checkpoint tick to record both files", || {
             std::fs::read_to_string(&checkpoint_path)
                 .is_ok_and(|text| text.contains("a.log") && text.contains("b.log"))
@@ -2956,7 +2878,7 @@ mod tests {
         })
         .await;
 
-        shutdown(shutdown_tx, handle).await;
+        running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }

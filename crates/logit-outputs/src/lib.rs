@@ -19,6 +19,8 @@ pub mod splunk;
 pub mod statsd;
 pub mod stdio;
 pub mod syslog;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod tls;
 
 pub use logit_pipeline::Output;

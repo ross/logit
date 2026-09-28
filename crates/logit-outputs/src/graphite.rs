@@ -448,16 +448,15 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Collector, ReadMode};
     use logit_core::interner::intern;
     use logit_core::{
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Value,
     };
     use logit_proto::graphite::GraphiteDecoder;
     use logit_proto::Decoder;
-    use std::net::SocketAddr;
     use std::sync::Arc;
-    use tokio::net::{TcpListener, UdpSocket as TokioUdpSocket};
-    use tokio::sync::Mutex;
+    use tokio::net::TcpListener;
 
     const TS: i64 = 1_700_000_000_000_000_000;
 
@@ -519,46 +518,14 @@ mod tests {
 
     // -- Socket ---------------------------------------------------------------------------------
 
-    async fn udp_collector() -> (SocketAddr, Arc<TokioUdpSocket>) {
-        let socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        (addr, Arc::new(socket))
-    }
-
-    async fn tcp_collector() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        {
-            let received = Arc::clone(&received);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = listener.accept().await else { break };
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    let _ = stream.read_to_end(&mut buf).await;
-                    received.lock().await.push(buf);
-                }
-            });
-        }
-        (addr, received)
-    }
-
     /// Whole-`EventBatch` equality against the input: a fixed-point assertion.
     #[tokio::test]
     async fn a_line_round_trips_through_a_real_collector_and_the_real_decoder() {
-        let (addr, collector) = udp_collector().await;
-        let mut output = GraphiteOutput::udp(addr.to_string()).unwrap();
+        let mut collector = Collector::udp().await;
+        let mut output = GraphiteOutput::udp(collector.addr().to_string()).unwrap();
         let batch = batch_with(vec![tagged_event("app.requests", 42.0, ("env", "prod"))]);
-
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let (n, _) = collector.recv_from(&mut buf).await.unwrap();
-            buf[..n].to_vec()
-        });
         output.send(&batch).await.expect("send should succeed");
-        let received =
-            tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
+        let received = collector.next().await;
 
         let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
         let mut events = Vec::new();
@@ -571,90 +538,70 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_terminates_every_line_including_the_last_one() {
-        let (addr, received) = tcp_collector().await;
-        let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut output = GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
         let batch = batch_with(vec![gauge_event("a.metric", 1.0), gauge_event("b.metric", 2.0)]);
         output.send(&batch).await.expect("send should succeed");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = received.lock().await;
-        let text = String::from_utf8_lossy(&got[0]);
+        let got = collector.next().await;
+        let text = String::from_utf8_lossy(&got);
         assert!(text.ends_with('\n'), "the last line must be newline-terminated too: {text:?}");
         assert_eq!(text.lines().count(), 2);
     }
 
     #[tokio::test]
     async fn udp_datagrams_carry_no_trailing_newline() {
-        let (addr, collector) = udp_collector().await;
-        let mut output = GraphiteOutput::udp(addr.to_string()).unwrap();
+        let mut collector = Collector::udp().await;
+        let mut output = GraphiteOutput::udp(collector.addr().to_string()).unwrap();
         let batch = batch_with(vec![gauge_event("a.metric", 1.0), gauge_event("b.metric", 2.0)]);
-
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let (n, _) = collector.recv_from(&mut buf).await.unwrap();
-            buf[..n].to_vec()
-        });
         output.send(&batch).await.expect("send should succeed");
-        let received =
-            tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
+        let received = collector.next().await;
         assert!(!received.ends_with(b"\n"), "a UDP datagram must not end with a trailing newline");
     }
 
     /// Checks both the decoded events and each datagram's size, since a packing bug can bleed
-    /// across datagrams and still decode correctly.
+    /// across datagrams and still decode correctly. Reads datagrams until every event has
+    /// decoded, rather than draining on a quiet window: the packing itself decides the count.
     #[tokio::test]
     async fn a_low_cap_packs_several_events_into_several_datagrams_none_over_cap() {
-        let (addr, collector) = udp_collector().await;
+        let mut collector = Collector::udp().await;
         const CAP: usize = 32;
-        let mut output = GraphiteOutput::udp(addr.to_string()).unwrap().with_max_packet_bytes(CAP);
+        let mut output =
+            GraphiteOutput::udp(collector.addr().to_string()).unwrap().with_max_packet_bytes(CAP);
         let events: Vec<Event> = (0..10).map(|i| gauge_event(&format!("m{i}"), i as f64)).collect();
         let batch = batch_with(events);
-
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let mut got = Vec::new();
-            while let Ok(Ok((n, _))) =
-                tokio::time::timeout(Duration::from_millis(300), collector.recv_from(&mut buf))
-                    .await
-            {
-                got.push(buf[..n].to_vec());
-            }
-            got
-        });
         output.send(&batch).await.expect("send should succeed");
-        let datagrams = recv_task.await.unwrap();
-        assert!(datagrams.len() > 1, "10 lines cannot fit one 32-byte datagram");
-        for datagram in &datagrams {
+
+        let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+        let mut datagrams = Vec::new();
+        let mut decoded = Vec::new();
+        while decoded.len() < batch.events.len() {
+            let datagram = collector.next().await;
             assert!(
                 datagram.len() <= CAP,
                 "a datagram of {} bytes exceeded the cap",
                 datagram.len()
             );
-        }
-
-        let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
-        let mut decoded = Vec::new();
-        for datagram in datagrams {
             decoder
-                .decode_into(bytes::Bytes::from(datagram), TS, &mut decoded)
+                .decode_into(bytes::Bytes::from(datagram.clone()), TS, &mut decoded)
                 .expect("every datagram must decode");
+            datagrams.push(datagram);
         }
+        assert!(datagrams.len() > 1, "10 lines cannot fit one 32-byte datagram");
         assert_eq!(decoded, batch.events, "decode(send(b)) must equal b, not just a count");
     }
 
     /// Strips the 4-byte length prefix and decodes the payload with the real pickle decoder.
     #[tokio::test]
     async fn a_pickle_send_writes_one_length_prefixed_frame_a_real_reader_accepts() {
-        let (addr, received) = tcp_collector().await;
-        let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2))
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut output = GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
             .with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle));
         let batch = batch_with(vec![tagged_event("app.requests", 42.0, ("env", "prod"))]);
         output.send(&batch).await.expect("send should succeed");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let frame = collector.next().await;
 
-        let got = received.lock().await;
-        let frame = &got[0];
         assert!(frame.len() > 4, "a frame must carry at least its own length prefix");
         let declared_len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
         assert_eq!(
@@ -710,8 +657,8 @@ mod tests {
     /// A first write that fails with zero bytes sent reconnects and retries once.
     #[tokio::test]
     async fn tcp_reconnects_exactly_once_after_the_peer_resets_an_inherited_connection() {
-        let (addr, received) = tcp_collector().await;
-        let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut output = GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
 
         let batch1 = batch_with(vec![gauge_event("first", 1.0)]);
         output.send(&batch1).await.expect("first send should succeed against a fresh connection");
@@ -727,40 +674,9 @@ mod tests {
             .expect("second send should reconnect once and succeed, not surface the failure");
 
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = received.lock().await;
+        let got = collector.take(2).await;
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
-    }
-
-    /// `tcp_collector`, but each connection closes (a clean FIN) once it has read anything, as a
-    /// restarting or idle-timing-out carbon receiver would.
-    async fn tcp_collector_that_closes_after_one_read(
-    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let accepts = Arc::new(AtomicUsize::new(0));
-        {
-            let received = Arc::clone(&received);
-            let accepts = Arc::clone(&accepts);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = listener.accept().await else { break };
-                    accepts.fetch_add(1, Ordering::SeqCst);
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 8192];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        buf.truncate(n);
-                        received.lock().await.push(buf);
-                    }
-                    // `stream` drops here: one batch read, then a clean close.
-                }
-            });
-        }
-        (addr, received, accepts)
     }
 
     /// After the receiver closes the pooled connection, the next batch still arrives. Asserts on
@@ -768,16 +684,17 @@ mod tests {
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {
-        let (addr, received, accepts) = tcp_collector_that_closes_after_one_read().await;
-        let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tcp(ReadMode::FirstReadThenClose).await;
+        let mut output = GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
 
         output
             .send(&batch_with(vec![gauge_event("first", 1.0)]))
             .await
             .expect("first send should succeed against a fresh connection");
 
-        // Let the FIN land before the probe looks for it.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The collector closes before it reports, so its FIN is sent before the probe looks.
+        let first = collector.next().await;
+        assert!(String::from_utf8_lossy(&first).contains("first"));
 
         output
             .send(&batch_with(vec![gauge_event("second", 1.0)]))
@@ -785,17 +702,15 @@ mod tests {
             .expect("the probe should reconnect rather than write into a closed socket");
 
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = collector.next().await;
         assert_eq!(
-            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            collector.accepts(),
             2,
             "the probe must have dialled a second connection for the second batch"
         );
-        let got = received.lock().await;
-        assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
         assert!(
-            got.iter().any(|b| String::from_utf8_lossy(b).contains("second")),
-            "the second batch must actually have reached the receiver: {got:?}"
+            String::from_utf8_lossy(&second).contains("second"),
+            "the second batch must actually have reached the receiver: {second:?}"
         );
     }
 
@@ -834,9 +749,9 @@ mod tests {
     /// because rule 38's upper bound applies to `collectd_out` only, not `graphite_out`.
     #[tokio::test]
     async fn an_emsgsize_datagram_is_counted_not_faulted() {
-        let (addr, _collector) = udp_collector().await;
+        let collector = Collector::udp().await;
         let registry = Registry::new();
-        let mut output = GraphiteOutput::udp(addr.to_string())
+        let mut output = GraphiteOutput::udp(collector.addr().to_string())
             .unwrap()
             .with_max_packet_bytes(100_000) // past the real UDP payload ceiling (65507)
             .with_telemetry(registry.telemetry_for("out", "graphite_out", "sink"));
@@ -927,19 +842,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_send_reports_batch_bytes_messages_datapoints_and_an_ok_request() {
-        let (addr, collector) = udp_collector().await;
+        let mut collector = Collector::udp().await;
         let registry = Registry::new();
-        let mut output = GraphiteOutput::udp(addr.to_string())
+        let mut output = GraphiteOutput::udp(collector.addr().to_string())
             .unwrap()
             .with_telemetry(registry.telemetry_for("out", "graphite_out", "sink"));
         let batch = batch_with(vec![gauge_event("app.requests", 42.0)]);
 
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            collector.recv_from(&mut buf).await.unwrap();
-        });
         output.send(&batch).await.expect("send should succeed");
-        tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
+        collector.next().await;
 
         let events = registry.drain(0);
         assert!(metric_sum(&events, "logit.output.batch.bytes") > 0.0);

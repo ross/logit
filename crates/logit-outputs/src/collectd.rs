@@ -226,6 +226,7 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Collector;
     use logit_core::interner::intern;
     use logit_core::{
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Sum,
@@ -235,10 +236,7 @@ mod tests {
         CollectdDecoder, ATTR_HOST, ATTR_INTERVAL, ATTR_PLUGIN, ATTR_TYPE,
     };
     use logit_proto::Decoder;
-    use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::net::UdpSocket as TokioUdpSocket;
 
     const TS: i64 = 1_700_000_000_000_000_000;
 
@@ -332,28 +330,15 @@ mod tests {
 
     // -- Socket ---------------------------------------------------------------------------------
 
-    async fn udp_collector() -> (SocketAddr, Arc<TokioUdpSocket>) {
-        let socket = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        (addr, Arc::new(socket))
-    }
-
     /// Whole-`Event` equality against the input: a fixed-point assertion that also covers the
     /// interval, timestamp, and record kind/name.
     #[tokio::test]
     async fn a_packed_datagram_round_trips_through_a_real_collector_and_decoder() {
-        let (addr, collector) = udp_collector().await;
-        let mut output = CollectdOutput::udp(addr.to_string()).unwrap();
+        let mut collector = Collector::udp().await;
+        let mut output = CollectdOutput::udp(collector.addr().to_string()).unwrap();
         let batch = batch_with(vec![relay_event("web-1", "load", 0.5)]);
-
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let (n, _) = collector.recv_from(&mut buf).await.unwrap();
-            buf[..n].to_vec()
-        });
         output.send(&batch).await.expect("send should succeed");
-        let received =
-            tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
+        let received = collector.next().await;
 
         let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
         let mut events = Vec::new();
@@ -364,45 +349,36 @@ mod tests {
     }
 
     /// Whole-`Event` equality plus each datagram's size against the cap, since a packing bug can
-    /// bleed identity across datagrams and still decode correctly.
+    /// bleed identity across datagrams and still decode correctly. Reads datagrams until every
+    /// event has decoded, rather than draining on a quiet window: the packing itself decides the
+    /// count.
     #[tokio::test]
     async fn a_low_cap_packs_several_events_into_several_datagrams() {
-        let (addr, collector) = udp_collector().await;
+        let mut collector = Collector::udp().await;
         const CAP: usize = 64;
-        let mut output = CollectdOutput::udp(addr.to_string()).unwrap().with_max_packet_bytes(CAP);
+        let mut output =
+            CollectdOutput::udp(collector.addr().to_string()).unwrap().with_max_packet_bytes(CAP);
         let events: Vec<Event> =
             (0..10).map(|i| relay_event("web-1", &format!("p{i}"), i as f64)).collect();
         let batch = batch_with(events);
-
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let mut got = Vec::new();
-            while let Ok(Ok((n, _))) =
-                tokio::time::timeout(Duration::from_millis(300), collector.recv_from(&mut buf))
-                    .await
-            {
-                got.push(buf[..n].to_vec());
-            }
-            got
-        });
         output.send(&batch).await.expect("send should succeed");
-        let datagrams = recv_task.await.unwrap();
-        assert!(datagrams.len() > 1, "10 lists cannot fit one 64-byte datagram");
-        for datagram in &datagrams {
+
+        let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
+        let mut datagrams = Vec::new();
+        let mut decoded = Vec::new();
+        while decoded.len() < batch.events.len() {
+            let datagram = collector.next().await;
             assert!(
                 datagram.len() <= CAP,
                 "a datagram of {} bytes exceeded the cap",
                 datagram.len()
             );
-        }
-
-        let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
-        let mut decoded = Vec::new();
-        for datagram in datagrams {
             decoder
-                .decode_into(bytes::Bytes::from(datagram), TS, &mut decoded)
+                .decode_into(bytes::Bytes::from(datagram.clone()), TS, &mut decoded)
                 .expect("every datagram must decode");
+            datagrams.push(datagram);
         }
+        assert!(datagrams.len() > 1, "10 lists cannot fit one 64-byte datagram");
         assert_eq!(decoded, batch.events, "decode(send(b)) must equal b, not just a count");
     }
 
@@ -486,19 +462,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_send_reports_batch_bytes_messages_datagrams_and_an_ok_request() {
-        let (addr, collector) = udp_collector().await;
+        let mut collector = Collector::udp().await;
         let registry = Registry::new();
-        let mut output = CollectdOutput::udp(addr.to_string())
+        let mut output = CollectdOutput::udp(collector.addr().to_string())
             .unwrap()
             .with_telemetry(registry.telemetry_for("out", "collectd_out", "sink"));
         let batch = batch_with(vec![relay_event("web-1", "load", 0.5)]);
 
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            collector.recv_from(&mut buf).await.unwrap();
-        });
         output.send(&batch).await.expect("send should succeed");
-        tokio::time::timeout(Duration::from_secs(2), recv_task).await.unwrap().unwrap();
+        collector.next().await;
 
         // One shared drain for every `metric_sum` below.
         let events = registry.drain(0);

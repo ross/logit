@@ -46,6 +46,9 @@ http.workspace = true
 http-body-util.workspace = true
 
 [dev-dependencies]
+# Compiles `logit_pipeline::test_util` for the integration tests. Dev-only, so the release binary
+# never has it; `script/lint` checks that.
+logit-pipeline = { workspace = true, features = ["test-util"] }
 # `admin_ready.rs`'s drain test needs a real SIGTERM: `Child::kill` sends SIGKILL, which has no
 # graceful drain to probe. Already a dependency via `logit-inputs`.
 libc.workspace = true

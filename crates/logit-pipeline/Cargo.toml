@@ -29,6 +29,9 @@ bytes.workspace = true
 # Arms the fault-injection seam (`src/fault.rs`) outside this crate's own tests. Only ever a
 # dev-dependency feature: `script/lint` fails if `logit-cli`'s normal dependency graph enables it.
 fault-injection = []
+# Compiles `src/test_util.rs`, the shared test helpers, outside this crate's own tests. Only ever a
+# dev-dependency feature: `script/lint` fails if `logit-cli`'s normal dependency graph enables it.
+test-util = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads: Linux-only socket

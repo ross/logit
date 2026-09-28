@@ -1685,6 +1685,7 @@ mod tests {
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
     use logit_core::{MetricKind, Registry};
+    use logit_pipeline::test_util::{self, expect_closed, TelemetryProbe};
     use logit_pipeline::Delivered;
     use rustls_pki_types::pem::PemObject;
     use std::convert::Infallible;
@@ -1768,6 +1769,9 @@ mod tests {
         PrometheusInput::new(vec![url.to_string()], Duration::from_secs(3600))
     }
 
+    /// The batch a scrape already sent, with no wait: `tick` returns after its send, so an
+    /// empty channel here is a failure, not a slow scrape. [`test_util::recv_batch`] is the
+    /// waiting form, for the receiver, which answers on a spawned task.
     async fn recv_batch(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
         match rx.try_recv().expect("expected a batch to have been sent") {
             Delivered::Owned(batch, _ctx) => batch,
@@ -2403,20 +2407,6 @@ mod tests {
         Some(String::from_utf8_lossy(&head).into_owned())
     }
 
-    async fn expect_closed<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
-        match result {
-            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
-            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN.
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(err) => panic!("{what}: read failed outright: {err}"),
-        }
-    }
-
     fn gauge_value_of(batch: &EventBatch, name: &str) -> Option<f64> {
         batch.events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| {
@@ -2464,7 +2454,7 @@ mod tests {
             !response.to_ascii_lowercase().contains(remote_write::HEADER_SAMPLES_WRITTEN),
             "got: {response}"
         );
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(gauge_value_of(&batch, "queue_depth"), Some(7.0));
     }
 
@@ -2494,7 +2484,7 @@ mod tests {
             lowered.contains(&format!("{}: 0", remote_write::HEADER_EXEMPLARS_WRITTEN)),
             "got: {response}"
         );
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(gauge_value_of(&batch, "queue_depth"), Some(7.0));
     }
 
@@ -2595,7 +2585,7 @@ mod tests {
         let response = post_raw(&addr, "/api/v1/write", &zstd_write_headers(), &body).await;
 
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1);
         assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "queue_depth");
         let events = registry.drain(0);
@@ -2846,7 +2836,7 @@ mod tests {
         let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 3, "one batch, one event per sample");
         let timestamps: Vec<i64> = batch.events.iter().map(|e| e.timestamp).collect();
         assert_eq!(
@@ -2876,7 +2866,7 @@ mod tests {
 
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(*batch.resource, Resource::default(), "no resource identity is invented");
         let event = &batch.events[0];
         assert_eq!(
@@ -2915,7 +2905,7 @@ mod tests {
         let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         let event = &batch.events[0];
         assert_eq!(gauge_value_of(&batch, "queue_depth"), Some(11.0), "the sample is exact");
         assert_eq!(
@@ -2968,12 +2958,12 @@ mod tests {
             "the 204 must not be written while the batch is still parked in Fanout::send"
         );
 
-        recv_batch_async(&mut rx).await; // drain the first batch; the parked send completes
+        test_util::recv_batch(&mut rx).await; // drain the first batch; the parked send completes
         let head = read_head(&mut blocked, Duration::from_secs(5))
             .await
             .expect("the 204 arrives once the downstream drains");
         assert!(head.starts_with("HTTP/1.1 204"), "got: {head}");
-        recv_batch_async(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
     }
 
     /// A histogram whose cumulative bucket counts *decrease* is dropped by `families_to_events`
@@ -3058,7 +3048,7 @@ mod tests {
                 .contains(&format!("{}: 4", remote_write::HEADER_SAMPLES_WRITTEN)),
             "two buckets plus _sum plus _count -- got: {response}"
         );
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1, "four wire samples, one model series");
     }
 
@@ -3096,7 +3086,7 @@ mod tests {
                 .contains(&format!("{}: 2", remote_write::HEADER_SAMPLES_WRITTEN)),
             "two quantiles and nothing else -- got: {response}"
         );
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1);
         let events = registry.drain(0);
         assert_eq!(counter_in(&events, "logit.input.samples", ("component", "receive")), Some(2.0));
@@ -3141,7 +3131,7 @@ mod tests {
         let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1, "one series, whatever it was spelled as");
         assert_eq!(
             batch.events[0].metrics[0].start_timestamp, 1_699_000_000_000_000_000,
@@ -3218,7 +3208,7 @@ mod tests {
         );
 
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
-        recv_batch_async(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
         post_write(&addr, "/nowhere", remote_write::Version::V1, &body).await;
 
         let events = registry.drain(0);
@@ -3268,7 +3258,7 @@ mod tests {
         let response = String::from_utf8_lossy(&buf).into_owned();
 
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(gauge_value_of(&batch, "queue_depth"), Some(5.0));
     }
 
@@ -3309,15 +3299,22 @@ mod tests {
             .await
             .expect("the keep-alive write is answered");
         assert!(head.starts_with("HTTP/1.1 204"), "got: {head}");
-        recv_batch_async(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
 
         expect_closed(&mut keep_alive, "a keep-alive connection quiet past its idle_timeout").await;
 
-        let drained = registry.drain(0);
+        // hyper's graceful close can send the FIN before `drive_with_idle` counts, so the close
+        // alone doesn't say the count is in.
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the idle close counted", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "idle")]) >= 1.0
+            })
+            .await;
         assert_eq!(
-            counter_in(&drained, "logit.input.connections.closed", ("reason", "idle")),
-            Some(1.0),
-            "an idle close is counted"
+            totals.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
+            "an idle close is counted once"
         );
         assert_eq!(
             listener_diag.occurrences("connection_error"),
@@ -3328,7 +3325,7 @@ mod tests {
         // Under `with_max_connections(1)` this can only be answered if the permit came back.
         let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
         assert!(response.starts_with("HTTP/1.1 204"), "permit came back, got: {response}");
-        recv_batch_async(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
         drop(keep_alive);
     }
 
@@ -3344,26 +3341,15 @@ mod tests {
             remote_write::Version::V1,
         );
 
-        let silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The connection's task drops the stream and then its permit with no `.await` between, so
+        // on this current-thread runtime the close means the permit is back.
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut silent, "a connection that sent nothing").await;
 
         let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
         assert!(response.starts_with("HTTP/1.1 204"), "permit came back, got: {response}");
-        recv_batch_async(&mut rx).await;
+        test_util::recv_batch(&mut rx).await;
         drop(silent);
-    }
-
-    /// `recv_batch`, awaiting: the receiver answers on a spawned task, so a batch may land after
-    /// the response is read.
-    async fn recv_batch_async(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a batch should arrive within 5s")
-            .expect("the channel should still be open");
-        match delivered {
-            Delivered::Owned(batch, _ctx) => batch,
-            Delivered::Shared(shared, _ctx) => (*shared).clone(),
-        }
     }
 
     /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`, presenting no client certificate.
@@ -3476,7 +3462,7 @@ mod tests {
             post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         let record = histogram_record(&batch).expect("the cached type assembles one histogram");
         assert_eq!(
             record.description.map(logit_core::interner::resolve),
@@ -3521,7 +3507,7 @@ mod tests {
         let samples = v1_histogram_samples_only();
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert!(histogram_record(&batch).is_none(), "nothing was remembered, so nothing assembled");
         assert_eq!(batch.events.len(), 3, "three unrelated flat series: {:#?}", batch.events);
         for event in &batch.events {
@@ -3573,7 +3559,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         // A `MetricKind::Gauge` named `foo` -- the request's type, not the remembered one, and
         // not the `Unknown` the seed would have given way to on its own.
         assert_eq!(gauge_value_of(&batch, "foo"), Some(3.0));
@@ -3629,7 +3615,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
-        let _ = recv_batch_async(&mut rx).await; // the 2.0 request's own (bucket-only) family
+        let _ = test_util::recv_batch(&mut rx).await; // the 2.0 request's own (bucket-only) family
 
         // Now a 1.0 sender's samples-only write of the same family.
         let samples = v1_histogram_samples_only();
@@ -3637,7 +3623,7 @@ mod tests {
             post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         let record = histogram_record(&batch).expect("the 2.0 declaration typed the 1.0 request");
         assert_eq!(
             record.description.map(logit_core::interner::resolve),
@@ -3825,13 +3811,13 @@ mod tests {
         )
         .await;
         // Its own sample survives: the remembered histogram gives way rather than rejecting it.
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert_eq!(gauge_value_of(&batch, "foo"), Some(1.0));
 
         // And the real sender's next write is still assembled as the histogram it is.
         let samples = v1_histogram_samples_only();
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
-        let batch = recv_batch_async(&mut rx).await;
+        let batch = test_util::recv_batch(&mut rx).await;
         assert!(histogram_record(&batch).is_some(), "{:#?}", batch.events);
 
         let events = registry.drain(0);

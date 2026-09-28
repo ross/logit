@@ -809,6 +809,7 @@ fn is_host_metadata(body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_pipeline::test_util::{recv_batch, Totals};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
@@ -831,14 +832,6 @@ mod tests {
 
     async fn start_default() -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
         start(DatadogInput::new("127.0.0.1:0"), 16).await
-    }
-
-    async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a batch within 5s")
-            .expect("the channel is open");
-        logit_pipeline::unwrap_batch(delivered)
     }
 
     /// `otlp_in`'s `post_raw`, with the method as a parameter: one request on a fresh
@@ -968,17 +961,16 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
         assert!(rx.try_recv().is_err(), "an acknowledged payload is never sent");
 
-        let events = registry.drain(0);
+        let events = Totals::of(registry.drain(0));
         for route in ["host_metadata", "metadata", "collector", "container", "orch", "intake"] {
             assert_eq!(
-                sum_of(&events, "logit.input.requests.acknowledged", ("route", route)),
-                Some(1.0),
+                events.sum("logit.input.requests.acknowledged", &[("route", route)]),
+                1.0,
                 "{route}"
             );
         }
-        assert_eq!(
-            sum_of(&events, "logit.input.events.skipped", ("reason", "no_title")),
-            None,
+        assert!(
+            !events.has("logit.input.events.skipped", &[("reason", "no_title")]),
             "host metadata is not a skipped event"
         );
     }
@@ -1059,8 +1051,8 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 202"), "{name}: {response}");
             recv_batch(&mut rx).await;
         }
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests.rejected", ("reason", "auth")), Some(3.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests.rejected", &[("reason", "auth")]), 3.0);
     }
 
     #[tokio::test]
@@ -1082,12 +1074,12 @@ mod tests {
             start(DatadogInput::new("127.0.0.1:0").with_telemetry(telemetry), 16).await;
         let response = post_raw(&addr, "/api/intake/metrics/v3/series", "", b"{}").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-        let events = registry.drain(0);
+        let events = Totals::of(registry.drain(0));
         assert_eq!(
-            sum_of(&events, "logit.input.requests.rejected", ("reason", "unknown_route")),
-            Some(1.0)
+            events.sum("logit.input.requests.rejected", &[("reason", "unknown_route")]),
+            1.0
         );
-        assert_eq!(sum_of(&events, "logit.input.requests", ("route", "unknown")), Some(1.0));
+        assert_eq!(events.sum("logit.input.requests", &[("route", "unknown")]), 1.0);
     }
 
     #[tokio::test]
@@ -1139,8 +1131,9 @@ mod tests {
         assert_eq!(body["status"], "error");
         assert!(body["errors"][0].as_str().is_some_and(|m| !m.is_empty()), "{body}");
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.requests.rejected", ("reason", "malformed")),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.requests.rejected", &[("reason", "malformed")]),
+            1.0
         );
     }
 
@@ -1170,8 +1163,9 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 413"), "{encoding}: {response}");
         }
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.requests.rejected", ("reason", "oversize")),
-            Some(3.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.requests.rejected", &[("reason", "oversize")]),
+            3.0
         );
 
         // 5 MiB + 1 of spaces isn't an `AgentPayload`, so the traces route's answer is a decode
@@ -1222,9 +1216,9 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
         recv_batch(&mut rx).await;
 
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("class", "busy")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
     }
 
     /// With two consumers and the second full, a `503` leaves the first holding nothing, and the
@@ -1253,9 +1247,9 @@ mod tests {
         recv_batch(&mut rx_b).await;
         assert!(rx_b.try_recv().is_err(), "b never had room for the 503'd batch");
 
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.component.batches.sent", ("", "")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.batches.dropped", ("reason", "busy")), Some(1.0));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.component.batches.sent", &[]), 1.0);
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
     }
 
     #[tokio::test]
@@ -1266,9 +1260,9 @@ mod tests {
             start(DatadogInput::new("127.0.0.1:0").with_telemetry(telemetry), 16).await;
         post_raw(&addr, "/api/v2/logs", "", LOGS).await;
         recv_batch(&mut rx).await;
-        let events = registry.drain(0);
-        assert_eq!(sum_of(&events, "logit.input.requests", ("route", "logs")), Some(1.0));
-        assert_eq!(sum_of(&events, "logit.input.request.bytes", ("", "")), Some(LOGS.len() as f64));
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("route", "logs")]), 1.0);
+        assert_eq!(events.sum("logit.input.request.bytes", &[]), LOGS.len() as f64);
     }
 
     #[tokio::test]
@@ -1280,7 +1274,8 @@ mod tests {
         let (addr, _rx) = start(input, 16).await;
         let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
         first.write_all(b"P").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The accept loop takes a connection's permit as it accepts it, one accept at a time and in
+        // the kernel queue's order, so `first` holds it before `second` is accepted.
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let mut buf = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf))
@@ -1288,8 +1283,9 @@ mod tests {
             .expect("the past-the-cap connection is closed");
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.connections.rejected", ("reason", "limit")),
-            Some(1.0)
+            Totals::of(registry.drain(0))
+                .sum("logit.input.connections.rejected", &[("reason", "limit")]),
+            1.0
         );
         drop(first);
     }
@@ -1332,27 +1328,5 @@ mod tests {
         assert!(!is_host_metadata(EVENT));
         assert!(!is_host_metadata(br#"{"apiKey":"k","events":{},"internalHostname":"h"}"#));
         assert!(!is_host_metadata(b"[1]"), "not an object: left for the decoder to reject");
-    }
-
-    /// The value of `metric`'s `Sum` in a drained snapshot, restricted to the point carrying
-    /// `tag`; an empty tag key matches any point.
-    fn sum_of(events: &[logit_core::Event], metric: &str, tag: (&str, &str)) -> Option<f64> {
-        let mut total = None;
-        for event in events {
-            if !tag.0.is_empty()
-                && event.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1)
-            {
-                continue;
-            }
-            for record in &event.metrics {
-                if logit_core::interner::resolve(record.name) != metric {
-                    continue;
-                }
-                if let logit_core::MetricKind::Sum(sum) = record.kind {
-                    *total.get_or_insert(0.0) += sum.value;
-                }
-            }
-        }
-        total
     }
 }

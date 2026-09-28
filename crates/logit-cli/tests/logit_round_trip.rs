@@ -16,14 +16,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// An address with nothing listening on it: bind an ephemeral port, read it back, drop the
-/// socket. Only [`connect_refused_is_classified_clean_against_a_real_logit_in_torn_down`] uses
-/// it; a test that wants a live listener uses [`bound_input`].
-async fn ephemeral_addr() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
-}
-
 /// Builds a `logit_in` on an ephemeral port, applies `configure` (TLS, mostly), and binds it,
 /// returning the OS-assigned address and the bound input. Binding before `run` is spawned means a
 /// `LogitOutput::send` can't race the bind.
@@ -70,10 +62,10 @@ async fn round_trip(
 
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
+    // `logit_in` writes its `Ack` after `Fanout::send` returns, and `send` returns on that `Ack`,
+    // so every batch the send delivered is already queued.
     let mut received = Vec::new();
-    while let Ok(Some(delivered)) =
-        tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-    {
+    while let Ok(delivered) = rx.try_recv() {
         received.push(logit_pipeline::unwrap_batch(delivered));
     }
     received
@@ -107,10 +99,9 @@ async fn round_trip_with_provenance(
     });
     output.send(batch).await.expect("send should succeed against a live logit_in");
 
+    // Every delivered batch is already queued, as in [`round_trip`].
     let mut received = Vec::new();
-    while let Ok(Some(delivered)) =
-        tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-    {
+    while let Ok(delivered) = rx.try_recv() {
         let provenance = delivered.provenance();
         received.push((logit_pipeline::unwrap_batch(delivered), provenance));
     }
@@ -224,8 +215,10 @@ async fn a_statsd_decoded_batch_forwards_through_logit_out_and_logit_in_with_its
 
 #[tokio::test]
 async fn connect_refused_is_classified_clean_against_a_real_logit_in_torn_down() {
-    let addr = ephemeral_addr().await; // nothing is listening here
-    let mut output = LogitOutput::new(addr).with_timeout(Duration::from_millis(300));
+    // Port 1: nothing listens there, so the connect is refused. A port bound and then released
+    // could be taken by another test before the connect.
+    let mut output =
+        LogitOutput::new("127.0.0.1:1".to_string()).with_timeout(Duration::from_millis(300));
     let err = output.send(&sample_batch()).await.unwrap_err();
     assert_eq!(classify(&err), Fault::Clean);
 }

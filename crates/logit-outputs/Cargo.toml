@@ -37,8 +37,9 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
-# Arms `logit_pipeline::fault` in this crate's tests. Dev-only, so the release binary never has it.
-logit-pipeline = { workspace = true, features = ["fault-injection"] }
+# Arms `logit_pipeline::fault` and compiles `logit_pipeline::test_util` in this crate's tests.
+# Dev-only, so the release binary never has either.
+logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }
 # Remote-write sender tests decode the captured body as the vendored prompb message, not this
 # codec's own view of it.
 prost.workspace = true

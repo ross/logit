@@ -869,16 +869,21 @@ mod tests {
     /// task the way a handler bug would.
     pub(super) const PANIC_HEADER: &str = "x-logit-test-panic";
 
+    /// The read-timeout window `logit_pipeline::test_util::expect_still_open` blocks on. Every
+    /// caller here has already waited out its own positive interval (an idle timeout's multiple)
+    /// before this call, so this window only confirms a still-blocked read; it does not itself
+    /// wait for a state change.
+    const STILL_OPEN_PROBE: Duration = Duration::from_millis(50);
+
     async fn bound_input(transport: OtlpTransport) -> (String, OtlpInput) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        (addr.to_string(), OtlpInput::new(addr.to_string(), transport))
+        let mut input = OtlpInput::new("127.0.0.1:0", transport);
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+        (addr, input)
     }
 
     /// `Input::bind` makes the port live *before* `run`'s accept loop starts, and `local_addr`
-    /// exposes the OS-assigned port, with no bind-drop-rebind (which `bound_input` above still
-    /// uses).
+    /// exposes the OS-assigned port, with no bind-drop-rebind.
     #[tokio::test]
     async fn bind_makes_the_port_live_before_run_and_local_addr_reports_it() {
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http);
@@ -917,16 +922,6 @@ mod tests {
         (Fanout::new(vec![tx]), rx)
     }
 
-    async fn recv_batch(
-        rx: &mut mpsc::Receiver<logit_pipeline::Delivered>,
-    ) -> logit_core::EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("should receive within 5s")
-            .expect("channel should still be open");
-        logit_pipeline::unwrap_batch(delivered)
-    }
-
     // ---- HTTP: raw-socket protocol tests ----
 
     async fn post_raw(addr: &str, path: &str, headers: &str, body: &[u8]) -> String {
@@ -947,7 +942,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let batch = logit_core::EventBatch {
@@ -983,7 +977,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(received.events.len(), 1);
         assert!(received.events[0].span.is_some());
     }
@@ -1005,7 +999,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1016,7 +1009,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(received.events.len(), 1);
         let span = received.events[0].span.as_ref().expect("event should carry a span");
         assert_eq!(span.trace_id, [9; 16]);
@@ -1030,7 +1023,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1050,7 +1042,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1069,7 +1060,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1090,7 +1080,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1100,7 +1089,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     #[tokio::test]
@@ -1108,7 +1097,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1126,7 +1114,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let gzipped = gzip(&one_span_json());
         let response = post_raw(
@@ -1139,7 +1126,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(received.events.len(), 1);
         assert!(received.events[0].span.is_some());
     }
@@ -1150,7 +1137,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let log_body = br#"{"resourceLogs": [{"scopeLogs": [{"logRecords": [{
             "timeUnixNano": "1", "body": {"stringValue": "hi"}
@@ -1163,7 +1149,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "logs, got: {response}");
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert!(received.events[0].log.is_some());
 
         let metric_body = br#"{"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
@@ -1177,7 +1163,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "metrics, got: {response}");
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert!(!received.events[0].metrics.is_empty());
     }
 
@@ -1187,7 +1173,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1206,7 +1191,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1226,7 +1210,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         for encoding in ["GZIP", "Gzip", "IDENTITY", "Identity"] {
             let body = if encoding.eq_ignore_ascii_case("gzip") {
@@ -1240,7 +1223,7 @@ mod tests {
             );
             let response = post_raw(&addr, "/v1/traces", &headers, &body).await;
             assert!(response.starts_with("HTTP/1.1 200"), "{encoding}: got {response}");
-            let received = recv_batch(&mut rx).await;
+            let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
             assert!(received.events[0].span.is_some(), "{encoding}: the span is delivered");
         }
     }
@@ -1253,7 +1236,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         for encoding in ["", "gzip\u{e9}", "\u{e9}zstd"] {
             let headers = format!(
@@ -1303,7 +1285,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let gzipped = gzip(&one_span_payload());
         let response = post_raw(
@@ -1316,7 +1297,7 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(received.events.len(), 1);
         assert!(received.events[0].span.is_some());
     }
@@ -1326,7 +1307,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1347,7 +1327,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let zeros = vec![0u8; MAX_REQUEST_BYTES + 1];
         let gzipped = gzip(&zeros);
@@ -1372,7 +1351,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let body = vec![0u8; MAX_REQUEST_BYTES + 1];
         let response = post_raw(
@@ -1390,7 +1368,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let response = post_raw(
             &addr,
@@ -1407,7 +1384,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         fn span_batch(host: &str, trace_byte: u8) -> logit_core::EventBatch {
             let mut resource = logit_core::Resource::default();
@@ -1458,8 +1434,8 @@ mod tests {
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
-        let first = recv_batch(&mut rx).await;
-        let second = recv_batch(&mut rx).await;
+        let first = logit_pipeline::test_util::recv_batch(&mut rx).await;
+        let second = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(first.resource.attributes.get("host").and_then(|v| v.as_str()), Some("a"));
         assert_eq!(second.resource.attributes.get("host").and_then(|v| v.as_str()), Some("b"));
     }
@@ -1471,7 +1447,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // `OtlpOutput` always sends well-formed frames, so this drives the raw framing over a
         // real HTTP/2 client connection.
@@ -1503,7 +1478,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
@@ -1530,7 +1504,7 @@ mod tests {
         let trailers = collected.trailers().expect("should carry trailers");
         assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "0");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(received.events.len(), 1);
         assert!(received.events[0].span.is_some());
     }
@@ -1540,7 +1514,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
@@ -1604,7 +1577,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         for (encoding, body) in [
             ("GZIP", grpc_message(true, &gzip(&one_span_payload()))),
@@ -1614,7 +1586,7 @@ mod tests {
         ] {
             let trailers = grpc_export(&addr, body, Some(encoding)).await;
             assert_eq!(trailers.get("grpc-status").unwrap(), "0", "{encoding}: {trailers:?}");
-            let received = recv_batch(&mut rx).await;
+            let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
             assert!(received.events[0].span.is_some(), "{encoding}: the span is delivered");
         }
     }
@@ -1627,7 +1599,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Grpc).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let first = grpc_message(false, &one_span_payload());
         let second = grpc_message(false, &one_span_payload());
@@ -1723,7 +1694,6 @@ mod tests {
         let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -1740,7 +1710,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     #[tokio::test]
@@ -1749,7 +1719,6 @@ mod tests {
         let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let connector = tls_connector(None).await;
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -1778,7 +1747,7 @@ mod tests {
         let trailers = collected.trailers().expect("should carry trailers");
         assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "0");
 
-        let received = recv_batch(&mut rx).await;
+        let received = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert!(received.events[0].span.is_some());
     }
 
@@ -1788,7 +1757,6 @@ mod tests {
         let mut input = input.with_tls(&test_tls_settings(None), &testdata_dir()).unwrap();
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Plain HTTP at a TLS-only listener: the server reads garbage TLS framing, sends an
         // alert, and closes, without taking the listener down. The client may see alert bytes or
@@ -1822,7 +1790,6 @@ mod tests {
             input.with_tls(&test_tls_settings(Some("ca.pem")), &testdata_dir()).unwrap();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let body = one_span_payload();
         let with_cert = tls_connector(Some(("client.pem", "client.key"))).await;
@@ -1835,7 +1802,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         let without_cert = tls_connector(None).await;
         let response = post_raw_tls(
@@ -1858,27 +1825,22 @@ mod tests {
     /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
     #[tokio::test]
     async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
-        let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input
+        // One listener for both halves, so the second proves this listener still serves TLS. Its
+        // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
+        // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
+        let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
             .with_tls(&test_tls_settings(None), &testdata_dir())
             .unwrap()
-            .with_handshake_timeout(Duration::from_millis(50));
+            .with_handshake_timeout(Duration::from_millis(500));
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Raw TCP, no byte sent, held until the close is observed, so only the server's deadline
-        // could have closed it. A 1s read budget against a 50ms handshake timeout.
+        // could have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut buf))
-            .await
-            .expect("a silent TLS connection should be closed within 1s");
-        match result {
-            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(err) => panic!("read failed outright: {err}"),
-        }
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
 
         // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
@@ -1895,67 +1857,12 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         drop(silent);
     }
 
     // ---- connection limit, the plaintext first-byte bound, and the connections gauge ----------
-
-    /// Reads one byte, expecting the peer to have closed instead. This helper, `sum_of`, and
-    /// `expect_still_open` are copies of `crate::tcp`'s test helpers of the same names.
-    async fn expect_closed<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
-        match result {
-            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
-            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN.
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(err) => panic!("{what}: read failed outright: {err}"),
-        }
-    }
-
-    /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
-    /// the point carrying `tag`.
-    fn sum_of(
-        events: &[logit_core::Event],
-        metric: &str,
-        tag: Option<(&str, &str)>,
-    ) -> Option<f64> {
-        events.iter().find_map(|e| {
-            if let Some((key, value)) = tag {
-                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
-                    return None;
-                }
-            }
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) != metric {
-                    return None;
-                }
-                match m.kind {
-                    logit_core::MetricKind::Sum(sum) => Some(sum.value),
-                    _ => None,
-                }
-            })
-        })
-    }
-
-    /// `sum_of` for a gauge: last-write-wins per `(name, tags)` until the next drain.
-    fn gauge_of(events: &[logit_core::Event], metric: &str) -> Option<f64> {
-        events.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| {
-                if logit_core::interner::resolve(m.name) != metric {
-                    return None;
-                }
-                match m.kind {
-                    logit_core::MetricKind::Gauge(v) => Some(v),
-                    _ => None,
-                }
-            })
-        })
-    }
 
     /// The cap rejects rather than queues, before any TLS handshake, and counts the rejection.
     /// Modelled on `crate::tcp`'s
@@ -1963,31 +1870,24 @@ mod tests {
     /// this one copies.
     #[tokio::test]
     async fn a_connection_past_the_cap_is_dropped_and_counted() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input.with_telemetry(telemetry).with_max_connections(1);
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The first connection holds the one permit. One byte, so it clears the first-byte peek
-        // rather than being closed by the deadline.
+        // rather than being closed by the deadline. No wait is needed before connecting the
+        // second: the accept loop is a single sequential `accept` call, so the OS's FIFO accept
+        // queue admits `first` before `second` regardless of how soon this task reaches it.
         let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
         first.write_all(b"P").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        expect_closed(&mut second, "a past-the-cap connection").await;
+        logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
 
-        assert_eq!(
-            sum_of(
-                &registry.drain(0),
-                "logit.input.connections.rejected",
-                Some(("reason", "limit"))
-            ),
-            Some(1.0)
-        );
+        assert_eq!(probe.sum("logit.input.connections.rejected", &[("reason", "limit")]), 1.0);
 
         drop(first);
     }
@@ -1996,15 +1896,14 @@ mod tests {
     /// count per probe.
     #[tokio::test]
     async fn a_plaintext_probe_that_closes_before_sending_is_not_a_connection_error() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut telemetry_probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = telemetry_probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input.with_diagnostics(
             logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone()),
         );
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Three probes, so power-of-two throttling can't hide a regression: `warn_throttled`
         // counts `logit.component.diagnostics` on every occurrence, reported or not.
@@ -2012,15 +1911,15 @@ mod tests {
             let probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
             drop(probe);
         }
+        // 200ms: nothing marks a probe's accept-peek-drop cycle finished, so this proves an
+        // absence rather than waiting for one; the cycle itself runs in well under a millisecond
+        // on loopback, so the window is many times that.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        assert_eq!(
-            sum_of(
-                &registry.drain(0),
-                "logit.component.diagnostics",
-                Some(("key", "connection_error"))
-            ),
-            None,
+        assert!(
+            !telemetry_probe
+                .poll()
+                .has("logit.component.diagnostics", &[("key", "connection_error")]),
             "a probe that connects and closes cleanly is not a connection error"
         );
     }
@@ -2035,12 +1934,15 @@ mod tests {
             input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // No byte sent, held until the close is observed, so only the server's deadline could
         // have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        expect_closed(&mut silent, "a plaintext connection that sent no bytes").await;
+        logit_pipeline::test_util::expect_closed(
+            &mut silent,
+            "a plaintext connection that sent no bytes",
+        )
+        .await;
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -2054,7 +1956,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         drop(silent);
     }
@@ -2068,7 +1970,6 @@ mod tests {
         let mut input = input.with_handshake_timeout(Duration::from_millis(50));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -2093,7 +1994,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
         let response = String::from_utf8_lossy(&buf).into_owned();
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     /// The peek consumes nothing, so h2c prior-knowledge (the case an ordinary read would break
@@ -2103,7 +2004,6 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -2126,50 +2026,57 @@ mod tests {
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     /// The gauge counts permit holders: 1 while a connection is served, 0 once it ends.
     #[tokio::test]
     async fn the_connections_gauge_tracks_a_live_connection_and_returns_to_zero() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input.with_telemetry(telemetry);
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // One byte, so the connection clears the peek and stays open.
         let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
         open.write_all(b"P").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(1.0));
+        probe
+            .wait_for("the connections gauge to read 1", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(1.0)
+            })
+            .await;
 
         drop(open);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
+        probe
+            .wait_for("the connections gauge to read 0", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
     }
 
     /// A handler that panics unwinds the h1 connection task, whose permit comes back on the
     /// unwind; the gauge has to come back with it, or it reads one live connection forever.
     #[tokio::test]
     async fn a_panicking_handler_still_returns_the_connections_gauge_to_zero() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input.with_telemetry(telemetry).with_max_connections(1);
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = format!(
             "Content-Type: application/x-protobuf\r\n{PANIC_HEADER}: 1\r\nConnection: close\r\n"
         );
         let response = post_raw(&addr, "/v1/metrics", &headers, &metric_body()).await;
         assert_eq!(response, "", "a panicking handler writes no response");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
+        probe
+            .wait_for("the connections gauge to read 0 after the unwind", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
 
         // The permit came back too: under `with_max_connections(1)` this is served only if so.
         let response = post_raw(
@@ -2180,7 +2087,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     /// One `/v1/metrics` body carrying two `ResourceMetrics` (hosts `a` and `b`), which decodes to
@@ -2230,9 +2137,8 @@ mod tests {
         let sink = Fanout::new(vec![tx_a, tx_b]);
         // Fills b's one slot, so the request's first send waits on b; a's copy is drained here.
         sink.send(metric_batch()).await;
-        recv_batch(&mut rx_a).await;
+        logit_pipeline::test_util::recv_batch(&mut rx_a).await;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_request(&mut client, &addr, "/v1/metrics", &two_resource_metrics_payload()).await;
@@ -2274,19 +2180,6 @@ mod tests {
         let payloads =
             logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
         payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap().1
-    }
-
-    /// Asserts a connection is still open: this listener never speaks unprompted, so a blocked
-    /// read means live, while a closed one returns `Ok(0)` (or `ECONNRESET`) at once. The inverse
-    /// of [`expect_closed`]; scheduler lag only makes the read likelier to time out.
-    async fn expect_still_open<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
-        let mut buf = [0u8; 1];
-        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
-            Err(_elapsed) => {}
-            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
-            Ok(Ok(n)) => panic!("{what}: expected no bytes, got {n}"),
-            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
-        }
     }
 
     /// [`post_raw`]'s keep-alive half: one complete HTTP/1.1 POST on an open stream with **no**
@@ -2374,8 +2267,8 @@ mod tests {
     #[tokio::test]
     async fn an_idle_keep_alive_http_connection_is_closed_after_the_idle_timeout_and_releases_its_permit(
     ) {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let diag = logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
         let listener_diag = diag.clone();
         let (addr, input) = bound_input(OtlpTransport::Http).await;
@@ -2386,21 +2279,23 @@ mod tests {
             .with_idle_timeout(Some(Duration::from_millis(100)));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // One complete export, keep-alive, so only the idle clock can end the connection.
         let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_request(&mut keep_alive, &addr, "/v1/metrics", &metric_body()).await;
         let head = read_response_head(&mut keep_alive, "the keep-alive export").await;
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
-        expect_closed(&mut keep_alive, "a keep-alive connection quiet past its idle_timeout").await;
+        logit_pipeline::test_util::expect_closed(
+            &mut keep_alive,
+            "a keep-alive connection quiet past its idle_timeout",
+        )
+        .await;
 
-        let drained = registry.drain(0);
         assert_eq!(
-            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
-            Some(1.0),
+            probe.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
             "an idle close is counted"
         );
         assert_eq!(
@@ -2419,7 +2314,7 @@ mod tests {
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "permit came back, got: {response}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         drop(keep_alive);
     }
@@ -2438,28 +2333,29 @@ mod tests {
             .with_handshake_timeout(Duration::from_millis(50));
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // One byte clears the first-byte peek, so the close can only come from the idle clock.
         let mut dribbling = tokio::net::TcpStream::connect(&addr).await.unwrap();
         dribbling.write_all(b"P").await.unwrap();
 
-        expect_closed(&mut dribbling, "a connection that sent one head byte and then stopped")
-            .await;
+        logit_pipeline::test_util::expect_closed(
+            &mut dribbling,
+            "a connection that sent one head byte and then stopped",
+        )
+        .await;
     }
 
     /// An established, quiet h2 connection is GOAWAY'd and closed, observed as the client's
     /// connection future ending. `sender` is held throughout, so the client didn't initiate it.
     #[tokio::test]
     async fn an_idle_grpc_connection_is_closed_after_the_idle_timeout() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Grpc).await;
         let mut input =
             input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
@@ -2486,7 +2382,7 @@ mod tests {
             collected.trailers().expect("should carry trailers").get("grpc-status").unwrap(),
             "0"
         );
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         // Either outcome is the close: `Ok` on a clean GOAWAY-then-FIN, `Err` if the socket goes
         // first.
@@ -2497,11 +2393,15 @@ mod tests {
 
         // The client's future ends on the GOAWAY, written during the grace poll; the count lands
         // after that poll returns, a moment later.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let totals = probe
+            .wait_for("the idle close counted on the gRPC transport", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "idle")]) >= 1.0
+            })
+            .await;
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
-            Some(1.0),
-            "an idle close is counted on the gRPC transport too"
+            totals.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
+            "one connection, one idle close"
         );
         drop(sender);
     }
@@ -2516,7 +2416,6 @@ mod tests {
             .with_handshake_timeout(Duration::from_millis(50));
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The first three bytes of the 24-byte h2 preface ("PRI * HTTP/2.0..."), then silence.
         let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -2536,7 +2435,6 @@ mod tests {
         let mut input = input.with_idle_timeout(Some(idle));
         let (sink, mut rx) = fanout_into_channel_with_capacity(1);
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let body = metric_body();
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -2549,19 +2447,24 @@ mod tests {
         // The second, on the same connection, parks in `Fanout::send` with nothing draining.
         write_request(&mut client, &addr, "/v1/metrics", &body).await;
         tokio::time::sleep(idle * 3).await;
-        expect_still_open(&mut client, "a request blocked on a full downstream").await;
+        logit_pipeline::test_util::expect_still_open(
+            &mut client,
+            STILL_OPEN_PROBE,
+            "a request blocked on a full downstream",
+        )
+        .await;
 
         // Draining frees the slot, the parked send returns, and its response arrives.
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
         let head = read_response_head(&mut client, "the blocked export").await;
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         // The connection still serves another request.
         write_request(&mut client, &addr, "/v1/metrics", &body).await;
         let head = read_response_head(&mut client, "a third export").await;
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
     }
 
     /// A full head then a body that stops mid-upload gets `408` and the connection closes behind
@@ -2575,7 +2478,6 @@ mod tests {
             .with_handshake_timeout(Duration::from_millis(200));
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // A complete head promising a real `Content-Length`, then two of those bytes and silence.
         let body = metric_body();
@@ -2608,7 +2510,6 @@ mod tests {
             .with_handshake_timeout(Duration::from_millis(200));
         let (sink, _rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let io = TokioIo::new(stream);
@@ -2659,8 +2560,8 @@ mod tests {
     /// would have lost the batch.
     #[tokio::test]
     async fn a_request_that_starts_inside_the_grace_window_is_served_not_dropped() {
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input
             .with_telemetry(telemetry)
@@ -2671,7 +2572,6 @@ mod tests {
         // Pre-filled, so the handler's own `Fanout::send` parks until this test drains it.
         sink.send(metric_batch()).await;
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let body = one_span_payload();
         let head = format!(
@@ -2693,9 +2593,9 @@ mod tests {
         // t+600ms: 300ms past the window, where a drop-on-expiry close would have lost this batch.
         tokio::time::sleep(Duration::from_millis(340)).await;
 
-        let prefilled = recv_batch(&mut rx).await;
+        let prefilled = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert!(prefilled.events[0].span.is_none(), "the pre-filled batch drains first");
-        let served = recv_batch(&mut rx).await;
+        let served = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert!(
             served.events[0].span.is_some(),
             "the request that started inside the grace window must reach the fanout"
@@ -2705,10 +2605,14 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
 
         // It still closes afterwards: waiting the request out defers the close, not cancels it.
-        expect_closed(&mut late, "a connection that served a request inside its grace").await;
+        logit_pipeline::test_util::expect_closed(
+            &mut late,
+            "a connection that served a request inside its grace",
+        )
+        .await;
         assert_eq!(
-            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
-            Some(1.0),
+            probe.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            1.0,
             "the deferred close is still counted once, as an idle close"
         );
     }
@@ -2720,16 +2624,20 @@ mod tests {
         let (addr, mut input) = bound_input(OtlpTransport::Http).await;
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_request(&mut keep_alive, &addr, "/v1/metrics", &metric_body()).await;
         let head = read_response_head(&mut keep_alive, "the keep-alive export").await;
         assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-        recv_batch(&mut rx).await;
+        logit_pipeline::test_util::recv_batch(&mut rx).await;
 
         // Three times the idle timeout the other tests in this section configure.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        expect_still_open(&mut keep_alive, "a keep-alive connection with no idle_timeout").await;
+        logit_pipeline::test_util::expect_still_open(
+            &mut keep_alive,
+            STILL_OPEN_PROBE,
+            "a keep-alive connection with no idle_timeout",
+        )
+        .await;
     }
 }
