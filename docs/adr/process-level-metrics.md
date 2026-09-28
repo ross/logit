@@ -73,7 +73,8 @@ seccomp profile, silence the other three.
 Every other `internal` counter is a delta `Sum`, and the downstream story is already built for it:
 
 - Under `aggregate` with `temporality: cumulative` into `prometheus_out`, it becomes
-  `logit_process_cpu_seconds_total{mode}`, and `rate()` over it is cores in use.
+  `logit_process_cpu_seconds_total{mode}`, and `rate()` over it is cores in use per `mode`, or in
+  total summed over `mode`.
 - Under a default delta `aggregate` into `influxdb_out`, each window's value is the CPU seconds
   spent in that window, so the value divided by the window length is utilization.
 
@@ -110,8 +111,10 @@ whatever the sys crate's defaults are.
 The difference between `resident` and `allocated` is not a leak by itself. It contains:
 
 - jemalloc's own metadata and fragmentation;
-- the LuaJIT heaps, which LuaJIT allocates through its own `lj_alloc` over `mmap`, outside the Rust
-  global allocator (`logit.script.vm.memory` reports them per VM);
+- LuaJIT's machine-code areas, which it maps directly with `mmap`. Each VM's GC heap is not in
+  this gap: mlua creates every VM with an allocator over the Rust global allocator, so Lua objects
+  count in `allocated`, and a script that retains memory raises it (`logit.script.vm.memory`
+  attributes that share per VM);
 - the binary's mapped pages and thread stacks;
 - the UDP read slab.
 
