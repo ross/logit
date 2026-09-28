@@ -1963,20 +1963,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   crash.** It doesn't matter whether a scan noticed first. After a clean stop, the checkpoint
   records its inode and offset, but the restart's scan never finds the file, so the entry is never
   used. After a crash, the lines it had read but not yet flushed are gone too. A pattern that also
-  matches the rotated name (`app.log*`) avoids it for a rename, but not for a removal.
+  matches the rotated name (`app.log*`) avoids it for a rename, but not for a removal. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 6.
 - **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
   rotation, and `compress` tails `app.log.N.gz` as text.** The copy `copytruncate` writes is a new
   inode, so `app.log*` reads it from `0`; a recorded run re-emitted about 1,600 to 2,000 lines per
   three rotations. A `.gz` file is read as lines of binary, diagnosed `invalid_utf8`.
-  `docs/deploying.md`'s "What to watch for file tailing" has the guidance.
+  `docs/deploying.md`'s "What to watch for file tailing" has the guidance. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s "Rotation and
+  truncation" section.
 - **Under an exact pattern, `copytruncate` loses the lines written after the tailer's last read
   and before the truncate.** They exist only in the copy, which the pattern doesn't match. The
-  window is up to one `poll_interval` of writes (or one wake).
+  window is up to one `poll_interval` of writes (or one wake). See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
 - **`tail_in` splits a line held unterminated at a clean stop into two events.** Shutdown emits the
   partial line as it stands, and the checkpoint records the end of what was read, so the rest of
   the line, written later, arrives after the restart as a line of its own. A line being dropped
   for `max_line_bytes` is the exception: its checkpoint stays at its start and it's dropped whole
-  again.
+  again. See [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
+  "Checkpoints" section.
 - **A `copytruncate` that the writer refills past the old offset before the next check goes
   undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
   and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
@@ -2000,7 +2007,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   listed after that listing failed starts at its beginning, which favors duplicates over loss.
 - **A file under a directory that stays unreadable stays tracked** until the listing recovers or
   its inode is unlinked. A failed listing retires nothing, and the handle check catches removal
-  and truncation but not a rename. `ELOOP` on a `docker_in` container's log path (a looping
+  and truncation but not a rename. Even an unlinked file stays open until a listing covering its
+  path succeeds, since a draining file is reaped only after a scan that could have rebound it. `ELOOP` on a `docker_in` container's log path (a looping
   `<id>-json.log` symlink) is treated the same way: unknown, kept, and diagnosed. See [ADR
   `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
   decision 1.

@@ -192,13 +192,23 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      syscall sequence and the line multiset recorded in TAIL-01's inventory entry, and the
      proptest's rotation operations reproduce that sequence.
 
-6. **A draining file is reaped only after it has been at EOF and draining for at least one
-   `poll_interval`.** Decided from the recorded `logrotate` run (TAIL-01's inventory entry).
-   `TrackedFile` records when it became `Draining` (the stale pass, the rotation arm, and a kept
-   file whose handle shows a link count of 0), and a rebind back to `Active` clears it.
-   `Tailer::reap_drained` reaps a `Draining` file when a `drain` pass finds it at EOF and at least
-   one `poll_interval` has passed since it started draining. Its doc comment is the canonical
-   statement of the rule. A `Deselected` file is still reaped at its first EOF.
+6. **A draining file is reaped only after it has been draining for at least one
+   `poll_interval`, a scan that could have rebound it has run, and it is at EOF.** Decided from
+   the recorded `logrotate` run (TAIL-01's inventory entry). `TrackedFile` records when, and in
+   which scan, it became `Draining` (the stale pass, the rotation arm, and a kept file whose
+   handle shows a link count of 0), and a rebind back to `Active` clears both.
+   `Tailer::reap_drained` reaps a `Draining` file only when all three hold:
+   - a `drain` pass found it at EOF;
+   - at least one `poll_interval` passed between it starting to drain and the start of that
+     pass, before the pass's reads, so a pass parked on the downstream can't reap on an EOF it
+     saw before the grace ran out;
+   - a scan after the one that retired it has completed with a listing that could name its path
+     (the path wasn't an unknown `stat` and no failed listing covers it), because a `drain`
+     also follows a data wake or a flush tick, and time alone doesn't order the rebinding scan
+     first.
+
+   Its doc comment is the canonical statement of the rule. A `Deselected` file is still reaped at
+   its first EOF.
 
    - **Why.** A first EOF isn't final for two reasons the run showed:
      - logrotate's `create` mode renames the file and HUPs the writer, which keeps appending to
@@ -212,8 +222,9 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      With the grace, the next scan (a `Discover` wake or the poll tick) rebinds the renamed inode
      through `open_tracked`, and a writer that reopens within the grace has its late lines read.
      The poll tick runs under every `WatchMode`, so a draining file with no other wake is reaped
-     within two poll intervals.
-   - **Cost.** A rotated or removed file's descriptor is held one `poll_interval` longer. A
+     within about two poll intervals. One whose every later listing fails stays pinned until one
+     succeeds.
+   - **Cost.** A rotated or removed file's descriptor is held at least one `poll_interval` longer. A
      writer that reopens later than that still loses what it writes after the reap. The shutdown
      path is unchanged: a file still draining at shutdown stays in the checkpoint, and the known
      orphan gap applies.
@@ -262,7 +273,7 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
 - **A file's head costs a small buffer per tracked file,** one read of at most 256 bytes when a
   file opens at `End` or `Resume`, and one hash per checkpoint write. A measurement on many
   thousands of tracked files belongs to the perf follow-up.
-- **A draining file's descriptor is held one `poll_interval` longer** (decision 6). A
+- **A draining file's descriptor is held at least one `poll_interval` longer** (decision 6). A
   `Deselected` file is unaffected.
 - **The fault seam is no longer mutation-only.** Every discovery syscall on the tail scan path
   (`read_dir`, each iteration step, `file_type`, and `metadata`) needs a `fault::check` before
@@ -380,13 +391,16 @@ state-machine proptest:
 Tests, in `driver.rs` unless noted, hand-drive `scan` and `drain` under `Watcher::Poll`, with
 `start_paused` and `tokio::time::advance` where the grace matters: a writer appending to the
 renamed inode after the rotation, a `stat` that races a rename rebinding a full poll interval
-later, the reap at the grace boundary, a `Deselected` file reaped with no time passing,
+later, a `drain` with no scan since draining started not reaping, a pass parked on the downstream
+past the grace not reaping on its earlier EOF, a file deleted under a failing listing pinned until
+the listing recovers, the reap at the grace boundary, a `Deselected` file reaped with no time passing,
 `files.rotated` for a two-inode swap and a rotation chain in every discovery order, a truncation
 dirtying the checkpoint, `lines` for the close-time partial and against a decoder that rejects
 lines, every discovered path offered to the factory once per scan, and a read error on an
 `Active` file (kept) and on a `Draining` one (reaped, its unread tail lost). `docker.rs` covers a
 de-selected container's cache entry surviving until its reap. Five tests that expected a reap in
-the same pass as the retiring scan advance the clock past the grace first.
+the same pass as the retiring scan advance the clock past the grace and scan again first, and so
+does `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping`, so it still reaps.
 
 ### `tailbk/w6`: driver state-machine proptest, close-out (TAIL-01..03, TAIL-10, TAIL-12)
 
