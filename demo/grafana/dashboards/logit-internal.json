@@ -314,7 +314,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Process memory",
-      "description": "Resident set size against jemalloc's live heap. The gap is jemalloc overhead, LuaJIT heaps, code, and stacks, not a leak by itself.",
+      "description": "Resident set size against jemalloc's live heap. Lua VM heaps count in the live heap; the gap is jemalloc overhead, LuaJIT machine code, mapped binary pages, stacks, and the UDP read slab, not a leak by itself.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 86 },
       "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
       "interval": "1m",
