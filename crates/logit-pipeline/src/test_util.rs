@@ -40,12 +40,19 @@ pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Polls `cond` every [`POLL_INTERVAL`] until it holds, panicking after [`RECV_TIMEOUT`].
-pub async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+pub async fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    wait_until_within(what, RECV_TIMEOUT, cond).await;
+}
+
+/// [`wait_until`] under a ceiling the caller sets, for a wait whose cost is known to exceed
+/// [`RECV_TIMEOUT`] (tens of fsyncs on a loaded disk, a spool replay). The call site's comment
+/// says what the ceiling covers.
+pub async fn wait_until_within(what: &str, ceiling: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + ceiling;
     while !cond() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out after {RECV_TIMEOUT:?} waiting for {what}"
+            "timed out after {ceiling:?} waiting for {what}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
