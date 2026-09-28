@@ -1133,8 +1133,9 @@ pub enum ComponentKind {
     /// and emits it as ordinary events into the graph. At most one per config.
     Internal {
         /// The drain cadence for every component's buffered points, and the sampling tick for
-        /// process-level gauges (interner size, uptime). Should divide evenly into any downstream
-        /// `aggregate` interval, or the two windows beat against each other. `0s` is rejected.
+        /// process-level metrics (resident memory, CPU time, threads, open files, interner size,
+        /// uptime). Should divide evenly into any downstream `aggregate` interval, or the two
+        /// windows beat against each other. `0s` is rejected.
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
