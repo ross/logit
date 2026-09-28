@@ -2565,9 +2565,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Process-level facts beyond what `internal` already samples.** `logit.process.memory.*` via
     jemalloc heap stats needs a new `tikv-jemalloc-ctl` dependency plus cross-crate plumbing, since
     `crates/logit-inputs` (home of `internal`) doesn't depend on `crates/logit-cli` (home of the
-    `jemalloc` feature, `docs/adr/jemalloc-global-allocator.md`). `logit.process.threads`/
+    `jemalloc` feature, `docs/adr/jemalloc-global-allocator.md`). ~~`logit.process.threads`/
     `.fds`/`.cpu.seconds` need Linux-specific `/proc` parsing. Candidate names:
-    `logit.process.memory.allocated`/`.resident`, `.threads`, `.fds`, `.cpu.seconds`.
+    `logit.process.memory.allocated`/`.resident`, `.threads`, `.fds`, `.cpu.seconds`.~~ **Closed
+    for procfs.** `internal` samples `logit.process.memory.resident.bytes`,
+    `logit.process.threads`, `logit.process.fds`, `logit.process.fds.limit`, and
+    `logit.process.cpu.seconds{mode}` from `/proc/self` on every tick
+    ([ADR `process-level-metrics`](adr/process-level-metrics.md),
+    [internal-telemetry.md](design/internal-telemetry.md)'s "Process-level metrics"). The jemalloc
+    half, `logit.process.memory.allocated.bytes`, stays open: `InternalInput::with_heap_stats` is
+    the hook, and nothing supplies it yet.
   - **`json`'s parse-outcome counts.** Its two failure modes (`no_brace`, `parse_failure`) already
     reach `logit.component.diagnostics{key=...}` through the `Diagnostics` bridge, so a dedicated
     metric would mostly restate them.

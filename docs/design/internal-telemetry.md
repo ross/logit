@@ -309,9 +309,9 @@ ComponentKind::Internal { interval: Duration, span_sample_rate: f64, logs: Inter
 
 1. **Drain cadence.** Every registered component's buffer is drained and its points emitted as one
    batch.
-2. **Sampling tick for process-level gauges**, facts tied to no occurrence, so nothing else has a
-   reason to push them: `logit.process.interner.strings` (`interner::len()`, the observability hook
-   `docs/known-gaps.md` names) and `logit.process.uptime`.
+2. **Sampling tick for process-level metrics**, facts tied to no occurrence, so nothing else has a
+   reason to push them: resident memory, CPU time, threads, open files, interner size, and uptime.
+   See [Process-level metrics](#process-level-metrics).
 
 A config can have at most one `internal` component (graph validation rule 13,
 `crates/logit-pipeline/src/graph.rs`). Two would each drain, and so split, the same process-wide
@@ -339,6 +339,55 @@ clients count their own packets sent/dropped the same way. `logs.emitted` is cou
 `points.emitted` for the same reason `spans.emitted` is: a log event carries neither `metrics` nor
 `span`, so it would otherwise be miscounted as a point
 (`crates/logit-inputs/src/internal.rs::tick`'s fold checks `event.log.is_some()` first).
+
+### Process-level metrics
+
+`internal` samples these on every tick, before its drain, so they arrive in that same drain
+([ADR `process-level-metrics`](../adr/process-level-metrics.md)). Each rides on `internal`'s own
+`Telemetry` handle and so carries `internal`'s `component`/`kind`/`role`, like every other point.
+Without that handle, nothing is sampled.
+
+| Name | Kind | Meaning and source |
+|---|---|---|
+| `logit.process.memory.resident.bytes` | gauge | Resident set size: `/proc/self/status` `VmRSS:`, kB × 1024. It can lag slightly, because the kernel batches per-thread RSS counters. |
+| `logit.process.memory.allocated.bytes` | gauge | Bytes live in the Rust global allocator: jemalloc's `stats.allocated`, when built with the `jemalloc` feature. |
+| `logit.process.threads` | gauge | Threads in the process: `/proc/self/status` `Threads:`. |
+| `logit.process.fds` | gauge | Open file descriptors: the entries in `/proc/self/fd`, less the one the listing holds. |
+| `logit.process.fds.limit` | gauge | The soft `Max open files` limit from `/proc/self/limits`. Not emitted when it's `unlimited`. |
+| `logit.process.cpu.seconds{mode=user\|system}` | delta counter | CPU seconds since the previous tick: `/proc/self/stat` `utime`/`stime`, over `USER_HZ` (100). |
+| `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook `docs/known-gaps.md` names. |
+| `logit.process.uptime` | gauge | Seconds since `internal` started. |
+
+**The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,
+`limits`) latches off on its own first failed read, with one diagnostic: `debug` on a non-Linux
+build, `warn` for a failed read on Linux. A sandbox that hides one file silences only the points
+that file feeds. The allocator gauge doesn't depend on procfs.
+
+**CPU is a delta, like every other `internal` counter.** The first tick's delta is CPU time since
+process start, so a cumulative total downstream equals the kernel's own counter. Every tick emits
+both modes, a zero delta included: a cumulative `aggregate` evicts a series idle for
+`series_retention` windows, and the restarted total would read as a counter reset. What an operator
+sees depends on the leg:
+
+- **Prometheus behind `aggregate` with `temporality: cumulative`:**
+  `logit_process_cpu_seconds_total{mode}`, where `rate()` is cores in use.
+- **`prometheus_out` without a cumulative `aggregate`:** it skips a delta `Sum` and counts it as
+  `logit.output.metrics.skipped{metric_kind="delta_sum"}`.
+- **InfluxDB behind a delta `aggregate`:** CPU seconds per window per mode, so the value divided by
+  the window length is utilization. The first window includes the CPU spent starting up.
+
+**Resident memory is more than the allocator's heap.** A gap between the two isn't a leak by itself:
+
+```text
+resident ≈ allocated
+         + jemalloc overhead and fragmentation
+         + LuaJIT heaps
+         + the binary's mapped pages and thread stacks
+         + the UDP read slab
+```
+
+LuaJIT allocates through its own `lj_alloc` over `mmap`, outside the Rust global allocator, so its
+heaps show in `resident` and never in `allocated`. `logit.script.vm.memory` reports them per VM.
 
 ### Reading an attribution dump
 
@@ -369,7 +418,7 @@ Dotted, lowercase, and namespaced by where the metric comes from:
 |---|---|
 | `logit.component.*` | The uniform set every component gets from the runtime (layer 2, below). |
 | `logit.<kind-family>.*` | Component-specific detail (layer 3), for example `logit.input.datagrams` and `logit.output.requests`. |
-| `logit.process.*` | Facts about the running process, not any one component. |
+| `logit.process.*` | Facts about the running process, not any one component. They ride on `internal`'s own `component`/`kind`/`role`; see [Process-level metrics](#process-level-metrics). |
 | `logit.internal.*` | Facts about the `internal` component itself, including `logit.internal.points.dropped`, which names the *offending* component through its `component` attribute, not through the metric name. |
 
 Metric names never include an event type (`logit.component.events_in`, say), because `internal`
