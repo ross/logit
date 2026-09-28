@@ -216,27 +216,22 @@ def strip_ansi(text):
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
-def rendered_events(path):
-    """`stdio_out`'s human render, as (attrs line, metric line) pairs."""
+def read_events(path):
+    """A `stdio_out` `format: json` capture (NDJSON), as one dict per event line."""
     if not path.exists():
         return []
-    events, attrs = [], ""
-    for line in path.read_text(errors="replace").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("attrs "):
-            attrs = stripped
-        elif stripped.startswith("metric "):
-            events.append((attrs, stripped))
-    return events
+    return [json.loads(line) for line in path.read_text(errors="replace").splitlines() if line.strip()]
 
 
 def telemetry_sum(events, metric, **attrs):
     total = 0.0
-    for attr_line, metric_line in events:
-        if metric_line.startswith(f"metric  {metric} ") and all(f'{k}="{v}"' in attr_line for k, v in attrs.items()):
-            match = re.search(r"sum=([0-9.e+-]+)", metric_line)
-            if match:
-                total += float(match.group(1))
+    for event in events:
+        have = {**event.get("resource", {}).get("attributes", {}), **event.get("attributes", {})}
+        if any(have.get(k) != v for k, v in attrs.items()):
+            continue
+        for item in event.get("metrics", []):
+            if item.get("name") == metric and item.get("kind") == "sum":
+                total += float(item["value"])
     return int(total)
 
 
@@ -257,7 +252,7 @@ def delivery(leg):
     A connect, DNS, or TLS failure is retried without a log line until the retry budget runs out,
     and a code 6 or oversize drop still returns success, so only the telemetry shows either.
     """
-    events = rendered_events(OUT / f"{leg}-telemetry.log")
+    events = read_events(OUT / f"{leg}-telemetry.log")
     requests = telemetry_sum(events, "logit.output.requests", route="event")
     ok = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "2xx"})
     network = telemetry_sum(events, "logit.output.requests", route="event", **{"class": "network_error"})
@@ -374,7 +369,7 @@ def leg_spans():
 def leg_ack():
     if not ACK_TOKEN:
         return "SKIP", "no SPLUNK_INTEROP_ACK_TOKEN: the leg didn't run"
-    telemetry = rendered_events(OUT / "hec-ack-telemetry.log")
+    telemetry = read_events(OUT / "hec-ack-telemetry.log")
     acked = telemetry_sum(telemetry, "logit.output.acks", result="acked")
     timeout = telemetry_sum(telemetry, "logit.output.acks", result="timeout")
     unsupported = telemetry_sum(telemetry, "logit.output.acks", result="unsupported")

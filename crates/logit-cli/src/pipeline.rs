@@ -1223,13 +1223,14 @@ fn to_rotate_interval(interval: logit_config::RotateInterval) -> OutputRotateInt
 }
 
 /// Config's `StreamFormat`/`Compression` into a `StreamEncoder`. `compression` is ignored under
-/// `Human`, where graph rule 33 guarantees it's `none`.
+/// `Human` and `Json`, where graph rule 33 guarantees it's `none`.
 fn to_stream_encoder(
     format: logit_config::StreamFormat,
     compression: logit_config::Compression,
 ) -> logit_outputs::stdio::StreamEncoder {
     match format {
         logit_config::StreamFormat::Human => logit_outputs::stdio::StreamEncoder::human(),
+        logit_config::StreamFormat::Json => logit_outputs::stdio::StreamEncoder::json(),
         logit_config::StreamFormat::Native => {
             logit_outputs::stdio::StreamEncoder::native(to_native_compression(compression))
         }

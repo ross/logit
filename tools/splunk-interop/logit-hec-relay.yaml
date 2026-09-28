@@ -43,3 +43,4 @@ components:
     type: stdio_out
     sources: [sink_telemetry]
     target: /out/hec-relay-telemetry.log
+    format: json

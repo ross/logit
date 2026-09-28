@@ -1890,27 +1890,29 @@ pub enum ComponentKind {
         #[serde(default)]
         target: StdioTarget,
         /// Which encoder writes through this sink: `human` (the default) is the readable text;
-        /// `native` is `logit`'s own wire format.
+        /// `json` is one JSON object per event per line, the machine-readable form; `native` is
+        /// `logit`'s own wire format.
         #[serde(default)]
         format: StreamFormat,
-        /// Per-frame compression under `format: native`. A non-`none` value under `format:
-        /// human` is rejected.
+        /// Per-frame compression under `format: native`. A non-`none` value under any other
+        /// format is rejected.
         #[serde(default)]
         compression: Compression,
     },
     /// A rotating file sink: size- and/or calendar-interval-triggered rotation with
     /// logrotate-style numbered-suffix retention. Renders the same human-readable text
-    /// `stdio_out` does by default, or `logit`'s native wire format under `format: native`.
+    /// `stdio_out` does by default, one JSON object per event per line under `format: json`, or
+    /// `logit`'s native wire format under `format: native`.
     FileOut {
         /// The active file. A relative path resolves against the config file's directory.
         path: String,
         #[serde(default)]
         rotate: RotateConfig,
-        /// Which encoder writes through this sink: `human` (the default) or `native`.
+        /// Which encoder writes through this sink: `human` (the default), `json`, or `native`.
         #[serde(default)]
         format: StreamFormat,
-        /// Per-frame compression under `format: native`. A non-`none` value under `format:
-        /// human` is rejected.
+        /// Per-frame compression under `format: native`. A non-`none` value under any other
+        /// format is rejected.
         #[serde(default)]
         compression: Compression,
     },
@@ -3117,13 +3119,15 @@ pub enum RotateInterval {
 }
 
 /// Which encoder a stream sink (`stdio_out`/`file_out`) writes through: `human` (the default) is
-/// the readable text render; `native` is `logit`'s own wire format, in which every frame is
-/// independently decodable, which is what a rotated-away file needs.
+/// the readable text render; `json` is one JSON object per event per line, the machine-readable
+/// form; `native` is `logit`'s own wire format, in which every frame is independently decodable,
+/// which is what a rotated-away file needs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamFormat {
     #[default]
     Human,
+    Json,
     Native,
 }
 
@@ -6078,7 +6082,11 @@ mod tests {
 
     #[test]
     fn each_stream_format_variant_deserializes() {
-        for (raw, expected) in [("human", StreamFormat::Human), ("native", StreamFormat::Native)] {
+        for (raw, expected) in [
+            ("human", StreamFormat::Human),
+            ("json", StreamFormat::Json),
+            ("native", StreamFormat::Native),
+        ] {
             let format: StreamFormat = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
             assert_eq!(format, expected);
         }

@@ -2120,7 +2120,7 @@
           ],
           "properties": {
             "compression": {
-              "description": "Per-frame compression under `format: native`. A non-`none` value under `format: human` is rejected.",
+              "description": "Per-frame compression under `format: native`. A non-`none` value under any other format is rejected.",
               "default": "none",
               "allOf": [
                 {
@@ -2129,7 +2129,7 @@
               ]
             },
             "format": {
-              "description": "Which encoder writes through this sink: `human` (the default) is the readable text; `native` is `logit`'s own wire format.",
+              "description": "Which encoder writes through this sink: `human` (the default) is the readable text; `json` is one JSON object per event per line, the machine-readable form; `native` is `logit`'s own wire format.",
               "default": "human",
               "allOf": [
                 {
@@ -2154,7 +2154,7 @@
           }
         },
         {
-          "description": "A rotating file sink: size- and/or calendar-interval-triggered rotation with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does by default, or `logit`'s native wire format under `format: native`.",
+          "description": "A rotating file sink: size- and/or calendar-interval-triggered rotation with logrotate-style numbered-suffix retention. Renders the same human-readable text `stdio_out` does by default, one JSON object per event per line under `format: json`, or `logit`'s native wire format under `format: native`.",
           "type": "object",
           "required": [
             "path",
@@ -2162,7 +2162,7 @@
           ],
           "properties": {
             "compression": {
-              "description": "Per-frame compression under `format: native`. A non-`none` value under `format: human` is rejected.",
+              "description": "Per-frame compression under `format: native`. A non-`none` value under any other format is rejected.",
               "default": "none",
               "allOf": [
                 {
@@ -2171,7 +2171,7 @@
               ]
             },
             "format": {
-              "description": "Which encoder writes through this sink: `human` (the default) or `native`.",
+              "description": "Which encoder writes through this sink: `human` (the default), `json`, or `native`.",
               "default": "human",
               "allOf": [
                 {
@@ -3852,10 +3852,11 @@
       "type": "string"
     },
     "StreamFormat": {
-      "description": "Which encoder a stream sink (`stdio_out`/`file_out`) writes through: `human` (the default) is the readable text render; `native` is `logit`'s own wire format, in which every frame is independently decodable, which is what a rotated-away file needs.",
+      "description": "Which encoder a stream sink (`stdio_out`/`file_out`) writes through: `human` (the default) is the readable text render; `json` is one JSON object per event per line, the machine-readable form; `native` is `logit`'s own wire format, in which every frame is independently decodable, which is what a rotated-away file needs.",
       "type": "string",
       "enum": [
         "human",
+        "json",
         "native"
       ]
     },

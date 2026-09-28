@@ -12,6 +12,7 @@ pub mod graphite;
 mod http;
 pub mod influxdb;
 pub mod logit;
+pub mod ndjson;
 pub mod null;
 pub mod otlp;
 pub mod prometheus;

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Fold a `shape.log` capture into `summary.json` + `summary.md`, for `script/shape-survey`.
 
-Parses `stdio_out`/`file_out`'s human render (`crates/logit-outputs/src/stdio.rs`), the only text
-output in `logit` that emits raw metric values rather than re-sketched quantiles.
+Reads `file_out`'s `format: json` output (NDJSON, one object per event), which carries raw metric
+values rather than re-sketched quantiles. `iter_events` is the one reader; `oteldemo.sh`'s
+`resource: keep` section imports `iter_samples` from it.
 
 What it does with each `logit.shape.*` record, per series (a series being the metric name plus the
 `signal`/`source`/`tap` tags `shape` stamps):
 
-  samples=[...]  concatenated across every flush window: raw observations, one per event (or
-                 per batch), so the summary covers the whole population
-  sum=           summed (a counter, delta temporality from `aggregate`)
-  gauge=         last value wins (cumulative-since-start gauges: distinct keys, key-set shares)
+  kind samples   `values` concatenated across every flush window: raw observations, one per
+                 event (or per batch), so the summary covers the whole population
+  kind sum       `value` summed (a counter, delta temporality from `aggregate`)
+  kind gauge     `value` of the last record wins (cumulative-since-start gauges: distinct keys,
+                 key-set shares)
 
 A sketched `logit.shape.*` series is a hard failure. Past `max_samples_per_series`, `aggregate`
-falls back to a `DdSketch` (`distribution count=N p50=...`), which would make every distribution
+falls back to a `DdSketch` (`kind: distribution`), which would make every distribution
 silently approximate. This exits non-zero and names the series, so the config's cap gets raised.
 
 Percentiles are nearest-rank. A p99 prints `n/a` below 100 values and a p90 below 10, and every
@@ -25,7 +27,7 @@ source's format came from. Stdlib only.
 
 Usage:
     summarize.py --shape-log /out/shape.log --out-dir /out --provenance /out/provenance.txt
-    summarize.py --self-test        # parse an embedded sample of the real render, check the numbers
+    summarize.py --self-test        # parse embedded NDJSON captures, check the numbers
 """
 
 import argparse
@@ -51,123 +53,44 @@ MIN_FOR_P90 = 10
 # ---- parsing -------------------------------------------------------------------------------------
 
 
-def parse_quoted(text: str, i: int) -> tuple[str, int]:
-    """Reads one `"..."` token starting at `text[i]`, undoing `render_quoted_str`'s escapes."""
-    assert text[i] == '"'
-    out: list[str] = []
-    i += 1
-    while i < len(text):
-        c = text[i]
-        if c == '"':
-            return "".join(out), i + 1
-        if c == "\\":
-            nxt = text[i + 1]
-            if nxt == "x":
-                out.append(chr(int(text[i + 2 : i + 4], 16)))
-                i += 4
-                continue
-            out.append({"n": "\n", "r": "\r", "t": "\t"}.get(nxt, nxt))
-            i += 2
-            continue
-        out.append(c)
-        i += 1
-    raise ValueError(f"unterminated quoted string in {text!r}")
+def iter_events(text: str):
+    """Yields each NDJSON line of a `format: json` capture as a dict.
 
-
-def skip_container(text: str, i: int) -> int:
-    """Returns the index just past the `[...]`/`{...}` that starts at `text[i]`.
-
-    `render_value` renders a `Value::Array` as `[a, b]` and a `Value::Map` as `{k=v, k=v}`,
-    recursively, and either can hold a quoted string containing a bracket, brace, comma, or space.
-    So this walks the container, counting nesting and stepping over quoted strings whole (a `\\"`
-    inside one isn't its terminator).
+    A line that is not a JSON object, an object without `timestamp`, or a `metrics` item without a
+    string `name` and `kind` raises `ValueError`: a half-written final line (a capture cut off
+    mid-flush) must not read as a valid, narrower event. Blank lines are skipped.
     """
-    closers = {"[": "]", "{": "}"}
-    stack = [closers[text[i]]]
-    i += 1
-    while i < len(text):
-        c = text[i]
-        if c == '"':
-            _, i = parse_quoted(text, i)
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip():
             continue
-        if c in closers:
-            stack.append(closers[c])
-            i += 1
-            continue
-        if c == stack[-1]:
-            stack.pop()
-            i += 1
-            if not stack:
-                return i
-            continue
-        i += 1
-    raise ValueError(f"unterminated container in {text!r}")
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"line {number} is not valid JSON: {err}") from err
+        if not isinstance(obj, dict) or "timestamp" not in obj:
+            raise ValueError(f"line {number} is not an event object with a timestamp: {raw[:80]!r}")
+        for item in obj.get("metrics", []):
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not isinstance(item.get("kind"), str)
+            ):
+                raise ValueError(f"line {number} has a metrics item without name and kind: {item!r}")
+        yield obj
 
 
-def parse_value(text: str, i: int) -> tuple[str, int]:
-    """Reads one rendered `Value` starting at `text[i]` (`crates/logit-outputs/src/stdio.rs`).
+def iter_samples(text: str):
+    """Yields `(attributes, resource_attributes, [(name, values)])` per event.
 
-    Every variant `render_value` can emit, and how each one ends:
-
-    | rendered                | variant                     | ends at                     |
-    |-------------------------|-----------------------------|-----------------------------|
-    | `"..."`                 | `Str`                       | the closing quote           |
-    | `[a, b]` / `{k=v}`      | `Array` / `Map`             | the matching bracket/brace  |
-    | `<12 bytes>`            | `Bytes`                     | the `>`                     |
-    | `null`/`true`/`-1`/`.5` | `Null`/`Bool`/ints/floats   | the next space              |
-    | `2026-09-20T…Z`         | `Timestamp`                 | the next space              |
-
-    A string is returned decoded; a container as its raw rendered text, since nothing under
-    `TAG_KEYS` is a container. The three space-bearing forms (a quoted string, a container, and
-    `<N bytes>`) are why an `attrs` line can't be split on whitespace.
+    `values` is the `values` list of each `kind: samples` metrics item; other kinds are omitted.
     """
-    c = text[i]
-    if c == '"':
-        return parse_quoted(text, i)
-    if c in "[{":
-        end = skip_container(text, i)
-        return text[i:end], end
-    if c == "<":
-        # `Value::Bytes` -> `<12 bytes>`: bare, and it contains a space.
-        end = text.find(">", i)
-        if end < 0:
-            raise ValueError(f"unterminated <N bytes> in {text!r}")
-        return text[i : end + 1], end + 1
-    end = text.find(" ", i)
-    end = len(text) if end < 0 else end
-    return text[i:end], end
-
-
-def parse_attrs(text: str) -> dict[str, str]:
-    """Parses one `attrs` line's space-separated `key=value` pairs.
-
-    `render_attrs`/`render_merged_attrs` write space-separated pairs, the key through `render_key`
-    (bare when identifier-shaped, quoted otherwise) and the value through `render_value`, so both
-    sides can contain spaces, `=`, commas, brackets, and quotes (see `parse_value`).
-
-    Only `TAG_KEYS` are read back out; the other pairs are parsed only to find where the next one
-    starts.
-    """
-    attrs: dict[str, str] = {}
-    i = 0
-    while i < len(text):
-        if text[i] == " ":
-            i += 1
-            continue
-        if text[i] == '"':
-            key, i = parse_quoted(text, i)
-        else:
-            end = text.find("=", i)
-            if end < 0:
-                raise ValueError(f"no = after key at {i} in {text!r}")
-            key, i = text[i:end], end
-        if i >= len(text) or text[i] != "=":
-            raise ValueError(f"expected = at {i} in {text!r}")
-        i += 1
-        if i >= len(text):
-            raise ValueError(f"key {key!r} has no value in {text!r}")
-        attrs[key], i = parse_value(text, i)
-    return attrs
+    for obj in iter_events(text):
+        samples = [
+            (item["name"], item.get("values", []))
+            for item in obj.get("metrics", [])
+            if item["kind"] == "samples"
+        ]
+        yield obj.get("attributes", {}), obj.get("resource", {}).get("attributes", {}), samples
 
 
 class Series:
@@ -187,47 +110,36 @@ class Series:
 def parse(text: str) -> "OrderedDict[tuple, Series]":
     """Parses a whole `shape.log` into series.
 
-    A block starts at any line with no leading whitespace (`render_event_block` writes the
-    timestamp flush left and indents everything else). `attrs` carries the block's tags; every
-    `metric` line in the block belongs to them.
+    `attributes` carries an event's tags (`signal`/`source`/`tap`, read from the top level only);
+    every `logit.shape.*` metrics item on the event belongs to them.
     """
     series: OrderedDict[tuple, Series] = OrderedDict()
-    tags: dict[str, str] = {}
     sketched: list[str] = []
 
-    for raw in text.splitlines():
-        if not raw or not raw.startswith(" "):
-            tags = {}
-            continue
-        line = raw.strip()
-        if line.startswith("attrs "):
-            tags = parse_attrs(line[len("attrs ") :].strip())
-            continue
-        if not line.startswith("metric "):
-            continue
-        body = line[len("metric ") :].strip()
-        name, _, rendered = body.partition(" ")
-        if not name.startswith("logit.shape."):
-            # Skipped, not an error: a producer may point other traffic at the same file_out.
-            continue
-        entry = series.setdefault((name, *(tags.get(k, "") for k in TAG_KEYS)), Series(name, tags))
+    for obj in iter_events(text):
+        attrs = obj.get("attributes", {})
+        tags = {k: str(attrs[k]) for k in TAG_KEYS if k in attrs}
+        for item in obj.get("metrics", []):
+            name, kind = item["name"], item["kind"]
+            if not name.startswith("logit.shape."):
+                # Skipped, not an error: a producer may point other traffic at the same file_out.
+                continue
+            entry = series.setdefault((name, *(tags.get(k, "") for k in TAG_KEYS)), Series(name, tags))
 
-        if rendered.startswith("samples=["):
-            values = rendered[len("samples=[") : rendered.index("]")]
-            if values:
-                entry.samples.extend(float(v) for v in values.split(","))
-        elif rendered.startswith("sum="):
-            entry.total = (entry.total or 0.0) + float(rendered[len("sum=") :].split(" ")[0])
-        elif rendered.startswith("gauge="):
-            entry.gauge = float(rendered[len("gauge=") :].split(" ")[0])
-        elif rendered.startswith("distribution "):
-            sketched.append(f"{name}{sorted(tags.items())}")
-        else:
-            raise ValueError(f"unrecognized metric render: {body!r}")
+            if kind == "samples":
+                entry.samples.extend(float(v) for v in item.get("values", []))
+            elif kind == "sum":
+                entry.total = (entry.total or 0.0) + float(item["value"])
+            elif kind == "gauge":
+                entry.gauge = float(item["value"])
+            elif kind == "distribution":
+                sketched.append(f"{name}{sorted(tags.items())}")
+            else:
+                raise ValueError(f"unrecognized metric kind {kind!r} on {name!r}")
 
     if sketched:
         raise SystemExit(
-            "summarize: a logit.shape.* series was rendered as a DdSketch, not raw samples:\n  "
+            "summarize: a logit.shape.* series was written as a DdSketch, not raw samples:\n  "
             + "\n  ".join(sorted(set(sketched)))
             + "\nThat means `aggregate` fell back past `max_samples_per_series` and the values"
             " behind it are gone. Raise that limit in the config; do not summarize this capture."
@@ -444,55 +356,74 @@ def summarize(series: "OrderedDict[tuple, Series]") -> dict:
 
 # ---- self-test -----------------------------------------------------------------------------------
 
-#: A verbatim excerpt of a real `shape.log` from the interop producer, so a change to `stdio_out`'s
-#: human render fails this test. `script/shape-survey` runs `--self-test` before every survey.
-SELF_TEST_RENDER = """2026-09-20T15:56:20.153724900Z
-  attrs   signal="metric" source="statsd_in" tap="tap_input"
-  metric  logit.shape.events sum=3 temporality=delta monotonic=true
-  metric  logit.shape.attributes samples=[7,7,0] rate=1
-  metric  logit.shape.value_depth samples=[0,0,0] rate=1
-  metric  logit.shape.key_bytes samples=[3,11,4,8,6,20,9] rate=1
-  metric  logit.shape.values.string sum=14 temporality=delta monotonic=true
+#: An NDJSON excerpt shaped like a real `shape.log` from the interop producer (`file_out`,
+#: `format: json`). `script/shape-survey` runs `--self-test` before every survey.
+SELF_TEST_RENDER = "\n".join(
+    [
+        '{"timestamp":"2026-09-20T15:56:20.153724900Z","metrics":['
+        '{"name":"logit.shape.events","kind":"sum","value":3,"temporality":"delta","monotonic":true},'
+        '{"name":"logit.shape.attributes","kind":"samples","values":[7,7,0],"sample_rate":1},'
+        '{"name":"logit.shape.value_depth","kind":"samples","values":[0,0,0],"sample_rate":1},'
+        '{"name":"logit.shape.key_bytes","kind":"samples","values":[3,11,4,8,6,20,9],"sample_rate":1},'
+        '{"name":"logit.shape.values.string","kind":"sum","value":14,"temporality":"delta","monotonic":true}],'
+        '"attributes":{"signal":"metric","source":"statsd_in","tap":"tap_input"}}',
+        '{"timestamp":"2026-09-20T15:56:20.153724900Z","metrics":['
+        '{"name":"logit.shape.batch.events","kind":"samples","values":[1,1,2],"sample_rate":1}],'
+        '"attributes":{"source":"statsd_in","tap":"tap_input"}}',
+        '{"timestamp":"2026-09-20T15:56:20.153724900Z","metrics":['
+        '{"name":"logit.shape.distinct_keys","kind":"gauge","value":9},'
+        '{"name":"logit.shape.keyset_share.top1","kind":"gauge","value":0.5},'
+        '{"name":"logit.shape.tracking_overflow","kind":"gauge","value":0}],'
+        '"attributes":{"tap":"tap_input"}}',
+    ]
+)
 
-2026-09-20T15:56:20.153724900Z
-  attrs   source="statsd_in" tap="tap_input"
-  metric  logit.shape.batch.events samples=[1,1,2] rate=1
 
-2026-09-20T15:56:20.153724900Z
-  attrs   tap="tap_input"
-  metric  logit.shape.distinct_keys gauge=9
-  metric  logit.shape.keyset_share.top1 gauge=0.5
-  metric  logit.shape.tracking_overflow gauge=0
-"""
-
-
-#: A second excerpt, structurally verbatim from a real `oteldemo` `resource: keep` capture, where
-#: every resource attribute lands on each record's `attrs` line. The structure is the capture's;
-#: the values are neutral placeholders, because a fixture quoting a capture must not carry the
-#: identity `shape`'s output never does.
+#: A second excerpt shaped like an `oteldemo` `resource: keep` capture, where the batch's resource
+#: attributes appear under `resource.attributes`. The structure is the capture's; the values are
+#: neutral placeholders, because a fixture quoting a capture must not carry the identity `shape`'s
+#: output never does.
 #:
-#: It holds what `parse_attrs` has to survive: an array of strings holding commas, spaces, and an
+#: It holds what the reader has to survive: an array of strings holding commas, spaces, and an
 #: `=` (`process.command_args`, on the resource of every OTel SDK that detects a process), a bare
-#: integer beside it, empty quoted strings, and a quoted string carrying spaces, `=`, and `:`.
-SELF_TEST_RESOURCE_KEEP = """2026-09-20T20:43:57.818255215Z
-  attrs   signal="log" source="otlp_gateway" tap="tap_input" process.pid=1 process.executable.path="/opt/app/bin/node" process.command_args=["/opt/app/bin/node", "--require=./Instrumentation.js", "/app/server.js"] process.command_line="/opt/jdk/bin/java -javaagent:/app/agent.jar -Xmx200m example.Service" host.name="host-placeholder" container.id="0000000000000000000000000000000000000000000000000000000000000000" service.name="frontend" os.description="Linux host-placeholder 0.0.0-0 #1 SMP PLACEHOLDER x86_64" host.cpu.cache.l2.size=1024 zone_name="" cluster_name=""
-  metric  logit.shape.attributes samples=[11,9] rate=1
-  metric  logit.shape.events sum=2 temporality=delta monotonic=true
+#: integer beside it, empty strings, and a string carrying spaces, `=`, and `:`.
+SELF_TEST_RESOURCE_KEEP = "\n".join(
+    [
+        '{"timestamp":"2026-09-20T20:43:57.818255215Z","metrics":['
+        '{"name":"logit.shape.attributes","kind":"samples","values":[11,9],"sample_rate":1},'
+        '{"name":"logit.shape.events","kind":"sum","value":2,"temporality":"delta","monotonic":true}],'
+        '"attributes":{"signal":"log","source":"otlp_gateway","tap":"tap_input"},'
+        '"resource":{"attributes":{"process.pid":1,"process.executable.path":"/opt/app/bin/node",'
+        '"process.command_args":["/opt/app/bin/node","--require=./Instrumentation.js","/app/server.js"],'
+        '"process.command_line":"/opt/jdk/bin/java -javaagent:/app/agent.jar -Xmx200m example.Service",'
+        '"host.name":"host-placeholder",'
+        '"container.id":"0000000000000000000000000000000000000000000000000000000000000000",'
+        '"service.name":"frontend",'
+        '"os.description":"Linux host-placeholder 0.0.0-0 #1 SMP PLACEHOLDER x86_64",'
+        '"host.cpu.cache.l2.size":1024,"zone_name":"","cluster_name":""}}}',
+        '{"timestamp":"2026-09-20T20:43:57.818255215Z","metrics":['
+        '{"name":"logit.shape.attributes","kind":"samples","values":[7],"sample_rate":1}],'
+        '"attributes":{"signal":"log","source":"otlp_gateway","tap":"tap_input"},'
+        '"resource":{"attributes":{"process.command_args":["./shipping"],"service.name":"shipping"}}}',
+    ]
+)
 
-2026-09-20T20:43:57.818255215Z
-  attrs   signal="log" source="otlp_gateway" tap="tap_input" process.command_args=["./shipping"] service.name="shipping"
-  metric  logit.shape.attributes samples=[7] rate=1
-"""
-
-#: The remaining `Value` variants `render_value` can put on an `attrs` line: a nested array, a
-#: `Value::Map` (a `syslog_in` structured-data element) including a nested one, a `Value::Bytes`
-#: (`<N bytes>`, bare, with a space in it), a key needing quotes, and a string value carrying
-#: `[`, `]`, `{`, `}`, `,`, `=`, a space, and an escaped quote. Synthetic: a grammar test, not a
-#: measurement.
-SELF_TEST_EXOTIC_VALUES = """2026-09-20T20:43:57.818255215Z
-  attrs   signal="metric" nested=[1, [2, 3], {a=1, b=[4, 5]}] sd={origin={ip="10.0.0.1", port=514}, note="a=b, c=d"} blob=<12 bytes> "odd key"="[{x=1}], \\"quoted\\"" source="syslog_in" tap="tap_input" trailing=true
-  metric  logit.shape.attributes samples=[6] rate=1
-"""
+#: The remaining `Value` variants that can sit in `attributes`: a nested array, a map (a
+#: `syslog_in` structured-data element) including a nested one, an array of objects, a
+#: `Value::Bytes` (`b"..."` text with a space in it), a key with a space, a string value carrying
+#: `[`, `]`, `{`, `}`, `,`, `=`, a space, and an escaped quote, a non-finite float (`"NaN"`), and
+#: empty `{}`/`[]`. `nested_tags` holds `signal`, `source`, and `tap` keys inside another attribute:
+#: they are not tags. Synthetic: a reader test, not a measurement.
+SELF_TEST_EXOTIC_VALUES = (
+    '{"timestamp":"2026-09-20T20:43:57.818255215Z","metrics":['
+    '{"name":"logit.shape.attributes","kind":"samples","values":[6],"sample_rate":1}],'
+    '"attributes":{"signal":"metric","nested":[1,[2,3],{"a":1,"b":[4,5]}],'
+    '"sd":{"origin":{"ip":"10.0.0.1","port":514},"note":"a=b, c=d"},'
+    '"items":[{"name":"x"},{"name":"y","tags":["t"]}],"blob":"b\\"\\\\xff\\\\x00 raw\\"",'
+    '"odd key":"[{x=1}], \\"quoted\\"","ratio":"NaN","empty_map":{},"empty_array":[],'
+    '"nested_tags":{"signal":"other","source":"other","tap":"other"},'
+    '"source":"syslog_in","tap":"tap_input","trailing":true}}'
+)
 
 
 def self_test() -> None:
@@ -542,9 +473,9 @@ def self_test() -> None:
 
     # And the guard itself: a sketched shape series must stop the run, not be summarized.
     sketched = (
-        "2026-09-20T15:56:20.153724900Z\n"
-        '  attrs   signal="metric" source="statsd_in" tap="tap_input"\n'
-        "  metric  logit.shape.attributes distribution count=4096 p50=6 p90=9 p99=12\n"
+        '{"timestamp":"2026-09-20T15:56:20.153724900Z","metrics":['
+        '{"name":"logit.shape.attributes","kind":"distribution","count":4096,"sum":1,"p50":6}],'
+        '"attributes":{"signal":"metric","source":"statsd_in","tap":"tap_input"}}'
     )
     try:
         parse(sketched)
@@ -558,31 +489,30 @@ def self_test() -> None:
 
 
 def self_test_attrs_grammar() -> None:
-    """The `attrs`-line grammar, over every `Value` variant `render_value` can emit.
+    """The NDJSON reader, over every `Value` variant that can appear in `attributes`.
 
-    An unquoted value can contain a space: an array renders bare, `[a, b]`, and its elements can
-    be quoted strings carrying an `=` (`--require=./Instrumentation.js` in
-    `process.command_args`, on every OTel SDK resource that detects a process). `Value::Map` and
-    `Value::Bytes` (`<12 bytes>`) have the same property. A parser that splits on the next `=`
-    breaks every `resource: keep` capture.
+    A `resource: keep` capture puts the batch's resource attributes (arrays holding `=`, such as
+    `process.command_args`) beside the tags; the tags come from `attributes` alone, so nothing in a
+    value or in the resource can be mistaken for one.
     """
     keep = parse(SELF_TEST_RESOURCE_KEEP)
 
-    # The whole line parses, the pairs after the array are still found, and the array's own text
-    # comes back intact rather than as three garbled fragments.
-    line = SELF_TEST_RESOURCE_KEEP.splitlines()[1].strip()[len("attrs ") :].strip()
-    attrs = parse_attrs(line)
-    assert attrs["process.command_args"] == (
-        '["/opt/app/bin/node", "--require=./Instrumentation.js", "/app/server.js"]'
-    ), attrs["process.command_args"]
-    assert attrs["process.pid"] == "1", attrs["process.pid"]
-    assert attrs["service.name"] == "frontend", attrs["service.name"]
-    assert attrs["zone_name"] == "" and attrs["cluster_name"] == "", attrs
-    assert attrs["process.command_line"].startswith("/opt/jdk/bin/java -javaagent:"), attrs
-    assert attrs["host.cpu.cache.l2.size"] == "1024", attrs["host.cpu.cache.l2.size"]
-    # And `shape`'s own three tags -- the only ones the series key is built from -- survive
-    # having a dozen resource attributes, one of them an array, interleaved around them.
+    events = list(iter_samples(SELF_TEST_RESOURCE_KEEP))
+    attrs, resource, samples = events[0]
+    assert resource["process.command_args"] == [
+        "/opt/app/bin/node",
+        "--require=./Instrumentation.js",
+        "/app/server.js",
+    ], resource["process.command_args"]
+    assert resource["process.pid"] == 1, resource["process.pid"]
+    assert resource["service.name"] == "frontend", resource["service.name"]
+    assert resource["zone_name"] == "" and resource["cluster_name"] == "", resource
+    assert resource["process.command_line"].startswith("/opt/jdk/bin/java -javaagent:"), resource
+    assert resource["host.cpu.cache.l2.size"] == 1024, resource
     assert (attrs["signal"], attrs["source"], attrs["tap"]) == ("log", "otlp_gateway", "tap_input")
+    assert samples == [("logit.shape.attributes", [11, 9])], samples
+    assert events[1][1] == {"process.command_args": ["./shipping"], "service.name": "shipping"}
+    assert list(iter_samples(SELF_TEST_RENDER))[0][1] == {}, "no resource on a resource: drop capture"
 
     # Two blocks, same series key (the resource is not part of it, by design), so the samples
     # concatenate as they do for a `resource: drop` capture.
@@ -591,33 +521,34 @@ def self_test_attrs_grammar() -> None:
     assert keep[("logit.shape.events", "log", "otlp_gateway", "tap_input")].total == 2.0
     assert summarize(keep)["attribute_widths"], "a resource: keep capture must still summarize"
 
-    # Nested containers, a map, a `<N bytes>`, a quoted key, and a string value full of the
-    # delimiters. Every one of these ends where the renderer ended it, not at the next space.
-    exotic = SELF_TEST_EXOTIC_VALUES.splitlines()[1].strip()[len("attrs ") :].strip()
-    values = parse_attrs(exotic)
-    assert values["nested"] == "[1, [2, 3], {a=1, b=[4, 5]}]", values["nested"]
-    assert values["sd"] == '{origin={ip="10.0.0.1", port=514}, note="a=b, c=d"}', values["sd"]
-    assert values["blob"] == "<12 bytes>", values["blob"]
+    # Nested containers, a map, bytes text, a key with a space, and a string value full of the
+    # delimiters come back as the values the encoder wrote.
+    values = next(iter_events(SELF_TEST_EXOTIC_VALUES))["attributes"]
+    assert values["nested"] == [1, [2, 3], {"a": 1, "b": [4, 5]}], values["nested"]
+    assert values["sd"] == {"origin": {"ip": "10.0.0.1", "port": 514}, "note": "a=b, c=d"}, values["sd"]
+    assert values["items"] == [{"name": "x"}, {"name": "y", "tags": ["t"]}], values["items"]
+    assert values["blob"] == 'b"\\xff\\x00 raw"', values["blob"]
     assert values["odd key"] == '[{x=1}], "quoted"', values["odd key"]
-    assert values["trailing"] == "true", values["trailing"]
-    assert (values["signal"], values["source"], values["tap"]) == (
-        "metric",
-        "syslog_in",
-        "tap_input",
-    ), values
-    assert len(values) == 8, sorted(values)
-    assert parse(SELF_TEST_EXOTIC_VALUES)[
-        ("logit.shape.attributes", "metric", "syslog_in", "tap_input")
-    ].samples == [6.0]
+    assert values["ratio"] == "NaN" and float(values["ratio"]) != float(values["ratio"])
+    assert values["empty_map"] == {} and values["empty_array"] == [], values
+    assert values["trailing"] is True, values["trailing"]
+    exotic = parse(SELF_TEST_EXOTIC_VALUES)
+    assert exotic[("logit.shape.attributes", "metric", "syslog_in", "tap_input")].samples == [6.0]
+    assert len(exotic) == 1, "a `signal` nested in another attribute is not a tag"
 
-    # A truncated container is a parse error, not a silently short attribute set: a half-written
-    # final line (a capture cut off mid-flush) must not read as a valid, narrower event.
-    for broken in ('a=[1, 2 b="x"', "a={k=1 b=2", "a=<12 bytes", "a="):
+    good = SELF_TEST_RESOURCE_KEEP.splitlines()[1]
+    for broken in (
+        good[: len(good) // 2],  # a capture cut off mid-line
+        '{"metrics":[]}',  # no timestamp
+        '{"timestamp":"2026-09-20T20:43:57Z","metrics":[{"kind":"sum","value":1}]}',  # no name
+        '{"timestamp":"2026-09-20T20:43:57Z","metrics":[{"name":"logit.shape.x","kind":"bogus"}]}',
+        "[1, 2]",  # not an object
+    ):
         try:
-            parse_attrs(broken)
+            parse(broken)
         except ValueError:
             continue
-        raise AssertionError(f"a malformed attrs line must raise, got a parse of {broken!r}")
+        raise AssertionError(f"a malformed line must raise, got a parse of {broken!r}")
 
 
 # ---- entry point ---------------------------------------------------------------------------------
@@ -644,7 +575,7 @@ def main() -> None:
         " summary.json as `producer_section`) -- the reading of these numbers only that producer"
         " can give, kept out of this general engine",
     )
-    ap.add_argument("--self-test", action="store_true", help="check the parser against a real render")
+    ap.add_argument("--self-test", action="store_true", help="check the reader against embedded NDJSON captures")
     args = ap.parse_args()
 
     if args.self_test:

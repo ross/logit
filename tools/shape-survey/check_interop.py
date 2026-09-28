@@ -37,6 +37,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import pathlib
 import sys
 from collections import Counter
@@ -139,34 +140,28 @@ def derive(corpus: pathlib.Path) -> dict:
 def read_reported(shape_log: pathlib.Path) -> dict[str, Counter]:
     """`logit.shape.batch.events` and `logit.shape.attributes` for the statsd tap, as multisets.
 
-    Its own reader (see the module docstring). It needs only which block an `attrs` line opens
-    and the `samples=[...]` on a `metric` line.
+    Its own reader (see the module docstring): one `json.loads` per line of the `format: json`
+    capture, keeping the `kind: samples` items of events tagged with `SOURCE` and `TAP`.
     """
     reported = {"batch_events": Counter(), "attributes": Counter()}
-    in_scope = False
+    targets = {
+        "logit.shape.batch.events": "batch_events",
+        "logit.shape.attributes": "attributes",
+    }
 
     for raw in shape_log.read_text().splitlines():
-        if raw and not raw.startswith(" "):
-            in_scope = False
+        if not raw.strip():
             continue
-        line = raw.strip()
-        if line.startswith("attrs "):
-            in_scope = f'source="{SOURCE}"' in line and f'tap="{TAP}"' in line
+        obj = json.loads(raw)
+        attrs = obj.get("attributes", {})
+        if attrs.get("source") != SOURCE or attrs.get("tap") != TAP:
             continue
-        if not in_scope or not line.startswith("metric "):
-            continue
-        body = line[len("metric ") :].strip()
-        name, _, rendered = body.partition(" ")
-        target = {
-            "logit.shape.batch.events": "batch_events",
-            "logit.shape.attributes": "attributes",
-        }.get(name)
-        if target is None or not rendered.startswith("samples=["):
-            continue
-        values = rendered[len("samples=[") : rendered.index("]")]
-        for value in values.split(","):
-            if value:
-                reported[target][int(float(value))] += 1
+        for item in obj.get("metrics", []):
+            target = targets.get(item.get("name"))
+            if target is None or item.get("kind") != "samples":
+                continue
+            for value in item.get("values", []):
+                reported[target][int(value)] += 1
     return reported
 
 
@@ -271,18 +266,18 @@ def self_test() -> None:
     assert parse_line("_e{5,4}:title|text") is None
     assert parse_line("_sc|svc|0") is None
 
-    render = (
-        "2026-09-20T00:00:00.000000000Z\n"
-        '  attrs   signal="metric" source="statsd_in" tap="tap_input"\n'
-        "  metric  logit.shape.attributes samples=[7,7,0] rate=1\n"
-        "\n"
-        "2026-09-20T00:00:00.000000000Z\n"
-        '  attrs   source="statsd_in" tap="tap_input"\n'
-        "  metric  logit.shape.batch.events samples=[1,11] rate=1\n"
-        "\n"
-        "2026-09-20T00:00:00.000000000Z\n"
-        '  attrs   signal="metric" source="syslog_udp_in" tap="tap_input"\n'
-        "  metric  logit.shape.attributes samples=[4] rate=1\n"
+    render = "\n".join(
+        [
+            '{"timestamp":"2026-09-20T00:00:00.000000000Z","metrics":['
+            '{"name":"logit.shape.attributes","kind":"samples","values":[7,7,0],"sample_rate":1}],'
+            '"attributes":{"signal":"metric","source":"statsd_in","tap":"tap_input"}}',
+            '{"timestamp":"2026-09-20T00:00:00.000000000Z","metrics":['
+            '{"name":"logit.shape.batch.events","kind":"samples","values":[1,11],"sample_rate":1}],'
+            '"attributes":{"source":"statsd_in","tap":"tap_input"}}',
+            '{"timestamp":"2026-09-20T00:00:00.000000000Z","metrics":['
+            '{"name":"logit.shape.attributes","kind":"samples","values":[4],"sample_rate":1}],'
+            '"attributes":{"signal":"metric","source":"syslog_udp_in","tap":"tap_input"}}',
+        ]
     )
     tmp = pathlib.Path("/tmp/check_interop_self_test.log")
     tmp.write_text(render)

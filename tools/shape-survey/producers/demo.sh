@@ -92,6 +92,7 @@ survey_demo_config() {
     type: file_out
     sources: [shape_rollup]
     path: /shape-survey/shape.log
+    format: json
     rotate:
       max_bytes: "64GiB"
 EOF

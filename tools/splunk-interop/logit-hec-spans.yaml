@@ -80,3 +80,4 @@ components:
     type: stdio_out
     sources: [sink_telemetry]
     target: /out/hec-spans-telemetry.log
+    format: json

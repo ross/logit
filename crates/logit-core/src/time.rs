@@ -11,8 +11,18 @@
 
 /// Formats Unix nanoseconds as RFC 3339 in UTC (`Z`, never an offset) with nine fractional
 /// digits: `2026-08-30T18:20:41.512847391Z`. Never panics: every `i64`, including the extremes,
-/// maps to a calendar date.
+/// maps to a calendar date. Allocates the returned `String`; [`write_rfc3339_utc`] writes into a
+/// caller's buffer instead.
 pub fn format_rfc3339_utc(nanos: i64) -> String {
+    // 30 bytes is the rendered length for every year in `0000..=9999`.
+    let mut out = String::with_capacity(30);
+    write_rfc3339_utc(&mut out, nanos);
+    out
+}
+
+/// [`format_rfc3339_utc`], written into `out` with no allocation of its own. A `fmt::Error` from
+/// `out` is discarded; a `String` never returns one.
+pub fn write_rfc3339_utc(out: &mut impl std::fmt::Write, nanos: i64) {
     // Euclidean, not truncating: before the epoch, `/`/`%` would give a negative remainder (-1ns
     // as 0s and -1ns); flooring keeps `nanos_of_sec`/`secs_of_day` in `[0, N)`.
     let secs = nanos.div_euclid(1_000_000_000);
@@ -26,7 +36,10 @@ pub fn format_rfc3339_utc(nanos: i64) -> String {
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
 
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos_of_sec:09}Z")
+    let _ = write!(
+        out,
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos_of_sec:09}Z"
+    );
 }
 
 /// Days since 1970-01-01 to a proleptic-Gregorian `(year, month, day)`: Howard Hinnant's

@@ -2725,6 +2725,22 @@ fn stdio_encode_100_events() {
     expect_allocs("stdio_out: encode 100 events", stats, 102);
 }
 
+/// `stdio_out` encoding 100 nginx events as NDJSON (`format: json`): 2, both per batch. One is
+/// the output `String`'s first growth (later growth is a realloc, not counted), the other
+/// `Encoder::encode`'s `Bytes::from(String)` shared-refcount allocation. Unlike the human render,
+/// no per-event term: `write_rfc3339_utc` writes each timestamp into the output buffer. If this
+/// starts tracking batch size, a renderer has regressed to a per-field `String`.
+#[test]
+fn stdio_json_encode_100_events() {
+    let mut dump = EventDump::new(Format::Json);
+    let batch = fixtures::nginx_batch(100);
+    drop(dump.encode(&batch));
+
+    let (result, stats) = measure(|| dump.encode(&batch));
+    assert!(!result.expect("should encode").is_empty());
+    expect_allocs("stdio_out: encode 100 events as json", stats, 2);
+}
+
 /// `syslog_out` encoding 100 nginx events as RFC 5424: 100, one per event, from
 /// `format_rfc3339_utc` (`push_rfc5424_timestamp`), the same timestamp cost `stdio_out` pays.
 /// `SyslogEncoder` holds `line`/`raw_msg`/`scratch` as reused struct fields; as function locals

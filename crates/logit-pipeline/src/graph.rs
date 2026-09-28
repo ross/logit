@@ -8156,6 +8156,24 @@ mod tests {
     }
 
     #[test]
+    fn file_out_with_compression_set_under_format_json_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], file_out_with_format(StreamFormat::Json, Compression::Lz4)),
+        ]));
+        assert!(err.contains("'compression' only applies under 'format: native'"), "got: {err}");
+    }
+
+    #[test]
+    fn stdio_out_with_format_json_and_no_compression_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], stdio_out_with_format(StreamFormat::Json, Compression::None)),
+        ]))
+        .expect("format: json with the default compression should validate fine");
+    }
+
+    #[test]
     fn file_out_with_format_native_and_compression_lz4_validates_fine() {
         resolve(cfg(vec![
             ("in", vec![], listener()),

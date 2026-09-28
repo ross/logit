@@ -49,7 +49,8 @@ in a way the plan records as a gap), or `FAIL`. The script exits 1 on any `FAIL`
 
 A run writes `perf/results/victoria-interop/<timestamp>/` (gitignored, or under
 `VICTORIA_INTEROP_OUT`): `results.md` and `results.json`, `provenance.txt` with the image tags,
-`logs/<service>.log`, and the `logit` file outputs.
+`logs/<service>.log`, and the `logit` file outputs (`stdio_out` with `format: json`, one object per line,
+which `check.py` reads with `json.loads`).
 
 ## Cleanup and a shared daemon
 

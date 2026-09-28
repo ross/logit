@@ -115,3 +115,4 @@ components:
     type: stdio_out
     sources: [sink_telemetry]
     target: /out/hec-metrics-telemetry.log
+    format: json

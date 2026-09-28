@@ -486,14 +486,14 @@ PYEOF
 SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT=180
 
 # Per-service medians, which summarize.py's series key can't separate. It walks shape.log with
-# summarize.py's own `parse_attrs`, which is under `--self-test` for a keep line's bare arrays.
+# summarize.py's own `iter_samples`, which is under `--self-test` for a keep event's resource.
 survey_oteldemo_keep_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
 """Per-service attribute-count medians from a `resource: keep` capture.
 
 Reads /out/shape.log directly, because summary.json has already pooled every service. It imports
-summarize.py's `parse_attrs` rather than a second parser that could disagree with it.
+summarize.py's `iter_samples` rather than a second reader that could disagree with it.
 
 Its output NAMES SERVICES and stays in this run directory.
 """
@@ -509,25 +509,12 @@ spec.loader.exec_module(summarize)
 
 # (metric, signal, service) -> samples
 buckets: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
-tags: dict[str, str] = {}
-for raw in pathlib.Path("/out/shape.log").read_text().splitlines():
-    if not raw or not raw.startswith(" "):
-        tags = {}
-        continue
-    line = raw.strip()
-    if line.startswith("attrs "):
-        tags = summarize.parse_attrs(line[len("attrs ") :].strip())
-        continue
-    if not line.startswith("metric "):
-        continue
-    name, _, rendered = line[len("metric ") :].strip().partition(" ")
-    if not name.startswith("logit.shape.") or not rendered.startswith("samples=["):
-        continue
-    values = rendered[len("samples=[") : rendered.index("]")]
-    if not values:
-        continue
-    key = (name, tags.get("signal", ""), tags.get("service.name", "(no service.name)"))
-    buckets[key].extend(float(v) for v in values.split(","))
+for attrs, resource, samples in summarize.iter_samples(pathlib.Path("/out/shape.log").read_text()):
+    for name, values in samples:
+        if not name.startswith("logit.shape.") or not values:
+            continue
+        key = (name, attrs.get("signal", ""), resource.get("service.name", "(no service.name)"))
+        buckets[key].extend(float(v) for v in values)
 
 
 def rows(metric):

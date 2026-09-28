@@ -1,13 +1,12 @@
-//! `stdio_out`: a human-facing debug sink that writes a pipeline's events as readable text to
-//! stdout (default), stderr, or a file. Also home of [`StreamOutput`], which `file_out`
+//! `stdio_out`: a debug sink that writes a pipeline's events as readable text (default) or NDJSON
+//! to stdout (default), stderr, or a file. Also home of [`StreamOutput`], which `file_out`
 //! (`crate::file`) builds on: `stdio_out`'s file target is `file_out` with an empty rotation
 //! policy, not a second implementation (`docs/adr/rotating-file-output.md`).
 //!
-//! **The render is a readable text block per event, not JSON.** It's for a person at a terminal,
-//! not an export format; an NDJSON [`Format`] variant is the extension point if a consumer needs
-//! one. See `docs/plans/nginx-integration.md`'s workstream D and `docs/known-gaps.md` for the
-//! accepted consequences. `tools/shape-survey/summarize.py` parses this render, [`render_value`]'s
-//! arrays and maps included, so a change to how anything renders must be mirrored there.
+//! **The default render is a readable text block per event, not JSON.** It's for a person at a
+//! terminal, not an export format; a program reads [`Format::Json`] instead, whose grammar is
+//! `crate::ndjson`'s module doc. See `docs/plans/nginx-integration.md`'s workstream D and
+//! `docs/known-gaps.md` for the accepted consequences.
 //!
 //! Split like `InfluxDbOutput`/`InfluxLineEncoder`: a pure [`EventDump`] encoder with no file
 //! descriptor (every format test runs against it alone), and the thin [`StreamOutput`] that owns
@@ -15,8 +14,8 @@
 //! (`format: native`, `docs/adr/file-output-native-format.md`); `Target`/`FileTarget` never see
 //! which.
 //!
-//! [`Format`] has one variant, and `render_value`/`render_metric` stay free functions, so a future
-//! `format:` template or NDJSON variant is a new `Format` arm calling the same renderers.
+//! [`Format`] has two variants: `Human`, rendered here, and `Json`, rendered by
+//! [`crate::ndjson::render_ndjson`]. A further `format:` is a new `Format` arm.
 //!
 //! Every string rendered here (a value, an attribute/map key, a metric or unit name) can come from
 //! attacker-influenced input such as a syslog line or a JSON body, so each goes through
@@ -45,14 +44,17 @@ use std::fmt::Write;
 use std::path::Path;
 use tokio::io::{self, AsyncWriteExt};
 
-/// The output format [`EventDump`] renders. One variant; the module doc says why it's an enum.
+/// The output format [`EventDump`] renders.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// One readable text block per event.
     #[default]
     Human,
+    /// One JSON object per event per line ([`crate::ndjson`]).
+    Json,
 }
 
-/// Renders an [`EventBatch`] as readable text. Pure: no file descriptor, no I/O.
+/// Renders an [`EventBatch`] as readable text or NDJSON. Pure: no file descriptor, no I/O.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EventDump {
     format: Format,
@@ -63,7 +65,7 @@ impl EventDump {
         Self { format }
     }
 
-    /// Renders `batch` as one readable block per event, in batch order.
+    /// Renders `batch` as one readable block, or one JSON line, per event, in batch order.
     ///
     /// Never fails and never panics: a debug sink has to stay up when everything else is falling
     /// over, so even a non-finite numeric value renders something.
@@ -88,6 +90,11 @@ impl EventDump {
                 }
                 out
             }
+            Format::Json => {
+                let mut out = String::new();
+                crate::ndjson::render_ndjson(&mut out, batch);
+                out
+            }
         }
     }
 }
@@ -100,7 +107,7 @@ impl Encoder for EventDump {
     }
 }
 
-/// Which encoder [`StreamOutput`] writes through: [`EventDump`]'s text render, or
+/// Which encoder [`StreamOutput`] writes through: [`EventDump`]'s text or NDJSON render, or
 /// `logit_proto::native::NativeEncoder` (`docs/adr/file-output-native-format.md`).
 ///
 /// An enum, not `Box<dyn Encoder>`, so `StreamOutput<StreamEncoder>` is the one concrete type
@@ -109,13 +116,17 @@ impl Encoder for EventDump {
 /// own, which is what lets `file_out` rotate mid-stream without stranding a reader.
 #[derive(Debug, Clone, Copy)]
 pub enum StreamEncoder {
-    Human(EventDump),
+    Dump(EventDump),
     Native(NativeEncoder),
 }
 
 impl StreamEncoder {
     pub fn human() -> Self {
-        StreamEncoder::Human(EventDump::default())
+        StreamEncoder::Dump(EventDump::default())
+    }
+
+    pub fn json() -> Self {
+        StreamEncoder::Dump(EventDump::new(Format::Json))
     }
 
     pub fn native(compression: NativeCompression) -> Self {
@@ -126,7 +137,7 @@ impl StreamEncoder {
 impl Encoder for StreamEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         match self {
-            StreamEncoder::Human(e) => e.encode(batch),
+            StreamEncoder::Dump(e) => e.encode(batch),
             StreamEncoder::Native(e) => e.encode(batch),
         }
     }
@@ -426,8 +437,7 @@ fn render_span_link(out: &mut String, link: &SpanLink) {
 
 /// Renders one [`Value`]: `Str` quoted and escaped; `Bytes` as `<N bytes>`, never a lossy UTF-8
 /// decode; `Timestamp` as RFC 3339 ([`format_rfc3339_utc`]); `Array` as `[a, b]` and `Map` as
-/// `{k=v, k2=v2}`, recursively. `tools/shape-survey/summarize.py`'s `parse_value` scans exactly
-/// these forms.
+/// `{k=v, k2=v2}`, recursively.
 ///
 /// `pub(crate)` for `syslog_out`'s container fallback (a `Map` or `Array` value); syslog never
 /// routes a `Str` here, since the quoting would mangle a raw MSG body (`syslog.rs`'s module doc).

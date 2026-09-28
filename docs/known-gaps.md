@@ -1845,10 +1845,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human`'s
     text render has no compression option, and nothing compresses already-rotated files after the
     fact. Both are left to an external tool.
-  - *Format:* `format:` (`human`, the human-readable render, or `native`, `logit_proto::native`'s
-    wire format, ADR `file-output-native-format`) is shared with `stdio_out`. A `format:`
-    *template* over `human` is the one unbuilt extension point (`Format::Ndjson` is named only as
-    an aspiration, not code). Reading a `format: native` file back — a decoder-side
+  - *Format:* `format:` (`human`, the human-readable render; `json`, one JSON object per event
+    per line, ADR `stream-json-format`; or `native`, `logit_proto::native`'s wire format, ADR
+    `file-output-native-format`) is shared with `stdio_out`. A `format:` *template* over `human`
+    is the one unbuilt extension point. Reading a `format: native` file back — a decoder-side
     reader/verifier, or wiring `NativeDecoder` into `tail_in` — is real, unblocked, undesigned
     follow-up work.
   - *Restart:* `FileTarget::open` seeds `RotationState`'s calendar period from an existing file's
@@ -1874,10 +1874,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   process's lifetime, so an external log rotator that moves the file leaves `logit` writing to the
   unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
   sink. When a file target needs bounding, use `file_out` (ADR `rotating-file-output`), which
-  shares `stdio_out`'s implementation and adds a rotation policy. The format is no longer fixed
-  (`format: human | native`, ADR `file-output-native-format`); a user-supplied `format:`
-  *template* over the human-readable render is designed for (the encoder is built around a
-  `Format` enum with room for it) but not implemented.
+  shares `stdio_out`'s implementation and adds a rotation policy. The format is not fixed
+  (`format: human | json | native`, ADRs `stream-json-format` and `file-output-native-format`);
+  a user-supplied `format:` *template* over the human-readable render is designed for (the
+  encoder is built around a `Format` enum with room for it) but not implemented.
 - **A send the shutdown grace cuts off can leave a torn line in a `stdio_out` or `file_out`
   file.** Both write a batch in place with one `write_all`. When `write_loop`'s grace drops that
   `send` part-way, the part already handed to the file stays, and the sink's `flush()` then
