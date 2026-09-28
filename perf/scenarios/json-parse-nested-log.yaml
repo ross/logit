@@ -20,8 +20,7 @@
 # parse against one, four of them the nested maps. A sizing change that improves flat width
 # without touching `Value::Map` should move this scenario least.
 #
-# `count` is scaled to ~8 s from the first VM run's wall time and not yet re-measured at this
-# value (docs/plans/load-test-harness.md, "Scenarios").
+# `count` gives about 8-9 s of wall on the perf VM (docs/design/performance.md §1).
 components:
   gen:
     type: generate_in
