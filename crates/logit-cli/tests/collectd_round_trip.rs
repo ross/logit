@@ -107,6 +107,7 @@ use logit_core::{Diagnostics, EventBatch, MetricKind, Registry, Resource, Value}
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::collectd::CollectdOutput;
+use logit_pipeline::test_util::{recv_batch, Totals, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::collectd::{
     CollectdDecoder, CollectdEncoder, ATTR_HOST, ATTR_PLUGIN, ATTR_PLUGIN_INSTANCE, ATTR_TYPE,
@@ -741,10 +742,11 @@ struct Harness {
     rx: mpsc::Receiver<Delivered>,
 }
 
-/// How long to wait for a send's first datagram or batch, and then for each further one.
-/// `SUBSEQUENT` bounds the "and nothing else came" assertions.
-const FIRST: Duration = Duration::from_millis(500);
-const SUBSEQUENT: Duration = Duration::from_millis(200);
+/// The capture socket's quiet window: once a datagram has arrived, how long the capture waits for
+/// another before deciding the send is complete. It follows a `send` that has returned, so every
+/// datagram is already on loopback; the window covers only the kernel's deferred delivery of the
+/// rest, which takes microseconds unloaded.
+const CAPTURE_QUIET: Duration = Duration::from_millis(200);
 
 impl Harness {
     async fn new() -> Self {
@@ -792,9 +794,10 @@ impl Harness {
     ) -> (Vec<Vec<u8>>, EventBatch) {
         let captured = self.capture_only(batch, &configure).await;
 
+        let expected = direct_batch_multi(&captured).events.len();
         let mut to_input = configure(CollectdOutput::udp(self.input_addr.to_string()).unwrap());
         to_input.send(batch).await.expect("send to the live collectd_in");
-        (captured, self.drain_decoded().await)
+        (captured, self.drain_decoded(expected).await)
     }
 
     /// [`Harness::round_trip_with`] with `collectd_out`'s defaults (`max_packet_bytes: 1452`, no
@@ -814,33 +817,35 @@ impl Harness {
         self.drain_captured().await
     }
 
-    /// Every datagram the capture socket holds: the first waited on for [`FIRST`], each later one
-    /// for [`SUBSEQUENT`].
+    /// Every datagram the capture socket holds: the first waited on for [`RECV_TIMEOUT`], each
+    /// later one for [`CAPTURE_QUIET`]. The datagram count isn't known up front (re-packing
+    /// decides it), so a quiet window, not a count, ends the capture.
     async fn drain_captured(&mut self) -> Vec<Vec<u8>> {
         let mut buf = vec![0u8; 65_536];
         let mut datagrams = Vec::new();
-        let mut wait = FIRST;
+        let mut wait = RECV_TIMEOUT;
         while let Ok(result) = tokio::time::timeout(wait, self.capture.recv_from(&mut buf)).await {
             let (n, _) = result.expect("recv_from should succeed");
             datagrams.push(buf[..n].to_vec());
-            wait = SUBSEQUENT;
+            wait = CAPTURE_QUIET;
         }
         assert!(!datagrams.is_empty(), "the capture socket received no datagram at all");
         datagrams
     }
 
-    /// Every batch the live `collectd_in` delivered, merged into one: how a multi-datagram send is
-    /// batched isn't this test's concern.
-    async fn drain_decoded(&mut self) -> EventBatch {
+    /// The batches the live `collectd_in` delivered until they hold `expected` events, merged into
+    /// one: how a multi-datagram send is batched isn't this test's concern. The listener's 100ms
+    /// flush timer can split one send's datagrams across batches, so the count, not a quiet
+    /// window, says the send has all arrived.
+    async fn drain_decoded(&mut self, expected: usize) -> EventBatch {
+        let mut merged = recv_batch(&mut self.rx).await;
         let mut batches = Vec::new();
-        let mut wait = FIRST;
-        while let Ok(delivered) = tokio::time::timeout(wait, self.rx.recv()).await {
-            let delivered = delivered.expect("the Fanout channel should not have closed");
-            batches.push(logit_pipeline::unwrap_batch(delivered));
-            wait = SUBSEQUENT;
+        let mut received = merged.events.len();
+        while received < expected {
+            let batch = recv_batch(&mut self.rx).await;
+            received += batch.events.len();
+            batches.push(batch);
         }
-        assert!(!batches.is_empty(), "collectd_in delivered nothing at all");
-        let mut merged = batches.remove(0);
         for batch in batches {
             assert_eq!(batch.resource, merged.resource, "one decoder, one shared resource");
             assert!(batch.scope.is_none(), "collectd carries no scope concept");
@@ -858,27 +863,11 @@ impl Harness {
     }
 }
 
-/// Whether `registry` recorded a point named `metric` carrying `tag`. Drains, so call once.
+/// Whether `registry` recorded a point named `metric` carrying `tag`. Drains, so call once, after
+/// the observable that the count happened: the decoder counts before its batch is delivered, and a
+/// sink counts before `send` returns.
 fn counted(registry: &Registry, metric: &str, tag: (&str, &str)) -> bool {
-    registry.drain(0).into_iter().any(|event| {
-        event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
-            && event.attributes.get(tag.0).and_then(Value::as_str) == Some(tag.1)
-    })
-}
-
-/// The summed value of every point named `metric` carrying `tag` in `events`. Takes an
-/// already-drained slice because `Registry::drain` empties the registry.
-fn metric_sum(events: &[logit_core::Event], metric: &str, tag: (&str, &str)) -> f64 {
-    events
-        .iter()
-        .filter(|e| e.attributes.get(tag.0).and_then(Value::as_str) == Some(tag.1))
-        .flat_map(|e| &e.metrics)
-        .filter(|m| logit_core::interner::resolve(m.name) == metric)
-        .map(|m| match &m.kind {
-            MetricKind::Sum(sum) => sum.value,
-            other => panic!("{metric} must be a counter, got {other:?}"),
-        })
-        .sum()
+    Totals::of(registry.drain(0)).has(metric, &[tag])
 }
 
 fn attr(event: &logit_core::Event, key: &str) -> Option<Value> {
@@ -949,9 +938,9 @@ async fn a_slash_in_an_identity_field_is_substituted_counted_and_not_a_round_tri
 
     // Three substituted bytes (one in `mount/data`, two in `/var/log`), but the counter is per
     // field, and each of the two sinks counts its own copy.
-    let events = registry.drain(0);
+    let totals = Totals::of(registry.drain(0));
     assert_eq!(
-        metric_sum(&events, "logit.output.identity.sanitized", ("reason", "substituted")),
+        totals.sum("logit.output.identity.sanitized", &[("reason", "substituted")]),
         4.0,
         "plugin and type_instance are each counted once per sink, over two sinks"
     );
@@ -1204,7 +1193,7 @@ async fn diagnostic_harness() -> (Harness, Arc<Registry>) {
 async fn an_encryption_part_drops_the_datagram_tail_and_is_counted() {
     let (mut harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("encrypted", "in")).await;
-    let batch = harness.drain_decoded().await;
+    let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "only the plaintext list before the Encryption part");
     assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(3600.0));
@@ -1224,7 +1213,7 @@ async fn a_list_with_no_time_part_is_stamped_with_receipt_time() {
             as i64;
     harness.send_raw(&read_fixture("no-time", "in")).await;
     let mut harness = harness;
-    let batch = harness.drain_decoded().await;
+    let batch = harness.drain_decoded(1).await;
     let after =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             as i64;
@@ -1243,7 +1232,7 @@ async fn a_list_with_no_time_part_is_stamped_with_receipt_time() {
 async fn a_truncated_values_part_keeps_the_lists_already_decoded_and_is_counted() {
     let (mut harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("truncated-values", "in")).await;
-    let batch = harness.drain_decoded().await;
+    let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "the well-formed list in front of the bad part survives");
     assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(0.5));
@@ -1256,7 +1245,7 @@ async fn a_truncated_values_part_keeps_the_lists_already_decoded_and_is_counted(
 async fn a_list_with_a_cleared_host_is_skipped_and_counted() {
     let (mut harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("incomplete-identity", "in")).await;
-    let batch = harness.drain_decoded().await;
+    let batch = harness.drain_decoded(1).await;
 
     assert_eq!(batch.events.len(), 1, "only the list that still had a host");
     assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(0.5));
@@ -1292,11 +1281,7 @@ impl CrossHarness {
         let sender =
             UdpSocket::bind("127.0.0.1:0").await.expect("binding an ephemeral sender socket");
         sender.send_to(line, self.statsd_addr).await.expect("sending the statsd line");
-        let delivered = tokio::time::timeout(FIRST, self.statsd_rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        logit_pipeline::unwrap_batch(delivered)
+        recv_batch(&mut self.statsd_rx).await
     }
 }
 
@@ -1392,9 +1377,9 @@ async fn a_tagged_statsd_gauge_relays_as_a_gauge_with_its_tag_counted_away() {
     assert_eq!(event.attributes.get("env"), None, "collectd has no wire form for a tag");
 
     // Both sinks share one `Telemetry`, so the tag is counted once per sink.
-    let events = registry.drain(0);
+    let totals = Totals::of(registry.drain(0));
     assert_eq!(
-        metric_sum(&events, "logit.output.tags.dropped", ("reason", "no_wire_form")),
+        totals.sum("logit.output.tags.dropped", &[("reason", "no_wire_form")]),
         2.0,
         "`env` has no wire form, and is counted once on each of the two sinks this case sends \
          through"

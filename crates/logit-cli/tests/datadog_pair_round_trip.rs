@@ -15,6 +15,7 @@ use logit_core::{
 };
 use logit_inputs::datadog::DatadogInput;
 use logit_outputs::datadog::{DatadogEndpoints, DatadogOutput};
+use logit_pipeline::test_util::{assert_no_batch, recv_batch};
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::datadog::generated::agentpayload::{
     metric_payload::{MetricPoint, MetricSeries, Resource as PbResource},
@@ -67,19 +68,11 @@ fn sink(addr: SocketAddr, registry: &Registry) -> DatadogOutput {
         .with_telemetry(registry.telemetry_for("out", "datadog_out", "sink"))
 }
 
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("datadog_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
-}
-
+/// Asserts nothing reaches `datadog_in`. `datadog_in` delivers a request's batches before it
+/// answers and the sink's `send` returns only after the answer, so nothing a send caused is still
+/// in flight; the 300ms window is a margin against a stray later batch, not a delivery interval.
 async fn assert_nothing_delivered(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) {
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "nothing reaches datadog_in"
-    );
+    assert_no_batch(rx, Duration::from_millis(300), "nothing reaches datadog_in").await;
 }
 
 /// A counter's total across every drained point tagged `reason`.
@@ -286,7 +279,7 @@ async fn every_route_relays_its_batch_unchanged() {
     for (name, batch) in cases {
         assert!(!batch.events.is_empty(), "{name}: the case carries events");
         out.send(&batch).await.unwrap_or_else(|err| panic!("{name}: {err:#}"));
-        assert_eq!(recv(&mut rx).await, batch, "{name}");
+        assert_eq!(recv_batch(&mut rx).await, batch, "{name}");
     }
     assert_nothing_delivered(&mut rx).await;
 }
@@ -304,7 +297,7 @@ async fn a_log_trace_ref_arrives_as_hex_id_attributes() {
     event.log.as_mut().unwrap().trace =
         Some(TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 1 });
     sink(addr, &registry).send(&batch).await.unwrap();
-    let delivered = recv(&mut rx).await;
+    let delivered = recv_batch(&mut rx).await;
     let attrs = &delivered.events[0].attributes;
     assert_eq!(attrs.get("trace_id"), Some(&Value::str("ab".repeat(16))));
     assert_eq!(attrs.get("span_id"), Some(&Value::str("cd".repeat(8))));
@@ -331,7 +324,7 @@ async fn a_set_arrives_as_a_gauge_of_its_estimate() {
         )],
     };
     sink(addr, &registry).send(&batch).await.unwrap();
-    let delivered = recv(&mut rx).await;
+    let delivered = recv_batch(&mut rx).await;
     assert_eq!(delivered.events.len(), 1);
     let record = &delivered.events[0].metrics[0];
     assert_eq!(resolve(record.name), "users");
@@ -394,6 +387,6 @@ async fn a_recorded_agent_series_request_relays_unchanged() {
     let registry = Registry::new();
     let mut out = sink(addr, &registry);
     out.send(&batch).await.expect("datadog_in accepts");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
     assert_nothing_delivered(&mut rx).await;
 }

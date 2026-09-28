@@ -2910,7 +2910,9 @@ mod tests {
     // produces: a 50ms budget closes a silent connection within the 1s read, where the 5s default
     // wouldn't.
 
-    /// A free loopback port, bound and released: a boxed `Input` can't report its `local_addr`.
+    /// A free loopback port, bound and released. This is the boxed-`dyn Input` exception to
+    /// `docs/adr/test-timing-and-observables.md`'s bind-before-spawn rule: a boxed `Input` can't
+    /// report its `local_addr`, so the port is chosen first and handed to its config.
     async fn free_port() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().to_string()
@@ -2919,8 +2921,8 @@ mod tests {
     /// Spawns a built `NodeSpec::Input` and asserts it closes a silent connection within 1s.
     async fn assert_closes_a_silent_connection(spec: NodeSpec, addr: &str) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        input.bind().await.expect("bind should succeed");
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 1];
@@ -3014,8 +3016,8 @@ mod tests {
     /// within 1s of it going quiet.
     async fn assert_closes_a_quiet_connection(spec: NodeSpec, addr: &str, wire: &[u8]) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        input.bind().await.expect("bind should succeed");
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut quiet = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut quiet, wire).await.unwrap();
@@ -3128,8 +3130,8 @@ mod tests {
         else {
             panic!("expected NodeSpec::Input")
         };
+        input.bind().await.expect("bind should succeed");
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         /// Reads and decodes one control frame. Hand-rolled: a real `logit_out` would reconnect
         /// and hide the close under test.

@@ -12,6 +12,7 @@ use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Registry, Resource, Value};
 use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_outputs::datadog_trace::{DatadogTraceOutput, TracerApiForm};
+use logit_pipeline::test_util::recv_batch;
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::datadog::generated::trace::{AgentPayload, Span, TraceChunk, TracerPayload};
 use logit_proto::datadog::stats::{
@@ -28,7 +29,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 // -------------------------------------------------------------------------------------------------
@@ -51,14 +51,6 @@ async fn start(
 async fn tcp_listener() -> (SocketAddr, mpsc::Receiver<logit_pipeline::Delivered>) {
     let (addr, rx) = start(DatadogTraceInput::new().with_bind("127.0.0.1:0")).await;
     (addr.expect("bind leaves an address"), rx)
-}
-
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("datadog_trace_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
 }
 
 /// What a dd-trace tracer sends alongside every trace payload.
@@ -210,7 +202,7 @@ async fn first_hop(
     body: &[u8],
 ) -> EventBatch {
     tracer_sends(addr, path, body).await;
-    recv(rx).await
+    recv_batch(rx).await
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -231,7 +223,7 @@ async fn a_v04_origin_batch_relays_equal_through_v04() {
 
     let (registry, mut out) = metered(DatadogTraceOutput::http(format!("http://{addr}")));
     out.send(&batch).await.expect("datadog_trace_in accepts");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
     let points = registry.drain(0);
     assert_eq!(counted(&points, "logit.output.spans.degraded", "no_wire_form"), 0.0);
 }
@@ -246,7 +238,7 @@ async fn a_v07_origin_batch_relays_equal_through_v07() {
     let mut out =
         DatadogTraceOutput::http(format!("http://{addr}")).with_version(TracerApiForm::V07);
     out.send(&batch).await.expect("datadog_trace_in accepts");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 }
 
 /// Client stats relay as `/v0.6/stats` decodes them.
@@ -255,7 +247,7 @@ async fn a_stats_batch_relays_equal() {
     let (addr, mut rx) = tcp_listener().await;
     let batch = first_hop(addr, &mut rx, "/v0.6/stats", &stats_body()).await;
     DatadogTraceOutput::http(format!("http://{addr}")).send(&batch).await.unwrap();
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 }
 
 /// Under `version: v0.4` a v0.7-origin batch loses what v0.4 has no field for, the chunk
@@ -268,7 +260,7 @@ async fn a_v07_origin_batch_through_v04_counts_what_it_cannot_carry() {
 
     let (registry, mut out) = metered(DatadogTraceOutput::http(format!("http://{addr}")));
     out.send(&batch).await.unwrap();
-    let relayed = recv(&mut rx).await;
+    let relayed = recv_batch(&mut rx).await;
 
     let mut expected = batch.clone();
     Arc::make_mut(&mut expected.resource).attributes.remove(RESOURCE_ATTR_TRACER_HOSTNAME);
@@ -315,16 +307,16 @@ async fn the_pair_relays_equal_over_the_unix_socket() {
 
     let batch = first_hop(addr, &mut rx, "/v0.4/traces", &v04_body()).await;
     DatadogTraceOutput::unix(&path).send(&batch).await.expect("the socket accepts");
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 
     let batch = first_hop(addr, &mut rx, "/v0.7/traces", &v07_body()).await;
     let mut out = DatadogTraceOutput::unix(&path).with_version(TracerApiForm::V07);
     out.send(&batch).await.unwrap();
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 
     let batch = first_hop(addr, &mut rx, "/v0.6/stats", &stats_body()).await;
     out.send(&batch).await.unwrap();
-    assert_eq!(recv(&mut rx).await, batch);
+    assert_eq!(recv_batch(&mut rx).await, batch);
 }
 
 /// A real dd-trace-py 4.15's requests (`testdata/interop/datadog/tracer-*`), sent with their
@@ -353,10 +345,10 @@ async fn recorded_tracer_requests_relay_equal() {
         }
         let status = request.body(body).send().await.expect("the first hop").status();
         assert_eq!(status, reqwest::StatusCode::OK, "{stem}");
-        let batch = recv(&mut rx).await;
+        let batch = recv_batch(&mut rx).await;
 
         out.send(&batch).await.unwrap_or_else(|err| panic!("{stem}: {err:#}"));
-        assert_eq!(recv(&mut rx).await, batch, "{stem}");
+        assert_eq!(recv_batch(&mut rx).await, batch, "{stem}");
     }
     let points = registry.drain(0);
     assert_eq!(counted(&points, "logit.output.spans.degraded", "no_wire_form"), 0.0);

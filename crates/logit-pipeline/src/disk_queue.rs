@@ -1742,7 +1742,6 @@ impl Drop for DiskQueue {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1752,8 +1751,6 @@ pub(crate) mod test_support {
     use logit_core::{AttrMap, Event, EventBatch, Provenance, Resource, Value};
     use logit_proto::frame::{self, Compression};
     use logit_proto::native;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     thread_local! {
         /// Bytes `parse_record` has copied out of its input on this thread.
@@ -1768,11 +1765,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn scratch_dir(label: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("logit-disk-queue-test-{label}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+        crate::test_util::scratch_dir(&format!("disk-queue-{label}"))
     }
 
     /// The on-disk length `DiskQueue::push` writes for `batch` under `Compression::None`, for

@@ -13,6 +13,7 @@ use bytes::Bytes;
 use logit_core::interner::intern;
 use logit_core::{AttrMap, Event, EventBatch, MetricKind, MetricRecord, Resource, Value};
 use logit_inputs::datadog::DatadogInput;
+use logit_pipeline::test_util::{assert_no_batch, recv_batch};
 use logit_pipeline::{Fanout, Input};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::generated::agentpayload::{
@@ -42,6 +43,12 @@ const RECEIVED_AT: i64 = 1_699_000_000_000_000_000;
 /// [`DatadogInput::with_busy_after`]'s test/tuning hook, so it doesn't wait out the real 5s
 /// default.
 const TEST_BUSY_AFTER: Duration = Duration::from_millis(200);
+
+/// The window of a "nothing more arrives" check. `datadog_in` delivers or drops a request's
+/// batches before it answers, so by the time the test reads the response nothing that request
+/// caused is still in flight; the window is a margin against a stray later batch, not a delivery
+/// interval.
+const NOTHING_MORE: Duration = Duration::from_millis(300);
 
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 
@@ -137,14 +144,6 @@ async fn post(
     let response = request.send().await.expect("the request reaches datadog_in");
     let status = response.status();
     (status, response.text().await.unwrap_or_default())
-}
-
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("datadog_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -384,7 +383,7 @@ async fn every_route_delivers_the_encoded_batch_under_every_encoding() {
         for encoding in ENCODINGS {
             let (status, _) = post(addr, case.path, case.content_type, encoding, &case.body).await;
             assert!(status.is_success(), "{} {encoding:?}: {status}", case.path);
-            let delivered = recv(&mut rx).await;
+            let delivered = recv_batch(&mut rx).await;
             assert_eq!(delivered, case.expected, "{} {encoding:?}", case.path);
         }
     }
@@ -401,8 +400,8 @@ async fn an_agent_payload_with_two_tracer_payloads_delivers_two_batches_in_order
         post(addr, "/api/v0.2/traces", "application/x-protobuf", Encoding::Zstd, &body).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(text, "{}");
-    assert_eq!(recv(&mut rx).await, expected[0]);
-    assert_eq!(recv(&mut rx).await, expected[1]);
+    assert_eq!(recv_batch(&mut rx).await, expected[0]);
+    assert_eq!(recv_batch(&mut rx).await, expected[1]);
 }
 
 /// Host metadata on `/intake/` is acknowledged with the events route's `202` and delivers
@@ -414,10 +413,7 @@ async fn intake_host_metadata_is_acknowledged_and_delivers_nothing() {
     let (status, text) = post(addr, "/intake/", "application/json", Encoding::Zstd, body).await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED);
     assert_eq!(text, r#"{"status":"ok"}"#);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "host metadata is never sent"
-    );
+    assert_no_batch(&mut rx, NOTHING_MORE, "host metadata is never sent").await;
 }
 
 /// The busy contract: a one-slot channel with a parked consumer takes the first request's batch;
@@ -453,15 +449,12 @@ async fn a_stalled_downstream_is_answered_503_and_the_retry_succeeds() {
     assert_eq!(response.text().await.unwrap(), r#"{"status":"error","errors":["busy"]}"#);
 
     // The consumer drains: the first batch, and nothing from the 503'd request.
-    assert_eq!(recv(&mut rx).await, case.expected);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "a 503'd request delivers nothing"
-    );
+    assert_eq!(recv_batch(&mut rx).await, case.expected);
+    assert_no_batch(&mut rx, NOTHING_MORE, "a 503'd request delivers nothing").await;
 
     let (status, _) = post(addr, case.path, case.content_type, Encoding::Zstd, &case.body).await;
     assert_eq!(status, reqwest::StatusCode::ACCEPTED, "the Agent's retry succeeds");
-    assert_eq!(recv(&mut rx).await, case.expected);
+    assert_eq!(recv_batch(&mut rx).await, case.expected);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -512,10 +505,10 @@ async fn every_recorded_agent_request_is_answered_2xx() {
         assert!(status.is_success(), "{stem} ({path}): {status} {text}");
     }
 
+    // Every request has been answered, and `datadog_in` delivers before it answers, so every
+    // batch is already queued.
     let mut names = std::collections::BTreeSet::new();
-    while let Ok(Some(delivered)) =
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
-    {
+    while let Ok(delivered) = rx.try_recv() {
         for event in logit_pipeline::unwrap_batch(delivered).events {
             if let Some(metric) = event.metrics.first() {
                 names.insert(logit_core::interner::resolve(metric.name).to_string());

@@ -38,6 +38,14 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// How long a poll that spawns `logit ready` once per attempt waits for the state it expects: a
+/// `logit run` child reporting ready, or exiting. Each attempt is a process spawn, so this is
+/// wider than `logit_pipeline::test_util::RECV_TIMEOUT`.
+const PROCESS_POLL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A free loopback port, bound and released. This is the child-process exception to
+/// `docs/adr/test-timing-and-observables.md`'s bind-before-spawn rule: the port is handed to a
+/// `logit run` child through its config, and the child binds it.
 async fn ephemeral_addr() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().to_string()
@@ -72,30 +80,15 @@ async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
     let mut child = KillOnDrop(child);
 
     // Retry the probe under test as its own readiness signal rather than a fixed sleep.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let output = logit_ready(&admin_addr);
-        if output.status.success() {
-            let word = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            assert_eq!(word, "ok");
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "logit ready never reported success within 10s; last attempt exited {:?} with \
-             stderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let word = wait_until_ready(&admin_addr).await;
+    assert_eq!(word, "ok");
 
     // Kill the pipeline, then confirm `logit ready` fails against the closed port: it reflects
     // live state, not a cached first success.
     child.0.kill().expect("killing the running logit process");
     child.0.wait().expect("waiting for logit to exit");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + PROCESS_POLL_DEADLINE;
     loop {
         let output = logit_ready(&admin_addr);
         if !output.status.success() {
@@ -113,20 +106,30 @@ async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
 /// orchestrator needs a definite "stop routing here, still finishing", not a refused connection
 /// it can't tell from a crash. So the admin server must keep its port open until the drain ends.
 ///
-/// The drain is made long enough to probe by giving a sink something it can never deliver:
-/// `internal` emits its own process gauges every 100ms with no traffic needed, `influxdb_out`
-/// points at a port nothing listens on, and `buffer.shutdown_grace` bounds the drain at 2s.
+/// The drain is held open by a sink request that never completes: `internal` emits its own
+/// process gauges every 100ms with no traffic needed, `influxdb_out` sends them to a listener this
+/// test accepts on and never answers, and `buffer.shutdown_grace` bounds the drain. `influxdb_out`'s
+/// HTTP client connects on its first send, not at startup, so the accept is the observable that a
+/// batch is in flight.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
+    /// The drain's bound, and the window the draining poll runs over. It is under
+    /// `influxdb_out`'s 10s default request timeout, so the held request is still pending when the
+    /// grace cuts it and the drain can't end early on a request timeout.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+    let influx = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let influx_addr = influx.local_addr().unwrap();
     let admin_addr = ephemeral_addr().await;
+    let grace_secs = SHUTDOWN_GRACE.as_secs();
     let config = TempConfig::write(
         "draining-e2e",
         format!(
             "admin:\n  bind: \"{admin_addr}\"\ncomponents:\n  self:\n    type: internal\n    \
              interval: 100ms\n  out:\n    type: influxdb_out\n    sources: [self]\n    url: \
-             \"http://127.0.0.1:1\"\n    org: o\n    bucket: b\n    token: t\n    buffer:\n      \
-             delivery: at_least_once\n      shutdown_grace: 2s\n"
+             \"http://{influx_addr}\"\n    org: o\n    bucket: b\n    token: t\n    buffer:\n      \
+             delivery: at_least_once\n      shutdown_grace: {grace_secs}s\n"
         )
         .as_bytes(),
     );
@@ -141,26 +144,14 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
     let pid = child.id();
     let _child = KillOnDrop(child);
 
-    // Wait for ready, as the test above does.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let output = logit_ready(&admin_addr);
-        if output.status.success() {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "logit ready never reported success within 10s; last attempt exited {:?} with \
-             stderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until_ready(&admin_addr).await;
 
-    // Give the undeliverable sink time to hold a batch it can't flush, so the drain SIGTERM
-    // starts is still running when probing begins.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The sink's first request, held unanswered for the rest of the test: the drain SIGTERM
+    // starts waits on it until the grace cuts it.
+    let (_held, _) = tokio::time::timeout(PROCESS_POLL_DEADLINE, influx.accept())
+        .await
+        .expect("influxdb_out never connected to send a batch")
+        .expect("accepting influxdb_out's connection");
 
     // A real SIGTERM, not `Child::kill` (SIGKILL) -- only SIGTERM starts the graceful drain this
     // test exists to probe.
@@ -174,7 +165,7 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
         std::io::Error::last_os_error()
     );
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
     let mut saw_draining = false;
     let mut last_status = String::new();
     while std::time::Instant::now() < deadline {
@@ -196,6 +187,26 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
         "logit ready never reported 'draining' during the drain window; last observed status: \
          {last_status}"
     );
+}
+
+/// Polls `logit ready` until it succeeds, returning its stdout, or panics after
+/// [`PROCESS_POLL_DEADLINE`].
+async fn wait_until_ready(admin_addr: &str) -> String {
+    let deadline = std::time::Instant::now() + PROCESS_POLL_DEADLINE;
+    loop {
+        let output = logit_ready(admin_addr);
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "logit ready never reported success within {PROCESS_POLL_DEADLINE:?}; last attempt \
+             exited {:?} with stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[test]

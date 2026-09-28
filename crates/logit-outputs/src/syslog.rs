@@ -1569,11 +1569,10 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{server_tls_config, testdata_dir, tls_settings, Collector, ReadMode};
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
     use logit_proto::Decoder;
-    use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
 
@@ -2029,34 +2028,15 @@ mod tests {
 
     // -- Sink: UDP ------------------------------------------------------------------------------
 
-    async fn udp_collector() -> (SocketAddr, Arc<UdpSocket>) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        (addr, Arc::new(socket))
-    }
-
     #[tokio::test]
     async fn udp_sends_one_datagram_per_message() {
-        let (addr, collector) = udp_collector().await;
-        let mut output = SyslogOutput::udp(addr.to_string()).unwrap();
+        let mut collector = Collector::udp().await;
+        let mut output = SyslogOutput::udp(collector.addr().to_string()).unwrap();
         let batch = batch_with(vec![log_event(0, "one", None), log_event(0, "two", None)]);
-        let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let mut received = Vec::new();
-            for _ in 0..2 {
-                let (n, _) = collector.recv_from(&mut buf).await.unwrap();
-                received.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-            }
-            received
-        });
         output.send(&batch).await.expect("send should succeed");
-        let received = tokio::time::timeout(Duration::from_secs(2), recv_task)
-            .await
-            .expect("should receive both datagrams promptly")
-            .unwrap();
-        assert_eq!(received.len(), 2);
-        assert!(received[0].ends_with("one"));
-        assert!(received[1].ends_with("two"));
+        let received = collector.take(2).await;
+        assert!(received[0].ends_with(b"one"));
+        assert!(received[1].ends_with(b"two"));
     }
 
     #[tokio::test]
@@ -2084,42 +2064,17 @@ mod tests {
 
     // -- Sink: TCP ------------------------------------------------------------------------------
 
-    /// A bare TCP receiver: reads every connection to EOF and records its bytes and the number of
-    /// connections accepted.
-    async fn tcp_collector() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let accepts = Arc::new(AtomicUsize::new(0));
-        {
-            let received = Arc::clone(&received);
-            let accepts = Arc::clone(&accepts);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = listener.accept().await else { break };
-                    accepts.fetch_add(1, Ordering::SeqCst);
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::new();
-                    let _ = stream.read_to_end(&mut buf).await;
-                    received.lock().unwrap().push(buf);
-                }
-            });
-        }
-        (addr, received, accepts)
-    }
-
     #[tokio::test]
     async fn tcp_sends_one_octet_counted_frame_per_batch() {
-        let (addr, received, accepts) = tcp_collector().await;
-        let mut output = SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
         let batch = batch_with(vec![log_event(0, "one", None), log_event(0, "two", None)]);
         output.send(&batch).await.expect("send should succeed");
         // Drop the sink so its write side closes and the collector's read_to_end returns.
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(accepts.load(Ordering::SeqCst), 1);
-        let got = received.lock().unwrap();
-        let frame = String::from_utf8_lossy(&got[0]);
+        let got = collector.next().await;
+        assert_eq!(collector.accepts(), 1);
+        let frame = String::from_utf8_lossy(&got);
         assert!(frame.contains("one") && frame.contains("two"));
     }
 
@@ -2136,11 +2091,11 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_reconnects_after_the_peer_resets_an_inherited_connection() {
-        let (addr, received, accepts) = tcp_collector().await;
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_out", "syslog", "output");
-        let mut output =
-            SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2)).with_telemetry(telemetry);
+        let mut output = SyslogOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
+            .with_telemetry(telemetry);
 
         let batch = batch_with(vec![log_event(0, "first", None)]);
         output.send(&batch).await.expect("first send should succeed against a fresh connection");
@@ -2165,9 +2120,9 @@ mod tests {
             .expect("second send should reconnect once and succeed, not surface the failure");
 
         drop(output); // closes the second connection so its `read_to_end` completes
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = collector.take(2).await;
         assert_eq!(
-            accepts.load(Ordering::SeqCst),
+            collector.accepts(),
             2,
             "the failure must cause exactly one reconnect, not be silently absorbed or looped"
         );
@@ -2177,37 +2132,8 @@ mod tests {
             "exactly one reconnect, counted (`logit.output.reconnects`, \
              docs/design/internal-telemetry.md)"
         );
-        let got = received.lock().unwrap();
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
-    }
-
-    /// [`tcp_collector`], except each connection closes after one read, as an idle-timing-out or
-    /// restarting receiver does. A clean FIN, which a plaintext sender can't detect from a write.
-    async fn tcp_collector_that_closes_after_one_read(
-    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let accepts = Arc::new(AtomicUsize::new(0));
-        {
-            let received = Arc::clone(&received);
-            let accepts = Arc::clone(&accepts);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut stream, _)) = listener.accept().await else { break };
-                    accepts.fetch_add(1, Ordering::SeqCst);
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 8192];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        buf.truncate(n);
-                        received.lock().unwrap().push(buf);
-                    }
-                    // `stream` drops here: one message read, then a clean close.
-                }
-            });
-        }
-        (addr, received, accepts)
     }
 
     /// The reuse probe (`SyslogOutput::send_tcp`): a message sent after the receiver closed the
@@ -2216,19 +2142,20 @@ mod tests {
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {
-        let (addr, received, accepts) = tcp_collector_that_closes_after_one_read().await;
+        let mut collector = Collector::tcp(ReadMode::FirstReadThenClose).await;
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_out", "syslog", "output");
-        let mut output =
-            SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2)).with_telemetry(telemetry);
+        let mut output = SyslogOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
+            .with_telemetry(telemetry);
 
         output
             .send(&batch_with(vec![log_event(0, "first", None)]))
             .await
             .expect("first send should succeed against a fresh connection");
 
-        // Let the collector's FIN arrive before the probe looks for it.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The collector closes before it reports, so its FIN is sent before the probe looks.
+        let first = collector.next().await;
+        assert!(String::from_utf8_lossy(&first).contains("first"));
 
         output
             .send(&batch_with(vec![log_event(0, "second", None)]))
@@ -2236,9 +2163,9 @@ mod tests {
             .expect("the probe should reconnect rather than write into a closed socket");
 
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = collector.next().await;
         assert_eq!(
-            accepts.load(Ordering::SeqCst),
+            collector.accepts(),
             2,
             "the probe must have dialled a second connection for the second message"
         );
@@ -2247,11 +2174,10 @@ mod tests {
             Some(1.0),
             "the replacement is an ordinary reconnect, counted like any other"
         );
-        let got = received.lock().unwrap();
-        assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
+        let second = String::from_utf8_lossy(&second);
         assert!(
-            got.iter().any(|b| String::from_utf8_lossy(b).contains("second")),
-            "the second message must actually have reached the receiver: {got:?}"
+            second.contains("second"),
+            "the second message must have reached the receiver: {second:?}"
         );
     }
 
@@ -2269,96 +2195,14 @@ mod tests {
 
     // -- Sink: TCP over TLS (RFC 5425, module doc's "TLS" section) -----------------------------
 
-    fn testdata_dir() -> std::path::PathBuf {
-        // The repo root's `testdata/tls` (`testdata/tls/README.md`), as in `otlp.rs`'s tests.
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
-    }
-
-    fn tls_settings(overrides: impl FnOnce(&mut TlsClientSettings)) -> TlsClientSettings {
-        let mut settings = TlsClientSettings::default();
-        overrides(&mut settings);
-        settings
-    }
-
-    /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` (SANs `localhost` and
-    /// `127.0.0.1`), optionally requiring a client certificate chaining to `testdata/tls/ca.pem`.
-    /// `otlp.rs`'s `test_server_tls_config` minus ALPN, which RFC 5425 predates.
-    fn server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
-        use rustls_pki_types::pem::PemObject;
-        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-
-        let dir = testdata_dir();
-        let chain: Vec<CertificateDer<'static>> =
-            CertificateDer::pem_file_iter(dir.join("server.pem"))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-        let key = PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let builder = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap();
-        let cfg = if require_client_auth {
-            let mut roots = rustls::RootCertStore::empty();
-            let ca: Vec<CertificateDer<'static>> =
-                CertificateDer::pem_file_iter(dir.join("ca.pem"))
-                    .unwrap()
-                    .collect::<Result<_, _>>()
-                    .unwrap();
-            roots.add_parsable_certificates(ca);
-            let verifier =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap();
-            builder.with_client_cert_verifier(verifier).with_single_cert(chain, key).unwrap()
-        } else {
-            builder.with_no_client_auth().with_single_cert(chain, key).unwrap()
-        };
-        Arc::new(cfg)
-    }
-
-    /// [`tcp_collector`]'s TLS twin: records each handshaken connection's plaintext to EOF. The
-    /// third return counts completed handshakes, not accepts, so a rejected client never counts.
-    /// One task per connection, so a failed handshake can't stall the accept loop.
-    async fn tls_tcp_collector(
-        require_client_auth: bool,
-    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
-        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config(require_client_auth));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let handshakes = Arc::new(AtomicUsize::new(0));
-        {
-            let received = Arc::clone(&received);
-            let handshakes = Arc::clone(&handshakes);
-            tokio::spawn(async move {
-                loop {
-                    let Ok((stream, _)) = listener.accept().await else { break };
-                    let acceptor = acceptor.clone();
-                    let received = Arc::clone(&received);
-                    let handshakes = Arc::clone(&handshakes);
-                    tokio::spawn(async move {
-                        let Ok(mut tls_stream) = acceptor.accept(stream).await else { return };
-                        handshakes.fetch_add(1, Ordering::SeqCst);
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::new();
-                        let _ = tls_stream.read_to_end(&mut buf).await;
-                        received.lock().unwrap().push(buf);
-                    });
-                }
-            });
-        }
-        (addr, received, handshakes)
-    }
-
     /// The bytes a plaintext `syslog_out` delivers for `batch`: the exact reference the TLS
     /// tests compare against.
     async fn plaintext_frame_for(batch: &EventBatch) -> Vec<u8> {
-        let (addr, received, _accepts) = tcp_collector().await;
-        let mut output = SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tcp(ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
         output.send(batch).await.expect("plaintext send should succeed");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let got = received.lock().unwrap();
-        got[0].clone()
+        collector.next().await
     }
 
     #[tokio::test]
@@ -2366,46 +2210,44 @@ mod tests {
         let batch = batch_with(vec![log_event(0, "one", None), log_event(0, "two", None)]);
         let expected = plaintext_frame_for(&batch).await;
 
-        let (addr, received, handshakes) = tls_tcp_collector(false).await;
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
         // `localhost`, not `127.0.0.1` (both SANs), so `host_only` yields a DNS SNI name.
-        let endpoint = format!("localhost:{}", addr.port());
+        let endpoint = format!("localhost:{}", collector.addr().port());
         let mut output = SyslogOutput::tcp(endpoint, Duration::from_secs(2))
             .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
             .expect("a tls: block on the TCP transport is legal");
         output.send(&batch).await.expect("send over TLS should succeed");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
-        let got = received.lock().unwrap();
+        let got = collector.next().await;
+        assert_eq!(collector.accepts(), 1);
         assert_eq!(
-            got[0], expected,
+            got, expected,
             "TLS must deliver byte-for-byte the same octet-counted frame plaintext does"
         );
     }
 
     #[tokio::test]
     async fn tls_tcp_with_a_client_certificate_satisfies_a_client_ca_requiring_collector() {
-        let (addr, received, handshakes) = tls_tcp_collector(true).await;
-        let mut output =
-            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(
-                    &tls_settings(|t| {
-                        t.ca_file = Some("ca.pem".to_string());
-                        t.cert_file = Some("client.pem".to_string());
-                        t.key_file = Some("client.key".to_string());
-                    }),
-                    &testdata_dir(),
-                )
-                .expect("a client certificate is legal on the TCP transport");
+        let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_tls(
+            &tls_settings(|t| {
+                t.ca_file = Some("ca.pem".to_string());
+                t.cert_file = Some("client.pem".to_string());
+                t.key_file = Some("client.key".to_string());
+            }),
+            &testdata_dir(),
+        )
+        .expect("a client certificate is legal on the TCP transport");
         let batch = batch_with(vec![log_event(0, "mutual", None)]);
         output.send(&batch).await.expect("mutual TLS should succeed");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
-        let got = received.lock().unwrap();
-        assert!(String::from_utf8_lossy(&got[0]).contains("mutual"));
+        let got = collector.next().await;
+        assert_eq!(collector.accepts(), 1);
+        assert!(String::from_utf8_lossy(&got).contains("mutual"));
     }
 
     /// A sink with no client certificate delivers nothing to a mutual-TLS collector.
@@ -2416,14 +2258,13 @@ mod tests {
     #[tokio::test]
     async fn tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector(
     ) {
-        let (addr, received, handshakes) = tls_tcp_collector(true).await;
-        let mut output =
-            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(
-                    &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
-                    &testdata_dir(),
-                )
-                .expect("a tls: block on the TCP transport is legal");
+        let mut collector = Collector::tls(server_tls_config(true).into(), ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+        .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "rejected", None)]);
         // Usually `Ok`, but a fast RST can fail the write; either way never `Permanent`.
         if let Err(err) = output.send(&batch).await {
@@ -2433,16 +2274,18 @@ mod tests {
             );
         }
         drop(output);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
+        // Covers the collector reading the client's certificate-less flight and rejecting it,
+        // well under 1 ms on loopback.
+        collector
+            .assert_quiet(
+                Duration::from_millis(200),
+                "nothing may reach a mutual-TLS collector from an unauthenticated client",
+            )
+            .await;
         assert_eq!(
-            handshakes.load(Ordering::SeqCst),
+            collector.accepts(),
             0,
             "a client with no certificate must not complete the handshake"
-        );
-        assert!(
-            received.lock().unwrap().is_empty(),
-            "nothing may reach a mutual-TLS collector from an unauthenticated client"
         );
     }
 
@@ -2450,20 +2293,19 @@ mod tests {
     /// so it's `Fault::Clean`.
     #[tokio::test]
     async fn tls_tcp_against_a_server_certificate_from_an_untrusted_ca_is_a_clean_fault() {
-        let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        let mut output =
-            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(
-                    &tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())),
-                    &testdata_dir(),
-                )
-                .expect("a tls: block on the TCP transport is legal");
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_tls(&tls_settings(|t| t.ca_file = Some("other-ca.pem".to_string())), &testdata_dir())
+        .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "untrusted", None)]);
         let err = output.send(&batch).await.expect_err("an untrusted CA must fail the handshake");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(handshakes.load(Ordering::SeqCst), 0);
-        assert!(received.lock().unwrap().is_empty());
+        // Covers the collector's side of the aborted handshake, well under 1 ms on loopback.
+        collector.assert_quiet(Duration::from_millis(100), "an untrusted-CA client").await;
+        assert_eq!(collector.accepts(), 0);
     }
 
     /// A `tracing` writer capturing rendered events, for asserting on a `Diagnostics::warn`,
@@ -2499,21 +2341,23 @@ mod tests {
             .finish()
             .set_default();
 
-        let (addr, received, handshakes) = tls_tcp_collector(false).await;
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
         // The bundled Mozilla roots never signed `server.pem`, so only the skip lets this connect.
-        let mut output =
-            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_diagnostics(Diagnostics::new("syslog_out"))
-                .with_tls(&tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir())
-                .expect("insecure_skip_verify is legal, if loud");
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_diagnostics(Diagnostics::new("syslog_out"))
+        .with_tls(&tls_settings(|t| t.insecure_skip_verify = true), &testdata_dir())
+        .expect("insecure_skip_verify is legal, if loud");
         let batch = batch_with(vec![log_event(0, "insecure", None)]);
         output.send(&batch).await.expect("insecure_skip_verify should bypass CA trust");
         drop(output);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = collector.next().await;
         drop(guard);
 
-        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
-        assert!(String::from_utf8_lossy(&received.lock().unwrap()[0]).contains("insecure"));
+        assert_eq!(collector.accepts(), 1);
+        assert!(String::from_utf8_lossy(&got).contains("insecure"));
         let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
         assert!(
             logged.contains("tls.insecure_skip_verify is set"),
@@ -2526,8 +2370,8 @@ mod tests {
     /// asserted if it fails.
     #[tokio::test]
     async fn a_plaintext_sink_against_a_tls_collector_delivers_nothing() {
-        let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        let mut output = SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2));
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(collector.addr().to_string(), Duration::from_secs(2));
         let batch = batch_with(vec![log_event(0, "cleartext", None)]);
         let result = output.send(&batch).await;
         if let Err(err) = &result {
@@ -2537,12 +2381,15 @@ mod tests {
             );
         }
         drop(output);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(handshakes.load(Ordering::SeqCst), 0);
-        assert!(
-            received.lock().unwrap().is_empty(),
-            "a TLS listener must never surface cleartext bytes as a message"
-        );
+        // Covers the collector reading the cleartext as a ClientHello and failing it, well under
+        // 1 ms on loopback.
+        collector
+            .assert_quiet(
+                Duration::from_millis(200),
+                "a TLS listener must never surface cleartext bytes as a message",
+            )
+            .await;
+        assert_eq!(collector.accepts(), 0);
     }
 
     // -- Sink: TCP over TLS, write/flush semantics --------------------------------------------
@@ -2864,14 +2711,13 @@ mod tests {
     /// keeps accepting, so a resend on a fresh connection would be recorded.
     #[tokio::test]
     async fn a_tls_frame_is_never_resent_after_the_peer_goes_away() {
-        let (addr, received, _handshakes) = tls_tcp_collector(false).await;
-        let mut output =
-            SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
-                .with_tls(
-                    &tls_settings(|t| t.ca_file = Some("ca.pem".to_string())),
-                    &testdata_dir(),
-                )
-                .expect("a tls: block on the TCP transport is legal");
+        let mut collector = Collector::tls(server_tls_config(false).into(), ReadMode::ToEof).await;
+        let mut output = SyslogOutput::tcp(
+            format!("localhost:{}", collector.addr().port()),
+            Duration::from_secs(2),
+        )
+        .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
+        .expect("a tls: block on the TCP transport is legal");
 
         let batch = batch_with(vec![log_event(0, "once", None)]);
         output.send(&batch).await.expect("the first send should succeed");
@@ -2889,12 +2735,15 @@ mod tests {
         }
 
         drop(output);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let got = received.lock().unwrap();
-        // Occurrences across all connections: a resend could land on either one.
-        let deliveries: usize =
-            got.iter().map(|b| String::from_utf8_lossy(b).matches("once").count()).sum();
-        assert_eq!(deliveries, 1, "the frame must reach the receiver exactly once: {got:?}");
+        let first = collector.next().await;
+        assert_eq!(
+            String::from_utf8_lossy(&first).matches("once").count(),
+            1,
+            "the frame must reach the receiver once: {first:?}"
+        );
+        // A resend would dial during `send`, so its connection closed with the drop above; the
+        // window covers the collector reading it to EOF, well under 1 ms on loopback.
+        collector.assert_quiet(Duration::from_millis(200), "a resent TLS frame").await;
     }
 
     /// Rule 44's check, repeated at construction: `tls:` on the UDP arm is an error.

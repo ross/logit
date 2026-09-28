@@ -113,6 +113,7 @@ use logit_core::{Event, EventBatch, Value};
 use logit_inputs::statsd::{StatsdDecoder, StatsdInput};
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::statsd::{Format, StatsdEncoder, StatsdOutput};
+use logit_pipeline::test_util::{recv_batch, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf};
 use logit_transforms::{Aggregator, Distributions, Sets};
@@ -211,11 +212,7 @@ impl Harness {
         let mut to_input =
             StatsdOutput::udp(self.input_addr.to_string()).unwrap().with_encoder(encoder());
         to_input.send(batch).await.expect("send to the live statsd_in");
-        let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(&mut self.rx).await;
         normalize_receipt_time(&mut decoded);
         (captured, decoded)
     }
@@ -227,11 +224,10 @@ impl Harness {
             StatsdOutput::udp(self.capture_addr.to_string()).unwrap().with_encoder(encoder);
         to_capture.send(batch).await.expect("send to the capture socket");
         let mut buf = vec![0u8; 65_536];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_millis(500), self.capture.recv_from(&mut buf))
-                .await
-                .expect("capture socket should receive the datagram")
-                .expect("recv_from should succeed");
+        let (n, _) = tokio::time::timeout(RECV_TIMEOUT, self.capture.recv_from(&mut buf))
+            .await
+            .expect("capture socket should receive the datagram")
+            .expect("recv_from should succeed");
         buf.truncate(n);
         buf
     }
@@ -242,11 +238,7 @@ impl Harness {
         let sender =
             UdpSocket::bind("127.0.0.1:0").await.expect("binding an ephemeral sender socket");
         sender.send_to(raw, self.input_addr).await.expect("sending the raw datagram");
-        let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        logit_pipeline::unwrap_batch(delivered)
+        recv_batch(&mut self.rx).await
     }
 }
 
@@ -856,7 +848,7 @@ mod tcp {
                     .with_encoder(encoder());
             to_capture.send(batch).await.expect("send to the capture listener");
             drop(to_capture); // closes the connection, EOFing the capture task's read_to_end
-            let framed = tokio::time::timeout(Duration::from_millis(500), self.capture_rx.recv())
+            let framed = tokio::time::timeout(RECV_TIMEOUT, self.capture_rx.recv())
                 .await
                 .expect("capture listener should receive the frame")
                 .expect("the capture channel should not have closed");
@@ -868,11 +860,7 @@ mod tcp {
             // Dropping it EOFs the listener's connection task, which flushes whatever it has
             // accumulated straight away rather than on the 100ms batch timer.
             drop(to_input);
-            let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
-                .await
-                .expect("statsd_in should decode and forward the batch")
-                .expect("the Fanout channel should not have closed");
-            let mut decoded = logit_pipeline::unwrap_batch(delivered);
+            let mut decoded = recv_batch(&mut self.rx).await;
             normalize_receipt_time(&mut decoded);
             (framed, decoded)
         }
@@ -976,11 +964,7 @@ mod tcp {
         client.flush().await.unwrap();
         drop(client);
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the line")
-            .expect("the Fanout channel should not have closed");
-        let batch = logit_pipeline::unwrap_batch(delivered);
+        let batch = recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1);
         assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "1.hits");
     }
@@ -1008,11 +992,7 @@ mod tcp {
         client.flush().await.unwrap();
         drop(client);
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the reassembled line")
-            .expect("the Fanout channel should not have closed");
-        let batch = logit_pipeline::unwrap_batch(delivered);
+        let batch = recv_batch(&mut rx).await;
         assert_eq!(batch.events.len(), 1, "one line, not two malformed halves");
         assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "halves.joined");
     }
@@ -1125,11 +1105,7 @@ mod tls {
         client.flush().await.unwrap();
         drop(client);
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the line")
-            .expect("the Fanout channel should not have closed");
-        logit_pipeline::unwrap_batch(delivered)
+        recv_batch(rx).await
     }
 
     fn metric_name(batch: &EventBatch) -> &'static str {
@@ -1154,11 +1130,7 @@ mod tls {
         // straight away rather than on the 100ms batch timer.
         drop(output);
 
-        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(rx).await;
         normalize_receipt_time(&mut decoded);
         decoded
     }
@@ -1302,11 +1274,7 @@ mod unix {
     }
 
     async fn next_decoded(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
-        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the packet")
-            .expect("the Fanout channel should not have closed");
-        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        let mut decoded = recv_batch(rx).await;
         normalize_receipt_time(&mut decoded);
         decoded
     }
@@ -1328,7 +1296,7 @@ mod unix {
                 .with_encoder(encoder());
             to_capture.send(&batch).await.expect("send to the capture socket");
             let mut buf = vec![0u8; 65_536];
-            let n = tokio::time::timeout(Duration::from_secs(2), capture.recv(&mut buf))
+            let n = tokio::time::timeout(RECV_TIMEOUT, capture.recv(&mut buf))
                 .await
                 .expect("the capture socket should receive the datagram")
                 .unwrap();
@@ -1379,7 +1347,7 @@ mod unix {
                 .with_encoder(encoder());
             to_capture.send(&batch).await.expect("send to the capture listener");
             drop(to_capture); // EOFs the capture task's read_to_end
-            let framed = tokio::time::timeout(Duration::from_secs(2), capture_rx.recv())
+            let framed = tokio::time::timeout(RECV_TIMEOUT, capture_rx.recv())
                 .await
                 .expect("the capture listener should receive the frame")
                 .unwrap();
