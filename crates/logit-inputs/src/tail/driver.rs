@@ -1446,6 +1446,9 @@ fn now_nanos() -> i64 {
 }
 
 #[cfg(test)]
+mod verification;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tail::line::LineDecoder;
@@ -1462,7 +1465,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// A stand-in for `tail_in`'s private `LineDecoderFactory`.
-    struct LineFactory;
+    pub(super) struct LineFactory;
 
     impl DecoderFactory<LineDecoder> for LineFactory {
         fn accept(&mut self, _path: &Path) -> bool {
@@ -1500,13 +1503,13 @@ mod tests {
     }
 
     /// A `due` for a test that calls `Tailer::drain` directly and wants it to run until idle.
-    fn no_timer_due() -> tokio::time::Instant {
+    pub(super) fn no_timer_due() -> tokio::time::Instant {
         tokio::time::Instant::now() + Duration::from_secs(3600)
     }
 
     /// Poll/checkpoint/flush intervals short enough for a test to see real ticks within a couple
     /// hundred milliseconds.
-    fn fast_config(read_from: ReadFrom) -> TailConfig {
+    pub(super) fn fast_config(read_from: ReadFrom) -> TailConfig {
         TailConfig {
             checkpoint_path: None,
             read_from,
@@ -1533,7 +1536,7 @@ mod tests {
         Running { shutdown, handle }
     }
 
-    fn messages(events: &[Event]) -> Vec<String> {
+    pub(super) fn messages(events: &[Event]) -> Vec<String> {
         events
             .iter()
             .map(|e| e.log.as_ref().unwrap().message.as_str().unwrap().to_string())
@@ -5250,4 +5253,5 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
     }
+
 }
