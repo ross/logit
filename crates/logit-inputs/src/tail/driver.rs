@@ -3454,7 +3454,8 @@ mod tests {
         assert_eq!(tick(&mut tailer, true).await.len(), 2);
         let txt_id = FileId::from_metadata(&std::fs::metadata(&txt).unwrap());
 
-        // One `ReadDir` per pattern per scan, in pattern order: the 2nd is `*.txt`'s.
+        // The directory is empty by the failing scan, so each pattern's listing is one `ReadDir`
+        // point, in pattern order: the 2nd is `*.txt`'s.
         let scope = fault::scope(&dir);
         scope.fail_nth(READ_DIR, 2, errno::EACCES);
         std::fs::remove_file(&log).unwrap();
@@ -3489,9 +3490,40 @@ mod tests {
         scope.record();
         assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
         let ops = |op| scope.hits().iter().filter(|h| h.point.op == op).count();
-        assert_eq!(ops(fault::Op::ReadDir), 2, "one listing per pattern");
+        // Per pattern: the `read_dir` itself and its one entry.
+        assert_eq!(ops(fault::Op::ReadDir), 4, "one listing per pattern");
         assert_eq!(ops(fault::Op::Stat), 1, "one stat per distinct path");
         drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An error from the listing's iterator fails the listing: what it already returned isn't
+    /// the whole directory, so nothing it left out is retired.
+    #[tokio::test]
+    async fn a_listing_that_fails_part_way_through_retires_nothing() {
+        let dir = scratch_dir("scan-fails-part-way");
+        for name in ["a.log", "b.log", "c.log"] {
+            std::fs::write(dir.join(name), format!("{name}\n")).unwrap();
+        }
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await.len(), 3);
+
+        // The 1st `ReadDir` point is the `read_dir` call, the 2nd the first entry it yields.
+        let scope = fault::scope(&dir);
+        scope.fail_nth(READ_DIR, 2, errno::EIO);
+        tick(&mut tailer, false).await;
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        assert!(diagnosed(&mut probe, "scan_error"));
+        assert_eq!(tailer.tracked_len(), 3);
+        for name in ["a.log", "b.log", "c.log"] {
+            assert_eq!(state_of(&tailer, &dir.join(name)), Some(FileState::Active), "{name}");
+        }
+        drop(scope);
+
+        append(&dir.join("b.log"), b"more\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["more"], "no replay after recovery");
         std::fs::remove_dir_all(&dir).ok();
     }
 

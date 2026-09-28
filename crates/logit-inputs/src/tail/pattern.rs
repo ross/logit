@@ -31,7 +31,7 @@ use std::fs::DirEntry;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The fault-seam point before a pattern directory's `read_dir`.
+/// The fault-seam point before a pattern directory's `read_dir`, and before each entry of it.
 pub(crate) const READ_DIR: Point = Point::new(sites::TAIL_SCAN, Op::ReadDir);
 /// The fault-seam point before a `stat`: `docker_in`'s two per-container checks (the `root`
 /// entry's type and the log's `metadata`, both keyed on the built log path) and
@@ -172,7 +172,8 @@ impl PathPattern {
         };
         let mut out = Scan::default();
         for entry in entries {
-            let entry = entry?;
+            // An entry's error fails the whole listing: a partial one can't say what's gone.
+            let entry = fault::check(READ_DIR, &self.dir, 0).and(entry)?;
             let Ok(name) = entry.file_name().into_string() else {
                 continue; // non-UTF-8 name: can't match a str-based pattern, skip it
             };
