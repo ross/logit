@@ -151,11 +151,12 @@ impl LineSplitter {
     }
 
     /// The file is closing: returns the held unterminated line, if any. A final line with no
-    /// `\n` is still data. An oversized line already being dropped isn't returned.
+    /// `\n` is still data. An oversized line already being dropped isn't returned, and the drop
+    /// stays in place: [`LineSplitter::pending_bytes`] still covers it, so the checkpoint written
+    /// at shutdown stays at the dropped line's start, and a later `push` continues the drop to
+    /// its `\n`.
     pub fn take_partial(&mut self) -> Option<Bytes> {
-        self.dropping = false;
-        self.dropping_len = 0;
-        if self.partial.is_empty() {
+        if self.dropping || self.partial.is_empty() {
             return None;
         }
         Some(strip_cr(self.partial.split().freeze()))
@@ -458,15 +459,17 @@ mod tests {
     }
 
     #[test]
-    fn take_partial_mid_drop_returns_none_and_the_next_push_starts_a_new_line() {
+    fn take_partial_mid_drop_returns_none_and_keeps_the_drop_in_place() {
         let mut s = LineSplitter::new(4);
         assert_eq!(push_starts(&mut s, b"toolo"), (vec![], 1));
         assert_eq!(s.take_partial(), None);
-        assert_eq!(s.pending_bytes(), 0);
+        assert_eq!(s.pending_bytes(), 5, "the drop still pins the checkpoint to its start");
         assert_eq!(
             push_starts(&mut s, b"ng\nok\n"),
-            (vec![(b"ng".to_vec(), Some(0)), (b"ok".to_vec(), Some(3))], 0)
+            (vec![(b"ok".to_vec(), Some(3))], 0),
+            "the drop continues to its newline and isn't counted again"
         );
+        assert_eq!(s.pending_bytes(), 0);
     }
 
     /// `Tailer::write_checkpoint` subtracts `pending_bytes`, so while dropping it must cover the

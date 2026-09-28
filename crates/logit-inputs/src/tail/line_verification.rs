@@ -141,14 +141,14 @@ impl Model {
         (emits, dropped)
     }
 
+    /// A line being dropped is left in place, still held and still counted; anything else is
+    /// taken and the next byte starts a fresh line.
     fn take_partial(&mut self) -> Option<Vec<u8>> {
-        let taken = if self.counted || self.cur.is_empty() {
-            None
-        } else {
-            Some(strip_one_cr(&self.cur).0.to_vec())
-        };
+        if self.counted {
+            return None;
+        }
+        let taken = (!self.cur.is_empty()).then(|| strip_one_cr(&self.cur).0.to_vec());
         self.cur.clear();
-        self.counted = false;
         taken
     }
 }
@@ -249,15 +249,23 @@ impl Harness {
     }
 
     fn take_partial(&mut self) {
+        let pending_before = self.real.pending_bytes();
+        let dropping = self.model.counted;
         let got = self.real.take_partial().map(|b| b.to_vec());
         let want = self.model.take_partial();
         assert_eq!(got, want, "take_partial");
         if let Some(line) = got {
             self.lines_out.push(line);
         }
-        self.resets.push(self.offset);
-        assert_eq!(self.real.pending_bytes(), 0, "take_partial leaves nothing pending");
+        if dropping {
+            assert_eq!(self.real.pending_bytes(), pending_before, "a drop survives take_partial");
+        } else {
+            self.resets.push(self.offset);
+            assert_eq!(self.real.pending_bytes(), 0, "take_partial leaves nothing pending");
+        }
         self.check_held();
+        let checkpoint = self.offset - self.real.pending_bytes();
+        assert!(self.is_line_start(checkpoint), "the checkpoint {checkpoint} is inside a line");
     }
 
     /// Re-splits the whole input, independently of the step-wise model, and checks every line
@@ -288,10 +296,12 @@ impl Harness {
             }
             if !taken {
                 trailing = last;
-            } else if last.len() > max {
-                dropped += 1;
-            } else if !last.is_empty() {
-                lines.push(strip_one_cr(last).0.to_vec());
+            } else {
+                // A drop survives `take_partial`, so a reset never ends a line over the limit.
+                assert!(last.len() <= max, "a reset split an oversized line");
+                if !last.is_empty() {
+                    lines.push(strip_one_cr(last).0.to_vec());
+                }
             }
         }
         if trailing.len() > max {

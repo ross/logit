@@ -856,8 +856,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// decoder still holds. A line rejected or dropped after that held run advances `offset`
     /// without clearing it, which is why it's a position and not a byte count to subtract. A file
     /// mid-drop checkpoints at the dropped line's start ([`LineSplitter::pending_bytes`]), so a
-    /// restart drops it whole again. At shutdown `close_all_for_shutdown` has already emitted
-    /// both, so the offset is the file's full `offset`.
+    /// restart drops it whole again, at shutdown too. Otherwise, at shutdown
+    /// `close_all_for_shutdown` has already emitted both, so the offset is the file's full
+    /// `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let entries = self.files.values().map(|f| {
@@ -2436,11 +2437,53 @@ mod tests {
         .await;
         assert_eq!(checkpointed_offset(&checkpoint_path), Some(4));
 
-        // Shutdown's forced write moves the offset to the end of what was read, so keep the
-        // interval checkpoint and put it back afterwards, as a crash here would leave it.
+        // Restore the interval checkpoint after the stop, as a crash here would leave it, so the
+        // restart doesn't depend on shutdown's forced write.
         let crashed = std::fs::read(&checkpoint_path).unwrap();
         running.stop().await;
         std::fs::write(&checkpoint_path, crashed).unwrap();
+
+        append(&path, b"ng\nok\n");
+        let diag = Diagnostics::new("test");
+        let (fanout, mut rx) = fanout_channel(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_diagnostics(diag.clone());
+        let running = spawn_tailer(tailer, fanout);
+
+        assert_eq!(
+            messages(&recv_events(&mut rx, 1).await),
+            vec!["ok"],
+            "the dropped line's tail must not be emitted as a line"
+        );
+        assert_eq!(diag.occurrences("long_line"), 1, "the restart drops the line again");
+
+        running.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shutdown's forced checkpoint also stays at the start of a line being dropped, since
+    /// `take_partial` leaves the drop in place.
+    #[tokio::test]
+    async fn a_shutdown_mid_drop_checkpoints_at_the_dropped_lines_start() {
+        let dir = scratch_dir("shutdown-mid-drop");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        // "one\n" is 4 bytes; "toolo" is over the limit with its newline not yet written.
+        std::fs::write(&path, b"one\ntoolo").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.max_line_bytes = 4;
+        let diag = Diagnostics::new("test");
+        let (fanout, mut rx) = fanout_channel(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone())
+            .with_diagnostics(diag.clone());
+        let running = spawn_tailer(tailer, fanout);
+
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["one"]);
+        assert_eq!(diag.occurrences("long_line"), 1, "the read reached the oversized line");
+        running.stop().await;
+        assert_eq!(checkpointed_offset(&checkpoint_path), Some(4));
 
         append(&path, b"ng\nok\n");
         let diag = Diagnostics::new("test");

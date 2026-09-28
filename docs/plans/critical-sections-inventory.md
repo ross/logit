@@ -1615,7 +1615,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     single-chunk and spanning branches of `push`.
   - `dropped_lines` counts each oversized line exactly once, not once per chunk (`push`'s
     spanning branch and its `dropping` flag).
-  - `take_partial` clears `dropping` and yields `None` when the held content was already dropped.
+  - ~~`take_partial` clears `dropping`~~ **changed (#440):** `take_partial` leaves a drop in
+    place, and yields `None` when the held content was already dropped.
   - A `\r` that is real data at end-of-line is indistinguishable from CRLF framing — accepted.
 - **Observed concerns (unverified):** the newline search is a byte-at-a-time
   `iter().position()` in `push` rather than `memchr`; on a 64 KiB chunk of long lines this is the
@@ -1637,6 +1638,8 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   tests. One real bug: while dropping, `pending_bytes` was 0, so a checkpoint landed inside the
   dropped line and a restart emitted its tail as a line; it now covers the dropped line, and a
   restart drops it whole again (`a_checkpoint_taken_mid_drop_stays_at_the_dropped_lines_start`).
+  `take_partial` now leaves a drop in place, so shutdown's forced checkpoint also stays at the
+  dropped line's start (`a_shutdown_mid_drop_checkpoints_at_the_dropped_lines_start`).
 
 ### TAIL-05 — Checkpoint persistence: atomicity, durability, and the corrupt-file fallback
 - **Location:** `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore::load`,
