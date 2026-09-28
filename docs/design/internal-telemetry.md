@@ -370,7 +370,8 @@ both modes, a zero delta included: a cumulative `aggregate` evicts a series idle
 sees depends on the leg:
 
 - **Prometheus behind `aggregate` with `temporality: cumulative`:**
-  `logit_process_cpu_seconds_total{mode}`, where `rate()` is cores in use.
+  `logit_process_cpu_seconds_total{mode}`, where `rate()` is cores in use per `mode` (sum over
+  `mode` for the total).
 - **`prometheus_out` without a cumulative `aggregate`:** it skips a delta `Sum` and counts it as
   `logit.output.metrics.skipped{metric_kind="delta_sum"}`.
 - **InfluxDB behind a delta `aggregate`:** CPU seconds per window per mode, so the value divided by
@@ -381,13 +382,15 @@ sees depends on the leg:
 ```text
 resident ≈ allocated
          + jemalloc overhead and fragmentation
-         + LuaJIT heaps
+         + LuaJIT machine code
          + the binary's mapped pages and thread stacks
          + the UDP read slab
 ```
 
-LuaJIT allocates through its own `lj_alloc` over `mmap`, outside the Rust global allocator, so its
-heaps show in `resident` and never in `allocated`. `logit.script.vm.memory` reports them per VM.
+mlua creates each Lua VM with an allocator over the Rust global allocator, so LuaJIT's GC heaps
+count in `allocated` as well as `resident`. A script that retains memory raises both, and
+`logit.script.vm.memory` attributes that share per VM. Only LuaJIT's machine-code areas, mapped
+directly with `mmap`, sit outside `allocated`.
 
 ### Reading an attribution dump
 
