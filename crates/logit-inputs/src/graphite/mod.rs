@@ -387,6 +387,7 @@ mod tests {
     use logit_core::interner::resolve;
     use logit_core::telemetry::Registry;
     use logit_core::{Event, MetricKind, Value};
+    use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::unwrap_batch;
     use logit_proto::Decoder as _;
     use rustls_pki_types::pem::PemObject;
@@ -447,6 +448,16 @@ mod tests {
         let handle =
             tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
         Running { addr, rx, shutdown, handle, registry }
+    }
+
+    /// Waits until the connection has read and accumulated one frame. The driver counts
+    /// `logit.input.frames` in `absorb_frame` before decoding and accumulating the frame, with
+    /// no `.await` between, and the connection task watches for shutdown only while waiting on
+    /// a read, so a shutdown or an RST after this can't lose the line.
+    async fn wait_for_one_frame(probe: &mut TelemetryProbe) {
+        probe
+            .wait_for("the listener to read one frame", |t| t.sum("logit.input.frames", &[]) >= 1.0)
+            .await;
     }
 
     /// A `receive:` block with no flush timer, so only a bound or shutdown completes a batch.
@@ -767,10 +778,11 @@ mod tests {
             Protocol::Plaintext,
         )
         .await;
+        let mut probe = TelemetryProbe::with_registry(running.registry.clone());
         let mut stream = running.connect().await;
         stream.write_all(line("drained.path").as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_one_frame(&mut probe).await;
         assert!(
             running.rx.try_recv().is_err(),
             "with no flush timer and a bound of 1000 events, nothing should have been sent yet"
@@ -779,9 +791,8 @@ mod tests {
         running.shutdown.send(true).expect("the receiver is alive");
         let batch = running.next_batch("the shutdown drain").await;
         assert_eq!(resolve(batch.events[0].metrics[0].name), "drained.path");
-        let drained = running.registry.drain(0);
         assert_eq!(
-            metric_sum(&drained, "logit.component.receive.flushed", Some(("reason", "shutdown"))),
+            probe.sum("logit.component.receive.flushed", &[("reason", "shutdown")]),
             1.0,
             "the component going away is the one thing that is really a shutdown"
         );
@@ -864,7 +875,7 @@ mod tests {
     }
 
     /// A read error (an RST, via `SO_LINGER 0`) still flushes what the connection accumulated.
-    /// The sleep lets the listener read the line first: an RST discards the receive buffer.
+    /// The frame wait lets the listener read the line first: an RST discards the receive buffer.
     #[tokio::test]
     async fn a_read_error_still_flushes_what_the_connection_accumulated() {
         let mut running = start(
@@ -873,11 +884,12 @@ mod tests {
             Protocol::Plaintext,
         )
         .await;
+        let mut probe = TelemetryProbe::with_registry(running.registry.clone());
         let stream = running.connect().await;
         let mut stream = stream;
         stream.write_all(line("reset.path").as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_one_frame(&mut probe).await;
         #[allow(deprecated)]
         stream.set_linger(Some(Duration::ZERO)).expect("SO_LINGER should be settable on loopback");
         drop(stream); // RST, not FIN

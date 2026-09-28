@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c912882c416e7ea8debb7b8ccaf38b5422ccf61b927879265c05847697c54573 # shrinks to specs = [RecordSpec { trace_id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], span_id: [0, 0, 0, 0, 0, 0, 0, 0], magic_at: None }, RecordSpec { trace_id: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 2, 117, 22, 84, 44], span_id: [137, 223, 157, 213, 160, 39, 25, 45], magic_at: Some(12) }, RecordSpec { trace_id: [34, 59, 57, 188, 113, 27, 160, 192, 0, 4, 234, 240, 137, 169, 141, 62], span_id: [144, 231, 181, 251, 238, 87, 185, 53], magic_at: None }, RecordSpec { trace_id: [128, 127, 235, 80, 193, 215, 226, 0, 27, 18, 103, 190, 249, 14, 241, 249], span_id: [0, 4, 196, 243, 44, 200, 16, 147], magic_at: None }], mutation = Insert { at: Index(9137950036896871591), bytes: [0, 129, 13, 44, 13] }

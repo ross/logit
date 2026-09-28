@@ -1607,14 +1607,17 @@ mod tests {
         let (addr, log) = acking(|_| false).await;
         let registry = Registry::new();
         let started = std::time::Instant::now();
-        let mut out = acked_sink(addr, &registry, Duration::from_millis(12));
+        let mut out = acked_sink(addr, &registry, Duration::from_millis(120));
+        out.ack_backoff = ACK_BACKOFF.map(|wait| wait / 100);
         let err = out.send(&logs(1)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
-        assert!(started.elapsed() >= Duration::from_millis(12));
-        // At most 0.5, 1.5, 3.5, 8.5, and the deadline at 12; a slow poll can push the deadline
-        // ahead of a scheduled one.
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        // At least one: `await_acks` polls before every deadline check. At most five: with waits
+        // of 5, 10, 20, and 50 ms, polls start no earlier than 5, 15, 35, and 85 ms, and the fifth
+        // waits until min(135, 120) ms, past the deadline. A slow poll delays every later one, so
+        // it can only remove polls.
         let polls = paths(&log).iter().filter(|p| p.ends_with("/ack")).count();
-        assert!((2..=5).contains(&polls), "{polls} polls");
+        assert!((1..=5).contains(&polls), "{polls} polls");
         assert_eq!(total(&registry.drain(0), ACKS, &[("result", "timeout")]), 1.0);
     }
 
