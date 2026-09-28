@@ -2458,6 +2458,7 @@ mod tests {
     use crate::graph;
     use crate::queue::OverflowPolicy;
     use crate::readiness::Phase;
+    use crate::test_util::{TelemetryProbe, Totals};
     use logit_config::{Component, ComponentKind, Config};
     use logit_core::{AttrMap, Event, MetricKind, Provenance, Registry, SpanLink, SpanStatus};
     use std::collections::HashMap as Map;
@@ -5236,18 +5237,10 @@ mod tests {
             .expect("task should not panic")
             .expect("shutdown-grace expiry should end run_output with Ok, not Err");
 
-        let dropped_for_shutdown: f64 = registry
-            .drain(0)
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
-            .filter_map(|m| match &m.kind {
-                MetricKind::Sum(s) => Some(s.value),
-                _ => None,
-            })
-            .sum();
+        let dropped_for_shutdown = Totals::of(registry.drain(0)).sum(
+            "logit.component.batches.dropped",
+            &[("component", "out"), ("reason", "shutdown")],
+        );
 
         assert_eq!(
             dropped_for_shutdown, 3.0,
@@ -5301,8 +5294,8 @@ mod tests {
         });
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let registry = Registry::new();
-        let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
 
         let run = tokio::spawn(run_output(
             "out".to_string(),
@@ -5341,7 +5334,13 @@ mod tests {
             ))
             .await
             .expect("receiver should still be alive");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // `drain_inbox` counts a batch received before its push, which parks on the full
+        // spool; waiting for batch 2's count keeps batch 3 in the channel.
+        probe
+            .wait_for("batch 2 received by drain_inbox", |t| {
+                t.sum("logit.component.batches.received", &[]) >= 2.0
+            })
+            .await;
 
         // Batch 3: stays unread in the channel for the sweep.
         inbox_tx
@@ -5365,18 +5364,10 @@ mod tests {
             .expect("task should not panic")
             .expect("shutdown-grace expiry should end run_output with Ok, not Err");
 
-        let dropped_for_shutdown: f64 = registry
-            .drain(0)
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
-            .filter_map(|m| match &m.kind {
-                MetricKind::Sum(s) => Some(s.value),
-                _ => None,
-            })
-            .sum();
+        let dropped_for_shutdown = probe.sum(
+            "logit.component.batches.dropped",
+            &[("component", "out"), ("reason", "shutdown")],
+        );
         assert_eq!(
             dropped_for_shutdown, 0.0,
             "a disk-backed sink drops nothing at shutdown -- everything still queued at shutdown \
@@ -5486,21 +5477,6 @@ mod tests {
             reopened.commit().unwrap();
         }
         spooled
-    }
-
-    /// Sums `logit.component.batches.dropped` for component `out` under `reason`.
-    fn batches_dropped(events: &[logit_core::Event], reason: &str) -> f64 {
-        events
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some("out"))
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some(reason))
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
-            .filter_map(|m| match &m.kind {
-                MetricKind::Sum(s) => Some(s.value),
-                _ => None,
-            })
-            .sum()
     }
 
     fn slow_retry_write_config(total_budget: Duration, grace: Duration) -> WriteLoopConfig {
@@ -5642,12 +5618,18 @@ mod tests {
                     drop(held_open);
                     drop(shutdown_tx);
 
-                    let events = registry.drain(0);
-                    let count = |name: &str| counter_sum(&events, "out", name, None);
+                    let totals = Totals::of(registry.drain(0));
+                    let count = |name: &str| totals.sum(name, &[("component", "out")]);
                     let received = count("logit.component.batches.received");
                     let delivered = count("logit.component.batches.delivered");
-                    let send_failed = batches_dropped(&events, "send_failed");
-                    let shutdown = batches_dropped(&events, "shutdown");
+                    let send_failed = totals.sum(
+                        "logit.component.batches.dropped",
+                        &[("component", "out"), ("reason", "send_failed")],
+                    );
+                    let shutdown = totals.sum(
+                        "logit.component.batches.dropped",
+                        &[("component", "out"), ("reason", "shutdown")],
+                    );
                     let spooled =
                         if disk { reopen_and_drain(&dir).await.len() as f64 } else { 0.0 };
                     assert_eq!(received, SENT as f64, "{at}: every batch sent is received");
@@ -5715,12 +5697,12 @@ mod tests {
         };
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let registry = Registry::new();
+        let mut probe = TelemetryProbe::new();
         let run = tokio::spawn(run_output(
             "out".to_string(),
             Box::new(output),
             inbox_rx,
-            registry.telemetry_for("out", "influxdb_out", "sink"),
+            probe.telemetry("out", "influxdb_out", "sink"),
             SinkStoreConfig::Disk(disk_store_config(&dir, one_counter_record_len())),
             slow_retry_write_config(Duration::from_secs(3600), Duration::from_millis(100)),
             shutdown_rx,
@@ -5729,7 +5711,13 @@ mod tests {
 
         inbox_tx.send(counter_batch(1.0)).await.unwrap();
         inbox_tx.send(counter_batch(2.0)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await; // batch 2 parks in the push
+        // `drain_inbox` counts a batch received before its push, which parks on the full
+        // spool.
+        probe
+            .wait_for("batch 2 parked in the push", |t| {
+                t.sum("logit.component.batches.received", &[]) >= 2.0
+            })
+            .await;
         shutdown_tx.send(true).unwrap();
 
         tokio::time::timeout(Duration::from_secs(5), run)
@@ -5739,7 +5727,13 @@ mod tests {
             .expect("shutdown-grace expiry ends run_output with Ok");
         drop(inbox_tx);
 
-        assert_eq!(batches_dropped(&registry.drain(0), "shutdown"), 0.0);
+        assert_eq!(
+            probe.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            0.0
+        );
         assert_eq!(reopen_and_drain(&dir).await, vec![1.0, 2.0]);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5778,7 +5772,13 @@ mod tests {
             .expect("the task must not panic")
             .expect("budget-exhausted drops don't fail the sink");
 
-        assert_eq!(batches_dropped(&registry.drain(0), "send_failed"), 2.0);
+        assert_eq!(
+            Totals::of(registry.drain(0)).sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "send_failed")]
+            ),
+            2.0
+        );
         assert!(
             reopen_and_drain(&dir).await.is_empty(),
             "a batch dropped after its retry budget is committed, so a restart doesn't replay it"
@@ -5813,7 +5813,7 @@ mod tests {
         store_config: SinkStoreConfig,
         posture: DeliveryPosture,
         batches: u64,
-    ) -> (Vec<Event>, u64) {
+    ) -> (Totals, u64) {
         let registry = Registry::with_span_sampling(1.0);
         let drain_total = Arc::new(AtomicU64::new(0));
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
@@ -5842,7 +5842,7 @@ mod tests {
             .expect("run_output ends within its grace")
             .expect("the task must not panic")
             .expect("grace expiry is not a failure");
-        (registry.drain(0), drain_total.load(std::sync::atomic::Ordering::Relaxed))
+        (Totals::of(registry.drain(0)), drain_total.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     #[tokio::test(start_paused = true)]
@@ -5853,13 +5853,20 @@ mod tests {
                 true => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
                 false => SinkStoreConfig::Memory(SinkQueueConfig::default()),
             };
-            let (events, drain_total) =
+            let (totals, drain_total) =
                 run_never_delivering_sink(store_config, DeliveryPosture::AtMostOnce, 1).await;
 
-            assert_eq!(batches_dropped(&events, "shutdown"), 1.0, "disk={disk}");
+            assert_eq!(
+                totals.sum(
+                    "logit.component.batches.dropped",
+                    &[("component", "out"), ("reason", "shutdown")]
+                ),
+                1.0,
+                "disk={disk}"
+            );
             assert_eq!(drain_total, 1, "disk={disk}");
             assert_eq!(
-                deliver_fault_tags(&events),
+                deliver_fault_tags(&totals.events),
                 vec![(SpanStatus::Error, "ambiguous".to_string())],
                 "disk={disk}: the cut-off send's span is an ambiguous error"
             );
@@ -5881,21 +5888,33 @@ mod tests {
                 true => SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
                 false => SinkStoreConfig::Memory(SinkQueueConfig::default()),
             };
-            let (events, drain_total) =
+            let (totals, drain_total) =
                 run_never_delivering_sink(store_config, DeliveryPosture::AtLeastOnce, 1).await;
 
             assert_eq!(
-                deliver_fault_tags(&events),
+                deliver_fault_tags(&totals.events),
                 vec![(SpanStatus::Error, "ambiguous".to_string())],
                 "disk={disk}"
             );
             if disk {
-                assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
+                assert_eq!(
+                    totals.sum(
+                        "logit.component.batches.dropped",
+                        &[("component", "out"), ("reason", "shutdown")]
+                    ),
+                    0.0
+                );
                 assert_eq!(drain_total, 0);
                 assert_eq!(reopen_and_drain(&dir).await, vec![1.0], "the batch replays");
             } else {
                 // Left uncommitted, so `SinkStore::finish` counts it: once, not twice.
-                assert_eq!(batches_dropped(&events, "shutdown"), 1.0);
+                assert_eq!(
+                    totals.sum(
+                        "logit.component.batches.dropped",
+                        &[("component", "out"), ("reason", "shutdown")]
+                    ),
+                    1.0
+                );
                 assert_eq!(drain_total, 1);
             }
             std::fs::remove_dir_all(&dir).ok();
@@ -5906,20 +5925,24 @@ mod tests {
     /// once by `finish_and_flush`.
     #[tokio::test(start_paused = true)]
     async fn a_head_left_reserved_by_a_grace_cut_delivery_is_dropped_and_counted_by_finish() {
-        let (events, drain_total) = run_never_delivering_sink(
+        let (totals, drain_total) = run_never_delivering_sink(
             SinkStoreConfig::Memory(SinkQueueConfig::default()),
             DeliveryPosture::AtLeastOnce,
             2,
         )
         .await;
-        assert_eq!(counter_sum(&events, "out", "logit.component.batches.received", None), 2.0);
-        assert_eq!(batches_dropped(&events, "shutdown"), 2.0);
+        assert_eq!(totals.sum("logit.component.batches.received", &[("component", "out")]), 2.0);
         assert_eq!(
-            counter_sum(
-                &events,
-                "out",
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            totals.sum(
                 "logit.component.events.dropped",
-                Some(("reason", "shutdown"))
+                &[("component", "out"), ("reason", "shutdown")]
             ),
             2.0
         );
@@ -5975,10 +5998,16 @@ mod tests {
 
         assert_eq!(handles.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(store.commit().is_some(), "the batch is still queued for finish_and_flush");
-        let events = registry.drain(0);
-        assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            0.0
+        );
         assert_eq!(drain_total.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert!(deliver_fault_tags(&events).is_empty(), "no send was cut off: no fault tag");
+        assert!(deliver_fault_tags(&totals.events).is_empty(), "no send was cut off: no fault tag");
     }
 
     /// Completes its send at `at`, and counts it.
@@ -6031,13 +6060,20 @@ mod tests {
             .expect("grace expiry is Ok");
 
             assert_eq!(tokio::time::Instant::now(), signalled + grace, "iteration {iteration}");
-            let events = registry.drain(0);
+            let totals = Totals::of(registry.drain(0));
             assert_eq!(
-                counter_sum(&events, "out", "logit.component.batches.delivered", None),
+                totals.sum("logit.component.batches.delivered", &[("component", "out")]),
                 1.0,
                 "iteration {iteration}"
             );
-            assert_eq!(batches_dropped(&events, "shutdown"), 0.0, "iteration {iteration}");
+            assert_eq!(
+                totals.sum(
+                    "logit.component.batches.dropped",
+                    &[("component", "out"), ("reason", "shutdown")]
+                ),
+                0.0,
+                "iteration {iteration}"
+            );
             assert_eq!(drain_total.load(std::sync::atomic::Ordering::Relaxed), 0);
             assert!(store.commit().is_none(), "iteration {iteration}: delivered and committed");
         }
@@ -6074,7 +6110,7 @@ mod tests {
         retry: RetryConfig,
         grace: Duration,
         batches: u64,
-    ) -> Vec<Event> {
+    ) -> Totals {
         let registry = Registry::with_span_sampling(1.0);
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
         let (shutdown_tx, shutdown_rx) = watch::channel(true);
@@ -6102,7 +6138,7 @@ mod tests {
             .expect("the task must not panic")
             .expect("grace expiry is not a failure");
         drop(shutdown_tx);
-        registry.drain(0)
+        Totals::of(registry.drain(0))
     }
 
     /// The first send completes in the grace deadline's wake. The second batch then either loses
@@ -6127,7 +6163,7 @@ mod tests {
                     first_fails: false,
                     attempts: Arc::clone(&attempts),
                 };
-                let events = run_with_grace_anchored_at_start(
+                let totals = run_with_grace_anchored_at_start(
                     output,
                     store_config,
                     fast_retry_config(),
@@ -6138,17 +6174,31 @@ mod tests {
 
                 assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "{at}");
                 assert_eq!(
-                    counter_sum(&events, "out", "logit.component.batches.delivered", None),
+                    totals.sum("logit.component.batches.delivered", &[("component", "out")]),
                     1.0,
                     "{at}"
                 );
-                assert!(deliver_fault_tags(&events).is_empty(), "{at}: nothing was cut off");
+                assert!(deliver_fault_tags(&totals.events).is_empty(), "{at}: nothing was cut off");
                 if disk {
-                    assert_eq!(batches_dropped(&events, "shutdown"), 0.0, "{at}");
+                    assert_eq!(
+                        totals.sum(
+                            "logit.component.batches.dropped",
+                            &[("component", "out"), ("reason", "shutdown")]
+                        ),
+                        0.0,
+                        "{at}"
+                    );
                     assert_eq!(reopen_and_drain(&dir).await, vec![2.0], "{at}: batch 2 replays");
                 } else {
                     // `finish`'s count, the only one: batch 2 was never committed by the cut.
-                    assert_eq!(batches_dropped(&events, "shutdown"), 1.0, "{at}");
+                    assert_eq!(
+                        totals.sum(
+                            "logit.component.batches.dropped",
+                            &[("component", "out"), ("reason", "shutdown")]
+                        ),
+                        1.0,
+                        "{at}"
+                    );
                 }
                 std::fs::remove_dir_all(&dir).ok();
             }
@@ -6173,7 +6223,7 @@ mod tests {
             base_delay: grace,
             max_delay: grace,
         };
-        let events = run_with_grace_anchored_at_start(
+        let totals = run_with_grace_anchored_at_start(
             output,
             SinkStoreConfig::Disk(disk_store_config(&dir, u64::MAX)),
             retry,
@@ -6183,8 +6233,14 @@ mod tests {
         .await;
 
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1, "no second attempt");
-        assert_eq!(batches_dropped(&events, "shutdown"), 0.0);
-        assert!(deliver_fault_tags(&events).is_empty(), "nothing was cut off");
+        assert_eq!(
+            totals.sum(
+                "logit.component.batches.dropped",
+                &[("component", "out"), ("reason", "shutdown")]
+            ),
+            0.0
+        );
+        assert!(deliver_fault_tags(&totals.events).is_empty(), "nothing was cut off");
         assert_eq!(reopen_and_drain(&dir).await, vec![1.0], "the batch replays");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6195,20 +6251,6 @@ mod tests {
         let line = text.lines().rev().find(|l| l.contains("drain complete"))?;
         let value = line.split("batches_dropped=").nth(1)?;
         value.split_whitespace().next()?.parse().ok()
-    }
-
-    /// Sums `logit.component.batches.dropped{reason="shutdown"}` across every component.
-    fn shutdown_batches_dropped_everywhere(events: &[Event]) -> f64 {
-        events
-            .iter()
-            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.batches.dropped")
-            .filter_map(|m| match &m.kind {
-                MetricKind::Sum(s) => Some(s.value),
-                _ => None,
-            })
-            .sum()
     }
 
     /// Six batches into a two-batch store whose sink never delivers, under at-most-once: the
@@ -6269,8 +6311,8 @@ mod tests {
         .expect("the run ends within the sink's grace")
         .expect("a grace-cut drain is not a failure");
 
-        let events = registry.drain(0);
-        let dropped = shutdown_batches_dropped_everywhere(&events);
+        let totals = Totals::of(registry.drain(0));
+        let dropped = totals.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
         assert_eq!(dropped, 6.0, "every batch is dropped for shutdown");
         assert_eq!(logged_drain_complete_batches_dropped(), Some(6));
         let text = String::from_utf8_lossy(&global_logs().0.lock().unwrap()).into_owned();
@@ -6352,17 +6394,15 @@ mod tests {
             .expect("grace expiry is Ok");
         produce.await.unwrap();
 
-        let events = registry.drain(0);
-        let sent = counter_sum(&events, "up", "logit.component.batches.sent", None);
-        let refused = counter_sum(
-            &events,
-            "up",
+        let totals = Totals::of(registry.drain(0));
+        let sent = totals.sum("logit.component.batches.sent", &[("component", "up")]);
+        let refused = totals.sum(
             "logit.component.events.dropped",
-            Some(("reason", "closed_consumer")),
+            &[("component", "up"), ("reason", "closed_consumer")],
         );
-        let received = counter_sum(&events, "out", "logit.component.batches.received", None);
-        let delivered = counter_sum(&events, "out", "logit.component.batches.delivered", None);
-        let dropped = counter_sum(&events, "out", "logit.component.batches.dropped", None);
+        let received = totals.sum("logit.component.batches.received", &[("component", "out")]);
+        let delivered = totals.sum("logit.component.batches.delivered", &[("component", "out")]);
+        let dropped = totals.sum("logit.component.batches.dropped", &[("component", "out")]);
         assert_eq!(sent, SENT as f64);
         assert!(refused > 0.0, "the parked send fails upstream once the inbox closes");
         assert_eq!(sent, received + refused, "every batch sent is received or refused upstream");
@@ -7533,13 +7573,11 @@ mod tests {
         permit.send(counter_batch(1.0));
 
         watcher.await.unwrap().expect_err("a wedge is an error");
-        let drained = registry.drain(0);
+        let totals = Totals::of(registry.drain(0));
         assert_eq!(
-            counter_sum(
-                &drained,
-                "enrich",
+            totals.sum(
                 "logit.component.events.dropped",
-                Some(("reason", "shutdown"))
+                &[("component", "enrich"), ("reason", "shutdown")]
             ),
             1.0,
             "the batch sent through the pre-reserved permit is counted"
@@ -7607,29 +7645,6 @@ mod tests {
 
     fn lua_spec(script: &str, interval: Option<Duration>, runtime: LuaRuntimeConfig) -> NodeSpec {
         NodeSpec::Lua { script: script.to_string(), interval, runtime }
-    }
-
-    /// Sums counter `name` for `component` (optionally only under tag `key = value`) across
-    /// `events`.
-    fn counter_sum(
-        events: &[logit_core::Event],
-        component: &str,
-        name: &str,
-        tag: Option<(&str, &str)>,
-    ) -> f64 {
-        events
-            .iter()
-            .filter(|e| e.attributes.get("component").and_then(|v| v.as_str()) == Some(component))
-            .filter(|e| {
-                tag.is_none_or(|(k, v)| e.attributes.get(k).and_then(|x| x.as_str()) == Some(v))
-            })
-            .flat_map(|e| e.metrics.iter())
-            .filter(|m| logit_core::interner::resolve(m.name) == name)
-            .filter_map(|m| match &m.kind {
-                MetricKind::Sum(s) => Some(s.value),
-                _ => None,
-            })
-            .sum()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7777,18 +7792,21 @@ mod tests {
                 Box::new(WedgeFeedInput {
                     // The first passes through into the window; the second wedges the script.
                     before: vec![one_counter_batch("kept"), one_counter_batch("wedge")],
-                    // Past the Lua node's default 2 s grace, so this send meets a revoked inbox.
+                    // 1.5 s past the Lua node's 1 s grace, so this send meets a revoked inbox.
                     after_shutdown: Duration::from_millis(2500),
                     after: Some(one_counter_batch("late")),
                 }),
                 InputRuntimeConfig { shutdown_grace: Duration::from_secs(5) },
             ),
         );
-        // Default graces everywhere but `stall_after`: the default Lua grace must be short enough
-        // that the window flushed after revocation still beats the sink's default grace. With
-        // `stall_after` below the grace, the node is revoked once its quiet time reaches 2 s.
-        let runtime =
-            LuaRuntimeConfig { stall_after: Duration::from_millis(50), ..Default::default() };
+        // Default sink graces: the Lua grace must be short enough that the window flushed after
+        // revocation still beats the sink's default 5 s grace. With `stall_after` below the grace,
+        // the node is revoked once its quiet time after shutdown reaches 1 s.
+        let runtime = LuaRuntimeConfig {
+            stall_after: Duration::from_millis(50),
+            shutdown_grace: Duration::from_secs(1),
+            ..Default::default()
+        };
         specs.insert("enrich".to_string(), lua_spec(SPIN_ON_SECOND_EVENT, None, runtime));
         // The `aggregate` stand-in: holds everything until its close-time flush.
         specs.insert(
@@ -7808,26 +7826,26 @@ mod tests {
             ),
         );
 
-        let registry = Registry::new();
+        let mut probe = TelemetryProbe::new();
         let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "windowed", "out"]
             .into_iter()
-            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .map(|id| (id.to_string(), probe.telemetry(id, "x", "x")))
             .collect();
-        let (readiness, mut rx) = Readiness::channel();
+        let (readiness, rx) = Readiness::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let run_task =
             tokio::spawn(run_with_telemetry(g, specs, telemetry, readiness, async move {
                 let _ = shutdown_rx.await;
             }));
 
-        // Shut down once the script is known to be spinning, so the wedge is certain.
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            rx.wait_for(|s| s.components.get("enrich") == Some(&NodeState::Stalled)),
-        )
-        .await
-        .expect("the spinning script is reported stalled first")
-        .expect("readiness sender alive");
+        // Shut down once the script is spinning on the second event, so the wedge is certain: a
+        // preemption during the first can read as a passing stall.
+        probe
+            .wait_for("the script stalled on the second event", |t| {
+                t.sum("logit.component.events.received", &[("component", "enrich")]) >= 2.0
+                    && rx.borrow().components.get("enrich") == Some(&NodeState::Stalled)
+            })
+            .await;
         let started = std::time::Instant::now();
         shutdown_tx.send(()).unwrap();
 
@@ -7853,13 +7871,10 @@ mod tests {
             .collect();
         assert_eq!(names, ["kept"], "the downstream window's close-time flush reached the sink");
 
-        let events = registry.drain(0);
         assert_eq!(
-            counter_sum(
-                &events,
-                "in",
+            probe.sum(
                 "logit.component.events.dropped",
-                Some(("reason", "closed_consumer"))
+                &[("component", "in"), ("reason", "closed_consumer")]
             ),
             1.0,
             "the send after revocation meets a closed inbox and is counted"
@@ -7958,11 +7973,9 @@ mod tests {
         assert_eq!(emitted, 100_000);
         assert!(!seen_stalled.await.unwrap(), "a flush making progress was reported stalled");
         assert_eq!(
-            counter_sum(
-                &registry.drain(0),
-                "enrich",
+            Totals::of(registry.drain(0)).sum(
                 "logit.component.diagnostics",
-                Some(("key", "script_stalled"))
+                &[("component", "enrich"), ("key", "script_stalled")]
             ),
             0.0
         );
@@ -8016,10 +8029,10 @@ mod tests {
             ),
         );
 
-        let registry = Registry::new();
+        let mut probe = TelemetryProbe::new();
         let telemetry: HashMap<String, Telemetry> = ["in", "enrich", "out"]
             .into_iter()
-            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .map(|id| (id.to_string(), probe.telemetry(id, "x", "x")))
             .collect();
         let (readiness, rx) = Readiness::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -8028,19 +8041,15 @@ mod tests {
                 let _ = shutdown_rx.await;
             }));
 
-        // Every batch is sent before the node can stall: the input sends without waiting.
-        let mut drained = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            drained.extend(registry.drain(0));
-            if counter_sum(&drained, "in", "logit.component.batches.sent", None) >= SENT as f64
-                && rx.borrow().components.get("enrich") == Some(&NodeState::Stalled)
-            {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "the script never stalled");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Every batch is sent, and the node is stalled on the second event rather than on a
+        // preemption during the first.
+        probe
+            .wait_for("every batch sent and the script stalled on the second event", |t| {
+                t.sum("logit.component.batches.sent", &[("component", "in")]) >= SENT as f64
+                    && t.sum("logit.component.events.received", &[("component", "enrich")]) >= 2.0
+                    && rx.borrow().components.get("enrich") == Some(&NodeState::Stalled)
+            })
+            .await;
         shutdown_tx.send(()).unwrap();
         let err = tokio::time::timeout(Duration::from_secs(10), run_task)
             .await
@@ -8048,21 +8057,17 @@ mod tests {
             .unwrap()
             .expect_err("a wedged script fails the run");
         assert!(err.to_string().contains("component 'enrich'"), "{err}");
-        drained.extend(registry.drain(0));
+        let totals = probe.poll();
 
-        let sent = counter_sum(&drained, "in", "logit.component.events.sent", None);
-        let received = counter_sum(&drained, "enrich", "logit.component.events.received", None);
-        let revoked = counter_sum(
-            &drained,
-            "enrich",
+        let sent = totals.sum("logit.component.events.sent", &[("component", "in")]);
+        let received = totals.sum("logit.component.events.received", &[("component", "enrich")]);
+        let revoked = totals.sum(
             "logit.component.events.dropped",
-            Some(("reason", "shutdown")),
+            &[("component", "enrich"), ("reason", "shutdown")],
         );
-        let revoked_batches = counter_sum(
-            &drained,
-            "enrich",
+        let revoked_batches = totals.sum(
             "logit.component.batches.dropped",
-            Some(("reason", "shutdown")),
+            &[("component", "enrich"), ("reason", "shutdown")],
         );
         let delivered: usize = out_rx.try_iter().map(|b| b.events.len()).sum();
         assert_eq!(sent, SENT as f64);
@@ -8110,10 +8115,11 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        // Well above scheduling noise on a loaded test run; the loop takes over a second in a
-        // debug build. The bound is not asserted, so a faster machine can't fail the test.
+        // Over 10x the worst heartbeat gap measured under CPU load (18 ms); the loop takes over a
+        // second in a debug build. The bound is not asserted, so a faster machine can't fail the
+        // test.
         let runtime = LuaRuntimeConfig {
-            stall_after: Duration::from_millis(100),
+            stall_after: Duration::from_millis(200),
             shutdown_grace: Duration::from_millis(20),
             ..Default::default()
         };
@@ -8216,7 +8222,7 @@ mod tests {
     struct MaxMemoryRun {
         id: &'static str,
         result: Result<(), RunError>,
-        telemetry: Vec<Event>,
+        telemetry: Totals,
         delivered: usize,
         elapsed: Duration,
         state: Option<NodeState>,
@@ -8231,7 +8237,9 @@ mod tests {
         }
 
         fn counter(&self, component: &str, name: &str, tag: Option<(&str, &str)>) -> f64 {
-            counter_sum(&self.telemetry, component, name, tag)
+            let mut tags = vec![("component", component)];
+            tags.extend(tag);
+            self.telemetry.sum(name, &tags)
         }
 
         fn gc_forced(&self) -> f64 {
@@ -8301,7 +8309,7 @@ mod tests {
         MaxMemoryRun {
             id,
             result,
-            telemetry: registry.drain(0),
+            telemetry: Totals::of(registry.drain(0)),
             delivered: out_rx.try_iter().map(|b| b.events.len()).sum(),
             elapsed,
             state,
@@ -8366,7 +8374,7 @@ mod tests {
         // The `max_memory` failure's inbox sweep reaches `drain complete` like any shutdown drop.
         assert_eq!(
             logged_drain_complete_batches_dropped().map(|n| n as f64),
-            Some(shutdown_batches_dropped_everywhere(&run.telemetry)),
+            Some(run.telemetry.sum("logit.component.batches.dropped", &[("reason", "shutdown")])),
         );
     }
 
@@ -8602,10 +8610,12 @@ mod tests {
             "in".to_string(),
             NodeSpec::Input(Box::new(BurstInput { batches }), InputRuntimeConfig::default()),
         );
-        // A grace far below the sink's: if a parked send were read as a wedge, it would fire.
+        // A grace below the sink's: if a parked send were read as a wedge, it would fire. Both
+        // thresholds are over 10x the worst heartbeat gap measured under CPU load (18 ms), so a
+        // preempted `process()` call is never read as a stall or a wedge.
         let runtime = LuaRuntimeConfig {
-            stall_after: Duration::from_millis(50),
-            shutdown_grace: Duration::from_millis(50),
+            stall_after: Duration::from_millis(250),
+            shutdown_grace: Duration::from_millis(250),
             ..Default::default()
         };
         specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
@@ -8618,17 +8628,14 @@ mod tests {
                     max_bytes: u64::MAX,
                     overflow: OverflowPolicy::Block,
                 }),
-                WriteLoopConfig {
-                    shutdown_grace: Duration::from_millis(300),
-                    ..Default::default()
-                },
+                WriteLoopConfig { shutdown_grace: Duration::from_secs(1), ..Default::default() },
             ),
         );
 
-        let registry = Registry::new();
+        let mut probe = TelemetryProbe::new();
         let telemetry: HashMap<String, Telemetry> = ["enrich", "out"]
             .into_iter()
-            .map(|id| (id.to_string(), registry.telemetry_for(id, "x", "x")))
+            .map(|id| (id.to_string(), probe.telemetry(id, "x", "x")))
             .collect();
         let (readiness, rx) = Readiness::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -8638,18 +8645,14 @@ mod tests {
             }));
 
         // The Lua node has sent enough to fill the sink's store and inbox, so its next send parks.
-        let mut drained = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            drained.extend(registry.drain(0));
-            if counter_sum(&drained, "enrich", "logit.component.batches.sent", None) >= 66.0 {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "the Lua node never filled the sink");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // Parked well past `stall_after` and the Lua grace, outside any script call.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        probe
+            .wait_for("the Lua node filled the sink", |t| {
+                t.sum("logit.component.batches.sent", &[("component", "enrich")]) >= 66.0
+            })
+            .await;
+        // A negative window: parked, outside any script call, for 4x `stall_after`, which a
+        // parked send misread as a stall would have crossed.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(rx.borrow().components.get("enrich"), Some(&NodeState::Running));
 
         shutdown_tx.send(()).unwrap();
@@ -8658,13 +8661,10 @@ mod tests {
             .expect("the sink's grace unparks the Lua node")
             .unwrap()
             .expect("a node parked by backpressure is never wedged");
-        drained.extend(registry.drain(0));
         assert_eq!(
-            counter_sum(
-                &drained,
-                "enrich",
+            probe.sum(
                 "logit.component.diagnostics",
-                Some(("key", "script_stalled"))
+                &[("component", "enrich"), ("key", "script_stalled")]
             ),
             0.0
         );
