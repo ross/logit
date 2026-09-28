@@ -50,7 +50,9 @@ Tests follow these rules. A reviewer can check each one on a diff.
 5. **Telemetry read in a poll loop goes through `TelemetryProbe`.** A test waits on the
    post-state (an offset, a count reaching N), not on an artifact existing.
 6. **One positive-wait ceiling: `RECV_TIMEOUT`, 5 s.** Every wait for a batch, a close, or a
-   telemetry post-state uses it.
+   telemetry post-state uses it. A wait whose cost is known to exceed it (tens of fsyncs on a
+   loaded disk, a spool replay) names its own ceiling through `wait_until_within`, and its
+   comment says what the ceiling covers.
 7. **`proptest-regressions/` files are committed.** A proptest failure seen only in CI becomes
    its `cc` line in that file plus a named deterministic test built from the minimal input.
 8. **Reproduce before fixing.** Run the test 20 times pinned to one core beside CPU hogs
