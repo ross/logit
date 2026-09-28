@@ -25,6 +25,9 @@ use tokio::sync::watch;
 /// file can't starve the others in `drain`'s round robin. Not configurable.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
+/// The fault seam's point for `read_one`'s read of a tracked file.
+pub(crate) const READ: fault::Point = fault::Point::new(fault::sites::TAIL_READ, fault::Op::Read);
+
 /// Turns a matched path into a decoder. [`DecoderFactory::accept`] may reject the path
 /// (`docker_in`'s container filter); [`DecoderFactory::open`] then builds the decoder.
 pub(crate) trait DecoderFactory<D: TailDecoder>: Send {
@@ -1039,7 +1042,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
         let mut chunk = vec![0u8; READ_CHUNK_BYTES];
         let n = match self.files.get_mut(&id) {
-            Some(tracked) => match tracked.file.read(&mut chunk).await {
+            Some(tracked) => match logit_pipeline::fault_io!(
+                READ,
+                &tracked.path,
+                0,
+                tracked.file.read(&mut chunk).await
+            ) {
                 Ok(n) => n,
                 Err(err) => {
                     self.diag
@@ -4917,6 +4925,57 @@ mod tests {
         hand.scan().await;
         assert_eq!(hand.tailer.files.len(), 3);
         assert_eq!(take(), sorted(vec![plain.clone(), renamed.clone(), gone.clone()]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- a read error (fault seam `tail.read`)
+
+    #[tokio::test]
+    async fn a_read_error_on_an_active_file_never_reaps_it() {
+        let dir = scratch_dir("read-error-active");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(READ, 1, errno::EIO);
+        append(&path, b"two\n");
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert!(diagnosed(&mut probe, "read_error"));
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        assert_eq!(closed_flushes(&mut probe), 0.0);
+
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "the next pass reads on");
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The documented gap in `docs/known-gaps.md`: a read error counts as EOF, so a `Draining`
+    /// file past its grace is reaped with its unread bytes.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_error_on_a_draining_file_reaps_it_and_loses_its_unread_tail() {
+        let dir = scratch_dir("read-error-draining");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\n");
+        std::fs::remove_file(&path).unwrap();
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.files.values().next().map(|f| f.state), Some(FileState::Draining));
+        tokio::time::advance(tailer.config.poll_interval).await;
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(READ, 1, errno::EIO);
+        assert!(drain_by_hand(&mut tailer).await.is_empty(), "\"two\" is lost");
+        assert_eq!(tailer.tracked_len(), 0);
+        assert!(diagnosed(&mut probe, "read_error"));
+        assert_eq!(probe.sum("logit.input.lines", &[]), 1.0);
+        drop(scope);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
