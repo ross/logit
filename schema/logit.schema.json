@@ -2137,6 +2137,15 @@
                 }
               ]
             },
+            "message": {
+              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under `format: native` is rejected.",
+              "default": "escaped",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MessageMode"
+                }
+              ]
+            },
             "target": {
               "default": "stdout",
               "allOf": [
@@ -2176,6 +2185,15 @@
               "allOf": [
                 {
                   "$ref": "#/definitions/StreamFormat"
+                }
+              ]
+            },
+            "message": {
+              "description": "How a log record's message renders under `format: human`: `escaped` (the default) keeps it on one line with newlines written as `\\n`; `multiline` writes real line breaks, with each continuation line aligned under the message's first character. `multiline` under `format: native` is rejected.",
+              "default": "escaped",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/MessageMode"
                 }
               ]
             },
@@ -3245,6 +3263,14 @@
       "enum": [
         "any_of",
         "only"
+      ]
+    },
+    "MessageMode": {
+      "description": "How a stream sink's human render writes a log record's message: `escaped` keeps it on one line, every control character written as an escape (`\\n`, `\\t`, `\\x1b`); `multiline` writes a newline as a real line break, with each continuation line indented to align under the message's first character, and a tab as a real tab. Every other control character is escaped in both modes, so a message can never drive the viewer's terminal.",
+      "type": "string",
+      "enum": [
+        "escaped",
+        "multiline"
       ]
     },
     "MetadataCacheConfig": {

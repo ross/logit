@@ -1898,6 +1898,12 @@ pub enum ComponentKind {
         /// format is rejected.
         #[serde(default)]
         compression: Compression,
+        /// How a log record's message renders under `format: human`: `escaped` (the default)
+        /// keeps it on one line with newlines written as `\n`; `multiline` writes real line
+        /// breaks, with each continuation line aligned under the message's first character.
+        /// `multiline` under `format: native` is rejected.
+        #[serde(default)]
+        message: MessageMode,
     },
     /// A rotating file sink: size- and/or calendar-interval-triggered rotation with
     /// logrotate-style numbered-suffix retention. Renders the same human-readable text
@@ -1915,6 +1921,12 @@ pub enum ComponentKind {
         /// format is rejected.
         #[serde(default)]
         compression: Compression,
+        /// How a log record's message renders under `format: human`: `escaped` (the default)
+        /// keeps it on one line with newlines written as `\n`; `multiline` writes real line
+        /// breaks, with each continuation line aligned under the message's first character.
+        /// `multiline` under `format: native` is rejected.
+        #[serde(default)]
+        message: MessageMode,
     },
     /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `syslog_in` and a real
     /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
@@ -3129,6 +3141,19 @@ pub enum StreamFormat {
     Human,
     Json,
     Native,
+}
+
+/// How a stream sink's human render writes a log record's message: `escaped` keeps it on one
+/// line, every control character written as an escape (`\n`, `\t`, `\x1b`); `multiline` writes
+/// a newline as a real line break, with each continuation line indented to align under the
+/// message's first character, and a tab as a real tab. Every other control character is escaped
+/// in both modes, so a message can never drive the viewer's terminal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageMode {
+    #[default]
+    Escaped,
+    Multiline,
 }
 
 /// Per-frame compression for `logit`'s native wire format. There is no `zstd` variant: the native
@@ -5989,10 +6014,11 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "stdio_out", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::StdioOut { target, format, compression } => {
+            ComponentKind::StdioOut { target, format, compression, message } => {
                 assert_eq!(target, StdioTarget::Stdout);
                 assert_eq!(format, StreamFormat::Human);
                 assert_eq!(compression, Compression::None);
+                assert_eq!(message, MessageMode::Escaped);
             }
             other => panic!("expected StdioOut, got {other:?}"),
         }
@@ -6023,11 +6049,12 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::FileOut { path, rotate, format, compression } => {
+            ComponentKind::FileOut { path, rotate, format, compression, message } => {
                 assert_eq!(path, "/var/log/logit/events.log");
                 assert_eq!(rotate, RotateConfig::default());
                 assert_eq!(format, StreamFormat::Human);
                 assert_eq!(compression, Compression::None);
+                assert_eq!(message, MessageMode::Escaped);
             }
             other => panic!("expected FileOut, got {other:?}"),
         }
@@ -6089,6 +6116,33 @@ mod tests {
         ] {
             let format: StreamFormat = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
             assert_eq!(format, expected);
+        }
+    }
+
+    #[test]
+    fn message_mode_defaults_to_escaped() {
+        assert_eq!(MessageMode::default(), MessageMode::Escaped);
+    }
+
+    #[test]
+    fn each_message_mode_variant_deserializes() {
+        for (raw, expected) in
+            [("escaped", MessageMode::Escaped), ("multiline", MessageMode::Multiline)]
+        {
+            let mode: MessageMode = serde_json::from_str(&format!(r#""{raw}""#)).unwrap();
+            assert_eq!(mode, expected);
+        }
+    }
+
+    #[test]
+    fn stdio_out_message_multiline_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "stdio_out", "sources": ["in"], "message": "multiline"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StdioOut { message, .. } => assert_eq!(message, MessageMode::Multiline),
+            other => panic!("expected StdioOut, got {other:?}"),
         }
     }
 

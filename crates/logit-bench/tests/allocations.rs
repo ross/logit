@@ -2708,12 +2708,13 @@ fn influx_encode_100_events() {
     expect_allocs("influxdb_out: encode 100 events", stats, 230);
 }
 
-/// `stdio_out` encoding 100 nginx events: 102. It merge-joins the resource and event attribute
-/// maps and formats numbers with `write!` straight into one output buffer. The 102 are one
-/// `format_rfc3339_utc` per event (`logit_core::time`), one first growth of the output `String`,
-/// and one for `Encoder::encode`'s `Bytes::from(String)`, which reuses the buffer but needs its
-/// own shared-refcount allocation. Measured through `Encoder::encode`, as `StreamOutput::send`
-/// calls it (`docs/adr/rotating-file-output.md`), not the inherent `EventDump::render`.
+/// `stdio_out` encoding 100 nginx events: 2. Every field, timestamps included
+/// (`logit_core::time::write_rfc3339_utc`), is written with `write!`/`push_str` straight into one
+/// output `String`, so the residue is that `String`'s first growth (its later doublings are
+/// reallocations, counted separately) and `Encoder::encode`'s `Bytes::from(String)`, which reuses
+/// the buffer but needs its own shared-refcount allocation. Measured through `Encoder::encode`, as
+/// `StreamOutput::send` calls it (`docs/adr/rotating-file-output.md`), not the inherent
+/// `EventDump::render`.
 #[test]
 fn stdio_encode_100_events() {
     let mut dump = EventDump::new(Format::Human);
@@ -2722,7 +2723,7 @@ fn stdio_encode_100_events() {
 
     let (result, stats) = measure(|| dump.encode(&batch));
     assert!(!result.expect("should encode").is_empty());
-    expect_allocs("stdio_out: encode 100 events", stats, 102);
+    expect_allocs("stdio_out: encode 100 events", stats, 2);
 }
 
 /// `stdio_out` encoding 100 nginx events as NDJSON (`format: json`): 2, both per batch. One is
@@ -2742,7 +2743,7 @@ fn stdio_json_encode_100_events() {
 }
 
 /// `syslog_out` encoding 100 nginx events as RFC 5424: 100, one per event, from
-/// `format_rfc3339_utc` (`push_rfc5424_timestamp`), the same timestamp cost `stdio_out` pays.
+/// `format_rfc3339_utc` (`push_rfc5424_timestamp`).
 /// `SyslogEncoder` holds `line`/`raw_msg`/`scratch` as reused struct fields; as function locals
 /// they would start from empty capacity on every call, and warming wouldn't help.
 #[test]

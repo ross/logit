@@ -10,6 +10,7 @@ pub mod datadog_trace;
 pub mod file;
 pub mod graphite;
 mod http;
+pub mod human;
 pub mod influxdb;
 pub mod logit;
 pub mod ndjson;

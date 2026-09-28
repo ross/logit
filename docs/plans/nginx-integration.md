@@ -222,8 +222,9 @@ useful for this integration's dev loop and generally for anyone getting started 
 > sink for a person reading a terminal, not a machine-parseable export format (`logit-outputs`
 > already has one purpose-built machine format, InfluxDB line protocol, and NDJSON export is a
 > reasonable future `Format` variant if a real need for one shows up — it doesn't need to be the
-> *only* format `stdio_out` ever writes). See `crates/logit-outputs/src/stdio.rs`'s module doc
-> comment and `docs/known-gaps.md` for the accepted consequences.
+> *only* format `stdio_out` ever writes). The block's grammar is ADR `human-render-block-format`
+> and `crates/logit-outputs/src/human.rs`'s module doc; `docs/known-gaps.md` has the accepted
+> consequences.
 
 **Registration.** This is the first new component kind this plan adds, so the four-touchpoint
 pattern is worth stating once here — workstream E's `kv_metrics`/`keep` follow the same list:

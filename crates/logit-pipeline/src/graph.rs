@@ -227,8 +227,9 @@
 use logit_config::{
     default_handshake_timeout, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
-    ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MetadataCacheConfig,
-    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, TraceIdFormat, MAX_READ_BATCH,
+    ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MessageMode,
+    MetadataCacheConfig, ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
+    TraceIdFormat, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
@@ -3324,6 +3325,21 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 72: `message:` does nothing outside `format: human`, as rule 33's `compression:`
+    // does nothing outside `format: native` (`docs/adr/human-render-block-format.md`).
+    for (id, component) in &components {
+        let stream = match &component.kind {
+            ComponentKind::StdioOut { format, message, .. }
+            | ComponentKind::FileOut { format, message, .. } => Some((*format, *message)),
+            _ => None,
+        };
+        if let Some((format, message)) = stream {
+            if format != StreamFormat::Human && message != MessageMode::Escaped {
+                anyhow::bail!("component '{id}': 'message' only applies under 'format: human'");
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is fixed here, once (see [`targets_of`]).
@@ -3866,10 +3882,19 @@ mod tests {
             rotate,
             format: StreamFormat::default(),
             compression: Compression::default(),
+            message: MessageMode::default(),
         }
     }
 
     fn file_out_with_format(format: StreamFormat, compression: Compression) -> ComponentKind {
+        file_out_with_render(format, compression, MessageMode::default())
+    }
+
+    fn file_out_with_render(
+        format: StreamFormat,
+        compression: Compression,
+        message: MessageMode,
+    ) -> ComponentKind {
         ComponentKind::FileOut {
             path: "events.log".to_string(),
             rotate: logit_config::RotateConfig {
@@ -3879,14 +3904,24 @@ mod tests {
             },
             format,
             compression,
+            message,
         }
     }
 
     fn stdio_out_with_format(format: StreamFormat, compression: Compression) -> ComponentKind {
+        stdio_out_with_render(format, compression, MessageMode::default())
+    }
+
+    fn stdio_out_with_render(
+        format: StreamFormat,
+        compression: Compression,
+        message: MessageMode,
+    ) -> ComponentKind {
         ComponentKind::StdioOut {
             target: logit_config::StdioTarget::default(),
             format,
             compression,
+            message,
         }
     }
 
@@ -8153,6 +8188,59 @@ mod tests {
             ("out", vec!["in"], stdio_out_with_format(StreamFormat::Human, Compression::Lz4)),
         ]));
         assert!(err.contains("'compression' only applies under 'format: native'"), "got: {err}");
+    }
+
+    /// Rule 72.
+    #[test]
+    fn stdio_out_with_message_multiline_under_format_native_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                stdio_out_with_render(
+                    StreamFormat::Native,
+                    Compression::None,
+                    MessageMode::Multiline,
+                ),
+            ),
+        ]));
+        assert!(err.contains("'message' only applies under 'format: human'"), "got: {err}");
+    }
+
+    /// Rule 72.
+    #[test]
+    fn file_out_with_message_multiline_under_format_native_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out_with_render(
+                    StreamFormat::Native,
+                    Compression::None,
+                    MessageMode::Multiline,
+                ),
+            ),
+        ]));
+        assert!(err.contains("'message' only applies under 'format: human'"), "got: {err}");
+    }
+
+    #[test]
+    fn stdio_out_with_message_multiline_under_format_human_validates_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                stdio_out_with_render(
+                    StreamFormat::Human,
+                    Compression::None,
+                    MessageMode::Multiline,
+                ),
+            ),
+        ]))
+        .expect("multiline under the human render should validate fine");
     }
 
     #[test]

@@ -125,8 +125,8 @@
 //!
 //! `log.message` is a `Value`. [`render_message`] renders `Value::Str` verbatim before
 //! [`sanitize_msg`]'s pass: the demo's JSON body must reach Loki unmangled for `| json` to parse
-//! it, so this doesn't reuse `stdio::render_value`, which quotes and escapes a string for a
-//! terminal. `Value::Map`/`Value::Array` do reuse it as a container fallback, since
+//! it, so this doesn't reuse `human::render_value_inline`, which quotes and escapes a string for
+//! a terminal. `Value::Map`/`Value::Array` do reuse it as a container fallback, since
 //! [`sanitize_msg`] still runs over the result. **`Value::Bytes` is never lossy-UTF-8-decoded**:
 //! [`sanitize_msg_bytes`] applies the same escapes to the raw bytes, which are appended with
 //! [`MessageBuf::push_bytes`], so a non-UTF-8 payload reaches the wire without
@@ -165,7 +165,7 @@
 //! consequences (on TLS, no internal retry and no `Fault::Clean` after an application write; on
 //! both, a flush before any batch is called delivered).
 
-use crate::stdio::render_value;
+use crate::human::render_value_inline;
 // Shared with `logit_out`, which dials the same bare `host:port`, optionally TLS-wrapped.
 // `AsyncStream` lets `Conn::Tcp` hold either without `SyslogOutput` becoming generic; `host_only`
 // derives the SNI name from an endpoint with no scheme.
@@ -746,7 +746,7 @@ fn is_valid_sd_name(s: &str) -> bool {
 }
 
 /// Renders a PARAM-VALUE before [`push_sd_escaped`] escapes it: [`render_message`]'s SD analogue.
-/// `Bytes`/`Map`/`Array` fall back to [`render_value`].
+/// `Bytes`/`Map`/`Array` fall back to [`render_value_inline`].
 fn render_sd_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => {}
@@ -768,7 +768,7 @@ fn render_sd_value(out: &mut String, value: &Value) {
             let text = std::str::from_utf8(s).expect("Value::Str is always valid UTF-8");
             out.push_str(text);
         }
-        Value::Bytes(_) | Value::Map(_) | Value::Array(_) => render_value(out, value),
+        Value::Bytes(_) | Value::Map(_) | Value::Array(_) => render_value_inline(out, value),
     }
 }
 
@@ -1024,9 +1024,9 @@ fn render_message(out: &mut String, value: &Value) {
             let text = std::str::from_utf8(s).expect("Value::Str is always valid UTF-8");
             out.push_str(text);
         }
-        // `sanitize_msg` still runs over the result, so `render_value`'s quoting is redundant
-        // here, not harmful.
-        Value::Array(_) | Value::Map(_) => render_value(out, value),
+        // `sanitize_msg` still runs over the result, so `render_value_inline`'s quoting is
+        // redundant here, not harmful.
+        Value::Array(_) | Value::Map(_) => render_value_inline(out, value),
     }
 }
 
