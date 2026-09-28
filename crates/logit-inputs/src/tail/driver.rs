@@ -812,9 +812,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             if deselected {
                 // This inode is alive, only unselected (a `Draining` one may be gone and its
-                // number reused), so keep its offset for a rename back into the selection. The
-                // full `offset`: `close_decoder` already emitted the held partial.
-                self.resume.insert(id, (tracked.path.clone(), tracked.offset));
+                // number reused), so keep its offset for a rename back into the selection.
+                // `close_decoder` already emitted the held partial, so `pending_bytes` is left
+                // only for a line being dropped, and subtracting it resumes at that line's start.
+                let offset = tracked.offset - tracked.splitter.pending_bytes();
+                self.resume.insert(id, (tracked.path.clone(), offset));
             }
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -1478,6 +1480,50 @@ mod tests {
             vec!["two"],
             "must resume from the retained offset -- \"one\" must never be replayed"
         );
+
+        running.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file deselected while a line is being dropped retains that line's start, so the
+    /// re-selected file drops it whole again instead of emitting its tail.
+    #[tokio::test]
+    async fn a_file_deselected_mid_drop_retains_the_dropped_lines_start() {
+        let dir = scratch_dir("deselect-mid-drop");
+        let path = dir.join("app.log");
+        // "one\n" fits a limit of 4; "toolo" is over it with its newline not yet written.
+        std::fs::write(&path, b"one\ntoolo").unwrap();
+
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("test");
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.max_line_bytes = 4;
+        let (fanout, mut rx) = fanout_channel(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], factory, config)
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"))
+            .with_diagnostics(diag.clone());
+        let running = spawn_tailer(tailer, fanout);
+
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["one"]);
+        assert_eq!(diag.occurrences("long_line"), 1, "the read reached the oversized line");
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_until("the next scan to notice the de-selection and reap the file", || {
+            probe.gauge("logit.input.files.open", &[]) == Some(0.0)
+        })
+        .await;
+
+        append(&path, b"ng\nok\n");
+        deselected.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            messages(&recv_events(&mut rx, 1).await),
+            vec!["ok"],
+            "the dropped line's tail must not be emitted as a line"
+        );
+        assert_eq!(diag.occurrences("long_line"), 2, "the re-selected file drops the line again");
 
         running.stop().await;
         std::fs::remove_dir_all(&dir).ok();

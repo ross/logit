@@ -1639,7 +1639,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   dropped line and a restart emitted its tail as a line; it now covers the dropped line, and a
   restart drops it whole again (`a_checkpoint_taken_mid_drop_stays_at_the_dropped_lines_start`).
   `take_partial` now leaves a drop in place, so shutdown's forced checkpoint also stays at the
-  dropped line's start (`a_shutdown_mid_drop_checkpoints_at_the_dropped_lines_start`).
+  dropped line's start (`a_shutdown_mid_drop_checkpoints_at_the_dropped_lines_start`), and a file
+  deselected mid-drop retains that start for its re-selection
+  (`a_file_deselected_mid_drop_retains_the_dropped_lines_start`).
 
 ### TAIL-05 — Checkpoint persistence: atomicity, durability, and the corrupt-file fallback
 - **Location:** `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore::load`,
