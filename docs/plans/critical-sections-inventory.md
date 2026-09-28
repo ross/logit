@@ -1953,8 +1953,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     following good entry (the truncation interaction is the case `reset` exists for).
   - Memory held for one reassembly is bounded: `decode_line` checks `max_line_bytes` before it
     appends a fragment, so a held reassembly never exceeds it.
-  - `max_line_bytes` is applied twice (per-fragment in the `!is_complete` branch, on the
-    completed message after reassembly) and the two agree.
+  - ~~`max_line_bytes` is applied twice (per-fragment in the `!is_complete` branch, on the
+    completed message after reassembly) and the two agree.~~ **changed (#442):** one pre-append
+    check covers fragments and the closing entry alike.
   - `strip_suffix('\n')` is total given `is_complete`.
   - ~~Unknown `stream` returns `Malformed` and emits nothing — the driver counts it as
     `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).~~ **fixed (#442):**
@@ -1994,12 +1995,13 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   both streams' held fragments, and `read_one`/`close_decoder` absorb them; the splitter takes
   `envelope_cap(max_line_bytes)` and the decoder alone bounds the message, checked before the
   append; `holds_entry` covers a drop in progress, so no checkpoint (interval, shutdown, or a
-  de-selected file's resume offset) lands inside a dropped line; `stream`, `time`, and `attrs`
+  de-selected file's resume offset) lands inside a dropped line, including one that starts in the
+  unterminated last line `close_decoder` decodes; `stream`, `time`, and `attrs`
   keys decode as `Cow`, so an escaped key no longer rejects every line; `log.iostream` wins over
   an `attrs` key of that name; `bad_time` and the `attrs` copy are skipped for a discarded
   entry. `docker_verification.rs`'s proptest checks the decoder against a per-stream model
-  through the real `LineSplitter` under arbitrary chunking (2000 cases clean), plus 19 new or
-  rewritten named tests in `docker.rs`. The real `docker run` capture wasn't done; the
+  through the real `LineSplitter` under arbitrary chunking (ran clean at `PROPTEST_CASES=2000`;
+  the committed floor is 256), plus 21 new or rewritten named tests in `docker.rs`. The real `docker run` capture wasn't done; the
   interleaving is from moby's `copier.go` and `jsonfilelog`. Open gaps are in
   `docs/known-gaps.md`.
 - **Priority:** P0 — per-line parsing of container-controlled input with cross-line state; a

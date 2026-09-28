@@ -279,8 +279,8 @@ would for any other source, per
 **owned** `String`, not a slice (`log` always contains escapes when it was written as valid JSON,
 e.g. embedded newlines as `\n` two-character sequences, so `serde_json` cannot borrow a slice of
 the original buffer for it; see Consequences). `severity: None`, `body_format: Raw`, an event
-attribute `log.iostream` (`stdout`/`stderr`) plus every entry of the envelope's own `attrs` object
-copied verbatim. Resource carries `container.id`, `container.name`, `container.image.name`,
+attribute `log.iostream` (`stdout`/`stderr`), and every other entry of the envelope's own `attrs`
+object copied verbatim (the 2026-09-28 amendment says why `log.iostream` wins). Resource carries `container.id`, `container.name`, `container.image.name`,
 `container.image.tag` (split on the image reference's last `:`, only when there's no `@` digest and
 no `/` after that colon — a registry port like `registry:5000/app` must not be misread as a tag),
 and `container.label.<key>` for every key named in `labels:` (default empty — a label's value is
@@ -534,13 +534,14 @@ stream: one partial and one `dropping` flag for each.
   `decoder.resource()` before they diagnose `bad_line`, and the trait doc changes with the
   contract. A decoder that flushed into `out` while the driver discarded it would lose the
   fragments outright. Once the decoder holds nothing, `held_from` clears.
-- `LineSplitter` measures the JSON *envelope* line, so `docker_in` passes it
-  `6 × max(max_line_bytes, 16 KiB) + 64 KiB` rather than the operator's `max_line_bytes`. dockerd
-  cuts fragments at 16 KiB of raw bytes, JSON escaping expands a byte to at most six
-  (`\u00XX`), and the fixed part of an envelope is 75 bytes, so the 64 KiB of slack is for
-  `attrs` (`--log-opt labels`, `env`, and `tag`). The decoder alone enforces `max_line_bytes`,
-  over the reassembled message, and checks the length before it appends a fragment, so a held
-  reassembly never exceeds it.
+- `LineSplitter` measures the JSON *envelope* line, so `docker_in` passes it a bound derived from
+  `max_line_bytes` that passes every envelope a dockerd fragment or a keepable entry can take,
+  rather than the operator's `max_line_bytes`. The bound and its derivation are `envelope_cap` in
+  `crates/logit-inputs/src/docker.rs`. The decoder alone enforces `max_line_bytes`, over the
+  reassembled message, and checks the length before it appends a fragment, so a held reassembly
+  never exceeds it.
+- `log.iostream` is inserted after the envelope's `attrs`, so an `attrs` key of that name can't
+  replace the stream the entry was written on.
 - A checkpoint never lands inside a line being dropped for `max_line_bytes`, so a restart re-drops
   the line whole. Decision 5 has the property and its cost.
 

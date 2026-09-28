@@ -2005,19 +2005,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
 - **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
   *closing* fragment lets the next line on that stream splice onto the held partial.**
-  `docker_in`'s `LineSplitter` drops a json-file line longer than `6 × max(max_line_bytes,
-  16 KiB) + 64 KiB` whole and counts it `long_line`, and `DockerDecoder` never learns a line went
-  missing. If the dropped line was a message's closing fragment, the held partial stays open and
+  `docker_in`'s `LineSplitter` drops a json-file line longer than its envelope bound (see
+  `envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it `long_line`, and
+  `DockerDecoder` never learns a line went missing. If the dropped line was a message's closing fragment, the held partial stays open and
   the next same-stream line joins it. Closing it needs the splitter to report drops in sequence
   and a `TailDecoder` hook to receive them. See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
-- **An `attrs` object larger than the envelope cap's slack can drop entries as `long_line`.** The
-  splitter drops an entry when its escaped fragment, its `attrs`, and the 75 fixed envelope bytes
-  exceed `6 × max(max_line_bytes, 16 KiB) + 64 KiB`. `attrs` up to 64 KiB less 75 bytes never
-  causes it: that is what the slack guarantees for a full, worst-case-escaped 16 KiB fragment.
-  Beyond that, only large or escape-heavy fragments are at risk, mostly with `max_line_bytes`
-  near its 16 KiB floor. `attrs` comes from `--log-opt labels`, `env`, and `tag`.
+- **An `attrs` object larger than the envelope bound's slack can drop entries as `long_line`.**
+  The bound leaves fixed room for `attrs` beside a worst-case-escaped fragment; an envelope whose
+  `attrs` outgrows it can exceed the bound, and the splitter drops it unseen. `attrs` comes from
+  `--log-opt labels`, `env`, and `tag`. The slack and the bound are `envelope_cap` in
+  `crates/logit-inputs/src/docker.rs`.
 - **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
   pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
   crash replays them. Replay, not loss.
