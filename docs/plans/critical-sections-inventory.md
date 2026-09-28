@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-26
+updated: 2026-09-28
 ---
 
 # Verification plan: critical sections inventory
@@ -54,7 +54,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 closed, #385: `lua_to_value` caps nesting at 128 levels, native's own cap, so a script-built value (and `value_heap_bytes`'s walk of it) is bounded like every other producer's |
 | 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | Closed, #386/#388/#391: ADR `lua-runaway-script-bounds`'s stall heartbeat + bounded wedge (`luab/w3`, #386), sandbox/handle-lifetime half (`luab/w2`, #388), and opt-in `max_memory` (`luab/w4`, #391) |
-| 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | open |
+| 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | in-progress (tailbk/w3) |
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
@@ -119,8 +119,11 @@ Entries that share a mechanism and should be verified together, in suggested ord
    A multi-thread randomized stress harness, a sequential proptest, and tokio-source pins for the
    queues (incl. the `peek`/`commit` head reservation), then a cancellation-safety audit of every
    `select!`, recorded as `docs/design/pipeline-graph.md`'s "Cancellation points" table.
-4. **Tail bookkeeping** — TAIL-01..04, TAIL-09, TAIL-10. Proptest state machine against a model
-   filesystem (rename/copytruncate/delete/transient-error), then a real `logrotate` run.
+4. **Tail bookkeeping (in progress: `tailbk/w0`–`w5`)** — TAIL-01..04, TAIL-09, TAIL-10, with
+   TAIL-11 and TAIL-12 folded in. A state-machine proptest on the real filesystem, with fault-seam
+   read ops for listing failures, a fingerprint-mismatch stand-in for inode reuse, and a recorded
+   manual `logrotate` run
+   ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
 6. **Sink send path** — SINK-01..06, WIRE-08/09, RT-05. Mechanical diff of the three copies first,
    then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
@@ -207,12 +210,12 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
-| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | unreviewed |
-| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | unreviewed |
-| [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | unreviewed |
-| [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | unreviewed |
+| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | in-progress (tailbk/w3) |
+| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | in-progress (tailbk/w4) |
+| [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
+| [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | in-progress (tailbk/w1) |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
-| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | unreviewed |
+| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | in-progress (tailbk/w2) |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::open`) | findings → #328 |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `parse_record`, `walk_segment`) | findings → #328, #367 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`, `write_record`) | findings → #331 |
@@ -252,7 +255,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #408 |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs` (`InotifyWatcher`, `parse_events`) | findings → #283 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #408 |
-| [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | unreviewed |
+| [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | in-progress (tailbk/w5) |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs` (`peek`, `read_record_at`, `read_at`) | unreviewed (partly fixed in #328) |
@@ -309,8 +312,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
 | [NET-13](#net-13--listener-wrappers-framingtransport-selection-and-the-decoder-clone-per-connection-contract) | P2 | Listener wrappers: framing/transport selection and the `Decoder: Clone` per-connection contract | `crates/logit-inputs/src/statsd.rs` (`Inner`, `StatsdInput::tcp`, `Input` impl), plus the `syslog`, `graphite`, `collectd` wrappers | unreviewed |
 | [NET-14](#net-14--listener-tls-termination-rustlsserverconfig-construction-from-operator-pem) | P2 | Listener TLS termination: `rustls::ServerConfig` construction from operator PEM | `crates/logit-inputs/src/tls.rs` (`build_server_config`) | unreviewed |
-| [TAIL-11](#tail-11--pattern-discovery-hand-rolled-glob-and-dockers-two-position-walk) | P2 | Pattern discovery: hand-rolled glob and Docker's two-position walk | `crates/logit-inputs/src/tail/pattern.rs` (`PathPattern`) | unreviewed |
-| [TAIL-12](#tail-12--telemetry-and-diagnostic-accounting-across-the-tail-driver) | P2 | Telemetry and diagnostic accounting across the tail driver | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`, `scan`, `read_one`) | unreviewed |
+| [TAIL-11](#tail-11--pattern-discovery-hand-rolled-glob-and-dockers-two-position-walk) | P2 | Pattern discovery: hand-rolled glob and Docker's two-position walk | `crates/logit-inputs/src/tail/pattern.rs` (`PathPattern`) | in-progress (tailbk/w3) |
+| [TAIL-12](#tail-12--telemetry-and-diagnostic-accounting-across-the-tail-driver) | P2 | Telemetry and diagnostic accounting across the tail driver | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`, `scan`, `read_one`) | in-progress (tailbk/w5) |
 | [DISK-11](#disk-11--rotationstate--rotation-trigger-bookkeeping-and-open-time-seeding) | P2 | `RotationState` — rotation-trigger bookkeeping and open-time seeding | `crates/logit-outputs/src/file.rs` (`RotationState`) | unreviewed |
 | [DISK-12](#disk-12--streamoutputsend--encoderotatewriteflush-ordering-and-error-posture) | P2 | `StreamOutput::send` — encode/rotate/write/flush ordering and error posture | `crates/logit-outputs/src/stdio.rs` (`StreamOutput`'s `Output::send`) | unreviewed |
 | [DISK-14](#disk-14--config--spool-wiring-path-resolution-graph-rule-35-and-the-exclusive-lock) | P2 | Config → spool wiring: path resolution, graph rule 35, and the exclusive lock | `crates/logit-cli/src/pipeline.rs` (`queue_config`) | unreviewed |
@@ -1932,14 +1935,13 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   data-loss/duplication (reassembly state spanning lines); custom (the reassembly and the
   drop-flag protocol, mirroring `LineSplitter`'s).
 - **Invariants to verify:**
-  - Every complete logical line is emitted exactly once, with the *closing* entry's
-    timestamp/stream/attrs (the final `emit` in `decode_line`), and a held `PartialEntry` is
-    emitted on `close` but discarded on `reset`.
+  - Every complete logical line is emitted once, with the timestamp and attrs of its stream's
+    closing entry (the final `emit` in `decode_line`; reassembly is held per stream), and a held
+    `PartialEntry` is emitted on `close` but discarded on `reset`.
   - `dropping` clears on exactly the entry that closes the oversized line, and never swallows the
     following good entry (the truncation interaction is the case `reset` exists for).
-  - Memory held for one reassembly is bounded: the per-fragment `max_line_bytes` check in
-    `decode_line` happens *after* the append,
-    so the bound can be overshot by at most one entry (~16 KiB) — confirm that's the intent.
+  - Memory held for one reassembly is bounded: `decode_line` checks `max_line_bytes` before it
+    appends a fragment, so a held reassembly never exceeds it.
   - `max_line_bytes` is applied twice (per-fragment in the `!is_complete` branch, on the
     completed message after reassembly) and the two agree.
   - `strip_suffix('\n')` is total given `is_complete`.

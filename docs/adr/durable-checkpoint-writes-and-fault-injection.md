@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-09-28
 ---
 
 # Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam
@@ -529,3 +529,25 @@ and their reopen without `finish` discards every job the worker hadn't started a
 (`DiskQueue::abandon_queued_persists`), as a `kill -9` would. Without that, the old worker could
 unlink a segment under the reopened queue. Before the helper existed, one generated case failed
 with a peek that stopped responding while draining, which is consistent with that race.
+
+## Amendment: the seam gains read operations, and a tail scan site (2026-09-28)
+
+**The seam's operations are no longer mutations only.** `Op` gains `ReadDir` and `Stat`, and
+`sites` gains `TAIL_SCAN` (`"tail.scan"`). `fault::check` runs before the `read_dir` calls in
+`crates/logit-inputs/src/tail/pattern.rs` and before the `metadata` call on a discovered path in
+`Tailer::scan`. The call rule, the disarmed cost (one atomic load), the compiled-out form, and
+the scoping are decision 8's, unchanged. Freeze (the crash model) doesn't apply to a read: a rule
+fails one or every hit with an errno, or records hits.
+
+**Why.** [ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md)
+decides that a failed listing retires nothing. Verifying that needs a listing to fail on demand,
+and a real filesystem can't do it: the dev container runs as root, which reads any directory, and
+a directory that fails to list on a real mount fails for reasons a test can't script (a network
+mount dropping, `EMFILE`). The mutation-only seam was the right size for the durability paths,
+where every failure is a write step. The tail scan is the first path whose failures are reads,
+and its tests need the same errno control.
+
+**Consequences.** Decision 8's "every filesystem mutation" rule widens for the tail scan path:
+every `read_dir` or `metadata` call there needs a `fault::check` before it, or the proptest's
+failure operations miss it. The seam still has no `Read` op for `File::read`, so a read error on
+an open file stays untested by injection; `docs/known-gaps.md` records what that leaves.

@@ -1963,6 +1963,59 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   pattern.** The shutdown checkpoint records its inode and offset, but the restart's scan never
   finds the file, so the entry is never used and the file's unread tail is lost. A pattern that
   also matches the rotated name (`app.log*`) avoids it.
+- **A `copytruncate` that the writer refills past the old offset before the next check goes
+  undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
+  and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
+  ordinary append: the tailer reads from the old offset in the new content, and the bytes before
+  it are never emitted. The inode doesn't change under `copytruncate`, so no other signal exists.
+  A writer that rotates by rename has no such window. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **A resume verifies only the first 256 bytes of a file, so two files that share them and a
+  recycled inode still resume at a stale offset.** A checkpoint entry and a de-selection
+  retention carry a fingerprint of the file's head, and a resume whose head differs starts at
+  `0`. For a file at most 256 bytes long, every skipped byte is verified. Beyond that, a
+  recycled inode whose new file begins with the same 256 bytes as the old one skips the bytes
+  between there and the stale offset. Files that start with a timestamp or a per-file header
+  make it unlikely. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 2.
+- **A read error on a `Draining` file loses its unread tail.** The driver reports a read error as
+  EOF so that a handle that keeps failing is reaped, and the reap drops whatever the file still
+  held. It's diagnosed `read_error`. An `Active` file is never reaped on a read error. The fault
+  seam has no read operation for `File::read`, so no test injects it. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **A `containers:` entry that is a container's *name* and also 12 or more hex characters selects
+  any container whose id starts with it.** An entry matches a container if it equals the
+  container's name, or if it is an id prefix: at least 12 hex characters that start the
+  container's id. Naming a container `deadbeefcafe` and listing that name therefore also selects
+  a different container whose id begins `deadbeefcafe`. It falls out of the matching rule, and
+  the remedy is not to give a container a name shaped like an id prefix. See [ADR
+  `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
+- **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
+  *closing* fragment lets the next line on that stream splice onto the held partial.**
+  `docker_in`'s `LineSplitter` drops a json-file line longer than `6 × max(max_line_bytes,
+  16 KiB) + 64 KiB` whole and counts it `long_line`, and `DockerDecoder` never learns a line went
+  missing. If the dropped line was a message's closing fragment, the held partial stays open and
+  the next same-stream line joins it. Closing it needs the splitter to report drops in sequence
+  and a `TailDecoder` hook to receive them. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **A container whose `attrs` object exceeds about 64 KiB has every entry dropped as
+  `long_line`.** `attrs` is written from `--log-opt labels`, `env`, and `tag`, and the envelope
+  cap's slack for it is 64 KiB. An envelope that carries more never reaches the decoder.
+- **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
+  pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
+  crash replays them. Replay, not loss.
+- **A line that never ends pins the checkpoint while it is being dropped.** A `\r`-only progress
+  bar is the case: dockerd never splits it, so a drop for `max_line_bytes` runs until a newline
+  that may never come, and a crash replays everything since it began. Replay, not loss, but
+  unbounded. Persisting per-stream drop state in the checkpoint would remove it.
+- **At shutdown, `docker_in`'s unterminated tail is almost always a dockerd write in progress,
+  and it is emitted as a `bad_line`.** `close`'s `take_partial` turns the tail into a rejected
+  line, and the final checkpoint then skips past it, so that line's content never becomes an
+  event. A decoder opt-out from `take_partial` at shutdown would fix it.
 - **`inotify` doesn't reliably fire over network or FUSE-backed mounts** (NFS chief among them) —
   and `watch: auto` falls back to polling only on outright setup failure, not on a mount type it
   can't detect in advance. For a config on such a mount, set `watch: poll` explicitly rather than
