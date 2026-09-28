@@ -5,8 +5,9 @@
 //! because the sink under test has to fail on command, which no real `ComponentKind` can express.
 
 use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
-use logit_core::{AttrMap, Event, EventBatch, MetricKind, Registry, Resource, Telemetry, Value};
+use logit_core::{AttrMap, Event, EventBatch, Registry, Resource, Telemetry, Value};
 use logit_pipeline::graph;
+use logit_pipeline::test_util::{wait_until, TelemetryProbe};
 use logit_pipeline::{
     DiskQueueConfig, Fanout, Input, InputRuntimeConfig, NodeSpec, Output, OverflowPolicy,
     Readiness, SinkStoreConfig, WriteLoopConfig, SINK_QUEUE_METRICS,
@@ -97,17 +98,6 @@ impl Output for RecordingOutput {
         // At-least-once: the posture that retries and redelivers, which surviving a restart needs.
         true
     }
-}
-
-/// The most recent `Gauge` point named `name` in one drain's worth of telemetry events -- a gauge
-/// is last-write-wins within a drain (`Telemetry::gauge`), so each drain carries at most one.
-fn latest_gauge(events: &[Event], name: &str) -> Option<f64> {
-    events.iter().rev().find_map(|e| {
-        e.metrics.iter().rev().find_map(|m| match &m.kind {
-            MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(*v),
-            _ => None,
-        })
-    })
 }
 
 fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueConfig) {
@@ -228,30 +218,22 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
             std::future::pending(),
         ));
         let expected_depth = (TOTAL as u64 - SUCCEED_FIRST_RUN) as f64;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut depth = None;
-        loop {
-            // `drain` consumes the pending points, and a gauge is last-write-wins per drain, so
-            // the most recent drain that carried one holds the current value.
-            if let Some(v) = latest_gauge(&registry.drain(0), SINK_QUEUE_METRICS.depth) {
-                depth = Some(v);
-            }
-            let jammed = run1_attempts
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(marker, ok)| *marker == SUCCEED_FIRST_RUN as usize && !*ok);
-            if (depth == Some(expected_depth) && jammed) || tokio::time::Instant::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            depth,
-            Some(expected_depth),
-            "all {TOTAL} batches should be spooled ({SUCCEED_FIRST_RUN} of them committed) before \
-             the kill"
-        );
+        TelemetryProbe::with_registry(registry)
+            .wait_for(
+                &format!(
+                    "all {TOTAL} batches spooled ({SUCCEED_FIRST_RUN} of them committed) and the \
+                     next one failing"
+                ),
+                |totals| {
+                    let jammed = run1_attempts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(marker, ok)| *marker == SUCCEED_FIRST_RUN as usize && !*ok);
+                    totals.gauge(SINK_QUEUE_METRICS.depth, &[]) == Some(expected_depth) && jammed
+                },
+            )
+            .await;
         assert!(!run.is_finished(), "run should still be going (in should be hanging) when killed");
         run.abort();
         // Let the abort land before reopening the spool: the aborted task still holds
@@ -316,15 +298,10 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         // how many deliveries run 2 makes depends on where run 1's cursor was last checkpointed.
         // `checkpoint_interval` is time-gated, so all 10 commits may land before the first
         // checkpoint and the whole spool replay, which the at-most-twice assertion below allows.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let last_delivered =
-                run2_attempts.lock().unwrap().iter().any(|(marker, _)| *marker == TOTAL - 1);
-            if last_delivered || tokio::time::Instant::now() > deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until("run 2 to deliver the last marker", || {
+            run2_attempts.lock().unwrap().iter().any(|(marker, _)| *marker == TOTAL - 1)
+        })
+        .await;
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -414,15 +391,8 @@ async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_h
         let _ = rx.wait_for(|&fired| fired).await;
     }));
 
-    // Poll for every delivery rather than sleeping a fixed guess; a reader that stalls after a
-    // rotation runs out the deadline instead.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if attempts.lock().unwrap().len() >= TOTAL || tokio::time::Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // A reader that stalls after a rotation runs out this wait's deadline.
+    wait_until("every marker delivered", || attempts.lock().unwrap().len() >= TOTAL).await;
 
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(5), run)

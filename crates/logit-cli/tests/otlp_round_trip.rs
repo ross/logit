@@ -17,14 +17,14 @@ use logit_outputs::otlp::{
 };
 use logit_pipeline::{Fanout, Input, Output};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Reserves an ephemeral port by binding and dropping a listener (bind-drop-rebind), as
-/// `crates/logit-inputs/src/otlp.rs`'s tests do.
-async fn ephemeral_addr() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
+/// Binds `input` (built on `127.0.0.1:0`, TLS already applied) and returns its OS-assigned
+/// address beside it, so the output can be pointed at a listener that already exists.
+async fn bound_input(mut input: OtlpInput) -> (String, OtlpInput) {
+    input.bind().await.expect("binding the otlp listener");
+    let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+    (addr, input)
 }
 
 // -- The fixture: fully populated, shared by every field this file asserts on -------------------
@@ -176,17 +176,15 @@ fn mixed_signal_batch() -> EventBatch {
     }
 }
 
-/// Runs `input` in the background, sends `batch` through `output`, and returns every
-/// [`EventBatch`] the input's own `Fanout` received -- one per `Resource*` entry the wire request
-/// carried (`logit-proto`'s decode side never collapses several into one).
+/// Runs `input`, already bound by [`bound_input`], in the background, sends `batch` through
+/// `output`, and returns every [`EventBatch`] the input's own `Fanout` received -- one per
+/// `Resource*` entry the wire request carried (`logit-proto`'s decode side never collapses several
+/// into one).
 async fn round_trip(
     mut input: OtlpInput,
     mut output: OtlpOutput,
     batch: &EventBatch,
 ) -> Vec<EventBatch> {
-    // `Input::bind` opens the listener before `run`'s accept loop starts, so `output.send` below
-    // can't race the bind.
-    input.bind().await.expect("binding the otlp listener");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {
@@ -195,10 +193,10 @@ async fn round_trip(
 
     output.send(batch).await.expect("send should succeed against a live otlp_in");
 
+    // `otlp_in` answers a request only after `Fanout::send` returns, and `send` returns once every
+    // request is answered, so every delivered batch is already queued.
     let mut received = Vec::new();
-    while let Ok(Some(delivered)) =
-        tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-    {
+    while let Ok(delivered) = rx.try_recv() {
         received.push(logit_pipeline::unwrap_batch(delivered));
     }
     received
@@ -279,8 +277,7 @@ fn assert_round_tripped(received: &[EventBatch]) {
 
 #[tokio::test]
 async fn otlp_output_to_otlp_input_round_trips_a_batch_through_http() {
-    let addr = ephemeral_addr().await;
-    let input = OtlpInput::new(addr.clone(), InTransport::Http);
+    let (addr, input) = bound_input(OtlpInput::new("127.0.0.1:0", InTransport::Http)).await;
     let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http).unwrap();
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
@@ -289,8 +286,7 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_http() {
 
 #[tokio::test]
 async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
-    let addr = ephemeral_addr().await;
-    let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
+    let (addr, input) = bound_input(OtlpInput::new("127.0.0.1:0", InTransport::Grpc)).await;
     let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc).unwrap();
 
     let received = round_trip(input, output, &mixed_signal_batch()).await;
@@ -301,8 +297,7 @@ async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc() {
 /// and `otlp_in`'s decode interoperate, beyond each side's own unit tests.
 #[tokio::test]
 async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_http() {
-    let addr = ephemeral_addr().await;
-    let input = OtlpInput::new(addr.clone(), InTransport::Http);
+    let (addr, input) = bound_input(OtlpInput::new("127.0.0.1:0", InTransport::Http)).await;
     let output = OtlpOutput::new(format!("http://{addr}"), OutTransport::Http)
         .unwrap()
         .with_compression(OtlpCompression::Gzip);
@@ -313,8 +308,7 @@ async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_h
 
 #[tokio::test]
 async fn otlp_output_to_otlp_input_round_trips_a_gzip_compressed_batch_through_grpc() {
-    let addr = ephemeral_addr().await;
-    let input = OtlpInput::new(addr.clone(), InTransport::Grpc);
+    let (addr, input) = bound_input(OtlpInput::new("127.0.0.1:0", InTransport::Grpc)).await;
     let output = OtlpOutput::new(addr.clone(), OutTransport::Grpc)
         .unwrap()
         .with_compression(OtlpCompression::Gzip);
@@ -337,17 +331,19 @@ mod tls {
 
     #[tokio::test]
     async fn otlp_output_to_otlp_input_round_trips_a_batch_through_https() {
-        let addr = ephemeral_addr().await;
-        let input = OtlpInput::new(addr.clone(), InTransport::Http)
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: None,
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, input) = bound_input(
+            OtlpInput::new("127.0.0.1:0", InTransport::Http)
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap(),
+        )
+        .await;
         let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Http)
             .unwrap()
             .with_tls(
@@ -362,17 +358,19 @@ mod tls {
 
     #[tokio::test]
     async fn otlp_output_to_otlp_input_round_trips_a_batch_through_grpc_over_tls() {
-        let addr = ephemeral_addr().await;
-        let input = OtlpInput::new(addr.clone(), InTransport::Grpc)
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: None,
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, input) = bound_input(
+            OtlpInput::new("127.0.0.1:0", InTransport::Grpc)
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: None,
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap(),
+        )
+        .await;
         let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Grpc)
             .unwrap()
             .with_tls(
@@ -390,17 +388,19 @@ mod tls {
     /// (`testdata/tls/regen.sh`).
     #[tokio::test]
     async fn otlp_output_to_otlp_input_round_trips_a_batch_through_mutual_tls() {
-        let addr = ephemeral_addr().await;
-        let input = OtlpInput::new(addr.clone(), InTransport::Http)
-            .with_tls(
-                &TlsServerSettings {
-                    cert_file: "server.pem".to_string(),
-                    key_file: "server.key".to_string(),
-                    client_ca_file: Some("ca.pem".to_string()),
-                },
-                &testdata_dir(),
-            )
-            .unwrap();
+        let (addr, input) = bound_input(
+            OtlpInput::new("127.0.0.1:0", InTransport::Http)
+                .with_tls(
+                    &TlsServerSettings {
+                        cert_file: "server.pem".to_string(),
+                        key_file: "server.key".to_string(),
+                        client_ca_file: Some("ca.pem".to_string()),
+                    },
+                    &testdata_dir(),
+                )
+                .unwrap(),
+        )
+        .await;
         let output = OtlpOutput::new(format!("https://{addr}"), OutTransport::Http)
             .unwrap()
             .with_tls(

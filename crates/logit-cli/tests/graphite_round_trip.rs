@@ -66,6 +66,7 @@ use logit_core::{Diagnostics, Event, EventBatch, Registry, Resource, Telemetry, 
 use logit_inputs::graphite::{GraphiteInput, Transport};
 use logit_inputs::statsd::StatsdInput;
 use logit_outputs::graphite::GraphiteOutput;
+use logit_pipeline::test_util::{recv_batch, TelemetryProbe, Totals, RECV_TIMEOUT};
 use logit_pipeline::{Delivered, Fanout, Input, Output};
 use logit_proto::graphite::{GraphiteEncoder, MultiValue, Protocol, Tags};
 use logit_proto::Decoder;
@@ -82,8 +83,11 @@ use tokio::sync::mpsc;
 /// round-trip corpora.
 const SAME_AS_INPUT: &[u8] = b"== SAME AS INPUT ==";
 
-/// How long to wait for a batch, datagram, or connection before declaring a hang.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// The UDP capture's quiet window: once a datagram has arrived, how long the capture waits for
+/// another before deciding the send is complete. It follows a `send` that has returned, so every
+/// datagram is already on loopback; the window covers only the kernel's deferred delivery of the
+/// rest, which takes microseconds unloaded.
+const CAPTURE_QUIET: Duration = Duration::from_millis(500);
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/graphite")
@@ -216,6 +220,7 @@ enum Capture {
 /// fixed to one transport and protocol at construction.
 struct Harness {
     transport: Transport,
+    protocol: Protocol,
     capture_addr: SocketAddr,
     capture: Capture,
     input_addr: SocketAddr,
@@ -270,7 +275,7 @@ impl Harness {
             let _ = input.run(sink).await;
         });
 
-        Self { transport, capture_addr, capture, input_addr, rx }
+        Self { transport, protocol, capture_addr, capture, input_addr, rx }
     }
 
     /// Sends `batch` once to the capture socket and once to the live `graphite_in`, each through a
@@ -283,9 +288,10 @@ impl Harness {
     ) -> (Vec<Vec<u8>>, EventBatch) {
         let captured = self.capture_only(batch, &configure).await;
 
+        let expected = self.direct_event_count(&captured);
         let mut to_input = configure(self.output_to(self.input_addr));
         to_input.send(batch).await.expect("send to the live graphite_in");
-        (captured, self.drain_decoded().await)
+        (captured, self.drain_decoded(expected).await)
     }
 
     /// [`Harness::round_trip_with`] with `graphite_out`'s defaults.
@@ -295,7 +301,7 @@ impl Harness {
 
     fn output_to(&self, addr: SocketAddr) -> GraphiteOutput {
         match self.transport {
-            Transport::Tcp => GraphiteOutput::tcp(addr.to_string(), TIMEOUT),
+            Transport::Tcp => GraphiteOutput::tcp(addr.to_string(), RECV_TIMEOUT),
             Transport::Udp => GraphiteOutput::udp(addr.to_string()).expect("binding graphite_out"),
         }
     }
@@ -313,7 +319,7 @@ impl Harness {
 
         match &mut self.capture {
             Capture::Tcp(rx) => {
-                let bytes = tokio::time::timeout(TIMEOUT, rx.recv())
+                let bytes = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
                     .await
                     .expect("the capture listener should receive a connection")
                     .expect("the capture channel should not have closed");
@@ -322,12 +328,14 @@ impl Harness {
             Capture::Udp(socket) => {
                 let mut buf = vec![0u8; 65_536];
                 let mut datagrams = Vec::new();
-                let mut wait = TIMEOUT;
+                // The datagram count isn't known up front (re-packing decides it), so a quiet
+                // window, not a count, ends the capture.
+                let mut wait = RECV_TIMEOUT;
                 while let Ok(result) = tokio::time::timeout(wait, socket.recv_from(&mut buf)).await
                 {
                     let (n, _) = result.expect("recv_from should succeed");
                     datagrams.push(buf[..n].to_vec());
-                    wait = Duration::from_millis(200);
+                    wait = CAPTURE_QUIET;
                 }
                 assert!(!datagrams.is_empty(), "the capture socket received no datagram at all");
                 datagrams
@@ -335,18 +343,33 @@ impl Harness {
         }
     }
 
-    /// Every batch the live `graphite_in` delivered, merged into one: how a multi-message send is
-    /// batched isn't this test's concern.
-    async fn drain_decoded(&mut self) -> EventBatch {
+    /// How many events `captured` holds, by a direct decode in this harness's protocol: what the
+    /// live `graphite_in` delivers for the same bytes.
+    fn direct_event_count(&self, captured: &[Vec<u8>]) -> usize {
+        captured
+            .iter()
+            .map(|message| match self.protocol {
+                Protocol::Plaintext => direct_plaintext_batch(message).events.len(),
+                Protocol::Pickle => pickle_frames(message)
+                    .map(|frame| direct_pickle_batch(frame).events.len())
+                    .sum(),
+            })
+            .sum()
+    }
+
+    /// The batches the live `graphite_in` delivered until they hold `expected` events, merged into
+    /// one: how a multi-message send is batched isn't this test's concern. The UDP listener's 100ms
+    /// flush timer can split one send's datagrams across batches, so the count, not a quiet
+    /// window, says the send has all arrived.
+    async fn drain_decoded(&mut self, expected: usize) -> EventBatch {
+        let mut merged = recv_batch(&mut self.rx).await;
         let mut batches = Vec::new();
-        let mut wait = TIMEOUT;
-        while let Ok(delivered) = tokio::time::timeout(wait, self.rx.recv()).await {
-            let delivered = delivered.expect("the Fanout channel should not have closed");
-            batches.push(logit_pipeline::unwrap_batch(delivered));
-            wait = Duration::from_millis(200);
+        let mut received = merged.events.len();
+        while received < expected {
+            let batch = recv_batch(&mut self.rx).await;
+            received += batch.events.len();
+            batches.push(batch);
         }
-        assert!(!batches.is_empty(), "graphite_in delivered nothing at all");
-        let mut merged = batches.remove(0);
         for batch in batches {
             assert_eq!(batch.resource, merged.resource, "one decoder, one shared resource");
             assert!(batch.scope.is_none(), "graphite carries no scope concept");
@@ -379,38 +402,30 @@ fn direct_pickle_batch(raw: &[u8]) -> EventBatch {
     decoder.decode(payload).expect("fixture should decode")
 }
 
-/// Whether `registry` recorded a point named `metric` carrying `tag`. Drains, so call once.
-fn counted(registry: &Registry, metric: &str, tag: (&str, &str)) -> bool {
-    registry.drain(0).into_iter().any(|event| {
-        event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
-            && event.attributes.get(tag.0).and_then(Value::as_str) == Some(tag.1)
+/// Each length-prefixed frame of a pickle stream, prefix included, as [`direct_pickle_batch`]
+/// takes it. Carbon's prefix is a big-endian `u32` payload length.
+fn pickle_frames(mut stream: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        let prefix: [u8; 4] = stream.get(..4)?.try_into().unwrap();
+        let (frame, rest) = stream.split_at(4 + u32::from_be_bytes(prefix) as usize);
+        stream = rest;
+        Some(frame)
     })
 }
 
-/// Polls `registry` every 10ms, accumulating each destructive [`Registry::drain`], until a point
-/// named `metric` carrying `tag` appears or [`TIMEOUT`] elapses. The decode-only cases need this:
-/// `send_raw` returns before `graphite_in` has decoded anything, and a skipped line delivers no
-/// batch to wait on. A fixed `sleep` would race the decode.
-async fn wait_for_counted(registry: &Registry, metric: &str, tag: (&str, &str)) {
-    let mut accumulated = Vec::new();
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        accumulated.extend(registry.drain(0));
-        let found = accumulated.iter().any(|event: &Event| {
-            event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
-                && event.attributes.get(tag.0).and_then(Value::as_str) == Some(tag.1)
-        });
-        if found {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out after {TIMEOUT:?} waiting for {metric}{{{}=\"{}\"}} to be counted",
-                tag.0, tag.1
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+/// Whether `registry` recorded a point named `metric` carrying `tag`. Drains, so call once, after
+/// the `send` that counts it has returned.
+fn counted(registry: &Registry, metric: &str, tag: (&str, &str)) -> bool {
+    Totals::of(registry.drain(0)).has(metric, &[tag])
+}
+
+/// Waits for `graphite_in` to count a point named `metric` carrying `tag`. The decode-only cases
+/// need this: `send_raw` returns before `graphite_in` has decoded anything, and a skipped line
+/// delivers no batch to wait on.
+async fn wait_for_counted(registry: &Arc<Registry>, metric: &str, tag: (&str, &str)) {
+    TelemetryProbe::with_registry(registry.clone())
+        .wait_for(&format!("{metric}{{{}=\"{}\"}}", tag.0, tag.1), |t| t.has(metric, &[tag]))
+        .await;
 }
 
 // -- byte for byte, TCP plaintext, default configuration ------------------------------------------
@@ -633,7 +648,7 @@ async fn minus_one_timestamp_is_stamped_with_receipt_time() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             as i64;
     harness.send_raw(&read_fixture("minus-one-timestamp", "in")).await;
-    let batch = harness.drain_decoded().await;
+    let batch = harness.drain_decoded(1).await;
     let after =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             as i64;
@@ -696,11 +711,7 @@ impl CrossHarness {
         let sender =
             UdpSocket::bind("127.0.0.1:0").await.expect("binding an ephemeral sender socket");
         sender.send_to(line, self.statsd_addr).await.expect("sending the statsd line");
-        let delivered = tokio::time::timeout(TIMEOUT, self.statsd_rx.recv())
-            .await
-            .expect("statsd_in should decode and forward the batch")
-            .expect("the Fanout channel should not have closed");
-        logit_pipeline::unwrap_batch(delivered)
+        recv_batch(&mut self.statsd_rx).await
     }
 
     /// Sends `batch` through a fresh `graphite_out` at the TCP capture socket and returns the
@@ -710,10 +721,10 @@ impl CrossHarness {
         batch: &EventBatch,
         configure: impl Fn(GraphiteOutput) -> GraphiteOutput,
     ) -> Vec<u8> {
-        let mut sink = configure(GraphiteOutput::tcp(self.capture_addr.to_string(), TIMEOUT));
+        let mut sink = configure(GraphiteOutput::tcp(self.capture_addr.to_string(), RECV_TIMEOUT));
         sink.send(batch).await.expect("send to the capture socket");
         drop(sink);
-        tokio::time::timeout(TIMEOUT, self.capture_rx.recv())
+        tokio::time::timeout(RECV_TIMEOUT, self.capture_rx.recv())
             .await
             .expect("the capture listener should receive a connection")
             .expect("the capture channel should not have closed")

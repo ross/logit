@@ -12,6 +12,7 @@
 
 use logit_core::EventBatch;
 use logit_inputs::splunk::SplunkHecInput;
+use logit_pipeline::test_util::{assert_no_batch, recv_batch, wait_until};
 use logit_pipeline::{Fanout, Input};
 use logit_proto::splunk::{Envelope, SplunkDecoder, SplunkEncoder};
 use logit_proto::Encoder;
@@ -28,8 +29,16 @@ const RECEIVED_AT: i64 = 1_699_000_000_000_000_000;
 const TEST_BUSY_AFTER: Duration = Duration::from_millis(200);
 
 /// How long `/health` stays `503` after a busy answer in the busy test, via
-/// [`SplunkHecInput::with_health_busy_window`], short so the test sees it lapse.
-const TEST_HEALTH_WINDOW: Duration = Duration::from_millis(500);
+/// [`SplunkHecInput::with_health_busy_window`]. The test reads the busy answer's body and then
+/// sends a `GET` that must land inside the window, so the window is wide against a loaded
+/// scheduler on that side, and the test waits it out in full to see it lapse on the other.
+const TEST_HEALTH_WINDOW: Duration = Duration::from_secs(2);
+
+/// The window of a "nothing more arrives" check. `splunk_hec_in` delivers or drops a request's
+/// batches before it answers, so by the time the test reads the response nothing that request
+/// caused is still in flight; the window is a margin against a stray later batch, not a delivery
+/// interval.
+const NOTHING_MORE: Duration = Duration::from_millis(300);
 
 const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -106,14 +115,6 @@ async fn post(
     (status, response.text().await.unwrap_or_default())
 }
 
-async fn recv(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
-    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("splunk_hec_in delivers a batch within 5s")
-        .expect("the Fanout channel is open");
-    logit_pipeline::unwrap_batch(delivered)
-}
-
 /// One decode of `body`, and the encoder's `/event` body for it: the batches the listener must
 /// deliver, and what to post.
 fn fixed_point_case(body: &[u8]) -> (Vec<EventBatch>, Vec<u8>) {
@@ -145,7 +146,7 @@ async fn every_event_alias_delivers_the_encoded_batches_identity_and_gzip() {
             assert_eq!(status, reqwest::StatusCode::OK, "{path} gzip={gzipped}: {text}");
             assert_eq!(text, r#"{"text":"Success","code":0}"#);
             for batch in &expected {
-                assert_eq!(&recv(&mut rx).await, batch, "{path} gzip={gzipped}");
+                assert_eq!(&recv_batch(&mut rx).await, batch, "{path} gzip={gzipped}");
             }
         }
     }
@@ -168,7 +169,7 @@ async fn raw_delivers_one_log_per_line_under_the_query_envelope() {
     let path = "/services/collector/raw?host=web-1&source=udp%3A514&sourcetype=syslog&index=main";
     let (status, text) = post(addr, path, body, true, None).await;
     assert_eq!(status, reqwest::StatusCode::OK, "{text}");
-    let mut delivered = recv(&mut rx).await;
+    let mut delivered = recv_batch(&mut rx).await;
     assert_eq!(delivered.events.len(), 2);
     for event in delivered.events.iter_mut().chain(expected.events.iter_mut()) {
         event.timestamp = 0; // receipt time on both sides
@@ -196,7 +197,7 @@ async fn ack_ids_count_per_channel_and_answer_true_once() {
         let (_, text) =
             post(addr, "/services/collector/event", &body, gzipped, Some(channel)).await;
         assert_eq!(text, format!(r#"{{"text":"Success","code":0,"ackId":{id}}}"#));
-        recv(&mut rx).await;
+        recv_batch(&mut rx).await;
     }
     assert_eq!(poll(addr, a, "0,1,5").await, r#"{"acks":{"0":true,"1":true,"5":false}}"#);
     assert_eq!(poll(addr, a, "0,1").await, r#"{"acks":{"0":false,"1":false}}"#);
@@ -263,18 +264,17 @@ async fn a_stalled_downstream_is_answered_503_code_9_and_the_retry_succeeds() {
     assert_eq!(response.text().await.unwrap(), r#"{"text":"Server is busy","code":9}"#);
     let unhealthy = r#"{"text":"HEC is unhealthy, queues are full","code":18}"#;
     assert_eq!(health(addr).await, (503, unhealthy.into()), "while posts answer 503");
+    // The window opened at the busy answer, before this point, so it has lapsed after a full
+    // window's wait from here.
     tokio::time::sleep(TEST_HEALTH_WINDOW).await;
     assert_eq!(health(addr).await.0, 200, "healthy once the window has passed");
 
-    assert_eq!(recv(&mut rx).await, expected[0]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "a 503'd request delivers nothing"
-    );
+    assert_eq!(recv_batch(&mut rx).await, expected[0]);
+    assert_no_batch(&mut rx, NOTHING_MORE, "a 503'd request delivers nothing").await;
 
     let (status, _) = post(addr, path, &body, true, None).await;
     assert_eq!(status, reqwest::StatusCode::OK, "the client's retry succeeds");
-    assert_eq!(recv(&mut rx).await, expected[0]);
+    assert_eq!(recv_batch(&mut rx).await, expected[0]);
 }
 
 /// A body with a syntax error delivers the objects before the bad one, as Splunk indexes them,
@@ -312,13 +312,11 @@ async fn a_code_6_delivers_the_objects_before_the_one_it_names() {
                 )
             );
             if delivered > 0 {
-                let batch = recv(&mut rx).await;
+                let batch = recv_batch(&mut rx).await;
                 assert_eq!(batch.events, expected[0].events[..delivered], "index {index}");
             }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
-                "nothing from object {index} on"
-            );
+            assert_no_batch(&mut rx, NOTHING_MORE, &format!("nothing from object {index} on"))
+                .await;
         }
     }
 }
@@ -339,19 +337,21 @@ async fn a_multi_batch_body_is_answered_503_only_when_none_of_it_was_delivered()
     let (status, _) = post(addr, path, &filler_body, false, None).await;
     assert_eq!(status, reqwest::StatusCode::OK, "the filler takes the one slot");
     let request = tokio::spawn(async move { post(addr, path, &body, false, None).await });
+    // Gives the request's first batch time to start waiting on the full slot before the slot
+    // frees. Nothing below rests on it: a first batch that arrives later goes straight in.
     tokio::time::sleep(TEST_BUSY_AFTER / 4).await;
-    assert_eq!(recv(&mut rx).await, filler[0]);
+    assert_eq!(recv_batch(&mut rx).await, filler[0]);
+    // The body's first batch is in, so its delivery (and the deadline's clock) has started; the
+    // third batch, behind the second in the one slot, now waits past `TEST_BUSY_AFTER`.
+    assert_eq!(recv_batch(&mut rx).await, expected[0]);
     tokio::time::sleep(TEST_BUSY_AFTER * 2).await;
-    for batch in &expected {
-        assert_eq!(&recv(&mut rx).await, batch);
+    for batch in &expected[1..] {
+        assert_eq!(&recv_batch(&mut rx).await, batch);
     }
     let (status, text) = request.await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "{text}");
     assert_eq!(text, r#"{"text":"Success","code":0}"#);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "every batch once"
-    );
+    assert_no_batch(&mut rx, NOTHING_MORE, "every batch once").await;
 
     // The slot never frees: nothing of the body is delivered.
     let (addr, mut rx) = start_with_busy_after(1, TEST_BUSY_AFTER).await;
@@ -361,11 +361,8 @@ async fn a_multi_batch_body_is_answered_503_only_when_none_of_it_was_delivered()
     let (status, text) = post(addr, path, &body, false, None).await;
     assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(text, r#"{"text":"Server is busy","code":9}"#);
-    assert_eq!(recv(&mut rx).await, filler[0]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
-        "a 503'd body delivers nothing"
-    );
+    assert_eq!(recv_batch(&mut rx).await, filler[0]);
+    assert_no_batch(&mut rx, NOTHING_MORE, "a 503'd body delivers nothing").await;
 }
 
 /// A wrong token is refused with Splunk's `403` code 4 and delivers nothing.
@@ -381,7 +378,7 @@ async fn a_wrong_token_is_403_code_4() {
         .expect("the request reaches splunk_hec_in");
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     assert_eq!(response.text().await.unwrap(), r#"{"text":"Invalid token","code":4}"#);
-    assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err());
+    assert_no_batch(&mut rx, NOTHING_MORE, "a refused token delivers nothing").await;
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -453,11 +450,8 @@ async fn every_recorded_request_is_answered_2xx() {
     // delivers at least one batch; the `OPTIONS` and `GET` captures deliver nothing. The drain
     // task trails the last answer, so wait for it rather than read once.
     assert_eq!(posts, 28, "the corpus's /event and /raw captures");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut seen = delivered.load(std::sync::atomic::Ordering::Relaxed);
-    while seen < posts && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        seen = delivered.load(std::sync::atomic::Ordering::Relaxed);
-    }
-    assert!(seen >= posts, "at least one batch per POST capture: {seen} batches for {posts}");
+    wait_until("at least one batch per POST capture", || {
+        delivered.load(std::sync::atomic::Ordering::Relaxed) >= posts
+    })
+    .await;
 }
