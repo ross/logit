@@ -2118,9 +2118,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   and the walk compares one stored 64-bit hash per group, about half a nanosecond each, before any
   full compare. So absorb cost still grows with the group count once it reaches tens of thousands
   and batches are small. A map from hash to group index is the next step if that shape shows up in
-  a profile. `logit.transform.resource.groups` shows the count. `docs/design/performance.md` has no
-  `aggregate-groups` row yet; it waits for a perf VM run. `docs/adr/aggregation-window-semantics.md`'s
-  "The groups bound" section has the mechanism and the measurements.
+  a profile. `logit.transform.resource.groups` shows the count. `docs/design/performance.md` §1's
+  `aggregate-groups` row measures 0.283 µs/event at 1000 groups on the perf VM (2026-09-28).
+  `docs/adr/aggregation-window-semantics.md`'s "The groups bound" section has the mechanism and the measurements.
 - **`aggregate` keeps `U64(200)`, `I64(200)`, and `F64(200.0)` as three series, and text sinks
   render all three as `200`.** Series identity is the typed value, so a mixed pipeline (a
   non-negative `json` integer arrives `U64`, an OTLP or Lua integer `I64`, a `scale`d one `F64`)
@@ -2329,6 +2329,19 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   original bytes don't survive); and `docs/http-access-logs.md` tells nginx users to log
   `$request_uri`, never `$uri`, which removes the decoded-path source but not a client's own
   non-ASCII header bytes.
+- **The `invalid_utf8` retry costs every `json` parse about 10% through an inlining flip, not
+  through the retry itself** (2026-09-28). `json-parse-x3` reads 2.490 µs/event on the perf VM
+  against 2.248 before #296, and a bisect over the merges between the two baselines lands the
+  whole step on that one merge (`docs/design/performance.md` §1, "What moved since 2026-09-20").
+  The only `json` change in it is the retry arm on the parse failure path. A `cpu-clock`
+  flamegraph pair shows what moved: with a second parse call site in `JsonParser::process`, LLVM
+  no longer inlines `parse_object` into it, and the `SmallVec` insert and drop inside `parse_object`
+  become out-of-line calls too; `AttrMap::insert_sym`'s self time rises from 10.1% to 14.9% of
+  samples. Single-parser `json-parse` moves less (+1.9% at the same step) because contention on
+  the shared interner already dominates `x3`'s stage cost. **Fix:** move the retry into a `#[cold]`
+  helper so `process` keeps one parse call site, confirm `parse_object` inlines again, and
+  re-measure `json-parse-x3` on the perf VM against the base column in that section. A code
+  change, not a docs one, so it waits for its own PR.
 
 ## Lua
 

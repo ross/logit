@@ -758,10 +758,10 @@ allocation strategy needs the perf VM
 
 Three arms were measured: `base`, the linear scan with a full compare per metric record; `cache`,
 the memo and once-per-call resolution; and `hash`, `cache` plus the stored hash. The numbers below
-are from a laptop, not the perf VM, so they aren't reference numbers:
-`docs/design/performance.md` records VM numbers only, and its `aggregate-groups` row waits for the
-next VM session. Scenario CPU µs per event, median of three, two rounds, with the child pinned to
-the laptop's Zen 5 cores:
+are from a laptop, not the perf VM, so they aren't reference numbers. On the perf VM,
+`docs/design/performance.md` §1 records `aggregate-groups` at 0.283 µs per event (2026-09-28, the
+`hash` arm as landed in #416). Laptop scenario CPU µs per event, median of three, two rounds, with
+the child pinned to the laptop's Zen 5 cores:
 
 | Shape | `base` | `cache` | `hash` |
 |---|---|---|---|
