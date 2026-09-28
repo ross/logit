@@ -1,6 +1,6 @@
 //! A fault-injection seam for filesystem operations whose failure a test must be able to force:
 //! the mutations that decide what survives a crash (the disk spool, the tail checkpoint, and
-//! `file_out` rotation), and the reads that decide what a tail scan retires
+//! `file_out` rotation), and the reads that decide what a tail scan retires or a tail read loses
 //! (`docs/adr/durable-checkpoint-writes-and-fault-injection.md`,
 //! `docs/adr/tail-discovery-failure-and-resume-identity.md`).
 //!
@@ -87,6 +87,8 @@ pub mod sites {
     /// `tail_in`/`docker_in` discovery: a pattern directory's listing, a discovered path's stat,
     /// and the open of a file about to be tracked, with its head read for a resume.
     pub const TAIL_SCAN: &str = "tail.scan";
+    /// `tail_in`/`docker_in` reading a tracked file's next chunk.
+    pub const TAIL_READ: &str = "tail.read";
 }
 
 /// Runs `$op` (an expression of type `io::Result<T>`, which may contain `.await`) unless
@@ -337,7 +339,7 @@ mod tests {
         Op::Read,
     ];
 
-    const EVERY_SITE: [&str; 8] = [
+    const EVERY_SITE: [&str; 9] = [
         sites::SPOOL_SEGMENT,
         sites::SPOOL_CURSOR,
         sites::SPOOL_DIR,
@@ -346,6 +348,7 @@ mod tests {
         sites::FILE_OUT_STAGING,
         sites::FILE_OUT_RETAINED,
         sites::TAIL_SCAN,
+        sites::TAIL_READ,
     ];
 
     const POINT: Point = Point::new(sites::SPOOL_SEGMENT, Op::SyncFile);
