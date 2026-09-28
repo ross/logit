@@ -5254,4 +5254,211 @@ mod tests {
         }
     }
 
+    // -- the refuter's cases for the state-machine proptest, pinned one at a time
+
+    /// A rotation chain under `app.log*`: `.1` to `.2`, `app.log` to `.1`, a new `app.log`. Each
+    /// old inode is rebound under its new name with its offset, in every order `scan` may visit
+    /// the three paths, and only the new file is read.
+    #[tokio::test]
+    async fn a_rotation_chain_under_a_wildcard_rebinds_every_inode_in_any_discovery_order() {
+        let names = ["app.log", "app.log.1", "app.log.2"];
+        let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+        for order in orders {
+            let dir = scratch_dir("rotation-chain-rebind");
+            std::fs::write(dir.join("app.log"), b"a1\n").unwrap();
+            std::fs::write(dir.join("app.log.1"), b"b1\n").unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            let mut first = tick(&mut tailer, true).await;
+            first.sort();
+            assert_eq!(first, vec!["a1", "b1"]);
+            let a = FileId::from_metadata(&std::fs::metadata(dir.join("app.log")).unwrap());
+            let b = FileId::from_metadata(&std::fs::metadata(dir.join("app.log.1")).unwrap());
+
+            std::fs::rename(dir.join("app.log.1"), dir.join("app.log.2")).unwrap();
+            std::fs::rename(dir.join("app.log"), dir.join("app.log.1")).unwrap();
+            std::fs::write(dir.join("app.log"), b"c1\n").unwrap();
+            let order: Vec<PathBuf> = order.iter().map(|&i| dir.join(names[i])).collect();
+            rotated_in_order(&mut tailer, &mut probe, &order).await;
+            assert_eq!(tailer.files[&a].path, dir.join("app.log.1"), "{order:?}");
+            assert_eq!(tailer.files[&a].offset, 3, "{order:?}");
+            assert_eq!(tailer.files[&b].path, dir.join("app.log.2"), "{order:?}");
+            assert_eq!(tailer.files[&b].offset, 3, "{order:?}");
+            assert_eq!(tick(&mut tailer, false).await, vec!["c1"], "{order:?}: no replay");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Two inodes trade names. Each keeps its offset under its new name in either order.
+    #[tokio::test]
+    async fn two_inodes_swapping_names_keep_their_offsets_in_either_discovery_order() {
+        for reversed in [false, true] {
+            let dir = scratch_dir("swap-offsets");
+            let (x, y) = (dir.join("app.log"), dir.join("app.log.1"));
+            std::fs::write(&x, b"x1\n").unwrap();
+            std::fs::write(&y, b"y-one\n").unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            tick(&mut tailer, true).await;
+            let x_id = FileId::from_metadata(&std::fs::metadata(&x).unwrap());
+            let y_id = FileId::from_metadata(&std::fs::metadata(&y).unwrap());
+
+            std::fs::rename(&x, dir.join("tmp")).unwrap();
+            std::fs::rename(&y, &x).unwrap();
+            std::fs::rename(dir.join("tmp"), &y).unwrap();
+            let mut order = vec![x.clone(), y.clone()];
+            if reversed {
+                order.reverse();
+            }
+            rotated_in_order(&mut tailer, &mut probe, &order).await;
+            assert_eq!((&tailer.files[&x_id].path, tailer.files[&x_id].offset), (&y, 3));
+            assert_eq!((&tailer.files[&y_id].path, tailer.files[&y_id].offset), (&x, 6));
+
+            append(&y, b"x2\n");
+            assert_eq!(tick(&mut tailer, false).await, vec!["x2"], "{order:?}: no replay");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `copytruncate` under `app.log*`: the copy is a new inode the pattern matches, so it's read
+    /// from its beginning, re-emitting what the truncated original already had
+    /// (`docs/known-gaps.md`).
+    #[tokio::test]
+    async fn copytruncate_under_a_wildcard_replays_the_copy_from_its_beginning() {
+        let dir = scratch_dir("copytruncate-wildcard");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
+
+        std::fs::copy(&path, dir.join("app.log.1")).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        assert_eq!(tick(&mut tailer, false).await, vec!["one", "two"], "the copy, from 0");
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `tail_in`'s clean stop emits an unterminated last line and checkpoints past it, so the
+    /// rest of that line arrives after the restart as an event of its own (`docs/known-gaps.md`).
+    #[tokio::test]
+    async fn a_clean_restart_mid_line_emits_the_prefix_and_the_remainder_as_two_events() {
+        let dir = scratch_dir("restart-mid-line");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\npar").unwrap();
+        let patterns = vec![PathPattern::new(&path)];
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+        let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+        assert_eq!(hand.shutdown().await, vec!["par"]);
+        assert_eq!(checkpointed_entry(&dir).0, 7, "past the emitted prefix");
+
+        append(&path, b"tial\n");
+        let mut hand = Hand::bind(patterns, LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["tial"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A removed file is read only by `drain`; a clean stop before one closes it with its unread
+    /// bytes, and no pattern reaches it afterwards.
+    #[tokio::test]
+    async fn a_deleted_file_not_drained_before_a_restart_loses_its_unread_tail() {
+        let dir = scratch_dir("deleted-before-restart");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let patterns = vec![PathPattern::new(&path)];
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+        let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+
+        append(&path, b"two\n");
+        std::fs::remove_file(&path).unwrap();
+        hand.scan().await;
+        assert!(hand.shutdown().await.is_empty(), "\"two\" was never read");
+        let mut hand = Hand::bind(patterns, LineFactory, config).await;
+        assert!(hand.pump().await.is_empty());
+        assert_eq!(hand.tailer.tracked_len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under an exact pattern, `app.log.1` is reachable only through the handle the crash drops.
+    #[tokio::test]
+    async fn a_rotated_file_under_a_literal_pattern_not_drained_before_a_crash_is_orphaned() {
+        let dir = scratch_dir("literal-rotated-crash");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let patterns = vec![PathPattern::new(&path)];
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+        let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+        hand.checkpoint().await;
+
+        append(&path, b"two\n");
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        hand.scan().await;
+        drop(hand);
+
+        let mut hand = Hand::bind(patterns, LineFactory, config).await;
+        assert!(hand.pump().await.is_empty(), "\"two\" is orphaned in app.log.1");
+        assert_eq!(hand.tailer.tracked_len(), 1, "only the new app.log");
+        assert!(hand.tailer.resume.is_empty(), "the rotated file's entry is pruned");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Truncation is `len < offset`: a file truncated before anything was read from it is at
+    /// offset `0`, so nothing is detected, and under an exact pattern its old content survives only
+    /// in the copy.
+    #[tokio::test]
+    async fn a_copytruncate_before_any_read_counts_no_truncation() {
+        let dir = scratch_dir("copytruncate-unread");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(0));
+
+        std::fs::copy(&path, dir.join("app.log.1")).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `logit.input.files.open` is set by `scan` only, so a file `drain` reaps still counts until
+    /// the next scan.
+    #[tokio::test(start_paused = true)]
+    async fn files_open_is_sampled_at_scan_so_a_reap_shows_at_the_next_scan() {
+        let dir = scratch_dir("files-open-sampled");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        tick(&mut tailer, true).await;
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0));
+
+        std::fs::remove_file(&path).unwrap();
+        tick(&mut tailer, false).await;
+        assert_eq!(tailer.tracked_len(), 1, "draining");
+        after_grace(&mut tailer).await;
+        assert_eq!(tailer.tracked_len(), 0, "reaped by the drain after the scan");
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0), "sampled before it");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(0.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

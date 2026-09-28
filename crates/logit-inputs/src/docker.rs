@@ -2634,4 +2634,105 @@ mod tests {
         assert_kept_with_identity(&batches, &mut probe, 2);
         std::fs::remove_dir_all(&root).ok();
     }
+
+    // -- the `config.v2.json` cache, factory-level (TAIL-10)
+
+    fn explicit_factory(names: &[&str], diag: &Diagnostics) -> DockerDecoderFactory {
+        DockerDecoderFactory {
+            filter: ContainerFilter::new(names.iter().map(|n| n.to_string()).collect(), false),
+            labels: vec![],
+            max_line_bytes: 1024,
+            diag: diag.clone(),
+            meta: BTreeMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// The cache re-reads `config.v2.json` only when its stat changes: an in-place rewrite that
+    /// keeps its length and mtime is never read (the rewrite here would fail to parse), and one
+    /// that moves the mtime is.
+    #[test]
+    fn an_unchanged_config_v2_json_is_not_read_again() {
+        use std::os::unix::fs::FileExt;
+        let root = scratch_dir("docker-config-unchanged");
+        let id = "7".repeat(64);
+        let log = container(&root, &id, "web", "nginx:1.25");
+        std::fs::write(&log, b"").unwrap();
+        let dir = root.join(&id);
+        let config = dir.join("config.v2.json");
+        let diag = Diagnostics::new("test");
+        let mut factory = explicit_factory(&["web"], &diag);
+        assert!(factory.accept(&log));
+        let mut decoder = factory.open(&log).unwrap();
+        factory.end_scan();
+        let identity =
+            |f: &DockerDecoderFactory| f.meta[&dir].identity.as_ref().unwrap().resource.clone();
+        let before = identity(&factory);
+
+        let mtime = std::fs::metadata(&config).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&config).unwrap();
+        file.write_all_at(b"X", 0).unwrap();
+        file.set_modified(mtime).unwrap();
+        for _ in 0..3 {
+            assert_eq!(factory.refresh(&log, &mut decoder), Refresh::Unchanged);
+            factory.end_scan();
+        }
+        assert_eq!(diag.occurrences("metadata_error"), 0, "never re-read");
+        assert!(Arc::ptr_eq(&before, &identity(&factory)));
+
+        file.set_modified(mtime + Duration::from_secs(1)).unwrap();
+        factory.refresh(&log, &mut decoder);
+        assert_eq!(diag.occurrences("metadata_error"), 1, "a new mtime is read, and fails");
+        assert!(Arc::ptr_eq(&before, &identity(&factory)), "a failed read keeps the identity");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `end_scan` keeps the containers this scan reached through `accept`, `refresh`, or
+    /// `retain`, and evicts the rest.
+    #[test]
+    fn end_scan_evicts_only_containers_no_path_reached_this_scan() {
+        let root = scratch_dir("docker-end-scan");
+        let ids = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+        let logs: Vec<PathBuf> = ids
+            .iter()
+            .zip(["x", "y", "z"])
+            .map(|(id, name)| container(&root, id, name, "app:1"))
+            .collect();
+        let dirs: Vec<PathBuf> = ids.iter().map(|id| root.join(id)).collect();
+        let diag = Diagnostics::new("test");
+        let mut factory = explicit_factory(&["x", "y", "z"], &diag);
+        for log in &logs {
+            assert!(factory.accept(log));
+        }
+        let mut decoder = factory.open(&logs[1]).unwrap();
+        factory.end_scan();
+        let cached = |f: &DockerDecoderFactory| {
+            dirs.iter().map(|d| f.meta.contains_key(d)).collect::<Vec<_>>()
+        };
+        assert_eq!(cached(&factory), vec![true, true, true]);
+
+        factory.accept(&logs[0]);
+        factory.refresh(&logs[1], &mut decoder);
+        factory.retain(&logs[2]);
+        factory.end_scan();
+        assert_eq!(cached(&factory), vec![true, true, true], "each reached one way");
+
+        factory.accept(&logs[0]);
+        factory.end_scan();
+        assert_eq!(cached(&factory), vec![true, false, false]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An entry is matched as a name and, when it's at least 12 hex characters, as an id prefix
+    /// too, so a container *named* like a hex string also selects any container whose id starts
+    /// with it (`docs/known-gaps.md`). The prefix match is case-sensitive, as ids are lowercase.
+    #[test]
+    fn a_hex_container_name_of_twelve_chars_matches_as_an_id_prefix() {
+        let id = format!("abcdef012345{}", "0".repeat(52));
+        let filter = |entry: &str| ContainerFilter::new(vec![entry.to_string()], false);
+        assert!(filter("abcdef012345").matches(&"f".repeat(64), Some("abcdef012345")), "by name");
+        assert!(filter("abcdef012345").matches(&id, Some("unrelated")), "and by id prefix");
+        assert!(!filter("ABCDEF012345").matches(&id, Some("unrelated")), "uppercase");
+        assert!(!filter("abcdef01234").matches(&id, Some("unrelated")), "11 characters");
+    }
 }
