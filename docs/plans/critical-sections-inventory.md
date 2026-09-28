@@ -54,7 +54,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 4 | `logit_in` eagerly allocates `vec![0u8; compressed_len]` from the header (64 MiB × 1024 conns, `idle_timeout` off by default) | WIRE-06 | **Done** (findings → #372): the slowloris lead is retired under the deployment threat model; the body is now held once, and every control write is bounded |
 | 5 | Unbounded recursion: OTLP/JSON `AnyValue` decode (network), and `lua_to_value` / `value_heap_bytes` (script-built nested table; the heap walk runs on queue push) | CODEC-16, CORE-17 | CODEC-16 reviewed @dc39d1c (pinned, no change): JSON accepts at most 41 `AnyValue` levels, protobuf 49, both under native's 128; P2, a local cap declined, tests pin both limits. CORE-17 closed, #385: `lua_to_value` caps nesting at 128 levels, native's own cap, so a script-built value (and `value_heap_bytes`'s walk of it) is bounded like every other producer's |
 | 6 | No instruction-count or memory ceiling on a `ScriptWorker` VM — `used_memory()` is observed, never enforced | CORE-15 | Closed, #386/#388/#391: ADR `lua-runaway-script-bounds`'s stall heartbeat + bounded wedge (`luab/w3`, #386), sandbox/handle-lifetime half (`luab/w2`, #388), and opt-in `max_memory` (`luab/w4`, #391) |
-| 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | in-progress (tailbk/w3) |
+| 7 | A transient `read_dir` failure makes the tail scan return empty → every file `Draining` → re-opened at byte 0: full-file duplicate burst, untested | TAIL-01 | **Done** (findings → #443): a failed listing retires nothing; counted and diagnosed |
 | 8 | Tail checkpoints and the disk-spool cursor are tmp+rename with **no fsync** (file or directory); a corrupt tail checkpoint falls back to `read_from` (default `End`) → silent *loss* on power failure, contradicting the ADR's "strictly duplicates" | TAIL-05, DISK-06 | **Done**: durable tail checkpoints that replay on corruption (#327); durable cursor writes (#324, #333) |
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
@@ -210,7 +210,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
-| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | in-progress (tailbk/w3) |
+| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443 |
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | in-progress (tailbk/w4) |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
@@ -312,7 +312,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
 | [NET-13](#net-13--listener-wrappers-framingtransport-selection-and-the-decoder-clone-per-connection-contract) | P2 | Listener wrappers: framing/transport selection and the `Decoder: Clone` per-connection contract | `crates/logit-inputs/src/statsd.rs` (`Inner`, `StatsdInput::tcp`, `Input` impl), plus the `syslog`, `graphite`, `collectd` wrappers | unreviewed |
 | [NET-14](#net-14--listener-tls-termination-rustlsserverconfig-construction-from-operator-pem) | P2 | Listener TLS termination: `rustls::ServerConfig` construction from operator PEM | `crates/logit-inputs/src/tls.rs` (`build_server_config`) | unreviewed |
-| [TAIL-11](#tail-11--pattern-discovery-hand-rolled-glob-and-dockers-two-position-walk) | P2 | Pattern discovery: hand-rolled glob and Docker's two-position walk | `crates/logit-inputs/src/tail/pattern.rs` (`PathPattern`) | in-progress (tailbk/w3) |
+| [TAIL-11](#tail-11--pattern-discovery-hand-rolled-glob-and-dockers-two-position-walk) | P2 | Pattern discovery: hand-rolled glob and Docker's two-position walk | `crates/logit-inputs/src/tail/pattern.rs` (`PathPattern`) | findings → #443 |
 | [TAIL-12](#tail-12--telemetry-and-diagnostic-accounting-across-the-tail-driver) | P2 | Telemetry and diagnostic accounting across the tail driver | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`, `scan`, `read_one`) | in-progress (tailbk/w5) |
 | [DISK-11](#disk-11--rotationstate--rotation-trigger-bookkeeping-and-open-time-seeding) | P2 | `RotationState` — rotation-trigger bookkeeping and open-time seeding | `crates/logit-outputs/src/file.rs` (`RotationState`) | unreviewed |
 | [DISK-12](#disk-12--streamoutputsend--encoderotatewriteflush-ordering-and-error-posture) | P2 | `StreamOutput::send` — encode/rotate/write/flush ordering and error posture | `crates/logit-outputs/src/stdio.rs` (`StreamOutput`'s `Output::send`) | unreviewed |
@@ -1479,7 +1479,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   - `Draining` is never reaped before EOF, and reaping removes the file from the next checkpoint
     write only after its accumulator was flushed.
 - **Observed concerns (unverified):**
-  - **Transient discovery failure looks identical to removal.** `PathPattern::scan` returns an
+  - ~~**Transient discovery failure looks identical to removal.** `PathPattern::scan` returns an
     empty `Vec` when `read_dir` fails for *any* reason (the `read_dir` let-else in `scan` and in
     `scan_docker_containers`), and `Tailer::scan`'s stale loop then marks **every** tracked file
     `Draining`. Those files drain, close, and are dropped from `files`; on the next successful
@@ -1487,12 +1487,18 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     entire file is re-emitted. One EMFILE/ENFILE, a permissions flap, or an NFS hiccup on
     `read_dir` therefore replays every tailed file from byte 0. Medium-high confidence from
     reading; the `resume` map is deliberately *not* populated for the `Draining` reap path (only
-    `reap_drained`'s `deselected` branch inserts into it).
+    `reap_drained`'s `deselected` branch inserts into it).~~ **fixed (#443):** confirmed, and a
+    failed per-path `stat` had the same effect. A failed listing is now an error, an unknown
+    `stat` is unknown, and neither retires a tracked path they could have named; the kept file's
+    handle is `fstat`ed for an unlink or a truncation. Counted `logit.input.scan.errors{op}` and
+    diagnosed `scan_error`.
   - **Truncation detection can be missed when the writer immediately refills.** `len >=
     tracked.offset` short-circuits (the early return in `reconcile_truncation`); a `copytruncate` followed quickly by enough
     writes to exceed the old offset before the next tick leaves the offset pointing into the new
     generation — lines are then silently skipped/garbled with no diagnostic. Inherent to
-    size-based detection; not listed in `known-gaps.md`. Medium confidence.
+    size-based detection; not listed in `known-gaps.md`. Medium confidence. Still open: now
+    recorded in `docs/known-gaps.md` ("A `copytruncate` that the writer refills past the old
+    offset before the next check goes undetected").
   - `scan` does blocking `read_dir`/`metadata` (and, for `docker_in`, `read` of every
     `config.v2.json`) directly on the async worker thread; `PathPattern::scan`'s doc comment argues
     this is cheap, but it is O(containers) per tick on a busy host. Low severity, high confidence.
@@ -1509,6 +1515,15 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (both `rename` and `copytruncate` modes) in the dev container.
 - **Priority:** P0 — custom rotation bookkeeping on the main data path; a misclassification is
   silent loss or a full-file duplicate burst.
+- **Verified (tailbk/w3, #443):** the first concern was real and wider: a failed `read_dir` or a
+  failed per-path `stat` retired every tracked file under it, and the next scan replayed each from
+  byte 0 with no counter. Checked with fault-seam `ReadDir`/`Stat` points at `tail.scan` driving
+  hand-run `scan`/`drain` over a real scratch directory: a failed listing or `stat` keeps the
+  file `Active` with no reap, no `Closed` flush, and no replay after recovery; `ENOENT` still
+  retires it; a deletion and a truncation under a failing listing are still seen through the open
+  handle; one failing pattern doesn't hold back another's retirement, in separate or shared
+  directories; a path two patterns name is stat'ed once; a bind-time failure starts the file at
+  `0` later (a documented gap). The rule's canonical table is `pattern.rs`'s module doc.
 
 ### TAIL-02 — Start-offset selection, inode rebinding, and the `resume` map
 - **Location:** `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`,
@@ -2085,14 +2100,23 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     `scan_docker_containers`).
   - Symlinked paths/directories behave sanely (`std::fs::metadata` in `Tailer::scan` follows
     symlinks, `entry.file_type()` in `scan_docker_containers` does not).
-- **Observed concerns (unverified):** the error-to-empty conversion (the `read_dir` let-else in
+- **Observed concerns (unverified):** ~~the error-to-empty conversion (the `read_dir` let-else in
   `scan` and `scan_docker_containers`) is
   indistinguishable from "directory is empty" at the call site — see the `scan` entry's first
-  concern. Symlink handling is untested either way. Low-medium confidence.
+  concern.~~ **fixed (#443):** `scan` returns `io::Result<Scan>`, and only `NotFound` or
+  `NotADirectory` is an empty listing. Symlink handling is untested either way. Low-medium
+  confidence.
 - **Existing coverage:** `pattern.rs`'s unit tests — eight tests covering literal/prefix/suffix
   matching, missing directory, docker two-position walk, and `dir()` behavior.
 - **Priority:** P2 — small, pure, and well tested in isolation; its risk is concentrated in how
   `scan` interprets an empty result.
+- **Verified (tailbk/w3, #443):** the error-to-empty conversion was real and is fixed. The
+  matcher held: a `matches_name` model proptest (`x*y` against `starts_with && ends_with && len >=
+  |x|+|y|`, and a literal against equality) found no counterexample, and a new
+  `PathPattern::covers` agrees with `scan` for both matchers over every file one and two levels
+  down (a rotated `.1`, a stray, and a `config.v2.json` included). Tests pin each row of the
+  module doc's table, a docker container directory whose type check or log `stat` fails reporting
+  `unknown`, and a log not yet written staying absent.
 
 ### TAIL-12 — Telemetry and diagnostic accounting across the tail driver
 - **Location:** `crates/logit-inputs/src/tail/driver.rs`: `Tailer::run_until_shutdown`
