@@ -13,6 +13,8 @@
 mod checkpoint;
 mod driver;
 mod line;
+#[cfg(test)]
+mod line_verification;
 mod pattern;
 mod watch;
 

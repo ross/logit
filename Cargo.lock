@@ -1004,6 +1004,7 @@ dependencies = [
  "logit-pipeline",
  "logit-proto",
  "logit-transforms",
+ "proptest",
  "prost",
  "reqwest",
  "rustls",
