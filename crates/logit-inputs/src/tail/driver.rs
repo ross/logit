@@ -608,6 +608,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         watcher: &mut super::watch::Watcher,
     ) {
         let id = FileId::from_metadata(meta);
+        // Peeked, not removed: `accept` may still reject this path (a de-selected container not
+        // yet re-selected), or the open may fail, and removing here would lose the retained
+        // offset. `open_tracked` removes it once the file is tracked. Both arms that open read
+        // it: whether a rotated path is still bound when it's reached depends on `discovered`'s
+        // order (a rebind of its old inode elsewhere may have released it first), and the start
+        // must not.
+        let start = match self.resume.get(&id) {
+            Some(retained) => StartOffset::Resume(retained.offset, retained.head),
+            None if first => self.first_scan_start,
+            None => StartOffset::Beginning,
+        };
         match self.by_path.get(&path).copied() {
             Some(existing_id) if existing_id == id => {
                 self.reconcile_truncation(id, meta.len()).await;
@@ -618,19 +629,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     tracked.start_draining(self.scan_generation);
                 }
                 self.by_path.remove(&path);
-                self.open_or_rebind(path, id, meta.len(), StartOffset::Beginning, watcher).await;
-            }
-            None => {
-                // Peeked, not removed: `accept` may still reject this path (a de-selected
-                // container not yet re-selected), or the open may fail, and removing here would
-                // lose the retained offset. `open_tracked` removes it once the file is tracked.
-                let start = match self.resume.get(&id) {
-                    Some(retained) => StartOffset::Resume(retained.offset, retained.head),
-                    None if first => self.first_scan_start,
-                    None => StartOffset::Beginning,
-                };
                 self.open_or_rebind(path, id, meta.len(), start, watcher).await;
             }
+            None => self.open_or_rebind(path, id, meta.len(), start, watcher).await,
         }
     }
 
@@ -5201,5 +5202,52 @@ mod tests {
             vec!["three", "four-refilled-past-the-old-offset"]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A checkpoint entry stays unspent while its path's `stat` fails. If a rotation then moves
+    /// that inode onto a path still bound to another inode, the rotation arm opens it, and it must
+    /// resume from the entry as the unbound arm would: which arm a path reaches depends on the
+    /// order `scan` visits `discovered` in.
+    #[tokio::test]
+    async fn a_rotation_arm_resumes_a_new_inode_from_its_unspent_checkpoint_entry_in_either_scan_order(
+    ) {
+        for rebind_first in [false, true] {
+            let dir = scratch_dir("rotation-arm-resume");
+            let live = dir.join("app.log");
+            let one = dir.join("app.log.1");
+            let two = dir.join("app.log.2");
+            std::fs::write(&one, b"x1\n").unwrap();
+            std::fs::write(&live, b"z1\n").unwrap();
+            let patterns = vec![PathPattern::new(dir.join("app.log*"))];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+            assert_eq!(hand.pump().await.len(), 2);
+            hand.checkpoint().await;
+            drop(hand);
+
+            // A restart whose `stat` of `app.log` fails: `app.log.1` resumes, `app.log`'s entry
+            // stays unspent.
+            let scope = fault::scope(&live);
+            scope.fail(STAT, errno::EIO);
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            drop(scope);
+            let z = FileId::from_metadata(&std::fs::metadata(&live).unwrap());
+            assert!(hand.tailer.resume.contains_key(&z), "the entry is unspent");
+
+            std::fs::rename(&one, &two).unwrap();
+            std::fs::rename(&live, &one).unwrap();
+            std::fs::write(&live, b"").unwrap();
+            let order = if rebind_first {
+                vec![two.clone(), one.clone(), live.clone()]
+            } else {
+                vec![one.clone(), two.clone(), live.clone()]
+            };
+            rotated_in_order(&mut hand.tailer, &mut hand.probe, &order).await;
+            assert_eq!(hand.tailer.files[&z].offset, 3, "resumed, rebind_first: {rebind_first}");
+            assert!(hand.tailer.resume.is_empty());
+            assert_eq!(hand.rejected(), 0.0);
+            assert!(hand.pump().await.is_empty(), "nothing replayed, rebind_first: {rebind_first}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }
