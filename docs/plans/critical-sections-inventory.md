@@ -24,16 +24,17 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   will be wrong. A deep-dive session's first job is to refute or confirm them.
 - **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
-- **Progress (2026-09-26, at `agg/w4`'s head):** 50 of 135
-  entries done (29 P0, 19 P1, 2 P2): 46 with findings and four reviewed clean. The six finished
+- **Progress (2026-09-28, at `tailbk/w6`'s head):** 58 of 135
+  entries done (34 P0, 20 P1, 4 P2): 54 with findings and four reviewed clean. The seven finished
   clusters are the `libc` surface (#280–#283), durability (#322–#337), remote-reachable
   crash/DoS (#361, #366, #369–#372, #374, #377), which also closed leads 13 and 15 and
   re-reviewed CORE-05's stale entry, the Lua boundary (#383, #385, #386, #388, #391, #392),
   which closed CORE-15..18 and RT-11 with findings and reviewed CORE-19 clean, the shared
   queue and shutdown (#401, #403, #404, #406, #408, #409), which closed NET-02, NET-03,
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
-  clean, and aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
-  with findings. The rest of the list is `unreviewed`. The index's **Status** column is the
+  clean, aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
+  with findings, and tail bookkeeping (#437, #440, #442–#445, #PRW6), which closed TAIL-01..04,
+  TAIL-09..12 with findings. The rest of the list is `unreviewed`. The index's **Status** column is the
   source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
@@ -119,7 +120,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    A multi-thread randomized stress harness, a sequential proptest, and tokio-source pins for the
    queues (incl. the `peek`/`commit` head reservation), then a cancellation-safety audit of every
    `select!`, recorded as `docs/design/pipeline-graph.md`'s "Cancellation points" table.
-4. **Tail bookkeeping (in progress: `tailbk/w0`–`w5`)** — TAIL-01..04, TAIL-09, TAIL-10, with
+4. **Tail bookkeeping (done, #437, #440, #442, #443, #444, #445, #PRW6)** — TAIL-01..04, TAIL-09, TAIL-10, with
    TAIL-11 and TAIL-12 folded in. A state-machine proptest on the real filesystem, with fault-seam
    read ops for listing failures, a fingerprint-mismatch stand-in for inode reuse, and a recorded
    manual `logrotate` run
@@ -210,9 +211,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-06](#net-06--boundedqueuepush_many-batched-admission-control-the-pre-wait-notify-and-cancellation) | P0 | `BoundedQueue::push_many`: batched admission control, the pre-wait notify, and cancellation | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::push_many`) | findings → #403 |
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
-| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443, #445 |
-| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #444 |
-| [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | findings → #445 |
+| [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443, #445, #PRW6 |
+| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #444, #PRW6 |
+| [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | findings → #445, #PRW6 |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | findings → #442 |
@@ -255,7 +256,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs` (`run_until_shutdown` exit, `close_all_for_shutdown`) | findings → #408 |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs` (`InotifyWatcher`, `parse_events`) | findings → #283 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::run_until_shutdown`) | findings → #408 |
-| [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | findings → #445 |
+| [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs` (`DockerDecoderFactory`, `ConfigStat`) | findings → #445, #PRW6 |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs` (`fsync_path`, `rotate_segment`, `finish`) | findings → #324, #331 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`'s overflow loop, `evict_oldest`) | findings → #331, #333 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs` (`peek`, `read_record_at`, `read_at`) | unreviewed (partly fixed in #328) |
@@ -1549,6 +1550,16 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   an exact pattern with `copytruncate`, and the `app.log*` traps for `copytruncate` and
   `compress`, all now in `docs/known-gaps.md`. The report and raw runs are in the lead's
   `tmp/tailbk/logrotate/`, not in the repo.
+- **Verified (tailbk/w6, #PRW6):** state-machine proptest on the real filesystem
+  (`tail/driver/verification.rs`, 64 cases, 1000 run locally), whose model pins, after every op,
+  what each scan retires, rebinds, opens, and finds truncated under the recorded `logrotate`
+  sequences (a scan between each rotation step, a writer appending to the renamed inode, a
+  `copytruncate` copy) and under failed listings and `stat`s. It found one bug, fixed: a rebind
+  skipped the truncation check, so an inode retired by a `stat` race and then truncated and
+  refilled past its offset was read from mid-line
+  (`a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset`).
+  Named tests pin a rotation chain in all six scan orders, a two-inode swap, a `copytruncate` before
+  any read, the orphan gaps at a restart and a crash, and `files.open` sampled at the scan.
 
 ### TAIL-02 — Start-offset selection, inode rebinding, and the `resume` map
 - **Location:** `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`,
@@ -1618,6 +1629,12 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   `checkpoint_is_written_on_interval_only_when_dirty_and_resumes_by_inode` and
   `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` pass
   unchanged under format 2.
+- **Verified (tailbk/w6, #PRW6):** the driver state-machine proptest's model pins every start
+  offset (an accepted entry, a rejection counted once, or `0`), the resume entries after every
+  op, and the checkpoint on disk across clean restarts and crashes, with inode numbers the
+  filesystem reuses. It found one bug, fixed: the rotation arm opened a new inode at `0` even with
+  an unspent checkpoint entry, a replay that depended on scan order
+  (`a_rotation_arm_resumes_a_new_inode_from_its_unspent_checkpoint_entry_in_either_scan_order`).
 
 ### TAIL-03 — Read → split → decode → batch hot loop, and its backpressure contract
 - **Location:** `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`, `emit`);
@@ -1668,6 +1685,10 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   `a_read_error_on_a_draining_file_reaps_it_and_loses_its_unread_tail`. `close_decoder` offered
   the unterminated last line to the decoder without counting it in `logit.input.lines` or
   `line.bytes`; it now counts it (`lines_counts_the_partial_line_emitted_at_close`).
+- **Verified (tailbk/w6, #PRW6):** the driver state-machine proptest's model restates the read,
+  split, drop, and batch loop: every batch's content and boundaries under `max_events` 1 and 3,
+  lines over a 40-byte bound dropped and counted once per read of them, an unterminated line held
+  and emitted at a clean stop or a reap, and `lines`, `line.bytes`, and flushes by reason exact.
 
 ### TAIL-04 — `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics
 - **Location:** `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`, `push`,
@@ -2149,6 +2170,11 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   `a_deselected_containers_cache_entry_survives_until_its_reap` in `docker.rs`). `docker_in`
   never rebinds, since a rotated `<id>-json.log.1` matches no pattern, so only the de-selected
   case reaches it.
+- **Verified (tailbk/w6, #PRW6):** factory-level tests in `docker.rs`:
+  `an_unchanged_config_v2_json_is_not_read_again` (an in-place rewrite keeping length and mtime
+  is never re-read; a new mtime is), `end_scan_evicts_only_containers_no_path_reached_this_scan`,
+  and `a_hex_container_name_of_twelve_chars_matches_as_an_id_prefix` (pins F10; uppercase and 11
+  characters don't match).
 
 ### TAIL-11 — Pattern discovery: hand-rolled glob and Docker's two-position walk
 - **Location:** `crates/logit-inputs/src/tail/pattern.rs` (`PathPattern::new`,
