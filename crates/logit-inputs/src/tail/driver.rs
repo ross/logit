@@ -5030,4 +5030,120 @@ mod tests {
         drop(scope);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A `drain` can follow a data wake or a flush tick with no scan since the retiring one. Time
+    /// alone must not reap then: the scan that would rebind a raced rename hasn't run.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_with_no_scan_since_a_file_started_draining_never_reaps_it() {
+        let dir = scratch_dir("reap-needs-a-scan");
+        let rotated = dir.join("app.log.1");
+        std::fs::write(&rotated, b"old-1\nold-2\n").unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec!["old-1", "old-2"]);
+        let id = FileId::from_metadata(&std::fs::metadata(&rotated).unwrap());
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(STAT, 1, errno::ENOENT);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        drop(scope);
+        assert_eq!(tailer.files.get(&id).map(|f| f.state), Some(FileState::Draining));
+
+        std::fs::rename(&rotated, dir.join("app.log.2")).unwrap();
+        tokio::time::advance(tailer.config.poll_interval).await;
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        assert!(tailer.files.contains_key(&id), "past the grace, but no scan since draining");
+
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        let tracked = tailer.files.get(&id).expect("rebound");
+        assert_eq!(tracked.state, FileState::Active);
+        assert_eq!(tracked.path, dir.join("app.log.2"));
+        assert_eq!(tracked.offset, 12, "the offset is kept");
+        assert!(tick(&mut tailer, false).await.is_empty(), "no replay from 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The grace is measured when a pass starts, before its reads. A `Draining` file read to EOF
+    /// early in a pass whose later `emit` parks on the downstream past the grace isn't reaped by
+    /// that pass, so lines the writer appends meanwhile are read by the next one.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_parked_on_the_downstream_past_the_grace_does_not_reap_on_its_earlier_eof() {
+        // `drain` reads files in `files`' iteration order, which a fresh map's hasher picks, so
+        // rebuild until the draining file comes first: only that order puts its EOF before the
+        // parked `emit`.
+        for attempt in 0..64 {
+            let dir = scratch_dir("reap-grace-pass-start");
+            let path = dir.join("app.log");
+            let busy = dir.join("busy.log");
+            std::fs::write(&path, b"one\n").unwrap();
+            std::fs::write(&busy, b"").unwrap();
+            let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(&path), PathPattern::new(&busy)],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            tailer.config.batching.max_events = 1;
+            assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+            let old = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+
+            std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+            tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+            tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+            assert_eq!(tailer.files.get(&old).map(|f| f.state), Some(FileState::Draining));
+            if tailer.files.keys().next() != Some(&old) {
+                std::fs::remove_dir_all(&dir).ok();
+                continue;
+            }
+
+            let grace = tailer.config.poll_interval;
+            tokio::time::advance(grace - Duration::from_millis(1)).await;
+            append(&busy, b"b1\nb2\nb3\n");
+            // Room for one batch: the second `emit` parks until the test receives.
+            let (fanout, mut rx) = fanout_channel(1);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut watcher = crate::tail::watch::Watcher::Poll;
+            let mut received = Vec::new();
+            let mut parked = false;
+            {
+                let drain = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due());
+                tokio::pin!(drain);
+                loop {
+                    tokio::select! {
+                        _ = &mut drain => break,
+                        Some(delivered) = rx.recv() => {
+                            received.extend(messages(&unwrap_batch(delivered).events));
+                            if !parked {
+                                parked = true;
+                                // The pass is inside `busy.log`'s emits, after the draining file's
+                                // EOF. The grace runs out, and the writer appends before reopening.
+                                tokio::time::advance(Duration::from_millis(2)).await;
+                                writer.write_all(b"late-1\nlate-2\n").unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+            while let Ok(delivered) = rx.try_recv() {
+                received.extend(messages(&unwrap_batch(delivered).events));
+            }
+            assert!(parked, "the pass parked on the downstream");
+            received.sort();
+            assert_eq!(
+                received,
+                vec!["b1", "b2", "b3", "late-1", "late-2"],
+                "the late lines are read by the next pass, not lost to a reap on the earlier EOF \
+                 (attempt {attempt})"
+            );
+            assert!(!tailer.files.contains_key(&old), "reaped once a pass starts past the grace");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        panic!("the draining file never came first in 64 fresh maps");
+    }
 }
