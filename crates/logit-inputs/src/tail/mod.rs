@@ -21,7 +21,7 @@ mod watch;
 #[cfg(test)]
 pub(crate) use line::LineSplitter;
 pub use line::{LineDecoder, TailDecoder};
-pub use pattern::PathPattern;
+pub use pattern::{PathPattern, Scan};
 
 // `pub(crate)` so `crate::docker` can build `docker_in` on the same driver.
 pub(crate) use driver::{DecoderFactory, Refresh, Tailer};
@@ -172,8 +172,10 @@ impl logit_pipeline::Input for TailInput {
     }
 }
 
-/// The `tail/` tests' scratch directories: the shared helper, under the path they already import.
+/// The `tail/` tests' scratch directories (the shared helper, under the path they already
+/// import), and the fault-seam points a scan checks, for `docker.rs`'s tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) use super::pattern::{READ_DIR, STAT};
     pub(crate) use logit_pipeline::test_util::scratch_dir;
 }

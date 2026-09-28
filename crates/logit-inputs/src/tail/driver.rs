@@ -13,7 +13,7 @@ use super::pattern::PathPattern;
 use super::TailConfig;
 use bytes::Bytes;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
-use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
+use logit_pipeline::{fault, BatchAccumulator, Fanout, FlushReason};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,8 +43,13 @@ pub(crate) trait DecoderFactory<D: TailDecoder>: Send {
         Refresh::Unchanged
     }
 
+    /// Called for a tracked path `scan` kept because its listing failed or its stat was unknown,
+    /// so a factory that evicts per-scan state keeps this path's. Default: nothing cached.
+    fn retain(&mut self, _path: &Path) {}
+
     /// End of one `scan`: every discovered path has had one `accept` or `refresh` call since the
-    /// previous `end_scan`, so a caching factory can evict the rest. Default: nothing cached.
+    /// previous `end_scan`, and every kept one a `retain` call, so a caching factory can evict the
+    /// rest. Default: nothing cached.
     fn end_scan(&mut self) {}
 }
 
@@ -114,6 +119,54 @@ impl From<super::ReadFrom> for StartOffset {
             super::ReadFrom::Beginning => StartOffset::Beginning,
             super::ReadFrom::End => StartOffset::End,
         }
+    }
+}
+
+/// A pattern whose listing failed in one scan.
+#[derive(Debug)]
+pub(super) struct FailedListing {
+    /// The index into `Tailer::patterns`.
+    pub pattern: usize,
+    pub dir: PathBuf,
+    pub error: std::io::Error,
+}
+
+/// What one scan's listing step (`Tailer::list`) learned: what's there, and what it couldn't
+/// check. A tracked path missing from `discovered` is gone only if [`Listing::listed`] says so.
+#[derive(Debug, Default)]
+pub(super) struct Listing {
+    /// Every regular file a pattern names, with its `stat`, one entry per distinct path.
+    pub discovered: HashMap<PathBuf, std::fs::Metadata>,
+    /// Paths a pattern may name that couldn't be checked: a pattern's `Scan::unknown`, and a
+    /// matched path whose `stat` failed other than as absent.
+    pub unknown: HashSet<PathBuf>,
+    /// Every pattern whose listing failed.
+    pub failed: Vec<FailedListing>,
+    /// How many paths went into `unknown`: the `op="stat"` count.
+    pub stat_errors: usize,
+    /// The first of those, with its error, for the diagnostic.
+    pub first_stat_error: Option<(PathBuf, std::io::Error)>,
+}
+
+impl Listing {
+    /// Whether this listing can say `path` is gone: it isn't unknown, and no failed listing
+    /// covers it.
+    pub fn listed(&self, patterns: &[PathPattern], path: &Path) -> bool {
+        !self.unknown.contains(path)
+            && !self.failed.iter().any(|f| patterns[f.pattern].covers(path))
+    }
+
+    /// Whether every listing and `stat` succeeded, so every path a pattern names is in
+    /// `discovered`.
+    #[allow(dead_code)] // the checkpoint's resume pruning is its first caller
+    pub fn is_complete(&self) -> bool {
+        self.failed.is_empty() && self.unknown.is_empty()
+    }
+
+    /// The inode of every discovered path.
+    #[allow(dead_code)] // the checkpoint's resume pruning is its first caller
+    pub fn discovered_ids(&self) -> impl Iterator<Item = FileId> + '_ {
+        self.discovered.values().map(FileId::from_metadata)
     }
 }
 
@@ -407,22 +460,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// Only files found on the `first` scan follow `read_from` (`first_scan_start`, which an
     /// unusable checkpoint overrides to `Beginning`); a later discovery starts at the beginning,
     /// since it has no "before startup" to skip. A checkpoint entry wins over both.
-    /// A path missing from this scan (including a failed `read_dir`) starts draining its file.
+    ///
+    /// A tracked path this scan shows is gone starts draining its file. One that a failed listing
+    /// or `stat` could have named is kept (`pattern.rs`'s module doc has the rule), and its open
+    /// handle is `fstat`ed instead, which still sees an unlinked file and a truncation.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
-        let mut discovered: HashMap<PathBuf, std::fs::Metadata> = HashMap::new();
-        for pattern in &self.patterns {
-            for path in pattern.scan() {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    if meta.is_file() {
-                        discovered.insert(path, meta);
-                    }
-                }
-            }
-        }
+        let listing = self.list();
+        self.report_scan_errors(&listing, first);
 
-        let stale: Vec<PathBuf> =
-            self.by_path.keys().filter(|p| !discovered.contains_key(*p)).cloned().collect();
+        let stale: Vec<PathBuf> = self
+            .by_path
+            .keys()
+            .filter(|p| !listing.discovered.contains_key(*p) && listing.listed(&self.patterns, p))
+            .cloned()
+            .collect();
         for path in stale {
             if let Some(id) = self.by_path.remove(&path) {
                 if let Some(tracked) = self.files.get_mut(&id) {
@@ -430,8 +482,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
         }
+        let kept: Vec<(PathBuf, FileId)> = self
+            .by_path
+            .iter()
+            .filter(|(p, _)| !listing.discovered.contains_key(*p))
+            .map(|(p, id)| (p.clone(), *id))
+            .collect();
+        for (path, id) in kept {
+            self.keep_unlisted(path, id).await;
+        }
 
-        for (path, meta) in discovered {
+        for (path, meta) in listing.discovered {
             let id = FileId::from_metadata(&meta);
             match self.by_path.get(&path).copied() {
                 Some(existing_id) if existing_id == id => {
@@ -477,6 +538,102 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             (self.watched_dirs.len() + file_watches) as f64,
             &[],
         );
+    }
+
+    /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
+    /// matched path, so a path two patterns name costs one `stat`. Blocking, like
+    /// `PathPattern::scan`.
+    fn list(&self) -> Listing {
+        let mut listing = Listing::default();
+        let mut candidates: HashSet<PathBuf> = HashSet::new();
+        for (pattern, p) in self.patterns.iter().enumerate() {
+            match p.scan() {
+                Ok(scan) => {
+                    candidates.extend(scan.matched);
+                    listing.stat_errors += scan.unknown.len();
+                    if let (Some(path), Some(err)) =
+                        (scan.unknown.first(), scan.first_unknown_error)
+                    {
+                        listing.first_stat_error.get_or_insert((path.clone(), err));
+                    }
+                    listing.unknown.extend(scan.unknown);
+                }
+                Err(error) => listing.failed.push(FailedListing {
+                    pattern,
+                    dir: p.dir().to_path_buf(),
+                    error,
+                }),
+            }
+        }
+        for path in candidates {
+            match fault::check(super::pattern::STAT, &path, 0)
+                .and_then(|()| std::fs::metadata(&path))
+            {
+                Ok(meta) if meta.is_file() => {
+                    listing.discovered.insert(path, meta);
+                }
+                Ok(_) => {}
+                Err(err) if super::pattern::is_absent(&err) => {}
+                Err(err) => {
+                    listing.stat_errors += 1;
+                    listing.first_stat_error.get_or_insert_with(|| (path.clone(), err));
+                    listing.unknown.insert(path);
+                }
+            }
+        }
+        listing
+    }
+
+    /// Counts `logit.input.scan.errors{op}` and diagnoses `scan_error`, once per operation per
+    /// scan that had a failure.
+    fn report_scan_errors(&mut self, listing: &Listing, first: bool) {
+        // `read_from: end` applies to the first scan only.
+        let later =
+            if first { "; a file first found by a later scan starts at the beginning" } else { "" };
+        if let Some(failed) = listing.failed.first() {
+            let n = listing.failed.len();
+            self.telemetry.count("logit.input.scan.errors", n as f64, &[("op", "read_dir")]);
+            self.diag.warn_throttled(
+                "scan_error",
+                format!(
+                    "listing {} failed: {} ({n} listing(s) failed this scan); no tracked file it \
+                     may name is closed until a listing succeeds{later}",
+                    failed.dir.display(),
+                    failed.error,
+                ),
+            );
+        }
+        if let Some((path, err)) = &listing.first_stat_error {
+            let n = listing.stat_errors;
+            self.telemetry.count("logit.input.scan.errors", n as f64, &[("op", "stat")]);
+            self.diag.warn_throttled(
+                "scan_error",
+                format!(
+                    "stat of {} failed: {err} ({n} stat(s) failed this scan); a tracked file \
+                     there stays open until a stat succeeds{later}",
+                    path.display(),
+                ),
+            );
+        }
+    }
+
+    /// Keeps a tracked `path` this scan couldn't list, unless its open handle shows the file was
+    /// unlinked; a handle shorter than the offset read is a truncation. The `fstat` needs no
+    /// permission on the path and sees the tracked inode, as `reconcile_truncation` requires.
+    async fn keep_unlisted(&mut self, path: PathBuf, id: FileId) {
+        use std::os::unix::fs::MetadataExt;
+        let Some(tracked) = self.files.get_mut(&id) else { return };
+        match tracked.file.metadata().await {
+            Ok(meta) if meta.nlink() == 0 => {
+                tracked.state = FileState::Draining;
+                self.by_path.remove(&path);
+                return;
+            }
+            Ok(meta) => self.reconcile_truncation(id, meta.len()).await,
+            // The handle still reads; a later scan decides.
+            Err(_) => {}
+        }
+        self.factory.retain(&path);
     }
 
     /// Runs [`DecoderFactory::refresh`] for a tracked path found by `scan` and applies the
@@ -3035,6 +3192,327 @@ mod tests {
         .await;
 
         running.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- a failed listing is no information (docs/adr/tail-discovery-failure-and-resume-identity.md)
+    //
+    // Each drives `scan`/`drain` by hand under `Watcher::Poll` and forces the failure through the
+    // fault seam, so nothing waits on a timer.
+
+    use crate::tail::pattern::{READ_DIR, STAT};
+    use logit_pipeline::fault::{self, errno};
+
+    /// A `Tailer` driven by hand, reporting its telemetry and diagnostics to `probe`.
+    fn probed_tailer(
+        patterns: Vec<PathPattern>,
+        read_from: ReadFrom,
+        probe: &TelemetryProbe,
+    ) -> Tailer<LineDecoder, LineFactory> {
+        let diag = Diagnostics::new("tail_in")
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        Tailer::new(patterns, LineFactory, fast_config(read_from))
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"))
+            .with_diagnostics(diag)
+    }
+
+    /// One poll tick by hand: a `scan`, a `drain` to idle (which reaps), and a flush. Returns the
+    /// messages it emitted.
+    async fn tick<F: DecoderFactory<LineDecoder>>(
+        tailer: &mut Tailer<LineDecoder, F>,
+        first: bool,
+    ) -> Vec<String> {
+        let (fanout, mut rx) = fanout_channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer.scan(first, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
+        tailer.flush_all(&fanout, FlushReason::Interval).await;
+        let mut out = Vec::new();
+        while let Ok(delivered) = rx.try_recv() {
+            out.extend(messages(&unwrap_batch(delivered).events));
+        }
+        out
+    }
+
+    fn state_of<F: DecoderFactory<LineDecoder>>(
+        tailer: &Tailer<LineDecoder, F>,
+        path: &Path,
+    ) -> Option<FileState> {
+        let id = FileId::from_metadata(&std::fs::metadata(path).ok()?);
+        tailer.files.get(&id).map(|f| f.state)
+    }
+
+    fn scan_errors(probe: &mut TelemetryProbe, op: &str) -> f64 {
+        probe.sum("logit.input.scan.errors", &[("op", op)])
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_dir_retires_no_tracked_file_and_is_counted() {
+        let dir = scratch_dir("scan-read-dir-fails");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        assert!(tailer.by_path.contains_key(&path), "the binding survives the failed listing");
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        assert_eq!(scan_errors(&mut probe, "stat"), 0.0);
+        assert!(diagnosed(&mut probe, "scan_error"));
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0));
+        assert_eq!(probe.sum("logit.component.receive.flushed", &[("reason", "closed")]), 0.0);
+        drop(scope);
+
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "no replay after recovery");
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0, "the clean scan counts nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_stat_other_than_not_found_keeps_the_file() {
+        let dir = scratch_dir("scan-stat-fails");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail(STAT, errno::EIO);
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "a kept file is still read");
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        assert_eq!(scan_errors(&mut probe, "stat"), 1.0);
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 0.0);
+        assert!(diagnosed(&mut probe, "scan_error"));
+        drop(scope);
+
+        append(&path, b"three\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["three"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_not_found_stat_still_drains_the_file() {
+        let dir = scratch_dir("scan-stat-not-found");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail(STAT, errno::ENOENT);
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "drained to EOF before the reap");
+        assert_eq!(tailer.tracked_len(), 0, "ENOENT is an absence: the file is retired");
+        assert_eq!(scan_errors(&mut probe, "stat"), 0.0);
+        assert!(!diagnosed(&mut probe, "scan_error"));
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_missing_pattern_directory_is_not_a_scan_error() {
+        let dir = scratch_dir("scan-missing-dir");
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("not-yet").join("*.log"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 0.0);
+        assert_eq!(scan_errors(&mut probe, "stat"), 0.0);
+        assert!(!diagnosed(&mut probe, "scan_error"));
+
+        std::fs::create_dir(dir.join("not-yet")).unwrap();
+        std::fs::write(dir.join("not-yet").join("app.log"), b"arrived\n").unwrap();
+        assert_eq!(tick(&mut tailer, false).await, vec!["arrived"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that is gone is an absence, so its files drain and close. Renamed back later,
+    /// the same inodes are new discoveries and replay from `0`: nothing retained them.
+    #[tokio::test]
+    async fn a_pattern_directory_removed_drains_and_closes_its_files() {
+        let dir = scratch_dir("scan-dir-removed");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("app.log"), b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(sub.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        std::fs::remove_dir_all(&sub).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 0);
+        // The gauge is sampled at the end of a scan, before that tick's reap.
+        tick(&mut tailer, false).await;
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(0.0));
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `fstat` on a kept file's handle sees the unlink the failed listing couldn't.
+    #[tokio::test]
+    async fn a_file_deleted_under_a_failing_listing_is_drained_and_closed() {
+        let dir = scratch_dir("scan-deleted-while-failing");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\n");
+        std::fs::remove_file(&path).unwrap();
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "read to EOF before the reap");
+        assert_eq!(tailer.tracked_len(), 0);
+        assert!(tailer.by_path.is_empty());
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_truncation_under_a_failing_listing_is_still_detected() {
+        let dir = scratch_dir("scan-truncated-while-failing");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"aaaaaaaaaa\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["aaaaaaaaaa"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        std::fs::write(&path, b"new\n").unwrap(); // `O_TRUNC`: same inode, shorter
+        assert_eq!(tick(&mut tailer, false).await, vec!["new"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One persistently failing directory doesn't hold back retirement under another pattern.
+    #[tokio::test]
+    async fn two_patterns_one_failing_still_retire_the_others_removed_file() {
+        let failing = scratch_dir("scan-two-failing");
+        let healthy = scratch_dir("scan-two-healthy");
+        let a = failing.join("a.log");
+        let b = healthy.join("b.log");
+        std::fs::write(&a, b"a1\n").unwrap();
+        std::fs::write(&b, b"b1\n").unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(failing.join("*.log")), PathPattern::new(healthy.join("*.log"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+
+        let scope = fault::scope(&failing);
+        scope.fail(READ_DIR, errno::EACCES);
+        std::fs::remove_file(&b).unwrap();
+        tick(&mut tailer, false).await;
+        assert_eq!(state_of(&tailer, &a), Some(FileState::Active));
+        assert_eq!(tailer.tracked_len(), 1, "b.log is retired and reaped");
+        assert!(!tailer.by_path.contains_key(&b));
+        drop(scope);
+        std::fs::remove_dir_all(&failing).ok();
+        std::fs::remove_dir_all(&healthy).ok();
+    }
+
+    /// Two patterns list one directory, and only the second fails: a path only the listed one
+    /// covers is retired, and one the failed one covers is kept.
+    #[tokio::test]
+    async fn two_patterns_sharing_a_directory_one_failing_retire_only_what_the_listed_one_covers() {
+        let dir = scratch_dir("scan-shared-dir");
+        let elsewhere = scratch_dir("scan-shared-dir-elsewhere");
+        let log = dir.join("app.log");
+        let txt = dir.join("app.txt");
+        std::fs::write(&log, b"log\n").unwrap();
+        std::fs::write(&txt, b"txt\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("*.log")), PathPattern::new(dir.join("*.txt"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        let txt_id = FileId::from_metadata(&std::fs::metadata(&txt).unwrap());
+
+        // One `ReadDir` per pattern per scan, in pattern order: the 2nd is `*.txt`'s.
+        let scope = fault::scope(&dir);
+        scope.fail_nth(READ_DIR, 2, errno::EACCES);
+        std::fs::remove_file(&log).unwrap();
+        // Moved, not unlinked, so the kept handle's `fstat` has no reason to retire it.
+        std::fs::rename(&txt, elsewhere.join("app.txt")).unwrap();
+        tick(&mut tailer, false).await;
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        assert!(!tailer.by_path.contains_key(&log), "*.log listed, so app.log is retired");
+        assert_eq!(tailer.by_path.get(&txt), Some(&txt_id), "*.txt failed, so app.txt is kept");
+        assert_eq!(tailer.files.get(&txt_id).map(|f| f.state), Some(FileState::Active));
+        drop(scope);
+
+        tick(&mut tailer, false).await;
+        assert_eq!(tailer.tracked_len(), 0, "a clean listing without app.txt retires it");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[tokio::test]
+    async fn a_path_matched_by_two_patterns_is_statted_once() {
+        let dir = scratch_dir("scan-stat-once");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(&path), PathPattern::new(dir.join("*.log"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+
+        let scope = fault::scope(&dir);
+        scope.record();
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+        let ops = |op| scope.hits().iter().filter(|h| h.point.op == op).count();
+        assert_eq!(ops(fault::Op::ReadDir), 2, "one listing per pattern");
+        assert_eq!(ops(fault::Op::Stat), 1, "one stat per distinct path");
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `read_from` applies to the bind scan only, so a file the bind scan couldn't list is a later
+    /// discovery and starts at the beginning. The diagnostic says so.
+    #[tokio::test]
+    async fn a_listing_that_fails_at_bind_starts_its_files_at_the_beginning_later() {
+        let dir = scratch_dir("scan-fails-at-bind");
+        std::fs::write(dir.join("app.log"), b"old\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::End, &probe);
+
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EMFILE);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        drop(scope);
+
+        assert_eq!(tick(&mut tailer, false).await, vec!["old"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -547,7 +547,18 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
         Refresh::Identity
     }
 
+    fn retain(&mut self, path: &Path) {
+        let Some(container_dir) = path.parent() else { return };
+        if let Some(entry) = self.meta.get_mut(container_dir) {
+            entry.seen = self.generation;
+        }
+    }
+
     fn end_scan(&mut self) {
+        // A container `scan` kept without listing it (`retain`) must keep its entry too. Evicted,
+        // the next good scan would rebuild its identity into a fresh `Arc`, `refresh`'s `ptr_eq`
+        // would fail, and every such container would report a spurious `container_renamed`,
+        // `files.identity_changed`, and `ResourceChange` flush.
         let generation = self.generation;
         self.meta.retain(|_, entry| entry.seen == generation);
         self.generation += 1;
@@ -2468,6 +2479,122 @@ mod tests {
             "the dropped line's closing entry must not surface as a message"
         );
         running.stop().await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- a failed listing keeps a container and its identity
+    // (docs/adr/tail-discovery-failure-and-resume-identity.md) --------------------------------
+
+    use crate::tail::test_support::{READ_DIR, STAT};
+    use logit_core::EventBatch;
+    use logit_pipeline::fault::{self, errno, Point};
+
+    /// Runs `docker_in` over `root` with `point` failing under `scope_dir` until at least two
+    /// scans counted it, then disarms it and waits for two more poll ticks, so at least one whole
+    /// scan ran clean. Returns every batch received, and the probe.
+    async fn fail_then_recover(
+        root: &Path,
+        logs: &[PathBuf],
+        scope_dir: &Path,
+        point: Point,
+        op: &str,
+    ) -> (Vec<EventBatch>, TelemetryProbe) {
+        for log in logs {
+            std::fs::write(log, json_file_line("before\n")).unwrap();
+        }
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(64);
+        let input = DockerInput::new(
+            root.to_path_buf(),
+            ContainerFilter::new(vec![], true),
+            vec![],
+            fast_tail_config(),
+        )
+        .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
+        let running = spawn_input(input, fanout).await;
+        let mut batches = Vec::new();
+        while batches.iter().map(|b: &EventBatch| b.events.len()).sum::<usize>() < logs.len() {
+            batches.push(recv_batch(&mut rx).await);
+        }
+
+        let scope = fault::scope(scope_dir);
+        scope.fail(point, errno::EACCES);
+        probe
+            .wait_for("two scans to count the injected failure", |t| {
+                t.sum("logit.input.scan.errors", &[("op", op)]) >= 2.0
+            })
+            .await;
+        drop(scope);
+        let ticks = probe.sum("logit.input.watch.wakes", &[("source", "poll")]);
+        probe
+            .wait_for("a whole scan after the failure is disarmed", |t| {
+                t.sum("logit.input.watch.wakes", &[("source", "poll")]) >= ticks + 2.0
+            })
+            .await;
+
+        for log in logs {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(log)
+                .unwrap()
+                .write_all(json_file_line("after\n").as_bytes())
+                .unwrap();
+        }
+        let before = batches.len();
+        while batches[before..].iter().map(|b| b.events.len()).sum::<usize>() < logs.len() {
+            batches.push(recv_batch(&mut rx).await);
+        }
+        running.stop().await;
+        (batches, probe)
+    }
+
+    /// Asserts nothing was retired, replayed, or re-identified across the failure, and that each
+    /// container's lines kept their full identity.
+    fn assert_kept_with_identity(batches: &[EventBatch], probe: &mut TelemetryProbe, n: usize) {
+        let mut msgs: Vec<String> = batches.iter().flat_map(|b| messages(&b.events)).collect();
+        msgs.sort();
+        let mut want = vec!["after".to_string(); n];
+        want.extend(vec!["before".to_string(); n]);
+        assert_eq!(msgs, want, "no line lost or replayed");
+        for batch in batches {
+            assert!(
+                batch.resource.attributes.get("container.name").is_some(),
+                "every batch carries the full identity"
+            );
+        }
+        assert_eq!(
+            probe.sum("logit.input.files.identity_changed", &[]),
+            0.0,
+            "a kept container's identity must not be rebuilt into a fresh Arc"
+        );
+        assert_eq!(probe.sum("logit.component.receive.flushed", &[("reason", "closed")]), 0.0);
+        assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(n as f64));
+    }
+
+    #[tokio::test]
+    async fn a_docker_container_dir_that_cannot_be_read_keeps_its_log_tracked() {
+        let root = scratch_dir("docker-scan-dir-unreadable");
+        let id = "7".repeat(64);
+        let log = container(&root, &id, "web", "nginx:1.25");
+
+        let (batches, mut probe) =
+            fail_then_recover(&root, std::slice::from_ref(&log), &root.join(&id), STAT, "stat")
+                .await;
+        assert_kept_with_identity(&batches, &mut probe, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_root_listing_keeps_every_container_and_its_identity() {
+        let root = scratch_dir("docker-scan-root-unreadable");
+        let logs = vec![
+            container(&root, &"5".repeat(64), "web", "nginx:1.25"),
+            container(&root, &"6".repeat(64), "db", "postgres:16"),
+        ];
+
+        let (batches, mut probe) =
+            fail_then_recover(&root, &logs, &root, READ_DIR, "read_dir").await;
+        assert_kept_with_identity(&batches, &mut probe, 2);
         std::fs::remove_dir_all(&root).ok();
     }
 }

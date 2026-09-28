@@ -52,8 +52,8 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-# `tail::line_verification`'s model test of `LineSplitter`, and `docker_verification`'s of
-# `DockerDecoder`.
+# Model tests: `tail::line_verification`'s `LineSplitter`, `docker_verification`'s
+# `DockerDecoder`, and `tail::pattern`'s `matches_name`.
 proptest.workspace = true
 # Arms `logit_pipeline::fault` and compiles `logit_pipeline::test_util` in this crate's tests.
 # Dev-only, so the release binary never has either.
