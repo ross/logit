@@ -309,6 +309,48 @@
           "legendFormat": "{{component}} {{reason}}"
         }
       ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Process memory",
+      "description": "Resident set size against jemalloc's live heap. Lua VM heaps count in the live heap; the gap is jemalloc overhead, LuaJIT machine code, mapped binary pages, stacks, and the UDP read slab, not a leak by itself.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 86 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(logit_process_memory_resident_bytes)",
+          "legendFormat": "resident"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "max(logit_process_memory_allocated_bytes)",
+          "legendFormat": "allocated"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Process CPU (cores)",
+      "description": "CPU time the logit process uses per second, by mode.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 86 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "interval": "1m",
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "expr": "sum by (mode) (rate(logit_process_cpu_seconds_total[$__rate_interval]))",
+          "legendFormat": "{{mode}}"
+        }
+      ]
     }
   ]
 }

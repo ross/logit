@@ -187,6 +187,15 @@ pub async fn run_pipelines(
     result
 }
 
+/// jemalloc's live heap size, `stats.allocated`, for `logit.process.memory.allocated.bytes`.
+/// `epoch::advance` refreshes the statistics jemalloc caches; without it every read repeats
+/// the previous snapshot.
+#[cfg(feature = "jemalloc")]
+fn jemalloc_allocated() -> Option<u64> {
+    tikv_jemalloc_ctl::epoch::advance().ok()?;
+    tikv_jemalloc_ctl::stats::allocated::read().ok().map(|n| n as u64)
+}
+
 /// [`prepare`]'s return type, named for clippy's `type_complexity`.
 type PrepareResult =
     (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
@@ -555,14 +564,15 @@ fn build_spec(
             let registry = registry
                 .cloned()
                 .expect("graph::resolve's rule 13 guarantees a Registry whenever an 'internal' component does");
-            NodeSpec::Input(
-                Box::new(
-                    InternalInput::new(*interval, registry)
-                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                        .with_telemetry(telemetry.clone()),
-                ),
-                input_runtime_config(&component.receive),
-            )
+            #[allow(unused_mut)]
+            let mut input = InternalInput::new(*interval, registry)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            #[cfg(feature = "jemalloc")]
+            {
+                input = input.with_heap_stats(jemalloc_allocated);
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
         // Rule 42 has already parsed every template and checked its placeholders, so these `?`s
@@ -1739,6 +1749,24 @@ mod tests {
     use logit_config::{Component, ComponentKind, InternalLogs};
     use std::collections::HashMap as Map;
     use std::time::Duration;
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_allocated_reports_a_live_heap() {
+        assert!(jemalloc_allocated().is_some_and(|n| n > 0));
+    }
+
+    #[cfg(feature = "jemalloc")]
+    #[test]
+    fn jemalloc_allocated_refreshes_on_every_read() {
+        let before = jemalloc_allocated().expect("jemalloc stats");
+        let held = std::hint::black_box(vec![1u8; 1 << 20]);
+        let after = jemalloc_allocated().expect("jemalloc stats");
+        // Not an equality against the 1 MiB: `stats.allocated` is process-wide, and under a
+        // shared-process runner another test's allocations and frees move it between the reads.
+        assert!(after > before, "before {before}, after {after}");
+        drop(held);
+    }
 
     #[test]
     fn every_internal_logs_threshold_is_at_or_above_warn() {

@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Process-level metrics from procfs and the allocator](process-level-metrics.md) | 2026-09-28 | 2026-09-28 |
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-09-28 |
 | [`stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it](stream-json-format.md) | 2026-09-28 | 2026-09-28 |
 | [Test timing: wait on an observable, size every sleep, and share one set of helpers](test-timing-and-observables.md) | 2026-09-28 | 2026-09-28 |
@@ -86,7 +87,7 @@ the same date, write the record, then add a row here.
 | [A separate demo stack, not an extension of the dev stack](demo-stack-separate-from-dev-stack.md) | 2026-09-01 | 2026-09-01 |
 | [Internal telemetry as ordinary pipeline events, drained from a component-level buffer](internal-telemetry-as-pipeline-events.md) | 2026-08-31 | 2026-09-12 |
 | [Minimize allocations over event size, when the two conflict](minimize-allocations-over-event-size.md) | 2026-08-31 | 2026-08-31 |
-| [jemalloc as the global allocator](jemalloc-global-allocator.md) | 2026-08-31 | 2026-08-31 |
+| [jemalloc as the global allocator](jemalloc-global-allocator.md) | 2026-08-31 | 2026-09-28 |
 | [`Arc<EventBatch>` copy-on-write on channels](arc-eventbatch-copy-on-write.md) | 2026-08-31 | 2026-08-31 |
 | [Service lifecycle: signal-driven shutdown and bounded output retry](service-lifecycle-and-output-retry.md) | 2026-08-30 | 2026-09-14 |
 | [`Event` carries a log, metrics, and a span at once, not one of the three](multi-payload-events.md) | 2026-08-30 | 2026-08-30 |

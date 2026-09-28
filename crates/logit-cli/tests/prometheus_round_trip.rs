@@ -356,7 +356,33 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
     let telemetry = registry.telemetry_for("probe", "statsd_in", "listener");
     telemetry.count("logit.component.batches.sent", 3.0, &[]);
 
-    let mut input = InternalInput::new(Duration::from_millis(20), registry);
+    let input = InternalInput::new(Duration::from_millis(20), registry);
+    let body = first_drain_through_cumulative_aggregate(input).await;
+    assert!(
+        body.contains("logit_component_batches_sent_total"),
+        "expected at least one logit_component_* counter family, got:\n{body}"
+    );
+}
+
+/// `internal`'s own `logit.process.*` points, on its own handle, reach a Prometheus exposition
+/// through a cumulative `aggregate`: CPU time as a `_total` counter and resident memory as a gauge.
+#[tokio::test]
+async fn internal_process_metrics_through_cumulative_aggregate_render_in_the_exposition() {
+    let registry = Registry::new();
+    let own = registry.telemetry_for("self", "internal", "listener");
+    let input = InternalInput::new(Duration::from_millis(20), registry).with_telemetry(own);
+    let body = first_drain_through_cumulative_aggregate(input).await;
+    assert!(body.contains("logit_process_uptime"), "got:\n{body}");
+    #[cfg(target_os = "linux")]
+    {
+        assert!(body.contains("logit_process_cpu_seconds_total"), "got:\n{body}");
+        assert!(body.contains("logit_process_memory_resident_bytes"), "got:\n{body}");
+    }
+}
+
+/// Runs `input` until its first drain, folds that batch through a cumulative `aggregate`, and
+/// returns the text exposition `prometheus_out` serves for the result.
+async fn first_drain_through_cumulative_aggregate(mut input: InternalInput) -> String {
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {
@@ -398,10 +424,7 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
     }
 
     let (body, _addr) = expose_and_fetch(&batches, ACCEPT_TEXT).await;
-    assert!(
-        body.contains("logit_component_batches_sent_total"),
-        "expected at least one logit_component_* counter family, got:\n{body}"
-    );
+    body
 }
 
 /// `aggregate -> prometheus_out`: a series keeps its first record's `description`, which the
