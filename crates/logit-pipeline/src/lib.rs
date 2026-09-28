@@ -32,6 +32,8 @@ pub mod runtime;
 /// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd. Not re-exported flat:
 /// call sites read as `sockstat::meminfo`.
 pub mod sockstat;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod transform;
 
 pub use accumulator::{BatchAccumulator, FlushReason};

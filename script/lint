@@ -16,3 +16,10 @@ if grep -q 'fault-injection' <<<"${tree}"; then
     echo "error: logit-cli's release dependency graph enables logit-pipeline's fault-injection feature" >&2
     exit 1
 fi
+
+# The same guard for logit-pipeline's `test-util` feature (crates/logit-pipeline/src/test_util.rs).
+# tokio has a `test-util` feature of its own, so the match names the crate.
+if grep -qF 'logit-pipeline feature "test-util"' <<<"${tree}"; then
+    echo "error: logit-cli's release dependency graph enables logit-pipeline's test-util feature" >&2
+    exit 1
+fi
