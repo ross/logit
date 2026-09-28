@@ -1986,8 +1986,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   listed after that listing failed starts at its beginning, which favors duplicates over loss.
 - **A file under a directory that stays unreadable stays tracked** until the listing recovers or
   its inode is unlinked. A failed listing retires nothing, and the handle check catches removal
-  and truncation but not a rename. `ELOOP` on a `docker_in` container directory is treated the
-  same way: unknown, kept, and diagnosed. See [ADR
+  and truncation but not a rename. `ELOOP` on a `docker_in` container's log path (a looping
+  `<id>-json.log` symlink) is treated the same way: unknown, kept, and diagnosed. See [ADR
   `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
   decision 1.
 - **A read error on a `Draining` file loses its unread tail.** The driver reports a read error as

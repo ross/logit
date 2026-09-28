@@ -537,7 +537,7 @@ with a peek that stopped responding while draining, which is consistent with tha
 
 - `Op::ReadDir`, before each `read_dir` in `crates/logit-inputs/src/tail/pattern.rs`, and again
   per iterated entry, so an error part-way through a listing can be injected.
-- `Op::Stat`, in `scan_docker_containers`, before the per-entry `file_type()` and before the
+- `Op::Stat`, in `PathPattern::scan_container`, before the per-entry `file_type()` and before the
   log-path `metadata`.
 - `Op::Stat`, before the per-path `metadata` in `Tailer::scan`.
 

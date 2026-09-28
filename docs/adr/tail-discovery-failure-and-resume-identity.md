@@ -74,10 +74,12 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      name is retired in this scan.
    - **A per-path `stat` has three outcomes.** `NotFound` or `NotADirectory` means absent. Any
      other error means unknown, and an unknown path retires nothing.
-   - **`docker_in`'s per-entry work.** In `scan_docker_containers`, a `file_type()` error on a
-     `root` entry, or a `metadata` error other than absent on the built log path, pushes the
-     path to `Scan::unknown` instead of skipping it. `ELOOP` on a container directory is
-     unknown: the file stays tracked and the error is diagnosed.
+   - **`docker_in`'s per-entry work.** In `PathPattern::scan_container`, a `file_type()` error
+     on a `root` entry, or a `metadata` error other than absent on the built log path, pushes the
+     path to `Scan::unknown` instead of skipping it. `ELOOP` (or any other non-absent error) on
+     the log path's `metadata` is unknown: the file stays tracked and the error is diagnosed. A
+     symlinked container directory isn't followed (`file_type()` doesn't follow it) and is
+     absent.
 
    `Tailer::scan` retires a tracked path only if its `stat` wasn't unknown and no pattern whose
    listing failed covers it (`PathPattern::covers`); `pattern.rs`'s table has the per-operation
@@ -284,11 +286,11 @@ checks three points at `tail.scan`: the `read_dir` in `PathPattern::scan`, the t
 stats in `docker_in`'s walk, and the per-path `metadata` in `Tailer::scan`, which runs once per
 distinct matched path.
 
-Tests, all against a real scratch directory with the failure forced through the seam:
-`pattern.rs` covers each row of its module doc's table, `covers` against `scan` for both
-matchers, and a model proptest of `matches_name`; `driver.rs` covers a failed listing and a
-failed `stat` keeping the file with no replay, `ENOENT` still retiring it, a missing or removed
-directory, a deletion and a truncation seen through the handle while the listing fails, two
+Tests, all against a real scratch directory with the failure forced through the seam: `pattern.rs`
+covers each row of its module doc's table, `covers` against `scan` for both matchers, and a model
+proptest of `matches_name`; `driver.rs` covers a failed listing (at the call or part-way through)
+and a failed `stat` keeping the file with no replay, `ENOENT` still retiring it, a missing or
+removed directory, a deletion and a truncation seen through the handle while the listing fails, two
 patterns with one failing (separate and shared directories), one `stat` per distinct path, and a
 bind-time failure starting the file at `0` later; `docker.rs` covers an unreadable container
 directory and an unreadable `root`, each recovering with no identity change.
