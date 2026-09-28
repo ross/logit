@@ -618,7 +618,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     tracked.start_draining(self.scan_generation);
                 }
                 self.by_path.remove(&path);
-                self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
+                self.open_or_rebind(path, id, meta.len(), StartOffset::Beginning, watcher).await;
             }
             None => {
                 // Peeked, not removed: `accept` may still reject this path (a de-selected
@@ -629,8 +629,28 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     None if first => self.first_scan_start,
                     None => StartOffset::Beginning,
                 };
-                self.open_tracked(path, id, start, watcher).await;
+                self.open_or_rebind(path, id, meta.len(), start, watcher).await;
             }
+        }
+    }
+
+    /// [`Tailer::open_tracked`], then, for an inode it rebound, the truncation check the
+    /// same-path arm runs. A rebound inode may have been truncated in place while it was unbound
+    /// (retired by a `stat` that raced a rename, then copytruncated); left unchecked, a refill past
+    /// its offset before the next scan would be read from mid-line. `len` is the scan's `stat` of
+    /// `path`, which names `id`.
+    async fn open_or_rebind(
+        &mut self,
+        path: PathBuf,
+        id: FileId,
+        len: u64,
+        start: StartOffset,
+        watcher: &mut super::watch::Watcher,
+    ) {
+        let rebind = self.files.get(&id).is_some_and(|f| f.state != FileState::Deselected);
+        self.open_tracked(path, id, start, watcher).await;
+        if rebind {
+            self.reconcile_truncation(id, len).await;
         }
     }
 
@@ -5145,5 +5165,41 @@ mod tests {
             return;
         }
         panic!("the draining file never came first in 64 fresh maps");
+    }
+
+    // -- rebinding (found by `verification`'s state-machine proptest)
+
+    /// A `stat` that raced a rename retires the file; logrotate's `copytruncate` then truncates it
+    /// in place and the writer refills it past the old offset before the scan that rebinds it.
+    /// The rebind sees the short length, so it must reset the offset as the same-path arm does,
+    /// or the next read starts mid-line.
+    #[tokio::test]
+    async fn a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset()
+    {
+        let dir = scratch_dir("rebind-after-truncation");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(STAT, 1, errno::ENOENT);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        drop(scope);
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Draining));
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(0).unwrap();
+        append(&path, b"three\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active), "rebound");
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        append(&path, b"four-refilled-past-the-old-offset\n");
+        assert_eq!(
+            tick(&mut tailer, false).await,
+            vec!["three", "four-refilled-past-the-old-offset"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
