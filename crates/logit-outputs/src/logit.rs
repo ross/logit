@@ -602,6 +602,7 @@ mod tests {
     use logit_core::{AttrMap, Event, LogRecord, Resource, Severity, Value};
     use logit_inputs::logit::LogitInput;
     use logit_inputs::Input;
+    use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::{
         classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fanout,
     };
@@ -630,54 +631,24 @@ mod tests {
 
     /// A real `LogitInput` on an ephemeral port, so round-trip tests can't drift from `logit_in`.
     async fn spawn_real_listener() -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
-        spawn_real_listener_with_idle_timeout(None).await
+        spawn_real_listener_with_idle_timeout(None, Telemetry::default()).await
     }
 
-    /// [`spawn_real_listener`] with `logit_in`'s `idle_timeout:` set, for the probe tests.
+    /// [`spawn_real_listener`] with `logit_in`'s `idle_timeout:` set and a telemetry handle, for
+    /// the probe tests. Binds before spawning, so the returned address is already live.
     async fn spawn_real_listener_with_idle_timeout(
         idle_timeout: Option<Duration>,
+        telemetry: Telemetry,
     ) -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        let mut input = LogitInput::new(addr.clone()).with_idle_timeout(idle_timeout);
+        let mut input = LogitInput::new("127.0.0.1:0")
+            .with_idle_timeout(idle_timeout)
+            .with_telemetry(telemetry);
+        input.bind().await.expect("bind should succeed");
+        let addr = input.local_addr().expect("a bound listener reports its address").to_string();
         let (tx, rx) = mpsc::channel(16);
         let sink = Fanout::new(vec![tx]);
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
         (addr, rx)
-    }
-
-    /// `logit.output.reconnects` from a drained `Registry`, or `None` if never counted.
-    fn reconnects_in(events: &[logit_core::Event]) -> Option<f64> {
-        events.iter().find_map(|e| {
-            e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(sum)
-                    if logit_core::interner::resolve(m.name) == "logit.output.reconnects" =>
-                {
-                    Some(sum.value)
-                }
-                _ => None,
-            })
-        })
-    }
-
-    /// `logit.output.requests`' total for one `class`, or `None` if never counted. A sum, since
-    /// `Telemetry` coalesces repeats into one point per drain.
-    fn requests_in(events: &[logit_core::Event], class: &str) -> Option<f64> {
-        events.iter().find_map(|e| {
-            if e.attributes.get("class").and_then(|v| v.as_str()) != Some(class) {
-                return None;
-            }
-            e.metrics.iter().find_map(|m| match &m.kind {
-                logit_core::MetricKind::Sum(sum)
-                    if logit_core::interner::resolve(m.name) == "logit.output.requests" =>
-                {
-                    Some(sum.value)
-                }
-                _ => None,
-            })
-        })
     }
 
     async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
@@ -720,17 +691,26 @@ mod tests {
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost(
     ) {
-        let (addr, mut rx) =
-            spawn_real_listener_with_idle_timeout(Some(Duration::from_millis(100))).await;
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
-        let mut output = LogitOutput::new(addr).with_telemetry(telemetry);
+        let mut probe = TelemetryProbe::new();
+        let (addr, mut rx) = spawn_real_listener_with_idle_timeout(
+            Some(Duration::from_millis(100)),
+            probe.telemetry("logit_in", "logit_in", "listener"),
+        )
+        .await;
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
         output.send(&sample_batch()).await.expect("first send should succeed");
         assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
 
-        // 3x the idle timeout: the listener's `Reject{GOING_AWAY}` and FIN are queued here.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The listener's own live-connections gauge drops back to 0 only once its idle timer has
+        // closed the connection: `crate::listener::LiveConnections::enter`'s guard runs after
+        // `serve_connection` writes the `Reject` and returns, so the FIN is already queued here.
+        probe
+            .wait_for("the idle connection to close", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
 
         output
             .send(&sample_batch())
@@ -742,16 +722,19 @@ mod tests {
             "the second batch must actually reach the listener, not be lost into a dead socket"
         );
 
-        let drained = registry.drain(0);
+        let totals = probe.poll();
         assert_eq!(
-            reconnects_in(&drained),
-            Some(1.0),
+            totals.sum("logit.output.reconnects", &[]),
+            1.0,
             "exactly one reconnect -- the probe's, not a retry of a failed write"
         );
-        assert_eq!(requests_in(&drained, "ok"), Some(2.0), "both batches delivered cleanly");
         assert_eq!(
-            requests_in(&drained, "ambiguous"),
-            None,
+            totals.sum("logit.output.requests", &[("class", "ok")]),
+            2.0,
+            "both batches delivered cleanly"
+        );
+        assert!(
+            !totals.has("logit.output.requests", &[("class", "ambiguous")]),
             "and neither may be classified ambiguous -- an ambiguous batch is a dropped one here"
         );
     }
@@ -763,6 +746,10 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_accepts = Arc::clone(&accepts);
+        // Fires once the first connection's `Reject` write has returned, so the probe test waits
+        // on that instead of guessing how long the bytes take to reach this host's receive queue.
+        let (reject_sent, reject_arrived) = tokio::sync::oneshot::channel();
+        let mut reject_sent = Some(reject_sent);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else { break };
@@ -797,17 +784,19 @@ mod tests {
                         message: "idle for 100ms".to_string(),
                     };
                     write_control(&mut stream, &reject).await.unwrap();
+                    if let Some(tx) = reject_sent.take() {
+                        let _ = tx.send(());
+                    }
                 }
             }
         });
 
-        let registry = logit_core::Registry::new();
-        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
-        let mut output = LogitOutput::new(addr).with_telemetry(telemetry);
+        let mut probe = TelemetryProbe::new();
+        let mut output =
+            LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
 
         output.send(&sample_batch()).await.expect("first send should succeed");
-        // Long enough for the `Reject` to be sitting in this host's receive queue.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        reject_arrived.await.expect("the peer task must signal before this test proceeds");
 
         output
             .send(&sample_batch())
@@ -819,10 +808,10 @@ mod tests {
             2,
             "the probe must have dialled a second connection"
         );
-        let drained = registry.drain(0);
-        assert_eq!(reconnects_in(&drained), Some(1.0));
-        assert_eq!(requests_in(&drained, "ok"), Some(2.0));
-        assert_eq!(requests_in(&drained, "ambiguous"), None);
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.reconnects", &[]), 1.0);
+        assert_eq!(totals.sum("logit.output.requests", &[("class", "ok")]), 2.0);
+        assert!(!totals.has("logit.output.requests", &[("class", "ambiguous")]));
     }
 
     // ---- provenance / codec negotiation ------------------------------------------------------
@@ -960,15 +949,20 @@ mod tests {
         // A peer that never acks, so the ack read can only be cancelled: deterministic.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(fake_peer(listener, |_hello| FakePeerBehavior::AckThenHang {
+        let (ready, frame_read) = tokio::sync::oneshot::channel();
+        tokio::spawn(fake_peer(listener, move |_hello| FakePeerBehavior::AckThenHang {
             ack_compression: 0,
+            ready,
         }));
 
         let mut output = LogitOutput::new(addr);
         let batch = sample_batch();
         tokio::select! {
             _ = output.send(&batch) => panic!("send should never resolve against a peer that never acks"),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            // Cancels only once the peer confirms the frame was read in full: had `send` been
+            // cancelled any earlier, `self.stream` would trivially be `None` regardless of the
+            // pooled-connection contract this test means to exercise.
+            _ = frame_read => {}
         }
         assert!(
             output.stream.is_none(),
@@ -1022,7 +1016,7 @@ mod tests {
                     }
                 }
             }
-            FakePeerBehavior::AckThenHang { ack_compression } => {
+            FakePeerBehavior::AckThenHang { ack_compression, ready } => {
                 let ack = control::HelloAck {
                     version: control::PROTOCOL_VERSION,
                     codec: native::CODEC_NATIVE_V1,
@@ -1031,6 +1025,13 @@ mod tests {
                     window: 1,
                 };
                 write_control(&mut stream, &ack).await.unwrap();
+                let mut header = [0u8; frame::HEADER_LEN];
+                stream.read_exact(&mut header).await.unwrap();
+                let mut header_bytes = Bytes::copy_from_slice(&header);
+                let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
+                let mut body = vec![0u8; h.compressed_len as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let _ = ready.send(());
                 // Open and silent forever: the ack read can only be cancelled.
                 std::future::pending::<()>().await;
             }
@@ -1058,9 +1059,18 @@ mod tests {
 
     enum FakePeerBehavior {
         Reject(control::Reject),
-        AckThenClose { ack_compression: u8 },
-        AckThenHang { ack_compression: u8 },
-        AckThenReject { code: u16 },
+        AckThenClose {
+            ack_compression: u8,
+        },
+        /// `ready` fires once the data frame has been read in full, proving the client's write
+        /// completed and it is now blocked awaiting the ack this peer never sends.
+        AckThenHang {
+            ack_compression: u8,
+            ready: tokio::sync::oneshot::Sender<()>,
+        },
+        AckThenReject {
+            code: u16,
+        },
     }
 
     #[tokio::test]
