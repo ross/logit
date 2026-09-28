@@ -6,8 +6,8 @@
 #
 # Why a separate config: `resource: drop` is what lets a run's summary leave an environment the
 # traffic could not (docs/adr/shape-observer-component.md). With `keep`, the observed `Resource`
-# reaches `aggregate`, which keys its series on it, and `file_out`'s human render merges those
-# attributes into each record's `attrs` line. The output of this config is identity-bearing: it
+# reaches `aggregate`, which keys its series on it, and `file_out`'s `format: json` output writes those
+# attributes under each record's `resource.attributes`. The output of this config is identity-bearing: it
 # names the demo's services, host, container ids and the collector's detected CPU model. It stays
 # in the run directory (`perf/results/` is gitignored) and nothing derived from it is pasted
 # anywhere without being read first.
@@ -52,5 +52,6 @@ components:
     type: file_out
     sources: [shape_rollup]
     path: /out/shape.log
+    format: json
     rotate:
       max_bytes: "64GiB"

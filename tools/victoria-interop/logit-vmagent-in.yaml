@@ -14,6 +14,7 @@ components:
     type: stdio_out
     sources: [from_vmagent]
     target: /out/vmagent-in-received.log
+    format: json
 
   self:
     type: internal
@@ -31,3 +32,4 @@ components:
     type: stdio_out
     sources: [writes]
     target: /out/vmagent-in-telemetry.log
+    format: json

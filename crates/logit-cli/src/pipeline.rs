@@ -884,7 +884,7 @@ fn build_spec(
                 write_config(&component.buffer),
             )
         }
-        StdioOut { target, format, compression } => {
+        StdioOut { target, format, compression, message } => {
             let output = match target {
                 StdioTarget::Stdout => StreamOutput::stdout(),
                 StdioTarget::Stderr => StreamOutput::stderr(),
@@ -892,17 +892,17 @@ fn build_spec(
                 // `StdioTarget` documents; `Path::join` leaves an absolute path untouched.
                 StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
             };
-            let output = output.with_format(to_stream_encoder(*format, *compression));
+            let output = output.with_format(to_stream_encoder(*format, *compression, *message));
             NodeSpec::Output(
                 Box::new(output.with_telemetry(telemetry.clone())),
                 queue_config(&component.buffer, base_dir),
                 write_config(&component.buffer),
             )
         }
-        FileOut { path, rotate, format, compression } => {
+        FileOut { path, rotate, format, compression, message } => {
             // Relative to the config file's directory, as `StdioTarget::Path` is.
             let output = StreamOutput::rotating(base_dir.join(path), to_rotate_policy(rotate))?
-                .with_format(to_stream_encoder(*format, *compression))
+                .with_format(to_stream_encoder(*format, *compression, *message))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             NodeSpec::Output(
@@ -1223,16 +1223,28 @@ fn to_rotate_interval(interval: logit_config::RotateInterval) -> OutputRotateInt
 }
 
 /// Config's `StreamFormat`/`Compression` into a `StreamEncoder`. `compression` is ignored under
-/// `Human`, where graph rule 33 guarantees it's `none`.
+/// `Human` and `Json`, where graph rule 33 guarantees it's `none`.
 fn to_stream_encoder(
     format: logit_config::StreamFormat,
     compression: logit_config::Compression,
+    message: logit_config::MessageMode,
 ) -> logit_outputs::stdio::StreamEncoder {
     match format {
-        logit_config::StreamFormat::Human => logit_outputs::stdio::StreamEncoder::human(),
+        logit_config::StreamFormat::Human => {
+            logit_outputs::stdio::StreamEncoder::human_with(to_message_mode(message))
+        }
+        logit_config::StreamFormat::Json => logit_outputs::stdio::StreamEncoder::json(),
         logit_config::StreamFormat::Native => {
             logit_outputs::stdio::StreamEncoder::native(to_native_compression(compression))
         }
+    }
+}
+
+// Mirrored rather than shared, as `Compression` is: `logit-config` depends on no output crate.
+fn to_message_mode(message: logit_config::MessageMode) -> logit_outputs::stdio::MessageMode {
+    match message {
+        logit_config::MessageMode::Escaped => logit_outputs::stdio::MessageMode::Escaped,
+        logit_config::MessageMode::Multiline => logit_outputs::stdio::MessageMode::Multiline,
     }
 }
 
@@ -3447,7 +3459,12 @@ mod tests {
             sources: vec!["in".to_string()],
             targets: Vec::new(),
             consumers: vec![],
-            kind: ComponentKind::StdioOut { target, format, compression },
+            kind: ComponentKind::StdioOut {
+                target,
+                format,
+                compression,
+                message: logit_config::MessageMode::default(),
+            },
         }
     }
 
@@ -3542,7 +3559,13 @@ mod tests {
             sources: vec!["in".to_string()],
             targets: Vec::new(),
             consumers: vec![],
-            kind: ComponentKind::FileOut { path: path.to_string(), rotate, format, compression },
+            kind: ComponentKind::FileOut {
+                path: path.to_string(),
+                rotate,
+                format,
+                compression,
+                message: logit_config::MessageMode::default(),
+            },
         }
     }
 

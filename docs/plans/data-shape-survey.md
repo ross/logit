@@ -271,9 +271,10 @@ changing a headline). Three things differ from what this plan set out:
 - `demo/`'s numbers are recorded and used for nothing. It gets its own representativeness tier,
   below a third party's demo: a stack built to demonstrate `logit`, with formats authored here.
 - The doc's follow-up list leads with two things this plan did not foresee: an NDJSON format for
-  `file_out`/`stdio_out` (the survey's readout depends on parsing a human text render, the only
-  sink that carries raw `Samples`), and running a peer's own flat-map benchmark, which measures the
-  same question directly.
+  `file_out`/`stdio_out` (the survey's readout depended on parsing a human text render, the only
+  sink that carries raw `Samples`; since landed as `format: json`, ADR `stream-json-format`, which
+  the readout now consumes), and running a peer's own flat-map benchmark, which measures the same
+  question directly.
 
 ## Follow-ups (listed in the doc; not done in this pass)
 

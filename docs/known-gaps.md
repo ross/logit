@@ -252,7 +252,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     bounded by `max_set_members_per_series`, falling back to an estimate on overflow); see
     [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s amendment.
     `logit-outputs::influxdb` renders a `Set`'s estimate as a `value=` field instead of erroring,
-    and `logit-outputs::stdio` renders `set=<estimate>`.
+    and `logit-outputs::human` renders `kind: set` with its `estimate:`.
   - **statsd producer**: statsd's `s` type is no longer a decode error.
     `crates/logit-inputs/src/statsd.rs` decodes `s` to `MetricKind::SetMembers`, one event per line,
     every member a zero-copy datagram slice; `crates/logit-outputs/src/statsd.rs` encodes one
@@ -844,7 +844,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   | encode | `MetricKind::Samples` (raw statsd `ms`/`h`/`d` observations) → OTLP `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99), sketched into a temporary `DdSketch` first | `logit.output.metrics.degraded{metric_kind="samples"}` | Same as the `Distribution` row: OTLP has no raw-sample-list type, so `otlp_out` sketches first (`add_weighted` per value, weighted by `(1/sample_rate).round()` clamped to `[1, 1000]`) and takes the degraded path ([ADR `metrics-model-v2`](adr/metrics-model-v2.md)). |
   | encode | `MetricRecord.exemplars` on a `Summary` point → dropped | none (documented) | `SummaryDataPoint` has no `exemplars` field (OTLP spec). `Sum`/`Gauge`/`Histogram`/`ExponentialHistogram` carry them; a `Samples`/`Distribution` degraded into a `Summary` loses them for the same reason (`crates/logit-proto/src/otlp/metrics.rs`'s module doc). |
   | encode/decode | `Exemplar`'s trace context (`TraceRef.flags`) → dropped on encode, hardcoded `0` on decode | none (documented) | OTLP's `Exemplar` has no trace-flags field: a permanent lossy mapping, not a decode shortcut (`crates/logit-proto/src/otlp/metrics.rs`'s `encode_exemplar`/`decode_exemplar`). |
-  | sinks with no no-value wire form / `aggregate` | A `MetricRecord` flagged `NO_RECORDED_VALUE` → skipped at `influxdb_out`/`statsd_out`, rendered as `no_recorded_value` at `stdio_out` (never dropped — a debug sink must show it), passed through unmerged at `aggregate` | `logit.output.messages.dropped{reason="no_recorded_value"}` (statsd) / throttled diagnostic key `no_recorded_value` (influxdb) / `logit.transform.metrics.passed_through{reason="no_recorded_value"}` (aggregate) | `otlp_out` re-encodes a flagged point unchanged, the fixed point `docs/adr/lossless-transit.md` requires for `otlp_in -> otlp_out`. `collectd_out` is the one other wire with its own concept: a flagged `Gauge` is written as a GAUGE `NaN` ("no reading this interval") and decodes back flagged (`crates/logit-proto/src/collectd/mod.rs`'s module doc); any other flagged kind at `collectd_out` is skipped and counted. No other sink or transform has a "no value here" concept, so using the flag's default numeric payload would fabricate a sample (`crates/logit-core/src/metric.rs`'s `flags` doc). |
+  | sinks with no no-value wire form / `aggregate` | A `MetricRecord` flagged `NO_RECORDED_VALUE` → skipped at `influxdb_out`/`statsd_out`, rendered as `no_recorded_value: true` in place of its value at `stdio_out` (never dropped — a debug sink must show it), passed through unmerged at `aggregate` | `logit.output.messages.dropped{reason="no_recorded_value"}` (statsd) / throttled diagnostic key `no_recorded_value` (influxdb) / `logit.transform.metrics.passed_through{reason="no_recorded_value"}` (aggregate) | `otlp_out` re-encodes a flagged point unchanged, the fixed point `docs/adr/lossless-transit.md` requires for `otlp_in -> otlp_out`. `collectd_out` is the one other wire with its own concept: a flagged `Gauge` is written as a GAUGE `NaN` ("no reading this interval") and decodes back flagged (`crates/logit-proto/src/collectd/mod.rs`'s module doc); any other flagged kind at `collectd_out` is skipped and counted. No other sink or transform has a "no value here" concept, so using the flag's default numeric payload would fabricate a sample (`crates/logit-core/src/metric.rs`'s `flags` doc). |
   | encode (Prometheus) | A delta `Sum`/`Histogram` → **skipped** | `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}`, throttled diagnostic key `delta_temporality_unresolved` | Exposition has no delta temporality: every counter and histogram is a running total since a start time. Resolving one in the sink means per-series state and an invented window, which [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md) makes an explicit stage. The diagnostic names the fix: `aggregate` with `temporality: cumulative`. |
   | encode/decode (Prometheus) | Native histograms are **skipped in both directions** — `MetricKind::ExponentialHistogram` on the way out of either `prometheus_out` mode, a `TimeSeries.histograms[]` entry on the way into `prometheus_in(bind)` | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` on send; `logit.input.metrics.skipped{reason="native_histogram"}` on receive (also reported per request as `Decoded::histograms_skipped`, which is why a 2.0 response's `X-Prometheus-Remote-Write-Histograms-Written` is always `0`). **A 1.0 sender gets no signal at all** — 1.0 defines none of the `-Written` headers, so a Prometheus configured with `protobuf_message: prometheus.WriteRequest` and native histograms enabled sees `204`s for requests whose histograms were dropped, and only this receiver's own counter says otherwise. A 2.0 sender at least reads the zero (and Prometheus's own queue manager treats a zero against a non-zero send as a failure, loudly) | Deferred, not rejected; [ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "Native histograms now" alternative has the scope: a `Point::NativeHistogram` for the sparse shape, a mapping between Prometheus's `schema` and OTLP's `scale` (both base-2 exponential, but they differ on sign and zero-bucket treatment), the positive/negative span-and-delta encoding, and a decision on the gauge-vs-counter `reset_hint`. Remote-write 2.0 carries them, so the wire exists; the mapping doesn't. (Text 0.0.4 and OpenMetrics 1.0 have no syntax for them — sparse buckets live only in Prometheus's protobuf exposition and remote-write, `docs/design/telemetry-landscape.md`.) Materializing explicit buckets would be the lossy conversion `MetricKind::ExponentialHistogram` exists to avoid. |
   | encode (Prometheus remote-write) | A record flagged `FLAG_NO_RECORDED_VALUE` whose kind expands to several derived series — `Histogram`, `Summary`, `Distribution`/`Samples` (a sketch) — → **skipped**, where a flagged `Gauge`/`Sum`/marker-untyped record is written as Prometheus's own stale marker (the NaN bit pattern `0x7ff0000000000002`) | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The flag says a series stopped reporting, not *which* of `_bucket{le}`/`_sum`/`_count` existed, and a stale marker must name a series by its full label set. A marker on the bare family name would mark a series that never existed (`crates/logit-proto/src/prometheus/mod.rs`'s `stale_point`). The exposition path differs: `with_stale_markers` is off there and *every* flagged record is skipped under the same counter. |
@@ -1845,12 +1845,12 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human`'s
     text render has no compression option, and nothing compresses already-rotated files after the
     fact. Both are left to an external tool.
-  - *Format:* `format:` (`human`, the human-readable render, or `native`, `logit_proto::native`'s
-    wire format, ADR `file-output-native-format`) is shared with `stdio_out`. A `format:`
-    *template* over `human` is the one unbuilt extension point (`Format::Ndjson` is named only as
-    an aspiration, not code). Reading a `format: native` file back — a decoder-side
-    reader/verifier, or wiring `NativeDecoder` into `tail_in` — is real, unblocked, undesigned
-    follow-up work.
+  - *Format:* `format:` (`human`, the block render of ADR `human-render-block-format`; `json`,
+    one JSON object per event per line, ADR `stream-json-format`; or `native`,
+    `logit_proto::native`'s wire format, ADR `file-output-native-format`) is shared with
+    `stdio_out`, as is `message:`. A `format:` *template* over `human` is the one unbuilt
+    extension point. Reading a `format: native` file back — a decoder-side reader/verifier, or
+    wiring `NativeDecoder` into `tail_in` — is real, unblocked, undesigned follow-up work.
   - *Restart:* `FileTarget::open` seeds `RotationState`'s calendar period from an existing file's
     mtime (not just `written` from its length), so a restart under an `interval` policy resumes
     mid-period instead of merging two periods into one file or never rotating. Residual: an
@@ -1874,10 +1874,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   process's lifetime, so an external log rotator that moves the file leaves `logit` writing to the
   unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
   sink. When a file target needs bounding, use `file_out` (ADR `rotating-file-output`), which
-  shares `stdio_out`'s implementation and adds a rotation policy. The format is no longer fixed
-  (`format: human | native`, ADR `file-output-native-format`); a user-supplied `format:`
-  *template* over the human-readable render is designed for (the encoder is built around a
-  `Format` enum with room for it) but not implemented.
+  shares `stdio_out`'s implementation and adds a rotation policy. The format is not fixed
+  (`format: human | json | native`, ADRs `human-render-block-format`, `stream-json-format`, and
+  `file-output-native-format`); a user-supplied `format:` *template* over the human-readable
+  render is designed for (the encoder is built around a `Format` enum with room for it) but not
+  implemented.
+- **The human render shows everything on the event but the batch's provenance.** `stdio_out`'s
+  block (ADR `human-render-block-format`) is exhaustive over `Event`, `Resource`, and `Scope`,
+  but a batch's `origin`/`previous` reach a sink only through `Output::observe_batch`, which
+  `StreamOutput` doesn't implement, and ADR `batch-provenance-on-delivered` keeps them off the
+  event. Showing them means implementing that hook and threading the two names into the render
+  ahead of `EventBatch`; a script that wants them in the data copies them into an attribute.
+  `format: json` has the same gap.
 - **A send the shutdown grace cuts off can leave a torn line in a `stdio_out` or `file_out`
   file.** Both write a batch in place with one `write_all`. When `write_loop`'s grace drops that
   `send` part-way, the part already handed to the file stays, and the sink's `flush()` then

@@ -1042,6 +1042,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "snap",
  "tokio",
  "tokio-rustls",

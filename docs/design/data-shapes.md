@@ -582,8 +582,9 @@ Decisions and builds this data serves:
    `perf/scenarios/json-parse-{app,nested,access}-log.yaml`) at the measured medians and tails: a 12-attribute
    flat JSON log, a pino-http-style nested record, a 16–17-attribute server span, a 30-field
    access-log line, a 3-record collectd event, and a 17-attribute resource over a 5-event batch.
-3. **An NDJSON format for `file_out`/`stdio_out`.** It would give `shape` — and any operator — a
-   machine-readable readout, and retire the text parser this survey depends on.
+3. ~~**An NDJSON format for `file_out`/`stdio_out`.**~~ **Done**: `format: json`
+   ([ADR `stream-json-format`](../adr/stream-json-format.md)); `summarize.py` reads it, and the
+   text parser is gone.
 4. **`shape` for operators:** a dashboard in `demo/`, width alarms, and an opt-in report an operator
    could share back — the only route to production-derived numbers this project is likely to have.
 5. **Whether `otlp_in` should group a scope's points onto one event**, informed by §3's batch data.

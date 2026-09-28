@@ -21,7 +21,7 @@ SHAPE_SURVEY_OUT=/tmp/x script/shape-survey interop    # write runs somewhere el
 ```
 
 Before any producer runs, the dispatcher runs `summarize.py --self-test` and builds
-`logit:shape-survey` from the current tree. A render change that breaks the summarizer fails there,
+`logit:shape-survey` from the current tree. A change to `file_out`'s `format: json` output that breaks the summarizer fails there,
 not after a 15-minute capture. `SHAPE_SURVEY_DURATION` replaces the main capture window of every
 producer except `interop`, which has no window.
 
@@ -96,14 +96,12 @@ when nine SDKs feed one gateway.
 `resource-keep/` subdirectory, with its own provenance saying so. `perf/results/` is gitignored,
 and nothing derived from this capture belongs in a shared summary or in this repository.
 
-It summarizes through the ordinary `summarize.py` path. That works because `summarize.py`'s
-`parse_attrs` knows the whole `render_value` grammar: arrays, maps, nested ones, `<N bytes>`, and
-strings carrying the delimiters. A keep capture needs it, because `process.command_args` rides on
-the resource of every OTel SDK that detects a process, rendered as a bare array
-(`["/usr/bin/node", "--require=…", …]`) that contains spaces without being quoted. An earlier
-parser split an `attrs` line as if only a quoted value could contain a space, walked into that
-array, and asserted. `--self-test` now carries a structurally verbatim keep-capture line, with
-neutral values, so this can't regress.
+It summarizes through the ordinary `summarize.py` path. That works because the capture is
+`format: json` (NDJSON): the tags come from each object's top-level `attributes`, and the
+resource attributes sit apart under `resource.attributes`, so an array such as
+`process.command_args` (`["/usr/bin/node", "--require=…", …]`, on the resource of every OTel
+SDK that detects a process) can't be mistaken for a tag. `--self-test` carries a keep-capture
+excerpt with neutral values.
 
 `summarize.py`'s series key is still the metric name plus `signal`/`source`/`tap`. It has no room
 for a resource, so its tables stay **pooled** across services. The per-service split is the
@@ -149,7 +147,7 @@ Each run writes one directory, `perf/results/shape-survey/<producer>/<UTC timest
 
 | File | What it is |
 |---|---|
-| `shape.log` | the capture — `file_out`'s human render of every `logit.shape.*` measurement |
+| `shape.log` | the capture — `file_out`'s `format: json` output (NDJSON) for every `logit.shape.*` measurement |
 | `logit.log` | the `logit` container's own output for the run |
 | `provenance.txt` | date, this repo's SHA and dirty state, docker and image ids, the producer's own software versions, and its **representativeness** line |
 | `summary.json` | every series: count, min, max, mean, nearest-rank p50/p90/p99, and an exact value→count table for integer-valued series |

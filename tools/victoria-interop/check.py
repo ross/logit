@@ -106,30 +106,22 @@ def strip_ansi(text):
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
-def rendered_events(path):
-    """`stdio_out`'s human render, as (attrs line, metric line) pairs."""
+def read_events(path):
+    """A `stdio_out` `format: json` capture (NDJSON), as one dict per event line."""
     if not path.exists():
         return []
-    events = []
-    attrs = ""
-    for line in path.read_text(errors="replace").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("attrs "):
-            attrs = stripped
-        elif stripped.startswith("metric "):
-            events.append((attrs, stripped))
-    return events
+    return [json.loads(line) for line in path.read_text(errors="replace").splitlines() if line.strip()]
 
 
 def telemetry_sum(events, metric, **attrs):
     total = 0.0
-    for attr_line, metric_line in events:
-        if not metric_line.startswith(f"metric  {metric} "):
+    for event in events:
+        have = {**event.get("resource", {}).get("attributes", {}), **event.get("attributes", {})}
+        if any(have.get(k) != v for k, v in attrs.items()):
             continue
-        if all(f'{k}="{v}"' in attr_line for k, v in attrs.items()):
-            match = re.search(r"sum=([0-9.e+-]+)", metric_line)
-            if match:
-                total += float(match.group(1))
+        for item in event.get("metrics", []):
+            if item.get("name") == metric and item.get("kind") == "sum":
+                total += float(item["value"])
     return int(total)
 
 
@@ -262,16 +254,21 @@ def leg_8():
 
 
 def leg_9():
-    events = rendered_events(OUT / "federate.log")
-    ours = [(a, m) for a, m in events if m.startswith("metric  vi_rw1_gauge ")]
+    events = read_events(OUT / "federate.log")
+    ours = [
+        (e.get("attributes", {}), item)
+        for e in events
+        for item in e.get("metrics", [])
+        if item.get("name") == "vi_rw1_gauge"
+    ]
     if not ours:
         return "FAIL", "prometheus_in scraped no vi_rw1_gauge from /federate"
     attrs, metric = ours[-1]
-    kind = re.search(r'prometheus\.type="([^"]+)"', attrs)
-    stamped = "prometheus.timestamp=true" in attrs
+    kind = attrs.get("prometheus.type")
+    stamped = attrs.get("prometheus.timestamp") is True
     return "PASS", (
-        f"{len(ours)} scrapes of vi_rw1_gauge, rendered `{metric.split(None, 1)[1]}`, "
-        f"prometheus.type={kind.group(1) if kind else 'absent'}, "
+        f"{len(ours)} scrapes of vi_rw1_gauge, rendered `{json.dumps(metric)}`, "
+        f"prometheus.type={kind if kind else 'absent'}, "
         f"wire timestamp {'kept' if stamped else 'absent'}"
     )
 
@@ -280,13 +277,18 @@ def leg_10():
     # After W2, `prometheus_in` accepts zstd on the first request, so vmagent (zstd by default)
     # never gets the `415` that used to force its Snappy downgrade: every write is class=ok,
     # encoding=zstd, and class=unsupported stays 0.
-    telemetry = rendered_events(OUT / "vmagent-in-telemetry.log")
+    telemetry = read_events(OUT / "vmagent-in-telemetry.log")
     unsupported = telemetry_sum(telemetry, "logit.input.writes", **{"class": "unsupported"})
     ok = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok"})
     ok_zstd = telemetry_sum(telemetry, "logit.input.writes", **{"class": "ok", "encoding": "zstd"})
     skipped = telemetry_sum(telemetry, "logit.input.metrics.skipped")
-    received = rendered_events(OUT / "vmagent-in-received.log")
-    ours = sorted({m.split()[1] for _, m in received if m.split()[1].startswith("vi_expose_")})
+    received = read_events(OUT / "vmagent-in-received.log")
+    ours = sorted({
+        item["name"]
+        for e in received
+        for item in e.get("metrics", [])
+        if item.get("name", "").startswith("vi_expose_")
+    })
     downgraded = "Downgrading protocol from VictoriaMetrics to Prometheus" in log("vmagent")
 
     detail = (

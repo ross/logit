@@ -484,7 +484,7 @@ survey_python() {
         "${SURVEY_PYTHON_IMAGE}" "$@"
 }
 
-# survey_self_test: runs `summarize.py --self-test`, so a change to `stdio_out`'s human render
+# survey_self_test: runs `summarize.py --self-test`, so a change to `file_out`'s `format: json` output
 # fails before any capture rather than after one.
 survey_self_test() {
     echo "shape-survey: summarize.py --self-test"

@@ -301,7 +301,8 @@ line.
 | `Event::clone` (3-record collectd event, 6 attributes) | **1** | `MetricList`'s spill, not the map's: six attributes fit inline and three records do not. The only measured `MetricList` spill in the survey -- 17.4% of 16,590 collectd events carry 2 records, 0.4% carry 3 (`data-shapes.md` §3) |
 | `EventBatch::clone` (5 events, 17-attribute `Resource`) | **6** | 1 `Vec<Event>` + 1 per event: the measured median OpenTelemetry log record carries **9** attributes, one slot past inline, so every event on that leg spills by one. **The 17-attribute resource is not among the six** -- it is `Arc`-shared, so the widest attribute set in the survey is the one place capacity is nearly free (`data-shapes.md` §4, §6) |
 | `unwrap_batch` (contended `Delivered::Shared`, that same batch) | **6** | identical, by construction -- the copy-on-write fallback *is* `EventBatch::clone` (§3) |
-| `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
+| `stdio_out` encode 100 events | **2** | per batch, not per event: the output `String`'s first growth and `Encoder::encode`'s `Bytes::from(String)` (ADR `rotating-file-output`); the block render (ADR `human-render-block-format`) writes every timestamp in place with `write_rfc3339_utc`, which removed the one-per-event `format_rfc3339_utc` residual §8 describes at 102 |
+| `stdio_out` encode 100 events, `format: json` | **2** | per batch, not per event: the output `String`'s first growth and `Encoder::encode`'s `Bytes::from(String)`; every timestamp is written in place by `write_rfc3339_utc` (ADR `stream-json-format`) |
 | `influxdb_out` encode 100 events | **230** | 30 of the encoder's own (~0.3/event — see below) + 200 = 2/event re-sketching the fixture's two raw `Samples` distributions (`Samples::sketch`'s `bins` Vec, the same cost the `graphite_out` `Samples` row further down documents). Those 2/event are the allocations `kv_metrics` used to pay for *every* downstream, moved into the one topology that needs a sketch -- an encoder fed straight from `kv_metrics` with no `aggregate` between ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)); the reference pipeline's `aggregate` sketches once per series instead |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
 | receive queue: push_many then pop_many, warm | **0** | the same hop for a whole batch of 8 (ADR `udp-intake-batching-and-socket-visibility`) -- `push_many` drains the caller's `Vec` and `pop_many` appends into one the caller clears, both keeping their capacity, so a batch costs the same nothing per datagram the single-item row above does |
@@ -335,6 +336,9 @@ And the corresponding times:
 | `influxdb_out` encode, 100 events | 257.1 µs | 2.57 µs |
 | `syslog_out` encode_into, 100 events | 82.4 µs | 824 ns |
 | `lua` (proxy / `to_table`) | 1.61 / 9.03 µs | |
+
+The `stdio_out` row predates the block render (ADR `human-render-block-format`), which writes
+several times the bytes per event, and is due a re-measure at the next perf-VM session.
 
 Every timing above comes from **one** `script/bench` run on the disposable perf VM
 (`docs/adr/disposable-azure-perf-vm.md`: `Standard_F8as_v6`, 8 dedicated EPYC 9V74 cores, SMT
@@ -470,19 +474,19 @@ stopped sketching per event; §2's row explains.) The changes stayed inside `inf
 and format straight into reused buffers held on the encoder, merge-join the resource and event
 attribute maps instead of cloning and re-inserting, borrow the series key for the lookup and
 allocate it only on a miss, and reuse the path-compression scratch buffer. `stdio_out` got the same
-treatment (§8 item 5): 1801 → 101 allocations per 100 events, ~18×, now 102 with the
-`Bytes::from(String)` its `Encoder::encode` path adds.
+treatment (§8 item 5): 1801 → 101 allocations per 100 events, ~18×, then 102 with the
+`Bytes::from(String)` its `Encoder::encode` path adds, and 2 once the block render wrote
+timestamps in place (§2's row).
 
 What's left in both is per-*batch* or per-series, not a growing per-event cost: `influxdb_out` keeps
 one `Bytes` for the finished body, one `String` key per distinct series on first sighting, and
-growth of the per-series timestamp maps; `stdio_out`'s residual is almost entirely one
-`format_rfc3339_utc` call per event. Protect that property: `influx_encode_100_events`/
-`stdio_encode_100_events` fail if it regresses.
+growth of the per-series timestamp maps; `stdio_out`'s residual is two per batch. Protect that
+property: `influx_encode_100_events`/`stdio_encode_100_events` fail if it regresses.
 
-**Allocation count and wall-clock don't rank the two encoders the same way.** `stdio_out` allocates
-~3.4× more than `influxdb_out`'s own 30, yet in §2's timing table it is faster (1.35 µs/event
-against 2.57 µs/event). The two metrics are related, not interchangeable, which is why this
-document tracks both. Don't read one run as a settled ranking.
+**Allocation count and wall-clock don't rank the two encoders the same way.** At 102, `stdio_out`
+allocated ~3.4× more than `influxdb_out`'s own 30, yet in §2's timing table it was faster
+(1.35 µs/event against 2.57 µs/event). The two metrics are related, not interchangeable, which is
+why this document tracks both. Don't read one run as a settled ranking.
 
 **`syslog_out` got a narrower version of the same fix (§8 item 5).** It first measured 401
 allocations per 100 events (~4/event): the header and message text, the pre-sanitize render, the
@@ -490,7 +494,8 @@ sanitized-message copy, and each sanitized header field were fresh `String`s per
 function-locals recreated on every `encode_into` call, so warming the call once didn't help: each
 call's locals started from empty capacity again, where a struct field wouldn't. Hoisting them into
 `SyslogEncoder`'s `line`/`raw_msg`/`scratch` fields, the pattern `InfluxLineEncoder` already used,
-brought it to 100 (1/event), the same `format_rfc3339_utc` residual `stdio_out` carries.
+brought it to 100 (1/event), a `format_rfc3339_utc` residual `write_rfc3339_utc` could remove
+as it did for `stdio_out`.
 
 **With the encoders fixed, the ingest chain is the cost again, and it dropped too.** `json`'s fix
 (§8 item 4) took the full chain from 11 allocations to 5, and `kv_metrics` emitting raw `Samples`

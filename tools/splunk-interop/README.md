@@ -87,7 +87,7 @@ legs and probes ran, `provenance.txt` with the target and the image tags, `logs/
 `replay.log`, one `<leg>-telemetry.log` per leg (`hec-logs-telemetry.log`,
 `hec-metrics-telemetry.log`, `hec-spans-telemetry.log`, `hec-ack-telemetry.log`, and
 `hec-relay-telemetry.log`: the sink's own telemetry, which every leg config taps with
-`internal`), and `tcpout/tcpout-000.raw`.
+`internal` and writes as `stdio_out` `format: json`, one object per line, for `check.py` to read), and `tcpout/tcpout-000.raw`.
 
 ## Splunk Cloud mode
 
