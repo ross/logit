@@ -533,9 +533,15 @@ with a peek that stopped responding while draining, which is consistent with tha
 ## Amendment: the seam gains read operations, and a tail scan site (2026-09-28)
 
 **The seam's operations are no longer mutations only.** `Op` gains `ReadDir` and `Stat`, and
-`sites` gains `TAIL_SCAN` (`"tail.scan"`). `fault::check` runs before the `read_dir` calls in
-`crates/logit-inputs/src/tail/pattern.rs` and before the `metadata` call on a discovered path in
-`Tailer::scan`. The call rule, the disarmed cost (one atomic load), the compiled-out form, and
+`sites` gains `TAIL_SCAN` (`"tail.scan"`). `fault::check` runs at these points:
+
+- `Op::ReadDir`, before each `read_dir` in `crates/logit-inputs/src/tail/pattern.rs`, and again
+  per iterated entry, so an error part-way through a listing can be injected.
+- `Op::Stat`, in `scan_docker_containers`, before the per-entry `file_type()` and before the
+  log-path `metadata`.
+- `Op::Stat`, before the per-path `metadata` in `Tailer::scan`.
+
+The call rule, the disarmed cost (one atomic load), the compiled-out form, and
 the scoping are decision 8's, unchanged. Freeze (the crash model) doesn't apply to a read: a rule
 fails one or every hit with an errno, or records hits.
 

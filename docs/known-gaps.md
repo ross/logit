@@ -2011,16 +2011,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   and a `TailDecoder` hook to receive them. See [ADR
   `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment.
-- **A container whose `attrs` object exceeds about 64 KiB has every entry dropped as
-  `long_line`.** `attrs` is written from `--log-opt labels`, `env`, and `tag`, and the envelope
-  cap's slack for it is 64 KiB. An envelope that carries more never reaches the decoder.
+- **An `attrs` object larger than the envelope cap's slack can drop entries as `long_line`.** The
+  splitter drops an entry when its escaped fragment, its `attrs`, and the 75 fixed envelope bytes
+  exceed `6 × max(max_line_bytes, 16 KiB) + 64 KiB`. `attrs` up to 64 KiB less 75 bytes never
+  causes it: that is what the slack guarantees for a full, worst-case-escaped 16 KiB fragment.
+  Beyond that, only large or escape-heavy fragments are at risk, mostly with `max_line_bytes`
+  near its 16 KiB floor. `attrs` comes from `--log-opt labels`, `env`, and `tag`.
 - **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
   pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
   crash replays them. Replay, not loss.
 - **A line that never ends pins the checkpoint while it is being dropped.** A `\r`-only progress
-  bar is the case: dockerd never splits it, so a drop for `max_line_bytes` runs until a newline
-  that may never come, and a crash replays everything since it began. Replay, not loss, but
-  unbounded. Persisting per-stream drop state in the checkpoint would remove it.
+  bar is the case: dockerd writes it as 16 KiB partial entries but never a closing one, because
+  only `\n` ends a message. A drop for `max_line_bytes` therefore runs until a newline that may
+  never come, and a crash replays everything since it began. Replay, not loss, but unbounded.
+  Persisting per-stream drop state in the checkpoint would remove it.
 - **At shutdown, `docker_in`'s unterminated tail is almost always a dockerd write in progress,
   and it is emitted as a `bad_line`.** `close`'s `take_partial` turns the tail into a rejected
   line, and the final checkpoint then skips past it, so that line's content never becomes an

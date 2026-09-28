@@ -493,69 +493,60 @@ sink whose own grace then drops that batch (`batches.dropped{reason="shutdown"}`
 the restart resumes past it. `docs/known-gaps.md` records this, along with a rotated file still
 draining at shutdown whose new name matches no pattern, which the restart never finds.
 
-## Amendment: removal needs a successful listing, truncation is size-only, and a rejected json-file entry flushes the held fragment (2026-09-28)
+## Amendment: removal needs a successful listing, truncation is size-only, and a rejected json-file entry flushes the held fragments (2026-09-28)
 
-Four points in "Rotation and truncation" and "Long lines are dropped whole" are decided by
-verifying TAIL-01, TAIL-09, and TAIL-11 (`docs/plans/critical-sections-inventory.md`). [ADR
+Verifying TAIL-01, TAIL-02, TAIL-03, TAIL-09, and TAIL-11 (`docs/plans/critical-sections-inventory.md`)
+corrects six points. Each is named by the section it amends. [ADR
 `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md) is
-canonical for the scan rule and the fingerprint.
+canonical for the scan, fingerprint, and eviction rules, and this amendment points at it.
 
-**A removal is a path a successful listing no longer names.** "A previously-tracked path no longer
-matched by any pattern is a removal" holds only for a listing that succeeded. A failed `read_dir`
-of a pattern's directory, or a `stat` failure other than `NotFound` on a discovered path, retires
-nothing: the file keeps its state, the failure is counted
-`logit.input.scan.errors{op="read_dir"|"stat"}` and diagnosed `scan_error`, and the next scan
-decides. Read as a removal, the failure would drain every file under the pattern, reap it at EOF, and
-replay it from `0` on the next good scan. A directory that doesn't exist is an empty listing, not a failure. A kept file is still checked
-through its open handle for removal and truncation. The per-operation rule, including
-`docker_in`'s per-entry unknowns, is decision 1 of the new ADR.
+**"Rotation and truncation": a removal is a path a successful listing no longer names.** "A
+previously-tracked path no longer matched by any pattern is a removal" holds only for a listing
+that succeeded. A failed listing, or a `stat` that failed with anything but `NotFound` or
+`NotADirectory`, retires nothing and is counted and diagnosed. Decision 1 has the per-operation
+rule.
 
-**Unconsumed checkpoint entries are persisted.** "Checkpoints" says a write persists only the
-tracked files, so pruning "falls out of the write contract". A write now also persists every
-resume entry no scan has consumed, until the ADR's per-entry rule prunes it. Otherwise a listing
-that fails at startup, followed by one checkpoint write, would drop the entry of a file that was
-never opened, and a restart under `read_from: end` would skip its data.
+**"Rotation and truncation": truncation detection is size-only.** A truncation is `len < offset`
+where a scan or a read sees the length. A `copytruncate` that the writer refills past the old
+offset before that check isn't detected: the tailer keeps its offset and reads from the middle of
+the new content, so the bytes before that offset are never emitted. A size comparison can't tell
+the two apart, and the inode is unchanged. A restart catches it through the head fingerprint
+(decision 2). The window is one `poll_interval` or one wake, and it's a documented gap
+(`docs/known-gaps.md`); a writer that rotates by rename has no such window.
 
-**Truncation detection is size-only.** A truncation is `len < offset` at the moment a scan or a
-read sees the length. A `copytruncate` that the writer refills past the old offset before that
-check isn't detected: the tailer keeps its offset, reads from the middle of the new content, and
-the lines before that offset are never emitted. Nothing in a size comparison can tell the two
-apart, and an inode-only check has the same blind spot, because `copytruncate` keeps the inode.
-The window is one `poll_interval` or one wake. It's a documented gap
-(`docs/known-gaps.md`), not a defect a check here could close; a writer that rotates by rename
-has no such window.
+**"Checkpoints": unconsumed entries are persisted.** "A checkpoint write only persists the tailer's
+*currently tracked* files, so ... pruning falls out of the write contract" no longer holds. A write
+also persists every resume entry no scan has consumed, until the per-entry rule prunes it
+(decision 4).
 
-**A rejected json-file entry flushes the held fragments, and the envelope cap is decoupled from
-`max_line_bytes`.** dockerd cuts a message over 16 KiB into several json-file entries, and
-`DockerDecoder` holds the fragments until the closing one arrives. dockerd's json-file driver
-writes stdout and stderr from separate goroutines, so fragments of two logical lines interleave
-at entry granularity. `DockerDecoder` therefore reassembles per stream: one partial and one
-`dropping` flag for each.
+**"Long lines are dropped whole": a rejected json-file entry flushes the held fragments, and a
+checkpoint stays clear of a dropped line.** dockerd cuts a message over 16 KiB into several
+json-file entries, and its json-file driver writes stdout and stderr from separate goroutines, so
+fragments of two logical lines interleave at entry granularity. `DockerDecoder` reassembles per
+stream: one partial and one `dropping` flag for each.
 
 - A `Malformed` entry (a JSON parse error or an unknown `stream`) flushes every stream's held
-  fragment as its own event, stdout first, as `close` does, then reports the bad line. Returning
-  before touching the held state would splice a fragment onto the next logical line.
-  `TailDecoder::decode_line`'s contract is that events pushed to `out` before an `Err` are still
-  emitted, and the driver absorbs them before it diagnoses `bad_line`. The checkpoint bound
-  follows: once the decoder holds nothing, `held_from` clears.
-- `LineSplitter` measures the JSON *envelope* line. Passing it the operator's `max_line_bytes`
-  would drop fragment envelopes before the decoder sees them once the cap is under about
-  16.1 KiB, and the decoder's own bound would never be the binding one. The splitter takes
-  `6 × max(max_line_bytes, 16 KiB) + 64 KiB` instead. dockerd cuts fragments at 16 KiB of raw
-  bytes, JSON escaping expands a byte to at most six (`\u00XX`), and the fixed part of an envelope
-  is 75 bytes, so the 64 KiB of slack is for `attrs` (`--log-opt labels`, `env`, and `tag`).
-  The decoder alone enforces `max_line_bytes`, over the reassembled message, and it checks the
-  length before it appends a fragment, so a held reassembly never exceeds the cap. "Long lines
-  are dropped whole" keeps its meaning for the message an operator sees.
+  fragment as its own event, stdout first, as `close` does, then reports the bad line. It doesn't
+  leave the fragment to splice onto the next logical line.
+- `TailDecoder::decode_line`'s contract becomes: events pushed to `out` before an `Err` are still
+  emitted. Both `Err` arms in the driver (`read_one` and `close_decoder`) absorb `out` under
+  `decoder.resource()` before they diagnose `bad_line`, and the trait doc changes with the
+  contract. A decoder that flushed into `out` while the driver discarded it would lose the
+  fragments outright. Once the decoder holds nothing, `held_from` clears.
+- `LineSplitter` measures the JSON *envelope* line, so `docker_in` passes it
+  `6 × max(max_line_bytes, 16 KiB) + 64 KiB` rather than the operator's `max_line_bytes`. dockerd
+  cuts fragments at 16 KiB of raw bytes, JSON escaping expands a byte to at most six
+  (`\u00XX`), and the fixed part of an envelope is 75 bytes, so the 64 KiB of slack is for
+  `attrs` (`--log-opt labels`, `env`, and `tag`). The decoder alone enforces `max_line_bytes`,
+  over the reassembled message, and checks the length before it appends a fragment, so a held
+  reassembly never exceeds it.
+- A checkpoint never lands inside a line being dropped for `max_line_bytes`: `pending_bytes`
+  covers the plain splitter's consumed bytes of it, and `holds_entry` stays true while a stream
+  is dropping. A restart re-drops the line whole instead of emitting its tail. The cost is a
+  checkpoint pinned at the line's start until its newline arrives.
 
-**A checkpoint never lands inside a line being dropped for `max_line_bytes`.** While the plain
-splitter drops an over-long line, `pending_bytes` covers the bytes it has consumed of that line,
-and while a stream is dropping, `holds_entry` stays true. A restart then re-reads the line from
-its start and drops it whole again, where a checkpoint inside it would emit the line's tail as an
-event. The cost is a checkpoint pinned at that line's start until its newline arrives.
-
-**A read error on a `Draining` file is its EOF.** A `Draining` (or `Deselected`) file has left the
-matched set, and `drain` reaps it at EOF. `read_one` reports a read error as EOF, because a
-handle that keeps erroring would never be reaped otherwise. The reap then drops the file's unread
-tail, and the error is diagnosed `read_error`. It's a documented gap (`docs/known-gaps.md`). An
-`Active` file is never reaped on a read error.
+**`read_one` and `drain` (TAIL-03): a read error on a `Draining` file is its EOF.** A `Draining`
+(or `Deselected`) file has left the matched set, and `drain` reaps it at EOF. `read_one` reports
+a read error as EOF, because a handle that keeps erroring would never be reaped otherwise, so the
+reap drops the file's unread tail. The error is diagnosed `read_error`, and the loss is a
+documented gap (`docs/known-gaps.md`). An `Active` file is never reaped on a read error.

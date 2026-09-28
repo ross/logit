@@ -103,16 +103,22 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
    other pattern, and a removed file under a healthy pattern would stay open for as long as
    the other directory failed.
 
-2. **Resume identity is `(dev, ino)` plus a head fingerprint the tailer captures as it reads.**
-   `TrackedFile` keeps the file's first `min(256, offset)` bytes as it reads them, and clears
-   them on a truncation. A checkpoint entry and a de-selection retention carry `head_len` (at
-   most 256) and `head_hash`, XXH64 with seed 0 (`twox-hash`, already pinned in the workspace)
-   over those bytes. Nothing reads the file for the fingerprint: no second descriptor and no
-   extra read, and the head is from the same generation of the file as the offset it is paired
-   with.
+2. **Resume identity is `(dev, ino)` plus a head fingerprint.** `TrackedFile` holds the file's
+   first `min(256, offset)` bytes and clears them on a truncation. A checkpoint entry and a
+   de-selection retention carry `head_len` (at most 256) and `head_hash`, XXH64 with seed 0
+   (`twox-hash`, already pinned in the workspace) over those bytes.
+
+   - **Where the head comes from.** A file opened at `0` captures its head as the tailer reads
+     it. A file opened at `End` or at a `Resume` offset has not read its own first bytes, so
+     `open_tracked` reads the first `min(256, target offset)` bytes once, from position 0, and
+     then seeks. For `Resume` it hashes them against the retained head; either way they seed
+     `TrackedFile`'s head. The head is therefore always from the same generation of the file as
+     the offset it is paired with, and a checkpoint write reads nothing and needs no second
+     descriptor.
 
    - **Resume accepts iff all three hold:** the current file is at least `head_len` long, its
-     first `head_len` bytes hash to `head_hash`, and the offset is at most the current length.
+     first `head_len` bytes hash to `head_hash` (the open-time read above), and the offset is at most the current
+     length.
      Any one failing is a single `logit.input.files.resume_rejected`, diagnosed
      `resume_rejected`, and the file starts at `0`. An offset past the file's length is
      therefore counted. The check runs in `open_tracked` before the seek.
@@ -196,7 +202,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   capped at 256 bytes is stable for an append-only file.
 - **A fingerprint read from the file at checkpoint time (`pread` on a cloned descriptor).**
   Rejected. It costs a second descriptor per tracked file and a blocking read per dirty tick,
-  and it can pair a head from one generation of the file with an offset from another.
+  and it can pair a head from one generation of the file with an offset from another. The one
+  read at open, for `End` and `Resume`, is the accepted cost.
 - **A filesystem trait for tests.** Rejected. The oracle for rotation and inode behavior is the
   real filesystem; `Watcher::Poll` and hand-driven `scan`/`drain` already are the seam.
 - **A committed test that shells out to `logrotate`.** Rejected. It adds a package to the dev
@@ -222,14 +229,27 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   256-byte residual.
 - **One release replays once.** The checkpoint version bump makes every existing checkpoint
   `Unusable`, so every file present at the first scan after the upgrade replays from `0`.
-- **A file's head costs a small buffer per tracked file** and one hash per checkpoint write,
-  with no extra I/O. A measurement on many thousands of tracked files belongs to the perf
-  follow-up.
+- **A file's head costs a small buffer per tracked file,** one read of at most 256 bytes when a
+  file opens at `End` or `Resume`, and one hash per checkpoint write. A measurement on many
+  thousands of tracked files belongs to the perf follow-up.
 - **The fault seam is no longer mutation-only.** Every new `read_dir` or `metadata` call on the
   tail scan path needs a `fault::check` before it.
-- **Documented gaps, not fixes.** Copytruncate fast refill, the 256-byte residual, the
-  `Draining` read-error reap, and a container name of 12 or more hex characters matching as an
-  id prefix are in `docs/known-gaps.md`. The perf items (a 64 KiB read buffer allocated per
+- **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps.md`'s "File tailing and
+  Docker logs" record what this stream leaves open, so a later workstream that closes one can
+  see it was expected:
+  - copytruncate fast refill;
+  - the 256-byte fingerprint residual;
+  - a `Draining` read error losing the unread tail;
+  - a container name of 12 or more hex characters matching as an id prefix;
+  - a directory unreadable at startup replaying under `read_from: end` once it recovers;
+  - a file kept under a directory that stays unreadable;
+  - a dropped closing fragment splicing the next same-stream line onto the held partial;
+  - `attrs` past the envelope cap's slack dropping an entry;
+  - the checkpoint pinned by the oldest held line across both streams;
+  - the checkpoint pinned by a line that never ends;
+  - the shutdown tail emitted as a `bad_line`.
+
+  The perf items (a 64 KiB read buffer allocated per
   call, per-pass `Vec`s, byte-by-byte newline search) wait for a perf session with a tail
   scenario, because an allocation or sizing change needs a measurement on the perf VM
   ([ADR `event-sizing-and-allocation-strategy`](event-sizing-and-allocation-strategy.md)).
@@ -242,8 +262,9 @@ subsection here.
 ### `tailbk/w0`: this ADR
 
 Docs only. It records the decisions above, the amendments to the tailing and fault-injection
-ADRs, four entries in `docs/known-gaps.md`, the telemetry names in
-`docs/design/internal-telemetry.md`, and eight inventory rows marked `in-progress`.
+ADRs, eleven entries in `docs/known-gaps.md`, the telemetry names in
+`docs/design/internal-telemetry.md`, and nine inventory items marked `in-progress` (eight TAIL
+rows and top lead 7).
 
 ### `tailbk/w1`: `LineSplitter` model proptest (TAIL-04)
 
