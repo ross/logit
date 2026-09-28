@@ -746,7 +746,7 @@ struct Harness {
 /// another before deciding the send is complete. It follows a `send` that has returned, so every
 /// datagram is already on loopback; the window covers only the kernel's deferred delivery of the
 /// rest, which takes microseconds unloaded.
-const CAPTURE_QUIET: Duration = Duration::from_millis(500);
+const CAPTURE_QUIET: Duration = Duration::from_millis(200);
 
 impl Harness {
     async fn new() -> Self {

@@ -7,7 +7,7 @@
 use logit_config::{BufferConfig, Component, ComponentKind, Config, ReceiveConfig};
 use logit_core::{AttrMap, Event, EventBatch, Registry, Resource, Telemetry, Value};
 use logit_pipeline::graph;
-use logit_pipeline::test_util::{wait_until, TelemetryProbe};
+use logit_pipeline::test_util::{wait_until_within, TelemetryProbe};
 use logit_pipeline::{
     DiskQueueConfig, Fanout, Input, InputRuntimeConfig, NodeSpec, Output, OverflowPolicy,
     Readiness, SinkStoreConfig, WriteLoopConfig, SINK_QUEUE_METRICS,
@@ -218,22 +218,25 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
             std::future::pending(),
         ));
         let expected_depth = (TOTAL as u64 - SUCCEED_FIRST_RUN) as f64;
-        TelemetryProbe::with_registry(registry)
-            .wait_for(
-                &format!(
-                    "all {TOTAL} batches spooled ({SUCCEED_FIRST_RUN} of them committed) and the \
-                     next one failing"
-                ),
-                |totals| {
-                    let jammed = run1_attempts
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|(marker, ok)| *marker == SUCCEED_FIRST_RUN as usize && !*ok);
-                    totals.gauge(SINK_QUEUE_METRICS.depth, &[]) == Some(expected_depth) && jammed
-                },
-            )
-            .await;
+        let mut probe = TelemetryProbe::with_registry(registry);
+        // Spooling every batch is 40 pushes over a 1 KiB segment, so three rotations with two
+        // fsyncs each; a loaded CI disk has taken over a second for it, past the shared ceiling.
+        wait_until_within(
+            &format!(
+                "all {TOTAL} batches spooled ({SUCCEED_FIRST_RUN} of them committed) and the \
+                 next one failing"
+            ),
+            Duration::from_secs(30),
+            || {
+                let jammed = run1_attempts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(marker, ok)| *marker == SUCCEED_FIRST_RUN as usize && !*ok);
+                probe.poll().gauge(SINK_QUEUE_METRICS.depth, &[]) == Some(expected_depth) && jammed
+            },
+        )
+        .await;
         assert!(!run.is_finished(), "run should still be going (in should be hanging) when killed");
         run.abort();
         // Let the abort land before reopening the spool: the aborted task still holds
@@ -298,7 +301,9 @@ async fn a_disk_backed_sink_survives_a_simulated_sigkill_and_redelivers_only_wha
         // how many deliveries run 2 makes depends on where run 1's cursor was last checkpointed.
         // `checkpoint_interval` is time-gated, so all 10 commits may land before the first
         // checkpoint and the whole spool replay, which the at-most-twice assertion below allows.
-        wait_until("run 2 to deliver the last marker", || {
+        // Run 2 may replay the whole spool from disk before the last marker; past the shared
+        // ceiling on a loaded disk, like the spooling above.
+        wait_until_within("run 2 to deliver the last marker", Duration::from_secs(30), || {
             run2_attempts.lock().unwrap().iter().any(|(marker, _)| *marker == TOTAL - 1)
         })
         .await;
@@ -392,7 +397,12 @@ async fn a_disk_backed_sink_keeps_delivering_across_a_rotation_once_the_reader_h
     }));
 
     // A reader that stalls after a rotation runs out this wait's deadline.
-    wait_until("every marker delivered", || attempts.lock().unwrap().len() >= TOTAL).await;
+    // Every marker crosses a 256-byte segment's rotation and its fsyncs; a loaded disk can take
+    // longer than the shared ceiling.
+    wait_until_within("every marker delivered", Duration::from_secs(10), || {
+        attempts.lock().unwrap().len() >= TOTAL
+    })
+    .await;
 
     let _ = shutdown_tx.send(true);
     tokio::time::timeout(Duration::from_secs(5), run)

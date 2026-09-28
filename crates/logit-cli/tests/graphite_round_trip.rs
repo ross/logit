@@ -87,7 +87,7 @@ const SAME_AS_INPUT: &[u8] = b"== SAME AS INPUT ==";
 /// another before deciding the send is complete. It follows a `send` that has returned, so every
 /// datagram is already on loopback; the window covers only the kernel's deferred delivery of the
 /// rest, which takes microseconds unloaded.
-const CAPTURE_QUIET: Duration = Duration::from_millis(500);
+const CAPTURE_QUIET: Duration = Duration::from_millis(200);
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/graphite")
