@@ -18,6 +18,8 @@ socket2.workspace = true
 # tail_in/docker_in's checkpoint file (docs/adr/file-tailing-and-docker-json-logs.md).
 serde.workspace = true
 serde_json.workspace = true
+# The checkpoint's head fingerprint (docs/adr/tail-discovery-failure-and-resume-identity.md).
+twox-hash.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
 # (docs/adr/hand-rolled-grpc-over-hyper.md).
 hyper.workspace = true

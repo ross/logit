@@ -7,7 +7,7 @@
 //! opened at the beginning. A tracked file whose size is below the offset already read was
 //! truncated in place: it's re-read from `0` with its partial-line state discarded.
 
-use super::checkpoint::{CheckpointStore, FileId, Loaded};
+use super::checkpoint::{CheckpointStore, FileId, Head, Loaded, Retained, Source, HEAD_BYTES};
 use super::line::{LineSplitter, TailDecoder};
 use super::pattern::PathPattern;
 use super::TailConfig;
@@ -109,8 +109,10 @@ enum DrainEnd {
 enum StartOffset {
     Beginning,
     End,
-    /// An offset past the file's current length (truncated while stopped) restarts at `0`.
-    Resume(u64),
+    /// A retained offset and the head it was recorded with. `Tailer::open_tracked` resumes there
+    /// only if the head still matches and the offset is within the file, else starts at `0`
+    /// (`checkpoint.rs`'s module doc has the rule).
+    Resume(u64, Head),
 }
 
 impl From<super::ReadFrom> for StartOffset {
@@ -195,6 +197,10 @@ struct TrackedFile<D> {
     /// That's harmless only because `on_data_wake`'s inode check returns early, and because `drain`
     /// reads every tracked file after every wake. Making draining wake-driven would break this.
     watch: Option<super::watch::WatchId>,
+    /// The file's bytes `[0, head.len())`, at most [`HEAD_BYTES`], captured as `read_one` reads
+    /// them and cleared on a truncation. Invariant: `head.len() >= min(HEAD_BYTES, offset)`, so
+    /// the fingerprint written beside any offset covers what `checkpoint.rs`'s module doc says.
+    head: Vec<u8>,
 }
 
 pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
@@ -204,13 +210,14 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     files: HashMap<FileId, TrackedFile<D>>,
     by_path: HashMap<PathBuf, FileId>,
     checkpoint: Option<CheckpointStore>,
-    /// The offset an inode resumes from when next discovered, consulted before `read_from`.
+    /// The offset and head an inode resumes from when next discovered, consulted before
+    /// `read_from`. An entry is spent only once `open_tracked` tracks the file.
     ///
-    /// Filled at `bind` from the checkpoint, and by `reap_drained` for a
-    /// [`FileState::Deselected`] file, so a container renamed back into the selection resumes
-    /// instead of replaying. Those entries are process-local, since the checkpoint writes only
-    /// tracked files (`docs/adr/docker-container-identity-and-minimal-watches.md`).
-    resume: HashMap<FileId, (PathBuf, u64)>,
+    /// Filled at `bind` from the checkpoint ([`Source::Checkpoint`], persisted by every checkpoint
+    /// write until spent or pruned), and by `reap_drained` for a [`FileState::Deselected`] file
+    /// ([`Source::Deselected`], process-local), so a container renamed back into the selection
+    /// resumes instead of replaying (`docs/adr/docker-container-identity-and-minimal-watches.md`).
+    resume: HashMap<FileId, Retained>,
     /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
     /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
     first_scan_start: StartOffset,
@@ -509,10 +516,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
                 None => {
                     // Peeked, not removed: `accept` may still reject this path (a de-selected
-                    // container not yet re-selected), and removing here would lose the retained
-                    // offset. `open_tracked` removes it once `accept` succeeds.
+                    // container not yet re-selected), or the open may fail, and removing here
+                    // would lose the retained offset. `open_tracked` removes it once the file is
+                    // tracked.
                     let start = match self.resume.get(&id) {
-                        Some(&(_, offset)) => StartOffset::Resume(offset),
+                        Some(retained) => StartOffset::Resume(retained.offset, retained.head),
                         None if first => self.first_scan_start,
                         None => StartOffset::Beginning,
                     };
@@ -678,6 +686,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         tracked.splitter = LineSplitter::new(max_line_bytes);
         tracked.decoder.reset();
         tracked.held_from = None;
+        tracked.head.clear();
         let path = tracked.path.clone();
         self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
@@ -743,8 +752,6 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if !self.factory.accept(&path) {
             return;
         }
-        // Accepted: `start` will be applied, so its resume entry (if any) is spent.
-        self.resume.remove(&id);
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(err) => {
@@ -752,20 +759,59 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return;
             }
         };
-        let len = match file.metadata().await {
-            Ok(meta) => meta.len(),
+        let meta = match file.metadata().await {
+            Ok(meta) => meta,
             Err(err) => {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
                 return;
             }
         };
+        if FileId::from_metadata(&meta) != id {
+            // Rotated between `scan`'s `stat` and this open: the descriptor is another inode, and
+            // `start` belongs to `id`. The next `scan` finds the new inode under this path.
+            return;
+        }
+        let len = meta.len();
+        let mut head = Vec::with_capacity(HEAD_BYTES);
+        let mut rejected = None;
         let offset = match start {
             StartOffset::Beginning => 0,
-            StartOffset::End => len,
-            StartOffset::Resume(off) if off > len => 0,
-            StartOffset::Resume(off) => off,
+            StartOffset::End => {
+                // `read_one` never sees the bytes skipped here, so the head is read once, now.
+                match read_head(&mut file, len.min(HEAD_BYTES as u64) as usize).await {
+                    Ok(bytes) => head = bytes,
+                    Err(err) => {
+                        self.diag
+                            .warn_throttled("open_error", format!("{}: {err}", path.display()));
+                        return;
+                    }
+                }
+                len
+            }
+            StartOffset::Resume(off, retained) => {
+                // Read at least `min(HEAD_BYTES, off)` bytes, so the invariant on
+                // `TrackedFile::head` holds from here without re-reading.
+                let n = off.max(u64::from(retained.len)).min(HEAD_BYTES as u64);
+                let current = if off <= len && u64::from(retained.len) <= len {
+                    read_head(&mut file, n as usize).await.ok()
+                } else {
+                    None
+                };
+                match current {
+                    Some(mut bytes) if retained.matches(&bytes) => {
+                        bytes.truncate(off.min(HEAD_BYTES as u64) as usize);
+                        head = bytes;
+                        off
+                    }
+                    _ => {
+                        rejected = Some(off);
+                        0
+                    }
+                }
+            }
         };
-        if offset > 0 {
+        // After any head read, even to `0`: the read moved the cursor.
+        if start != StartOffset::Beginning {
             if let Err(err) = file.seek(std::io::SeekFrom::Start(offset)).await {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
                 return;
@@ -801,9 +847,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             state: FileState::Active,
             held_from: None,
             watch,
+            head,
         };
+        if let Some(off) = rejected {
+            self.telemetry.count("logit.input.files.resume_rejected", 1.0, &[]);
+            self.diag.warn_throttled("resume_rejected", resume_rejected_message(&path, off));
+        }
         self.by_path.insert(path, id);
         self.files.insert(id, tracked);
+        // Spent only now: an open, head read, seek, or decoder failure above leaves the entry for
+        // the next `scan`, so a transient error doesn't replay. Removed whatever `start` was, so
+        // no entry outlives its inode being tracked.
+        self.resume.remove(&id);
         if let Some(cp) = &mut self.checkpoint {
             cp.mark_dirty();
         }
@@ -883,6 +938,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 None => return false,
             };
             let chunk_start = tracked.offset;
+            capture_head(&mut tracked.head, chunk_start, &bytes);
             let partial_start = chunk_start - tracked.splitter.pending_bytes();
             let stats = tracked.splitter.push(bytes, |line, start| {
                 let start = start.map_or(partial_start, |i| chunk_start + i as u64);
@@ -973,10 +1029,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // `close_decoder` emitted the held partial and the decoder's held lines. What it
                 // leaves is a line still being dropped: by the splitter (`pending_bytes`, so the
                 // boundary is that line's start) or by the decoder (`held_from`). Resume at the
-                // earlier of the two, so a rename back drops that line whole again.
+                // earlier of the two, so a rename back drops that line whole again. The head is
+                // checked again on re-selection, since the file may be rewritten meanwhile.
                 let boundary = tracked.offset - tracked.splitter.pending_bytes();
-                let resume_at = tracked.held_from.map_or(boundary, |h| h.min(boundary));
-                self.resume.insert(id, (tracked.path.clone(), resume_at));
+                let retained = Retained {
+                    path: tracked.path.clone(),
+                    offset: tracked.held_from.map_or(boundary, |h| h.min(boundary)),
+                    head: Head::of(&tracked.head),
+                    source: Source::Deselected,
+                };
+                self.resume.insert(id, retained);
             }
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -1023,11 +1085,20 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
-        let entries = self.files.values().map(|f| {
+        let tracked = self.files.values().map(|f| {
             let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
-            (f.id, f.path.as_path(), boundary.min(f.held_from.unwrap_or(u64::MAX)))
+            let offset = boundary.min(f.held_from.unwrap_or(u64::MAX));
+            (f.id, f.path.as_path(), offset, Head::of(&f.head))
         });
-        checkpoint.write(entries, force, &mut self.diag, &self.telemetry).await;
+        // An entry not yet spent persists until `scan` prunes it: dropping it here would lose
+        // the position of a file whose listing failed, and a restart under `read_from: end`
+        // would then skip what it gained.
+        let unspent = self
+            .resume
+            .iter()
+            .filter(|(_, r)| r.source == Source::Checkpoint)
+            .map(|(id, r)| (*id, r.path.as_path(), r.offset, r.head));
+        checkpoint.write(tracked.chain(unspent), force, &mut self.diag, &self.telemetry).await;
     }
 }
 
@@ -1079,6 +1150,38 @@ async fn close_decoder<D: TailDecoder>(
             emit(sink, telemetry, batch, reason).await;
         }
     }
+}
+
+/// Reads a newly opened file's first `n` bytes from its current position, `0`. A short file is
+/// an error (`UnexpectedEof`).
+async fn read_head(file: &mut tokio::fs::File, n: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    file.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Appends to `head` the part of `chunk`, read at file offset `chunk_start`, that falls below
+/// [`HEAD_BYTES`] and past what `head` already holds. `TrackedFile::head`'s invariant puts
+/// `chunk_start` at or below `head.len()` whenever the head is short of `HEAD_BYTES`.
+fn capture_head(head: &mut Vec<u8>, chunk_start: u64, chunk: &[u8]) {
+    let have = head.len() as u64;
+    let chunk_end = chunk_start + chunk.len() as u64;
+    if have >= HEAD_BYTES as u64 || chunk_end <= have {
+        return;
+    }
+    debug_assert!(chunk_start <= have, "a gap between the head and the chunk");
+    let from = (have - chunk_start) as usize;
+    let to = (chunk_end.min(HEAD_BYTES as u64) - chunk_start) as usize;
+    head.extend_from_slice(&chunk[from..to]);
+}
+
+/// The `resume_rejected` diagnostic's text.
+fn resume_rejected_message(path: &Path, offset: u64) -> String {
+    format!(
+        "{}: the retained offset {offset} doesn't match this file (a recycled inode, or \
+         rewritten while not tailed) -- reading from the beginning",
+        path.display()
+    )
 }
 
 /// Lossily converts (and diagnoses `invalid_utf8`) a line that isn't UTF-8, upholding
@@ -1745,40 +1848,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_with_an_offset_past_the_file_size_restarts_at_zero() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = scratch_dir("checkpoint-overshoot");
-        let path = dir.join("app.log");
-        std::fs::write(&path, b"short\n").unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
-        let checkpoint_path = dir.join("checkpoint.json");
-        std::fs::write(
-            &checkpoint_path,
-            format!(
-                r#"{{"version":1,"files":[{{"dev":{},"ino":{},"path":"{}","offset":999999}}]}}"#,
-                meta.dev(),
-                meta.ino(),
-                path.display(),
-            ),
-        )
-        .unwrap();
-
-        let mut config = fast_config(ReadFrom::End); // ignored: the resume entry wins
-        config.checkpoint_path = Some(checkpoint_path);
-
-        let (fanout, mut rx) = fanout_channel(8);
-        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
-        let running = spawn_tailer(tailer, fanout);
-
-        let events = recv_events(&mut rx, 1).await;
-        assert_eq!(messages(&events), vec!["short"]);
-
-        running.stop().await;
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
     async fn checkpoint_prunes_entries_for_missing_paths_on_write() {
         let dir = scratch_dir("checkpoint-prune-driver");
         let a_path = dir.join("a.log");
@@ -1883,9 +1952,9 @@ mod tests {
         // `(label, bytes, written at the tmp path rather than the checkpoint path)`.
         let cases: [(&str, &[u8], bool); 4] = [
             ("empty", b"", false),
-            ("truncated", br#"{"version":1,"files":[{"dev":"#, false),
+            ("truncated", br#"{"version":2,"files":[{"dev":"#, false),
             ("wrong-version", br#"{"version":99,"files":[]}"#, false),
-            ("stray-tmp", br#"{"version":1,"#, true),
+            ("stray-tmp", br#"{"version":2,"#, true),
         ];
         for (label, bytes, at_tmp) in cases {
             let dir = scratch_dir(&format!("unusable-checkpoint-{label}"));
@@ -3545,6 +3614,479 @@ mod tests {
         drop(scope);
 
         assert_eq!(tick(&mut tailer, false).await, vec!["old"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- resume identity: the head fingerprint (docs/adr/tail-discovery-failure-and-resume-identity.md)
+
+    /// A `Tailer` driven by hand under `Watcher::Poll`: `bind` loads the checkpoint and runs the
+    /// first scan, and each step below is one thing the run loop does, so no test waits on a
+    /// timer.
+    struct Hand<F: DecoderFactory<LineDecoder>> {
+        tailer: Tailer<LineDecoder, F>,
+        watcher: crate::tail::watch::Watcher,
+        fanout: Fanout,
+        rx: mpsc::Receiver<Delivered>,
+        shutdown: watch::Receiver<bool>,
+        _shutdown_tx: watch::Sender<bool>,
+        probe: TelemetryProbe,
+        diag: Diagnostics,
+    }
+
+    impl<F: DecoderFactory<LineDecoder>> Hand<F> {
+        async fn bind(patterns: Vec<PathPattern>, factory: F, config: TailConfig) -> Self {
+            let probe = TelemetryProbe::new();
+            let diag = Diagnostics::new("test");
+            let mut tailer = Tailer::new(patterns, factory, config)
+                .with_diagnostics(diag.clone())
+                .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+            tailer.bind().await.expect("bind should succeed");
+            let watcher = tailer.watcher.take().expect("bind() leaves a watcher behind");
+            let (fanout, rx) = fanout_channel(64);
+            let (shutdown_tx, shutdown) = watch::channel(false);
+            Self { tailer, watcher, fanout, rx, shutdown, _shutdown_tx: shutdown_tx, probe, diag }
+        }
+
+        async fn scan(&mut self) {
+            self.tailer.scan(false, &mut self.watcher).await;
+        }
+
+        /// Reads every tracked file to EOF, reaps what's due, flushes, and returns the lines.
+        async fn pump(&mut self) -> Vec<String> {
+            let end = self
+                .tailer
+                .drain(&self.fanout, &self.shutdown, &mut self.watcher, no_timer_due())
+                .await;
+            assert_eq!(end, DrainEnd::Idle);
+            self.tailer.flush_all(&self.fanout, FlushReason::Interval).await;
+            let mut lines = Vec::new();
+            while let Ok(delivered) = self.rx.try_recv() {
+                lines.extend(messages(&unwrap_batch(delivered).events));
+            }
+            lines
+        }
+
+        /// An interval checkpoint tick, forced so the test doesn't depend on what dirtied it.
+        async fn checkpoint(&mut self) {
+            self.tailer.flush_all(&self.fanout, FlushReason::Interval).await;
+            self.tailer.write_checkpoint(true).await;
+        }
+
+        /// What `run_until_shutdown` does after its loop.
+        async fn shutdown(mut self) -> Vec<String> {
+            self.tailer.close_all_for_shutdown(&self.fanout).await;
+            self.tailer.flush_all(&self.fanout, FlushReason::Shutdown).await;
+            self.tailer.write_checkpoint(true).await;
+            let mut lines = Vec::new();
+            while let Ok(delivered) = self.rx.try_recv() {
+                lines.extend(messages(&unwrap_batch(delivered).events));
+            }
+            lines
+        }
+
+        fn rejected(&mut self) -> f64 {
+            self.probe.sum("logit.input.files.resume_rejected", &[])
+        }
+
+        fn head_of(&self, path: &Path) -> Vec<u8> {
+            let id = FileId::from_metadata(&std::fs::metadata(path).unwrap());
+            self.tailer.files.get(&id).expect("the file is tracked").head.clone()
+        }
+    }
+
+    fn checkpointed(dir: &Path, read_from: ReadFrom) -> TailConfig {
+        let mut config = fast_config(read_from);
+        config.checkpoint_path = Some(dir.join("checkpoint.json"));
+        config
+    }
+
+    /// A format 2 checkpoint naming `file`'s live `(dev, ino)` at `offset` with `head`.
+    fn write_checkpoint_for(dir: &Path, file: &Path, offset: u64, head: Head) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(file).unwrap();
+        let text = format!(
+            r#"{{"version":2,"files":[{{"dev":{},"ino":{},"path":"{}","offset":{offset},"head_len":{},"head_hash":{}}}]}}"#,
+            meta.dev(),
+            meta.ino(),
+            file.display(),
+            head.len,
+            head.hash,
+        );
+        std::fs::write(dir.join("checkpoint.json"), text).unwrap();
+    }
+
+    /// The first entry of the checkpoint on disk, as `(offset, head_len, head_hash)`.
+    fn checkpointed_entry(dir: &Path) -> (u64, u32, u64) {
+        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["version"], 2, "{text}");
+        let entry = &doc["files"][0];
+        (
+            entry["offset"].as_u64().unwrap(),
+            entry["head_len"].as_u64().unwrap() as u32,
+            entry["head_hash"].as_u64().unwrap(),
+        )
+    }
+
+    /// Rewrites `path` in place, as `copytruncate` and a refilling writer leave it: same inode.
+    fn copytruncate_and_refill(path: &Path, content: &[u8]) {
+        let before = FileId::from_metadata(&std::fs::metadata(path).unwrap());
+        std::fs::write(path, content).unwrap(); // `O_TRUNC` on the existing inode
+        let after = FileId::from_metadata(&std::fs::metadata(path).unwrap());
+        assert_eq!(before, after, "an in-place rewrite keeps the inode");
+    }
+
+    /// The state a recycled inode leaves: a checkpoint entry for the live `(dev, ino)` whose
+    /// head doesn't match what the file now holds. Tmpfs doesn't recycle an inode on demand.
+    #[tokio::test]
+    async fn a_checkpoint_entry_whose_head_no_longer_matches_starts_at_zero_and_is_counted() {
+        let dir = scratch_dir("resume-head-mismatch");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"old\n"));
+
+        // `read_from: end` loses to the entry, and the rejected entry to `0`.
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::End),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["one", "two"]);
+        assert_eq!(hand.rejected(), 1.0);
+        assert_eq!(hand.diag.occurrences("resume_rejected"), 1);
+        assert_eq!(hand.head_of(&path), b"one\ntwo\n", "the head is recaptured from 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_offset_past_the_file_length_is_a_rejected_resume() {
+        let dir = scratch_dir("resume-past-end");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"short\n").unwrap();
+        // The head matches, so only the offset can reject it.
+        write_checkpoint_for(&dir, &path, 999_999, Head::of(b"short\n"));
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::End),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["short"]);
+        assert_eq!(hand.rejected(), 1.0);
+        assert_eq!(hand.diag.occurrences("resume_rejected"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `HEAD_BYTES`, the head is the whole of what was read, so one changed byte anywhere
+    /// before the offset rejects the resume.
+    #[tokio::test]
+    async fn a_file_shorter_than_head_bytes_is_verified_in_full() {
+        let dir = scratch_dir("resume-short-file");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"abc\n").unwrap();
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["abc"]);
+        hand.shutdown().await;
+        assert_eq!(checkpointed_entry(&dir), (4, 4, Head::of(b"abc\n").hash));
+
+        // Unchanged: resumes at the end and reads nothing.
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert!(hand.pump().await.is_empty());
+        assert_eq!(hand.rejected(), 0.0);
+        hand.shutdown().await;
+
+        // The last byte before the offset differs: replayed.
+        copytruncate_and_refill(&path, b"abd\n");
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["abd"]);
+        assert_eq!(hand.rejected(), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_file_under_head_bytes_that_grew_after_the_checkpoint_still_resumes() {
+        let dir = scratch_dir("resume-short-file-grew");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"line one\n").unwrap();
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["line one"]);
+        hand.shutdown().await;
+        assert_eq!(checkpointed_entry(&dir), (9, 9, Head::of(b"line one\n").hash));
+
+        append(&path, b"line two\n");
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["line two"]);
+        assert_eq!(hand.rejected(), 0.0);
+        assert_eq!(hand.head_of(&path), b"line one\nline two\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The head grows with each read until it reaches `HEAD_BYTES`, then stays fixed, so a
+    /// checkpoint written on either side of that point resumes.
+    #[tokio::test]
+    async fn an_appended_file_keeps_its_fingerprint_across_checkpoints() {
+        let dir = scratch_dir("resume-head-grows");
+        let path = dir.join("app.log");
+        let line = |i: usize| format!("line-{i:04}\n"); // 10 bytes
+        let first: String = (0..20).map(line).collect(); // 200 bytes
+        let second: String = (20..40).map(line).collect(); // to 400
+        std::fs::write(&path, &first).unwrap();
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await.len(), 20);
+        hand.checkpoint().await;
+        assert_eq!(checkpointed_entry(&dir), (200, 200, Head::of(first.as_bytes()).hash));
+
+        append(&path, second.as_bytes());
+        assert_eq!(hand.pump().await.len(), 20);
+        hand.checkpoint().await;
+        let whole = std::fs::read(&path).unwrap();
+        assert_eq!(checkpointed_entry(&dir), (400, 256, Head::of(&whole[..HEAD_BYTES]).hash));
+        assert_eq!(hand.head_of(&path), &whole[..HEAD_BYTES]);
+        hand.shutdown().await;
+
+        append(&path, b"after\n");
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["after"]);
+        assert_eq!(hand.rejected(), 0.0);
+        assert_eq!(hand.head_of(&path), &whole[..HEAD_BYTES]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verifying the head reads it, which moves the cursor; a rejection must still start at 0.
+    #[tokio::test]
+    async fn a_resume_rejection_seeks_back_to_zero_after_reading_the_head() {
+        let dir = scratch_dir("resume-reject-seek");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        // A 4-byte head read leaves the cursor at "two".
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"ONE\n"));
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["one", "two", "three"]);
+        assert_eq!(hand.rejected(), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The size check can't see a truncation the writer refilled past the offset while `logit`
+    /// was stopped. The head can.
+    #[tokio::test]
+    async fn a_copytruncate_refilled_past_the_offset_before_a_restart_replays_instead_of_skipping()
+    {
+        let dir = scratch_dir("resume-copytruncate");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+        hand.shutdown().await;
+
+        copytruncate_and_refill(&path, b"ONE\nTWO\n");
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["ONE", "TWO"], "\"ONE\" must not be skipped");
+        assert_eq!(hand.rejected(), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_truncation_resets_the_captured_head() {
+        let dir = scratch_dir("truncation-resets-head");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"abcdef\n").unwrap();
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await, vec!["abcdef"]);
+        assert_eq!(hand.head_of(&path), b"abcdef\n");
+
+        copytruncate_and_refill(&path, b"x\n"); // 2 < 7: a truncation the scan sees
+        hand.scan().await;
+        assert!(hand.head_of(&path).is_empty(), "the old generation's head is gone");
+        assert_eq!(hand.pump().await, vec!["x"]);
+        assert_eq!(hand.head_of(&path), b"x\n");
+        hand.shutdown().await;
+        assert_eq!(checkpointed_entry(&dir), (2, 2, Head::of(b"x\n").hash));
+
+        append(&path, b"y\n");
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+        assert_eq!(hand.pump().await, vec!["y"]);
+        assert_eq!(hand.rejected(), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file opened at its end never passes its first bytes through `read_one`, so `open_tracked`
+    /// reads them. Without that, the checkpoint's head would be empty and cover nothing.
+    #[tokio::test]
+    async fn read_from_end_captures_the_head_at_open() {
+        let dir = scratch_dir("read-from-end-head");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"old\n").unwrap();
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::End),
+        )
+        .await;
+        assert_eq!(hand.head_of(&path), b"old\n");
+        append(&path, b"new\n");
+        assert_eq!(hand.pump().await, vec!["new"]);
+        hand.shutdown().await;
+        assert_eq!(checkpointed_entry(&dir), (8, 8, Head::of(b"old\nnew\n").hash));
+
+        append(&path, b"newer\n");
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["newer"]);
+        assert_eq!(hand.rejected(), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_deselected_retention_whose_head_changed_is_rejected_on_reselect() {
+        let dir = scratch_dir("deselect-head-changed");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+
+        let mut hand =
+            Hand::bind(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning))
+                .await;
+        assert_eq!(hand.pump().await, vec!["one"]);
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        hand.scan().await;
+        assert!(hand.pump().await.is_empty());
+        assert_eq!(hand.tailer.files.len(), 0, "reaped");
+        let id = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+        assert_eq!(hand.tailer.resume[&id].source, Source::Deselected);
+
+        // Rewritten past the retained offset while not tailed.
+        copytruncate_and_refill(&path, b"ONE\nTWO\n");
+        deselected.store(false, std::sync::atomic::Ordering::SeqCst);
+        hand.scan().await;
+        assert_eq!(hand.pump().await, vec!["ONE", "TWO"]);
+        assert_eq!(hand.rejected(), 1.0);
+        assert!(hand.tailer.resume.is_empty(), "spent once tracked");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A format 1 checkpoint has no head, so it's unusable: every file replays once.
+    #[tokio::test]
+    async fn a_v1_checkpoint_is_unusable_and_replays() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = scratch_dir("resume-v1");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        std::fs::write(
+            dir.join("checkpoint.json"),
+            format!(
+                r#"{{"version":1,"files":[{{"dev":{},"ino":{},"path":"{}","offset":4}}]}}"#,
+                meta.dev(),
+                meta.ino(),
+                path.display(),
+            ),
+        )
+        .unwrap();
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::End),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["one", "two"]);
+        assert_eq!(hand.probe.sum("logit.input.checkpoint.errors", &[("op", "load")]), 1.0);
+        assert_eq!(hand.rejected(), 0.0, "an unusable checkpoint isn't a rejected resume");
+        hand.shutdown().await;
+        assert_eq!(checkpointed_entry(&dir), (8, 8, Head::of(b"one\ntwo\n").hash));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Rotated between `scan`'s `stat` and `open_tracked`'s open: the descriptor names another
+    /// inode, so nothing is tracked and the entry for the scanned one stays.
+    #[tokio::test]
+    async fn an_open_that_finds_a_different_inode_than_scanned_keeps_the_entry() {
+        let dir = scratch_dir("open-finds-other-inode");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let scanned = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, b"other\n").unwrap();
+        assert_ne!(FileId::from_metadata(&std::fs::metadata(&path).unwrap()), scanned);
+
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        let head = Head::of(b"one\n");
+        let retained = Retained { path: path.clone(), offset: 4, head, source: Source::Checkpoint };
+        tailer.resume.insert(scanned, retained.clone());
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer
+            .open_tracked(path.clone(), scanned, StartOffset::Resume(4, head), &mut watcher)
+            .await;
+
+        assert!(tailer.files.is_empty(), "the other inode isn't tracked under the scanned id");
+        assert!(tailer.by_path.is_empty());
+        assert_eq!(tailer.resume.get(&scanned), Some(&retained));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A decoder that fails to open leaves the entry, and the next scan resumes from it.
+    #[tokio::test]
+    async fn a_resume_entry_survives_a_failed_decoder_open() {
+        struct FailsOnce(bool);
+        impl DecoderFactory<LineDecoder> for FailsOnce {
+            fn accept(&mut self, _path: &Path) -> bool {
+                true
+            }
+            fn open(&mut self, path: &Path) -> anyhow::Result<LineDecoder> {
+                if std::mem::replace(&mut self.0, false) {
+                    anyhow::bail!("injected");
+                }
+                Ok(LineDecoder::new(path, Arc::new(Resource::default())))
+            }
+        }
+
+        let dir = scratch_dir("resume-decoder-open-fails");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        write_checkpoint_for(&dir, &path, 4, Head::of(b"one\n"));
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            FailsOnce(true),
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert!(hand.tailer.files.is_empty());
+        assert_eq!(hand.diag.occurrences("open_error"), 1);
+        hand.scan().await;
+        assert_eq!(hand.pump().await, vec!["two"], "resumed at the entry, not replayed");
+        assert!(hand.tailer.resume.is_empty());
+        assert_eq!(hand.rejected(), 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
