@@ -215,7 +215,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
-| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | findings → #PRNUM |
+| [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs` (`PartialEntry`, `DockerDecoder::decode_line`) | findings → #442 |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::open`) | findings → #328 |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs` (`CONTEXT_LEN`, `parse_record`, `walk_segment`) | findings → #328, #367 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue::push`, `write_record`) | findings → #331 |
@@ -1957,7 +1957,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     completed message after reassembly) and the two agree.
   - `strip_suffix('\n')` is total given `is_complete`.
   - ~~Unknown `stream` returns `Malformed` and emits nothing — the driver counts it as
-    `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).~~ **fixed (#PRNUM):**
+    `bad_line` and clears scratch (`read_one`'s `Err` arm in `driver.rs`).~~ **fixed (#442):**
     a `Malformed` entry flushes the held fragments first, and the driver absorbs them before it
     counts `bad_line`.
 - **Observed concerns (unverified):**
@@ -1965,7 +1965,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     `decode_line` returns `Err` before touching `self.partial`/`self.dropping` (the envelope parse and stream match come first), so a
     held fragment survives and the next closing entry joins it to content from a different logical
     line, with only a throttled `bad_line` to show for it. Medium confidence it is reachable (a
-    torn read of the json-file, or a `stream` value Docker adds later).~~ **fixed (#PRNUM):**
+    torn read of the json-file, or a `stream` value Docker adds later).~~ **fixed (#442):**
     confirmed, and wider: one `partial` served both streams, which dockerd interleaves. Design in
     the ADR's 2026-09-28 amendment.
   - **Interner growth from container-supplied `attrs` keys.** `emit` interns every key of the
@@ -1988,7 +1988,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
 - **Suggested verification approach:** proptest over fragment sequences (including interleaved
   malformed entries and truncations) against a model reassembler; a real `docker run` emitting
   >16 KiB lines on both streams.
-- **Verified (tailbk/w2, #PRNUM):** findings, all fixed per [ADR
+- **Verified (tailbk/w2, #442):** findings, all fixed per [ADR
   `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
   amendment: reassembly per stream; a `Malformed` entry (bad JSON or unknown `stream`) flushes
   both streams' held fragments, and `read_one`/`close_decoder` absorb them; the splitter takes
