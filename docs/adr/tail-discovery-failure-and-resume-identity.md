@@ -70,9 +70,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      `NotFound` or `NotADirectory` is the "not there yet" case `docs/deploying.md` describes. It
      is a successful empty listing and counts nothing.
    - **Any other `read_dir` failure fails that pattern's listing.** So does an error from the
-     `ReadDir` iterator part-way through. `scan` returns `Err`, and `Tailer::scan` records the
-     pattern's directory in `failed_dirs`. No path under that directory (`tail_in`) or that
-     `root` (`docker_in`) is retired in this scan.
+     `ReadDir` iterator part-way through. `scan` returns `Err`, and no path that pattern could
+     name is retired in this scan.
    - **A per-path `stat` has three outcomes.** `NotFound` or `NotADirectory` means absent. Any
      other error means unknown, and an unknown path retires nothing.
    - **`docker_in`'s per-entry work.** In `scan_docker_containers`, a `file_type()` error on a
@@ -80,12 +79,11 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      path to `Scan::unknown` instead of skipping it. `ELOOP` on a container directory is
      unknown: the file stays tracked and the error is diagnosed.
 
-   `Tailer::scan` builds `discovered` and an `unknown: HashSet<PathBuf>` holding every path from
-   a pattern's `Scan::unknown` plus every discovered path whose `stat` was unknown. The stale
-   pass retires a `by_path` key only if it isn't in `unknown` and its parent (`tail_in`) or its
-   `root` prefix (`docker_in`) isn't in `failed_dirs`. Each failure is counted once per scan per
-   operation, as `logit.input.scan.errors{op="read_dir"|"stat"}`, and diagnosed `scan_error`
-   through `warn_throttled`.
+   `Tailer::scan` retires a tracked path only if its `stat` wasn't unknown and no pattern whose
+   listing failed covers it (`PathPattern::covers`); `pattern.rs`'s table has the per-operation
+   detail. Each failure is counted once per scan per operation, as
+   `logit.input.scan.errors{op="read_dir"|"stat"}`, and diagnosed `scan_error` through
+   `warn_throttled`.
 
    - **A file kept only because its listing failed or its stat was unknown is still checked
      through its open handle.** The driver runs `fstat` on it: a link count of 0 means it was
@@ -278,7 +276,22 @@ To be filled by the PR that lands it.
 
 ### `tailbk/w3`: scan failure is no information (TAIL-01, TAIL-11)
 
-To be filled by the PR that lands it.
+Decision 1 as written. Because a failed pattern is tested with `PathPattern::covers` rather than
+by directory, two patterns sharing a directory, one of them failing, still retire what only the
+listed one names. `Tailer::scan`'s listing step returns a `Listing` (`discovered`,
+`unknown`, `failed`, with `is_complete` for the resume pruning in decision 4). The fault seam
+checks three points at `tail.scan`: the `read_dir` in `PathPattern::scan`, the two per-container
+stats in `docker_in`'s walk, and the per-path `metadata` in `Tailer::scan`, which runs once per
+distinct matched path.
+
+Tests, all against a real scratch directory with the failure forced through the seam:
+`pattern.rs` covers each row of its module doc's table, `covers` against `scan` for both
+matchers, and a model proptest of `matches_name`; `driver.rs` covers a failed listing and a
+failed `stat` keeping the file with no replay, `ENOENT` still retiring it, a missing or removed
+directory, a deletion and a truncation seen through the handle while the listing fails, two
+patterns with one failing (separate and shared directories), one `stat` per distinct path, and a
+bind-time failure starting the file at `0` later; `docker.rs` covers an unreadable container
+directory and an unreadable `root`, each recovering with no identity change.
 
 ### `tailbk/w4`: head fingerprint and eviction (TAIL-02)
 

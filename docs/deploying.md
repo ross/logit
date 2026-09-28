@@ -1189,6 +1189,15 @@ see [ADR
 - `logit.input.watch.overflows` (count): the `inotify` event queue overflowed. The driver responds
   with a full rescan instead of losing track of changes, but a sustained nonzero rate means
   `poll_interval` is doing more of the real work than the wake source.
+- `logit.input.scan.errors{op="read_dir"|"stat"}` (count): a pattern's directory couldn't be
+  listed, or a matched path couldn't be `stat`ed, for a reason other than it not existing
+  (`EACCES`, `EIO`, `EMFILE`, a symlink loop). A failed look is no information, so no tracked file
+  it may name is closed: an open file keeps being read, and a truncation or deletion is still seen
+  through the open handle. A file first found only after a failure starts at its beginning, even
+  under `read_from: end`, if the failure hid it from the startup scan. Each failing scan also logs a
+  throttled `logit.component.diagnostics{key="scan_error"}` naming the first failing path and its
+  errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
+  fixed, a file renamed out of that directory stays open.
 - `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge):
   a line dropped whole for exceeding `max_line_bytes`, or a tracked file's length shrinking under
   it (rare, but real for a tool that recreates a log file in place instead of renaming it away
