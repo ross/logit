@@ -1858,27 +1858,22 @@ mod tests {
     /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
     #[tokio::test]
     async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
-        let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input
+        // One listener for both halves, so the second proves this listener still serves TLS. Its
+        // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
+        // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
+        let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
             .with_tls(&test_tls_settings(None), &testdata_dir())
             .unwrap()
-            .with_handshake_timeout(Duration::from_millis(50));
+            .with_handshake_timeout(Duration::from_millis(500));
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Raw TCP, no byte sent, held until the close is observed, so only the server's deadline
-        // could have closed it. A 1s read budget against a 50ms handshake timeout.
+        // could have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(1), silent.read(&mut buf))
-            .await
-            .expect("a silent TLS connection should be closed within 1s");
-        match result {
-            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
-            Err(err) => panic!("read failed outright: {err}"),
-        }
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
 
         // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
