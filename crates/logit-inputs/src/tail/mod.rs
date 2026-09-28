@@ -168,19 +168,8 @@ impl logit_pipeline::Input for TailInput {
     }
 }
 
-/// Unique scratch directories for the `tail/` tests; this crate has no `tempfile` dependency.
+/// The `tail/` tests' scratch directories: the shared helper, under the path they already import.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    pub(crate) fn scratch_dir(label: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("logit-tail-test-{label}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
+    pub(crate) use logit_pipeline::test_util::scratch_dir;
 }
