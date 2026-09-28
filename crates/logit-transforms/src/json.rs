@@ -67,6 +67,35 @@ impl JsonParser {
         self.diag = diag;
         self
     }
+
+    /// Parses `body` into `scratch` under the configured mode.
+    #[inline]
+    fn parse(&mut self, body: &Bytes) -> Result<(), serde_json::Error> {
+        if self.skip_to_brace {
+            parse_object_prefix(body, &mut self.scratch, &mut self.keys)
+        } else {
+            parse_object(body, &mut self.scratch, &mut self.keys)
+        }
+    }
+
+    /// Retries a parse that failed on invalid UTF-8, on a lossy copy. The repaired copy is a
+    /// fresh `Bytes`, so every zero-copy `Value::Str` the retry produces slices it, never the
+    /// invalid original: that keeps `Value::Str`'s valid-UTF-8 invariant. A second failure takes
+    /// the ordinary `parse_failure` path in `process`.
+    #[cold]
+    #[inline(never)]
+    fn retry_lossy(&mut self, body: &Bytes) -> Result<(), serde_json::Error> {
+        self.scratch.clear();
+        let repaired = Bytes::from(String::from_utf8_lossy(body).into_owned());
+        let retried = self.parse(&repaired);
+        if retried.is_ok() {
+            self.diag.warn_throttled(
+                "invalid_utf8",
+                "message is not valid UTF-8; parsed after replacing invalid sequences with U+FFFD",
+            );
+        }
+        retried
+    }
 }
 
 impl Transform for JsonParser {
@@ -95,34 +124,16 @@ impl Transform for JsonParser {
         // Parsed apart from `event.attributes` and merged only on success, so a failure partway
         // through a malformed object leaves the event's attributes untouched.
         self.scratch.clear();
-        let parsed = if self.skip_to_brace {
-            parse_object_prefix(&body, &mut self.scratch, &mut self.keys)
-        } else {
-            parse_object(&body, &mut self.scratch, &mut self.keys)
-        };
-        // Only a failed parse of invalid UTF-8 is copied and retried. The repaired copy is a fresh
-        // `Bytes`, so every zero-copy `Value::Str` the retry produces slices it, never the invalid
-        // original: that keeps `Value::Str`'s valid-UTF-8 invariant. A second failure takes the
-        // ordinary `parse_failure` path.
-        let parsed = match parsed {
+        // Only a failed parse of invalid UTF-8 is copied and retried, and the retry lives in a
+        // `#[cold]` helper so this function keeps one parse call site: a second one here stops
+        // LLVM inlining `parse_object` into `process`, which costs `json-parse-x3` about 10%
+        // (`docs/known-gaps.md`'s "HTTP access logs" section).
+        let parsed = match self.parse(&body) {
             Err(_)
                 if self.invalid_utf8 == InvalidUtf8::Replace
                     && std::str::from_utf8(&body).is_err() =>
             {
-                self.scratch.clear();
-                let repaired = Bytes::from(String::from_utf8_lossy(&body).into_owned());
-                let retried = if self.skip_to_brace {
-                    parse_object_prefix(&repaired, &mut self.scratch, &mut self.keys)
-                } else {
-                    parse_object(&repaired, &mut self.scratch, &mut self.keys)
-                };
-                if retried.is_ok() {
-                    self.diag.warn_throttled(
-                        "invalid_utf8",
-                        "message is not valid UTF-8; parsed after replacing invalid sequences with U+FFFD",
-                    );
-                }
-                retried
+                self.retry_lossy(&body)
             }
             other => other,
         };
