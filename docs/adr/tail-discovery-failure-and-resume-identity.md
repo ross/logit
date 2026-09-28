@@ -280,10 +280,10 @@ To be filled by the PR that lands it.
 
 Decision 1 as written. Because a failed pattern is tested with `PathPattern::covers` rather than
 by directory, two patterns sharing a directory, one of them failing, still retire what only the
-listed one names. `Tailer::scan`'s listing step returns a `Listing` (`discovered`,
-`unknown`, `failed`, with `is_complete` for the resume pruning in decision 4). The fault seam
-checks three points at `tail.scan`: the `read_dir` in `PathPattern::scan`, the two per-container
-stats in `docker_in`'s walk, and the per-path `metadata` in `Tailer::scan`, which runs once per
+listed one names. `Tailer::scan`'s listing step returns a `Listing` (`discovered`, `unknown`,
+`failed`, and `listed`, which the resume pruning in decision 4 also uses). The fault seam checks
+three points at `tail.scan`: the `read_dir` in `PathPattern::scan`, the two per-container stats
+in `docker_in`'s walk, and the per-path `metadata` in `Tailer::scan`, which runs once per
 distinct matched path.
 
 Tests, all against a real scratch directory with the failure forced through the seam: `pattern.rs`
@@ -297,7 +297,34 @@ directory and an unreadable `root`, each recovering with no identity change.
 
 ### `tailbk/w4`: head fingerprint and eviction (TAIL-02)
 
-To be filled by the PR that lands it.
+Decisions 2 to 4 as written. `checkpoint.rs`'s module doc is the canonical statement of format 2,
+the capture rule, the accept rule, and the residual. Three details the decisions leave open:
+
+- **A resume reads `min(256, max(offset, head_len))` bytes from `0`** before the seek, so the
+  tracked file's head satisfies its invariant (`head.len() >= min(256, offset)`) without a second
+  read, and the file is always sought afterwards, to `0` on a rejection. A file opened at its end
+  reads its first `min(256, len)` bytes once, at open; every other head byte comes from
+  `read_one`'s own chunks.
+- **The resume entry is removed once the file is tracked, whatever the start was**, so an entry
+  never outlives its inode being tracked (the rotation arm opens at `0` and still spends one).
+- **The fault seam's `tail.scan` site gains `Op::Open`**, checked before `open_tracked` opens a
+  discovered file, so a test can fail the open after a good `stat`.
+
+Tests, in `driver.rs` unless noted, drive `bind`/`scan`/`drain` by hand under `Watcher::Poll`
+against a real scratch directory: a hand-written format 2 entry with a wrong hash for a live
+inode (the recycled-inode stand-in), an offset past the file's length, a file under 256 bytes
+checked in full and still resumed after it grew, a head that crosses 256 bytes between two
+checkpoints, the seek back to `0` after a rejection, a `copytruncate` refilled past the offset
+while stopped, a truncation clearing the head, `read_from: end` capturing it at open, a
+de-selection retention rejected after a rewrite and pruned when its path is gone or another
+inode's, checkpoint entries pruned after a clean scan and kept under a failed listing or an
+unknown `stat` (and persisted by a write meanwhile, so a `read_from: end` restart replays), an
+entry spent only once the file is tracked (a failed open or decoder open), and an open that finds
+another inode than the one scanned. `checkpoint.rs` covers the version probe (format 1 reads as
+"unsupported version 1"), a `head_len` over 256, a format 2 entry without its head, `Head::matches`,
+and XXH64 test vectors. `checkpoint_is_written_on_interval_only_when_dirty_and_resumes_by_inode`
+and `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` pass
+unchanged.
 
 ### `tailbk/w5`: driver state machine, `logrotate` run, close-out (TAIL-01..03, TAIL-10, TAIL-12)
 

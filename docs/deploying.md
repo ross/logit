@@ -1100,7 +1100,11 @@ match `docker_in`'s `root:` default, the only layout this driver understands.
 the first scan with no checkpoint entry naming it. A file discovered later (a new log, a rotated
 one, a newly selected container) always starts at its beginning, since it has nothing "from before
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
-file it names.
+file it names, provided the file still starts with the bytes `logit` read from it. A resume
+re-checks the file's first 256 bytes (fewer for a smaller offset) and its length. A file whose
+head changed, because a new file reused the inode or the file was rewritten while `logit` was
+down, starts at offset 0 instead; `logit.input.files.resume_rejected` and a `resume_rejected`
+diagnostic say so.
 
 **A checkpoint that exists but can't be used replays every file from its beginning.** If
 `checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
@@ -1109,7 +1113,8 @@ file present at the first scan starts at offset 0, even under `read_from: end`. 
 those files, so skipping to their end would lose whatever they gained while `logit` was down.
 Expect a burst of duplicates; `logit.input.checkpoint.errors{op="load"}` and a `checkpoint_error`
 diagnostic say why. Only a missing checkpoint with no `.tmp` beside it is a first run that
-`read_from` decides.
+`read_from` decides. An upgrade that changes the checkpoint format is this case too: every file
+replays once.
 
 **Set `checkpoint_path` for `docker_in`.** It is optional and unset by default, in which case every
 restart re-applies `read_from` as if every file were newly discovered. A long-running container's

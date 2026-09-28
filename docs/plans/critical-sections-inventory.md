@@ -211,7 +211,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-07](#net-07--boundedqueuepop_many--pop--close-cancellation-safety-and-the-closed-and-empty-signal) | P0 | `BoundedQueue::pop_many` / `pop` / `close`: cancellation safety and the closed-and-empty signal | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue::pop`, `pop_many`, `close`) | reviewed @510291b1 |
 | [NET-08](#net-08--tcp-framer-rfc-6587-auto-detect-latch-lf-lines-with-drain-resync-and-the-4-byte-length-prefix) | P0 | TCP `Framer`: RFC 6587 auto-detect latch, LF lines with drain-resync, and the 4-byte length prefix | `crates/logit-inputs/src/tcp.rs` (`Framer`) | unreviewed |
 | [TAIL-01](#tail-01--rotation--truncation--removal-reconciliation-in-scan) | P0 | Rotation / truncation / removal reconciliation in `scan` | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::scan`, `reconcile_truncation`) | findings → #443 |
-| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | in-progress (tailbk/w4) |
+| [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::open_tracked`, `StartOffset`) | findings → #N |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`) | in-progress (tailbk/w5) |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs` (`LineSplitter`) | findings → #440 |
 | [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs` (`CheckpointStore`) | findings → #327 |
@@ -1537,9 +1537,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (a wrong `End`/resume offset skips content); custom (all of it); bookkeeping whose error silently
   orphans an entry from `by_path`.
 - **Invariants to verify:**
-  - `resume` entries are consumed exactly once and only after `accept` succeeded (the
-    `self.resume.remove(&id)` after `factory.accept` in `open_tracked`) — the "peeked, not
-    removed" comment in `scan`'s `None` arm is the argument.
+  - `resume` entries are consumed once, and only after the file is tracked (the
+    `self.resume.remove(&id)` at the end of `open_tracked`) — the "peeked, not removed" comment in
+    `scan`'s `None` arm is the argument.
   - `read_from` applies only on the first scan, never to a later discovery.
   - A `Deselected` entry is never revived by the rebind branch (the early return at the top of
     `open_tracked`).
@@ -1547,17 +1547,28 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     binding, in either HashMap iteration order.
   - A `Draining` entry revived by the rebind branch keeps its offset and continues, not restarts.
 - **Observed concerns (unverified):**
-  - **`resume` is keyed on `(dev, ino)` with the stored path never compared** (`scan`'s `None`
+  - ~~**`resume` is keyed on `(dev, ino)` with the stored path never compared** (`scan`'s `None`
     arm, `CheckpointStore::load`). An inode number recycled by the filesystem between the checkpoint
     write (or a de-selection) and rediscovery would apply a stale byte offset to unrelated
     content — skipping data rather than duplicating it. The stored `path` is explicitly described
     as "for a human reading the file, never used to match" (the `FileId` doc in `checkpoint.rs`). Plausible on a
     churning Docker host where containers are created and removed constantly. Medium confidence
-    that it's reachable, high confidence the guard is absent.
-  - `resume` entries for inodes never rediscovered are never evicted; the map grows to the size of
-    the checkpoint plus every de-selection for the life of the process. Low severity.
+    that it's reachable, high confidence the guard is absent.~~ **fixed (#N):** confirmed. A
+    resume now also verifies a fingerprint of the file's first `min(256, offset)` bytes, captured
+    as they're read, and that the offset is within the file; anything else starts at `0`, counted
+    `logit.input.files.resume_rejected`. Not the path: a rotation while stopped is a supported
+    resume. Past 256 bytes, a recycled inode sharing its first 256 bytes is the residual in
+    `docs/known-gaps.md`.
+  - ~~`resume` entries for inodes never rediscovered are never evicted; the map grows to the size of
+    the checkpoint plus every de-selection for the life of the process. Low severity.~~
+    **fixed (#N):** a de-selection retention is dropped once a scan lists its path and finds it
+    gone or another inode's; an unspent checkpoint entry once a scan lists its stored path and
+    doesn't discover its inode. Neither is dropped under a failed listing or an unknown `stat`,
+    and every checkpoint write persists unspent checkpoint entries until then.
 - **Existing coverage:** `checkpoint_is_written_on_interval_only_when_dirty_and_resumes_by_inode`,
-  `checkpoint_with_an_offset_past_the_file_size_restarts_at_zero`,
+  `checkpoint_with_an_offset_past_the_file_size_restarts_at_zero` (under format 2 it would pass
+  with its entry unread, so `a_checkpoint_offset_past_the_file_length_is_a_rejected_resume`
+  replaces it),
   `a_reselected_file_resumes_at_the_retained_offset_rather_than_replaying`,
   `read_from_end_skips_preexisting_lines_and_read_from_beginning_replays_them`,
   `a_file_created_after_startup_is_discovered_and_read_from_the_beginning`.
@@ -1566,6 +1577,22 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   from 0.
 - **Priority:** P0 — start offset is exactly the loss/duplication knob, and the identity key has a
   known blind spot.
+- **Verified (tailbk/w4, #N):** both concerns were real, and two more turned up. The resume
+  entry was spent at `accept`, so a transient open or decoder failure replayed the file; it's now
+  spent only once the file is tracked, and an open that finds another inode than the one scanned
+  keeps it. A checkpoint write persisted only tracked files, so an entry whose listing failed at
+  startup was lost at the first write, and a restart under `read_from: end` then skipped what the
+  file gained. Checked by hand-driven `bind`/`scan`/`drain` over a real scratch directory under
+  `Watcher::Poll`: a hand-written format 2 entry naming a live inode with a wrong hash stands in
+  for inode reuse (tmpfs doesn't recycle on demand) and replays from `0`, counted once; an offset
+  past the length is a counted rejection; a file under 256 bytes is verified in full and still
+  resumes after growing; the head survives crossing 256 bytes between checkpoints; a rejection
+  seeks back to `0` after the head read; a `copytruncate` refilled past the offset while stopped
+  replays; pruning keeps entries under fault-seam `ReadDir`/`Stat` failures and drops them after
+  a clean scan; the seam's `Open` point proves an entry survives a failed open. The existing
+  `checkpoint_is_written_on_interval_only_when_dirty_and_resumes_by_inode` and
+  `a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it` pass
+  unchanged under format 2.
 
 ### TAIL-03 — Read → split → decode → batch hot loop, and its backpressure contract
 - **Location:** `crates/logit-inputs/src/tail/driver.rs` (`Tailer::drain`, `read_one`, `emit`);
