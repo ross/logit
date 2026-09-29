@@ -236,7 +236,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → #370 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
-| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | in-progress (sink/w3) |
+| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | findings → #452 |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | findings → #374 |
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | findings → #374 |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | findings → #374 |
@@ -4557,19 +4557,21 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `Output::flush` is or isn't needed after a write under TLS — the send path never calls
     it, relying on `write_all` having pushed the record out.
 - **Observed concerns (unverified):**
-  - **`logit.output.requests` is not counted on several failure paths.** The two "batch too large"
+  - ~~**`logit.output.requests` is not counted on several failure paths.** The two "batch too large"
     returns (the `MAX_SANE_UNCOMPRESSED_LEN` pre-check and the `bound` check in `send`) and every
     failure inside `connect_and_handshake` (reached via the `?` on `self.connect_and_handshake()`
     in `send`) return without incrementing the counter, while every post-write path does.
     The counter therefore under-reports failures and its `class` distribution does not reconcile
-    with `write_loop`'s attempt count. **High confidence — the code paths are plainly visible.**
-  - TLS write semantics (above) — the memory of the syslog-TLS review records `tokio-rustls` write
+    with `write_loop`'s attempt count. **High confidence — the code paths are plainly visible.**~~
+    **Resolved (sink/w3, #452):** `send` counts once, from `classify` of an inner attempt's result.
+  - ~~TLS write semantics (above) — the memory of the syslog-TLS review records `tokio-rustls` write
     semantics as a past source of error, so this deserves a re-derivation rather than a re-read of
     the "single `write` first" comment in `send`. **Medium confidence there is a real gap; high confidence it is
-    worth re-verifying.**
-  - `compression_from_u8(...).unwrap_or(Compression::None)` in `connect_and_handshake` silently accepts a
+    worth re-verifying.**~~ **Resolved (sink/w3, #452):** a real gap, the missing flush; see the
+    Verified bullet.
+  - ~~`compression_from_u8(...).unwrap_or(Compression::None)` in `connect_and_handshake` silently accepts a
     nonsense compression byte where the adjacent codec check is strict. **High confidence,
-    low impact.**
+    low impact.**~~ **Resolved (sink/w3, #452):** `validate_hello_ack` refuses it as `Permanent`.
   - `Ack.seq` mismatch is `Ambiguous` and drops the connection (the `ack.seq != conn.seq` branch of `send`), but nothing bounds
     how often a peer can force that — a hostile listener that always acks the wrong seq turns
     every batch into a reconnect plus an ambiguous retry, i.e. unbounded duplication downstream.
@@ -4609,6 +4611,53 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   TLS.~~ It is needed. A third too-large path exists beyond the two the entry names: the
   compressed-frame check against `frame::compressed_bound`, which also returns `Permanent`
   without counting `logit.output.requests`.
+- **Verified (sink/w3, #452):** findings, fixed. Read against `logit_in`'s frame path,
+  tokio-rustls 0.26.5, and rustls 0.23.45; tests in `crates/logit-outputs/src/logit.rs` and
+  `crates/logit-inputs/src/logit.rs`, each shown to fail before its fix or on a planted mutation.
+  ADR `sink-send-path-and-attempt-accounting`'s `sink/w3` section lists them.
+  - `self.stream` is `None` for the whole attempt: unchanged, and still pinned by
+    `a_cancelled_send_dropped_mid_await_leaves_stream_none`. Every new write-phase test asserts
+    the pool is empty after the failure.
+  - ~~"Nothing left the host" (`Clean`) versus "at least one byte left" (`Ambiguous`) is true
+    through a `tokio_rustls` stream.~~ **Refuted, and replaced:** the fault now says what the peer
+    holds. `logit_in` fills the whole frame, checks its CRC, decodes, forwards, and only then
+    acks, with no partial decode path (confirmed by reading `read_frame_body` and
+    `serve_connection`), so every failure before the frame is completely written and flushed is
+    `Clean`, and the ack wait is the one `Ambiguous` window.
+    `a_tls_write_error_after_a_whole_record_left_is_clean_and_logit_in_forwards_nothing` puts
+    20 000 bytes of the frame's ciphertext on a real TLS `logit_in` before the socket fails: the
+    attempt is `Clean`, and the listener counts `truncated` and forwards nothing. The residual, a
+    TLS 1.3 `KeyUpdate` queued behind the frame's last record at 2^24 records under one AES-GCM
+    key, is in the ADR's decision 6.
+  - `conn.seq` stays in lockstep: it advances only after the write and flush succeed, and every
+    failure after the connection is taken drops it, except the too-large returns, which write
+    nothing. A fresh connection starts at 0 on both sides. Confirmed by reading;
+    `every_returned_send_counts_one_request` drives an `Ack.seq` mismatch to `Ambiguous`.
+  - No frame is written twice on one connection: the same drop rule. Confirmed by reading.
+  - The too-large checks keep the connection and write nothing:
+    `each_too_large_return_counts_one_permanent_request_and_keeps_the_connection`. The
+    compressed-bound return is unreachable with lz4, since `frame::compressed_bound` is lz4's
+    worst case over a payload the check before it bounded; it has no test.
+  - `read_control` bounds both lengths before allocating, on the first call: now at
+    `control::MAX_CONTROL_MESSAGE_BYTES` (4096; the longest message is a 1033-byte `Reject`), not
+    64 MiB. `read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over`.
+  - ~~`Output::flush` is or isn't needed after a write under TLS.~~ The frame and the `Hello` are
+    flushed before each wait (`a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait`,
+    `the_hello_is_flushed_before_the_hello_ack_wait`), and so are `logit_in`'s `HelloAck`, `Ack`,
+    and `Reject` (`hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record`,
+    `a_reject_reaches_a_tls_client_over_a_pipe_smaller_than_one_record`). `Output::flush` itself
+    now shuts the connection down and sends `close_notify`.
+  - `Ack.seq` mismatch unbounded: unchanged. The peer is a configured `logit_in`, and ADR
+    `deployment-threat-model` keeps a hostile peer out of scope; each mismatch drops the
+    connection.
+  - Found beyond the entry: `logit_out` never sent `close_notify`, so under TLS every disconnect
+    reached `logit_in` as `UnexpectedEof` and was logged as `connection_error`
+    (`logit_in_reads_a_tls_connection_ended_after_an_ack_as_a_clean_close`,
+    `a_tls_client_gone_without_close_notify_between_frames_is_a_clean_close`); a `HelloAck`
+    naming an unoffered codec was `Ambiguous` and counted a reconnect before it was refused (the
+    four `a_hello_ack_…` tests); a frame truncated mid-header was uncounted
+    (`a_client_gone_mid_header_is_an_error_counted_as_a_truncated_header`); and
+    `observe_batch`'s doc said once per attempt.
 
 ---
 
@@ -4687,6 +4736,11 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     closes: `a_tls_close_notify_probes_eof`, `a_tls_transport_close_without_close_notify_probes_eof`.
   - The suggested TLS twins of the two `logit_out` probe tests and the FIN-between-probe-and-write
     test belong to `sink/w3` and `sink/w2`.
+- **Landed (sink/w3, #452):** the TLS twins,
+  `a_pooled_tls_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost`
+  and `a_pooled_tls_connection_with_an_unsolicited_reject_is_replaced`, both against a real
+  TLS peer, and `a_tls_peer_gone_between_the_frame_and_its_ack_is_ambiguous_and_the_next_send_reconnects`.
+  The FIN-between-probe-and-write test stays with `sink/w2`.
 
 ---
 
