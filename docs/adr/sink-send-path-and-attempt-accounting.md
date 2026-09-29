@@ -530,7 +530,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
 Each workstream filled in its subsection in the PR that landed it and updated its inventory rows.
 `sink/w0` (#449) is this record. `sink/w1` (#450) through `sink/w7` (#456) landed the code and
-tests below, one PR each, and `sink/w8` (#PRW8) closed the cluster out in the docs.
+tests below, one PR each, and `sink/w8` (#457) closed the cluster out in the docs.
 
 ### `sink/w1`: pinned TLS semantics and one fake stream (SINK-03, WIRE-09)
 

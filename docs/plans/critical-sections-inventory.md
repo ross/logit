@@ -34,7 +34,7 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   NET-06, RT-02..04, RT-07, TAIL-06, and TAIL-08 with findings and reviewed NET-07 and DISK-08
   clean, aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
   with findings, tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
-  TAIL-09..12 with findings, and the sink send path (#449–#456, #PRW8), which also closed leads
+  TAIL-09..12 with findings, and the sink send path (#449–#456, #457), which also closed leads
   12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings. The rest of the
   list is `unreviewed`. The index's **Status** column is the source of truth.
 
@@ -133,7 +133,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    manual `logrotate` run
    ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
-6. **Sink send path (done, #449–#456, #PRW8)** — SINK-01..06, WIRE-08/09, RT-05. One shared
+6. **Sink send path (done, #449–#456, #457)** — SINK-01..06, WIRE-08/09, RT-05. One shared
    pooled-stream driver and datagram packer for the copied send paths, fault injection against
    them and against real TLS pairs (RST mid-write, blackhole, a stalled handshake, a partial
    record under a `Pending` poll), and attempt accounting that counts encode-side drops once per
