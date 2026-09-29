@@ -131,6 +131,27 @@ impl CountGate {
     pub fn is_muted(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Runs `f` with the gate muted, then puts back the state it had before, on return and on
+    /// unwind alike: a gate muted before stays muted, an open one opens again. A sink's encode of a
+    /// unit already runs muted or open by `BatchAccounting`, and a re-encode inside it (a request
+    /// bisected over a byte cap) runs through this, so it never counts and never opens a gate the
+    /// unit's encode muted.
+    pub fn muted<R>(&self, f: impl FnOnce() -> R) -> R {
+        /// Puts the saved state back when dropped, so a panic in `f` can't leave the gate muted.
+        struct Restore<'a> {
+            gate: &'a CountGate,
+            was_muted: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.gate.set_muted(self.was_muted);
+            }
+        }
+        let _restore = Restore { gate: self, was_muted: self.is_muted() };
+        self.set_muted(true);
+        f()
+    }
 }
 
 /// One component's telemetry handle; `Clone` is an `Arc` bump. [`Telemetry::default`] is the
@@ -952,6 +973,51 @@ mod tests {
         gated.gauge("g", 4.0, &[]);
         gated.timing("t", Duration::from_millis(1), &[]);
         assert_eq!(registry.drain(0).len(), 2);
+    }
+
+    #[test]
+    fn muted_mutes_inside_and_restores_the_state_it_found() {
+        let gate = CountGate::new();
+        let inner = gate.muted(|| gate.is_muted());
+        assert!(inner, "muted inside");
+        assert!(!gate.is_muted(), "an open gate opens again");
+
+        gate.set_muted(true);
+        gate.muted(|| assert!(gate.is_muted()));
+        assert!(gate.is_muted(), "a muted gate stays muted");
+    }
+
+    #[test]
+    fn muted_nests() {
+        let gate = CountGate::new();
+        gate.muted(|| {
+            gate.muted(|| assert!(gate.is_muted()));
+            assert!(gate.is_muted(), "the outer call is still muted after the inner returns");
+        });
+        assert!(!gate.is_muted());
+    }
+
+    #[test]
+    fn muted_restores_the_state_it_found_when_f_panics() {
+        for was_muted in [false, true] {
+            let gate = CountGate::new();
+            gate.set_muted(was_muted);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gate.muted(|| panic!("an encode panicked"));
+            }));
+            assert!(unwound.is_err());
+            assert_eq!(gate.is_muted(), was_muted);
+        }
+    }
+
+    #[test]
+    fn muted_mutes_the_counts_of_a_handle_gated_over_it() {
+        let registry = Registry::new();
+        let gate = CountGate::new();
+        let gated = registry.telemetry_for("out", "datadog_out", "sink").gated(&gate);
+        gate.muted(|| gated.count("x", 1.0, &[]));
+        gated.count("x", 2.0, &[]);
+        assert_eq!(summed(&registry.drain(0), "x"), 2.0);
     }
 
     #[test]
