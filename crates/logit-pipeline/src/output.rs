@@ -23,6 +23,8 @@ use logit_core::EventBatch;
 /// resend, bounded, on a verdict that proves the resend safe, or poll, bounded, for a verdict:
 /// - the pooled-stream driver's one reconnect after a plaintext first write that accepted nothing
 ///   (`PooledStream::send` in `logit-outputs`);
+/// - `statsd_out`'s Unix datagram socket, which reconnects and resends once when a batch's first
+///   datagram finds an inherited socket's receiver gone (`UnixDest::send` in `logit-outputs`);
 /// - `splunk_hec_out`'s resend of the rest of a body after a code 6 dropped one of its objects
 ///   (`SplunkHecOutput::send_once`);
 /// - `splunk_hec_out`'s one split of a body Splunk Cloud answered as over its cap, each half sent

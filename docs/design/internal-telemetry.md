@@ -1897,8 +1897,8 @@ Some reasons exist only on one path:
 `temporality: cumulative` fix); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
 use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
 registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
-sender mode, a `503` that is retried included, carrying the status and the first 256 bytes of the
-response body, read bounded rather than read whole and then trimmed.
+sender mode (`crates/logit-outputs/src/prometheus.rs`'s module doc, "Faults, retries and duplicate
+safety", has what it carries).
 
 Retry is layer 2 in both modes: in registry mode `send` is an in-memory upsert with nothing to
 retry, and in sender mode one `send` is one attempt by design, with `write_loop` owning the retry.

@@ -1,5 +1,8 @@
 //! Receivers that sink tests send to: a TCP, TLS, or UDP collector that reports each message on
-//! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from. Also the
+//! a channel, [`http_recorder`] for the HTTP sinks, which records each request and answers it by
+//! its index, and the `testdata/tls` fixtures a TLS collector and client are built from. The
+//! attempt-accounting helpers run a sink through the real write loop and compare its counters;
+//! [`HUNG_REQUEST_BUDGET`] is the retry budget for an HTTP request that never answers. Also the
 //! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
 //! [`ScriptedDial`] for the fresh connections `crate::stream`'s driver dials, and [`tls_pair`]
 //! with [`TapIo`] for tests that need real tokio-rustls behavior. [`ScriptedDest`] is the datagram
@@ -730,6 +733,20 @@ const PER_ATTEMPT: [&str; 4] = [
     "logit.component.errors",
     "logit.component.retries",
 ];
+
+/// The retry budget for an HTTP sink's test whose first request never answers, so the budget cuts
+/// the attempt off: 2 s of real time. A paused clock can't stand in, because it runs past the HTTP
+/// client's own timers while socket I/O is in flight.
+///
+/// - Above it, the sink's request timeout (10 s by default: `otlp_out`'s `DEFAULT_TIMEOUT`,
+///   `prometheus_out`'s `DEFAULT_ENDPOINT_TIMEOUT`, `splunk_hec_out`'s `DEFAULT_TIMEOUT`) is 8 s
+///   away, so the budget, not the client, ends the hung request.
+/// - Below it, a loopback connect and write take milliseconds, so the first request is on the wire
+///   and recorded long before the budget ends, and the next batch's request, which gets its own
+///   budget, finishes well inside it on a loaded machine.
+/// - `drive_write_loop`'s ceiling, `RECV_TIMEOUT` (5 s) plus one budget per batch, is 9 s for the
+///   two batches these tests send, above the one cut-off budget and the delivered batch together.
+pub(crate) const HUNG_REQUEST_BUDGET: Duration = Duration::from_secs(2);
 
 /// A write-loop config whose retries take a millisecond.
 pub(crate) fn fast_retry() -> logit_pipeline::WriteLoopConfig {

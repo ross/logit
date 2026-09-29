@@ -1593,6 +1593,8 @@ mod tests {
 
         let (addr, _log) = crate::test_support::http_recorder(|_, _, _| Reply::Hang).await;
         let (registry, out) = metered(addr);
+        // A 100 ms request timeout against a server that never answers. The outcome doesn't depend
+        // on its size: any timeout is `Ambiguous` and counts the bytes; it only bounds the wait.
         let mut out = out.with_timeout(Duration::from_millis(100));
         let err = out.send(&logs(2)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
@@ -1968,7 +1970,7 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_hec(addr, &probe);
         let mut config = fast_retry();
-        config.retry.total_budget = Duration::from_secs(2);
+        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "splunk_hec_out", batches, config)

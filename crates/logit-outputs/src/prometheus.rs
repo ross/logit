@@ -135,7 +135,7 @@
 //! | Outcome | Result |
 //! |---|---|
 //! | 2xx | `Ok` |
-//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied |
+//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied. The status and the first 256 bytes of the response body are in the message and in a throttled `remote_write_rejected` diagnostic, as below, so a retried `503` reports once per attempt |
 //! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange. Under `compression: zstd`, a `415` or `400` also names `compression: snappy` as the likely remedy, since those are the statuses a receiver that doesn't take zstd answers |
 //! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
@@ -2847,7 +2847,7 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_sender(&format!("http://{addr}/api/v1/write"), &probe);
         let mut config = fast_retry();
-        config.retry.total_budget = Duration::from_secs(2);
+        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "prometheus_out", batches, config)

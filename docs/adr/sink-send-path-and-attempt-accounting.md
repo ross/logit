@@ -508,7 +508,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
   and decision 1 says so.
 - `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
 - `logit.output.request.bytes` no longer counts a request whose connection was refused, so on a
-  sink whose destination is down it stops growing while `requests{class="network_error"}` does.
+  sink whose destination is down it stops growing while `requests{class="network_error"}` does:
+  on `splunk_hec_out` as of `sink/w6`, and on `datadog_out` and `datadog_trace_out` from
+  `sink/w7`.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
 - Left open for later workstreams: the HTTP sinks' `requests` vocabulary.
@@ -891,9 +893,9 @@ diag:: retry_counts stdio:: datagram:: runtime::tests graph::tests::a_sinks_buff
   request, so it is encode-side: its `records.dropped{reason="oversize"}` and `oversize`
   diagnostic are skipped when `encode` reports a repeat.
 - **What stays per attempt, on ungated handles**: `requests` and `request.duration` on all three;
-  `samples` and the `remote_write_rejected` diagnostic, which fires on every non-2xx answer, a
-  retried `503` included; `records.rejected` and `otlp_partial_success`; and everything Splunk's
-  answer decides: `records`, `request.bytes`, `requests.rejected`, `acks`, a code 6's
+  `samples` and the `remote_write_rejected` diagnostic, on every non-2xx answer (the fault table
+  in `prometheus_out`'s module doc); `records.rejected` and `otlp_partial_success`; and
+  everything Splunk's answer decides: `records`, `request.bytes`, `requests.rejected`, `acks`, a code 6's
   `records.dropped{reason="invalid_event"}` and resend, Splunk Cloud's oversize answer and split,
   and the `token_rejected`, `request_rejected`, `invalid_event`, and `ack_*` diagnostics. Gating
   them instead would change nothing (the Alternatives' "Gating the sink's own handles too"): the

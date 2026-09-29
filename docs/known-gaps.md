@@ -132,6 +132,21 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`
   does. Nothing shipped is affected. Revisit when a test needs rules on one point to count the same
   hits, say `n`th operations named by their absolute position whatever earlier rules failed.
+- **A test that captures `tracing` output fails under plain `cargo test` beside tests that emit
+  diagnostics.** `splunk::tests::a_code_6_out_of_range_is_diagnosed` installs a thread-local
+  subscriber with `set_default` and asserts the `request_rejected` report reached it.
+  - **Verified:** run as `cargo test -p logit-outputs --lib splunk::tests::`, which runs the
+    module's tests on threads of one process, it failed twice in a row with nothing captured. Run
+    alone, and under `cargo nextest run`, which runs each test in its own process, it passes, so
+    `script/test`, `script/check`, and CI are unaffected.
+  - **Suspected, not verified:** `tracing` caches each callsite's interest process-wide. When
+    another test's thread reaches the `warn!` inside `Diagnostics::warn_throttled` with no
+    subscriber interested, that callsite can be cached as never enabled, and this test's
+    thread-local subscriber then never sees the event. The module's attempt-accounting tests
+    emit more such diagnostics concurrently, which would make the race more likely.
+  - **Revisit:** if a documented script runs `logit-outputs` tests under plain `cargo test`; the
+    fix then is a test that doesn't depend on a thread-local subscriber, such as reading
+    `Diagnostics::occurrences`.
 
 ## Event model and interner
 
