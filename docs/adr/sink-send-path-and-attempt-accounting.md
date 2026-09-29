@@ -513,7 +513,8 @@ zstd frame, which `compression_from_u8` never yields, so the failure is unreacha
   (4096; the largest message this version writes is a 1033-byte `Reject`), not the 64 MiB data
   cap, and `logit_in` reads a `Hello` against the same cap. An over-cap `Hello` header closes the
   connection before any body is read, counted `logit.proto.errors{reason="handshake"}` like any
-  other bad `Hello`. `LogitOutput::observe_batch`'s doc says once per batch.
+  other bad `Hello`. A control frame is never compressed, so both sides cap its compressed length
+  at the same 4096, not lz4's worst case over it. `LogitOutput::observe_batch`'s doc says once per batch.
 
 The tests, in `crates/logit-outputs/src/logit.rs` unless named otherwise:
 
@@ -553,6 +554,8 @@ The tests, in `crates/logit-outputs/src/logit.rs` unless named otherwise:
   `crates/logit-proto/src/native/control.rs`, and in `logit_in`,
   `a_hello_is_bounded_by_the_control_message_cap` (a `Hello` at the cap is answered, and one
   over it is closed on its header; before the fix, the connection waited for the body).
+  `a_hello_whose_compressed_length_is_over_the_control_message_cap_is_refused` pins the
+  compressed-length half.
 - The shared dial: `with_tls_rejects_an_endpoint_with_no_valid_server_name`, and
   `a_tls_logit_output_endpoint_with_no_valid_server_name_fails_startup` in
   `crates/logit-cli/src/pipeline.rs`.
