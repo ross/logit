@@ -249,7 +249,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | findings → #451 |
-| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | in-progress (sink/w4) |
+| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | findings → #453 |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | in-progress (sink/w5) |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
@@ -7370,14 +7370,24 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     `send` reports success and `logit.output.requests{class="ok"}` increments. Deliberate and
     documented (a per-message data condition, not a sink failure — `SyslogOutput::send_udp`'s doc comment), but it
     is the one path where "delivered" and "dropped" are both true for the same batch. High
-    confidence this is intended; worth confirming the counters make it legible.
-  - `is_message_too_large` is duplicated verbatim in four files (`statsd.rs`,
+    confidence this is intended; worth confirming the counters make it legible. **Confirmed
+    (sink/w4, #453):** intended, and legible: every sink counts the drop in its own unit, and
+    `docs/design/internal-telemetry.md`'s oversize table names each. The case that wasn't legible
+    was the `InvalidInput` fallback below, which put whole batches under this path for errors that
+    weren't `EMSGSIZE`.
+  - ~~`is_message_too_large` is duplicated verbatim in four files (`statsd.rs`,
     `syslog.rs`, `graphite.rs`, `collectd.rs`) with a Linux-only errno 90 and an
     `ErrorKind::InvalidInput` fallback; [`docs/known-gaps.md`](../known-gaps.md#udp-intake) already tracks the absence of
     per-errno send accounting (`ENOBUFS` vs `EMSGSIZE` vs `ECONNREFUSED` are one undifferentiated
-    failure). Listed as documented context, not a surprise.
-  - `collectd_out` has **no `flush()` override** (the `impl Output for CollectdOutput` block in `collectd.rs`) — correct for UDP, but it
-    is the only sink in the family that doesn't spell the contract out.
+    failure). Listed as documented context, not a surprise.~~ **Resolved (sink/w4, #453):** one
+    `is_message_too_large` in `crates/logit-outputs/src/datagram.rs` tests `EMSGSIZE` only. The
+    fallback was a real defect: a Unix socket path of 108 bytes or more and a UDP endpoint on port
+    0 each counted every batch `oversize_datagram` under `requests{class="ok"}`. Both are faults
+    now and graph rules 65 and 73 reject them. The per-errno gap stays in `docs/known-gaps.md`,
+    narrowed to the failures other than `EMSGSIZE`.
+  - ~~`collectd_out` has **no `flush()` override** (the `impl Output for CollectdOutput` block in `collectd.rs`) — correct for UDP, but it
+    is the only sink in the family that doesn't spell the contract out.~~ **Resolved (sink/w4,
+    #453):** the `impl` block's doc says why the trait's no-op is right.
 - **Existing coverage:** `statsd.rs` (`udp_packs_several_lines_into_one_newline_separated_datagram`,
   `a_line_that_would_overflow_the_cap_starts_a_new_datagram`,
   `a_single_line_longer_than_max_packet_bytes_is_dropped_whole`,
@@ -7408,6 +7418,44 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   fallback also catches errors that aren't `EMSGSIZE`; `collectd_out` accepts `max_packet_bytes` up
   to 65535 against a 65507-byte UDP payload ceiling; and all four UDP sinks bind `0.0.0.0:0`, so
   an IPv6 endpoint fails `Clean` on every batch.
+- **Verified (sink/w4, #453):** findings; the four UDP sinks and `statsd_out`'s
+  `transport: unix` send through one module, `crates/logit-outputs/src/datagram.rs`
+  (`send_datagrams`, `DatagramDest`, `UnixDest`, `UdpDest`), and every invariant has a test, each
+  shown to fail on a planted bug.
+  - The cap: the packer's check is `len + 1 + entry > cap` on a non-empty buffer, and the
+    proptest `packing_never_exceeds_the_cap_never_splits_an_entry_and_reconciles` asserts every
+    datagram at most the cap, non-empty, with no leading or trailing separator, the datagrams
+    joined by `\n` equal to the entries joined by `\n`, each datagram a run of whole entries, and
+    greedy packing. Planted off-by-one checks in both directions and a separator counted twice
+    each fail it.
+  - An entry over the cap: every encoder caps its entries at the value its sink passes the
+    packer, and the packer has a `debug_assert!` plus a release-build branch that skips and counts
+    such an entry (`an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent`, run
+    in release to reach the branch). `GraphiteOutput::with_encoder` refuses pickle on UDP, the one
+    builder path that could have produced one.
+  - Entries, not `\n` bytes: the scripted destination records the entry count per datagram, and
+    the proptest's entries carry embedded `\n`s, as the negative-gauge pair does.
+  - Resets on every exit: the packer's per-datagram counts are locals reset after each send and
+    the buffer is cleared at the start of each batch. A planted missing reset fails the proptest's
+    reconciliation, and a planted missing clear fails
+    `a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`.
+  - `Clean` only before the first sent datagram, `EMSGSIZE` drops included:
+    `emsgsize_then_a_failure_with_nothing_sent_is_clean` and
+    `sent_then_emsgsize_then_a_failure_is_ambiguous`, plus each sink's partial-send test.
+  - One resolution per batch, `Clean` on failure: `UdpDest::resolve`, shared by the four sinks.
+    It now prefers the first IPv4 address, else the first IPv6 one, over an IPv6 socket bound on
+    first use (`pick_addr_takes_the_first_ipv4_address_else_the_first_ipv6_one` and each sink's
+    `an_ipv6_udp_endpoint_is_delivered`).
+  - A cancelled send: the next send starts from a clean buffer and a Unix destination keeps its
+    connection (`a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`). The
+    counts of what the cancelled send had sent are lost; `docs/known-gaps.md` records it.
+  - Accounting: a failed attempt now counts what it sent (each sink's partial-send test), and
+    each sink's real-`EMSGSIZE` test reconciles sent plus dropped against what was encoded, in the
+    sink's unit. `collectd_out` counts `requests` under the four fault classes.
+  - The 65507 ceiling binds `collectd_out` and the UDP transports of `statsd_out` and
+    `graphite_out`, not statsd's Unix transports; `syslog_out` on UDP caps its encoder at
+    `min(max_message_bytes, 65507)`, so an over-long message is truncated
+    (`a_message_longer_than_a_udp_datagram_is_truncated_to_fit_one`).
 
 ---
 
