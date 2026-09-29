@@ -498,7 +498,8 @@ mod tests {
         let scope = fault::scope(&dir);
         let open = Point::new(sites::FILE_OUT_ACTIVE, Op::Open);
         // Two rules failing their first hit: a rule that fails returns before the next rule sees
-        // the hit, so the second rule's first hit is the second re-open.
+        // the hit, so the second rule's first hit is the second re-open (`docs/known-gaps.md`,
+        // "Pipeline runtime and graph", the `fault` seam entry).
         scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
         let config = WriteLoopConfig {
             retry: RetryConfig {

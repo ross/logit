@@ -122,6 +122,15 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   at the sink. It's a named exception in [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md), decision 1.
   Revisit if a reconciliation shows a sink's `received` short of its producers' `sent` after a
   shutdown with no `closed_consumer` drops.
+- **The `fault` seam's rules on one point don't each see every hit.** `logit_pipeline::fault`
+  (a test-only seam) checks a scope's rules in the order they were added, and a rule that fails
+  an operation returns before any later rule counts it. So
+  `scope.fail_nth(p, 1, E).fail_nth(p, 2, E)` fails only the first operation at `p`: the second
+  rule's first hit is the second operation, which it lets through. A test that wants the first
+  two to fail adds two `fail_nth(p, 1, E)` rules, as
+  `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`
+  does. Nothing shipped is affected. Revisit when a test needs a failure at two hit numbers of
+  one point that aren't consecutive from the first.
 
 ## Event model and interner
 
