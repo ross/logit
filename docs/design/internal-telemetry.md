@@ -1501,7 +1501,9 @@ codec encodes before any bisection, that is once per count-capped request:
 `tags.dropped{reason="no_wire_form"\|"unrepresentable"}` for a stats payload's resource
 attributes, and `stats.degraded{reason="negative_timestamp"}`, once per bucket. `datadog_out`
 never cuts a traces or stats request by count, so these count once per batch there;
-`datadog_trace_out` counts them once per 1,000 traces or stats groups.
+`datadog_trace_out` counts them once per 1,000 traces or stats groups. "Once" is per bucket for
+`negative_timestamp`: on `datadog_out` it counts once for each distinct negative bucket in the
+batch, on `datadog_trace_out` once for each such bucket in each request.
 
 `splunk_hec_out`'s `records.dropped{reason="oversize"}` mixes two classes: an object over
 `max_body_bytes` is dropped before any request and counts once per batch, and a lone object Splunk

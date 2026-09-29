@@ -112,8 +112,8 @@
 //! `oversize` diagnostic. The re-encodes of a bisection count nothing ([`split_encode`]), so an
 //! event's encoder counters (`metrics.degraded`, say) count once per event, at its first encode
 //! (that of the count-capped request it fell in), even within a single attempt; an event the
-//! encoder degraded and the bisection then dropped counts under both. Datadog's 1 MB per-log limit isn't enforced here: the intake truncates such
-//! a log and still accepts it.
+//! encoder degraded and the bisection then dropped counts under both. Datadog's 1 MB per-log
+//! limit isn't enforced here: the intake truncates such a log and still accepts it.
 //!
 //! The series wire limit is the intake's: a 512,180 B gzip body drew `413` ("limit=512 kB"). The
 //! intake enforced none of the others at the sizes tried (distribution points: 1,052,533 B gzip
