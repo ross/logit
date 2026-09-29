@@ -496,7 +496,8 @@ impl SplunkHecOutput {
     }
 
     /// One request, one attempt: the transport half every route shares. A transport error is
-    /// counted and returned with its [`Fault`].
+    /// counted and returned with its [`Fault`]. `request.bytes` counts a request that may have
+    /// left: any answer, and any error but a [`Fault::Clean`] one, which never connected.
     async fn post(
         &mut self,
         route: &'static str,
@@ -516,20 +517,23 @@ impl SplunkHecOutput {
             .send()
             .await;
         timer.stop(&tags);
-        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
         match result {
             Ok(response) => {
+                self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
                 let class = status_class(response.status());
                 self.telemetry.count(REQUESTS, 1.0, &[("route", route), ("class", class)]);
                 Ok(response)
             }
             Err(err) => {
+                let fault = classify_reqwest_error(&err);
+                if fault != Fault::Clean {
+                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                }
                 self.telemetry.count(
                     REQUESTS,
                     1.0,
                     &[("route", route), ("class", "network_error")],
                 );
-                let fault = classify_reqwest_error(&err);
                 Err(anyhow::Error::new(err).context(fault))
             }
         }
@@ -1558,6 +1562,57 @@ mod tests {
             let err = sink(addr).send(&logs(3)).await.unwrap_err();
             assert_eq!(logit_pipeline::classify(&err), fault, "n={n}: {err:#}");
         }
+    }
+
+    // ---- request.bytes ------------------------------------------------------------------------
+
+    /// A refused connection sent nothing, so it counts no `request.bytes`, only its request.
+    #[tokio::test]
+    async fn a_refused_connection_counts_no_request_bytes() {
+        let addr = crate::test_support::refused_addr().await;
+        let (registry, mut out) = metered(addr);
+        let err = out.send(&logs(1)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        let points = registry.drain(0);
+        assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
+        let refused = [("route", "event"), ("class", "network_error")];
+        assert_eq!(total(&points, REQUESTS, &refused), 1.0);
+    }
+
+    /// A request that got an answer counts the body as sent, and so does one that timed out,
+    /// which may have reached Splunk.
+    #[tokio::test]
+    async fn an_answered_or_timed_out_request_counts_its_bytes() {
+        let (addr, log) = accepting().await;
+        let (registry, out) = metered(addr);
+        let mut out = out.with_compression(SplunkCompression::None);
+        out.send(&logs(2)).await.unwrap();
+        let sent = log.lock().unwrap()[0].body.len() as f64;
+        assert_eq!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "event")]), sent);
+
+        let (addr, _log) = crate::test_support::http_recorder(|_, _, _| Reply::Hang).await;
+        let (registry, out) = metered(addr);
+        let mut out = out.with_timeout(Duration::from_millis(100));
+        let err = out.send(&logs(2)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "event")]) > 0.0);
+    }
+
+    /// An `/ack` poll whose connection is refused counts no `request.bytes` on the `ack` route.
+    #[tokio::test]
+    async fn a_refused_ack_poll_counts_no_request_bytes() {
+        let accepted = String::from_utf8(encode_success(Some(1))).unwrap();
+        let (addr, bodies) = answers_once(200, accepted).await;
+        let registry = Registry::new();
+        let mut out = acked_sink(addr, &registry, Duration::from_millis(50));
+        let err = out.send(&logs(1)).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(bodies.lock().unwrap().len(), 1, "the one /event request");
+        let points = registry.drain(0);
+        assert!(total(&points, REQUEST_BYTES, &[("route", "event")]) > 0.0);
+        assert_eq!(total(&points, REQUEST_BYTES, &[("route", "ack")]), 0.0);
+        let refused = [("route", "ack"), ("class", "network_error")];
+        assert!(total(&points, REQUESTS, &refused) >= 1.0, "every poll was refused");
     }
 
     /// A code 6 naming no object of the body is permanent, with a `request_rejected` diagnostic.

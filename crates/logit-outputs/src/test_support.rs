@@ -932,3 +932,11 @@ pub(crate) async fn http_recorder(
     });
     (addr, log)
 }
+
+/// A `127.0.0.1` address nothing listens on: a connect to it is refused.
+pub(crate) async fn refused_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
