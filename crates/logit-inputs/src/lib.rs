@@ -24,6 +24,7 @@ pub mod internal;
 mod listener;
 pub mod logit;
 pub mod otlp;
+mod procstat;
 pub mod prometheus;
 pub mod splunk;
 pub mod statsd;

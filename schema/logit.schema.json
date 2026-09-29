@@ -763,7 +763,7 @@
           ],
           "properties": {
             "interval": {
-              "description": "The drain cadence for every component's buffered points, and the sampling tick for process-level gauges (interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other. `0s` is rejected.",
+              "description": "The drain cadence for every component's buffered points, and the sampling tick for process-level metrics (resident memory, CPU time, threads, open files, interner size, uptime). Should divide evenly into any downstream `aggregate` interval, or the two windows beat against each other. `0s` is rejected.",
               "type": "string"
             },
             "logs": {
