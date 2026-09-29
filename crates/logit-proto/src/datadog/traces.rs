@@ -761,7 +761,7 @@ impl DatadogEncoder {
                 (ATTR_CHUNK_ORIGIN, _) => fields.origin = Some(self.text(value)),
                 (ATTR_CHUNK_DROPPED_TRACE, Value::Bool(b)) => fields.dropped_trace = *b,
                 (ATTR_CHUNK_TAGS, _) => fields.tags = self.str_map(value),
-                // A batch-level carrier: `resource_carriers_lost` counts it once per batch.
+                // A batch-level carrier: `resource_carriers_lost` counts it once per body.
                 _ => {}
             }
         }
@@ -870,10 +870,11 @@ impl DatadogEncoder {
         }
     }
 
-    /// Counts, once per batch, every batch-resource carrier `form` has no field for: the
-    /// `datadog.agent.*` ones below `AgentPayload`, the `datadog.tracer.*` ones below v0.7, and the
-    /// tracer headers' carriers no payload has a field for. With `headers`, the caller sends every
-    /// tracer header as a request header, so no header's carrier is lost.
+    /// Counts, once per call, so once per request body, every batch-resource carrier `form` has
+    /// no field for: the `datadog.agent.*` ones below `AgentPayload`, the `datadog.tracer.*` ones
+    /// below v0.7, and the tracer headers' carriers no payload has a field for. A sender that cuts
+    /// a batch into several requests counts them once per request. With `headers`, the caller
+    /// sends every tracer header as a request header, so no header's carrier is lost.
     pub(super) fn resource_carriers_lost(&self, resource: &Resource, form: Form, headers: bool) {
         let attrs = &resource.attributes;
         let lost_here =
