@@ -2,7 +2,10 @@
 all-features = true
 
 [advisories]
-ignore = []
+ignore = [
+    # `paste` is a compile-time proc-macro pulled in by `tikv-jemalloc-ctl`, ships no runtime code.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # ISC/BSD-3-Clause/CDLA-Permissive-2.0 came in with reqwest's rustls TLS stack (ring, webpki,

@@ -9,9 +9,12 @@
 //! `logit-cli` activates `logit_core::TelemetryLayer` at that threshold (`warn`, the default, or
 //! `error`).
 //!
-//! `interval` is also the sampling tick for this component's own `logit.process.*` gauges, which
-//! no occurrence would ever push.
+//! `interval` is also the sampling tick for the `logit.process.*` metrics (resident memory, CPU
+//! time, threads, open files, interner size, uptime), which no occurrence would ever push. They
+//! ride on this component's own `Telemetry` handle; see `ProcessSampler` and
+//! `docs/design/internal-telemetry.md`'s "Process-level metrics".
 
+use crate::procstat::{self, CpuTicks, Status, Unavailable};
 use crate::Input;
 use logit_core::{
     interner, AttrMap, Diagnostics, EventBatch, Registry, Resource, Scope, Telemetry,
@@ -34,6 +37,7 @@ pub struct InternalInput {
     scope: Arc<Scope>,
     telemetry: Telemetry,
     diag: Diagnostics,
+    process: ProcessSampler,
 }
 
 impl InternalInput {
@@ -51,6 +55,7 @@ impl InternalInput {
             }),
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
+            process: ProcessSampler::new(),
         }
     }
 
@@ -60,9 +65,17 @@ impl InternalInput {
     }
 
     /// This component's own handle, registered in the `Registry` it drains, so its
-    /// `logit.process.*`/`logit.internal.*` points ride along in the next drain.
+    /// `logit.process.*`/`logit.internal.*` points ride along in the next drain. Without one, no
+    /// process-level metric is sampled and no `/proc` file is read.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// The allocator's live heap size in bytes, gauged as `logit.process.memory.allocated.bytes`
+    /// on every tick it returns `Some`. A hook because this crate can't see the global allocator.
+    pub fn with_heap_stats(mut self, f: fn() -> Option<u64>) -> Self {
+        self.process.heap = Some(f);
         self
     }
 }
@@ -120,11 +133,12 @@ impl Input for InternalInput {
 }
 
 impl InternalInput {
-    async fn tick(&self, started: Instant, sink: &Fanout) {
+    async fn tick(&mut self, started: Instant, sink: &Fanout) {
         // Sampled here because nothing else has an occasion to push them. `interner.strings` is
         // the process-wide interner's size, which never shrinks (`interner::len`).
         self.telemetry.gauge("logit.process.interner.strings", interner::len() as f64, &[]);
         self.telemetry.gauge("logit.process.uptime", started.elapsed().as_secs_f64(), &[]);
+        self.process.sample(&self.telemetry, &self.diag);
 
         let drain_timer = self.telemetry.timer("logit.internal.drain.duration");
         let events = self.registry.drain(now_nanos());
@@ -167,6 +181,127 @@ impl InternalInput {
     }
 }
 
+/// A `/proc/self` reader; a field of [`ProcessSampler`] so a test can inject one.
+type Reader<T> = fn() -> Result<T, Unavailable>;
+
+/// Samples the procfs- and allocator-backed `logit.process.*` metrics once per `internal` tick
+/// (`docs/adr/process-level-metrics.md`).
+///
+/// Each of the four procfs sources latches off on its own first failure, with one diagnostic, as
+/// `crate::tcp::AcceptQueueSampler` does: a sandbox that hides one file must not silence the
+/// others. The heap hook is independent of all four.
+struct ProcessSampler {
+    read_status: Reader<Status>,
+    read_cpu: Reader<CpuTicks>,
+    read_fds: Reader<u64>,
+    read_fds_limit: Reader<Option<u64>>,
+    status_enabled: bool,
+    cpu_enabled: bool,
+    fds_enabled: bool,
+    fds_limit_enabled: bool,
+    /// The previous `cpu_ticks` reading. Zero at start, so the first delta is CPU time since
+    /// process start and a cumulative total downstream equals the kernel's counter.
+    last_cpu: CpuTicks,
+    heap: Option<fn() -> Option<u64>>,
+}
+
+impl ProcessSampler {
+    fn new() -> Self {
+        Self {
+            read_status: procstat::status,
+            read_cpu: procstat::cpu_ticks,
+            read_fds: procstat::open_fds,
+            read_fds_limit: procstat::open_files_limit,
+            status_enabled: true,
+            cpu_enabled: true,
+            fds_enabled: true,
+            fds_limit_enabled: true,
+            last_cpu: CpuTicks::default(),
+            heap: None,
+        }
+    }
+
+    /// Gauges are re-emitted every tick because a drain takes the point map. The CPU counter is
+    /// emitted every tick too, a zero delta included: a cumulative `aggregate` evicts a series
+    /// idle for `series_retention` windows, and the restarted total reads downstream as a counter
+    /// reset.
+    fn sample(&mut self, telemetry: &Telemetry, diag: &Diagnostics) {
+        if !telemetry.is_enabled() {
+            return;
+        }
+        if self.status_enabled {
+            match (self.read_status)() {
+                Ok(status) => {
+                    telemetry.gauge(
+                        "logit.process.memory.resident.bytes",
+                        status.resident_bytes as f64,
+                        &[],
+                    );
+                    telemetry.gauge("logit.process.threads", status.threads as f64, &[]);
+                }
+                Err(err) => {
+                    self.status_enabled = false;
+                    report(
+                        diag,
+                        &err,
+                        "/proc/self/status",
+                        "logit.process.memory.resident.bytes and logit.process.threads",
+                    );
+                }
+            }
+        }
+        if self.cpu_enabled {
+            match (self.read_cpu)() {
+                Ok(now) => {
+                    let hz = procstat::USER_HZ as f64;
+                    let user = now.user.saturating_sub(self.last_cpu.user) as f64 / hz;
+                    let system = now.system.saturating_sub(self.last_cpu.system) as f64 / hz;
+                    self.last_cpu = now;
+                    telemetry.count("logit.process.cpu.seconds", user, &[("mode", "user")]);
+                    telemetry.count("logit.process.cpu.seconds", system, &[("mode", "system")]);
+                }
+                Err(err) => {
+                    self.cpu_enabled = false;
+                    report(diag, &err, "/proc/self/stat", "logit.process.cpu.seconds");
+                }
+            }
+        }
+        if self.fds_enabled {
+            match (self.read_fds)() {
+                Ok(fds) => telemetry.gauge("logit.process.fds", fds as f64, &[]),
+                Err(err) => {
+                    self.fds_enabled = false;
+                    report(diag, &err, "/proc/self/fd", "logit.process.fds");
+                }
+            }
+        }
+        if self.fds_limit_enabled {
+            match (self.read_fds_limit)() {
+                Ok(Some(limit)) => telemetry.gauge("logit.process.fds.limit", limit as f64, &[]),
+                Ok(None) => {}
+                Err(err) => {
+                    self.fds_limit_enabled = false;
+                    report(diag, &err, "/proc/self/limits", "logit.process.fds.limit");
+                }
+            }
+        }
+        if let Some(allocated) = self.heap.and_then(|heap| heap()) {
+            telemetry.gauge("logit.process.memory.allocated.bytes", allocated as f64, &[]);
+        }
+    }
+}
+
+/// The one diagnostic a source gets when it latches off: `debug` on a non-Linux build, where the
+/// absence is expected, and `warn` for a failed read on Linux.
+fn report(diag: &Diagnostics, err: &Unavailable, source: &str, metrics: &str) {
+    let message = format_args!("{source} is not available: {err}; {metrics} will not be reported");
+    if matches!(err, Unavailable::NotLinux) {
+        diag.debug(message);
+    } else {
+        diag.warn(message);
+    }
+}
+
 /// Resolves once `shutdown` holds `true`, yielding nothing.
 ///
 /// Exists to keep the `select!` above `Send`, as `#[async_trait]` requires: `wait_for` resolves to
@@ -190,12 +325,14 @@ fn now_nanos() -> i64 {
 mod tests {
     use super::*;
     use logit_core::MetricKind;
+    use logit_pipeline::test_util::Totals;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn a_tick_with_nothing_buffered_sends_nothing() {
         let registry = Registry::new();
-        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry);
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -210,7 +347,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry);
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -232,7 +369,7 @@ mod tests {
     async fn a_tick_samples_its_own_process_level_gauges() {
         let registry = Registry::new();
         let own_telemetry = registry.telemetry_for("self", "internal", "listener");
-        let input =
+        let mut input =
             InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(2);
         let fanout = Fanout::new(vec![tx]);
@@ -252,7 +389,170 @@ mod tests {
             .collect();
         assert!(names.contains(&"logit.process.interner.strings"));
         assert!(names.contains(&"logit.process.uptime"));
+        #[cfg(target_os = "linux")]
+        {
+            let totals = Totals::of(batch.events.clone());
+            for name in [
+                "logit.process.memory.resident.bytes",
+                "logit.process.threads",
+                "logit.process.fds",
+            ] {
+                assert!(totals.gauge(name, &[]).is_some_and(|v| v > 0.0), "{name}");
+            }
+            assert!(totals.has("logit.process.cpu.seconds", &[("mode", "user")]));
+            assert!(totals.has("logit.process.cpu.seconds", &[("mode", "system")]));
+            let limit = procstat::open_files_limit().expect("limits should read on Linux");
+            assert_eq!(totals.gauge("logit.process.fds.limit", &[]).is_some(), limit.is_some());
+        }
         let _ = rx.try_recv(); // drain any second batch, unasserted
+    }
+
+    fn fixed_status() -> Result<Status, Unavailable> {
+        Ok(Status { resident_bytes: 4096, threads: 3 })
+    }
+
+    fn fixed_cpu() -> Result<CpuTicks, Unavailable> {
+        Ok(CpuTicks::default())
+    }
+
+    fn fixed_fds() -> Result<u64, Unavailable> {
+        Ok(10)
+    }
+
+    fn fixed_fds_limit() -> Result<Option<u64>, Unavailable> {
+        Ok(Some(1024))
+    }
+
+    /// A sampler over fixed readers, so a test's values don't depend on the host's `/proc`.
+    fn fixed_sampler() -> ProcessSampler {
+        ProcessSampler {
+            read_status: fixed_status,
+            read_cpu: fixed_cpu,
+            read_fds: fixed_fds,
+            read_fds_limit: fixed_fds_limit,
+            ..ProcessSampler::new()
+        }
+    }
+
+    #[test]
+    fn cpu_seconds_are_the_delta_between_ticks_and_a_zero_delta_is_still_emitted() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn two_readings() -> Result<CpuTicks, Unavailable> {
+            Ok(match CALLS.fetch_add(1, Ordering::Relaxed) {
+                0 => CpuTicks { user: 150, system: 20 },
+                _ => CpuTicks { user: 170, system: 20 },
+            })
+        }
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("self", "internal", "listener");
+        let diag = Diagnostics::default();
+        let mut sampler = ProcessSampler { read_cpu: two_readings, ..fixed_sampler() };
+
+        sampler.sample(&telemetry, &diag);
+        let first = Totals::of(registry.drain(0));
+        assert_eq!(first.sum("logit.process.cpu.seconds", &[("mode", "user")]), 1.5);
+        assert_eq!(first.sum("logit.process.cpu.seconds", &[("mode", "system")]), 0.2);
+
+        sampler.sample(&telemetry, &diag);
+        let second = Totals::of(registry.drain(0));
+        assert!((second.sum("logit.process.cpu.seconds", &[("mode", "user")]) - 0.2).abs() < 1e-9);
+        assert!(
+            second.has("logit.process.cpu.seconds", &[("mode", "system")]),
+            "an idle mode still emits its zero delta"
+        );
+        assert_eq!(second.sum("logit.process.cpu.seconds", &[("mode", "system")]), 0.0);
+    }
+
+    #[test]
+    fn a_failing_source_latches_off_alone_and_is_not_read_again() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn failing_fds() -> Result<u64, Unavailable> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            Err(Unavailable::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))
+        }
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("self", "internal", "listener");
+        let diag = Diagnostics::default();
+        let mut sampler =
+            ProcessSampler { read_fds: failing_fds, heap: Some(|| Some(7)), ..fixed_sampler() };
+
+        for tick in 0..2 {
+            sampler.sample(&telemetry, &diag);
+            let totals = Totals::of(registry.drain(0));
+            assert_eq!(totals.gauge("logit.process.fds", &[]), None, "tick {tick}");
+            assert_eq!(
+                totals.gauge("logit.process.memory.resident.bytes", &[]),
+                Some(4096.0),
+                "tick {tick}"
+            );
+            assert_eq!(totals.gauge("logit.process.threads", &[]), Some(3.0), "tick {tick}");
+            assert_eq!(totals.gauge("logit.process.fds.limit", &[]), Some(1024.0), "tick {tick}");
+            assert!(totals.has("logit.process.cpu.seconds", &[("mode", "user")]), "tick {tick}");
+            assert_eq!(
+                totals.gauge("logit.process.memory.allocated.bytes", &[]),
+                Some(7.0),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1, "a latched source is never read again");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_telemetry_handle_reads_no_process_source() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_status() -> Result<Status, Unavailable> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            fixed_status()
+        }
+        fn counted_cpu() -> Result<CpuTicks, Unavailable> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            fixed_cpu()
+        }
+        fn counted_fds() -> Result<u64, Unavailable> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            fixed_fds()
+        }
+        fn counted_fds_limit() -> Result<Option<u64>, Unavailable> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            fixed_fds_limit()
+        }
+        fn counted_heap() -> Option<u64> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(1)
+        }
+        let mut input = InternalInput::new(Duration::from_millis(1), Registry::new())
+            .with_heap_stats(counted_heap);
+        input.process.read_status = counted_status;
+        input.process.read_cpu = counted_cpu;
+        input.process.read_fds = counted_fds;
+        input.process.read_fds_limit = counted_fds_limit;
+        let (tx, _rx) = mpsc::channel(1);
+
+        input.tick(Instant::now(), &Fanout::new(vec![tx])).await;
+
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_heap_hook_gauges_allocated_bytes_only_when_it_answers() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("self", "internal", "listener");
+        let diag = Diagnostics::default();
+
+        let mut answering = fixed_sampler();
+        answering.heap = InternalInput::new(Duration::from_millis(1), Registry::new())
+            .with_heap_stats(|| Some(42))
+            .process
+            .heap;
+        answering.sample(&telemetry, &diag);
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.gauge("logit.process.memory.allocated.bytes", &[]), Some(42.0));
+
+        let mut silent = ProcessSampler { heap: Some(|| None), ..fixed_sampler() };
+        silent.sample(&telemetry, &diag);
+        let totals = Totals::of(registry.drain(0));
+        assert!(!totals.has("logit.process.memory.allocated.bytes", &[]));
+        assert_eq!(totals.gauge("logit.process.threads", &[]), Some(3.0));
     }
 
     /// OTLP backends read a trace's service name off the root span's resource; with an empty one,
@@ -263,7 +563,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry);
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -286,7 +586,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let input = InternalInput::new(Duration::from_millis(1), registry);
+        let mut input = InternalInput::new(Duration::from_millis(1), registry);
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
 
@@ -309,7 +609,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        let input =
+        let mut input =
             InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
@@ -353,7 +653,7 @@ mod tests {
             None,
         ));
 
-        let input =
+        let mut input =
             InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);
@@ -398,7 +698,7 @@ mod tests {
             tracing::warn!(target: "logit", component = "stat", key = "bad_datagram", "malformed");
         });
 
-        let input =
+        let mut input =
             InternalInput::new(Duration::from_millis(1), registry).with_telemetry(own_telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);

@@ -247,8 +247,10 @@ impl NodeStats {
     }
 }
 
-/// Groups every decoded point by its `component` attribute. Events carrying no `component` (the
-/// process-level `logit.process.*` gauges) are skipped -- they belong to no node.
+/// Groups every decoded point by its `component` attribute; a point with none belongs to no node
+/// and is skipped. Within a row, `fold_metric` counts only the names it matches, so the
+/// `logit.process.*` points, which ride on `internal`'s own identity, leave that row's columns at
+/// zero.
 pub fn aggregate(events: &[Event]) -> BTreeMap<String, NodeStats> {
     let mut nodes: BTreeMap<String, NodeStats> = BTreeMap::new();
     for event in events {
@@ -645,15 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_skips_process_level_points_that_name_no_component() {
-        let mut attrs = AttrMap::new();
-        attrs.insert("host", "any");
-        let events = vec![Event::metric(
-            0,
-            attrs,
-            MetricRecord::new(interner::intern("logit.process.uptime"), MetricKind::Gauge(5.0)),
+    fn aggregate_counts_nothing_for_process_level_points_on_internals_row() {
+        let events = vec![point(
+            "self",
+            "internal",
+            "listener",
+            "logit.process.uptime",
+            MetricKind::Gauge(5.0),
         )];
-        assert!(aggregate(&events).is_empty());
+        let nodes = aggregate(&events);
+        assert_eq!(
+            nodes.get("self"),
+            Some(&NodeStats {
+                kind: "internal".to_string(),
+                role: "listener".to_string(),
+                ..NodeStats::default()
+            })
+        );
     }
 
     #[test]
