@@ -693,8 +693,9 @@ plaintext, backed by a real proof: one `AsyncWriteExt::write` is one `write(2)`,
 zero bytes of that call were accepted and the whole frame can safely be retried on a fresh
 connection. TLS removes that proof. `tokio_rustls`' `poll_write` copies plaintext into the rustls
 session and loops socket writes until one returns `Pending`; it can therefore fail having already
-put complete records — each a run of complete, LF-terminated statsd lines a receiver keeps and
-counts — on the wire. So on TLS this sink does **no** internal reconnect-and-retry, and every
+put complete records on the wire. rustls cuts a record every 16 KiB of plaintext wherever that
+falls, so a record can end mid-line, but every complete, LF-terminated statsd line in what arrived
+is one a receiver keeps and counts. So on TLS this sink does **no** internal reconnect-and-retry, and every
 failure at or after the first application write is `Fault::Ambiguous`; `Fault::Clean` survives only
 for failures inside the dial itself. On plaintext the pre-existing behaviour is unchanged: one
 reconnect-and-retry after a zero-byte failure, `Fault::Clean` if the retry fails too. Given

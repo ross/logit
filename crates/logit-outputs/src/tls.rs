@@ -66,13 +66,19 @@ impl std::fmt::Display for PendingClose {
 /// the peer already closed (`docs/adr/idle-connection-timeout.md`'s "The client-side probe"
 /// section).
 ///
-/// **Why one `poll_read` and not `tokio::time::timeout(stream.read(..))`.** A timed-out read is
-/// cancelled, and on a TLS stream dropping the read future can discard a partial record
-/// `tokio_rustls` already took off the socket, gone from kernel and session both. Behind a
-/// `Box<dyn AsyncStream>` the caller can't tell which kind of stream it has. A `poll_read` that
-/// returns `Pending` has consumed nothing, so [`PendingClose::Open`], the one answer that keeps
-/// the connection, takes nothing off the stream. The answers that may consume bytes
-/// ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both drop the connection.
+/// **One `poll_read`, because the probe must not wait.** The peers these sinks talk to are silent
+/// unless answering, so a healthy connection has nothing to read, and any wait, however short,
+/// would be added to every send. One poll answers from what has already arrived.
+///
+/// **What a `Pending` poll can move.** On a TLS stream, tokio-rustls reads whatever the socket
+/// holds into the session before it answers: part of a record, or whole records that carry no
+/// plaintext (the TLS 1.3 session tickets a server sends after the handshake). `Pending` then
+/// means no plaintext is ready, not that nothing was read. Nothing is lost: the session keeps
+/// those bytes, and [`PendingClose::Open`] keeps the stream and so the session, so a later read
+/// completes the record. A read future dropped mid-record loses nothing either, since the bytes
+/// belong to the session and not to the read call (`crate::stream_pins` pins both). The answers
+/// that may take plaintext off the stream ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both
+/// drop the connection.
 ///
 /// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works like a `&mut TcpStream`.
 ///
@@ -89,6 +95,9 @@ pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
             Poll::Pending => Poll::Ready(PendingClose::Open),
             Poll::Ready(Ok(())) if read_buf.filled().is_empty() => Poll::Ready(PendingClose::Eof),
             Poll::Ready(Ok(())) => Poll::Ready(PendingClose::Bytes(read_buf.filled().len())),
+            // A reset, a TLS peer closing without `close_notify` (`UnexpectedEof`), or a bad
+            // record all leave nothing worth writing to, and a transient error costs one
+            // reconnect with nothing written.
             Poll::Ready(Err(_)) => Poll::Ready(PendingClose::Eof),
         }
     })

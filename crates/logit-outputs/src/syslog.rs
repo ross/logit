@@ -1387,9 +1387,11 @@ impl SyslogOutput {
     /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the session, then writes to
     ///   the socket until it returns `Pending`, and returns `Ok(n)` with finished records still
     ///   queued in userspace: `Ok` proves only that the session took the bytes, and `flush` makes
-    ///   them the kernel's. A failing `poll_write` may already have completed socket writes
-    ///   (rustls fragments at 16 KiB, and each record is a complete octet-counted message a
-    ///   receiver keeps), so `Err` never proves zero bytes. So on TLS: no internal retry, no
+    ///   them the kernel's. A failing `poll_write` may already have completed socket writes, and
+    ///   each whole record among them decrypts at the peer. rustls cuts a record every 16 KiB of
+    ///   plaintext regardless of message boundaries, so a record can end mid-message, but every
+    ///   complete octet-counted message in what arrived is one a receiver keeps. `Err` never
+    ///   proves zero bytes. So on TLS: no internal retry, no
     ///   resend once an application write has been attempted, every such failure is
     ///   `Fault::Ambiguous`, and `Fault::Clean` is left only for [`TcpDial::connect`] failures,
     ///   which precede every byte of the frame.
