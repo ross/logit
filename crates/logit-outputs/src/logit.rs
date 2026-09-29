@@ -10,7 +10,9 @@
 //! rather than leaving `self.stream` partway through a frame.
 //!
 //! **Lazy connect.** `LogitOutput::new` never touches the network: a peer that isn't up yet is
-//! not a config error. A failed connection is dropped; the next `send` reconnects.
+//! not a config error. A failed connection is dropped; the next `send` reconnects. The dial is
+//! `crate::stream::connect`, shared with the pooled line sinks; the handshake after it is this
+//! module's.
 //!
 //! **Fault classification.** A fault says what the peer can hold, and `logit_in` holds a batch
 //! only once it has read the whole frame and checked its CRC: it has no partial decode, and it
@@ -62,16 +64,12 @@ use crate::Output;
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
-use logit_pipeline::{classify, BatchContext, Fault};
+use logit_pipeline::{BatchContext, Fault};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, control};
-use rustls_pki_types::ServerName;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 
 /// Bounds the TCP connect, the TLS handshake, the `HelloAck` wait, the ack wait, and the shutdown
 /// in `Output::flush`, each separately. The `Hello` and data-frame writes and flushes have only
@@ -81,9 +79,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `crate::tls::TlsClientSettings`, re-exported to match `crate::otlp`'s path.
 pub use crate::tls::TlsClientSettings;
 
-// Shared by every raw-TCP sink: `AsyncStream` erases plain-or-TLS, `host_only` derives the SNI
-// name from a bare `host:port`.
-use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
+// Shared with the pooled line sinks: the dial (`crate::stream`), the plain-or-TLS stream
+// erasure, and the probe of a reused connection.
+use crate::stream::{count_request, Dial, Target, TlsTarget};
+use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
 
 /// A live, handshaken connection.
 struct Conn {
@@ -106,7 +105,7 @@ pub struct LogitOutput {
     /// Offered in `Hello`; [`Conn::compression`] may still be `None`.
     compression: Compression,
     timeout: Duration,
-    tls: Option<Arc<rustls::ClientConfig>>,
+    tls: Option<TlsTarget>,
     diag: Diagnostics,
     telemetry: Telemetry,
     stream: Option<Conn>,
@@ -149,6 +148,8 @@ impl LogitOutput {
     /// Turns on TLS (`tls:` in config). Presence alone turns it on: `endpoint` is a bare
     /// `host:port` with no scheme to select it, unlike `otlp_out`. Warns when
     /// `insecure_skip_verify` is set, as `TlsClientConfig::insecure_skip_verify`'s doc promises.
+    /// Errors when the endpoint's host is no valid TLS server name (`TlsTarget::new`), so a bad
+    /// endpoint fails startup and not every batch.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
@@ -160,7 +161,8 @@ impl LogitOutput {
                  output will accept any certificate the peer presents, self-signed or otherwise",
             );
         }
-        self.tls = Some(Arc::new(crate::tls::build_client_config(settings, base_dir)?));
+        let config = crate::tls::build_client_config(settings, base_dir)?;
+        self.tls = Some(TlsTarget::new("logit_out", &self.endpoint, config)?);
         Ok(self)
     }
 
@@ -180,36 +182,16 @@ impl LogitOutput {
         self.handshake(stream).await
     }
 
-    /// Connects, then performs the TLS handshake if configured, each bounded by `self.timeout`.
-    ///
-    /// `&mut self` because `&LogitOutput` isn't `Send`: its pooled stream isn't `Sync`.
+    /// The shared dial (`crate::stream::connect`): a TCP connect and, with TLS, a handshake, each
+    /// bounded by `self.timeout`, every failure `Fault::Clean`. `&mut self` because
+    /// `&LogitOutput` isn't `Send`: its pooled stream isn't `Sync`.
     async fn dial(&mut self) -> anyhow::Result<Box<dyn AsyncStream>> {
-        let tcp = tokio::time::timeout(self.timeout, TcpStream::connect(&self.endpoint))
-            .await
-            .context("connecting to logit_out endpoint timed out")
-            .and_then(|r| r.context("connecting to logit_out endpoint"))
-            .context(Fault::Clean)?;
-
-        let stream: Box<dyn AsyncStream> = match &self.tls {
-            Some(cfg) => {
-                let host = host_only(&self.endpoint);
-                let server_name = ServerName::try_from(host.to_string())
-                    .map_err(|e| {
-                        anyhow::anyhow!("logit_out: invalid TLS server name {host:?}: {e}")
-                    })
-                    .context(Fault::Clean)?;
-                let connector = TlsConnector::from(cfg.clone());
-                let tls_stream =
-                    tokio::time::timeout(self.timeout, connector.connect(server_name, tcp))
-                        .await
-                        .context("TLS handshake with logit_in endpoint timed out")
-                        .and_then(|r| r.context("TLS handshake with logit_in endpoint"))
-                        .context(Fault::Clean)?;
-                Box::new(tls_stream)
-            }
-            None => Box::new(tcp),
+        let dial = Dial {
+            target: Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() },
+            connect_timeout: self.timeout,
+            sink: "logit_out",
         };
-        Ok(stream)
+        crate::stream::connect(&dial).await
     }
 
     /// `Hello`/`HelloAck` over a dialed `stream`. The `HelloAck` wait is bounded by
@@ -327,14 +309,6 @@ fn compression_tag(compression: Compression) -> &'static str {
         Compression::None => "none",
         Compression::Lz4 => "lz4",
         Compression::Zstd => "zstd",
-    }
-}
-
-fn fault_tag(fault: Fault) -> &'static str {
-    match fault {
-        Fault::Clean => "clean",
-        Fault::Ambiguous => "ambiguous",
-        Fault::Permanent => "permanent",
     }
 }
 
@@ -515,11 +489,7 @@ impl Output for LogitOutput {
 
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
-        let class = match &result {
-            Ok(()) => "ok",
-            Err(err) => fault_tag(classify(err)),
-        };
-        self.telemetry.count("logit.output.requests", 1.0, &[("class", class)]);
+        count_request(&self.telemetry, &result);
         result
     }
 
@@ -633,6 +603,7 @@ mod tests {
     use logit_pipeline::{
         classify, is_explicitly_permanent, is_retryable, DeliveryPosture, Fanout,
     };
+    use rustls_pki_types::ServerName;
     use std::sync::{Arc, Mutex};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
@@ -1008,7 +979,7 @@ mod tests {
         assert_eq!(requests(totals), ([1.0, 0.0, 1.0, 0.0], 2.0));
     }
 
-    // ---- close_notify ----------------------------------------------------------------------------
+    // ---- close_notify ------------------------------------------------------------------------
 
     /// `flush` runs once after the last batch, and shuts the pooled connection down: under TLS
     /// that sends `close_notify`, which the peer reads as a clean close. Dropped without it, the
@@ -1779,8 +1750,8 @@ mod tests {
     }
 
     /// A TLS write returns with ciphertext still queued in the session, and a waiting ack read
-    /// never sends it (`crate::stream_pins`). A frame larger than the socket can take at once reaches
-    /// the peer only through the flush after it; without one the peer never holds the frame, the
+    /// never sends it (`crate::stream_pins`). A frame larger than the socket can take at once
+    /// reaches the peer only through the flush after it; without one the peer never holds the frame, the
     /// ack wait times out `Ambiguous`, and at-most-once drops a batch the peer never received.
     #[tokio::test]
     async fn a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait() {
@@ -1985,6 +1956,24 @@ mod tests {
             .expect("refused on the header, before any body")
             .unwrap_err();
         assert!(err.to_string().contains("control message cap"), "{err:#}");
+    }
+
+    /// A TLS endpoint whose host is no valid server name fails at construction, naming the
+    /// endpoint, rather than failing every batch; an IP literal is a valid name.
+    #[test]
+    fn with_tls_rejects_an_endpoint_with_no_valid_server_name() {
+        for endpoint in ["[fe80::1%eth0]:5140", ":5140"] {
+            let err = LogitOutput::new(endpoint)
+                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .err()
+                .expect(endpoint);
+            assert!(err.to_string().contains(endpoint), "{err}");
+        }
+        for endpoint in ["127.0.0.1:5140", "[::1]:5140", "central.example.com:5140"] {
+            LogitOutput::new(endpoint)
+                .with_tls(&TlsClientSettings::default(), &testdata_dir())
+                .unwrap_or_else(|err| panic!("{endpoint}: {err}"));
+        }
     }
 
     // -- `with_tls`'s `insecure_skip_verify` warning -------------------------------------------
