@@ -37,7 +37,8 @@ pub use resource::{Resource, Scope};
 pub use sketch::{Bin, Mapping, MappingKind, SketchDecodeError, SketchStats};
 pub use span::{SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord, SpanStatus};
 pub use telemetry::{
-    trace_is_sampled, Registry, SpanGuard, Tag, Telemetry, TelemetryLayer, DEFAULT_SPAN_SAMPLE_RATE,
+    trace_is_sampled, CountGate, Registry, SpanGuard, Tag, Telemetry, TelemetryLayer,
+    DEFAULT_SPAN_SAMPLE_RATE,
 };
 pub use time::{
     format_rfc3339_utc, parse_decimal_nanos, parse_rfc3339_to_nanos, write_rfc3339_utc,

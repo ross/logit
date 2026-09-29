@@ -20,7 +20,7 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,16 +108,69 @@ impl PointKey {
     }
 }
 
+/// A switch that mutes the [`Telemetry::count`] calls, and the [`crate::Diagnostics`] warnings,
+/// of every handle built over it with [`Telemetry::gated`] or [`crate::Diagnostics::gated`].
+///
+/// A sink holds one and mutes its encoder's handles while it re-encodes a batch an earlier
+/// attempt already counted, so an encode-side counter counts once per batch however many
+/// attempts the runtime makes (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2).
+/// `Clone` shares the switch.
+#[derive(Clone, Debug, Default)]
+pub struct CountGate(Arc<AtomicBool>);
+
+impl CountGate {
+    /// An unmuted gate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.0.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// One component's telemetry handle; `Clone` is an `Arc` bump. [`Telemetry::default`] is the
 /// disabled handle, on which every method is a no-op that doesn't even read the clock.
+///
+/// A handle from [`Telemetry::gated`] shares its buffer with the original and drops `count`
+/// calls while its [`CountGate`] is muted. Only `count`: a gauge is last-write-wins, so a repeat
+/// changes nothing, and a timing or span measures an attempt, not the batch.
 #[derive(Clone, Debug, Default)]
-pub struct Telemetry(Option<Arc<ComponentBuffer>>);
+pub struct Telemetry {
+    buf: Option<Arc<ComponentBuffer>>,
+    /// Never state in [`ComponentBuffer`]: the runtime and every ungated handle share that.
+    gate: Option<CountGate>,
+}
 
 impl Telemetry {
+    fn live(buf: Arc<ComponentBuffer>) -> Self {
+        Self { buf: Some(buf), gate: None }
+    }
+
+    /// A handle over the same buffer whose `count` calls, and the diagnostics of a
+    /// [`crate::Diagnostics`] built over it, go quiet while `gate` is muted. Replaces any gate
+    /// `self` had; `self` is unchanged. Works on a disabled handle, so a
+    /// [`crate::Diagnostics`] over it is still muted when there's no `internal` component.
+    pub fn gated(&self, gate: &CountGate) -> Telemetry {
+        Self { buf: self.buf.clone(), gate: Some(gate.clone()) }
+    }
+
+    /// Whether this handle's gate is muted; `false` for a handle with no gate.
+    pub fn is_muted(&self) -> bool {
+        self.gate.as_ref().is_some_and(CountGate::is_muted)
+    }
+
     /// Adds `n` to a counter, summed per `(name, tags)` until the next drain and emitted as
-    /// [`MetricKind::counter`].
+    /// [`MetricKind::counter`]. A no-op while this handle's gate is muted.
     pub fn count(&self, name: &'static str, n: f64, tags: &[Tag]) {
-        let Some(buf) = &self.0 else { return };
+        let Some(buf) = &self.buf else { return };
+        if self.is_muted() {
+            return;
+        }
         buf.upsert(
             name,
             tags,
@@ -131,14 +184,14 @@ impl Telemetry {
 
     /// Sets a gauge, last write wins per `(name, tags)` until the next drain.
     pub fn gauge(&self, name: &'static str, v: f64, tags: &[Tag]) {
-        let Some(buf) = &self.0 else { return };
+        let Some(buf) = &self.buf else { return };
         buf.upsert(name, tags, || Pending::Gauge(v), |p| *p = Pending::Gauge(v));
     }
 
     /// Records one duration in seconds, sketched per `(name, tags)` until the next drain and
     /// emitted as `MetricKind::Distribution`.
     pub fn timing(&self, name: &'static str, d: Duration, tags: &[Tag]) {
-        let Some(buf) = &self.0 else { return };
+        let Some(buf) = &self.buf else { return };
         let secs = d.as_secs_f64();
         buf.upsert(
             name,
@@ -162,12 +215,12 @@ impl Telemetry {
     /// A guard that records one `timing` sample for `name` when dropped (or via [`Timer::stop`]).
     /// A disabled handle's timer never reads the clock, so timing a hot path is free.
     pub fn timer(&self, name: &'static str) -> Timer {
-        Timer { telemetry: self.clone(), name, start: self.0.as_ref().map(|_| Instant::now()) }
+        Timer { telemetry: self.clone(), name, start: self.buf.as_ref().map(|_| Instant::now()) }
     }
 
     /// Whether this handle is live, so a caller can skip building tags or values that aren't free.
     pub fn is_enabled(&self) -> bool {
-        self.0.is_some()
+        self.buf.is_some()
     }
 
     /// Opens a span for this component's visit to one unit of work (per node kind, see
@@ -187,12 +240,12 @@ impl Telemetry {
         span_id: [u8; 8],
         parent_span_id: Option<[u8; 8]>,
     ) -> SpanGuard {
-        let Some(buf) = &self.0 else { return SpanGuard::disabled() };
+        let Some(buf) = &self.buf else { return SpanGuard::disabled() };
         if !trace_is_sampled(&trace_id, buf.span_sample_rate) {
             return SpanGuard::disabled();
         }
         SpanGuard {
-            telemetry: Telemetry(Some(buf.clone())),
+            telemetry: Telemetry::live(buf.clone()),
             span: Some(PendingSpan {
                 start: now_unix_nanos(),
                 started_at: Instant::now(),
@@ -387,7 +440,7 @@ impl SpanGuard {
 
     fn finish_inner(&mut self) {
         let Some(mut span) = self.span.take() else { return };
-        let Some(buf) = self.telemetry.0.as_ref() else { return };
+        let Some(buf) = self.telemetry.buf.as_ref() else { return };
         // Never a second wall-clock read (see `PendingSpan::started_at`). Saturates rather than
         // wrapping negative past ~292 years.
         let elapsed_nanos = span.started_at.elapsed().as_nanos().min(i64::MAX as u128) as i64;
@@ -658,11 +711,11 @@ impl Registry {
     pub fn telemetry_for(&self, id: &str, kind: &'static str, role: &'static str) -> Telemetry {
         let mut buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = buffers.iter().find(|buf| buf.id == id) {
-            return Telemetry(Some(existing.clone()));
+            return Telemetry::live(existing.clone());
         }
         let buf = Arc::new(ComponentBuffer::new(id.to_string(), kind, role, self.span_sample_rate));
         buffers.push(buf.clone());
-        Telemetry(Some(buf))
+        Telemetry::live(buf)
     }
 
     /// Pushes `log` into `component_id`'s buffer, for `TelemetryLayer::on_event`. A no-op for an
@@ -838,6 +891,78 @@ mod tests {
         telemetry.gauge("x", 1.0, &[]);
         telemetry.timing("x", Duration::from_secs(1), &[]);
         drop(telemetry.timer("y"));
+    }
+
+    /// The sum of every `Sum` point named `name` in `events`.
+    fn summed(events: &[Event], name: &str) -> f64 {
+        events
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| crate::interner::resolve(m.name) == name)
+            .map(|m| match &m.kind {
+                MetricKind::Sum(s) => s.value,
+                other => panic!("expected Sum, got {other:?}"),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_gated_handle_counts_into_the_buffer_its_original_counts_into() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "statsd_out", "sink");
+        let gated = telemetry.gated(&CountGate::new());
+        telemetry.count("x", 1.0, &[]);
+        gated.count("x", 2.0, &[]);
+
+        let events = registry.drain(0);
+        assert_eq!(events.len(), 1, "one key in one buffer, not a second buffer");
+        assert_eq!(summed(&events, "x"), 3.0);
+    }
+
+    #[test]
+    fn a_muted_gate_mutes_only_the_handles_built_over_it() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "statsd_out", "sink");
+        let (muted, open) = (CountGate::new(), CountGate::new());
+        let silenced = telemetry.gated(&muted);
+        let clone_of_silenced = silenced.clone();
+        let other = telemetry.gated(&open);
+        muted.set_muted(true);
+
+        assert!(silenced.is_muted() && clone_of_silenced.is_muted());
+        assert!(!telemetry.is_muted(), "the ungated original has no gate");
+        assert!(!other.is_muted());
+        silenced.count("x", 1.0, &[]);
+        clone_of_silenced.count("x", 10.0, &[]);
+        telemetry.count("x", 100.0, &[]);
+        other.count("x", 1000.0, &[]);
+        assert_eq!(summed(&registry.drain(0), "x"), 1100.0);
+
+        muted.set_muted(false);
+        silenced.count("x", 1.0, &[]);
+        assert_eq!(summed(&registry.drain(0), "x"), 1.0, "unmuted, the handle counts again");
+    }
+
+    #[test]
+    fn a_muted_gate_leaves_gauges_and_timings_alone() {
+        let registry = Registry::new();
+        let gate = CountGate::new();
+        let gated = registry.telemetry_for("out", "statsd_out", "sink").gated(&gate);
+        gate.set_muted(true);
+        gated.gauge("g", 4.0, &[]);
+        gated.timing("t", Duration::from_millis(1), &[]);
+        assert_eq!(registry.drain(0).len(), 2);
+    }
+
+    #[test]
+    fn a_disabled_handle_can_be_gated_and_stays_disabled() {
+        let gate = CountGate::new();
+        let gated = Telemetry::default().gated(&gate);
+        assert!(!gated.is_enabled());
+        assert!(!gated.is_muted());
+        gate.set_muted(true);
+        assert!(gated.is_muted(), "a disabled handle still carries its gate");
+        gated.count("x", 1.0, &[]);
     }
 
     #[test]
