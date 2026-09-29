@@ -60,7 +60,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
-| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | in progress (sink/w5): confirmed for every sink, and `datadog_out` also reads its clock per attempt; encode-side counters will count once per batch through a sink-owned gate, and server-verdict drops still repeat per attempt |
+| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | Partly done (sink/w5): confirmed for every sink. `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, and `influxdb_out` count encode-side counters once per batch through a gate `observe_batch` arms; `stdio_out`/`file_out` count after the write. The HTTP sinks, and `datadog_out`'s per-attempt clock, are `sink/w6`'s. Server-verdict and kernel drops still repeat per attempt |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
@@ -126,7 +126,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    manual `logrotate` run
    ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
-6. **Sink send path (in progress: `sink/w0`–`w6`)** — SINK-01..06, WIRE-08/09, RT-05. One shared
+6. **Sink send path (in progress: `sink/w0`–`w7`)** — SINK-01..06, WIRE-08/09, RT-05. One shared
    pooled-stream driver and datagram packer for the copied send paths, fault injection against
    them and against real TLS pairs (RST mid-write, blackhole, a stalled handshake, a partial
    record under a `Pending` poll), and attempt accounting that counts encode-side drops once per
@@ -250,7 +250,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | findings → #451 |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | findings → #453 |
-| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | in-progress (sink/w5) |
+| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | findings → sink/w5 |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs` (`serve_connection`) | unreviewed |
@@ -267,7 +267,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | reviewed @510291b1 |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
-| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | in-progress (sink/w5) |
+| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | findings → sink/w5 |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | findings → #403 |
 | [RT-08](#rt-08--run_transform-flush-deadline-race-close-time-flush-and-cadence-math) | P1 | `run_transform`: flush-deadline race, close-time flush, and cadence math | `runtime.rs` (`run_transform`, `run_flush`, `advance_flush_deadline`) | unreviewed |
@@ -311,7 +311,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
-| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w5) |
+| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w6); line, datagram, InfluxDB, and file sinks → sink/w5 |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
@@ -3467,6 +3467,23 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   `buffer.retry_max_delay` as `RetryConfig::max_delay`, and `backoff_for` ends in
   `backoff.min(retry.max_delay)`, so it returns zero for every attempt and `deliver_with_retry`
   loops until the budget ends. A zero `retry_budget` is unvalidated too.
+- **Verified (sink/w5):** findings. Graph rule 15 rejects `buffer.retry_budget: 0s` and
+  `buffer.retry_max_delay: 0s` on a sink
+  (`a_sinks_buffer_with_a_zero_retry_budget_is_rejected`,
+  `a_sinks_buffer_with_a_zero_retry_max_delay_is_rejected`), and `deliver_with_retry`
+  `debug_assert!`s both nonzero. No floor in `backoff_for`: a `retry_max_delay` below 200 ms is a
+  valid cap. The invariants, each with a test shown to fail on a planted bug:
+  - `backoff_for` over `base > max`, `base == max`, and attempts 1, 2, 128, and `u32::MAX`,
+    including a base that saturates `Duration`
+    (`backoff_for_doubles_from_base_and_is_capped_at_max_for_every_attempt`; an uncapped return
+    fails it).
+  - One `send.duration` sample per attempt, one `errors` per failed attempt, and one `retries` per
+    attempt that another follows, over `Clean`, `Ambiguous`, and `Permanent` outcomes and both
+    postures (`every_attempt_records_one_send_duration_sample_and_every_retry_one_error`; a
+    cancelled timer and a retry counted on a drop each fail it).
+  - An attempt the budget cuts off is `Ambiguous` and ends exactly at the budget
+    (`an_attempt_cut_off_by_the_budget_is_ambiguous`, paused clock; `Clean` fails it).
+  - `attempt` uses `saturating_add`, so it can't wrap even past `u32::MAX` attempts.
 
 ---
 
@@ -7522,6 +7539,20 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `splunk_hec_out` and `datadog_out` (in the module doc). `statsd_out`, `syslog_out`,
   `graphite_out`, `collectd_out`, `logit_out`, `influxdb_out`, `prometheus_out`, and `null_out` don't
   mention it.
+- **Verified (sink/w5):** findings, all prose. The `Output` trait now says:
+  - `observe_batch` runs once per batch, before its first attempt, and is where a sink resets
+    per-batch state; a sink with encode-side counters arms its accounting there.
+  - `send` is one attempt, cancellable at every await, with a synchronous encode and a `Fault` on
+    failure.
+  - "A sink never runs its own retry loop" allows a bounded, verdict-driven resend inside one
+    attempt, naming the two there are: the stream driver's one plaintext reconnect and
+    `splunk_hec_out`'s code-6 resend.
+  - `flush` runs once when the sink's input has closed, which on a grace expiry with a disk buffer
+    isn't after every batch was delivered.
+  - Every `duplicate_safe` doc on the eight sinks above names the `buffer.delivery` override.
+  `send_batch`'s doc and the allocation test that called it `run_output`'s per-batch body are
+  corrected: it calls no `observe_batch`. The cancellation harness this entry suggested exists per
+  sink since `sink/w2` and `sink/w4` (the dropped-`send` tests in `stream.rs` and `datagram.rs`).
 
 ---
 
@@ -7573,6 +7604,30 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   is per batch. The trait doc and `LogitOutput`'s field doc say it runs before each attempt and
   are wrong. A once-per-batch hook is what lets a sink reset a gate there, and the retry-counter
   question is settled that way in the ADR.
+- **Verified (sink/w5), for the line, datagram, InfluxDB, and file sinks:** findings. The inflation
+  was real in all five encoding sinks: with the gate never armed, a batch delivered on its second
+  attempt read every encode-side counter and diagnostic twice (`batch.bytes`, the drop and
+  normalization counters, and `logit.component.diagnostics`). The fix
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 2) is a `CountGate` in `logit_core::Telemetry`: `observe_batch` arms it, an encode
+  that repeats one the batch already counted runs muted, and the sink skips its own encode-side
+  counts on a repeat. Each sink gives its encoder gated handles and keeps ungated ones for its
+  transport counters. Each sink and transport has a test that runs a batch through the real
+  `write_loop` (`drive_write_loop`) with a first attempt that fails `Clean`, against a
+  single-attempt run: `statsd_out` over UDP, `unix`, TCP, and `unix_stream`, `syslog_out` and
+  `graphite_out` over UDP and TCP, `collectd_out`, and `influxdb_out` (a `503`, then a `204`). A
+  second batch, a batch after one the budget cut off, and direct `send`s with no
+  `observe_batch` all count normally.
+  - `stdio_out`/`file_out` had a sibling defect: `StreamOutput::send` counted `batch.bytes` and
+    noted the size before a write whose re-open could fail `Clean`, so a retry counted both twice
+    and rotated early, and a rotation whose re-open failed never counted in `file.rotations`. Both
+    count after the write now
+    (`a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`).
+  - The cancelled-attempt asymmetry stays as documented: a cancelled attempt's encode-side counts
+    stand (the batch's one count), and it counts no `requests`.
+  - Still open, `sink/w6`: `otlp_out`, `prometheus_out`'s remote-write mode, `datadog_out`,
+    `datadog_trace_out`, and `splunk_hec_out` count their encode-side counters per attempt
+    (`docs/known-gaps.md`), and `datadog_out` reads its clock per attempt.
 
 ---
 

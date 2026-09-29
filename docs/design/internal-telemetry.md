@@ -1467,10 +1467,27 @@ The datagram sinks count an oversize drop at one of two points, and in each sink
 | `logit.output.metrics.skipped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
 | `logit.output.metrics.skipped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
 
-An encoder-side drop counts once per encode of a batch. `oversize_datagram` is the kernel's verdict
-on one attempt ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
-decision 1), so a retried batch counts it again. `crates/logit-outputs/src/datagram.rs`'s module
-doc has the send side's rules.
+A sink counter falls in one of three classes
+([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `influxdb_out`,
+`stdio_out`, and `file_out`:
+
+| Class | Counts | Counters |
+|---|---|---|
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out` and `collectd_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`); `file.rotations`; and every `logit.component.diagnostics` count an encoder emits |
+| Transport | once per attempt | `requests`, `request.duration`, `reconnects`, and what the attempt sent: `messages`, `datagrams`, `datapoints` |
+| Kernel verdict | once per attempt the kernel refuses a datagram | `messages.dropped{reason="oversize_datagram"}` from `EMSGSIZE` |
+
+The five sinks with encoders count the first class through a gate `Output::observe_batch` arms
+(`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
+delivered the batch. A caller that sends without `observe_batch` counts every `send`. The HTTP
+sinks (`otlp_out`, `prometheus_out`'s remote-write, `datadog_out`, `datadog_trace_out`,
+`splunk_hec_out`) still count their encode-side counters once per attempt (`docs/known-gaps.md`).
+
+`oversize_datagram` mixes two classes under one reason. The packer's skip of an entry over the cap,
+a release-build backstop no encoder reaches, is encode-side and counts once per batch; the kernel's
+`EMSGSIZE` counts on every attempt, so a batch retried after a later failure counts it again.
+`crates/logit-outputs/src/datagram.rs`'s module doc has the send side's rules.
 
 The same four sinks, and `statsd_out` under `transport: unix`, count `logit.output.messages`,
 `logit.output.datagrams`, and `graphite_out`'s `logit.output.datapoints` for every datagram the
@@ -1499,9 +1516,11 @@ transport the same counters count only a delivered frame.
 `StreamOutput`, `crates/logit-outputs/src/stdio.rs`. Both are built on the same sink (ADR
 `rotating-file-output`).
 
-- `logit.output.batch.bytes`, matching `influxdb_out`'s. A write error propagates as a hard failure,
-  with no `warn_throttled` call site to bridge.
-- `file_out` rotation only: `logit.output.file.rotations` (count, one per successful rotation) and,
+- `logit.output.batch.bytes`, matching `influxdb_out`'s, counted once the batch is written, so a
+  retried batch counts once. A write error propagates as a hard failure, with no `warn_throttled`
+  call site to bridge.
+- `file_out` rotation only: `logit.output.file.rotations` (count, one per rotation whose rename
+  committed, including one whose re-open then failed and was retried) and,
   through `Diagnostics::warn_throttled`,
   `logit.component.diagnostics{key="rotate_failure"|"retention_failure"}`
   (`crates/logit-outputs/src/file.rs::FileTarget::rotate`). `rotate_failure` means the rotation

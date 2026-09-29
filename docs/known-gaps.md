@@ -614,6 +614,14 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 on a UDP socket because a datagram is
   charged and uncharged inside one `sendmsg`, so a send-buffer gauge would be a flat zero. It was
   deliberately not built; `SockMeminfo` carries the field only because the option returns it.
+- **The HTTP sinks count their encode-side counters once per attempt.** `otlp_out`,
+  `prometheus_out`'s remote-write mode, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`
+  re-encode a batch on every attempt and count its drops, normalizations, and diagnostics each
+  time, so on an unhealthy destination those counters grow with the retries. The line, datagram,
+  InfluxDB, and file sinks count them once per batch
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 2); `sink/w6` brings the HTTP sinks onto the same gate, with per-route units for the
+  two Datadog sinks and `datadog_out`'s per-batch clock.
 - **A cancelled datagram send loses the counts of what it already sent.** A UDP sink, or
   `statsd_out` under `transport: unix`, counts `logit.output.messages` and
   `logit.output.datagrams` (and `graphite_out`'s `datapoints`) once `send_datagrams` returns, on

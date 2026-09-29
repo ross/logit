@@ -237,7 +237,10 @@ in this section. To make the queue survive a restart, see [Durable buffering](#d
 A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
 
 - **A retryable failure** (per the sink's fault classification and delivery posture) is retried
-  within `retry_budget` (60s by default), then the batch is dropped and counted.
+  within `retry_budget` (60s by default), then the batch is dropped and counted. The backoff
+  between attempts starts at 200ms and doubles up to `retry_max_delay` (10s by default).
+  `logit validate` rejects `retry_budget: 0s` and `retry_max_delay: 0s`: the first times every
+  attempt out before it starts, and the second retries with no pause until the budget ends.
 - **A non-retryable failure**, including retry-budget exhaustion, drops the batch, counts it, and
   logs a throttled warning. The writer moves on to the next batch; the rest of the pipeline and
   every other sink keep running.
@@ -285,6 +288,16 @@ buffering:
   (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
+- **A retried batch doesn't inflate a sink's drop counters.** On `statsd_out`, `syslog_out`,
+  `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, and `file_out`, what the encoder
+  decided (`logit.output.messages.dropped`, `tags.dropped`, `*.normalized`, `batch.bytes`, and
+  their diagnostics) counts once per batch, however many attempts it took. What an attempt did
+  (`logit.output.requests`, `reconnects`, `messages`) counts per attempt, and so does a datagram the
+  kernel refused (`oversize_datagram`). The HTTP sinks still count their encode-side drops once per
+  attempt, so on an unhealthy `otlp_out`, `prometheus_out`, `datadog_out`, `datadog_trace_out`, or
+  `splunk_hec_out` those counters grow with retries
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 1).
 
 ### Durable buffering
 

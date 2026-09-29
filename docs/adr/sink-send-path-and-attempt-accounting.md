@@ -92,17 +92,35 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
-2. **A sink-owned gate makes encode-side counters count once per batch.**
-   - `Output::observe_batch`, which `write_loop` calls once per batch before its retry loop,
-     resets a gate the sink owns.
-   - The sink closes the gate after the first encode of each unit. A unit is a batch, or a route
-     for `datadog_out` and `datadog_trace_out`, which encode each route lazily and can encode one
-     route after an await that another attempt already passed.
-   - Codecs count through a gated view of `Telemetry`. While the gate is closed, the view drops
-     `count` calls and skips the diagnostic throttle bump, so a repeated warning doesn't advance
-     the throttle's window for an attempt that reports nothing.
-   - The gate defaults to open. A caller of `send` that never calls `observe_batch` (a unit test,
-     a tool) sees today's behavior.
+2. **A gate in `Telemetry`, armed once per batch, makes encode-side counters count once per
+   batch.** (Amended by `sink/w5`: an armed gate in `Telemetry`, not a sink-owned one that
+   defaults open.)
+   - `logit_core::CountGate` is a shared switch. `Telemetry::gated` and `Diagnostics::gated`
+     build a new handle over the same buffer and the same throttle. While the gate is muted, the
+     gated `Telemetry` drops `count` calls, and the gated `Diagnostics::warn_throttled` returns
+     before it counts or bumps the throttle, so the next unmuted report is numbered as if the
+     muted ones never happened. A gauge or timing isn't gated: a gauge is last-write-wins, and a
+     timing measures an attempt. The gate attaches to a disabled handle too, so the throttle is
+     muted when the config has no `internal` component.
+   - The gate is never state in `ComponentBuffer`: the runtime holds a clone of the same handle,
+     and every ungated handle shares the buffer.
+   - Each sink holds a `BatchAccounting` (`crates/logit-outputs/src/accounting.rs`) and two sets
+     of handles. Its encoder gets views gated by the sink's gate, in every builder order. The sink
+     keeps the ungated originals for its transport counters (`requests`, `request.duration`,
+     `reconnects`, `messages`, `datagrams`, `datapoints`) and for kernel and peer verdicts
+     (`oversize_datagram` from `EMSGSIZE`).
+   - `Output::observe_batch`, which `write_loop` calls once per batch before the batch's first
+     attempt, arms the gate and clears the units counted. Each encode runs as a synchronous
+     closure through `BatchAccounting::encode(unit, ..)`: an encode of a unit the armed batch has
+     already encoded runs muted, and the gate unmutes when the closure returns, so nothing awaits
+     while it's muted. An `Ok` send disarms the gate.
+   - An unarmed gate never mutes. A caller of `send` that never calls `observe_batch` (a unit
+     test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted.
+   - The encode-side counts a sink emits itself (`statsd_out`'s and `syslog_out`'s `EncodeStats`,
+     `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`, the datagram packer's
+     over-cap skip) are skipped when `encode` reports a repeat.
+   - A unit is a batch, or a route for `datadog_out` and `datadog_trace_out`, which encode each
+     route lazily and can encode one route after an await that another attempt already passed.
    - `Output` gains no method and no parameter.
 
    The bisection in `split_encode` (`crates/logit-outputs/src/http.rs`), which `datadog_out` and
@@ -286,10 +304,13 @@ nature. The encode-side counters are the only ones that measure the batch and no
      stream driver, `logit_out`, and the datagram sinks. `collectd_out` counts through it, which
      completes decision 4.
 10. **Config validation rejects the values that make retry spin or a bad endpoint retry forever.**
-    - A graph rule rejects `retry_budget: 0s` and `retry_max_delay: 0s`, as the graph does for
-      other durations where zero breaks the component. `backoff_for` isn't floored at
-      `base_delay`: a floor would override a `retry_max_delay` an operator set below 200 ms,
-      which is a valid choice.
+    - Graph rule 15, which already rejects a zero `buffer.max_batches` or `buffer.max_bytes` on a
+      sink, rejects `buffer.retry_budget: 0s` and `buffer.retry_max_delay: 0s`, as the graph does
+      for other durations where zero breaks the component. A zero budget times every attempt out
+      before it starts; a zero delay retries with no pause until the budget ends.
+      `deliver_with_retry` `debug_assert!`s both are nonzero and counts attempts with
+      `saturating_add`. `backoff_for` isn't floored at `base_delay`: a floor would override a
+      `retry_max_delay` an operator set below 200 ms, which is a valid choice.
     - Each TLS sink parses the endpoint's server name once, in `with_tls`, and stores the
       parsed target. A bad endpoint fails startup, not every batch. If a name
       still fails to parse at the send path, the fallback classification is `Fault::Permanent`,
@@ -309,7 +330,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
     disconnect reached `logit_in` as `UnexpectedEof`, which `serve_connection` returned as an
     error and the accept loop logged as `connection_error`; the listener's clean-close path was
     unreachable under TLS.
-    - `Output::flush`, which `run_output` calls once after the last batch, shuts the pooled
+    - `Output::flush`, which `run_output` calls once when the sink stops, shuts the pooled
       connection down within the sink's `request_timeout` and drops it. The shutdown sends
       `close_notify` under TLS and a FIN under both. A failure isn't reported, since every frame
       on a pooled connection was acked.
@@ -320,8 +341,26 @@ nature. The encode-side counters are the only ones that measure the batch and no
       header stays an error and counts `logit.proto.errors{reason="truncated_header"}`, which
       was uncounted; part-way through a body it stays `reason="truncated"`.
 
+13. **`stdio_out` and `file_out` count a batch's bytes after its write.** `StreamOutput::send`
+    counts `logit.output.batch.bytes` and calls `FileTarget::note_written` once the write and
+    flush succeeded, not before. A re-open after a rotation can fail `Fault::Clean`, which
+    retries, so counting first counted the batch once per attempt and grew the size the rotation
+    policy tracks, rotating the next file early. `logit.output.file.rotations` counts a rotation
+    whose commit-point rename landed even when the re-open after it fails
+    (`FileTarget::awaiting_reopen`). `StreamOutput` needs no gate: its encoders count nothing.
+
 ## Alternatives considered
 
+- **A gate that defaults open and closes after the first encode.** Rejected. A caller that never
+  calls `observe_batch` (a test, a tool, `send_batch`) would find it closed after its first
+  `send` and count nothing for every later batch. Arming it in `observe_batch` and never muting an
+  unarmed one keeps such a caller on today's behavior.
+- **The gate in `ComponentBuffer`.** Rejected. The runtime and every ungated handle of the
+  component share that buffer, so muting it would mute the transport counters and the runtime's
+  own counts with the codec's.
+- **Gating the sink's own handles too.** Not needed: the gate is muted only inside the encode
+  closure, where a sink counts nothing, so a sink's transport counters would read the same through
+  a gated handle. The sinks keep ungated handles so that holds without reasoning about timing.
 - **A runtime-set attempt number on the component's `Telemetry` handle, with encode-side counts
   muted after attempt 1.** Rejected. It loses counts wherever encoding follows an await:
   `datadog_out` and `datadog_trace_out` encode per route, lazily, so a route first encoded on
@@ -373,10 +412,13 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
 - One pooled-stream driver and one datagram packer replace three and two copies. A fix to a fault
   arm or to packing lands once, and each driver test covers three sinks.
-- A sink with encode-side counters owns a gate and closes it after each unit's first encode. A
-  new sink or codec that counts encode-side must count through the gated view. A test that runs
-  a sink through `write_loop` with a first attempt that fails `Clean` must match the counters of
-  a single-attempt run, and each sink gets one.
+- A sink with encode-side counters owns a `BatchAccounting`, arms it in `observe_batch`, and runs
+  every encode through it. A new sink or codec that counts encode-side must count through the gated
+  view, or skip its own counts on a repeat encode. A test that runs a sink through `write_loop`
+  (`logit_pipeline::test_util::drive_write_loop`) with a first attempt that fails `Clean` must
+  match the counters of a single-attempt run, and each sink gets one.
+- `Telemetry` grows from one pointer to two words, and `Telemetry::count` on a gated handle pays one
+  relaxed atomic load. No allocation pin moves.
 - `logit.output.requests` gains the classes `clean`, `ambiguous`, and `permanent` on the line
   sinks and `collectd_out`, and loses `error`. A dashboard or alert on `class="error"` needs to
   change. This is a pre-release break with no alias.
@@ -704,13 +746,63 @@ graphite:: collectd:: graph::`.
 
 ### `sink/w5`: attempt accounting and backoff (SINK-05, SINK-06, RT-05)
 
-`sink/w5` lands decisions 1 to 3 in `crates/logit-pipeline/src/runtime.rs` and every sink: the
-gate, the gated `Telemetry` view, `datadog_out`'s per-batch `now`, and the graph rule from
-decision 10. It corrects the `Output::observe_batch` doc and the `duplicate_safe` docs that omit
-the `buffer.delivery` override.
+`sink/w5` lands decisions 1 and 2 for `statsd_out`, `syslog_out`, `graphite_out`,
+`collectd_out`, and `influxdb_out`, decision 13 for `stdio_out` and `file_out`, and decision 10's
+graph rule. The multi-request HTTP sinks wait for `sink/w6`.
 
-### `sink/w6`: close-out
+- **The gate.** `CountGate`, `Telemetry::gated`/`is_muted`, and `Diagnostics::gated` in
+  `logit-core`; `BatchAccounting` in `crates/logit-outputs/src/accounting.rs`. The five sinks
+  override `observe_batch`, run their encode through `BatchAccounting::encode`, hand their encoder
+  gated views in every builder order, and keep ungated handles. `null_out`, `logit_out`, and
+  `prometheus_out` count nothing encode-side that a retry repeats, and have no gate.
+- **The packer.** `datagram::Report::count_local_drops` carries the batch's first-encode flag, so
+  the over-cap skip counts once per batch while `EMSGSIZE` counts per attempt. Both keep the reason
+  `oversize_datagram`.
+- **`StreamOutput`.** Decision 13.
+- **The runtime.** Rule 15 rejects the two zero durations; `deliver_with_retry` asserts them
+  nonzero and saturates its attempt count. `logit_pipeline::test_util::drive_write_loop` runs the
+  real `write_loop`, with its `observe_batch` call site, over a sink and a Registry-backed handle.
+- **Docs.** The `Output` trait: `observe_batch` once per batch, `send`'s contract (one attempt,
+  cancellable at every await, a synchronous encode, a `Fault` on failure), the bounded
+  verdict-driven resend inside one attempt, and `flush` on a grace expiry. Every `duplicate_safe`
+  doc names the `buffer.delivery` override.
+- **Tests**, each shown to fail on a planted bug:
+  - `accounting::tests`: an unarmed gate never mutes, a repeat of a unit is muted, `observe`
+    resets, `delivered` disarms, and units are independent. `telemetry::tests` and `diag::tests`:
+    a gated handle shares the buffer and the throttle, a gate mutes only the handles built over it,
+    a disabled handle can be gated, and a muted `warn_throttled` leaves no trace in the throttle.
+  - Per sink and transport, a batch with encode-side drops, normalizations, and a diagnostic,
+    delivered on its second attempt through `drive_write_loop`, against a single-attempt run of
+    the same batch: every series but `requests`, `reconnects`, `component.errors`, and
+    `component.retries` must match, and the transport counters show both attempts.
+    `statsd::tests::a_{udp,unix_datagram,tcp,unix_stream}_retry_counts_encode_side_counters_once`,
+    `syslog::tests::a_{udp,tcp}_retry_...`, `graphite::tests::a_{udp,tcp}_retry_...` and
+    `an_encoder_installed_after_the_handles_counts_encode_side_once_too`,
+    `collectd::tests::a_retry_counts_encode_side_counters_once` (the stream sinks' first attempt
+    is a refused `ScriptedDial`, the datagram sinks' a failing `ScriptedDest`), and
+    `influxdb::tests::a_retry_counts_encode_side_counters_once` (a `503`, then a `204`). With the
+    gate never armed, every one reads each encode-side counter and diagnostic twice.
+  - `statsd::tests`: a second batch through the loop counts again, a batch after one the budget
+    cut off counts, and direct `send`s with no `observe_batch` count every time.
+  - `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`,
+    over the `fault` seam.
+  - `datagram::tests::a_repeat_encode_skips_an_over_cap_entry_uncounted_and_counts_an_emsgsize`
+    (release builds; a debug build stops at the `debug_assert!`, as its neighbour does).
+  - `runtime::tests`: `backoff_for_doubles_from_base_and_is_capped_at_max_for_every_attempt`,
+    `every_attempt_records_one_send_duration_sample_and_every_retry_one_error`, and
+    `an_attempt_cut_off_by_the_budget_is_ambiguous`; `graph::tests`'s two zero-duration rejects.
 
-`sink/w6` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
+Run them with `script/test -p logit-core -p logit-outputs -p logit-pipeline accounting:: telemetry::
+diag:: retry_counts stdio:: datagram:: runtime::tests graph::tests::a_sinks_buffer`.
+
+### `sink/w6`: the multi-request HTTP sinks
+
+`sink/w6` lands decisions 2 and 3 for `otlp_out`, `prometheus_out`'s remote-write mode,
+`datadog_out`, `datadog_trace_out`, and `splunk_hec_out`: per-route units and `split_encode`'s
+bisection for the two Datadog sinks, and `datadog_out`'s per-batch `now`.
+
+### `sink/w7`: close-out
+
+`sink/w7` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
 `write_all` on the pooled sinks and the datagram loop, updates `docs/known-gaps.md`,
 `docs/design/internal-telemetry.md`, and `docs/deploying.md`, and closes the inventory rows.

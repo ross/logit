@@ -313,8 +313,19 @@ batch uncommitted under either posture.
 ## Amendment: attempt accounting (2026-09-29)
 
 This record says `send` is one attempt and the runtime owns retry. [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) adds what that means for
-counters. Encode-side counters count once per batch, through a sink-owned gate that
-`Output::observe_batch` resets, and transport counters count once per attempt. Server-verdict
-drops count per attempt and repeat on a retried batch. `Output::observe_batch` runs once per
-batch, not once per attempt. Zero `retry_budget` and `retry_max_delay` values are rejected at
-config load. `Output` gains no method and no parameter.
+counters. Encode-side counters count once per batch, through a gate `Output::observe_batch` arms,
+and transport counters count once per attempt. Server-verdict drops count per attempt and repeat
+on a retried batch. `Output::observe_batch` runs once per batch, not once per attempt. A sink's
+zero `buffer.retry_budget` or `buffer.retry_max_delay` fails config validation (graph rule 15),
+so `logit validate` and `logit run` both reject it. `Output` gains no method and no parameter.
+
+## Amendment: once-per-batch counting (2026-09-29)
+
+`sink/w5` lands the counting above for `statsd_out`, `syslog_out`, `graphite_out`,
+`collectd_out`, `influxdb_out`, `stdio_out`, and `file_out`, and graph rule 15's two zero-duration
+rejects ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decisions 2, 10, and 13). The gate lives in `logit_core::Telemetry`, armed by `observe_batch`, and
+mutes only during an encode that repeats one an earlier attempt at the batch already counted; an
+unarmed gate never mutes, so a caller that never calls `observe_batch` counts every `send`. The
+multi-request HTTP sinks follow in `sink/w6`, and until then count their encode-side counters once
+per attempt (`docs/known-gaps.md`).
