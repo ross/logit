@@ -74,6 +74,12 @@
 //! A `buffer.disk:` replaying after a long outage therefore sends only what is still inside these
 //! windows. Anything older is counted `stale` and dropped at replay time, not delivered late.
 //!
+//! The send time is read once per batch, in `observe_batch`, and every attempt at the batch
+//! measures from it: staleness isn't monotonic in the clock (a point too far ahead becomes fresh),
+//! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
+//! clears it; a `send` with no `observe_batch` reads the clock itself. A batch retried for
+//! `retry_budget` can send a point up to that long past its window.
+//!
 //! The series window is the documented one, and stricter than the intake, which stored older
 //! points in a trial-org run (`docs/plans/datadog-relay.md`, "Verification"). That plan's
 //! "Timestamp windows" section has what the intake stored and how it treats a point too far ahead.
@@ -557,6 +563,9 @@ pub struct DatadogOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
+    /// reaches the same stale verdict; cleared by an `Ok`. `None` reads the clock per `send`.
+    batch_now: Option<i64>,
     /// [`now_nanos`], or a test's scripted clock.
     clock: Clock,
     /// Replaces every route's [`Route::caps`], so a test can bisect a small body.
@@ -588,6 +597,7 @@ impl DatadogOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
+            batch_now: None,
             clock: Box::new(now_nanos),
             #[cfg(test)]
             caps_override: None,
@@ -799,10 +809,13 @@ impl DatadogOutput {
         Ok(())
     }
 
-    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). An `Ok` disarms the batch
-    /// accounting, a batch that sent nothing included.
+    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). An `Ok` clears the batch's
+    /// send time and disarms the batch accounting, a batch that sent nothing included.
     async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let result = self.attempt(batch, now).await;
+        if result.is_ok() {
+            self.batch_now = None;
+        }
         self.accounting.finish(result)
     }
 
@@ -907,15 +920,18 @@ impl DatadogOutput {
 
 #[async_trait::async_trait]
 impl Output for DatadogOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
+    /// Arms this sink's batch accounting (`crate::accounting`) and fixes the batch's send time,
+    /// so every attempt at it reaches the same stale verdict (module doc's "What is never sent").
     fn observe_batch(&mut self, _ctx: BatchContext) {
         self.accounting.observe();
+        self.batch_now = Some((self.clock)());
     }
 
     /// One request per route the batch needs, sequentially; the first failure aborts the rest
-    /// (module doc's "Faults, retries, and duplicate safety").
+    /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one
+    /// `observe_batch` fixed, or the clock's when nothing armed the batch.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let now = (self.clock)();
+        let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
     }
 
@@ -1594,6 +1610,7 @@ mod tests {
     use logit_core::{Sum, Temporality};
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SERIES: &str = "/api/v2/series";
     const LOGS: &str = "/api/v2/logs";
@@ -1834,6 +1851,71 @@ mod tests {
             ("logit.component.diagnostics", &[("key", "oversize")]),
         ];
         assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
+    /// A scripted clock reading `t0` first and `t0 + 2 min` on every later read, and a count of
+    /// its reads.
+    fn stepping_clock(t0: i64) -> (impl Fn() -> i64 + Send + Sync + 'static, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let clock = move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                t0
+            } else {
+                t0 + 2 * MINUTE
+            }
+        };
+        (clock, reads)
+    }
+
+    /// The gauges each series body sent, by timestamp.
+    fn series_points(log: &[Recorded]) -> Vec<Vec<i64>> {
+        bodies(log, SERIES)
+            .iter()
+            .map(|body| {
+                let series = DatadogDecoder::new().decode_series_v2_protobuf(body, NOW).unwrap();
+                series.events.iter().map(|e| e.timestamp).collect()
+            })
+            .collect()
+    }
+
+    /// A point 11 minutes ahead of the batch's send time is stale there, and fresh 2 minutes
+    /// later. The send time is read once per batch, so every attempt drops it: it is never sent,
+    /// and its `stale` drop counts once.
+    #[tokio::test]
+    async fn a_point_stale_at_the_batchs_send_time_is_dropped_on_every_attempt() {
+        let (clock, reads) = stepping_clock(NOW);
+        let ahead = NOW + 11 * MINUTE;
+        let b = batch(vec![gauge(NOW), gauge(ahead)]);
+        let build = |addr, probe: &TelemetryProbe| instrumented(addr, probe).with_clock(clock);
+        let (sums, log) = run_dd(busy_once, vec![b], at_least_once(), build).await;
+
+        assert_eq!(series_points(&log), [vec![NOW], vec![NOW]], "the ahead point is never sent");
+        assert_eq!(
+            sum_of(&sums, RECORDS_DROPPED, &[("route", "series"), ("reason", "stale")]),
+            1.0
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one read for the batch");
+    }
+
+    /// An `Ok` clears the batch's send time: a later `send` with no `observe_batch` reads the
+    /// clock again, so a point stale at the delivered batch's time and fresh at its own is sent.
+    #[tokio::test]
+    async fn a_direct_send_after_a_delivered_batch_reads_the_clock_again() {
+        let (clock, reads) = stepping_clock(NOW);
+        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe).with_clock(clock);
+        let batches = vec![batch(vec![gauge(NOW)])];
+        sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, fast_retry())
+            .await;
+        let ahead = NOW + 11 * MINUTE;
+        output.send(&batch(vec![gauge(ahead)])).await.unwrap();
+
+        let log = log.lock().unwrap().clone();
+        assert_eq!(series_points(&log), [vec![NOW], vec![ahead]]);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
     }
 
     /// The gate re-arms per batch: a second batch counts as the first did.
