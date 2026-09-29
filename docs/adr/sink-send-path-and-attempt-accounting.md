@@ -211,8 +211,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - `poll_flush` drives that queue to the socket.
    - A `poll_read` that processes its records cleanly drives no writes, so a reader waiting for
      a reply doesn't push out an unflushed request.
-   - A `poll_read` that fails on a bad record makes one last-gasp write for the alert, which
-     sends queued ciphertext first, and then returns `ErrorKind::InvalidData`.
+   - A `poll_read` whose record processing fails (a bad record, or a peer's fatal alert) makes
+     one last-gasp write for the alert, which sends queued ciphertext first, and then returns an
+     error (`ErrorKind::InvalidData` for a bad record).
    - A `Pending` `poll_read` can move a partial record into the session. The session keeps it,
      and a later read completes the record.
    - Dropping a read future loses nothing the session already holds.
@@ -415,6 +416,67 @@ rustls, or tokio re-runs `stream_pins` and re-reads the functions each test name
 `sink/w2` lands decision 5's driver in `crates/logit-outputs/src/stream.rs`, moves `statsd_out`,
 `syslog_out`, and `graphite_out` onto it, and lands decision 4's counter classes and decision
 10's server-name parsing for those sinks.
+
+- **The driver.** `PooledStream::send(&Dial, frame, telemetry)` and `PooledStream::flush`, with a
+  free `connect(&Dial)` that counts nothing, for `logit_out` to share in `sink/w3`. A caller
+  builds its frame into its own buffer (statsd's LF lines or `unix_stream` length prefixes,
+  syslog's octet counting, graphite's lines or pickle frames) and counts its own messages and
+  datapoints. `stream.rs`'s module doc lists the fault rules. The three `send_tcp` copies, both
+  `TcpDial` copies, and graphite's `connect` are gone. `transport: unix` keeps its own
+  reconnect-once datagram path and its own `has_connected_once`.
+- **What an operator sees change.**
+  - `logit.output.requests` on the three sinks is `class=ok|clean|ambiguous|permanent` on every
+    transport, one per attempt that returns. `class="error"` is gone. A failed connect or handshake
+    counts `clean`; an empty batch counts nothing. `collectd_out` keeps `ok|error` until `sink/w4`.
+  - `graphite_out` flushes before it calls a TCP batch delivered, counts
+    `logit.output.reconnects`, and holds a `Box<dyn AsyncStream>`. It still has no `tls:` option.
+  - `with_tls` on `statsd_out` and `syslog_out` parses the endpoint's server name once, into a
+    `TlsTarget`. A host that is neither an IP literal nor a DNS name (an empty host, a scoped IPv6
+    literal such as `[fe80::1%eth0]:514`) fails startup with an error naming the component and the
+    endpoint. The send path no longer parses a name, so it has no `Permanent` fallback to take.
+  - Dial errors name the sink and the endpoint or socket path.
+- **Driver tests** (`stream::tests`), each asserting the `Fault`, what reached the peer, the pool
+  afterwards, and the counters through `TelemetryProbe`:
+  - the dial: `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`,
+    `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout` (a peer that
+    accepts TCP and never answers the ClientHello, the handshake timed out on a paused clock),
+    and `a_tls_target_needs_a_server_name_in_the_endpoint_host`;
+  - the probe: `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives` and
+    `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, where
+    the redialed connection's first write fails and the one retry still delivers;
+  - write faults: `a_plaintext_first_write_error_is_retried_once_then_clean`,
+    `a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`,
+    `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`,
+    `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`, and
+    `a_real_reset_mid_frame_is_ambiguous` (a loopback RST inside `write_all` of a 32 MiB frame);
+  - TLS over a real tokio-rustls pair: `a_tls_write_error_is_ambiguous_and_never_retried` and
+    `a_tls_send_returns_only_once_the_peer_can_read_the_whole_frame` (a 100 000-byte frame over a
+    4096-byte pipe);
+  - cancellation: `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`,
+    `a_send_dropped_while_dialing_leaves_the_pool_empty`, and
+    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`. The probe itself never
+    suspends, so there is no await inside it to drop at;
+  - bounds and accounting: `one_send_dials_at_most_the_probe_redial_and_one_retry` (a table over
+    every probe answer, plaintext and TLS) and
+    `reconnects_count_every_successful_dial_after_the_first`;
+  - Unix streams: `unix_stream_redials_after_the_peer_closes_a_pooled_connection`,
+    `unix_stream_retries_a_first_write_the_peer_refused` (the peer's `SHUT_RD` makes the first
+    write fail with `EPIPE`), and `unix_stream_dial_failures_are_clean`.
+
+  `ScriptedDial` in `test_support.rs` hands the driver scripted fresh connections, including one
+  that never completes, and counts dials.
+- **Per-sink wiring tests.**
+  `statsd::tests::the_stream_transports_report_their_counts_through_the_driver`
+  (TCP and `unix_stream`), `syslog::tests::tcp_and_tls_report_their_counts_through_the_driver`,
+  `graphite::tests::plaintext_and_pickle_over_tcp_report_their_own_counts`,
+  `graphite::tests::tcp_counts_every_connect_after_the_first_as_a_reconnect`,
+  `graphite::tests::a_tcp_batch_is_flushed_before_it_is_reported_delivered`,
+  `with_tls_rejects_an_endpoint_with_no_valid_server_name` in `statsd` and `syslog`, and
+  `logit-cli`'s `a_tls_statsd_output_endpoint_with_no_valid_server_name_fails_startup`. The tests
+  that called `send_tcp` directly keep their names and now drive each sink's `send` with a
+  `FakeStream` pooled behind the driver.
+
+Run them with `script/test -p logit-outputs stream:: statsd:: syslog:: graphite::`.
 
 ### `sink/w3`: `logit_out` (WIRE-08)
 

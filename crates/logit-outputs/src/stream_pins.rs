@@ -64,8 +64,8 @@ async fn a_tls_write_returns_ok_with_ciphertext_still_queued_in_the_session() {
 
 /// tokio-rustls `common/mod.rs`, `Stream::poll_fill_buf` and `Stream::read_io`: a read that
 /// processes its records cleanly calls only `read_io`, so a reader waiting for a reply doesn't
-/// push out an unflushed request, even with room in the socket for it. The exception, a read that
-/// fails on a bad record, is pinned by the next test.
+/// push out an unflushed request, even with room in the socket for it. The exception, a read whose
+/// record processing fails, is pinned by the next test.
 #[tokio::test]
 async fn a_tls_read_that_succeeds_leaves_queued_ciphertext_queued() {
     unconstrained(async {

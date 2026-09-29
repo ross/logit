@@ -1,7 +1,8 @@
 //! Receivers that sink tests send to: a TCP, TLS, or UDP collector that reports each message on
 //! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from. Also the
-//! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam, and
-//! [`tls_pair`] with [`TapIo`] for tests that need real tokio-rustls behavior.
+//! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
+//! [`ScriptedDial`] for the fresh connections `crate::stream`'s driver dials, and [`tls_pair`]
+//! with [`TapIo`] for tests that need real tokio-rustls behavior.
 //!
 //! A [`Collector`] message depends on how it reads:
 //!
@@ -366,6 +367,60 @@ impl AsyncRead for FakeStream {
                 bytes.drain(..n);
                 Poll::Ready(Ok(()))
             }
+        }
+    }
+}
+
+/// Connections handed out in order by `crate::stream::connect` for a
+/// `crate::stream::Target::Scripted` dial, so a driver test scripts each fresh connection's
+/// behavior and counts the dials.
+pub(crate) struct ScriptedDial {
+    steps: Mutex<std::collections::VecDeque<DialStep>>,
+    dials: AtomicUsize,
+    tls: bool,
+}
+
+/// What one scripted dial does.
+pub(crate) enum DialStep {
+    /// Succeeds with this connection.
+    Connect(Box<dyn crate::tls::AsyncStream>),
+    /// Fails `Fault::Clean`, as a refused connect does.
+    Refuse,
+    /// Never completes, as a dial to a blackholed peer.
+    Hang,
+}
+
+impl ScriptedDial {
+    /// A plaintext dial (`tls: false`) or one the driver treats as TLS. An exhausted script
+    /// refuses.
+    pub(crate) fn new(tls: bool, steps: impl IntoIterator<Item = DialStep>) -> Self {
+        Self { steps: Mutex::new(steps.into_iter().collect()), dials: AtomicUsize::new(0), tls }
+    }
+
+    pub(crate) fn is_tls(&self) -> bool {
+        self.tls
+    }
+
+    /// Dials started, including one still hanging.
+    pub(crate) fn dials(&self) -> usize {
+        self.dials.load(Ordering::SeqCst)
+    }
+
+    /// Scripted steps not yet used.
+    pub(crate) fn unused(&self) -> usize {
+        self.steps.lock().unwrap().len()
+    }
+
+    pub(crate) async fn connect(&self) -> anyhow::Result<Box<dyn crate::tls::AsyncStream>> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
+        let step = self.steps.lock().unwrap().pop_front();
+        match step {
+            Some(DialStep::Connect(stream)) => Ok(stream),
+            Some(DialStep::Refuse) | None => {
+                Err(anyhow::anyhow!("scripted connect refused")
+                    .context(logit_pipeline::Fault::Clean))
+            }
+            Some(DialStep::Hang) => std::future::pending().await,
         }
     }
 }

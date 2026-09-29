@@ -1497,9 +1497,12 @@ data loss.
 
 `crates/logit-outputs/src/syslog.rs`.
 
-- `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `influxdb_out`'s shape, minus the HTTP status
-  classes, because there's no response to classify.
+- `logit.output.batch.bytes` and `logit.output.request.duration`: `influxdb_out`'s shape.
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count): one per attempt
+  that returns, on both transports, tagged with the attempt's `Fault` class
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 4). A failed connect or TLS handshake is an attempt and counts `clean`; an attempt the
+  runtime cancels counts nothing. There's no HTTP status to classify.
 - `logit.output.messages` (count): messages sent.
 - `logit.output.events.skipped`: events with no `log` record, so nothing to render as a syslog
   message (ADR `multi-payload-events`).
@@ -1512,9 +1515,9 @@ data loss.
   PARAM-NAME to value; the opt-in element colliding with an SD-ID the event already carries.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
-  TLS (RFC 5425) connections alike, because both take the same connect path
-  ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). UDP is connectionless
-  and never reports it.
+  TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
+  `statsd_out` and `graphite_out` share (`crates/logit-outputs/src/stream.rs`). A failed connect
+  doesn't count. UDP is connectionless and never reports it.
 
 `Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`, and
 `oversize_header`, mirroring the counters above.
@@ -1524,7 +1527,8 @@ data loss.
 `crates/logit-outputs/src/statsd.rs`, `docs/adr/statsd-output.md`.
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `syslog_out`'s shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  every transport.
 - `logit.output.messages`: encoded messages, one per `MessageBuf` entry, on every transport,
   matching `syslog_out`'s. Usually one entry is one statsd line. A negative-absolute-gauge metric's
   two-line `0|g`/`-n|g` pair is one indivisible entry (`docs/adr/statsd-output.md`) and counts once
@@ -1553,8 +1557,8 @@ data loss.
   rendering rather than a drop. A timer's `h`/`d` wire-type letter collapsing to `ms` under
   `format: statsd`, or a `SetMembers` member changing after lossy UTF-8 plus sanitization.
 - `logit.output.reconnects` (count; `tcp`, `unix_stream`, and `unix`): every connect *after* the
-  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because both take the
-  same `TcpDial::connect` path ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment).
+  first, as for `syslog_out`. Counted on plaintext and TLS connections alike, because `tcp` and
+  `unix_stream` both go through the shared pooled-stream driver.
   Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
   receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
   decision 12). UDP is connectionless and never reports it.
@@ -1578,7 +1582,7 @@ reports through them itself, so both halves of one `send` appear under one compo
 The sink adds only what a socket send can produce and the codec can't know:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: `statsd_out`'s shape.
+  `logit.output.requests{class="ok"|"error"}`: one per attempt that returns.
 - `logit.output.messages`: value lists actually sent (the per-datagram list count each
   `logit_proto::MessageBuf<usize>` entry's meta carries, summed).
 - `logit.output.datagrams`: datagrams actually sent. Both this and `messages` are UDP concepts;
@@ -1611,7 +1615,10 @@ The sink's `with_telemetry`/`with_diagnostics` feed the codec, so both halves of
 under one component id, as for `collectd_out`. The sink adds only what a socket send can produce:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: every other sink's shape.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape, on
+  both transports.
+- `logit.output.reconnects` (count, TCP only): every connect *after* the first, including the
+  redial after the probe finds a pooled connection closed, as for `syslog_out`.
 - `logit.output.messages`: entries actually sent (one plaintext line, or one
   already-length-prefixed pickle frame).
 - `logit.output.datapoints`: Σ each sent entry's own datapoint count (`MessageBuf<usize>`'s `meta`).

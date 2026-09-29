@@ -4408,4 +4408,38 @@ mod tests {
         assert!(err.contains("tls.ca_file"), "got: {err}");
         assert!(err.contains("does-not-exist.pem"), "got: {err}");
     }
+
+    /// A TLS endpoint whose host is no valid server name is a startup error that names the
+    /// component and the endpoint, not a fault on every batch.
+    #[test]
+    fn a_tls_statsd_output_endpoint_with_no_valid_server_name_fails_startup() {
+        let endpoint = "[fe80::1%eth0]:8125";
+        let cfg = config(vec![
+            ("in", statsd_in()),
+            (
+                "out",
+                Component {
+                    buffer: logit_config::BufferConfig::default(),
+                    receive: logit_config::ReceiveConfig::default(),
+                    sources: vec!["in".to_string()],
+                    targets: Vec::new(),
+                    kind: ComponentKind::StatsdOut {
+                        endpoint: endpoint.to_string(),
+                        transport: logit_config::StatsdTransport::Tcp,
+                        format: logit_config::StatsdFormat::default(),
+                        relative_gauges: false,
+                        max_packet_bytes: 1432,
+                        connect_timeout: Duration::from_secs(5),
+                        tls: Some(logit_config::TlsClientConfig::default()),
+                    },
+                },
+            ),
+        ]);
+        let err = match prepare(cfg, testdata_tls_dir()) {
+            Ok(_) => panic!("expected a bad TLS endpoint to fail startup"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("component 'out'"), "got: {err}");
+        assert!(err.contains(endpoint), "got: {err}");
+    }
 }

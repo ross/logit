@@ -986,6 +986,10 @@ one:
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame and applies regardless of transport,
   since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) matches
   `statsd_out`'s and `syslog_out`'s default.
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a
+  climbing count means the peer or the network is unstable. TCP sends through the same connection
+  handling as `statsd_out` and `syslog_out`.
 - **Retries rely on whisper's semantics.** This is the first non-HTTP sink with a real destination
   to report `duplicate_safe: true` (`null_out` reports it trivially, having no destination):
   whisper is last-write-wins per `(path, second)`, so a datapoint redelivered on retry overwrites
@@ -1020,6 +1024,9 @@ components:
   in this project). No statsd client in the wild speaks TLS, so, like `statsd_in`'s listener block,
   this is for a `logit`-to-`logit` or stunnel-shaped relay hop, not an application's DogStatsD
   client. See ["TLS"](#tls) below for the full field reference.
+- **The TLS server name comes from `endpoint:`'s host, and a host that isn't one fails startup.**
+  An IP literal or a DNS name works; an empty host or a scoped IPv6 address (`[fe80::1%eth0]:8125`)
+  stops `logit run` with an error naming the component and the endpoint.
 - **`connect_timeout:` bounds the TCP connect and the TLS handshake as two separate phases**, not
   one combined deadline, so a TLS connect can take up to twice the configured value (`syslog_out`'s
   arrangement). Account for that if you raise it.
@@ -1031,8 +1038,8 @@ components:
   ([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment). That is deliberately conservative:
   `statsd_out` reports `duplicate_safe: false` because a redelivered `hits:5|c` *increments the
   destination counter a second time*. Watch `logit.component.batches.dropped` accordingly.
-- **What to watch.** `logit.output.requests{class="ok"|"error"}` (one per attempt) and, on TCP,
-  `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
+- **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt, tagged with its fault class) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
   way, since both take the same connect path. `logit.output.datagrams` exists only under the
   datagram transports, `udp` and `unix`.
@@ -2316,7 +2323,8 @@ components:
 
 For mutual TLS, add `cert_file`/`key_file` together to `syslog_out`'s `tls:` block, as in
 `otlp_out`'s mutual TLS example above. `tls.insecure_skip_verify` (`syslog_out` only) behaves
-identically too, including the rejection alongside `ca_file`.
+identically too, including the rejection alongside `ca_file`. As for `statsd_out`, the TLS server
+name is `endpoint:`'s host, and a host that isn't an IP literal or a DNS name fails startup.
 
 **`syslog_out.connect_timeout` bounds the TCP connect and the TLS handshake as two separate
 phases**, not one combined deadline, so a TLS connect can take up to twice the configured value
@@ -2333,7 +2341,8 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
 
 **What to watch.**
 
-- `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
+- `syslog_out`: `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
+  attempt, tagged with its fault class) and
   `logit.output.reconnects`, which should stay near zero in steady state. A climbing count on a TLS
   connection means the peer or the network is unstable, not this sink. Plaintext and TLS
   connections are counted the same way, since both take the same connect path.
