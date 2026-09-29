@@ -555,7 +555,8 @@ impl ControlEncode for control::Ack {
 
 /// Reads and decodes one control frame. Both declared lengths are checked against
 /// [`control::MAX_CONTROL_MESSAGE_BYTES`] before sizing an allocation: the first call reads
-/// `HelloAck` from a peer not yet trusted.
+/// `HelloAck` from a peer not yet trusted. A control frame is never compressed, so the compressed
+/// length shares the cap, as `logit_in` applies it to a `Hello`.
 async fn read_control<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> anyhow::Result<control::ControlMessage> {
@@ -1752,8 +1753,9 @@ mod tests {
 
     /// A TLS write returns with ciphertext still queued in the session, and a waiting ack read
     /// never sends it (`crate::stream_pins`). A frame larger than the socket can take at once
-    /// reaches the peer only through the flush after it; without one the peer never holds the frame, the
-    /// ack wait times out `Ambiguous`, and at-most-once drops a batch the peer never received.
+    /// reaches the peer only through the flush after it; without one the peer never holds the
+    /// frame, the ack wait times out `Ambiguous`, and at-most-once drops a batch the peer never
+    /// received.
     #[tokio::test]
     async fn a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait() {
         let (client_io, server_io) = tokio::io::duplex(4096);

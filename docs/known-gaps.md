@@ -472,6 +472,19 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     flow control lands; see the "Credit-based flow control" item of the native wire protocol entry
     in this section.
 
+- **A TLS `logit_out` that dies inside the first record of a frame reads, at `logit_in`, as a clean
+  close.** The frame's header travels in its first TLS record. If the sender's connection fails
+  before that record is complete, `logit_in` has decrypted zero bytes of the header when the
+  stream ends, so `read_header` takes the end as a close between frames and counts nothing, where
+  `logit.proto.errors{reason="truncated_header"}` would be truthful. Nothing is lost or
+  duplicated: the sender's write fails `Clean` and the batch is resent on a new connection. Only
+  the listener's count is off. It isn't fixed because the listener can't tell the two apart:
+  rustls 0.23.45 marks `has_seen_eof` on the transport EOF whatever its deframer still holds, so a
+  record that never completed and no record at all both reach `read_header` as the same
+  `UnexpectedEof` with no plaintext read
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decision 12).
+
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one
   octet-counted TCP frame per message, and `statsd_out` one statsd line per metric packed up to a

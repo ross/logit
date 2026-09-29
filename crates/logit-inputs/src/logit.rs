@@ -668,7 +668,19 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             anyhow::bail!("connection closed before sending Hello");
         };
         // A control message, so bounded by the control cap, not `max_frame_bytes`; an over-cap
-        // header fails like any bad `Hello`. `None`: the whole read is inside `handshake_timeout`.
+        // header fails like any bad `Hello`. A control frame is never compressed, so its
+        // `compressed_len` has the same cap, as `logit_out`'s `read_control` applies, not lz4's
+        // worst case over it. A header that doesn't parse is left to `read_frame_body`.
+        if let Ok(header) = FrameHeader::read(&mut Bytes::copy_from_slice(&header_buf)) {
+            if header.compressed_len > control::MAX_CONTROL_MESSAGE_BYTES {
+                anyhow::bail!(
+                    "Hello declares {} compressed bytes, over the {}-byte control message cap",
+                    header.compressed_len,
+                    control::MAX_CONTROL_MESSAGE_BYTES
+                );
+            }
+        }
+        // `None`: the whole read is inside `handshake_timeout`.
         read_frame_body(stream, header_buf, control::MAX_CONTROL_MESSAGE_BYTES, None)
             .await
             .map_err(FrameReadError::into_inner)
@@ -2791,6 +2803,47 @@ mod tests {
             .await;
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
         drop(at_cap);
+    }
+
+    /// A control frame is never compressed, so a `Hello` header whose `compressed_len` is one
+    /// past the control-message cap is refused on the header, as `logit_out`'s `read_control`
+    /// refuses a reply, not admitted up to lz4's worst case over the cap.
+    #[tokio::test]
+    async fn a_hello_whose_compressed_length_is_over_the_control_message_cap_is_refused() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: the close must come from the cap, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // A real lz4 `Hello` header with `compressed_len` (bytes 16..20) raised past the cap.
+        let mut header = BytesMut::from(
+            &frame::write_frame_with_flags(
+                0,
+                Compression::Lz4,
+                frame::FLAG_CONTROL,
+                &hello_v1().encode(),
+            )
+            .unwrap()[..frame::HEADER_LEN],
+        );
+        let over = control::MAX_CONTROL_MESSAGE_BYTES + 1;
+        assert!(over <= frame::compressed_bound(control::MAX_CONTROL_MESSAGE_BYTES));
+        header[16..20].copy_from_slice(&over.to_le_bytes());
+
+        let mut client = connect(&addr).await;
+        client.write_all(&header).await.unwrap();
+        expect_closed(&mut client, "a Hello whose compressed length is over the cap").await;
+
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the oversized Hello counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
     }
 
     /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected
