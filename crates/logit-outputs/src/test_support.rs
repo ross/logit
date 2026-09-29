@@ -759,10 +759,21 @@ pub(crate) async fn sums_through_write_loop<O: logit_pipeline::Output + Send>(
     probe.poll().sums().map(|(name, tags, v)| ((name.to_string(), tags.to_vec()), v)).collect()
 }
 
-/// `sums` without the [`PER_ATTEMPT`] counters.
-fn once_per_batch(sums: &Sums) -> Sums {
+/// A counter name and the tags a series must carry to match it.
+pub(crate) type SumSeries<'a> = (&'a str, &'a [(&'a str, &'a str)]);
+
+/// Whether the series `(name, tags)` matches `series`: the same name, and every tag it names.
+fn matches(series: &SumSeries<'_>, name: &str, tags: &[(String, String)]) -> bool {
+    series.0 == name && series.1.iter().all(|(k, v)| tags.iter().any(|(tk, tv)| tk == k && tv == v))
+}
+
+/// `sums` without the [`PER_ATTEMPT`] counters and without the series `per_attempt` names.
+fn once_per_batch(sums: &Sums, per_attempt: &[SumSeries<'_>]) -> Sums {
     sums.iter()
-        .filter(|((name, _), _)| !PER_ATTEMPT.contains(&name.as_str()))
+        .filter(|((name, tags), _)| {
+            !PER_ATTEMPT.contains(&name.as_str())
+                && !per_attempt.iter().any(|series| matches(series, name, tags))
+        })
         .map(|(key, v)| (key.clone(), *v))
         .collect()
 }
@@ -777,18 +788,30 @@ pub(crate) fn sum_of(sums: &Sums, name: &str, tags: &[(&str, &str)]) -> f64 {
         .sum()
 }
 
-/// Asserts a retried run counted every series outside [`PER_ATTEMPT`] as a single-attempt run of
-/// the same batch did, and that each of `encode_side` was counted at all, so the comparison has
-/// something to compare.
+/// Asserts a retried run counted every series outside [`PER_ATTEMPT`] and the sink's own
+/// `per_attempt` series as a single-attempt run of the same batch did, and that each of
+/// `encode_side` was counted at all, so the comparison has something to compare.
+///
+/// `per_attempt` names the transport and server-verdict series a sink counts per attempt beyond
+/// [`PER_ATTEMPT`] (ADR `sink-send-path-and-attempt-accounting`, decision 1). It may not cover a
+/// series of `encode_side`, so a sink can't exempt an encode-side counter from the comparison.
 pub(crate) fn assert_counted_once_per_batch(
     single: &Sums,
     retried: &Sums,
-    encode_side: &[(&str, &[(&str, &str)])],
+    encode_side: &[SumSeries<'_>],
+    per_attempt: &[SumSeries<'_>],
 ) {
     for (name, tags) in encode_side {
         assert!(sum_of(single, name, tags) > 0.0, "{name} {tags:?} was never counted: {single:?}");
+        let owned: Vec<(String, String)> =
+            tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert!(
+            !per_attempt.iter().any(|series| matches(series, name, &owned)),
+            "{name} {tags:?} is encode-side and can't be exempted as per attempt"
+        );
     }
-    let (single, retried) = (once_per_batch(single), once_per_batch(retried));
+    let (single, retried) =
+        (once_per_batch(single, per_attempt), once_per_batch(retried, per_attempt));
     let keys: std::collections::BTreeSet<_> = single.keys().chain(retried.keys()).collect();
     let differing: Vec<_> = keys
         .into_iter()
@@ -798,20 +821,36 @@ pub(crate) fn assert_counted_once_per_batch(
     assert!(differing.is_empty(), "(series, single attempt, retried) that differ: {differing:?}");
 }
 
+/// What a sink counts when it sends something: a batch that encoded to nothing counts none of
+/// these, which [`assert_direct_sends_count_after_an_empty_batch`] checks before relying on it.
+const SENT: [&str; 6] = [
+    "logit.output.requests",
+    "logit.output.batch.bytes",
+    "logit.output.records",
+    "logit.output.request.bytes",
+    "logit.output.messages",
+    "logit.output.datagrams",
+];
+
 /// Runs `empty`, a batch the encoder skips whole, through the write loop, then sends `batch`
 /// twice directly with no `observe_batch`, and asserts each of `encode_side` counted both direct
-/// sends: a batch that encoded to nothing leaves the sink's accounting disarmed.
+/// sends: a batch that encoded to nothing leaves the sink's accounting disarmed. Asserts first
+/// that `empty` was delivered and sent nothing ([`SENT`]), so the early `Ok` is what ran.
 pub(crate) async fn assert_direct_sends_count_after_an_empty_batch<O>(
     output: &mut O,
     probe: &mut logit_pipeline::test_util::TelemetryProbe,
     kind: &'static str,
     empty: logit_core::EventBatch,
     batch: impl Fn() -> logit_core::EventBatch,
-    encode_side: &[(&str, &[(&str, &str)])],
+    encode_side: &[SumSeries<'_>],
 ) where
     O: logit_pipeline::Output + Send,
 {
     let before = sums_through_write_loop(output, probe, kind, vec![empty], fast_retry()).await;
+    assert_eq!(sum_of(&before, "logit.component.batches.delivered", &[]), 1.0, "{before:?}");
+    for name in SENT {
+        assert_eq!(sum_of(&before, name, &[]), 0.0, "the empty batch counted {name}: {before:?}");
+    }
     let mut after: Vec<Sums> = Vec::new();
     for _ in 0..2 {
         output.send(&batch()).await.expect("a direct send delivers");

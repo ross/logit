@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
-        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
     }
 
     #[tokio::test]
@@ -1007,7 +1007,7 @@ mod tests {
                 .await,
             );
         }
-        assert_counted_once_per_batch(&runs[0], &runs[1], &ENCODE_SIDE);
+        assert_counted_once_per_batch(&runs[0], &runs[1], &ENCODE_SIDE, &[]);
     }
 
     /// A batch the encoder skips whole returns `Ok` early and still leaves the accounting

@@ -1661,7 +1661,7 @@ mod tests {
         assert_eq!(sum_of(single, "logit.output.requests", &[("class", "2xx")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "5xx")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "2xx")]), 1.0);
-        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
     }
 
     /// A batch that encodes to an empty body returns `Ok` early and still leaves the accounting
