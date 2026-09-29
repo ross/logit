@@ -178,9 +178,8 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
                 if committed {
                     self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
                 }
-                if let Err(err) = rotated {
-                    return Err(err);
-                }
+                // `committed` already read the outcome.
+                let _ = rotated?;
             }
         }
 
