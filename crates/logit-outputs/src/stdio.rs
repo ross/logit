@@ -161,28 +161,6 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
         }
         let bytes = self.encoder.encode(batch).context("encoding batch")?;
 
-        // Rotation is decided before the write, so a batch is never split across files
-        // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
-        let now = crate::file::now_unix();
-        if let Target::File(file) = &mut self.target {
-            if file.should_rotate(now, bytes.len()) {
-                let rotated = file.rotate(&mut self.diagnostics).await;
-                // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means the
-                // active file's rename or truncate failed and nothing on disk changed, so it
-                // isn't a rotation. An `Err` after the commit-point rename, a failed re-open, is
-                // one, and leaves the file closed.
-                let committed = match &rotated {
-                    Ok(outcome) => *outcome == RotateOutcome::Rotated,
-                    Err(_) => file.awaiting_reopen(),
-                };
-                if committed {
-                    self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
-                }
-                // `committed` already read the outcome.
-                let _ = rotated?;
-            }
-        }
-
         // One `write_all` and one `flush` per batch, so nothing sits in tokio's buffer between
         // batches. `flush` is not `fsync`: the OS page cache still holds the bytes. A write error
         // carries no `Fault`, so the runtime doesn't retry the batch, and it doesn't count toward
@@ -197,12 +175,31 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
                 w.write_all(&bytes).await?;
                 w.flush().await?;
             }
-            Target::File(f) => {
-                f.write_all(&bytes).await?;
-                f.flush().await?;
+            Target::File(file) => {
+                // Rotation is decided before the write, so a batch is never split across files
+                // (`FileTarget::should_rotate` on a batch bigger than `max_bytes`).
+                let now = crate::file::now_unix();
+                if file.should_rotate(now, bytes.len()) {
+                    let rotated = file.rotate(&mut self.diagnostics).await;
+                    // Counted here because `FileTarget` holds no `Telemetry`. `NotRotated` means
+                    // the active file's rename or truncate failed and nothing on disk changed, so
+                    // it isn't a rotation. An `Err` after the commit-point rename, a failed
+                    // re-open, is one, and leaves the file closed.
+                    let committed = match &rotated {
+                        Ok(outcome) => *outcome == RotateOutcome::Rotated,
+                        Err(_) => file.awaiting_reopen(),
+                    };
+                    if committed {
+                        self.telemetry.count("logit.output.file.rotations", 1.0, &[]);
+                    }
+                    // `committed` already read the outcome.
+                    let _ = rotated?;
+                }
+                file.write_all(&bytes).await?;
+                file.flush().await?;
                 // After the write, so a retry of a batch whose write failed isn't noted twice
                 // and doesn't rotate early.
-                f.note_written(now, bytes.len());
+                file.note_written(now, bytes.len());
             }
         }
         // Once, for the attempt that wrote the batch: an attempt that failed before the write
@@ -473,8 +470,6 @@ mod tests {
     async fn a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice() {
         use logit_pipeline::fault::{self, errno, sites, Op, Point};
         use logit_pipeline::test_util::{drive_write_loop, scratch_dir, TelemetryProbe};
-        use logit_pipeline::{RetryConfig, WriteLoopConfig};
-        use std::time::Duration;
 
         let small = batch_with(vec![metric_event(0, "b", MetricKind::counter(2.0))]);
         let len = StreamEncoder::human().encode(&small).unwrap().len();
@@ -497,18 +492,11 @@ mod tests {
 
         let scope = fault::scope(&dir);
         let open = Point::new(sites::FILE_OUT_ACTIVE, Op::Open);
-        // Two rules failing their first hit: a rule that fails returns before the next rule sees
-        // the hit, so the second rule's first hit is the second re-open (`docs/known-gaps.md`,
-        // "Pipeline runtime and graph", the `fault` seam entry).
+        // Two rules failing their first hit: a rule counts only the hits no earlier rule failed,
+        // so the second rule's first hit is the second re-open (`docs/known-gaps.md`, "Pipeline
+        // runtime and graph", the `fault` seam entry).
         scope.fail_nth(open, 1, errno::EMFILE).fail_nth(open, 1, errno::EMFILE);
-        let config = WriteLoopConfig {
-            retry: RetryConfig {
-                total_budget: Duration::from_secs(5),
-                base_delay: Duration::from_millis(1),
-                max_delay: Duration::from_millis(1),
-            },
-            ..WriteLoopConfig::default()
-        };
+        let config = crate::test_support::fast_retry();
         drive_write_loop(&mut output, vec![small], config, telemetry).await.unwrap();
         drop(scope);
 
