@@ -2172,9 +2172,10 @@ fn clone_span_event() {
 // ---------------------------------------------------------------------------------------------
 //
 // The node loops' per-batch bodies, including their telemetry accounting. `run_transform`'s is
-// exported as `logit_pipeline::process_batch` (synchronous) and `run_output`'s as
-// `logit_pipeline::send_batch` (async, driven on a `current_thread` runtime with no channel), so
-// both can be measured directly. `unwrap_batch` is exported for the same reason.
+// exported as `logit_pipeline::process_batch` (synchronous). `logit_pipeline::send_batch` (async,
+// driven on a `current_thread` runtime with no channel) is a sink's receive counts and one `send`,
+// not `run_output`'s body, which splits them across `drain_inbox` and `write_loop`. Both can be
+// measured directly. `unwrap_batch` is exported for the same reason.
 //
 // Telemetry has two states, both covered for both functions. `ComponentBuffer::drain`
 // `mem::take`s the `points` map on every `internal` tick, so the next `count`/`timer` per key is
@@ -2597,8 +2598,8 @@ fn send_batch_failing_first_call_after_a_drain() {
     expect_allocs("runtime: send_batch, failing, first call after an internal drain", stats, 7);
 }
 
-/// `run_output`'s per-batch body, `logit_pipeline::send_batch`, telemetry disabled: 1, from
-/// neither telemetry nor dispatch. `Output` is `#[async_trait]`, which boxes every `send`'s future
+/// A sink's receive counts and one `send` (`logit_pipeline::send_batch`), telemetry disabled: 1,
+/// from neither telemetry nor dispatch. `Output` is `#[async_trait]`, which boxes every `send`'s future
 /// (16 bytes); calling `NoopOutput::send` directly, with no `dyn Output`, costs the same 1. It's a
 /// per-batch cost on every sink (`docs/known-gaps.md`).
 #[test]

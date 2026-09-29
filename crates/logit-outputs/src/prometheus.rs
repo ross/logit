@@ -542,6 +542,8 @@ impl Output for PrometheusOutput {
         }
     }
 
+    /// The mode's own posture, which each mode's `duplicate_safe` explains. `buffer.delivery`
+    /// overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         match self {
             PrometheusOutput::Expose(output) => output.duplicate_safe(),

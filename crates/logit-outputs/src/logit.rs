@@ -504,6 +504,8 @@ impl Output for LogitOutput {
         Ok(())
     }
 
+    /// `false`: `logit_in` forwards a frame before it acks it, so a resend after a lost ack
+    /// forwards the batch twice. `buffer.delivery` overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         false
     }

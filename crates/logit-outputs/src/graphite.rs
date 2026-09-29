@@ -271,7 +271,7 @@ impl Output for GraphiteOutput {
     }
 
     /// Whisper is last-write-wins per `(path, second)`; the module doc's "Duplicate safety" has
-    /// the boundary.
+    /// the boundary. `buffer.delivery` overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         true
     }

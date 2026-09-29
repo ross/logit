@@ -206,7 +206,8 @@ impl Output for InfluxDbOutput {
     /// (`InfluxLineEncoder::series`) is cleared at the top of every `encode`, so a retry re-encodes
     /// byte-for-byte the same body. InfluxDB treats an identical `(measurement, tag set,
     /// timestamp)` write as an idempotent overwrite, not a second point.
-    /// See `docs/adr/buffered-sink-delivery.md`.
+    /// See `docs/adr/buffered-sink-delivery.md`. `buffer.delivery` overrides this posture for the
+    /// component.
     fn duplicate_safe(&self) -> bool {
         true
     }

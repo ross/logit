@@ -43,7 +43,8 @@ impl Output for NullOutput {
         Ok(())
     }
 
-    /// No destination to double-write to.
+    /// No destination to double-write to. `buffer.delivery` overrides this posture for the
+    /// component.
     fn duplicate_safe(&self) -> bool {
         true
     }

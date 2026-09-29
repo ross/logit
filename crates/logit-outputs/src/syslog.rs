@@ -1340,7 +1340,8 @@ impl Output for SyslogOutput {
 
     /// `false` on both transports: a redelivered message is a duplicated log line. `AtMostOnce`
     /// still retries a `Fault::Clean` (`docs/adr/buffered-sink-delivery.md`), which covers a
-    /// restarting receiver with no duplicate risk.
+    /// restarting receiver with no duplicate risk. `buffer.delivery` overrides this posture for
+    /// the component.
     fn duplicate_safe(&self) -> bool {
         false
     }

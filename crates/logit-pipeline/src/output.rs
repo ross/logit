@@ -19,7 +19,11 @@ use logit_core::EventBatch;
 /// Retry is the runtime's job too. `send` is a single attempt that reports what a failure means
 /// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing,
 /// budget, and the retryable/permanent decision, from [`is_retryable`] and
-/// [`Output::duplicate_safe`]. A sink never runs its own retry loop.
+/// [`Output::duplicate_safe`]. A sink runs no retry loop of its own. Inside one attempt it may
+/// resend once, bounded, on a verdict that proves the resend safe: the pooled-stream driver's one
+/// reconnect after a plaintext first write that accepted nothing (`PooledStream::send` in
+/// `logit-outputs`), and `splunk_hec_out`'s resend of the rest of a body after a code 6 dropped
+/// one of its objects (`SplunkHecOutput::send_body`).
 #[async_trait::async_trait]
 pub trait Output {
     /// Opens whatever this sink must open before it can serve anything: a listening socket, in
@@ -40,26 +44,41 @@ pub trait Output {
         Ok(())
     }
 
+    /// One delivery attempt at `batch`. `write_loop` calls it once per attempt and owns the retry
+    /// (the trait doc). The contract:
+    ///
+    /// - **Cancellable at every await.** Each attempt races the rest of the retry budget and the
+    ///   shutdown grace, so the future can be dropped at any await; the sink must stay usable for
+    ///   the next call (`docs/design/pipeline-graph.md`'s "Cancellation points").
+    /// - **The encode is synchronous**, with no await inside it, so a sink's per-batch accounting
+    ///   holds across it (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2).
+    /// - **A failure carries a [`Fault`]**; one with none classifies `Fault::Permanent`
+    ///   ([`classify`]).
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()>;
 
-    /// Called immediately before each delivery attempt in `write_loop`, retries included, so a
-    /// sink that saves the value for `send` sees the same one on every attempt at one batch.
-    /// `BatchContext` is the trace/span id plus which component created and last handled the
-    /// batch (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the
-    /// wire. Default no-op.
+    /// Called once per batch by `write_loop`, before the batch's first attempt, never between its
+    /// retries: the place a sink resets per-batch state. A sink that saves the value for `send`
+    /// sees the same one on every attempt at the batch. `BatchContext` is the trace/span id plus
+    /// which component created and last handled the batch
+    /// (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the wire, and
+    /// a sink with encode-side counters arms its once-per-batch accounting here
+    /// (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2). A caller outside the
+    /// runtime that never calls it gets every `send` counted. Default no-op.
     fn observe_batch(&mut self, ctx: BatchContext) {
         let _ = ctx;
     }
 
-    /// Called once after the last batch has been delivered or dropped and no more will follow,
-    /// for a sink that holds unwritten data at shutdown (`docs/adr/buffered-sink-delivery.md`'s
-    /// shutdown-grace section). Default no-op, for a sink with nothing buffered internally.
+    /// Called once, when the sink's input has closed and `write_loop` has stopped, for a sink
+    /// that holds unwritten data at shutdown (`docs/adr/buffered-sink-delivery.md`'s
+    /// shutdown-grace section). That isn't always after every batch was delivered or dropped: on a
+    /// shutdown-grace expiry, a disk-buffered sink keeps its undelivered batches spooled for the
+    /// next run. Default no-op, for a sink with nothing buffered internally.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Whether re-delivering an already-delivered batch is safe for this destination. Drives the
-    /// default [`DeliveryPosture`]; config can override it per component
+    /// default [`DeliveryPosture`]; `buffer.delivery` overrides it per component
     /// (`logit_config::BufferConfig::delivery`). Defaults to `false`, the safe choice for a sink
     /// that hasn't opted in.
     fn duplicate_safe(&self) -> bool {

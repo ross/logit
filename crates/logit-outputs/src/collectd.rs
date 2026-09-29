@@ -183,7 +183,7 @@ impl Output for CollectdOutput {
     }
 
     /// A redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE; there's no
-    /// idempotency key.
+    /// idempotency key. `buffer.delivery` overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         false
     }

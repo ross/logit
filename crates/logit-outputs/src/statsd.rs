@@ -1875,7 +1875,8 @@ impl Output for StatsdOutput {
     /// `false`: a redelivered `hits:5|c` **increments the destination counter a second time**,
     /// corrupting the value with no trace at the receiver (worse than `syslog_out`'s duplicated
     /// log line). The derived `AtMostOnce` posture still retries a `Fault::Clean` failure, which
-    /// covers the common receiver-restart outage with no duplicate risk.
+    /// covers the common receiver-restart outage with no duplicate risk. `buffer.delivery`
+    /// overrides this posture for the component.
     fn duplicate_safe(&self) -> bool {
         false
     }
