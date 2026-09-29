@@ -4603,7 +4603,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   holds a truncated frame it can't forward. The premise in `send`'s comment (nothing left the
   host) is wrong, and the `io::Error` is discarded. The real defect is the missing `flush()`:
   tokio-rustls 0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued, and
-  `poll_read` never drives writes, so `send` waits for an `Ack` the peer can't send. The same
+  a `poll_read` that processes its records cleanly drives no writes, so `send` waits for an
+  `Ack` the peer can't send. The same
   shape exists at `Hello`/`HelloAck`. ~~`Output::flush` is or isn't needed after a write under
   TLS.~~ It is needed. A third too-large path exists beyond the two the entry names: the
   compressed-frame check against `frame::compressed_bound`, which also returns `Permanent`
@@ -7123,7 +7124,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `logit.rs`, another agent's area).
 - **What it does:** Wraps a single `AsyncRead::poll_read` in `poll_fn`, mapping `Pending` → still
   open, `Ready(Ok)` with an empty buffer → peer EOF, `Ready(Ok)` with bytes → unsolicited data,
-  `Ready(Err)` → treat as closed. Deliberately *not* `timeout(read)`, ~~because a cancelled read on a
+  `Ready(Err)` → treat as closed. *Not* `timeout(read)`, ~~because a cancelled read on a
   `tokio-rustls` stream can discard a partially received record~~ because the probe must not wait
   (a cancelled read loses nothing; see the Verified bullet).
 - **Why sensitive:** custom (hand-rolled `poll_fn` over a trait object rather than any crate API);
@@ -7172,8 +7173,13 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     record completes and decrypts afterwards). `a_partial_tls_record_survives_a_dropped_read`
     pins the same for a dropped read future, against tokio-rustls 0.26.5 directly.
   - A key update or other post-handshake message read by the probe: the session keeps its state,
-    and a read never drives writes (`a_tls_read_never_drives_queued_ciphertext_to_the_socket`),
-    so any reply rustls queues goes out with the next write's flush.
+    and a read that processes its records cleanly drives no writes
+    (`a_tls_read_that_succeeds_leaves_queued_ciphertext_queued`), so any reply rustls queues goes
+    out with the next write's flush. A read that fails on a bad record, one of the cases the
+    `Ready(Err)` arm names, makes one last-gasp write for the alert that sends any queued
+    ciphertext first (`a_tls_read_failing_on_a_bad_record_sends_queued_ciphertext`). The probe
+    then answers `Eof` and the stream is dropped; a sink that flushed its last batch has nothing
+    queued for that write to send.
     `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending` pins that the session
     tickets after a TLS 1.3 handshake read as `Open`, not `Eof` or `Bytes`.
   - Closes: `a_tls_close_notify_probes_eof`, and

@@ -26,7 +26,8 @@ found the following.
 
 - **A TLS write can return before its bytes reach the socket (WIRE-08).**
   tokio-rustls's `poll_write` returns `Ok(n)` with up to 64 KiB of ciphertext still queued in
-  the session whenever a socket write goes `Pending`, and `poll_read` never drives writes.
+  the session whenever a socket write goes `Pending`, and a `poll_read` that processes its
+  records cleanly drives no writes.
   `logit_out` writes a frame and then waits for an `Ack` without calling `flush()`. Under TLS the
   peer never receives the queued tail, so the wait ends in a timeout, classified `Ambiguous`.
   Under the default `at_most_once` posture that drops a batch the peer never saw. The same shape
@@ -166,13 +167,15 @@ nature. The encode-side counters are the only ones that measure the batch and no
    forwards. A `logit_out` frame carries a length and a CRC-32C, so a prefix is never forwarded.
 7. **`logit_out` calls `flush()` after the frame write and after the `Hello` write, before it
    waits for a reply.** Without the flush, the failure in the Context section follows. tokio-rustls
-   0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued in the session, and
-   `poll_read` doesn't drive the writes that queued it. So the peer never receives the tail of
-   the frame or the `Hello`, and the sink waits for a reply the peer can't send. The timeout is
-   `Ambiguous`, and under `at_most_once` it drops a batch the peer never received. The
-   handshake shape is the same: a `Hello` split across a `Pending` socket write stalls the
-   `HelloAck` wait. A flush after the write closes both. Plaintext `TcpStream::flush` is a no-op,
-   so the flush costs nothing off TLS.
+   0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued in the session, and a
+   `poll_read` that processes its records cleanly doesn't drive the writes that queued it. So the
+   peer never receives the tail of the frame or the `Hello`, and the sink waits for a reply the
+   peer can't send. The timeout is `Ambiguous`, and under `at_most_once` it drops a batch the
+   peer never received. The handshake shape is the same: a `Hello` split across a `Pending`
+   socket write stalls the `HelloAck` wait. A flush after the write closes both. Plaintext
+   `TcpStream::flush` is a no-op, so the flush costs nothing off TLS. A read that fails on a bad
+   record does write (decision 8), but the stall is on the clean path, where a waiting read
+   drives nothing, so the flush is needed either way.
 8. **Third-party semantics are pinned by tests, and a dependency bump re-verifies them.** The
    design rests on facts about tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. Tests run
    against a real TLS pair over `tokio::io::duplex` with a small buffer, which makes a mid-record
@@ -181,8 +184,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - `poll_write` returns `Ok(n)` with ciphertext still queued whenever the socket write goes
      `Pending`, up to 64 KiB.
    - `poll_flush` drives that queue to the socket.
-   - `poll_read` never drives writes, so a reader waiting for a reply doesn't push out an
-     unflushed request.
+   - A `poll_read` that processes its records cleanly drives no writes, so a reader waiting for
+     a reply doesn't push out an unflushed request.
+   - A `poll_read` that fails on a bad record makes one last-gasp write for the alert, which
+     sends queued ciphertext first, and then returns `ErrorKind::InvalidData`.
    - A `Pending` `poll_read` can move a partial record into the session. The session keeps it,
      and a later read completes the record.
    - Dropping a read future loses nothing the session already holds.
@@ -290,16 +295,21 @@ No code from this record exists until a workstream lands it.
 
 - **Pinned facts.** `crates/logit-outputs/src/stream_pins.rs` pins decision 8's facts against
   tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. Each test names the source function it
-  pins. The TLS tests run a real client and server over `tokio::io::duplex(4096)`, handshake
-  complete, with a counting wrapper (`TapIo`) under each end. No test sleeps or reads a clock:
+  pins. The TLS tests run a real client and server over `tokio::io::duplex(4096)`, except
+  `a_tls_write_error_can_follow_a_whole_record_reaching_the_peer`, whose 65536-byte pipe holds a
+  whole record before its armed failure. Each pair is handshake complete, with a counting wrapper (`TapIo`) under each end. No test sleeps or reads a clock:
   "nothing more is available" is a one-poll read that answers `Pending` on an in-memory pipe,
   and each body runs under `tokio::task::unconstrained` so the cooperative budget can't produce
   that `Pending` on its own.
   - `a_tls_write_returns_ok_with_ciphertext_still_queued_in_the_session`: a 100 000-byte write
     returns `Ok(65536)`, rustls's buffer limit, with 4096 bytes on the pipe and `wants_write()`
     still set.
-  - `a_tls_read_never_drives_queued_ciphertext_to_the_socket`: after the server drains the pipe,
-    a client read moves no ciphertext, and the server receives nothing more.
+  - `a_tls_read_that_succeeds_leaves_queued_ciphertext_queued`: after the server drains the
+    pipe, a client read that processes its records cleanly moves no ciphertext, and the server
+    receives nothing more.
+  - `a_tls_read_failing_on_a_bad_record_sends_queued_ciphertext`: a bad record written toward
+    the client makes its read fail with `InvalidData`, and that read's last-gasp write puts queued
+    ciphertext on the pipe.
   - `a_tls_flush_drives_every_queued_byte_to_the_peer`: a flush delivers every accepted byte.
   - `a_peer_close_notify_reads_as_an_empty_ready` and
     `a_peer_transport_close_without_close_notify_reads_as_unexpected_eof`: a `close_notify` reads
@@ -333,9 +343,10 @@ No code from this record exists until a workstream lands it.
   whole post-handshake records into the session, that the kept session loses nothing, and that
   the probe is one poll because it must not wait. The `Ready(Err)` arm says why it reads as
   `Eof`. `send_tcp` in `statsd_out` and `syslog_out`, and ADRs `statsd-output` and
-  `syslog-output`, no longer say each TLS record holds complete lines or messages: rustls cuts a
-  record every 16 KiB of plaintext wherever it falls, and the complete lines or messages in what
-  arrived are what a receiver keeps.
+  `syslog-output`, no longer say each TLS record holds complete lines or messages: rustls splits
+  what each session write accepted into records of at most 16384 bytes of plaintext, with no
+  regard for line or message boundaries, and the complete lines or messages in what arrived are
+  what a receiver keeps.
 
 Run them with `script/test -p logit-outputs stream_pins tls::tests`. A bump of tokio-rustls,
 rustls, or tokio re-runs `stream_pins` and re-reads the functions each test names.

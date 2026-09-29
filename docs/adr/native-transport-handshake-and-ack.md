@@ -223,8 +223,8 @@ and `reject_write_stalled` for any `Reject` (the write is abandoned and the conn
 [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) records three changes to `logit_out`:
 
 - It calls `flush()` after the `Hello` write and after the frame write, before waiting for a
-  reply. Under TLS a write can return with ciphertext still queued, and a reply read doesn't push
-  it out, so an unflushed frame ended in an `Ambiguous` ack timeout.
+  reply. Under TLS a write can return with ciphertext still queued, and a reply read that
+  processes its records cleanly doesn't push it out, so an unflushed frame ended in an `Ambiguous` ack timeout.
 - A first-write `Err` stays `Fault::Clean`. The reason changes: bytes of the frame may have
   reached the wire under TLS, but the peer then holds a truncated frame it can't forward. The
   classification of a `write_all`-remainder or flush failure is an open question for `sink/w3`,
