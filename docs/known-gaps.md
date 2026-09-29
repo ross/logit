@@ -1374,7 +1374,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   are muted, and on `datadog_out` measures the stale windows from the failed batch's send time.
   - **Consequence:** none on a shipped path. `write_loop` calls `observe_batch` before every
     batch, which re-arms the gate and replaces the time. `logit_pipeline::send_batch`, which the
-    benchmarks use, is the one caller that skips it, and it sends to fresh sinks.
+    benchmarks use, is the one caller that skips it. It never calls `observe_batch`, so no gate is
+    armed and no send time is stored, and its repeated sends to one sink leave no state.
   - **Fix, if a caller ever needs it:** a runtime signal that a batch ended (an `Output` method,
     which decision 2 declined to add). A sink can't clear on `Err` without breaking the reuse the
     retries need.

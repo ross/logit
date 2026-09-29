@@ -1481,7 +1481,8 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
-delivered the batch. A caller that sends without `observe_batch` counts every `send`.
+delivered the batch. A caller that sends without `observe_batch` counts every `send`, unless an
+earlier batch whose last attempt failed left the gate armed (`docs/known-gaps.md`, "Datadog").
 `prometheus_out`'s registry mode has no gate: its `send` never fails, so nothing repeats. No sink
 counts an encode-side counter per attempt.
 

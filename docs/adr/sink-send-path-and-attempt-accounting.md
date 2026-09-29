@@ -116,7 +116,8 @@ nature. The encode-side counters are the only ones that measure the batch and no
      already encoded runs muted, and the gate unmutes when the closure returns, so nothing awaits
      while it's muted. An `Ok` send disarms the gate.
    - An unarmed gate never mutes. A caller of `send` that never calls `observe_batch` (a unit
-     test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted.
+     test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted, unless an earlier
+     batch whose last attempt failed left the gate armed (`docs/known-gaps.md`).
    - The encode-side counts a sink emits itself (`statsd_out`'s and `syslog_out`'s `EncodeStats`,
      `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`) are skipped when `encode`
      reports a repeat. The datagram packer's over-cap skip isn't one of them: it counts per
@@ -521,9 +522,11 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
 - Align the HTTP sinks' `logit.output.requests` vocabulary with decision 4's four fault classes
   (`docs/known-gaps.md`, "Internal telemetry and self-logging").
-- Make `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a failure after an accepted
-  request in the same `send` as `Fault::Ambiguous`, as `splunk_hec_out` does, so an at-most-once
-  retry stops re-sending what was accepted (one `docs/known-gaps.md` entry per sink).
+- Decide how `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a connect failure that
+  follows an accepted request in the same `send`. `Clean` re-sends what was accepted, and
+  `Ambiguous` under the default at-most-once posture drops what wasn't. `splunk_hec_out` classifies
+  it `Ambiguous`. The choice weighs duplicate delivery against loss and needs its own record (one
+  `docs/known-gaps.md` entry per sink).
 - Fix or scope the pre-existing warnings that `cargo doc` reports with warnings denied in
   `logit-outputs`, `logit-pipeline`, and `logit-proto`, which CI doesn't check.
 - Configure a nextest per-test timeout, so a hung test fails and doesn't stall the run.
@@ -869,7 +872,8 @@ graph rule. `sink/w6` and `sink/w7` gate the HTTP sinks.
     `influxdb::tests::a_retry_counts_encode_side_counters_once` (a `503`, then a `204`). With the
     gate never armed, every one reads each encode-side counter and diagnostic twice.
   - `statsd::tests`: a second batch through the loop counts again, a batch after one the budget
-    cut off counts, and direct `send`s with no `observe_batch` count every time.
+    cut off counts, and direct `send`s with no `observe_batch` count every time, on a sink no
+    failed batch has armed.
   - `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`,
     over the `fault` seam.
   - `datagram::tests::an_over_cap_entry_first_reached_on_a_retry_is_counted` (attempt 1 fails
