@@ -1388,9 +1388,10 @@ impl SyslogOutput {
     ///   the socket until it returns `Pending`, and returns `Ok(n)` with finished records still
     ///   queued in userspace: `Ok` proves only that the session took the bytes, and `flush` makes
     ///   them the kernel's. A failing `poll_write` may already have completed socket writes, and
-    ///   each whole record among them decrypts at the peer. rustls cuts a record every 16 KiB of
-    ///   plaintext regardless of message boundaries, so a record can end mid-message, but every
-    ///   complete octet-counted message in what arrived is one a receiver keeps. `Err` never
+    ///   each whole record among them decrypts at the peer. rustls splits what each session write
+    ///   accepted into records of at most 16384 bytes of plaintext, with no regard for message
+    ///   boundaries, so a record can end mid-message, but every complete octet-counted message in
+    ///   what arrived is one a receiver keeps. `Err` never
     ///   proves zero bytes. So on TLS: no internal retry, no
     ///   resend once an application write has been attempted, every such failure is
     ///   `Fault::Ambiguous`, and `Fault::Clean` is left only for [`TcpDial::connect`] failures,

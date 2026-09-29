@@ -91,8 +91,9 @@ partially delivered twice.
 gained TLS ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)), the proof it rests
 on — one `write(2)` failing means zero bytes of that call were accepted — holds for a raw
 `TcpStream` and not for a `tokio_rustls` one, whose failing write may already have put complete
-records on the socket. rustls cuts a record every 16 KiB of plaintext regardless of message
-boundaries, and every complete octet-counted message in what arrived is one a receiver keeps. On a TLS connection there is no internal
+records on the socket. rustls splits what each session write accepted into records of at most
+16384 bytes of plaintext, with no regard for message boundaries, and every complete
+octet-counted message in what arrived is one a receiver keeps. On a TLS connection there is no internal
 retry: once an application write has been attempted, every failure is `Fault::Ambiguous` and the
 frame is never resent. That ADR's `syslog_out` section has the details.
 

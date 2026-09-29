@@ -1992,10 +1992,10 @@ impl StatsdOutput {
     ///   socket writes until one returns `Pending`, then returns `Ok(n)` with finished records
     ///   still queued in userspace. `Ok` proves only that the *session* accepted the bytes; `flush`
     ///   is what hands them to the kernel. A failing `poll_write` may already have completed
-    ///   several socket writes, and each whole record among them decrypts at the peer. rustls cuts
-    ///   a record every 16 KiB of plaintext wherever that falls in the frame, so a record can end
-    ///   mid-line, but every complete, LF-terminated line in what arrived is one a receiver keeps
-    ///   and counts. So `Err` never proves a zero-byte attempt. **A TLS write failure is never
+    ///   several socket writes, and each whole record among them decrypts at the peer. rustls
+    ///   splits what each session write accepted into records of at most 16384 bytes of
+    ///   plaintext, with no regard for line boundaries, so a record can end mid-line, but every
+    ///   complete, LF-terminated line in what arrived is one a receiver keeps and counts. So `Err` never proves a zero-byte attempt. **A TLS write failure is never
     ///   retried**: once an application write is attempted,
     ///   every failure is `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
     ///   [`TcpDial::connect`], which precede every byte of the frame. A resend here would be worse
