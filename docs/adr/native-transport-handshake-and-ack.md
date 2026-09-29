@@ -226,6 +226,9 @@ and `reject_write_stalled` for any `Reject` (the write is abandoned and the conn
   reply. Under TLS a write can return with ciphertext still queued, and a reply read doesn't push
   it out, so an unflushed frame ended in an `Ambiguous` ack timeout.
 - A first-write `Err` stays `Fault::Clean`. The reason changes: bytes of the frame may have
-  reached the wire under TLS, but the peer then holds a truncated frame it can't forward.
+  reached the wire under TLS, but the peer then holds a truncated frame it can't forward. The
+  classification of a `write_all`-remainder or flush failure is an open question for `sink/w3`,
+  because a failure anywhere in the write phase leaves a truncated frame, so `Clean` may be
+  truthful there too.
 - `logit.output.requests` counts every returned attempt, including connect, handshake, and
   too-large returns, tagged `class=ok|clean|ambiguous|permanent`.

@@ -24,7 +24,7 @@ Top leads 12 and 14 sit on the same code. Read-only passes checked the entries a
 and against the pinned sources of tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. They
 found the following.
 
-- **A TLS write can return before its bytes are queued for the socket (WIRE-08).**
+- **A TLS write can return before its bytes reach the socket (WIRE-08).**
   tokio-rustls's `poll_write` returns `Ok(n)` with up to 64 KiB of ciphertext still queued in
   the session whenever a socket write goes `Pending`, and `poll_read` never drives writes.
   `logit_out` writes a frame and then waits for an `Ack` without calling `flush()`. Under TLS the
@@ -100,8 +100,12 @@ nature. The encode-side counters are the only ones that measure the batch and no
      a tool) sees today's behavior.
    - `Output` gains no method and no parameter.
 
-   `datadog_out`'s `split_encode` bisection re-encodes count through the same gated view, so a
-   bisection triggered by a retry doesn't count a second time.
+   The bisection in `split_encode` (`crates/logit-outputs/src/http.rs`), which `datadog_out` and
+   `datadog_trace_out` both call, re-encodes each half of an over-limit request. Those
+   re-encodes count through the same gated view, so they are muted twice over: a bisection
+   triggered by a retry doesn't count again, and, because the gate closes after a unit's first
+   encode, bisection re-encodes inside one attempt are muted too. Today they count the same
+   records more than once within a single `send`, which `datadog.rs`'s module doc records.
 3. **`datadog_out` fixes `now` once per batch, in `observe_batch`.** Staleness isn't monotonic
    in `now`: a point is stale when it's older than `METRIC_MAX_AGE` or more than
    `METRIC_MAX_AHEAD` in the future. With a clock read per attempt, a point that was ahead of the
@@ -153,7 +157,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
      `write_all` `Err` after a first write that returned `Ok` stays `Ambiguous`. `Clean` holds
      under TLS even though bytes of the frame may have reached the wire, because the peer then
      holds a truncated frame that it can't decode or forward. The sink keeps the `io::Error` as
-     context and doesn't discard it.
+     context and doesn't discard it. The classification of a `write_all`-remainder failure and of
+     a flush failure is an open question for `sink/w3`: a failure anywhere in the write phase leaves a truncated frame at
+     the peer, so `Clean` may be truthful there too. `sink/w3` settles it after its own review.
 
    The difference between the line sinks and `logit_out` is framing. A line stream has no frame
    boundary the peer waits for: any prefix that ends at a newline is a complete record it
@@ -180,6 +186,12 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - A `Pending` `poll_read` can move a partial record into the session. The session keeps it,
      and a later read completes the record.
    - Dropping a read future loses nothing the session already holds.
+   - A peer's `close_notify` reads as `Ready(Ok)` with an empty buffer.
+   - A peer close without `close_notify` reads as `ErrorKind::UnexpectedEof`.
+   - A poll of an idle TLS 1.3 connection with post-handshake tickets in flight is `Pending`, not
+     an empty `Ready(Ok)`.
+   - A write `Err` can follow ciphertext from the same call reaching the peer.
+   - `write_all` maps an `Ok(0)` write to `ErrorKind::WriteZero`.
    - A fake stream that returns `Ok(0)` under tokio-rustls returns `Pending` and registers no
      waker, so the plaintext seam takes a `FakeStream` and TLS tests take the real pair.
 
@@ -261,8 +273,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
 - `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
-- Left open for later workstreams: the HTTP sinks' `requests` vocabulary, and whether
-  `logit_in`'s `Ack` and `Reject` writes need a flush.
+- Left open for later workstreams: the HTTP sinks' `requests` vocabulary, whether `logit_in`'s
+  `Ack` and `Reject` writes need a flush, and the classification of a `logit_out`
+  `write_all`-remainder or flush failure (decision 6), which `sink/w3` settles.
 
 ## Running it
 
