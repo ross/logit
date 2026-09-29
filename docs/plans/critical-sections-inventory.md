@@ -7648,8 +7648,30 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     request bodies compared, a verdict on a repeat attempt counted, a second batch, a batch after
     one the budget cut off, direct sends after a batch that sent nothing, every builder order
     after decoy handles, and a sink with no handle builders.
-  - Still open, `sink/w7`: `datadog_out` and `datadog_trace_out` count their encode-side counters
-    per attempt (`docs/known-gaps.md`), and `datadog_out` reads its clock per attempt.
+- **Verified (sink/w7), `datadog_out` and `datadog_trace_out`:** findings. The inflation was real
+  in both, and `datadog_out` had a worse defect beside it: it read the wall clock on every
+  attempt, and staleness isn't monotonic in the clock, so a point 11 minutes ahead was dropped as
+  `stale` on one attempt and sent by an attempt two minutes later. `observe_batch` reads the
+  clock once per batch now, and an `Ok` clears it. Before the fix a retried batch read every codec
+  counter, `plan`'s drops, and the `oversized_sketch` and `bad_header` diagnostics twice, and one
+  attempt of a bisected request counted a record's codec counters once per re-encode (23 for nine
+  logs). The fix is per-route units of the same gate, and `CountGate::muted`, which
+  `split_encode` runs every bisection re-encode inside (ADR decision 2's amendment): the landed
+  gate mutes a whole unit, so it couldn't mute the re-encodes alone.
+  - Codec counters for the batch resource and a stats bucket count once per request body, so once
+    per 1,000 traces on `datadog_trace_out`, not once per batch; the codec docs said once per
+    batch, and say per body now.
+  - Both sinks counted `request.bytes` for a refused connection (and `datadog_trace_out` for a
+    missing socket file). They count only a request that got an answer or may have left.
+  - Tests through `drive_write_loop` per sink: a route failing after another was sent, a route
+    first encoded on a retry, bisection on one attempt and a retried one, a per-body counter over
+    two count-capped requests, the clock (a stale-ahead point never sent; the clock read once per
+    batch, and again after an `Ok`), a second batch, a batch after one the budget cut off, direct
+    sends after a batch that sent nothing, both builder orders after decoy handles, no handle
+    builders, a `413` on a repeat attempt, and `request.bytes` on a refused connection.
+  - Recorded in `docs/known-gaps.md`, not fixed: `datadog_trace_out` returns `Clean` for a
+    connect failure after an earlier request of the same `send` was accepted, as `datadog_out`
+    and `otlp_out` do.
 
 ---
 
