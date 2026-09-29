@@ -60,7 +60,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
-| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | in progress (sink/w5): confirmed for every sink, and `datadog_out` also reads its clock per attempt; encode-side counters will count once per batch through a sink-owned gate, and server-verdict drops still repeat per attempt |
+| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | in progress (sink/w5): confirmed for every sink, and `datadog_out` also reads its clock per attempt; encode-side counters will count once per batch through a sink-owned gate, and server-verdict drops still repeat per attempt |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | in progress (sink/w2): confirmed, and statsd and syslog classify an invalid TLS server name as `Clean`; one shared driver replaces the three copies |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
@@ -7325,9 +7325,12 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 - **Correction (2026-09-29, `sink/w0`):** ~~`bind()` is unimplemented (default) for every sink here,
   and only `prometheus_out` overrides it.~~ Two sinks override `bind`: `prometheus_out` (`PrometheusOutput`,
   which delegates to `ExposeOutput` and `RemoteWriteOutput`) and `splunk_hec_out`
-  (`SplunkHecOutput`, which builds its HTTP client and opens nothing). Also confirmed: a grep of
-  `crates/logit-outputs/src` finds no `duplicate_safe` doc that mentions the `buffer.delivery`
-  override, which can change the posture.
+  (`SplunkHecOutput`, which builds its HTTP client and opens nothing). Also confirmed: `buffer.delivery`
+  can override a sink's posture, and a grep for `delivery` across `crates/logit-outputs/src`
+  finds it mentioned only by `otlp_out` and `datadog_trace_out` (in the `duplicate_safe` doc) and by
+  `splunk_hec_out` and `datadog_out` (in the module doc). `statsd_out`, `syslog_out`,
+  `graphite_out`, `collectd_out`, `logit_out`, `influxdb_out`, `prometheus_out`, and `null_out` don't
+  mention it.
 
 ---
 
