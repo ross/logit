@@ -1520,6 +1520,15 @@ kernel took, on an attempt that then failed as well as on one that succeeded: th
 the wire either way. A cancelled attempt counts none of them (`docs/known-gaps.md`). On a stream
 transport the same counters count only a delivered frame.
 
+An attempt the runtime cancels (a budget timeout or the shutdown grace) counts no `requests` and
+none of the counts a dropped future never reaches, and `logit.component.errors` covers it. Its
+`request.duration` timer still records, because a timer records when it drops.
+
+`logit.output.requests` has two vocabularies. The stream and datagram sinks and `logit_out` tag
+one count per attempt with `class=ok|clean|ambiguous|permanent`, the `Fault` taxonomy. The HTTP
+sinks tag one count per request with its status class or `network_error`
+(`docs/known-gaps.md`, "Internal telemetry and self-logging").
+
 ##### `influxdb_out`
 
 `crates/logit-outputs/src/influxdb.rs`.
@@ -1713,8 +1722,8 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   shared `gauge_delta_unresolved`.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
-attempt. The encoder's counters and diagnostics count once per batch; `requests`,
-`records.rejected`, and `otlp_partial_success` once per attempt (the class table above).
+attempt. The class table above says which of this sink's counters count once per batch and which
+once per attempt.
 
 ##### `datadog_out`
 
@@ -1761,8 +1770,8 @@ The codec's own points are the `datadog` codec's, under [Codecs](#codecs), and t
 repeat them. They count once per batch, per route (the class table above). The one to watch here
 is `logit.output.spans.degraded{reason="no_wire_form"}` under `version: v0.4`: the trace chunk and
 tracer payload fields v0.4 can't carry. A tracer header's carrier doesn't count there, because the
-request header carries it. A batch-resource carrier counts once per request of up to 1,000 traces,
-not once per batch.
+request header carries it. A batch-resource carrier counts once per request body (the
+paragraph on Datadog codec counters above).
 
 `Diagnostics` keys, each throttled: `request_rejected` (a non-retryable `4xx`, `3xx`, or `1xx`,
 quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for its size), and

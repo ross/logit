@@ -288,16 +288,14 @@ buffering:
   (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
-- **A retried batch doesn't inflate a sink's drop counters.** On every sink, what the encoder
-  decided (`logit.output.messages.dropped`, `metrics.skipped`, `tags.dropped`, `*.normalized`,
-  `batch.bytes`, `datadog_out`'s `stale` drops, and their diagnostics) counts once per batch,
-  however many attempts it took; no sink counts an encode-side drop per attempt. What an attempt
-  did (`logit.output.requests`, `request.bytes`, `reconnects`, `messages`) counts per attempt, and
-  so does a drop a kernel or a destination decided: a datagram refused as too large
-  (`oversize_datagram`), a Splunk code 6 or Splunk Cloud's oversize answer, an OTLP partial
-  success, a Datadog `413`
+- **A retried batch doesn't inflate a sink's encode-side drop counters, but a drop a peer or the
+  kernel decided repeats.** While a sink retries, counts such as
+  `logit.output.messages.dropped{reason="oversize_datagram"}`, a Splunk code 6, and an OTLP
+  partial success grow with each attempt that meets the same answer, so read them as attempts,
+  not batches. [Internal telemetry](design/internal-telemetry.md#outputs) has the class table
+  that lists every sink counter as once per batch, once per attempt, or repeating
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
-  decision 1). A refused connection counts no `request.bytes`.
+  decision 1).
 
 ### Durable buffering
 
@@ -1058,8 +1056,9 @@ components:
   way, since both take the same connect path. `logit.output.datagrams` exists only under the
   datagram transports, `udp` and `unix`, and there
   `logit.output.messages.dropped{reason="oversize_datagram"}` counts the lines of a datagram the
-  kernel refused as too large (`EMSGSIZE`) under an `ok` request. That count is per attempt, so a
-  batch retried after a later failure counts it again.
+  kernel refused as too large (`EMSGSIZE`) under an `ok` request. The kernel decided that drop, so a
+  retried batch counts it again (see
+  [What to watch for sink buffering](#what-to-watch-for-sink-buffering)).
 - **Over UDP, `endpoint:` needs a real port and `max_packet_bytes:` at most `65507`.** `logit
   validate` rejects port 0, which the kernel refuses every datagram to (rule 73), and a
   `max_packet_bytes:` above 65507, the largest UDP payload (rule 38). A name that resolves to both
@@ -2521,7 +2520,7 @@ version, or a codec or compression this sink didn't offer, fails every attempt `
 `Reject` for a version mismatch: the batch is dropped, and a minute of nothing else ends the
 pipeline. A stock `logit_in` never answers this way; it points at something else on the port.
 
-**Clean close.** `logit_out` shuts its connection down after its last batch, which under TLS sends
+**Clean close.** `logit_out` shuts its connection down when it stops, which under TLS sends
 `close_notify`, and `logit_in` takes a close between frames as the end of a connection, not an
 error, including a TLS peer that went away without `close_notify`. So a `logit_out` restarting or
 reconnecting doesn't show as `connection_error` on the far end.
