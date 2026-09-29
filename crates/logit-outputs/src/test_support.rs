@@ -958,3 +958,39 @@ pub(crate) async fn refused_addr() -> SocketAddr {
     drop(listener);
     addr
 }
+
+/// An [`http_recorder`] that answers the `k`th request (from 0) on each path with
+/// `script(path, k)`, for a sink that sends to several routes and fails one of them.
+pub(crate) async fn per_path_recorder(
+    script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+) -> (SocketAddr, RecordLog) {
+    let per_path: Mutex<std::collections::HashMap<String, usize>> = Mutex::default();
+    http_recorder(move |_, path, _| {
+        let k = {
+            let mut per_path = per_path.lock().unwrap();
+            let seen = per_path.entry(path.to_string()).or_default();
+            *seen += 1;
+            *seen - 1
+        };
+        script(path, k)
+    })
+    .await
+}
+
+/// The path of each request in `log`, in arrival order.
+pub(crate) fn recorded_paths(log: &[Recorded]) -> Vec<&str> {
+    log.iter().map(|r| r.path.as_str()).collect()
+}
+
+/// The bodies of the requests in `log` to `path`, in arrival order.
+pub(crate) fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
+    log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
+}
+
+/// [`fast_retry`] under `delivery: at_least_once`, so an `Ambiguous` failure retries.
+pub(crate) fn at_least_once() -> logit_pipeline::WriteLoopConfig {
+    logit_pipeline::WriteLoopConfig {
+        delivery_override: Some(logit_pipeline::DeliveryPosture::AtLeastOnce),
+        ..fast_retry()
+    }
+}

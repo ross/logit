@@ -1608,13 +1608,14 @@ mod tests {
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decisions 2 and 3) --
 
     use crate::test_support::{
-        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
-        http_recorder, refused_addr, sum_of, sums_through_write_loop, RecordLog, Recorded, Reply,
-        SumSeries, Sums, HUNG_REQUEST_BUDGET,
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
+        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
+        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply, SumSeries, Sums,
+        HUNG_REQUEST_BUDGET,
     };
     use logit_core::{Sum, Temporality};
     use logit_pipeline::test_util::TelemetryProbe;
-    use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
+    use logit_pipeline::WriteLoopConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SERIES: &str = "/api/v2/series";
@@ -1682,27 +1683,6 @@ mod tests {
         }
     }
 
-    /// An intake answering the `k`th request (from 0) on each path with `script(path, k)`.
-    async fn scripted_intake(
-        script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
-    ) -> (SocketAddr, RecordLog) {
-        let per_path: Mutex<HashMap<String, usize>> = Mutex::default();
-        http_recorder(move |_, path, _| {
-            let k = {
-                let mut per_path = per_path.lock().unwrap();
-                let seen = per_path.entry(path.to_string()).or_default();
-                *seen += 1;
-                *seen - 1
-            };
-            script(path, k)
-        })
-        .await
-    }
-
-    fn at_least_once() -> WriteLoopConfig {
-        WriteLoopConfig { delivery_override: Some(DeliveryPosture::AtLeastOnce), ..fast_retry() }
-    }
-
     /// A sink on `probe`'s handles, with uncompressed bodies and every send time [`NOW`].
     fn instrumented(addr: SocketAddr, probe: &TelemetryProbe) -> DatadogOutput {
         let telemetry = probe.telemetry("out", "datadog_out", "sink");
@@ -1714,28 +1694,20 @@ mod tests {
     }
 
     /// `batches` through the write loop under `config`, over the sink `build` makes, against a
-    /// [`scripted_intake`]; and the requests it received.
+    /// [`per_path_recorder`]; and the requests it received.
     async fn run_dd(
         script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
         batches: Vec<EventBatch>,
         config: WriteLoopConfig,
         build: impl FnOnce(SocketAddr, &TelemetryProbe) -> DatadogOutput,
     ) -> (Sums, Vec<Recorded>) {
-        let (addr, log) = scripted_intake(script).await;
+        let (addr, log) = per_path_recorder(script).await;
         let mut probe = TelemetryProbe::new();
         let mut output = build(addr, &probe);
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, config).await;
         let log = log.lock().unwrap().clone();
         (sums, log)
-    }
-
-    fn recorded_paths(log: &[Recorded]) -> Vec<&str> {
-        log.iter().map(|r| r.path.as_str()).collect()
-    }
-
-    fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
-        log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
     }
 
     /// Every request to `path` sent the bytes of the single-attempt run's one request there.
@@ -1895,7 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn a_direct_send_after_a_delivered_batch_reads_the_clock_again() {
         let (clock, reads) = stepping_clock(NOW);
-        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(addr, &probe).with_clock(clock);
         let batches = vec![batch(vec![gauge(NOW)])];
@@ -1940,7 +1912,7 @@ mod tests {
     /// disarmed, so later direct sends count.
     #[tokio::test]
     async fn datadog_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
-        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(addr, &probe);
         assert_direct_sends_count_after_an_empty_batch(
@@ -2003,7 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn a_datadog_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once() {
         let (addr, log) =
-            scripted_intake(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
+            per_path_recorder(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
         let mut probe = TelemetryProbe::new();
         let mut output = sink(addr)
             .with_compression(DatadogCompression::None)
