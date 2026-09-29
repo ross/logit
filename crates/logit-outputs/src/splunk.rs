@@ -128,6 +128,7 @@
 //! `metrics.degraded` by `metric_kind` under `multi_value`, `metrics.normalized`, `tags.dropped`,
 //! `events.skipped`, `spans.degraded`), which this sink doesn't repeat.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
     status_class,
@@ -137,7 +138,7 @@ pub use crate::tls::TlsClientSettings;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output};
 use logit_proto::splunk::response::{
     encode_ack_request, parse_ack_reply, parse_reply, HecReply, HecStatus, SPLUNK_CLOUD_BODY_CAP,
 };
@@ -350,11 +351,16 @@ pub struct SplunkHecOutput {
     /// Built by [`SplunkHecOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
     multi_value: MultiValue,
+    /// Counts through views of `telemetry`/`diag` gated by `accounting`
+    /// ([`SplunkHecOutput::new_encoder`]).
     encoder: SplunkEncoder,
     /// Reused across batches; see [`MessageBuf`]'s `clear`.
     objects: MessageBuf<ObjectMeta>,
+    /// Ungated: everything Splunk's answer decides, and the `max_body_bytes` drop, which
+    /// [`SplunkHecOutput::send_objects`] skips itself on a repeat encode.
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl SplunkHecOutput {
@@ -370,7 +376,7 @@ impl SplunkHecOutput {
             })?;
         authorization.set_sensitive(true);
         let endpoint = endpoint.into().trim_end_matches('/').to_string();
-        Ok(Self {
+        let mut output = Self {
             endpoint,
             token: token.to_string(),
             authorization,
@@ -388,7 +394,10 @@ impl SplunkHecOutput {
             objects: MessageBuf::default(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-        })
+            accounting: BatchAccounting::default(),
+        };
+        output.encoder = output.new_encoder();
+        Ok(output)
     }
 
     pub fn with_compression(mut self, compression: SplunkCompression) -> Self {
@@ -457,10 +466,14 @@ impl SplunkHecOutput {
         self
     }
 
+    /// The encoder, on views of this sink's handles gated by its batch accounting, so a retried
+    /// batch counts the codec's drops once (`crate::accounting`). `new` and every builder that
+    /// changes what the encoder holds call this, so no builder order leaves it ungated.
     fn new_encoder(&self) -> SplunkEncoder {
+        let gate = self.accounting.gate();
         SplunkEncoder::new()
-            .with_telemetry(self.telemetry.clone())
-            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.gated(gate))
+            .with_diagnostics(self.diag.gated(gate))
             .with_multi_value(self.multi_value)
     }
 
@@ -794,12 +807,21 @@ impl SplunkHecOutput {
         .map_err(|err| err.context(Fault::Ambiguous))
     }
 
-    /// Packs `objects` into bodies and sends them (module doc's "Requests").
-    async fn send_objects(&mut self, objects: &MessageBuf<ObjectMeta>) -> anyhow::Result<()> {
+    /// Packs `objects` into bodies and sends them (module doc's "Requests"). The `max_body_bytes`
+    /// drop is decided before the first request, so it is encode-side: counted and diagnosed
+    /// only on the batch's `first` encode.
+    async fn send_objects(
+        &mut self,
+        objects: &MessageBuf<ObjectMeta>,
+        first: bool,
+    ) -> anyhow::Result<()> {
         let mut sendable: Vec<Object<'_>> = Vec::with_capacity(objects.len());
         for (bytes, meta) in objects.iter_with() {
             if bytes.len() <= self.max_body_bytes {
                 sendable.push((bytes, meta.records));
+                continue;
+            }
+            if !first {
                 continue;
             }
             self.telemetry.count(RECORDS_DROPPED, meta.records as f64, &[("reason", "oversize")]);
@@ -821,6 +843,18 @@ impl SplunkHecOutput {
         }
         Ok(())
     }
+
+    /// Every body sequentially, then acknowledgment; the first failure aborts the rest (module
+    /// doc's "Faults, retries, and duplicate safety"). The encode is unit 0 of the batch
+    /// accounting.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let mut objects = std::mem::take(&mut self.objects);
+        let (first, ()) =
+            self.accounting.encode(0, || self.encoder.encode_objects(batch, &mut objects));
+        let result = self.send_objects(&objects, first).await;
+        self.objects = objects;
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -831,14 +865,16 @@ impl Output for SplunkHecOutput {
         Ok(())
     }
 
-    /// Every body sequentially, then acknowledgment; the first failure aborts the rest (module
-    /// doc's "Faults, retries, and duplicate safety").
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`SplunkHecOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that sent nothing included.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let mut objects = std::mem::take(&mut self.objects);
-        self.encoder.encode_objects(batch, &mut objects);
-        let result = self.send_objects(&objects).await;
-        self.objects = objects;
-        result
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `false`: the module doc's "Faults, retries, and duplicate safety" says why.
@@ -1707,5 +1743,264 @@ mod tests {
         assert!(!SplunkHecOutput::new("http://h/services/collector", TOKEN)
             .unwrap()
             .duplicate_safe());
+    }
+
+    // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) --------
+
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        http_recorder, sum_of, sums_through_write_loop, RecordLog, Reply, SumSeries, Sums,
+    };
+    use logit_pipeline::test_util::TelemetryProbe;
+
+    /// The `max_body_bytes` of the sinks below: the 2000-byte log of [`encode_side_batch`] is
+    /// over it, and every other object fits.
+    const MAX_BODY: usize = 1_000;
+
+    fn histogram_event() -> Event {
+        let histogram = MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 2), (5.0, 3)],
+            temporality: Temporality::Cumulative,
+            sum: Some(9.0),
+            min: None,
+            max: None,
+        });
+        Event::metric(TS, AttrMap::new(), MetricRecord::new(intern("latency"), histogram))
+    }
+
+    /// A blank log the codec skips with its diagnostic, and a histogram `multi_value: skip`
+    /// drops: a batch that sends no request.
+    fn nothing_to_send_batch() -> EventBatch {
+        batch(vec![log_event(""), histogram_event()])
+    }
+
+    /// A log that is sent, a log over [`MAX_BODY`] the sink drops as oversize before sending,
+    /// and [`nothing_to_send_batch`]'s two.
+    fn encode_side_batch() -> EventBatch {
+        let mut b = nothing_to_send_batch();
+        b.events.push(log_event("kept"));
+        b.events.push(log_event(&"x".repeat(2_000)));
+        b
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 5] = [
+        ("logit.output.events.skipped", &[("reason", "blank_event")]),
+        ("logit.component.diagnostics", &[("key", "blank_event")]),
+        ("logit.output.metrics.skipped", &[("metric_kind", "histogram")]),
+        (RECORDS_DROPPED, &[("reason", "oversize")]),
+        ("logit.component.diagnostics", &[("key", "oversize")]),
+    ];
+
+    /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
+    const PER_ATTEMPT: [SumSeries<'static>; 1] = [(REQUEST_BYTES, &[])];
+
+    /// How a [`scripted_hec`] collector answers one request.
+    #[derive(Clone, Copy)]
+    enum Hec {
+        Accept,
+        /// `503` code 9, before any body of the `send` was accepted: `Fault::Clean`.
+        Busy,
+        /// `400` code 6 naming object `n`.
+        Invalid(u64),
+        Hang,
+    }
+
+    /// A collector answering the `n`th request by `script[n]`, the last to every later one.
+    async fn scripted_hec(script: &'static [Hec]) -> (SocketAddr, RecordLog) {
+        http_recorder(move |n, _, _| match script[n.min(script.len() - 1)] {
+            Hec::Accept => Reply::Answer(200, encode_success(None)),
+            Hec::Busy => Reply::Answer(503, encode_status_body(9, None)),
+            Hec::Invalid(n) => Reply::Answer(400, encode_status_body(6, Some(n))),
+            Hec::Hang => Reply::Hang,
+        })
+        .await
+    }
+
+    fn instrumented_hec(addr: SocketAddr, probe: &TelemetryProbe) -> SplunkHecOutput {
+        let telemetry = probe.telemetry("out", "splunk_hec_out", "sink");
+        sink(addr)
+            .with_max_body_bytes(MAX_BODY)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    /// `batch` through the write loop over the sink `build` makes, against [`scripted_hec`]; and
+    /// the request bodies it received, each on `/event`.
+    async fn run_hec(
+        script: &'static [Hec],
+        batch: EventBatch,
+        build: impl FnOnce(SocketAddr, &TelemetryProbe) -> SplunkHecOutput,
+    ) -> (Sums, Vec<Vec<u8>>) {
+        let (addr, log) = scripted_hec(script).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = build(addr, &probe);
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "splunk_hec_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
+        let log = log.lock().unwrap();
+        assert!(log.iter().all(|r| r.path == "/services/collector/event"), "{log:?}");
+        (sums, log.iter().map(|r| r.body.clone()).collect())
+    }
+
+    const EVENT_5XX: [(&str, &str); 2] = [("route", "event"), ("class", "5xx")];
+    const EVENT_2XX: [(&str, &str); 2] = [("route", "event"), ("class", "2xx")];
+
+    /// A busy answer then an accepted one: delivered on the second attempt, with every
+    /// encode-side counter and diagnostic read as after one attempt, the local oversize drop
+    /// included, the second request's body the first's, and `request.bytes` counting both.
+    #[tokio::test]
+    async fn a_hec_retry_counts_encode_side_counters_once() {
+        let (single, one) = run_hec(&[Hec::Accept], encode_side_batch(), instrumented_hec).await;
+        let script = &[Hec::Busy, Hec::Accept];
+        let (retried, bodies) = run_hec(script, encode_side_batch(), instrumented_hec).await;
+        assert_eq!(sum_of(&single, REQUESTS, &EVENT_2XX), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &EVENT_5XX), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &EVENT_2XX), 1.0);
+        assert_eq!(bodies.len(), 2, "one request per attempt");
+        assert_eq!(bodies[0], bodies[1], "the retry sends the first attempt's bytes");
+        assert_eq!(one[0], bodies[1]);
+        let bytes = sum_of(&single, REQUEST_BYTES, &[]);
+        assert_eq!(sum_of(&retried, REQUEST_BYTES, &[]), 2.0 * bytes);
+        assert_eq!(sum_of(&retried, RECORDS, &[]), 1.0);
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// A code 6 answered on a retry is Splunk's verdict on that attempt: counted, diagnosed, and
+    /// resent without the named object, through the sink's ungated handles.
+    #[tokio::test]
+    async fn a_code_6_answered_on_a_retry_is_counted() {
+        let script = &[Hec::Busy, Hec::Invalid(1), Hec::Accept];
+        let (sums, bodies) = run_hec(script, logs(3), instrumented_hec).await;
+        assert_eq!(bodies.len(), 3, "busy, the code 6, and the resend");
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "invalid_event")]), 1.0);
+        assert_eq!(sum_of(&sums, REQUESTS_REJECTED, &[("code", "6")]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.diagnostics", &[("key", "invalid_event")]), 1.0);
+        assert_eq!(sum_of(&sums, RECORDS, &[]), 2.0);
+    }
+
+    /// The gate re-arms per batch: a second batch counts as the first did.
+    #[tokio::test]
+    async fn a_second_hec_batch_counts_its_encode_side_counters() {
+        let (addr, _log) = scripted_hec(&[Hec::Accept]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_hec(addr, &probe);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "splunk_hec_out",
+            batches,
+            fast_retry(),
+        )
+        .await;
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
+    /// the next batch counts its encode-side counters.
+    #[tokio::test]
+    async fn a_hec_batch_after_one_dropped_at_its_budget_counts_encode_side() {
+        let (addr, log) = scripted_hec(&[Hec::Hang, Hec::Accept]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_hec(addr, &probe);
+        let mut config = fast_retry();
+        config.retry.total_budget = Duration::from_secs(2);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "splunk_hec_out", batches, config)
+                .await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch that sends no request returns `Ok` early and leaves the accounting disarmed, so
+    /// later direct sends count.
+    #[tokio::test]
+    async fn hec_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
+        let (addr, log) = scripted_hec(&[Hec::Accept]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_hec(addr, &probe);
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "splunk_hec_out",
+            nothing_to_send_batch(),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 2, "the two direct sends, and nothing before them");
+    }
+
+    /// One of the three builders that rebuild the encoder.
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        MultiValue,
+        Diagnostics,
+        Telemetry,
+    }
+
+    /// Every order of the three encoder-building builders, each after a first call with other
+    /// values, leaves the encoder counting through gated views of the last handles and on the
+    /// last `multi_value`.
+    #[tokio::test]
+    async fn every_hec_builder_order_gates_the_encoder_on_the_final_handles() {
+        use Builder::{Diagnostics as D, MultiValue as M, Telemetry as T};
+        let orders = [[M, D, T], [M, T, D], [D, M, T], [D, T, M], [T, M, D], [T, D, M]];
+        for order in orders {
+            let decoy = Registry::new();
+            let build = |addr: SocketAddr, probe: &TelemetryProbe| -> SplunkHecOutput {
+                let other = decoy.telemetry_for("other", "splunk_hec_out", "sink");
+                let mut sink = sink(addr)
+                    .with_max_body_bytes(MAX_BODY)
+                    .with_multi_value(MultiValue::Expand)
+                    .with_telemetry(other.clone())
+                    .with_diagnostics(Diagnostics::new("other").with_telemetry(other));
+                let telemetry = probe.telemetry("out", "splunk_hec_out", "sink");
+                for builder in order {
+                    sink = match builder {
+                        Builder::MultiValue => sink.with_multi_value(MultiValue::Skip),
+                        Builder::Diagnostics => sink.with_diagnostics(
+                            Diagnostics::new("out").with_telemetry(telemetry.clone()),
+                        ),
+                        Builder::Telemetry => sink.with_telemetry(telemetry.clone()),
+                    };
+                }
+                sink
+            };
+            let (single, _) = run_hec(&[Hec::Accept], encode_side_batch(), build).await;
+            let script = &[Hec::Busy, Hec::Accept];
+            let (retried, _) = run_hec(script, encode_side_batch(), build).await;
+            assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+            let stale = decoy.drain(0).iter().map(|e| e.metrics.len()).sum::<usize>();
+            assert_eq!(stale, 0, "{order:?}: nothing counts through a replaced handle");
+        }
+    }
+
+    /// With no handle builders, the encoder's diagnostics share the sink's throttle and are gated
+    /// too: a retried batch reports its codec diagnostic and its local oversize drop once.
+    #[tokio::test]
+    async fn a_hec_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once() {
+        let (addr, log) = scripted_hec(&[Hec::Busy, Hec::Accept]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = sink(addr).with_max_body_bytes(MAX_BODY);
+        let batches = vec![encode_side_batch()];
+        sums_through_write_loop(&mut output, &mut probe, "splunk_hec_out", batches, fast_retry())
+            .await;
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert_eq!(output.diag.occurrences("blank_event"), 1);
+        assert_eq!(output.diag.occurrences("oversize"), 1);
     }
 }
