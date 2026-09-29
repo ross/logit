@@ -168,7 +168,7 @@
 //! |---|---|
 //! | `logit.output.requests{route, class}` | one per request; `class` is [`crate::http::status_class`]'s, or `network_error` |
 //! | `logit.output.request.duration{route}` | one timer per request |
-//! | `logit.output.request.bytes{route}` | the body as sent, after compression |
+//! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; not for a refused connection |
 //! | `logit.output.records{route}` | entries in a request Datadog accepted |
 //! | `logit.output.records.dropped{route, reason}` | `stale`, `oversize`, `needs_agent_processing`, `not_datadog_origin`, as above |
 //!
@@ -839,6 +839,8 @@ impl DatadogOutput {
     }
 
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
+    /// `request.bytes` counts a request that may have left: any answer, and any error but a
+    /// [`Fault::Clean`] one, which never connected.
     async fn post(&mut self, route: Route, encoded: Encoded, entries: usize) -> anyhow::Result<()> {
         let url = self.url(route);
         let tags = [("route", route.name())];
@@ -853,20 +855,23 @@ impl DatadogOutput {
             .send()
             .await;
         timer.stop(&tags);
-        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
 
         let response = match result {
             Ok(response) => response,
             Err(err) => {
+                let fault = classify_reqwest_error(&err);
+                if fault != Fault::Clean {
+                    self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
+                }
                 self.telemetry.count(
                     REQUESTS,
                     1.0,
                     &[("route", route.name()), ("class", "network_error")],
                 );
-                let fault = classify_reqwest_error(&err);
                 return Err(anyhow::Error::new(err)).context(fault);
             }
         };
+        self.telemetry.count(REQUEST_BYTES, wire_len as f64, &tags);
         let status = response.status();
         self.telemetry.count(
             REQUESTS,
@@ -1604,8 +1609,8 @@ mod tests {
 
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
-        http_recorder, sum_of, sums_through_write_loop, RecordLog, Recorded, Reply, SumSeries,
-        Sums,
+        http_recorder, refused_addr, sum_of, sums_through_write_loop, RecordLog, Recorded, Reply,
+        SumSeries, Sums,
     };
     use logit_core::{Sum, Temporality};
     use logit_pipeline::test_util::TelemetryProbe;
@@ -2044,5 +2049,40 @@ mod tests {
         assert_eq!(sum_of(&sums, RECORDS_DROPPED, &oversize), 2.0);
         let rejected = [("key", "request_rejected")];
         assert_eq!(sum_of(&sums, "logit.component.diagnostics", &rejected), 1.0);
+    }
+
+    // ---- request.bytes -----------------------------------------------------------------------
+
+    /// A refused connection sent nothing, so it counts no `request.bytes`, only its request.
+    #[tokio::test]
+    async fn a_refused_connection_counts_no_request_bytes() {
+        let (registry, mut out) = metered(refused_addr().await);
+        let err = out.send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        let points = registry.drain(0);
+        assert_eq!(total(&points, REQUEST_BYTES, &[]), 0.0);
+        let refused = [("route", "series"), ("class", "network_error")];
+        assert_eq!(total(&points, REQUESTS, &refused), 1.0);
+    }
+
+    /// A request that got an answer counts the body as sent, and so does one that timed out,
+    /// which may have reached the intake.
+    #[tokio::test]
+    async fn an_answered_or_timed_out_request_counts_its_bytes() {
+        let (addr, log) = accepting().await;
+        let (registry, out) = metered(addr);
+        let mut out = out.with_compression(DatadogCompression::None);
+        out.send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap();
+        let sent = log.lock().unwrap()[0].body.len() as f64;
+        assert_eq!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "series")]), sent);
+
+        let (addr, _log) = http_recorder(|_, _, _| Reply::Hang).await;
+        let (registry, out) = metered(addr);
+        // The recorder never answers, so the timeout ends the request whatever its length: 100 ms
+        // bounds only how long the test waits, and a loaded machine can't make it fire early.
+        let mut out = out.with_timeout(Duration::from_millis(100));
+        let err = out.send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert!(total(&registry.drain(0), REQUEST_BYTES, &[("route", "series")]) > 0.0);
     }
 }
