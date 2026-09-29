@@ -164,9 +164,13 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
    A changing verdict would break decision 2 too: the plan decides which items each route holds,
    and a route re-encoded muted on attempt 2 would then hold items its attempt-1 encode never
-   counted. `observe_batch` reads the clock once and stores the send time; `send` reads the stored
-   one, or the clock when nothing armed the batch; an `Ok` clears it, where the gate disarms, so a
-   later `send` with no `observe_batch` reads the clock again. The send time is read only by the
+   counted. `observe_batch` reads the clock once and stores the send time; every attempt at the
+   batch reads the stored one; an `Ok` clears it, where the gate disarms, and the next
+   `observe_batch` replaces it. A `send` with no `observe_batch` reads the clock itself only when no
+   earlier batch left a time behind: after a batch whose last attempt failed, the sink can't tell a
+   final attempt from one the runtime will retry, so the time stays, as the armed gate does
+   (`docs/known-gaps.md`). The runtime calls `observe_batch` before every batch, so no shipped
+   path reaches that case. The send time is read only by the
    plan's stale filter: no payload, header, or sketch carries it. `datadog_trace_out` has no
    clock-dependent drop. (Amended by `sink/w7`.)
 4. **`logit.output.requests` counts every attempt that returns, tagged

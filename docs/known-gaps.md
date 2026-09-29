@@ -1364,6 +1364,22 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Suppressing it would need the codec to defer its counts until the request is accepted.
   - **Consequence:** the degradation counters of a route that also drops oversize records read
     high by those records.
+- **A sink sent to again without `observe_batch`, after a batch whose last attempt failed, keeps
+  that batch's state.** `observe_batch` arms the attempt gate of every sink that has one, and on
+  `datadog_out` it also fixes the batch's send time; only an `Ok` disarms the gate and clears the
+  time, because the sink can't tell a final failed attempt from one the runtime will retry
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+  decisions 2 and 3). A caller that then calls `send` with a new batch and no `observe_batch`
+  finds the gate armed, so the new batch's encode-side counts for units the failed batch encoded
+  are muted, and on `datadog_out` measures the stale windows from the failed batch's send time.
+  - **Consequence:** none on a shipped path. `write_loop` calls `observe_batch` before every
+    batch, which re-arms the gate and replaces the time. `logit_pipeline::send_batch`, which the
+    benchmarks use, is the one caller that skips it, and it sends to fresh sinks.
+  - **Fix, if a caller ever needs it:** a runtime signal that a batch ended (an `Output` method,
+    which decision 2 declined to add). A sink can't clear on `Err` without breaking the reuse the
+    retries need.
+  - `datadog::tests::a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate`
+    pins the behavior, so a change to it is noticed.
 
 ## Splunk
 

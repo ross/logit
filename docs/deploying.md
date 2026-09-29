@@ -1688,7 +1688,9 @@ because Datadog's events route answers any compressed body `400 Invalid JSON str
 
 **Stale data is dropped before sending.** Datadog documents a window for each kind of data and
 discards data outside it, so `datadog_out` drops it and counts
-`logit.output.records.dropped{reason="stale"}`, measured from the moment of sending:
+`logit.output.records.dropped{reason="stale"}`, measured from one send time per batch, read when
+the batch is first tried, so every retry of it drops the same points (and a batch retried for up
+to `retry_budget` can send a point that far past its window):
 
 | Data | Dropped when |
 |---|---|

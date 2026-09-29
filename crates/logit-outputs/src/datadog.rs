@@ -77,7 +77,9 @@
 //! The send time is read once per batch, in `observe_batch`, and every attempt at the batch
 //! measures from it: staleness isn't monotonic in the clock (a point too far ahead becomes fresh),
 //! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
-//! clears it; a `send` with no `observe_batch` reads the clock itself. A batch retried for
+//! clears it, and the next `observe_batch` replaces it. A `send` with no `observe_batch` reads the
+//! clock itself only when no earlier batch left a time behind: after a batch whose last attempt
+//! failed, it reuses that batch's time (`docs/known-gaps.md`). A batch retried for
 //! `retry_budget` can send a point up to that long past its window.
 //!
 //! The series window is the documented one, and stricter than the intake, which stored older
@@ -110,8 +112,8 @@
 //! `oversize` diagnostic. The re-encodes of a bisection count nothing ([`split_encode`]), so an
 //! event's encoder counters (`metrics.degraded`, say) count once per event, at its first encode
 //! (that of the count-capped request it fell in), even within a single attempt; an event the
-//! encoder degraded and the bisection then dropped counts under both. Datadog's 1 MB per-log limit isn't enforced here: the intake truncates such
-//! a log and still accepts it.
+//! encoder degraded and the bisection then dropped counts under both. Datadog's 1 MB per-log
+//! limit isn't enforced here: the intake truncates such a log and still accepts it.
 //!
 //! The series wire limit is the intake's: a 512,180 B gzip body drew `413` ("limit=512 kB"). The
 //! intake enforced none of the others at the sizes tried (distribution points: 1,052,533 B gzip
@@ -564,7 +566,8 @@ pub struct DatadogOutput {
     telemetry: Telemetry,
     accounting: BatchAccounting,
     /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
-    /// reaches the same stale verdict; cleared by an `Ok`. `None` reads the clock per `send`.
+    /// reaches the same stale verdict; cleared by an `Ok`, replaced by the next `observe_batch`.
+    /// `None` reads the clock per `send`.
     batch_now: Option<i64>,
     /// [`now_nanos`], or a test's scripted clock.
     clock: Clock,
@@ -933,8 +936,8 @@ impl Output for DatadogOutput {
     }
 
     /// One request per route the batch needs, sequentially; the first failure aborts the rest
-    /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one
-    /// `observe_batch` fixed, or the clock's when nothing armed the batch.
+    /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one the last
+    /// `observe_batch` fixed until an `Ok` clears it, else the clock's.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
@@ -1608,13 +1611,14 @@ mod tests {
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decisions 2 and 3) --
 
     use crate::test_support::{
-        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
-        http_recorder, refused_addr, sum_of, sums_through_write_loop, RecordLog, Recorded, Reply,
-        SumSeries, Sums, HUNG_REQUEST_BUDGET,
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
+        at_least_once, bodies, fast_retry, http_recorder, per_path_recorder, recorded_paths,
+        refused_addr, sum_of, sums_through_write_loop, Recorded, Reply, SumSeries, Sums,
+        HUNG_REQUEST_BUDGET,
     };
     use logit_core::{Sum, Temporality};
     use logit_pipeline::test_util::TelemetryProbe;
-    use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
+    use logit_pipeline::WriteLoopConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SERIES: &str = "/api/v2/series";
@@ -1682,27 +1686,6 @@ mod tests {
         }
     }
 
-    /// An intake answering the `k`th request (from 0) on each path with `script(path, k)`.
-    async fn scripted_intake(
-        script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
-    ) -> (SocketAddr, RecordLog) {
-        let per_path: Mutex<HashMap<String, usize>> = Mutex::default();
-        http_recorder(move |_, path, _| {
-            let k = {
-                let mut per_path = per_path.lock().unwrap();
-                let seen = per_path.entry(path.to_string()).or_default();
-                *seen += 1;
-                *seen - 1
-            };
-            script(path, k)
-        })
-        .await
-    }
-
-    fn at_least_once() -> WriteLoopConfig {
-        WriteLoopConfig { delivery_override: Some(DeliveryPosture::AtLeastOnce), ..fast_retry() }
-    }
-
     /// A sink on `probe`'s handles, with uncompressed bodies and every send time [`NOW`].
     fn instrumented(addr: SocketAddr, probe: &TelemetryProbe) -> DatadogOutput {
         let telemetry = probe.telemetry("out", "datadog_out", "sink");
@@ -1714,28 +1697,20 @@ mod tests {
     }
 
     /// `batches` through the write loop under `config`, over the sink `build` makes, against a
-    /// [`scripted_intake`]; and the requests it received.
+    /// [`per_path_recorder`]; and the requests it received.
     async fn run_dd(
         script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
         batches: Vec<EventBatch>,
         config: WriteLoopConfig,
         build: impl FnOnce(SocketAddr, &TelemetryProbe) -> DatadogOutput,
     ) -> (Sums, Vec<Recorded>) {
-        let (addr, log) = scripted_intake(script).await;
+        let (addr, log) = per_path_recorder(script).await;
         let mut probe = TelemetryProbe::new();
         let mut output = build(addr, &probe);
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, config).await;
         let log = log.lock().unwrap().clone();
         (sums, log)
-    }
-
-    fn recorded_paths(log: &[Recorded]) -> Vec<&str> {
-        log.iter().map(|r| r.path.as_str()).collect()
-    }
-
-    fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
-        log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
     }
 
     /// Every request to `path` sent the bytes of the single-attempt run's one request there.
@@ -1895,7 +1870,7 @@ mod tests {
     #[tokio::test]
     async fn a_direct_send_after_a_delivered_batch_reads_the_clock_again() {
         let (clock, reads) = stepping_clock(NOW);
-        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(addr, &probe).with_clock(clock);
         let batches = vec![batch(vec![gauge(NOW)])];
@@ -1907,6 +1882,84 @@ mod tests {
         let log = log.lock().unwrap().clone();
         assert_eq!(series_points(&log), [vec![NOW], vec![ahead]]);
         assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
+    }
+
+    /// Two batches through the write loop: the first's series request answers `first()` and the
+    /// batch is dropped; the second holds one point 11 min ahead of `NOW`. [`stepping_clock`]
+    /// reads `NOW` for the first batch and `NOW + 2 min` for the second. Against
+    /// `METRIC_MAX_AHEAD` (10 min) the point is 11 min ahead of the first reading, stale, and 9
+    /// min ahead of the second, fresh. `observe_batch` replaces the dropped batch's send time, so
+    /// the point is sent, nothing is counted `stale`, and the clock is read once per batch.
+    async fn assert_a_batch_after_a_dropped_one_reads_the_clock_again(
+        first: fn() -> Reply,
+        config: WriteLoopConfig,
+    ) {
+        let (clock, reads) = stepping_clock(NOW);
+        let script = move |p: &str, k| if p == SERIES && k == 0 { first() } else { accepted(p) };
+        let ahead = NOW + 11 * MINUTE;
+        let batches = vec![batch(vec![gauge(NOW)]), batch(vec![gauge(ahead)])];
+        let build = |addr, probe: &TelemetryProbe| instrumented(addr, probe).with_clock(clock);
+        let (sums, log) = run_dd(script, batches, config, build).await;
+
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(series_points(&log), [vec![NOW], vec![ahead]], "the second point is sent");
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 0.0);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
+    }
+
+    /// The first batch's request never answers, and the retry budget drops it.
+    #[tokio::test]
+    async fn a_batch_after_one_dropped_at_its_budget_reads_the_clock_again() {
+        let mut config = fast_retry();
+        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+        assert_a_batch_after_a_dropped_one_reads_the_clock_again(|| Reply::Hang, config).await;
+    }
+
+    /// The first batch's request is answered `400`, a permanent failure that drops it at once,
+    /// with no real time involved.
+    #[tokio::test]
+    async fn a_batch_after_one_rejected_permanently_reads_the_clock_again() {
+        let rejected = || Reply::Answer(400, b"bad request".to_vec());
+        assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
+    }
+
+    /// Pins a documented corner (`docs/known-gaps.md`): after a batch whose last attempt failed,
+    /// a `send` with no `observe_batch` reuses that batch's send time and finds the gate armed.
+    /// The failed batch fixed `NOW`, so the direct send's point 11 min ahead is stale there and
+    /// dropped (it would be fresh at the clock's next reading, `NOW + 2 min`), and its `stale`
+    /// drop is muted, since the failed batch already encoded the plan's unit. Its `Ok` clears
+    /// both, so the next direct send reads the clock and sends the same point.
+    #[tokio::test]
+    async fn a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate() {
+        let (clock, reads) = stepping_clock(NOW);
+        let rejected_first = |p: &str, k| {
+            if p == SERIES && k == 0 {
+                Reply::Answer(400, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
+        let (addr, log) = per_path_recorder(rejected_first).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe).with_clock(clock);
+        let batches = vec![batch(vec![gauge(NOW)])];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, fast_retry())
+                .await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+
+        let ahead = NOW + 11 * MINUTE;
+        output.send(&batch(vec![gauge(ahead)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the failed batch's time is reused");
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW]], "the point is dropped");
+        let sums: Sums =
+            probe.poll().sums().map(|(n, t, v)| ((n.to_string(), t.to_vec()), v)).collect();
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 0.0, "and muted");
+
+        output.send(&batch(vec![gauge(ahead)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW], vec![ahead]]);
     }
 
     /// The gate re-arms per batch: a second batch counts as the first did.
@@ -1940,7 +1993,7 @@ mod tests {
     /// disarmed, so later direct sends count.
     #[tokio::test]
     async fn datadog_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
-        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(addr, &probe);
         assert_direct_sends_count_after_an_empty_batch(
@@ -2003,7 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn a_datadog_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once() {
         let (addr, log) =
-            scripted_intake(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
+            per_path_recorder(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
         let mut probe = TelemetryProbe::new();
         let mut output = sink(addr)
             .with_compression(DatadogCompression::None)
