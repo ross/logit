@@ -484,7 +484,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         return close_idle(&mut stream, &telemetry, idle, handshake_timeout).await
                     }
                     Err(HeaderReadError::Truncated(err)) => {
-                        telemetry.count("logit.proto.errors", 1.0, &[("reason", "truncated_header")]);
+                        let reason = [("reason", "truncated_header")];
+                        telemetry.count("logit.proto.errors", 1.0, &reason);
                         return Err(err);
                     }
                     Err(err) => return Err(err.into_inner()),
@@ -666,8 +667,9 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         else {
             anyhow::bail!("connection closed before sending Hello");
         };
-        // `None`: the whole `Hello` read is already inside `handshake_timeout`.
-        read_frame_body(stream, header_buf, max_frame_bytes, None)
+        // A control message, so bounded by the control cap, not `max_frame_bytes`; an over-cap
+        // header fails like any bad `Hello`. `None`: the whole read is inside `handshake_timeout`.
+        read_frame_body(stream, header_buf, control::MAX_CONTROL_MESSAGE_BYTES, None)
             .await
             .map_err(FrameReadError::into_inner)
     });
@@ -2363,8 +2365,8 @@ mod tests {
     }
 
     /// A TLS write returns with ciphertext still queued in the session, and this listener's
-    /// waiting read never sends it. Over a 16-byte pipe, a `HelloAck` or `Ack` reaches the client only
-    /// because [`write_control`] flushes it.
+    /// waiting read never sends it. Over a 16-byte pipe, a `HelloAck` or `Ack` reaches the client
+    /// only because [`write_control`] flushes it.
     #[tokio::test]
     async fn hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record() {
         let (mut client, server) = tls_duplex(16).await;
@@ -2735,6 +2737,60 @@ mod tests {
             })
             .await;
         assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 2.0);
+    }
+
+    /// A `Hello` is read against the control-message cap, not `max_frame_bytes`: one at the cap,
+    /// padded with a field a later protocol version might add, is answered `HelloAck`, and a header
+    /// declaring one byte more closes the connection before any body is read, counted as a
+    /// handshake error like any other bad `Hello`.
+    #[tokio::test]
+    async fn a_hello_is_bounded_by_the_control_message_cap() {
+        let cap = control::MAX_CONTROL_MESSAGE_BYTES as usize;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // Far longer than the test waits: the close must come from the cap, not a timeout.
+        let mut input =
+            input.with_telemetry(telemetry).with_handshake_timeout(Duration::from_secs(30));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // `hello_v1` padded with unknown field 99: tag, a 2-byte uvarint length, then bytes.
+        let mut payload = BytesMut::from(&hello_v1().encode()[..]);
+        let pad = cap - payload.len() - 3;
+        payload.extend_from_slice(&[99, (pad as u8 & 0x7f) | 0x80, (pad >> 7) as u8]);
+        payload.extend_from_slice(&vec![0u8; pad]);
+        assert_eq!(payload.len(), cap);
+
+        let mut at_cap = connect(&addr).await;
+        let framed =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                .unwrap();
+        at_cap.write_all(&framed).await.unwrap();
+        match read_control_response(&mut at_cap).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V1)
+            }
+            other => panic!("expected HelloAck at the cap, got {other:?}"),
+        }
+
+        payload.extend_from_slice(&[0]);
+        let over =
+            frame::write_frame_with_flags(0, Compression::None, frame::FLAG_CONTROL, &payload)
+                .unwrap();
+        let mut over_cap = connect(&addr).await;
+        // The header alone: a listener that waited for the body would hold the connection open.
+        over_cap.write_all(&over[..frame::HEADER_LEN]).await.unwrap();
+        expect_closed(&mut over_cap, "a Hello header over the control-message cap").await;
+
+        let mut probe = TelemetryProbe::with_registry(registry);
+        let totals = probe
+            .wait_for("the oversized Hello counted", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) >= 1.0
+            })
+            .await;
+        assert_eq!(totals.sum("logit.proto.errors", &[("reason", "handshake")]), 1.0);
+        drop(at_cap);
     }
 
     /// A connection turned away at the cap holds no permit: with the cap at 1, the rejected
