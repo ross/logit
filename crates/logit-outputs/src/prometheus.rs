@@ -2847,7 +2847,7 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_sender(&format!("http://{addr}/api/v1/write"), &probe);
         let mut config = fast_retry();
-        config.retry.total_budget = Duration::from_secs(2);
+        config.retry.total_budget = crate::test_support::HUNG_REQUEST_BUDGET;
         let batches = vec![encode_side_batch(), encode_side_batch()];
         let sums =
             sums_through_write_loop(&mut output, &mut probe, "prometheus_out", batches, config)
