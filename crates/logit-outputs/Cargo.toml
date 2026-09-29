@@ -57,3 +57,5 @@ tracing-subscriber.workspace = true
 proptest.workspace = true
 # `ndjson`'s test that every line it writes parses as JSON.
 serde_json.workspace = true
+# `test-util` for the paused-clock TLS handshake timeout test in `stream.rs`.
+tokio = { workspace = true, features = ["test-util"] }

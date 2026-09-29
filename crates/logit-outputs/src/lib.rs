@@ -20,6 +20,7 @@ pub mod prometheus;
 pub mod splunk;
 pub mod statsd;
 pub mod stdio;
+mod stream;
 #[cfg(test)]
 mod stream_pins;
 pub mod syslog;
