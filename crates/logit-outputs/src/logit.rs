@@ -81,7 +81,8 @@ pub use crate::tls::TlsClientSettings;
 
 // Shared with the pooled line sinks: the dial (`crate::stream`), the plain-or-TLS stream
 // erasure, and the probe of a reused connection.
-use crate::stream::{count_request, Dial, Target, TlsTarget};
+use crate::count_request;
+use crate::stream::{Dial, Target, TlsTarget};
 use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
 
 /// A live, handshaken connection.

@@ -16,19 +16,23 @@
 //!
 //! ## Config
 //!
-//! - `endpoint`: `host:port`, resolved once per batch, never at config load.
+//! - `endpoint`: `host:port`, resolved once per batch, never at config load; on UDP, sent to the
+//!   first IPv4 address it resolves to, else the first IPv6 one.
 //! - `transport`: `tcp` (default) or `udp`.
-//! - `protocol`: `plaintext` (default) or `pickle`, TCP only (graph rule 46).
+//! - `protocol`: `plaintext` (default) or `pickle`, TCP only (graph rule 46, and
+//!   [`GraphiteOutput::with_encoder`]).
 //! - `tags`/`multi_value`: forwarded to the encoder; no sink-level meaning.
-//! - `max_packet_bytes`: default `1432`, UDP only; TCP has no datagram to overflow.
+//! - `max_packet_bytes`: default `1432`, UDP only, at most 65507 (graph rule 38); TCP has no
+//!   datagram to overflow.
 //! - `max_frame_bytes`: default 1 MiB, Twisted's `Int32StringReceiver.MAX_LENGTH`.
 //! - `connect_timeout`: TCP only, default `5s`.
 //!
 //! ## Packing
 //!
 //! - **Plaintext UDP**: lines are packed newline-joined, **no trailing newline**, into as few
-//!   datagrams as fit under `max_packet_bytes`. The encoder already dropped any single line over
-//!   the cap, so every line fits a datagram on its own.
+//!   datagrams as fit under `max_packet_bytes`, by the packer `statsd_out` shares
+//!   (`crate::datagram`). The encoder already dropped any single line over the cap, so every line
+//!   fits a datagram on its own.
 //! - **Plaintext TCP**: every line `\n`-terminated, **including the last**.
 //! - **Pickle** (TCP only): frames concatenated with no separator; the receiver parses each off
 //!   its own length prefix.
@@ -37,15 +41,14 @@
 //!
 //! ## Faults
 //!
-//! - UDP `EMSGSIZE` (raw OS error 90, or `ErrorKind::InvalidInput` where the shim never reaches
-//!   the syscall) drops that datagram's datapoints under
-//!   `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
-//!   sending continues. Any other UDP send error is [`Fault::Clean`] if no datagram of the batch
-//!   was sent yet, else [`Fault::Ambiguous`].
+//! - UDP: `crate::datagram`'s module doc lists the rules. A datagram the kernel refuses with
+//!   `EMSGSIZE` drops its datapoints under
+//!   `logit.output.messages.dropped{reason="oversize_datagram"}`, and sending continues. Any other
+//!   send error is [`logit_pipeline::Fault::Clean`] if no datagram of the batch was sent yet, else
+//!   [`logit_pipeline::Fault::Ambiguous`].
 //! - TCP: `crate::stream`'s module doc lists the fault rules. A connect failure or timeout is
-//!   [`Fault::Clean`]. A first write that accepted nothing is retried once on a fresh connection.
-//!   A failure after a byte left, or of the flush, is [`Fault::Ambiguous`] and never retried by
-//!   this sink.
+//!   `Clean`. A first write that accepted nothing is retried once on a fresh connection. A
+//!   failure after a byte left, or of the flush, is `Ambiguous` and never retried by this sink.
 //!
 //! ## Telemetry
 //!
@@ -54,7 +57,8 @@
 //! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`, `logit.output.messages`
 //! (entries sent), `logit.output.datapoints` (Σ sent entries' meta; equals `messages` for
 //! plaintext), `logit.output.datagrams` (UDP only), `logit.output.reconnects` (TCP, every connect
-//! after the first), and the `oversize_datagram` drop above.
+//! after the first), and the `oversize_datagram` drop above. On UDP the sent counts include what
+//! reached the kernel before a failure; on TCP they count only a delivered frame.
 //!
 //! ## Duplicate safety
 //!
@@ -63,14 +67,15 @@
 //! like a collectd COUNTER or statsd `|c`. That's whisper's behavior, not the carbon wire's; a
 //! non-whisper receiver on the same wire could add instead, and this sink can't tell.
 
-use crate::stream::{count_request, Dial, PooledStream, Target};
+use crate::count_request;
+use crate::datagram::{Datagrams, Framing, Report, UdpDest};
+use crate::stream::{Dial, PooledStream, Target};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::{Fault, Output};
+use logit_pipeline::Output;
 use logit_proto::graphite::{GraphiteEncoder, Protocol};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::time::Duration;
-use tokio::net::{lookup_host, UdpSocket};
 
 /// Which transport a `graphite_out` was configured with: the target of `build_spec`'s
 /// `graphite_out_transport` converter, which picks [`GraphiteOutput::udp`] or
@@ -84,7 +89,7 @@ pub enum Transport {
 /// `statsd`'s `Conn`, in shape. `Tcp`'s `stream` starts `None`: an eager connect would turn "the
 /// destination isn't up yet" into a startup failure instead of a retryable `send`-time one.
 enum Conn {
-    Udp(UdpSocket),
+    Udp(UdpDest),
     Tcp { pool: PooledStream, connect_timeout: Duration },
 }
 
@@ -106,14 +111,10 @@ pub struct GraphiteOutput {
 }
 
 impl GraphiteOutput {
-    /// Binds an ephemeral local UDP socket eagerly; `endpoint` is resolved per `send`.
+    /// Binds an ephemeral local IPv4 UDP socket eagerly; `endpoint` is resolved per `send`
+    /// (`crate::datagram`'s module doc).
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("binding graphite_out's local UDP socket")?;
-        socket.set_nonblocking(true).context("configuring graphite_out's UDP socket")?;
-        let socket =
-            UdpSocket::from_std(socket).context("registering graphite_out's UDP socket")?;
-        Ok(Self::new(endpoint, Conn::Udp(socket)))
+        Ok(Self::new(endpoint, Conn::Udp(UdpDest::bind("graphite_out")?)))
     }
 
     /// Never connects here -- see [`Conn`]'s doc comment.
@@ -147,12 +148,19 @@ impl GraphiteOutput {
     /// Installs `encoder` with this sink's line cap, diagnostics, and telemetry re-applied, so
     /// builder order doesn't matter (`CollectdOutput::with_encoder` says what goes wrong
     /// otherwise).
-    pub fn with_encoder(mut self, encoder: GraphiteEncoder) -> Self {
+    ///
+    /// Errors on a pickle encoder over UDP, as graph validation does: a pickle frame is bounded
+    /// by `max_frame_bytes`, not by the datagram cap, and its length prefix means nothing in a
+    /// datagram.
+    pub fn with_encoder(mut self, encoder: GraphiteEncoder) -> anyhow::Result<Self> {
+        if matches!(self.conn, Conn::Udp(_)) && encoder.protocol() == Protocol::Pickle {
+            anyhow::bail!("graphite_out: protocol: pickle requires transport: tcp");
+        }
         self.encoder = encoder
             .with_max_packet_bytes(self.encoder_cap())
             .with_diagnostics(self.diag.clone())
             .with_telemetry(self.telemetry.clone());
-        self
+        Ok(self)
     }
 
     /// Bounds one UDP datagram of packed lines; no effect on TCP.
@@ -189,17 +197,24 @@ impl Output for GraphiteOutput {
         self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = match &mut self.conn {
-            Conn::Udp(socket) => {
-                let result = Self::send_udp(
-                    socket,
-                    &self.endpoint,
-                    &self.buf,
-                    self.max_packet_bytes,
-                    &mut self.packet_buf,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await;
+            Conn::Udp(udp) => {
+                let batch = Datagrams {
+                    entries: &self.buf,
+                    weight: |datapoints| *datapoints,
+                    cap: self.max_packet_bytes,
+                    framing: Framing::Packed,
+                };
+                let mut report = Report {
+                    sink: "graphite_out",
+                    diag: &mut self.diag,
+                    telemetry: &self.telemetry,
+                };
+                let (sent, result) =
+                    udp.send(&self.endpoint, batch, &mut self.packet_buf, &mut report).await;
+                // What reached the kernel, even when the batch then failed.
+                self.telemetry.count("logit.output.messages", sent.entries as f64, &[]);
+                self.telemetry.count("logit.output.datapoints", sent.weight as f64, &[]);
+                self.telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
                 count_request(&self.telemetry, &result);
                 result
             }
@@ -212,22 +227,16 @@ impl Output for GraphiteOutput {
                     connect_timeout: *connect_timeout,
                     sink: "graphite_out",
                 };
-                let messages = self.buf.len();
-                pool.send(&dial, &self.packet_buf, &self.telemetry)
-                    .await
-                    .map(|()| (messages, datapoints, 0))
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                if result.is_ok() {
+                    self.telemetry.count("logit.output.messages", self.buf.len() as f64, &[]);
+                    self.telemetry.count("logit.output.datapoints", datapoints as f64, &[]);
+                }
+                result
             }
         };
         drop(request_timer);
-
-        if let Ok((messages, datapoints, datagrams)) = &result {
-            self.telemetry.count("logit.output.messages", *messages as f64, &[]);
-            self.telemetry.count("logit.output.datapoints", *datapoints as f64, &[]);
-            if matches!(self.conn, Conn::Udp(_)) {
-                self.telemetry.count("logit.output.datagrams", *datagrams as f64, &[]);
-            }
-        }
-        result.map(|_| ())
+        result
     }
 
     /// `send` pools a connection only after flushing it; this is the shutdown backstop.
@@ -242,108 +251,6 @@ impl Output for GraphiteOutput {
     /// the boundary.
     fn duplicate_safe(&self) -> bool {
         true
-    }
-}
-
-/// Running totals for one [`GraphiteOutput::send_udp`] call: `statsd`'s `UdpSendCounts` plus
-/// `datapoints`. An `oversize_datagram` drop counts datapoints (Σ `meta`), not entries; the two
-/// coincide for plaintext, the only protocol UDP allows.
-#[derive(Default)]
-struct UdpSendCounts {
-    /// Entries written to the socket: `logit.output.messages`.
-    messages: usize,
-    /// Σ written entries' `meta`: `logit.output.datapoints`.
-    datapoints: usize,
-    /// Datagrams written to the socket: `logit.output.datagrams`.
-    datagrams: usize,
-    /// Entries appended to `packet_buf` since the last flush; reset by every flush.
-    entries_in_packet: usize,
-    /// Σ `meta` appended to `packet_buf` since the last flush; reset by every flush.
-    datapoints_in_packet: usize,
-}
-
-impl GraphiteOutput {
-    /// Packs `buf` into as few datagrams as fit under `max_packet_bytes`, one `send_to` each, as
-    /// `StatsdOutput::send_udp` does. Returns `(messages, datapoints, datagrams)` sent.
-    async fn send_udp(
-        socket: &UdpSocket,
-        endpoint: &str,
-        buf: &MessageBuf<usize>,
-        max_packet_bytes: usize,
-        packet_buf: &mut Vec<u8>,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<(usize, usize, usize)> {
-        // Once per batch: a non-numeric host must not be re-resolved per datagram.
-        let mut addrs = lookup_host(endpoint)
-            .await
-            .context("resolving graphite_out endpoint")
-            .context(Fault::Clean)?;
-        let addr = addrs
-            .next()
-            .context("graphite_out endpoint resolved to no addresses")
-            .context(Fault::Clean)?;
-
-        let mut counts = UdpSendCounts::default();
-        packet_buf.clear();
-        for (msg, meta) in buf.iter_with() {
-            let needs_sep = !packet_buf.is_empty();
-            let extra = msg.len() + usize::from(needs_sep);
-            if !packet_buf.is_empty() && packet_buf.len() + extra > max_packet_bytes {
-                Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry)
-                    .await?;
-            }
-            if needs_sep && !packet_buf.is_empty() {
-                packet_buf.push(b'\n');
-            }
-            packet_buf.extend_from_slice(msg);
-            counts.entries_in_packet += 1;
-            counts.datapoints_in_packet += *meta;
-        }
-        if !packet_buf.is_empty() {
-            Self::flush_datagram(socket, addr, packet_buf, &mut counts, diag, telemetry).await?;
-        }
-        Ok((counts.messages, counts.datapoints, counts.datagrams))
-    }
-
-    /// Sends one packed datagram, then clears `packet_buf` and the per-packet counters.
-    async fn flush_datagram(
-        socket: &UdpSocket,
-        addr: std::net::SocketAddr,
-        packet_buf: &mut Vec<u8>,
-        counts: &mut UdpSendCounts,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<()> {
-        match socket.send_to(packet_buf, addr).await {
-            Ok(_) => {
-                counts.messages += counts.entries_in_packet;
-                counts.datapoints += counts.datapoints_in_packet;
-                counts.datagrams += 1;
-            }
-            Err(err) if is_message_too_large(&err) => {
-                telemetry.count(
-                    "logit.output.messages.dropped",
-                    counts.datapoints_in_packet as f64,
-                    &[("reason", "oversize_datagram")],
-                );
-                diag.warn_throttled(
-                    "oversize_datagram",
-                    format_args!("graphite_out: packed datagram too large for one send: {err}"),
-                );
-            }
-            Err(err) => {
-                let fault = if counts.datagrams > 0 { Fault::Ambiguous } else { Fault::Clean };
-                packet_buf.clear();
-                counts.entries_in_packet = 0;
-                counts.datapoints_in_packet = 0;
-                return Err(anyhow::Error::new(err).context(fault));
-            }
-        }
-        packet_buf.clear();
-        counts.entries_in_packet = 0;
-        counts.datapoints_in_packet = 0;
-        Ok(())
     }
 }
 
@@ -362,22 +269,16 @@ fn build_tcp_frame(buf: &MessageBuf<usize>, protocol: Protocol, frame: &mut Vec<
     datapoints
 }
 
-/// `90` is `EMSGSIZE` on Linux, the only platform `logit` ships for; a copy of
-/// `statsd::is_message_too_large`.
-fn is_message_too_large(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
-        || err.kind() == std::io::ErrorKind::InvalidInput
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Collector, FakeStream, ReadMode};
+    use crate::test_support::{Collector, FakeStream, ReadMode, ScriptedDest, SendStep};
     use logit_core::interner::intern;
     use logit_core::{
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Value,
     };
     use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::Fault;
     use logit_proto::graphite::GraphiteDecoder;
     use logit_proto::Decoder;
     use std::sync::Arc;
@@ -522,7 +423,8 @@ mod tests {
     async fn a_pickle_send_writes_one_length_prefixed_frame_a_real_reader_accepts() {
         let mut collector = Collector::tcp(ReadMode::ToEof).await;
         let mut output = GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
-            .with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle));
+            .with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle))
+            .unwrap();
         let batch = batch_with(vec![tagged_event("app.requests", 42.0, ("env", "prod"))]);
         output.send(&batch).await.expect("send should succeed");
         drop(output);
@@ -567,6 +469,36 @@ mod tests {
         let batch = batch_with(vec![gauge_event("hits", 1.0)]);
         let err = output.send(&batch).await.expect_err("resolution should fail");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    /// The kernel refuses a UDP send to port 0 with `EINVAL`: a clean error, not every datapoint
+    /// counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_udp_endpoint_with_port_zero_fails_clean_and_counts_no_oversize() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = GraphiteOutput::udp("127.0.0.1:0")
+            .unwrap()
+            .with_telemetry(probe.telemetry("out", "graphite_out", "sink"));
+        let batch = batch_with(vec![gauge_event("hits", 1.0)]);
+        let err = output.send(&batch).await.expect_err("the kernel refuses port 0");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        assert_eq!(crate::test_support::errno_in(&err), Some(22), "EINVAL on Linux: {err:#}");
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+    }
+
+    /// An IPv6 endpoint goes out over an IPv6 socket.
+    #[tokio::test]
+    async fn an_ipv6_udp_endpoint_is_delivered() {
+        let Ok(mut collector) = Collector::udp_at("[::1]:0").await else {
+            println!("skipping: this environment has no usable IPv6 loopback");
+            return;
+        };
+        let mut output = GraphiteOutput::udp(collector.addr().to_string()).unwrap();
+        let batch = batch_with(vec![gauge_event("a.metric", 1.0)]);
+        output.send(&batch).await.expect("an IPv6 endpoint must be reachable");
+        assert!(String::from_utf8_lossy(&collector.next().await).starts_with("a.metric 1 "));
     }
 
     #[tokio::test]
@@ -694,6 +626,7 @@ mod tests {
             let mut output =
                 GraphiteOutput::tcp(collector.addr().to_string(), Duration::from_secs(2))
                     .with_encoder(GraphiteEncoder::new().with_protocol(protocol))
+                    .unwrap()
                     .with_telemetry(probe.telemetry("out", "graphite_out", "sink"));
             let batch =
                 batch_with(vec![gauge_event("a.metric", 1.0), gauge_event("b.metric", 2.0)]);
@@ -755,27 +688,74 @@ mod tests {
         assert!(pool.is_empty(), "a connection that failed mid-frame is never pooled");
     }
 
-    /// A real `EMSGSIZE` from `send_to` is counted and skipped, not a `send` error. Reachable
-    /// because rule 38's upper bound applies to `collectd_out` only, not `graphite_out`.
+    /// The kernel refuses a datagram over the largest UDP payload with `EMSGSIZE`. A builder can
+    /// set a cap config validation refuses, so the refused datagram's datapoint is dropped and
+    /// counted, the send is `ok`, and the datagrams on either side arrive.
     #[tokio::test]
-    async fn an_emsgsize_datagram_is_counted_not_faulted() {
-        let collector = Collector::udp().await;
-        let registry = Registry::new();
+    async fn a_real_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive() {
+        let mut collector = Collector::udp().await;
+        let mut probe = TelemetryProbe::new();
         let mut output = GraphiteOutput::udp(collector.addr().to_string())
             .unwrap()
-            .with_max_packet_bytes(100_000) // past the real UDP payload ceiling (65507)
-            .with_telemetry(registry.telemetry_for("out", "graphite_out", "sink"));
-        let events: Vec<Event> = (0..3000)
-            .map(|i| gauge_event(&format!("some.long.metric.path.{i}"), i as f64))
-            .collect();
-        let batch = batch_with(events);
-        output.send(&batch).await.expect("an EMSGSIZE datagram must be dropped, not surfaced");
+            .with_max_packet_bytes(100_000)
+            .with_telemetry(probe.telemetry("out", "graphite_out", "sink"));
+        // `<name> 1 1700000000`: lines of 40 013, 70 013, and 40 013 bytes. No two share a
+        // datagram, and only the middle one is over 65 507.
+        let batch = batch_with(vec![
+            gauge_event(&"a".repeat(40_000), 1.0),
+            gauge_event(&"b".repeat(70_000), 1.0),
+            gauge_event(&"c".repeat(40_000), 1.0),
+        ]);
+        output.send(&batch).await.expect("an EMSGSIZE datagram is a drop, not a fault");
 
-        let events = registry.drain(0);
-        assert!(
-            metric_sum(&events, "logit.output.messages.dropped") > 0.0,
-            "expected the oversize datagram's datapoints to be counted dropped"
-        );
+        let got = collector.take(2).await;
+        assert!(got[0].starts_with(b"aaaa") && got[0].len() == 40_013);
+        assert!(got[1].starts_with(b"cccc") && got[1].len() == 40_013);
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0, "one datapoint");
+        assert_eq!(probe.sum("logit.output.datapoints", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(dropped + probe.sum("logit.output.datapoints", &[]), 3.0, "sent + dropped");
+    }
+
+    /// A batch that fails after two datagrams counts the two datagrams' messages and datapoints
+    /// before it returns the error.
+    #[tokio::test]
+    async fn a_udp_failure_after_two_datagrams_counts_what_reached_the_wire() {
+        let script = ScriptedDest::new([
+            SendStep::Accept,
+            SendStep::Accept,
+            SendStep::Fail(std::io::ErrorKind::ConnectionRefused),
+        ]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = GraphiteOutput::udp("127.0.0.1:2003")
+            .unwrap()
+            .with_max_packet_bytes(14) // one `x 1 1700000000` line per datagram
+            .with_telemetry(probe.telemetry("out", "graphite_out", "sink"));
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let batch = batch_with(["a", "b", "c"].map(|name| gauge_event(name, 1.0)).to_vec());
+        let err = output.send(&batch).await.expect_err("the third datagram fails");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datapoints", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
+    }
+
+    /// Pickle frames are bounded by `max_frame_bytes`, not the datagram cap, so a pickle encoder
+    /// can't be installed on the UDP transport, as graph validation refuses the config.
+    #[tokio::test]
+    async fn with_encoder_refuses_pickle_on_udp() {
+        let pickle = || GraphiteEncoder::new().with_protocol(Protocol::Pickle);
+        let err = GraphiteOutput::udp("127.0.0.1:2003").unwrap().with_encoder(pickle()).err();
+        let err = err.expect("pickle over UDP is refused");
+        assert!(err.to_string().contains("pickle requires transport: tcp"), "{err}");
+        GraphiteOutput::tcp("127.0.0.1:2003", Duration::from_secs(1))
+            .with_encoder(pickle())
+            .expect("pickle over TCP is fine");
     }
 
     #[tokio::test]
@@ -794,11 +774,13 @@ mod tests {
             .unwrap()
             .with_max_packet_bytes(4)
             .with_encoder(GraphiteEncoder::new())
+            .unwrap()
             .with_telemetry(registry_cap_then_encoder.telemetry_for("out", "graphite_out", "sink"));
         let registry_encoder_then_cap = Registry::new();
         let encoder_then_cap = GraphiteOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_encoder(GraphiteEncoder::new())
+            .unwrap()
             .with_max_packet_bytes(4)
             .with_telemetry(registry_encoder_then_cap.telemetry_for("out", "graphite_out", "sink"));
         for (mut output, registry) in [
@@ -831,7 +813,8 @@ mod tests {
             .with_diagnostics(diag)
             .with_encoder(
                 GraphiteEncoder::new().with_multi_value(logit_proto::graphite::MultiValue::Skip),
-            );
+            )
+            .unwrap();
         // `multi_value: skip` counts a `Samples` record through both handles, if they survived.
         let batch = batch_with(vec![Event::metric(
             TS,

@@ -43,6 +43,7 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
+use crate::count_request;
 use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 
 /// A sink's TLS client settings with the endpoint's server name parsed once, at construction, so a
@@ -291,21 +292,6 @@ impl PooledStream {
     pub(crate) fn is_empty(&self) -> bool {
         self.stream.is_none()
     }
-}
-
-/// Counts `logit.output.requests` for one returned attempt, tagged with its fault class
-/// (`ok|clean|ambiguous|permanent`, decision 4). The datagram arms of the same sinks count
-/// through it too, so a sink has one vocabulary whatever its transport.
-pub(crate) fn count_request<T>(telemetry: &Telemetry, result: &anyhow::Result<T>) {
-    let class = match result {
-        Ok(_) => "ok",
-        Err(err) => match logit_pipeline::classify(err) {
-            Fault::Clean => "clean",
-            Fault::Ambiguous => "ambiguous",
-            Fault::Permanent => "permanent",
-        },
-    };
-    telemetry.count("logit.output.requests", 1.0, &[("class", class)]);
 }
 
 #[cfg(test)]

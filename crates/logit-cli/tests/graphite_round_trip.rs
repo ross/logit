@@ -499,7 +499,7 @@ async fn tags_drop_removes_the_tag_segment_entirely() {
 
     let (captured, _decoded) = harness
         .round_trip_with(&batch, |sink| {
-            sink.with_encoder(GraphiteEncoder::new().with_tags(Tags::Drop))
+            sink.with_encoder(GraphiteEncoder::new().with_tags(Tags::Drop)).unwrap()
         })
         .await;
     assert_eq!(captured.len(), 1);
@@ -517,7 +517,7 @@ async fn assert_pickle_dialect_case(fixture: &str, decoder: impl Fn(&[u8]) -> Ev
 
     let (captured, decoded) = harness
         .round_trip_with(&batch, |sink| {
-            sink.with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle))
+            sink.with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle)).unwrap()
         })
         .await;
     assert_eq!(captured.len(), 1, "{fixture}: one TCP connection, one write");
@@ -548,7 +548,7 @@ async fn plaintext_to_pickle_relays_as_the_same_canonical_pickle() {
 
     let captured = harness
         .capture_only(&batch, |sink| {
-            sink.with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle))
+            sink.with_encoder(GraphiteEncoder::new().with_protocol(Protocol::Pickle)).unwrap()
         })
         .await;
     assert_eq!(captured.len(), 1);
@@ -786,7 +786,7 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
 
     let captured = cross
         .graphite_capture(&out_batch, |sink| {
-            sink.with_encoder(GraphiteEncoder::new().with_multi_value(MultiValue::Expand))
+            sink.with_encoder(GraphiteEncoder::new().with_multi_value(MultiValue::Expand)).unwrap()
         })
         .await;
     let text = std::str::from_utf8(&captured).expect("ascii output");

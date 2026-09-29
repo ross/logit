@@ -151,6 +151,8 @@
 //! forge an extra metric. A line that would overflow the cap starts a new datagram. A single line
 //! longer than the cap is **dropped whole**, never truncated (unlike `syslog_out`): a truncated
 //! statsd line decodes as a different metric or a parse error, never a shorter version of itself.
+//! The packer, its `EMSGSIZE` handling, and its fault rules are `crate::datagram`'s, shared with
+//! `graphite_out` and used by both datagram transports here.
 //!
 //! TCP terminates **every** line with `\n`, including the last: a stream has no per-batch EOF, so
 //! the last line of one batch would otherwise glue onto the first line of the next. No
@@ -314,20 +316,23 @@
 //! `key_str.starts_with("statsd.")` check in [`build_tag_suffix`] keeps them out of every line's
 //! `|#k:v,...` segment.
 
+use crate::count_request;
+use crate::datagram::{
+    send_datagrams, DatagramDest, Datagrams, Framing, Report, Sent, UdpDest, UnixDest, UnixSocket,
+    UnixTarget,
+};
 use crate::influxdb::{push_float, tag_value};
-use crate::stream::{count_request, Dial, PooledStream, Target, TlsTarget};
+use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
 use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
     Value,
 };
-use logit_pipeline::Fault;
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
-use tokio::net::{lookup_host, UdpSocket, UnixDatagram};
 
 /// Re-exported for symmetry with `crate::syslog`'s and `crate::logit`'s paths; every TLS-dialing
 /// sink shares the one definition in `crate::tls`.
@@ -1523,19 +1528,18 @@ fn is_forbidden_in_service_check_message(c: char) -> bool {
 /// local socket is a config error); the Unix datagram and stream arms connect lazily inside
 /// `send`, so a receiver that isn't up yet can't block startup.
 enum Conn {
-    Udp(UdpSocket),
+    Udp(UdpDest),
     /// Plaintext or TLS through the shared [`PooledStream`] driver. No DTLS arm:
     /// `logit-pipeline::graph::resolve`'s rule 52 rejects `tls:` under `transport: udp`.
     Tcp {
         pool: PooledStream,
         connect_timeout: Duration,
     },
-    /// Connected to the path in `endpoint` on first use, and `None` again after a send that shows
-    /// the receiver gone or stuck, so the next send reconnects; each send is bounded by
-    /// `send_timeout` (module doc's "Packing and framing"). `has_connected_once` gates
-    /// `logit.output.reconnects`, as [`PooledStream`]'s does for the stream arms.
+    /// Sent through [`UnixDest`], which connects to the path in `endpoint` on first use and
+    /// reconnects after a send that shows the receiver gone or stuck (module doc's "Packing and
+    /// framing").
     UnixDatagram {
-        socket: Option<UnixDatagram>,
+        socket: Option<UnixSocket>,
         send_timeout: Duration,
         has_connected_once: bool,
     },
@@ -1564,14 +1568,10 @@ pub struct StatsdOutput {
 }
 
 impl StatsdOutput {
-    /// Binds an ephemeral local UDP socket now; `endpoint` is resolved per `send`
-    /// (`SyslogOutput::udp` has why).
+    /// Binds an ephemeral local IPv4 UDP socket now; `endpoint` is resolved per `send`
+    /// (`crate::datagram`'s module doc).
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("binding statsd_out's local UDP socket")?;
-        socket.set_nonblocking(true).context("configuring statsd_out's UDP socket")?;
-        let socket = UdpSocket::from_std(socket).context("registering statsd_out's UDP socket")?;
-        Ok(Self::new(endpoint, Conn::Udp(socket)))
+        Ok(Self::new(endpoint, Conn::Udp(UdpDest::bind("statsd_out")?)))
     }
 
     /// Never connects here; see [`Conn`].
@@ -1770,43 +1770,35 @@ impl Output for StatsdOutput {
 
         self.telemetry.count("logit.output.batch.bytes", self.lines.total_bytes() as f64, &[]);
         let request_timer = self.telemetry.timer("logit.output.request.duration");
-        let messages = self.lines.len();
+        let batch = Datagrams {
+            entries: &self.lines,
+            weight: |_| 1,
+            cap: self.max_packet_bytes,
+            framing: Framing::Packed,
+        };
+        let mut report =
+            Report { sink: "statsd_out", diag: &mut self.diag, telemetry: &self.telemetry };
         let result = match &mut self.conn {
-            Conn::Udp(socket) => {
-                let result = Self::send_udp(
-                    socket,
-                    &self.endpoint,
-                    &self.lines,
-                    self.max_packet_bytes,
-                    &mut self.packet_buf,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await;
-                count_request(&self.telemetry, &result);
-                result
+            Conn::Udp(udp) => {
+                let (sent, result) =
+                    udp.send(&self.endpoint, batch, &mut self.packet_buf, &mut report).await;
+                count_datagram_send(&self.telemetry, sent, result)
             }
             Conn::UnixDatagram { socket, send_timeout, has_connected_once } => {
                 let mut dest = DatagramDest::Unix(UnixDest {
                     socket,
-                    path: Path::new(&self.endpoint),
+                    target: UnixTarget::Path(Path::new(&self.endpoint)),
                     send_timeout: *send_timeout,
+                    sink: "statsd_out",
                     telemetry: &self.telemetry,
                     has_connected_once,
                 });
-                let result = Self::send_datagrams(
-                    &mut dest,
-                    &self.lines,
-                    self.max_packet_bytes,
-                    &mut self.packet_buf,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await;
-                count_request(&self.telemetry, &result);
-                result
+                let (sent, result) =
+                    send_datagrams(batch, &mut dest, &mut self.packet_buf, &mut report).await;
+                count_datagram_send(&self.telemetry, sent, result)
             }
-            // The stream arms count `requests` inside the driver.
+            // The stream arms count `requests` inside the driver, and messages only once the
+            // frame is delivered.
             Conn::Tcp { pool, connect_timeout } => {
                 build_lf_frame(&self.lines, &mut self.packet_buf);
                 let dial = Dial {
@@ -1814,7 +1806,8 @@ impl Output for StatsdOutput {
                     connect_timeout: *connect_timeout,
                     sink: "statsd_out",
                 };
-                pool.send(&dial, &self.packet_buf, &self.telemetry).await.map(|()| (messages, 0))
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                count_stream_send(&self.telemetry, self.lines.len(), result)
             }
             Conn::UnixStream { pool, connect_timeout } => {
                 build_length_prefixed_frame(
@@ -1827,18 +1820,12 @@ impl Output for StatsdOutput {
                     connect_timeout: *connect_timeout,
                     sink: "statsd_out",
                 };
-                pool.send(&dial, &self.packet_buf, &self.telemetry).await.map(|()| (messages, 0))
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                count_stream_send(&self.telemetry, self.lines.len(), result)
             }
         };
         drop(request_timer);
-
-        if let Ok((messages, datagrams)) = &result {
-            self.telemetry.count("logit.output.messages", *messages as f64, &[]);
-            if matches!(self.conn, Conn::Udp(_) | Conn::UnixDatagram { .. }) {
-                self.telemetry.count("logit.output.datagrams", *datagrams as f64, &[]);
-            }
-        }
-        result.map(|_| ())
+        result
     }
 
     /// `send` flushes and retains nothing between calls, so this only flushes a stream as a
@@ -1859,114 +1846,31 @@ impl Output for StatsdOutput {
     }
 }
 
-/// Running totals for one [`StatsdOutput::send_udp`] call. `entries_in_packet` can't be recovered
-/// from `packet_buf`'s bytes: a negative-gauge pair is **one** [`MessageBuf`] entry with an
-/// embedded `\n`, so counting `\n` bytes would report two messages where the stream transports
-/// (and `syslog_out`) report one.
-#[derive(Default)]
-struct UdpSendCounts {
-    /// [`MessageBuf`] entries written to the socket (`logit.output.messages`).
-    messages: usize,
-    /// Datagrams written to the socket (`logit.output.datagrams`).
-    datagrams: usize,
-    /// Entries appended to `packet_buf` since the last flush.
-    entries_in_packet: usize,
+/// Counts a datagram send's `messages` and `datagrams`, what reached the kernel even when the
+/// batch then failed, and its `requests` class. A message is a [`MessageBuf`] entry, so a
+/// negative-gauge pair is one message on every transport.
+fn count_datagram_send(
+    telemetry: &Telemetry,
+    sent: Sent,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    telemetry.count("logit.output.messages", sent.entries as f64, &[]);
+    telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
+    count_request(telemetry, &result);
+    result
 }
 
-impl StatsdOutput {
-    /// Packs `lines` greedily into datagrams of at most `max_packet_bytes` (newline-joined, no
-    /// trailing newline), one `send_to` each (module doc's "Packing and framing" section). The
-    /// encoder already dropped any line over the cap, so every line fits a datagram alone. Returns
-    /// `(messages sent, datagrams sent)`.
-    async fn send_udp(
-        socket: &UdpSocket,
-        endpoint: &str,
-        lines: &MessageBuf,
-        max_packet_bytes: usize,
-        packet_buf: &mut Vec<u8>,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<(usize, usize)> {
-        // Once per batch, not per datagram (`syslog::send_udp` has why).
-        let mut addrs = lookup_host(endpoint)
-            .await
-            .context("resolving statsd_out endpoint")
-            .context(Fault::Clean)?;
-        let addr = addrs
-            .next()
-            .context("statsd_out endpoint resolved to no addresses")
-            .context(Fault::Clean)?;
-        let mut dest = DatagramDest::Udp { socket, addr };
-        Self::send_datagrams(&mut dest, lines, max_packet_bytes, packet_buf, diag, telemetry).await
+/// Counts a stream send's `messages`, all of them once the driver delivered the frame and none
+/// otherwise; the driver counts `requests`.
+fn count_stream_send(
+    telemetry: &Telemetry,
+    messages: usize,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if result.is_ok() {
+        telemetry.count("logit.output.messages", messages as f64, &[]);
     }
-
-    /// [`Self::send_udp`]'s packing loop over either datagram family.
-    async fn send_datagrams(
-        dest: &mut DatagramDest<'_>,
-        lines: &MessageBuf,
-        max_packet_bytes: usize,
-        packet_buf: &mut Vec<u8>,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<(usize, usize)> {
-        let mut counts = UdpSendCounts::default();
-        packet_buf.clear();
-        for msg in lines.iter() {
-            let needs_sep = !packet_buf.is_empty();
-            let extra = msg.len() + usize::from(needs_sep);
-            if !packet_buf.is_empty() && packet_buf.len() + extra > max_packet_bytes {
-                Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
-            }
-            if needs_sep && !packet_buf.is_empty() {
-                packet_buf.push(b'\n');
-            }
-            packet_buf.extend_from_slice(msg);
-            counts.entries_in_packet += 1;
-        }
-        if !packet_buf.is_empty() {
-            Self::flush_datagram(dest, packet_buf, &mut counts, diag, telemetry).await?;
-        }
-        Ok((counts.messages, counts.datagrams))
-    }
-
-    /// Sends one packed datagram, then clears `packet_buf` and `counts.entries_in_packet`. Counts
-    /// [`MessageBuf`] entries, not `\n` bytes (see [`UdpSendCounts`]), toward `counts.messages`
-    /// or, when the kernel rejects the datagram as too large,
-    /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
-    async fn flush_datagram(
-        dest: &mut DatagramDest<'_>,
-        packet_buf: &mut Vec<u8>,
-        counts: &mut UdpSendCounts,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<()> {
-        match dest.send(packet_buf, counts.datagrams == 0).await {
-            Ok(_) => {
-                counts.messages += counts.entries_in_packet;
-                counts.datagrams += 1;
-            }
-            Err(err) if is_message_too_large(&err) => {
-                telemetry.count(
-                    "logit.output.messages.dropped",
-                    counts.entries_in_packet as f64,
-                    &[("reason", "oversize_datagram")],
-                );
-                diag.warn_throttled(
-                    "oversize_datagram",
-                    format_args!("statsd_out: packed datagram too large for one send: {err}"),
-                );
-            }
-            Err(err) => {
-                let fault = if counts.datagrams > 0 { Fault::Ambiguous } else { Fault::Clean };
-                packet_buf.clear();
-                counts.entries_in_packet = 0;
-                return Err(anyhow::Error::new(err).context(fault));
-            }
-        }
-        packet_buf.clear();
-        counts.entries_in_packet = 0;
-        Ok(())
-    }
+    result
 }
 
 /// `transport: tcp` framing: every line `\n`-terminated, including the last (module doc's
@@ -2010,124 +1914,21 @@ fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, fram
     }
 }
 
-/// Where [`StatsdOutput::send_datagrams`] sends each packed packet.
-enum DatagramDest<'a> {
-    Udp { socket: &'a UdpSocket, addr: std::net::SocketAddr },
-    Unix(UnixDest<'a>),
-}
-
-impl DatagramDest<'_> {
-    /// One datagram; `first_of_batch` is whether nothing of this batch has been sent yet.
-    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
-        match self {
-            DatagramDest::Udp { socket, addr } => socket.send_to(buf, *addr).await,
-            DatagramDest::Unix(dest) => dest.send(buf, first_of_batch).await,
-        }
-    }
-}
-
-/// Counts every connect after the first as `logit.output.reconnects`: [`UnixDest`]'s copy of the
-/// rule `crate::stream::PooledStream` applies to the stream arms.
-fn count_connect(telemetry: &Telemetry, has_connected_once: &mut bool) {
-    if *has_connected_once {
-        telemetry.count("logit.output.reconnects", 1.0, &[]);
-    } else {
-        *has_connected_once = true;
-    }
-}
-
-/// A `transport: unix` sender: a datagram socket connected to `path` (module doc's "Packing and
-/// framing" has why it's connected and when it reconnects).
-struct UnixDest<'a> {
-    socket: &'a mut Option<UnixDatagram>,
-    path: &'a Path,
-    send_timeout: Duration,
-    telemetry: &'a Telemetry,
-    has_connected_once: &'a mut bool,
-}
-
-impl UnixDest<'_> {
-    /// Sends one datagram. When it's the batch's first and an inherited socket finds its receiver
-    /// gone, reconnects and retries once: nothing of the batch has left, so the retry can't
-    /// duplicate.
-    async fn send(&mut self, buf: &[u8], first_of_batch: bool) -> std::io::Result<usize> {
-        let inherited = self.socket.is_some();
-        match self.send_once(buf).await {
-            Err(err) if first_of_batch && inherited && is_receiver_gone(&err) => {
-                self.send_once(buf).await
-            }
-            result => result,
-        }
-    }
-
-    /// Connects when there's no socket, then sends under `send_timeout`. Drops the socket on a
-    /// timeout or a gone receiver, so the next send reconnects to whatever is at `path`. A connect
-    /// doesn't block on a datagram socket; its failure reaches `flush_datagram` as a send error,
-    /// `Fault::Clean` on a batch's first datagram.
-    async fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let socket: &UnixDatagram = match &mut *self.socket {
-            Some(socket) => socket,
-            slot @ None => {
-                let socket = UnixDatagram::unbound()
-                    .and_then(|socket| socket.connect(self.path).map(|()| socket))
-                    .map_err(|err| {
-                        std::io::Error::new(
-                            err.kind(),
-                            format!(
-                                "connecting to statsd_out socket {}: {err}",
-                                self.path.display()
-                            ),
-                        )
-                    })?;
-                count_connect(self.telemetry, self.has_connected_once);
-                slot.insert(socket)
-            }
-        };
-        let result = match tokio::time::timeout(self.send_timeout, socket.send(buf)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "the receiver at {} did not take a datagram within {:?}",
-                    self.path.display(),
-                    self.send_timeout
-                ),
-            )),
-        };
-        if let Err(err) = &result {
-            if err.kind() == std::io::ErrorKind::TimedOut || is_receiver_gone(err) {
-                *self.socket = None;
-            }
-        }
-        result
-    }
-}
-
-/// `ECONNREFUSED` (the connected receiver's socket closed) or `ENOTCONN` (a later send on a socket
-/// the kernel already disconnected): the path may now name a new receiver.
-fn is_receiver_gone(err: &std::io::Error) -> bool {
-    matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotConnected)
-}
-
-/// `90` is `EMSGSIZE` on Linux, the only target (`syslog::is_message_too_large` has more).
-fn is_message_too_large(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
-        || err.kind() == std::io::ErrorKind::InvalidInput
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{
-        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode, WriteStep,
+        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode,
+        ScriptedDest, SendStep, WriteStep,
     };
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_inputs::statsd::StatsdDecoder;
-    use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::test_util::{TelemetryProbe, RECV_TIMEOUT};
+    use logit_pipeline::Fault;
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UnixDatagram};
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
@@ -3665,6 +3466,159 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..n], b"second:2|c");
         assert_eq!(reconnects_in(registry.drain(0)), Some(1.0));
+    }
+
+    // -- Datagram endpoint faults --------------------------------------------------------------
+
+    /// A path of 108 bytes or more doesn't fit `sockaddr_un`, so the connect fails before any
+    /// datagram: a clean error, not every line counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_unix_socket_path_too_long_for_sockaddr_un_fails_clean_and_counts_no_oversize() {
+        let path = format!("/tmp/{}", "p".repeat(110));
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1))
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        let err = output.send(&two_counters()).await.expect_err("the path can't be connected to");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 0.0);
+    }
+
+    /// The kernel refuses a UDP send to port 0 with `EINVAL`: a clean error, not every line
+    /// counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_udp_endpoint_with_port_zero_fails_clean_and_counts_no_oversize() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp("127.0.0.1:0").unwrap().with_telemetry(probe.telemetry(
+            "out",
+            "statsd_out",
+            "sink",
+        ));
+        let err = output.send(&two_counters()).await.expect_err("the kernel refuses port 0");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        assert_eq!(crate::test_support::errno_in(&err), Some(22), "EINVAL on Linux: {err:#}");
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 0.0);
+    }
+
+    /// An IPv6 endpoint goes out over an IPv6 socket.
+    #[tokio::test]
+    async fn an_ipv6_udp_endpoint_is_delivered() {
+        let Ok(mut collector) = Collector::udp_at("[::1]:0").await else {
+            println!("skipping: this environment has no usable IPv6 loopback");
+            return;
+        };
+        let mut output = StatsdOutput::udp(collector.addr().to_string()).unwrap();
+        output.send(&two_counters()).await.expect("an IPv6 endpoint must be reachable");
+        assert_eq!(collector.next().await, b"a:1|c\nb:2|c");
+    }
+
+    /// A counter named by `len` copies of `name`: a line of `len + 4` bytes.
+    fn long_counter(name: char, len: usize) -> Event {
+        metric_event(&name.to_string().repeat(len), MetricKind::counter(1.0), &[])
+    }
+
+    /// A batch that fails after two datagrams counts the two datagrams' messages before it
+    /// returns the error.
+    #[tokio::test]
+    async fn a_udp_failure_after_two_datagrams_counts_what_reached_the_wire() {
+        let script = ScriptedDest::new([
+            SendStep::Accept,
+            SendStep::Accept,
+            SendStep::Fail(std::io::ErrorKind::ConnectionRefused),
+        ]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp("127.0.0.1:8125")
+            .unwrap()
+            .with_max_packet_bytes(5) // one five-byte line per datagram
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let batch = batch_with(
+            ["a", "b", "c"].map(|n| metric_event(n, MetricKind::counter(1.0), &[])).to_vec(),
+        );
+        let err = output.send(&batch).await.expect_err("the third datagram fails");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
+    }
+
+    /// The kernel refuses a datagram over the largest UDP payload with `EMSGSIZE`. A builder can
+    /// set a cap config validation refuses, so the refused datagram's line is dropped and
+    /// counted, the send is `ok`, and the datagrams on either side arrive.
+    #[tokio::test]
+    async fn a_real_udp_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive() {
+        let mut collector = Collector::udp().await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp(collector.addr().to_string())
+            .unwrap()
+            .with_max_packet_bytes(100_000)
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        // Lines of 40 004, 70 004, and 40 004 bytes: no two share a datagram, and only the
+        // middle one is over 65 507.
+        let batch = batch_with(vec![
+            long_counter('a', 40_000),
+            long_counter('b', 70_000),
+            long_counter('c', 40_000),
+        ]);
+        output.send(&batch).await.expect("an EMSGSIZE datagram is a drop, not a fault");
+
+        let got = collector.take(2).await;
+        assert!(got[0].starts_with(b"aaaa") && got[0].len() == 40_004);
+        assert!(got[1].starts_with(b"cccc") && got[1].len() == 40_004);
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0, "one line, in entries");
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(dropped + probe.sum("logit.output.messages", &[]), 3.0, "sent + dropped");
+    }
+
+    /// A Unix datagram longer than the socket's send buffer allows is refused `EMSGSIZE`; the
+    /// buffer defaults to `wmem_default`, so the datagram is sized from it.
+    #[tokio::test]
+    async fn a_real_unix_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive() {
+        let wmem: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_default")
+            .expect("Linux exposes wmem_default")
+            .trim()
+            .parse()
+            .expect("wmem_default is a number");
+        let cap = 2 * wmem;
+        let dir = SocketDir::new("dgram-emsgsize");
+        let path = dir.socket();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::unix_datagram(&path, Duration::from_secs(1))
+            .with_max_packet_bytes(cap)
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        // The middle line is past the send buffer but inside the cap, and no two lines share a
+        // datagram.
+        let batch = batch_with(vec![
+            long_counter('a', 96),
+            long_counter('b', cap - 14),
+            long_counter('c', 96),
+        ]);
+        output.send(&batch).await.expect("an EMSGSIZE datagram is a drop, not a fault");
+
+        let mut buf = vec![0u8; 4096];
+        for first in *b"ac" {
+            let n = tokio::time::timeout(RECV_TIMEOUT, receiver.recv(&mut buf))
+                .await
+                .expect("the datagram arrives")
+                .unwrap();
+            assert_eq!((n, buf[0]), (100, first));
+        }
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
     }
 
     #[test]

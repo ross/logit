@@ -1055,7 +1055,7 @@ fn build_spec(
                 .with_multi_value(graphite_multi_value(*multi_value))
                 .with_max_frame_bytes(*max_frame_bytes as usize);
             let output = output
-                .with_encoder(encoder)
+                .with_encoder(encoder)?
                 .with_max_packet_bytes(*max_packet_bytes as usize)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());

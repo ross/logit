@@ -2,7 +2,8 @@
 //! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from. Also the
 //! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
 //! [`ScriptedDial`] for the fresh connections `crate::stream`'s driver dials, and [`tls_pair`]
-//! with [`TapIo`] for tests that need real tokio-rustls behavior.
+//! with [`TapIo`] for tests that need real tokio-rustls behavior. [`ScriptedDest`] is the datagram
+//! double behind `crate::datagram`'s `Scripted` seams.
 //!
 //! A [`Collector`] message depends on how it reads:
 //!
@@ -67,8 +68,14 @@ impl Collector {
 
     /// A UDP collector on `127.0.0.1`: one message per datagram.
     pub(crate) async fn udp() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
+        Self::udp_at("127.0.0.1:0").await.unwrap()
+    }
+
+    /// A UDP collector bound to `bind`, or the bind's error, so a test can skip where an address
+    /// family is unavailable (IPv6 loopback in some containers).
+    pub(crate) async fn udp_at(bind: &str) -> io::Result<Self> {
+        let socket = UdpSocket::bind(bind).await?;
+        let addr = socket.local_addr()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -78,7 +85,7 @@ impl Collector {
                 }
             }
         });
-        Self { addr, rx, accepts: Arc::new(AtomicUsize::new(0)), task: task.abort_handle() }
+        Ok(Self { addr, rx, accepts: Arc::new(AtomicUsize::new(0)), task: task.abort_handle() })
     }
 
     async fn stream(acceptor: Option<TlsAcceptor>, mode: ReadMode) -> Self {
@@ -174,6 +181,13 @@ async fn read_one<S: AsyncRead + Unpin>(
         }
     };
     let _ = tx.send(buf);
+}
+
+/// The OS error number of the first `io::Error` in `err`'s chain.
+pub(crate) fn errno_in(err: &anyhow::Error) -> Option<i32> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error)
 }
 
 /// The repo root's `testdata/tls` (`testdata/tls/README.md`).
@@ -421,6 +435,81 @@ impl ScriptedDial {
                     .context(logit_pipeline::Fault::Clean))
             }
             Some(DialStep::Hang) => std::future::pending().await,
+        }
+    }
+}
+
+/// A datagram destination for `crate::datagram`'s `Scripted` seams: each send follows the next
+/// scripted [`SendStep`] (then [`SendStep::Accept`] once the script runs out), and an accepted
+/// datagram is recorded with the entry count the packer said it holds.
+#[derive(Default)]
+pub(crate) struct ScriptedDest(Mutex<ScriptedState>);
+
+/// What a [`ScriptedDest`] has seen, and its script.
+#[derive(Default)]
+pub(crate) struct ScriptedState {
+    steps: std::collections::VecDeque<SendStep>,
+    /// Accepted datagrams, each with its entry count (`None` through a Unix socket, which isn't
+    /// told it).
+    pub(crate) accepted: Vec<(Vec<u8>, Option<usize>)>,
+    /// Send calls, whatever their outcome.
+    pub(crate) sends: usize,
+    /// Connects through a scripted Unix target.
+    pub(crate) connects: usize,
+}
+
+/// A scripted outcome for one send of a [`ScriptedDest`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SendStep {
+    Accept,
+    /// Fails with the kernel's `EMSGSIZE`.
+    TooLarge,
+    /// Fails with this kind and no OS error number.
+    Fail(io::ErrorKind),
+    /// Never completes, as a send parked on a full receiver.
+    Park,
+}
+
+impl ScriptedDest {
+    pub(crate) fn new(steps: impl IntoIterator<Item = SendStep>) -> Arc<Self> {
+        let dest = Self::default();
+        dest.then(steps);
+        Arc::new(dest)
+    }
+
+    /// Appends `steps` to the script.
+    pub(crate) fn then(&self, steps: impl IntoIterator<Item = SendStep>) {
+        self.state().steps.extend(steps);
+    }
+
+    pub(crate) fn state(&self) -> MutexGuard<'_, ScriptedState> {
+        self.0.lock().unwrap()
+    }
+
+    /// The accepted datagrams' bytes.
+    pub(crate) fn datagrams(&self) -> Vec<Vec<u8>> {
+        self.state().accepted.iter().map(|(bytes, _)| bytes.clone()).collect()
+    }
+
+    pub(crate) fn connect(&self) {
+        self.state().connects += 1;
+    }
+
+    pub(crate) async fn send(&self, datagram: &[u8], entries: Option<usize>) -> io::Result<usize> {
+        let step = {
+            let mut state = self.state();
+            state.sends += 1;
+            let step = state.steps.pop_front().unwrap_or(SendStep::Accept);
+            if let SendStep::Accept = step {
+                state.accepted.push((datagram.to_vec(), entries));
+            }
+            step
+        };
+        match step {
+            SendStep::Accept => Ok(datagram.len()),
+            SendStep::TooLarge => Err(io::Error::from_raw_os_error(90)),
+            SendStep::Fail(kind) => Err(io::Error::new(kind, "scripted send failure")),
+            SendStep::Park => std::future::pending().await,
         }
     }
 }

@@ -137,7 +137,10 @@
 //! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG). It defaults to 8192,
 //! Grafana Alloy's `loki.source.syslog` `max_message_length` default (the demo stack's receiver),
 //! rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on
-//! every modern relay chain.
+//! every modern relay chain. Over UDP the encoder's bound is at most 65507, the largest UDP
+//! payload ([`SyslogOutput::with_encoder`]), so a longer message is truncated below rather than
+//! refused by the kernel. UDP sends one datagram per message through the path the UDP sinks share
+//! (`crate::datagram`, which lists the fault rules).
 //!
 //! - STRUCTURED-DATA counts as header: it's written into the line buffer before the header-length
 //!   check, so an SD element that pushes the header over the limit drops the whole message
@@ -166,18 +169,18 @@
 //! called delivered only after a flush. Both transports count `logit.output.requests` tagged
 //! `class=ok|clean|ambiguous|permanent`.
 
+use crate::count_request;
+use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use crate::human::render_value_inline;
-use crate::stream::{count_request, Dial, PooledStream, Target, TlsTarget};
+use crate::stream::{Dial, PooledStream, Target, TlsTarget};
 use crate::Output;
 use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
-use logit_pipeline::Fault;
-use logit_proto::{FramedEncoder, MessageBuf};
+use logit_proto::{FramedEncoder, MessageBuf, MAX_UDP_PAYLOAD_BYTES};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
-use tokio::net::{lookup_host, UdpSocket};
 
 /// The shared `crate::tls` type, re-exported at this path as `crate::otlp` and `crate::logit` do.
 pub use crate::tls::TlsClientSettings;
@@ -279,6 +282,10 @@ impl SyslogEncoder {
     pub fn with_app_name(mut self, app_name: impl Into<String>) -> Self {
         self.default_app_name = Some(app_name.into());
         self
+    }
+
+    pub fn max_message_bytes(&self) -> usize {
+        self.max_message_bytes
     }
 
     pub fn with_max_message_bytes(mut self, max_message_bytes: usize) -> Self {
@@ -1101,7 +1108,7 @@ fn frame_octet_counting(messages: &MessageBuf, out: &mut Vec<u8>) {
 /// startup; `Tcp` connects lazily in `send`, so a receiver that isn't up yet doesn't block
 /// `logit` from starting.
 enum Conn {
-    Udp(UdpSocket),
+    Udp(UdpDest),
     /// Plaintext or TLS through the shared [`PooledStream`] driver. No DTLS arm: rule 44 rejects
     /// `tls:` under `transport: udp`.
     Tcp {
@@ -1117,9 +1124,9 @@ pub struct SyslogOutput {
     conn: Conn,
     encoder: SyslogEncoder,
     messages: MessageBuf,
-    /// TCP only: the batch's octet-counted frame, reused across `send` calls. Never shrinks, so
-    /// an outlier batch pins its peak capacity, the trade `InfluxLineEncoder`'s buffers make
-    /// (`docs/design/memory.md`).
+    /// The batch's octet-counted TCP frame, reused across `send` calls (UDP sends each message
+    /// straight from `messages` and only clears it). Never shrinks, so an outlier batch pins its
+    /// peak capacity, the trade `InfluxLineEncoder`'s buffers make (`docs/design/memory.md`).
     frame_buf: Vec<u8>,
     /// TCP only: `Some` exactly when a `tls:` block was configured (module doc's "TLS"). Built
     /// once by [`SyslogOutput::with_tls`], shared by every connect.
@@ -1129,14 +1136,11 @@ pub struct SyslogOutput {
 }
 
 impl SyslogOutput {
-    /// Binds an ephemeral local UDP socket now. `endpoint` is resolved per batch instead, so a DNS
-    /// failure is a delivery-time `Fault::Clean`, not a startup error.
+    /// Binds an ephemeral local IPv4 UDP socket now. `endpoint` is resolved per batch instead, so
+    /// a DNS failure is a delivery-time `Fault::Clean`, not a startup error
+    /// (`crate::datagram`'s module doc).
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .context("binding syslog_out's local UDP socket")?;
-        socket.set_nonblocking(true).context("configuring syslog_out's UDP socket")?;
-        let socket = UdpSocket::from_std(socket).context("registering syslog_out's UDP socket")?;
-        Ok(Self::new(endpoint, Conn::Udp(socket)))
+        Ok(Self::new(endpoint, Conn::Udp(UdpDest::bind("syslog_out")?)))
     }
 
     /// Never connects here -- see [`Conn`]'s doc comment.
@@ -1157,8 +1161,17 @@ impl SyslogOutput {
         }
     }
 
+    /// Installs `encoder`. Over UDP its `max_message_bytes` is capped at
+    /// [`MAX_UDP_PAYLOAD_BYTES`], so a longer message is truncated to fit one datagram (module
+    /// doc's "Sizing") rather than refused by the kernel and dropped.
     pub fn with_encoder(mut self, encoder: SyslogEncoder) -> Self {
-        self.encoder = encoder;
+        self.encoder = match self.conn {
+            Conn::Udp(_) => {
+                let cap = encoder.max_message_bytes().min(MAX_UDP_PAYLOAD_BYTES);
+                encoder.with_max_message_bytes(cap)
+            }
+            Conn::Tcp { .. } => encoder,
+        };
         self
     }
 
@@ -1247,15 +1260,21 @@ impl Output for SyslogOutput {
         self.telemetry.count("logit.output.batch.bytes", self.messages.total_bytes() as f64, &[]);
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = match &mut self.conn {
-            Conn::Udp(socket) => {
-                let result = Self::send_udp(
-                    socket,
-                    &self.endpoint,
-                    &self.messages,
-                    &mut self.diag,
-                    &self.telemetry,
-                )
-                .await;
+            // One datagram per message, never packed, which would depend on the receiver
+            // splitting on a delimiter (module doc's "Injection safety").
+            Conn::Udp(udp) => {
+                let batch = Datagrams {
+                    entries: &self.messages,
+                    weight: |_| 1,
+                    cap: MAX_UDP_PAYLOAD_BYTES,
+                    framing: Framing::OnePerEntry,
+                };
+                let mut report =
+                    Report { sink: "syslog_out", diag: &mut self.diag, telemetry: &self.telemetry };
+                let (sent, result) =
+                    udp.send(&self.endpoint, batch, &mut self.frame_buf, &mut report).await;
+                // What reached the kernel, even when the batch then failed.
+                self.telemetry.count("logit.output.messages", sent.entries as f64, &[]);
                 count_request(&self.telemetry, &result);
                 result
             }
@@ -1267,16 +1286,15 @@ impl Output for SyslogOutput {
                     connect_timeout: *connect_timeout,
                     sink: "syslog_out",
                 };
-                let sent = self.messages.len();
-                pool.send(&dial, &self.frame_buf, &self.telemetry).await.map(|()| sent)
+                let result = pool.send(&dial, &self.frame_buf, &self.telemetry).await;
+                if result.is_ok() {
+                    self.telemetry.count("logit.output.messages", self.messages.len() as f64, &[]);
+                }
+                result
             }
         };
         drop(request_timer);
-
-        if let Ok(sent) = &result {
-            self.telemetry.count("logit.output.messages", *sent as f64, &[]);
-        }
-        result.map(|_| ())
+        result
     }
 
     /// A backstop: `send` pools a connection only after flushing it, and a cancelled attempt
@@ -1297,86 +1315,17 @@ impl Output for SyslogOutput {
     }
 }
 
-impl SyslogOutput {
-    /// One `send_to` per message, never packed into one datagram, which would depend on the
-    /// receiver splitting on a delimiter (module doc's "Injection safety").
-    ///
-    /// - `EMSGSIZE`/`InvalidInput` (too large for the path MTU or send buffer) is a per-message
-    ///   data condition: dropped and counted, never a `Fault`, which could trip
-    ///   `docs/adr/buffered-sink-delivery.md`'s sustained-failure exit on a healthy sink.
-    /// - Any other failure is `Fault::Clean` only before the first datagram of the batch has gone
-    ///   out ([`udp_send_fault`]). After that it's `Fault::Ambiguous`: `Clean` promises the
-    ///   destination saw none of the batch, and over-claiming it would resend, and so duplicate,
-    ///   what already landed.
-    ///
-    /// `endpoint` resolves to one [`SocketAddr`] per batch. Passing the `&str` to `send_to` would
-    /// re-resolve a hostname by DNS on every message; the tests all use IP literals, so they
-    /// wouldn't notice. Per batch rather than cached still picks up a DNS change.
-    async fn send_udp(
-        socket: &UdpSocket,
-        endpoint: &str,
-        messages: &MessageBuf,
-        diag: &mut Diagnostics,
-        telemetry: &Telemetry,
-    ) -> anyhow::Result<usize> {
-        let mut addrs = lookup_host(endpoint)
-            .await
-            .context("resolving syslog_out endpoint")
-            .context(Fault::Clean)?;
-        let addr = addrs
-            .next()
-            .context("syslog_out endpoint resolved to no addresses")
-            .context(Fault::Clean)?;
-
-        let mut sent = 0usize;
-        for msg in messages.iter() {
-            match socket.send_to(msg, addr).await {
-                Ok(_) => sent += 1,
-                Err(err) if is_message_too_large(&err) => {
-                    telemetry.count(
-                        "logit.output.messages.dropped",
-                        1.0,
-                        &[("reason", "oversize_datagram")],
-                    );
-                    diag.warn_throttled(
-                        "oversize_datagram",
-                        format_args!("syslog_out: message too large for one UDP datagram: {err}"),
-                    );
-                }
-                Err(err) => return Err(anyhow::Error::new(err).context(udp_send_fault(sent))),
-            }
-        }
-        Ok(sent)
-    }
-}
-
-/// `Fault::Clean` only when nothing in the batch has left the host. Its own function because a
-/// mid-batch `send_to` failure can't be provoked reliably over a real socket in a test.
-fn udp_send_fault(sent: usize) -> Fault {
-    if sent > 0 {
-        Fault::Ambiguous
-    } else {
-        Fault::Clean
-    }
-}
-
-/// `90` is `EMSGSIZE` on Linux only (macOS/BSD use `40`). `logit` ships only in Linux containers,
-/// so a miss elsewhere is a dev-host false negative, and the `InvalidInput` fallback doesn't
-/// cover other platforms either.
-fn is_message_too_large(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc_emsgsize) if libc_emsgsize == 90 /* EMSGSIZE, Linux */)
-        || err.kind() == std::io::ErrorKind::InvalidInput
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{
-        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode, WriteStep,
+        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode,
+        ScriptedDest, SendStep, WriteStep,
     };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
     use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::Fault;
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
@@ -1860,12 +1809,105 @@ mod tests {
         assert!(!output.duplicate_safe());
     }
 
-    /// A mid-batch `send_to` failure is `Ambiguous`, since earlier datagrams may have landed.
-    #[test]
-    fn udp_send_fault_is_clean_only_before_anything_in_the_batch_has_sent() {
-        assert_eq!(udp_send_fault(0), Fault::Clean);
-        assert_eq!(udp_send_fault(1), Fault::Ambiguous);
-        assert_eq!(udp_send_fault(5), Fault::Ambiguous);
+    /// A message longer than one UDP datagram can carry is truncated to fit one by the encoder,
+    /// whatever `max_message_bytes` allows, rather than refused by the kernel and dropped.
+    #[tokio::test]
+    async fn a_message_longer_than_a_udp_datagram_is_truncated_to_fit_one() {
+        let mut collector = Collector::udp().await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = SyslogOutput::udp(collector.addr().to_string())
+            .unwrap()
+            .with_encoder(SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(100_000))
+            .with_telemetry(probe.telemetry("out", "syslog_out", "sink"));
+        let message = "x".repeat(70_000);
+        output.send(&batch_with(vec![log_event(0, &message, None)])).await.expect("send");
+
+        let got = collector.next().await;
+        assert_eq!(got.len(), 65_507, "the largest IPv4 UDP payload");
+        assert!(got.ends_with(b"xxxx"), "the MSG is truncated, not the header");
+        assert_eq!(probe.sum("logit.output.messages.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 1.0);
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+    }
+
+    /// The kernel refuses a UDP send to port 0 with `EINVAL`: a clean error, not every message
+    /// counted `oversize_datagram` under an `ok` request.
+    #[tokio::test]
+    async fn a_udp_endpoint_with_port_zero_fails_clean_and_counts_no_oversize() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = SyslogOutput::udp("127.0.0.1:0").unwrap().with_telemetry(probe.telemetry(
+            "out",
+            "syslog_out",
+            "sink",
+        ));
+        let batch = batch_with(vec![log_event(0, "one", None)]);
+        let err = output.send(&batch).await.expect_err("the kernel refuses port 0");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+        assert_eq!(crate::test_support::errno_in(&err), Some(22), "EINVAL on Linux: {err:#}");
+        let oversize = [("reason", "oversize_datagram")];
+        assert_eq!(probe.sum("logit.output.messages.dropped", &oversize), 0.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 1.0);
+    }
+
+    /// A UDP `syslog_out` over `script`, reporting into `probe`.
+    fn scripted_udp(script: &Arc<ScriptedDest>, probe: &TelemetryProbe) -> SyslogOutput {
+        let mut output = SyslogOutput::udp("127.0.0.1:514")
+            .unwrap()
+            .with_telemetry(probe.telemetry("out", "syslog_out", "sink"));
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(script)));
+        output
+    }
+
+    fn three_messages() -> EventBatch {
+        batch_with(["one", "two", "three"].map(|m| log_event(0, m, None)).to_vec())
+    }
+
+    /// Over IPv4 the encoder's cap keeps a message inside one datagram, so a kernel `EMSGSIZE`
+    /// needs a script: the refused message is dropped and counted, and the rest are sent.
+    #[tokio::test]
+    async fn an_emsgsize_message_is_dropped_and_counted_and_the_rest_are_sent() {
+        let script = ScriptedDest::new([SendStep::Accept, SendStep::TooLarge, SendStep::Accept]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = scripted_udp(&script, &probe);
+        output.send(&three_messages()).await.expect("an EMSGSIZE message is a drop, not a fault");
+        let sent = script.datagrams();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].ends_with(b"one") && sent[1].ends_with(b"three"));
+        let dropped =
+            probe.sum("logit.output.messages.dropped", &[("reason", "oversize_datagram")]);
+        assert_eq!(dropped, 1.0);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 1.0);
+    }
+
+    /// A batch that fails after two messages counts the two before it returns the error.
+    #[tokio::test]
+    async fn a_udp_failure_after_two_messages_counts_what_reached_the_wire() {
+        let script = ScriptedDest::new([
+            SendStep::Accept,
+            SendStep::Accept,
+            SendStep::Fail(std::io::ErrorKind::ConnectionRefused),
+        ]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = scripted_udp(&script, &probe);
+        let err = output.send(&three_messages()).await.expect_err("the third message fails");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert_eq!(probe.sum("logit.output.messages", &[]), 2.0);
+        assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
+    }
+
+    /// An IPv6 endpoint goes out over an IPv6 socket.
+    #[tokio::test]
+    async fn an_ipv6_udp_endpoint_is_delivered() {
+        let Ok(mut collector) = Collector::udp_at("[::1]:0").await else {
+            println!("skipping: this environment has no usable IPv6 loopback");
+            return;
+        };
+        let mut output = SyslogOutput::udp(collector.addr().to_string()).unwrap();
+        let batch = batch_with(vec![log_event(0, "one", None)]);
+        output.send(&batch).await.expect("an IPv6 endpoint must be reachable");
+        assert!(collector.next().await.ends_with(b"one"));
     }
 
     // -- Sink: TCP ------------------------------------------------------------------------------
