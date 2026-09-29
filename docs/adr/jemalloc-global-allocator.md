@@ -1,6 +1,6 @@
 ---
 created: 2026-08-31
-updated: 2026-08-31
+updated: 2026-09-28
 ---
 
 # jemalloc as the global allocator
@@ -86,3 +86,6 @@ then `jeprof`) is available on the same binary, with no separate instrumented bu
   numbers do, and it names the allocator they were taken under.
 - `tikv-jemallocator` and `tikv-jemalloc-sys` are MIT/Apache-2.0 over jemalloc's own BSD-2-Clause,
   all already permitted by `deny.toml`'s allow-list.
+- `tikv-jemalloc-ctl` is a dependency under the same feature, and the feature turns on jemalloc's
+  statistics to feed `logit.process.memory.allocated.bytes` (ADR
+  [`process-level-metrics`](process-level-metrics.md)).
