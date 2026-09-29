@@ -239,16 +239,7 @@ impl UdpDest {
                 let addr = pick_addr(addrs)
                     .with_context(|| format!("{sink} endpoint {endpoint} resolved to no addresses"))
                     .context(Fault::Clean)?;
-                let socket: &UdpSocket = if addr.is_ipv4() {
-                    v4
-                } else {
-                    match v6 {
-                        Some(socket) => socket,
-                        slot @ None => {
-                            slot.insert(bind_udp("[::]:0", sink, "IPv6").context(Fault::Clean)?)
-                        }
-                    }
-                };
+                let socket = socket_for(addr, v4, v6, sink)?;
                 Ok(DatagramDest::Udp { socket, addr })
             }
             #[cfg(test)]
@@ -269,6 +260,23 @@ impl UdpDest {
             Ok(mut dest) => send_datagrams(batch, &mut dest, packet_buf, report).await,
             Err(err) => (Sent::default(), Err(err)),
         }
+    }
+}
+
+/// The socket of `addr`'s family: `v4`, or `v6`, bound here on first use. A failed IPv6 bind is
+/// `Fault::Clean`.
+fn socket_for<'a>(
+    addr: SocketAddr,
+    v4: &'a UdpSocket,
+    v6: &'a mut Option<UdpSocket>,
+    sink: &str,
+) -> anyhow::Result<&'a UdpSocket> {
+    if addr.is_ipv4() {
+        return Ok(v4);
+    }
+    match v6 {
+        Some(socket) => Ok(socket),
+        slot @ None => Ok(slot.insert(bind_udp("[::]:0", sink, "IPv6").context(Fault::Clean)?)),
     }
 }
 
@@ -495,6 +503,37 @@ mod tests {
         assert_eq!(pick_addr([v4(2), v6(1), v4(1)]), Some(v4(2)), "the first IPv4 one");
         assert_eq!(pick_addr([v6(2), v6(1)]), Some(v6(2)), "the first IPv6 one");
         assert_eq!(pick_addr([]), None, "nothing to send to: resolution's error");
+    }
+
+    /// The socket choice behind `UdpDest::resolve`, with no packet sent, so it runs where IPv6
+    /// loopback isn't routable. An IPv4 answer uses the IPv4 socket and binds no IPv6 one; an
+    /// IPv6-only answer binds the IPv6 slot, or fails `Clean` naming it where the host has no
+    /// IPv6 at all. Never skipped.
+    #[tokio::test]
+    async fn resolution_selects_the_socket_of_the_chosen_address_family() {
+        let UdpDest::Sockets { v4, mut v6 } = UdpDest::bind("test_out").unwrap() else {
+            unreachable!("bind builds real sockets")
+        };
+        let v4_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let v6_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+
+        let chosen = pick_addr([v6_addr, v4_addr]).unwrap();
+        let socket = socket_for(chosen, &v4, &mut v6, "test_out").unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv4());
+        assert!(v6.is_none(), "an IPv4 answer binds no IPv6 socket");
+
+        let chosen = pick_addr([v6_addr]).unwrap();
+        match socket_for(chosen, &v4, &mut v6, "test_out") {
+            Ok(socket) => {
+                assert!(socket.local_addr().unwrap().is_ipv6());
+                assert!(v6.is_some(), "the IPv6 slot keeps the socket for later batches");
+            }
+            Err(err) => {
+                println!("this environment can't bind an IPv6 socket: {err:#}");
+                assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+                assert!(format!("{err:#}").contains("IPv6 UDP socket"), "{err:#}");
+            }
+        }
     }
 
     /// Nothing reached the wire: an `EMSGSIZE` drop sends nothing, so the failure after it is
