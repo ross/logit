@@ -857,8 +857,8 @@ diag:: retry_counts stdio:: datagram:: runtime::tests graph::tests::a_sinks_buff
   diagnostic are skipped when `encode` reports a repeat.
 - **What stays per attempt, on ungated handles**: `requests` and `request.duration` on all three;
   `samples` and the `remote_write_rejected` diagnostic, on every non-2xx answer (the fault table
-  in `prometheus_out`'s module doc); `records.rejected` and `otlp_partial_success`; and everything Splunk's
-  answer decides: `records`, `request.bytes`, `requests.rejected`, `acks`, a code 6's
+  in `prometheus_out`'s module doc); `records.rejected` and `otlp_partial_success`; and
+  everything Splunk's answer decides: `records`, `request.bytes`, `requests.rejected`, `acks`, a code 6's
   `records.dropped{reason="invalid_event"}` and resend, Splunk Cloud's oversize answer and split,
   and the `token_rejected`, `request_rejected`, `invalid_event`, and `ack_*` diagnostics. Gating
   them instead would change nothing (the Alternatives' "Gating the sink's own handles too"): the
