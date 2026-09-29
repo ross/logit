@@ -126,11 +126,34 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - `Output` gains no method and no parameter.
 
    The bisection in `split_encode` (`crates/logit-outputs/src/http.rs`), which `datadog_out` and
-   `datadog_trace_out` both call, re-encodes each half of an over-limit request. Those
-   re-encodes count through the same gated view, so they are muted twice over: a bisection
-   triggered by a retry doesn't count again, and, because the gate closes after a unit's first
-   encode, bisection re-encodes inside one attempt are muted too. Today they count the same
-   records more than once within a single `send`, which `datadog.rs`'s module doc records.
+   `datadog_trace_out` both call, needs one more piece (amended by `sink/w7`). `split_encode`
+   cuts a route's items into count-capped chunks and encodes each chunk once; a chunk whose body
+   is over a byte cap is bisected and each half re-encoded, down to one item. The chunk encodes
+   partition the items, so each item is encoded once at depth 0, and every deeper encode repeats
+   items a chunk encode already counted. `BatchAccounting::encode` mutes or opens a whole closure,
+   and the gate doesn't close after a unit's first encode: it is muted only while a repeat of the
+   unit runs. So:
+   - `CountGate::muted(f)` runs `f` with the gate muted and puts back the state it found, through
+     a drop guard, so a panic in `f` restores it too. It allocates nothing.
+   - `split_encode` takes the gate as a parameter and runs every encode below depth 0 inside
+     `CountGate::muted`. A sink runs the whole `split_encode` inside `encode(unit, ..)`: on the
+     unit's first encode the chunk encodes count and the bisection re-encodes don't; on a repeat
+     the gate is muted already, and `muted` restores it to muted, so nothing counts. A caller
+     can't forget the muting, because the gate is a parameter.
+
+   Two simpler shapes are wrong. Running `split_encode` inside one `encode(unit, ..)` closure with
+   no gate inside it counts every bisection re-encode on the first attempt, the same records once
+   per level. Wrapping each codec call in its own `encode(unit, ..)` mutes the second and later
+   depth-0 chunks, which hold different records, so they'd never count at all.
+
+   A codec counter that describes a request body, not a record (a batch-resource carrier the
+   form has no field for, a stats payload's resource attributes, a negative stats bucket start),
+   counts once per depth-0 encode, that is once per count-capped request chunk. That is stable
+   across attempts, which is what the gate guarantees, but it isn't once per batch:
+   `datadog_trace_out` counts it once per 1,000 traces. `datadog_out` never cuts a traces or stats
+   request by count, so there it is once per batch. A record the codec degraded at depth 0 and the
+   bisection then dropped as oversize at the leaf is reported under both counters: the codec's,
+   and `records.dropped{reason="oversize"}`.
 3. **`datadog_out` fixes `now` once per batch, in `observe_batch`.** Staleness isn't monotonic
    in `now`: a point is stale when it's older than `METRIC_MAX_AGE` or more than
    `METRIC_MAX_AHEAD` in the future. With a clock read per attempt, a point that was ahead of the
@@ -138,6 +161,14 @@ nature. The encode-side counters are the only ones that measure the batch and no
    delivers it. With one `now`, every attempt reaches the same verdict for every point. The
    trade-off is that a batch retried for `retry_budget` can send a point up to that long past the
    end of its window.
+
+   A changing verdict would break decision 2 too: the plan decides which items each route holds,
+   and a route re-encoded muted on attempt 2 would then hold items its attempt-1 encode never
+   counted. `observe_batch` reads the clock once and stores the send time; `send` reads the stored
+   one, or the clock when nothing armed the batch; an `Ok` clears it, where the gate disarms, so a
+   later `send` with no `observe_batch` reads the clock again. The send time is read only by the
+   plan's stale filter: no payload, header, or sketch carries it. `datadog_trace_out` has no
+   clock-dependent drop. (Amended by `sink/w7`.)
 4. **`logit.output.requests` counts every attempt that returns, tagged
    `class=ok|clean|ambiguous|permanent`.** This applies to `statsd_out`, `syslog_out`,
    `graphite_out`, `collectd_out`, and `logit_out`, so the label set is the one `Fault` defines.
@@ -372,7 +403,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
     - **`logit.output.request.bytes` counts the bytes of a request that was sent.** A request
       that got an answer counts, and so does one that failed in a way that may have sent it (a
       timeout, a reset); one that failed `Fault::Clean` never connected and counts nothing. It
-      stays a transport counter, once per attempt that sends.
+      stays a transport counter, once per attempt that sends. `splunk_hec_out`, `datadog_out`,
+      and `datadog_trace_out` follow it; on `datadog_trace_out`'s Unix socket, a path the
+      connector can't dial is the `Clean` case.
 
 ## Alternatives considered
 
@@ -400,6 +433,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
   the bytes.
 - **Counting server-verdict drops once per batch.** Rejected. See decision 1: each attempt gets
   its own verdict, and a later attempt can get a different one.
+- **For `split_encode`'s bisection, one `encode(unit, ..)` around the whole split, or one around
+  each codec call.** Rejected (decision 2): the first counts every bisection re-encode on the
+  first attempt, and the second mutes the second and later count-capped chunks, which hold
+  records nothing counted yet.
 - **A per-attempt clock in `datadog_out`, with the gated view alone covering counters.**
   Rejected. The stale verdict can flip between attempts, so a point can be counted dropped and
   still be sent.
@@ -905,6 +942,82 @@ Run them with `script/test -p logit-outputs prometheus:: otlp:: splunk::`.
 
 `sink/w7` lands decisions 2 and 3 and decision 14's `request.bytes` rule for the two Datadog
 sinks: per-route units, `split_encode`'s bisection, and `datadog_out`'s per-batch `now`.
+
+- **The clock.** `datadog_out`'s `send` read the wall clock on every attempt. A point 11 minutes
+  ahead of the first attempt's clock was dropped as `stale` there and sent by an attempt two
+  minutes later. `observe_batch` now reads the clock once, through a `clock` field a test can
+  script; `send` uses that time until an `Ok` clears it. `plan` returns its items and drops as a
+  `Plan` and counts nothing, since it can't borrow the sink inside `BatchAccounting::encode`.
+- **Bisection.** `CountGate::muted` in `logit-core`, and `split_encode`'s gate parameter
+  (decision 2's amendment).
+- **Units.** `datadog_out`: unit 0 is `plan`, whose drops `count_plan_drops` counts on the unit's
+  first encode, and route `r` is unit `1 + r as u32`, its `split_encode` and its local oversize
+  drops. `datadog_trace_out`: `TRACES_UNIT` (0) is the trace route's `split_encode` and the
+  tracer headers, whose `bad_header` diagnostic is reported on the unit's first encode only, and
+  `STATS_UNIT` (1) is the stats route's. Both sinks' `send` is `attempt` and
+  `BatchAccounting::finish`, `datadog_out`'s through `send_at`; `new_encoder` builds the encoder
+  on gated views, called by `new` and `with_client` and by `with_diagnostics` and
+  `with_telemetry`.
+- **What stays per attempt, on ungated handles**: `requests`, `request.duration`,
+  `request.bytes`, `records`, a `413`'s `records.dropped{reason="oversize"}`, and the
+  `request_rejected` and `api_key_rejected` diagnostics.
+- **`request.bytes`** (decision 14): both sinks' `post` count it on an answer and on an error
+  that isn't `Fault::Clean`. A refused connection counted 41 bytes for one gauge on `datadog_out`
+  before; on `datadog_trace_out` a refused TCP connection and a missing socket file together
+  counted 336 bytes for two three-span batches.
+- **Per-chunk counters**, in `crates/logit-proto/src/datadog/`: `resource_carriers_lost`
+  (`spans.degraded{reason="no_wire_form"}`), `json_text` for a resource carrier in `wire_tracer`
+  and `wire_agent`, `client_payload`'s resource `tags.dropped{reason="no_wire_form"}` and
+  `unrepresentable` carriers, `encode_stats_payload`'s envelope flags, and
+  `stats.degraded{reason="negative_timestamp"}`, once per bucket. Each counts once per body the
+  codec writes, and none of them differs between a depth-0 encode and the bisection halves in a
+  way depth-0 counting would get wrong: a half repeats the same resource and buckets.
+- **Tests**, each shown to fail on a planted bug:
+  - `telemetry::tests`: `muted_mutes_inside_and_restores_the_state_it_found`, `muted_nests`,
+    `muted_restores_the_state_it_found_when_f_panics` (`catch_unwind`), and
+    `muted_mutes_the_counts_of_a_handle_gated_over_it`.
+    In `http::tests`,
+    `bisection_re_encodes_run_muted_and_count_capped_chunks_as_the_caller_left_the_gate`: depth-0
+    encodes see the gate as the caller left it and partition the items, deeper ones run
+    muted, under an open and a muted outer gate.
+  - `datadog::tests`, over `http_recorder` answering per path, through `drive_write_loop` under
+    `delivery: at_least_once`:
+    `a_route_failing_after_another_was_sent_counts_every_routes_encode_side_once` (logs `503`
+    then `202` after the series route was accepted) and
+    `routes_first_encoded_on_a_retry_count_their_encode_side_then` (series `503` first, so the
+    sketches and logs routes are first encoded on attempt 2), each against a single-attempt run,
+    with the retried bodies byte-identical per route; before the fix the plan's drops, the codec
+    counters, and `oversized_sketch` read 2 where one attempt read 1.
+    `bisection_counts_each_records_codec_counters_once_on_every_attempt` (a caps override
+    bisects nine logs, in two count-capped chunks, into five requests and one leaf oversize
+    log): `reserved_key` reads 9, one per record, on one attempt and on a retried one, where it
+    read 23 on one attempt before; a `muted` that reopened the gate made the retried run read 13.
+    `a_point_stale_at_the_batchs_send_time_is_dropped_on_every_attempt` (the point 11 minutes
+    ahead, the scripted clock stepping 2 minutes): sent on attempt 2 before the fix, never
+    after, with the clock read once. `a_direct_send_after_a_delivered_batch_reads_the_clock_again`.
+    `a_second_datadog_batch_counts_its_encode_side_counters`,
+    `a_datadog_batch_after_one_dropped_at_its_budget_counts_encode_side`,
+    `datadog_direct_sends_after_a_batch_that_sent_nothing_count_every_time`,
+    `every_datadog_builder_order_gates_the_encoder_on_the_final_handles`,
+    `a_datadog_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once`,
+    `a_413_answered_on_a_retry_is_counted`, `a_refused_connection_counts_no_request_bytes`, and
+    `an_answered_or_timed_out_request_counts_its_bytes`.
+  - `datadog_trace::tests`, the same shape:
+    `a_stats_failure_after_the_traces_were_sent_counts_each_units_encode_side_once`,
+    `stats_first_encoded_on_a_retry_count_their_encode_side_then`,
+    `a_per_body_counter_counts_once_per_count_capped_chunk_on_every_attempt` (1,001 traces: the
+    runtime id's `no_wire_form` reads 2, one per request, on one attempt and on a retried one,
+    where the retried run read 4 before), `a_second_trace_batch_counts_its_encode_side_counters`,
+    `a_trace_batch_after_one_dropped_at_its_budget_counts_encode_side`,
+    `trace_direct_sends_after_a_batch_that_sent_nothing_count_every_time`,
+    `every_trace_builder_order_gates_the_encoder_on_the_final_handles`,
+    `a_trace_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once`,
+    `an_oversize_trace_counts_once_on_a_retried_batch` (a caps override),
+    `a_413_answered_on_a_retry_is_counted`,
+    `a_refused_connection_or_a_missing_socket_counts_no_request_bytes`, and
+    `an_answered_or_timed_out_request_counts_its_bytes`.
+
+Run them with `script/test -p logit-core -p logit-outputs telemetry:: http:: datadog`.
 
 ### `sink/w8`: close-out
 
