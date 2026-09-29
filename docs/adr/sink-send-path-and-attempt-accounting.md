@@ -379,7 +379,6 @@ nature. The encode-side counters are the only ones that measure the batch and no
       same close as an `Ok(0)`: no frame is in flight. A close or read error part-way through a
       header stays an error and counts `logit.proto.errors{reason="truncated_header"}`, which
       was uncounted; part-way through a body it stays `reason="truncated"`.
-
 13. **`stdio_out` and `file_out` count a batch's bytes after its write.** `StreamOutput::send`
     counts `logit.output.batch.bytes` and calls `FileTarget::note_written` once the write and
     flush succeeded, not before. A re-open after a rotation can fail `Fault::Clean`, which
@@ -501,8 +500,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
 - A UDP sink endpoint that resolves only to IPv6 addresses is reached, where it failed `Clean` on
   every batch. A name that resolves to both still goes to IPv4.
 - A `syslog_out` message over 65507 bytes on UDP is truncated where the kernel refused it.
-- `collectd_out`'s `logit.output.requests` loses `class="error"` for the four fault classes, and
-  the UDP sinks count the messages and datagrams a failed attempt did send.
+- The UDP sinks count the messages and datagrams a failed attempt did send.
 - Encode-side counts lose their inflation on retry, and the drop counters read while a sink is
   unhealthy stop growing by the attempt count. A server-verdict drop still grows with retries,
   and decision 1 says so.
@@ -512,12 +510,27 @@ nature. The encode-side counters are the only ones that measure the batch and no
   on `splunk_hec_out`, `datadog_out`, and `datadog_trace_out`.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
-- Left open for later workstreams: the HTTP sinks' `requests` vocabulary.
+- The HTTP sinks keep their own `requests` vocabulary, and other work this record leaves is under
+  Follow-ups.
+
+## Follow-ups
+
+- Align the HTTP sinks' `logit.output.requests` vocabulary with decision 4's four fault classes
+  (`docs/known-gaps.md`, "Internal telemetry and self-logging").
+- Make `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a failure after an accepted
+  request in the same `send` as `Fault::Ambiguous`, as `splunk_hec_out` does, so an at-most-once
+  retry stops re-sending what was accepted (one `docs/known-gaps.md` entry per sink).
+- Fix or scope the pre-existing warnings that `cargo doc` reports with warnings denied in
+  `logit-outputs`, `logit-pipeline`, and `logit-proto`, which CI doesn't check.
+- Configure a nextest per-test timeout, so a hung test fails and doesn't stall the run.
+- Give `influxdb_out` the shared HTTP client's redirect policy, or its own explicit one, since
+  its `build_client` follows redirects (inventory top lead 18).
 
 ## Running it
 
-Each workstream fills in its subsection in the PR that lands it, and updates its inventory rows.
-No code from this record exists until a workstream lands it.
+Each workstream filled in its subsection in the PR that landed it and updated its inventory rows.
+`sink/w0` (#449) is this record. `sink/w1` (#450) through `sink/w7` (#456) landed the code and
+tests below, one PR each, and `sink/w8` (#PRW8) closed the cluster out in the docs.
 
 ### `sink/w1`: pinned TLS semantics and one fake stream (SINK-03, WIRE-09)
 
@@ -816,8 +829,7 @@ graphite:: collectd:: graph::`.
 
 `sink/w5` lands decisions 1 and 2 for `statsd_out`, `syslog_out`, `graphite_out`,
 `collectd_out`, and `influxdb_out`, decision 13 for `stdio_out` and `file_out`, and decision 10's
-graph rule. `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out` follow in
-`sink/w6`, and `datadog_out` and `datadog_trace_out` in `sink/w7`.
+graph rule. `sink/w6` and `sink/w7` gate the HTTP sinks.
 
 - **The gate.** `CountGate`, `Telemetry::gated`/`is_muted`, and `Diagnostics::gated` in
   `logit-core`; `BatchAccounting` in `crates/logit-outputs/src/accounting.rs`. The five sinks
@@ -1022,6 +1034,26 @@ Run them with `script/test -p logit-core -p logit-outputs telemetry:: http:: dat
 
 ### `sink/w8`: close-out
 
-`sink/w8` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
-`write_all` on the pooled sinks and the datagram loop, updates `docs/known-gaps.md`,
-`docs/design/internal-telemetry.md`, and `docs/deploying.md`, and closes the inventory rows.
+`sink/w8` changes no code. It audits the docs the eight PRs edited piecemeal, and closes the
+inventory rows.
+
+- **Cancellation points.** `docs/design/pipeline-graph.md`'s table names what a dropped `send`
+  leaves in each sink family, on the `deliver_with_retry` row, and points at the tests that pin it:
+  `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh` and its
+  dial and redial siblings in `stream::tests`,
+  `a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket` in `datagram::tests`,
+  and `a_cancelled_send_dropped_mid_await_leaves_stream_none` in `logit`'s tests. The shared dial's
+  connect and handshake bounds, `logit_out`'s `HelloAck` bound, its ack wait, its shutdown bound,
+  and `UnixDest`'s send timeout each have a row. The datagram send loop has no `select!` or
+  `timeout`, so it has no row; its lost counts are in `docs/known-gaps.md`.
+- **Known gaps.** The gaps the stack recorded are each in `docs/known-gaps.md` once: a grace cut
+  mid-write on `logit_out`, a cancelled datagram send's lost counts, a TLS `logit_out` dying in a
+  frame's first record, a connect failure `Clean` after an accepted request (three sinks), drops a
+  peer or the kernel decided that repeat on retry, per-body and double-reported Datadog codec
+  counters, the `fault` seam's rule ordering, the Splunk test under plain `cargo test`, `file_out`'s
+  size bookkeeping after a failed flush, the skipped IPv6 tests, the IPv4 preference, and the HTTP
+  sinks' `requests` vocabulary.
+- **Counter docs.** `docs/design/internal-telemetry.md`'s class table under "Outputs" is the one
+  statement of the three counter classes. Each sink's section and `docs/deploying.md` point at it.
+- **Inventory.** SINK-01..06, WIRE-08, WIRE-09, and RT-05 are `findings`, top leads 12 and 14 are
+  done, and cluster 6 is done.
