@@ -510,6 +510,18 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 12).
 
+- **A shutdown grace that cuts a `logit_out` `send` mid-write commits, and counts as dropped, a
+  batch that provably never landed.** `write_loop` reads any cut-off send as `Fault::Ambiguous`,
+  because it can't know how far the send got. On `logit_out` a cut inside the frame's write or
+  flush leaves `logit_in` holding a truncated frame it never forwards, so the batch didn't
+  arrive. Under the default `at_most_once` posture the runtime then commits it and counts it
+  `logit.component.batches.dropped{reason="shutdown"}`; under `at_least_once` it stays queued. It
+  isn't fixed because the runtime sees a cancelled future, not where in the send it stopped, and
+  a cut inside the ack wait, after the frame landed, is truly ambiguous.
+  `docs/design/pipeline-graph.md`'s "Cancellation points" table has the row. To keep such a
+  batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
+  at the read cursor.
+
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one
   octet-counted TCP frame per message, and `statsd_out` one statsd line per metric packed up to a
@@ -647,6 +659,25 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   (`crates/logit-outputs/src/datagram.rs`'s module doc). Counting each datagram as it goes would
   close it, at a telemetry call per datagram. `logit.component.errors` records the cancelled
   attempt.
+- **A UDP sink reaches only the IPv4 address of a name that resolves to both families.** Each
+  UDP sink (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`) sends to the first IPv4
+  address its endpoint resolves to and falls back to the first IPv6 one only when there is no
+  IPv4 address. Binding by the first resolved address instead would turn a loud failure into
+  silent loss where `localhost` resolves to `::1` first and the receiver listens on `127.0.0.1`
+  only.
+  - **Consequence:** a receiver that listens on IPv6 only, behind a name that also has an IPv4
+    address, gets nothing, and the send reports `ok`.
+  - **Workaround:** write the IPv6 address in `endpoint:`, for example `[::1]:8125`.
+  - **Revisit trigger:** an operator who needs the IPv6 address preferred
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 9).
+- **The four IPv6 UDP sink tests skip where IPv6 loopback is unavailable.** Each of
+  `statsd::tests::an_ipv6_udp_endpoint_is_delivered` and its `syslog`, `graphite`, and `collectd`
+  twins binds a collector on `[::1]:0` and prints a reason and returns when it can't. The dev
+  container has IPv6 loopback, so `script/test` and CI run them, but a host without it shows four
+  passes that tested nothing. The datagram module's
+  `resolution_selects_the_socket_of_the_chosen_address_family` never skips and covers the family
+  choice.
 - **Netns-wide UDP counters (`/proc/net/snmp`, `netstat -su`) are deliberately not collected.**
   `Udp: InErrors` / `RcvbufErrors` / `NoPorts` and the `UdpLite` block answer questions the
   per-socket counters can't — most usefully `NoPorts`, datagrams for a port nothing listens on,
@@ -1312,6 +1343,27 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     trace request and the stats request gets the traces again on the retry, and an Agent dedupes
     nothing, so every span in them is stored twice.
   - **Fix:** the same as `datadog_out`'s.
+- **Some Datadog codec counters count once per request body, not once per batch.** They
+  describe a body and not a record: `spans.degraded{reason="no_wire_form"}` and
+  `{reason="json_text"}` for a batch-resource carrier,
+  `tags.dropped{reason="no_wire_form"|"unrepresentable"}` for a stats payload's resource
+  attributes, and `stats.degraded{reason="negative_timestamp"}`. A count-capped request is one
+  body, and `datadog_trace_out` cuts a batch of more than 1,000 traces or stats groups into
+  several. `datadog_out` cuts no traces or stats request by count, so there it is once per batch.
+  - **Consequence:** a batch of 1,001 traces reports a carrier the form can't hold twice. The
+    count is stable across retries, which is what the attempt accounting guarantees, but it
+    isn't a per-batch measure.
+  - **Revisit trigger:** a dashboard that needs the per-batch figure
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 2).
+- **A record a Datadog codec degraded and the sink then dropped as oversize is reported under
+  both counters.** The codec counts the degradation (`no_wire_form`, `json_text`, and the like)
+  at the record's first encode, and `split_encode`'s bisection may then find the record alone
+  over the route's byte limit and drop it, counted `records.dropped{reason="oversize"}`. The
+  record is never sent, so its degradation counter describes a wire form that never left.
+  Suppressing it would need the codec to defer its counts until the request is accepted.
+  - **Consequence:** the degradation counters of a route that also drops oversize records read
+    high by those records.
 
 ## Splunk
 
@@ -1960,8 +2012,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   completes the write in flight, so the file can hold a torn line or native frame. The batch is
   counted as the grace decides (ADR
   [`shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
-  decision 3), but nothing marks the torn record, and the next run appends after it. Open, for the
-  sink send path's verification cluster. A write that succeeds followed by a flush that fails
+  decision 3), but nothing marks the torn record, and the next run appends after it. The sink send
+  path cluster verified what a dropped `send` leaves in the other sink families
+  ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md))
+  and left this one. A write that succeeds followed by a flush that fails
   leaves `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
   rotation can come late; the error carries no `Fault`, so the batch isn't retried.
 - ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ **Closed.** It was the
@@ -2791,6 +2845,29 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   only `logit-cli/src/main.rs` — `Command::Run`'s exit-error printer, `Command::Graph`'s
   validation warning, and `Command::Ready`'s probe failure: a CLI's own stderr on its own error
   paths, not a running service's self-log.
+- **A drop a kernel or a destination decided counts again on a retried batch.** Encode-side
+  counters count once per batch, but these repeat on every attempt that gets the same answer:
+  Splunk's code 6 (`records.dropped{reason="invalid_event"}`) and Splunk Cloud's oversize answer,
+  an OTLP `partial_success` (`records.rejected`), a datagram refused with `EMSGSIZE`, and the
+  packer's skip of an entry over the datagram cap (`oversize_datagram`).
+  [internal-telemetry.md](design/internal-telemetry.md)'s class table lists them.
+  - **Consequence:** on a sink that retries, these counters read high by the number of attempts
+    that met the verdict, and the batch's own retries account for the growth.
+  - **Why it stays:** each attempt got its own answer, and a retry might get a different one, so
+    counting once would need the sink to remember what an earlier attempt learned
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 1).
+- **The HTTP sinks' `logit.output.requests` doesn't use the four fault classes.** The stream and
+  datagram sinks (`statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `logit_out`) tag
+  each attempt `class=ok|clean|ambiguous|permanent`. `influxdb_out`, `otlp_out`,
+  `prometheus_out`'s remote-write mode, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`
+  tag each request with its status class (`2xx`, `5xx`, `network_error`, and the gRPC status name
+  for `otlp_out`), and count one per request, so a `send` that issues several counts several.
+  - **Consequence:** one alert on `class="ambiguous"` covers the first group and not the second,
+    and a dashboard needs a query per group.
+  - **Revisit trigger:** aligning the vocabulary, which the ADR names as follow-up work
+    ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
+    decision 4).
 
 ## Load-test harness and perf tooling
 
