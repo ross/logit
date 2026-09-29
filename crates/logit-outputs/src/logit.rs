@@ -32,7 +32,7 @@
 //!   `Err` or `Ok(0)`, a failed flush) is `Clean`, with the `io::Error` kept, and the connection
 //!   is dropped. Bytes of the frame may have left the host, but not all of them, so the peer can't
 //!   hold the batch. The flush is part of the phase because a TLS write can return with the
-//!   frame's tail still queued in the session, and the ack read doesn't send it. ADR
+//!   frame's tail still queued in the session, and a waiting ack read doesn't send it. ADR
 //!   `sink-send-path-and-attempt-accounting`, decisions 6 and 7, has the one residual (a TLS 1.3
 //!   `KeyUpdate` queued behind the frame).
 //! - **Ack wait**: a timeout, a read error, a message other than `Ack` or `Reject`, or a
@@ -539,9 +539,9 @@ impl Output for LogitOutput {
 }
 
 /// Writes and flushes one control message with [`frame::FLAG_CONTROL`] set. Flushed because every
-/// control message is followed by a wait for the peer, which a TLS read doesn't send it through
-/// (ADR `sink-send-path-and-attempt-accounting`, decision 7). Duplicates `logit_inputs::logit`'s
-/// `write_control` rather than add a cross-crate dependency for it.
+/// control message is followed by a wait for the peer, and a waiting TLS read doesn't send it
+/// (ADR `sink-send-path-and-attempt-accounting`, decision 7). Duplicates
+/// `logit_inputs::logit`'s `write_control` rather than add a cross-crate dependency for it.
 async fn write_control<S: AsyncWrite + Unpin>(
     stream: &mut S,
     msg: &impl ControlEncode,
@@ -1778,8 +1778,8 @@ mod tests {
         err.chain().any(|e| e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == kind))
     }
 
-    /// A TLS write returns with ciphertext still queued in the session, and the ack read never
-    /// sends it (`crate::stream_pins`). A frame larger than the socket can take at once reaches
+    /// A TLS write returns with ciphertext still queued in the session, and a waiting ack read
+    /// never sends it (`crate::stream_pins`). A frame larger than the socket can take at once reaches
     /// the peer only through the flush after it; without one the peer never holds the frame, the
     /// ack wait times out `Ambiguous`, and at-most-once drops a batch the peer never received.
     #[tokio::test]

@@ -388,7 +388,7 @@ decision record.
   frame is a clean fault, although bytes of the frame may have left. The ack wait is the one
   ambiguous window.
 - **Every write that awaits a reply is flushed.** Under TLS, a write can return with ciphertext
-  still queued in the session, and a read doesn't send it. So `logit_out` flushes the `Hello` and
+  still queued in the session, and a waiting read doesn't send it. So `logit_out` flushes the `Hello` and
   each frame, and `logit_in` flushes `HelloAck`, `Ack`, and every `Reject`, before either side
   waits.
 - **Close.** `logit_out` shuts its connection down after its last batch, which under TLS sends

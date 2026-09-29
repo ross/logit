@@ -32,7 +32,7 @@
 //! **Bounded, flushed writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`,
 //! including `GOING_AWAY`) is flushed, and the write and flush finish within `handshake_timeout`
 //! or are abandoned ([`write_control`]). The flush is what sends a TLS write's queued tail: the
-//! next read on this side doesn't, and the peer is waiting for the whole message. A peer
+//! waiting read on this side doesn't, and the peer is waiting for the whole message. A peer
 //! that sends frames but never reads its `Ack`s fills this side's send buffer; unbounded, the
 //! blocked write would hold the task, its permit, and its [`Fanout`] clone, and so the
 //! shutdown, for as long as the peer stayed connected. `idle_timeout` bounds reads only and can't
@@ -2362,8 +2362,8 @@ mod tests {
         stream.flush().await.unwrap();
     }
 
-    /// A TLS write returns with ciphertext still queued in the session, and this listener's next
-    /// read never sends it. Over a 16-byte pipe, a `HelloAck` or `Ack` reaches the client only
+    /// A TLS write returns with ciphertext still queued in the session, and this listener's
+    /// waiting read never sends it. Over a 16-byte pipe, a `HelloAck` or `Ack` reaches the client only
     /// because [`write_control`] flushes it.
     #[tokio::test]
     async fn hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record() {
