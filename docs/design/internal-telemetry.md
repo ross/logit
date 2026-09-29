@@ -1458,6 +1458,26 @@ DogStatsD tag key) renders as its last representable element, and every other el
 It's `normalized` rather than `dropped` because the tag or label itself survives, but read it as
 data loss.
 
+The datagram sinks count an oversize drop at one of two points, and in each sink's own unit:
+
+| Counter | Reason | Where | Unit |
+|---|---|---|---|
+| `logit.output.messages.dropped` | `oversize_datagram` | the kernel refused a datagram with `EMSGSIZE` | `statsd_out`: entries (lines); `graphite_out`: datapoints; `collectd_out`: value lists (a notification counts one); `syslog_out`: messages |
+| `logit.output.messages.dropped` | `oversize_line` | `statsd_out`'s encoder: one line over `max_packet_bytes` | lines |
+| `logit.output.metrics.skipped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
+| `logit.output.metrics.skipped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
+
+An encoder-side drop counts once per encode of a batch. `oversize_datagram` is the kernel's verdict
+on one attempt ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+decision 1), so a retried batch counts it again. `crates/logit-outputs/src/datagram.rs`'s module
+doc has the send side's rules.
+
+The same four sinks, and `statsd_out` under `transport: unix`, count `logit.output.messages`,
+`logit.output.datagrams`, and `graphite_out`'s `logit.output.datapoints` for every datagram the
+kernel took, on an attempt that then failed as well as on one that succeeded: those datagrams are on
+the wire either way. A cancelled attempt counts none of them (`docs/known-gaps.md`). On a stream
+transport the same counters count only a delivered frame.
+
 ##### `influxdb_out`
 
 `crates/logit-outputs/src/influxdb.rs`.
@@ -1582,15 +1602,15 @@ reports through them itself, so both halves of one `send` appear under one compo
 The sink adds only what a socket send can produce and the codec can't know:
 
 - `logit.output.batch.bytes`, `logit.output.request.duration`, and
-  `logit.output.requests{class="ok"|"error"}`: one per attempt that returns.
+  `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: `syslog_out`'s shape.
 - `logit.output.messages`: value lists actually sent (the per-datagram list count each
   `logit_proto::MessageBuf<usize>` entry's meta carries, summed).
 - `logit.output.datagrams`: datagrams actually sent. Both this and `messages` are UDP concepts;
   collectd has no TCP mode.
 - `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled `oversize_datagram`
-  diagnostic: `EMSGSIZE` on one already-packed datagram, as in `statsd_out`'s identical case
-  (`StatsdOutput::flush_datagram`). The datagram's own lists are dropped, not the whole batch, and
-  sending continues with the next datagram.
+  diagnostic: `EMSGSIZE` on one already-packed datagram, as in `statsd_out`'s identical case. The
+  datagram's own lists are dropped, not the whole batch, and sending continues with the next
+  datagram.
 
 A `log`-only event carrying a `collectd.severity` attribute is a notification, and the codec's
 diagnostics mirror `collectd_in`'s: `notification_dropped` (severity absent despite being

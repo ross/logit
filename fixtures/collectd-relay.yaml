@@ -51,7 +51,7 @@ components:
     # UDP only: collectd's `network` plugin has no TCP mode.
     endpoint: central-collectd:25826
     # Every field below is its default; omit it for the same effect.
-    # max_packet_bytes: "1452"   # bounds one datagram, not one value list; 1024..=65535. Lower it
+    # max_packet_bytes: "1452"   # bounds one datagram, not one value list; 1024..=65507. Lower it
     #                            # to match a path MTU. A list that alone exceeds it is dropped
     #                            # whole and counted, not split.
     # hostname:                  # unset: used only for an event carrying neither `collectd.host`

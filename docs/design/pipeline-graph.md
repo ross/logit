@@ -315,8 +315,9 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     value.
 37. A `has_provenance`/`drop_provenance` with nothing configured, or an empty or repeated entry.
     An id isn't checked against this graph: it may name a component in another process.
-38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, or a `collectd_out`
-    value outside `1024..=65535`.
+38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, a value above 65507
+    (the largest UDP payload) on `collectd_out` or a UDP `statsd_out`/`graphite_out`, or a
+    `collectd_out` value below 1024.
 39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
     `series_retention` or `max_retained_series` of `0`; in either mode, `series_retention` above `0`
     with `max_retained_series: 0`, and a `max_samples_per_series` or `max_set_members_per_series` of
@@ -358,7 +359,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 64. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
     path, or `tls` without `bind`.
 65. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
-    `transport: unix`/`unix_stream`, or `tls:` under either Unix transport.
+    `transport: unix`/`unix_stream` or is 108 bytes or longer, or `tls:` under either Unix
+    transport.
 66. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
     scheme or `/`, an `endpoints` entry that isn't an absolute `http://`/`https://` URL,
     `timeout: 0s`, a reserved or colliding header, or a bad `tls`.
@@ -375,6 +377,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `max_body_bytes` of `0`, or a bad `tls` (including any `tls` with an `http://` endpoint).
 71. A `lua`/`lua_file` `max_memory` of `0`: an empty Lua VM already holds more than that.
 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`.
+73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, or `syslog_out` on `transport: udp`, or
+    `collectd_out`) on port 0.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -660,7 +664,7 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | Sink connect bounds: `connect` in `outputs/stream.rs` (the dial `statsd_out`, `syslog_out`, `graphite_out`, and `logit_out` share), and `outputs/logit.rs` `LogitOutput::handshake` | `timeout(connect_timeout, ..)` around the TCP connect, the TLS handshake, and `logit_out`'s `HelloAck` read | The timeout firing drops a connect or handshake | No byte of the batch has left, so the attempt is `Fault::Clean`, and `deliver_with_retry` retries it under either posture |
 | Sink reply bounds: `outputs/logit.rs` `send` (the ack), `outputs/otlp.rs` `send_grpc`, `outputs/datadog_trace.rs` `send`, and the `reqwest` request `timeout` of `influxdb_out`, `otlp_out`, `datadog_out`, `splunk_hec_out`, and `prometheus_out`'s remote-write | `timeout(request_timeout, ..)` around the request and its reply | The timeout firing drops a request that may have reached the destination | The attempt is `Fault::Ambiguous` (`Fault::Clean` when `reqwest` reports a connect failure), and `is_retryable` retries it only under `at_least_once`, as for a cut-off send |
 | `outputs/logit.rs`, `Output::flush` (`logit_out`) | `timeout(request_timeout, stream.shutdown())` on the pooled connection, once after the last batch | The timeout firing drops a shutdown, possibly with `close_notify` part-written | Every frame on a pooled connection was acked, so nothing is in flight; the connection drops either way, and `logit_in` reads a close between frames, with or without `close_notify`, as the end of the connection |
-| `outputs/statsd.rs`, `UnixDest::send_once` | `timeout(send_timeout, socket.send(buf))` | The timeout firing drops a `send` that wrote nothing: a datagram send is all or nothing | The socket is reset, so the next send reconnects, and the send error reaches `flush_datagram`, which classifies it like any other send failure |
+| `outputs/datagram.rs`, `UnixDest::send_once` (`statsd_out`'s `transport: unix`) | `timeout(send_timeout, socket.send(datagram))` | The timeout firing drops a `send` that wrote nothing: a datagram send is all or nothing | The socket is reset, so the next send reconnects, and the send error reaches `send_datagrams`, which classifies it like any other send failure |
 
 The table leaves out `logit-cli`'s signal wait (`shutdown_signal`) and admin server, which run
 outside any node, and test code.

@@ -935,8 +935,8 @@ reference. Before deploying one:
   which this relay re-emits as 1717 bytes across two. Expect a capture of relayed traffic to look
   chattier than the original.
 - **`max_packet_bytes:` bounds a datagram, not a value list**, and defaults to `1452`, collectd's
-  own `MaxPacketSize` default. Graph validation rejects values outside `1024..=65535`, collectd's
-  range. Lower it to match a path MTU. The encoder re-packs incoming lists into datagrams of its own
+  own `MaxPacketSize` default. Graph validation rejects values outside `1024..=65507`: 1024 is
+  collectd's own minimum, and 65507 is the largest UDP payload. Lower it to match a path MTU. The encoder re-packs incoming lists into datagrams of its own
   choosing, however the sender packed them, so this setting (together with the inflation above,
   which pushes that 1296-byte capture over the default cap) decides egress framing. A single value
   list too large to fit alone is dropped whole and counted
@@ -981,8 +981,8 @@ one:
   dotted sub-paths tabled in `logit_proto::graphite`'s module doc (`.count`, `.sum`,
   `.q0_5`...`.q0_99`, per-bucket counts, and so on), an explicit, named convention counted
   `logit.output.metrics.degraded{metric_kind=...}` once per record.
-- **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`) bounds a datagram, not
-  a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
+- **Size and timeout bounds.** `max_packet_bytes:` (UDP only, default `1432`, at most `65507`, the
+  largest UDP payload) bounds a datagram, not a single line, like `statsd_out`'s setting. `max_frame_bytes:` (default `1MiB`, Twisted's
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame and applies regardless of transport,
   since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) matches
   `statsd_out`'s and `syslog_out`'s default.
@@ -1042,7 +1042,16 @@ components:
   attempt, tagged with its fault class) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
   peer or the network is unstable, not this sink. It counts plaintext and TLS connections the same
   way, since both take the same connect path. `logit.output.datagrams` exists only under the
-  datagram transports, `udp` and `unix`.
+  datagram transports, `udp` and `unix`, and there
+  `logit.output.messages.dropped{reason="oversize_datagram"}` counts the lines of a datagram the
+  kernel refused as too large (`EMSGSIZE`) under an `ok` request. That count is per attempt, so a
+  batch retried after a later failure counts it again.
+- **Over UDP, `endpoint:` needs a real port and `max_packet_bytes:` at most `65507`.** `logit
+  validate` rejects port 0, which the kernel refuses every datagram to (rule 73), and a
+  `max_packet_bytes:` above 65507, the largest UDP payload (rule 38). A name that resolves to both
+  IPv4 and IPv6 addresses is sent to the first IPv4 one; an endpoint with only IPv6 addresses goes
+  out over an IPv6 socket. `syslog_out`, `graphite_out`, and `collectd_out` resolve their UDP
+  endpoints the same way.
 
 ### `statsd_out`: sending to a DogStatsD Unix socket
 
@@ -1075,8 +1084,11 @@ components:
 - **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
   4-byte little-endian integer, which a real Agent 7.83 accepted. A write that fails having
   accepted zero bytes is retried once on a fresh connection, as on plaintext TCP.
-- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
-  `endpoint:` (rule 65).
+- **No TLS.** `logit validate` rejects `tls:` under either Unix transport, a relative
+  `endpoint:`, and a path of 108 bytes or more, which doesn't fit a Unix socket address (rule 65).
+- **`max_packet_bytes:` isn't bounded by the UDP ceiling here.** A `unix` datagram's limit is the
+  socket's send buffer (`net.core.wmem_default`, 212 992 bytes on a default kernel); a larger
+  packet is refused `EMSGSIZE` and counted `oversize_datagram`, as over UDP.
 
 ## Tailing files and Docker logs
 

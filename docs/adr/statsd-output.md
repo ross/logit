@@ -756,6 +756,7 @@ amendment records the same finding from the Datadog side.
 [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `statsd_out`'s pooled TCP and Unix stream send onto a driver shared with `syslog_out` and
 `graphite_out`, and its datagram packing onto a packer shared with `graphite_out` and the Unix
 datagram transport. It also changes three behaviors: `logit.output.requests` is tagged
-`class=ok|clean|ambiguous|permanent` and counts connect failures, an over-cap entry is dropped and
-counted `oversize_datagram` before any I/O, and a TLS server name is parsed at construction, so a
-bad endpoint fails startup. A TLS write `Err` is `Ambiguous`.
+`class=ok|clean|ambiguous|permanent` and counts connect failures, the datagram transports count
+what reached the kernel before a failure, and a TLS server name is parsed at construction, so a
+bad endpoint fails startup. A TLS write `Err` is `Ambiguous`. Over UDP, `max_packet_bytes` is at
+most 65507, the largest UDP payload, and an IPv6 endpoint is sent to over an IPv6 socket.

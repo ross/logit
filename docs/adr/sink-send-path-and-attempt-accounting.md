@@ -84,7 +84,11 @@ nature. The encode-side counters are the only ones that measure the batch and no
      a Splunk code 6 and the oversize split, an HTTP 413, an OTLP `partial_success`, and
      `EMSGSIZE`. They count per attempt. A batch retried after such a verdict counts the verdict
      again, because each attempt got its own answer. Counting them once would need the sink to
-     remember what an earlier attempt learned, and a retry might get a different answer.
+     remember what an earlier attempt learned, and a retry might get a different answer. An
+     `EMSGSIZE` drop repeats in two sequences: drops followed by a failure before any datagram of
+     the attempt was sent, under either posture, since that failure is `Clean` and `Clean` retries
+     under both; and any `Ambiguous` retry under `at_least_once`, which is `graphite_out`'s
+     default.
 
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
@@ -229,25 +233,58 @@ nature. The encode-side counters are the only ones that measure the batch and no
      real pair.
 
    Each fact gets a test.
-9. **`statsd_out` and `graphite_out` share one datagram packer, and the four UDP sinks share one
-   errno helper.**
-   - The packer is generic over entry weight (entries for statsd, datapoints for graphite) and
-     sends through a destination seam that tests can make fail. The seam keeps `UnixDest`'s
-     reconnect-once rule, so the Unix datagram transport uses the same packer.
-   - The over-cap scan runs as a pre-pass before any I/O. An entry longer than the datagram cap
-     is dropped and counted `oversize_datagram` up front, an encode-side count that goes through
-     decision 2's gate, so the packer never emits a datagram
-     over the cap and a partial batch never depends on where the oversize entry falls.
-   - `is_message_too_large` is one function that tests `EMSGSIZE`. The `InvalidInput` fallback
-     is removed. It only ever caught `EINVAL`, and it counted unrelated errors as an oversize
-     datagram.
-   - The datagram ceiling is 65507 bytes, the largest UDP payload over IPv4. `collectd_out`'s
-     `max_packet_bytes` bound becomes 65507, and `statsd_out` and `graphite_out` get the same
-     bound.
-   - A UDP sink binds its socket by the resolved address's family, so an IPv6 endpoint works.
-     A name that resolves to `::1` first no longer fails `Clean` on every batch.
-   - `syslog_out` sends one datagram per message and `collectd_out` sends the codec's datagrams
-     unpacked. They use the shared errno helper and not the packer.
+9. **The four UDP sinks and `statsd_out`'s `transport: unix` share one datagram send path,
+   `crates/logit-outputs/src/datagram.rs`.**
+   - **One packer.** `send_datagrams` is generic over an entry's weight: `1` for `statsd_out` and
+     `syslog_out`, datapoints for `graphite_out`, value lists for `collectd_out`. Its framing is
+     `Packed` (entries joined by `\n` up to the cap: statsd and graphite) or `OnePerEntry` (each
+     entry its own datagram: syslog, which never packs, and collectd, whose encoder chose every
+     boundary). One loop holds the fault rule, the `EMSGSIZE` handling, and the counts for all four
+     sinks, and it builds each packed datagram in the sink's own buffer.
+   - **A destination enum, not a trait.** `DatagramDest` is `Udp`, `Unix` (`UnixDest`, with its
+     reconnect-once rule on a batch's first datagram and its `send_timeout`), and a
+     `#[cfg(test)]` `Scripted` variant, as the stream driver has `Target::Scripted`. `UnixDest`'s
+     connect target has a scripted variant too, so its reconnect and timeout rules run under a
+     script.
+   - **No over-cap pre-pass.** Every encoder caps its entries at the value its sink passes the
+     packer, on every builder path and transport, and `MessageBuf` has no remove API, so a
+     pre-pass would scan for something the code can't produce. The packer has a `debug_assert!`
+     and one release-build branch that skips an over-cap entry and counts it
+     `messages.dropped{reason="oversize_datagram"}` in the weight unit.
+     `GraphiteOutput::with_encoder` refuses a pickle encoder on UDP, as rule 46 does in config: it
+     was the one builder path that could put an entry past the cap, since a pickle frame is bounded
+     by `max_frame_bytes`, not by the datagram cap.
+   - **`is_message_too_large` tests `EMSGSIZE` only**, as a named constant holding Linux's value.
+     The `InvalidInput` fallback is removed. It caught more than `EINVAL`: std raises
+     `InvalidInput` itself for a Unix socket path of 108 bytes or more, a NUL in a path, and a name
+     that resolves to nothing, and the kernel's `EINVAL` for a UDP send to port 0 maps to it too.
+     Each of those fails every datagram alike, so the fallback turned a bad endpoint into every
+     batch counted `oversize_datagram` under `requests{class="ok"}`, a silent loss under the wrong
+     reason. They are faults now, `Clean` when nothing of the batch was sent.
+   - **Two graph rules** reject the two reachable cases at config time: rule 65 rejects a
+     `statsd_in`/`statsd_out` Unix socket path of 108 bytes or more, and rule 73 rejects port 0 on
+     a UDP sink endpoint. The port is readable at validation even when the host is a name, and
+     `!env` is resolved by then.
+   - **The ceiling is per transport.** `logit_proto::MAX_UDP_PAYLOAD_BYTES` (65507, the largest UDP
+     payload over IPv4) bounds `max_packet_bytes` on `collectd_out`, whose range becomes
+     `1024..=65507`, and on `statsd_out` and `graphite_out` under `transport: udp` (rule 38). It
+     doesn't bound statsd's Unix transports, whose limit is the socket's send buffer. IPv6 allows
+     20 more bytes, but validation can't know a hostname's family, so the bound is the same. A
+     `syslog_out` over UDP caps its encoder at `min(max_message_bytes, 65507)`, so a longer message
+     is truncated by the encoder's existing truncation rather than refused by the kernel.
+   - **IPv4 first, IPv6 when the endpoint has nothing else.** Each UDP sink keeps its IPv4 socket
+     bound at construction, so a bad local bind stays a startup error, and binds an IPv6 socket
+     the first time a batch needs one; a failed IPv6 bind is `Fault::Clean`. Per batch, the sink
+     sends to the first IPv4 address the endpoint resolves to, else the first IPv6 one
+     (`pick_addr`).
+   - **Partial sends are counted.** `send_datagrams` returns what it sent on every exit, so a sink
+     counts `logit.output.messages`, `logit.output.datagrams`, and `graphite_out`'s
+     `logit.output.datapoints` for the datagrams that reached the kernel before a failure. They
+     are transport facts and count per attempt. A cancelled send returns nothing, so its counts
+     are lost, which `docs/known-gaps.md` records.
+   - **`count_request` moves to crate level** (`crates/logit-outputs/src/lib.rs`), shared by the
+     stream driver, `logit_out`, and the datagram sinks. `collectd_out` counts through it, which
+     completes decision 4.
 10. **Config validation rejects the values that make retry spin or a bad endpoint retry forever.**
     - A graph rule rejects `retry_budget: 0s` and `retry_max_delay: 0s`, as the graph does for
       other durations where zero breaks the component. `backoff_for` isn't floored at
@@ -313,6 +350,24 @@ nature. The encode-side counters are the only ones that measure the batch and no
   was sent, so `Ambiguous` is wrong, and `Clean` retries to budget exhaustion on every batch
   against a peer that will answer the same way every time.
 - **Flooring `backoff_for` at `base_delay`.** Rejected. See decision 10.
+- **Scanning a batch for over-cap entries before any datagram is sent.** Rejected. No encoder can
+  produce such an entry once `GraphiteOutput::with_encoder` refuses pickle on UDP, and dropping one
+  would need a remove API `MessageBuf` doesn't have. A `debug_assert!` and a skip-and-count branch
+  cover the invariant at no cost per batch.
+- **A destination trait for the packer.** Rejected for an enum: the destinations are a closed set
+  of two plus a test double, as the stream driver's `Target` is, and an enum keeps the send
+  future's type concrete.
+- **Binding the UDP socket by the family of the first resolved address.** Rejected. Where
+  `localhost` resolves to `::1` first and the receiver listens on `127.0.0.1` only, the send to
+  `::1` succeeds and nothing receives it: a loud `Clean` failure on every batch becomes silent loss.
+  Preferring IPv4 keeps every endpoint that works today working, and reaches IPv6 when the
+  endpoint has no IPv4 address.
+- **Keeping `is_message_too_large`'s `InvalidInput` fallback for platforms that report
+  `EMSGSIZE` differently.** Rejected. `logit` builds and runs in Linux containers, and the fallback
+  counted a misconfigured endpoint as oversize data on every batch.
+- **Counting each datagram as it's sent, so a cancelled send keeps its counts.** Not taken: it
+  costs a telemetry call per datagram for a loss already bounded to the attempt the runtime
+  cancelled, which `logit.component.errors` records.
 
 ## Consequences
 
@@ -335,7 +390,15 @@ nature. The encode-side counters are the only ones that measure the batch and no
   frames; a truncated header now counts `truncated_header`.
 - `retry_budget: 0s` and `retry_max_delay: 0s` become validation errors. A config that sets
   either fails to load.
-- `collectd_out` rejects `max_packet_bytes` above 65507 where it accepted up to 65535.
+- `collectd_out` rejects `max_packet_bytes` above 65507 where it accepted up to 65535, and a UDP
+  `statsd_out` or `graphite_out` rejects the same values. A Unix socket path of 108 bytes or more
+  and a UDP sink endpoint on port 0 become validation errors; built past validation, both are
+  faults on every batch where they were silent drops counted `oversize_datagram`.
+- A UDP sink endpoint that resolves only to IPv6 addresses is reached, where it failed `Clean` on
+  every batch. A name that resolves to both still goes to IPv4.
+- A `syslog_out` message over 65507 bytes on UDP is truncated where the kernel refused it.
+- `collectd_out`'s `logit.output.requests` loses `class="error"` for the four fault classes, and
+  the UDP sinks count the messages and datagrams a failed attempt did send.
 - Encode-side counts lose their inflation on retry, and the drop counters read while a sink is
   unhealthy stop growing by the attempt count. A server-verdict drop still grows with retries,
   and decision 1 says so.
@@ -502,7 +565,8 @@ zstd frame, which `compression_from_u8` never yields, so the failure is unreacha
 - **Shared dial.** `dial` is `crate::stream::connect` with `request_timeout` as its
   `connect_timeout`: the TCP connect and the TLS handshake are each bounded by it, as before, and
   every failure is `Clean`. `with_tls` builds a `TlsTarget`, so an endpoint with no valid server
-  name fails startup (decision 10), and `send` counts `requests` through `stream::count_request`.
+  name fails startup (decision 10), and `send` counts `requests` through `count_request` (at crate
+  level since `sink/w4`).
 - **Faults.** Every write-phase failure is `Clean`, with the `io::Error` in the chain. A
   `HelloAck` that doesn't answer the `Hello` is `Permanent`, counted as no connection.
 - **`requests`.** `Output::send` wraps one inner attempt and counts `logit.output.requests`
@@ -561,8 +625,79 @@ Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit
 
 ### `sink/w4`: the datagram packer (SINK-04)
 
-`sink/w4` lands decision 9: `crates/logit-outputs/src/datagram.rs`, the shared packer and
-`is_message_too_large`, the 65507 ceiling, and binding by address family.
+`sink/w4` lands decision 9 and completes decision 4 for `collectd_out`.
+
+- **The module.** `crates/logit-outputs/src/datagram.rs` holds `send_datagrams`,
+  `is_message_too_large`, `pick_addr`, `UdpDest` (the eager IPv4 socket and the lazy IPv6 one),
+  `DatagramDest`, and `UnixDest`, moved out of `statsd.rs`. `statsd_out` (UDP and Unix datagram)
+  and `graphite_out` pack through it; `syslog_out` and `collectd_out` send one datagram per entry
+  through it. Both old packers, both `flush_datagram`s, the four `is_message_too_large` copies,
+  `syslog_out`'s `udp_send_fault`, and `collectd_out`'s own send loop are gone.
+  `ScriptedDest` in `crates/logit-outputs/src/test_support.rs` scripts each send (accept,
+  `EMSGSIZE`, an error of a given kind, or never completing) and records each accepted datagram
+  with its entry count.
+- **The two old packers differed only in what they counted and where they sent.** Same greedy
+  test (`len + 1 + entry > cap` on a non-empty buffer), same separator guard, same
+  `Clean`-until-the-first-sent-datagram rule, same resets on every exit. `graphite_out` summed
+  datapoints and counted an `EMSGSIZE` drop in datapoints; `statsd_out` counted entries. `statsd_out`
+  sent through `DatagramDest` (UDP or Unix) with a first-of-batch flag, `graphite_out` straight to a
+  `UdpSocket`, so the Unix reconnect rule was statsd's alone. The diagnostic text named each sink.
+  The shared packer keeps the arithmetic, takes the unit as the weight function, takes the sink
+  name for its diagnostics, and gives both sinks the destination enum. Neither old packer checked
+  an entry against the cap, and both discarded their counts on an error.
+- **What an operator sees change.**
+  - New validation errors: a `statsd_in`/`statsd_out` Unix socket path of 108 bytes or more (rule
+    65), a UDP sink endpoint on port 0 (rule 73), and `max_packet_bytes` above 65507 on a UDP
+    `statsd_out`/`graphite_out` or on `collectd_out` (rule 38).
+  - An endpoint that resolves only to IPv6 addresses works on all four UDP sinks.
+  - A `syslog_out` message longer than 65507 bytes on UDP is truncated to fit a datagram.
+  - `collectd_out` counts `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`.
+  - A failed UDP attempt counts the messages, datagrams, and (graphite) datapoints it did send.
+- **Tests**, each shown to fail on a planted bug:
+  - `datagram::tests`: `only_emsgsize_is_a_message_too_large`,
+    `pick_addr_takes_the_first_ipv4_address_else_the_first_ipv6_one`,
+    `emsgsize_then_a_failure_with_nothing_sent_is_clean`,
+    `sent_then_emsgsize_then_a_failure_is_ambiguous`,
+    `a_failure_after_two_datagrams_returns_what_the_two_carried`, `one_per_entry_never_packs`,
+    `an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent` (a `should_panic`
+    on the `debug_assert!` in a debug build; its release run exercises the skip branch),
+    `the_reconnect_once_rule_survives_an_emsgsize_dropped_first_datagram`,
+    `a_timed_out_unix_send_drops_the_socket_and_the_next_send_reconnects`,
+    `a_unix_send_parked_past_send_timeout_times_out_and_drops_the_socket` (paused clock),
+    `a_send_dropped_mid_batch_leaves_a_clean_start_and_a_usable_unix_socket`, and the proptest
+    `packing_never_exceeds_the_cap_never_splits_an_entry_and_reconciles`: every datagram at most the
+    cap, non-empty, with no leading or trailing `\n`; the datagrams joined by `\n` equal the
+    entries joined by `\n`; each datagram is the run of whole entries the packer reports it holds,
+    and the next entry wouldn't have fit; entries, weight, and datagrams reconcile. Entries hold
+    embedded `\n`s, so splitting a datagram on `\n` isn't used to recover them.
+  - A real kernel `EMSGSIZE` through each sink's builders, with exact drop counts in the sink's
+    unit, `send` returning `Ok`, `requests{class="ok"}`, sent plus dropped equal to what was
+    encoded, and the datagrams around the refused one arriving:
+    `statsd::tests::a_real_udp_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive`,
+    `statsd::tests::a_real_unix_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive` (sized
+    from `/proc/sys/net/core/wmem_default`),
+    `graphite::tests::a_real_emsgsize_drops_one_datagram_and_the_ones_around_it_arrive`, and
+    `collectd::tests::a_real_emsgsize_drops_one_datagram_and_the_one_after_it_arrives`. Over IPv4
+    `syslog_out`'s encoder cap keeps every message inside a datagram, so its `EMSGSIZE` test is
+    scripted: `syslog::tests::an_emsgsize_message_is_dropped_and_counted_and_the_rest_are_sent`.
+  - Each sink's `a_udp_endpoint_with_port_zero_fails_clean_and_counts_no_oversize` (the kernel's
+    `EINVAL`, asserted by errno), `an_ipv6_udp_endpoint_is_delivered` (a collector on `[::1]:0`,
+    skipped with a printed reason where IPv6 loopback is unavailable), and its partial-send test
+    (`a_udp_failure_after_two_datagrams_counts_what_reached_the_wire` in statsd and graphite,
+    `a_udp_failure_after_two_messages_counts_what_reached_the_wire` in syslog,
+    `a_failure_after_two_datagrams_counts_what_reached_the_wire` in collectd); and
+    `statsd::tests::a_unix_socket_path_too_long_for_sockaddr_un_fails_clean_and_counts_no_oversize`,
+    `syslog::tests::a_message_longer_than_a_udp_datagram_is_truncated_to_fit_one` (a real 70 000
+    byte message), and `graphite::tests::with_encoder_refuses_pickle_on_udp`.
+  - `logit-pipeline`'s graph tests: `a_udp_max_packet_bytes_above_the_udp_payload_ceiling_is_rejected`,
+    `the_udp_payload_ceiling_binds_only_the_udp_transports`,
+    `a_max_packet_bytes_above_the_udp_payload_ceiling_is_rejected_for_collectd_out`,
+    `a_unix_socket_path_too_long_for_sockaddr_un_is_rejected_on_both_statsd_kinds`,
+    `a_udp_sink_endpoint_with_port_zero_is_rejected`, and
+    `a_nonzero_port_and_the_stream_transports_pass_rule_73`.
+
+Run them with `script/test -p logit-outputs -p logit-pipeline datagram:: statsd:: syslog::
+graphite:: collectd:: graph::`.
 
 ### `sink/w5`: attempt accounting and backoff (SINK-05, SINK-06, RT-05)
 

@@ -589,16 +589,26 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `read_loop_sampled` per socket with no way to reach a second. Left deliberately: it is a signature
   change to a function whose arm ordering is load-bearing.
 - **A UDP sink's send failures are not counted by cause.** `statsd_out`, `syslog_out`,
-  `graphite_out` and `collectd_out` treat every failed datagram send the same way, so an operator
-  can't tell `ENOBUFS` (local socket-buffer pressure: a tuning problem) from `EMSGSIZE` (a datagram
-  past the path MTU: a configuration problem) from `ECONNREFUSED` (an ICMP port-unreachable from a
+  `graphite_out` and `collectd_out` count an `EMSGSIZE` refusal (a datagram past the path MTU: a
+  configuration problem) as `logit.output.messages.dropped{reason="oversize_datagram"}`, but end
+  the batch on every other failed send alike, so an operator can't tell `ENOBUFS` (local
+  socket-buffer pressure: a tuning problem) from `ECONNREFUSED` (an ICMP port-unreachable from a
   missing receiver: a deployment problem). The fix is a `logit.output.send.errors{errno="..."}`
-  count at those four send sites, with the errno set bounded by the handful a UDP `sendmsg` can
-  return; only the call site can see the errno. The receive side's kernel counters (see "No
+  count at the one send site the four share (`send_one` in `crates/logit-outputs/src/datagram.rs`),
+  with the errno set bounded by the handful a UDP `sendmsg` can return; only the call site can see
+  the errno. The receive side's kernel counters (see "No
   visibility into the kernel's own UDP receive-buffer drops", closed, below) have no useful
   send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 on a UDP socket because a datagram is
   charged and uncharged inside one `sendmsg`, so a send-buffer gauge would be a flat zero. It was
   deliberately not built; `SockMeminfo` carries the field only because the option returns it.
+- **A cancelled datagram send loses the counts of what it already sent.** A UDP sink, or
+  `statsd_out` under `transport: unix`, counts `logit.output.messages` and
+  `logit.output.datagrams` (and `graphite_out`'s `datapoints`) once `send_datagrams` returns, on
+  success and on failure alike. A `send` dropped mid-batch, by the retry budget or the shutdown
+  grace, never returns, so the datagrams it had already handed the kernel are never counted
+  (`crates/logit-outputs/src/datagram.rs`'s module doc). Counting each datagram as it goes would
+  close it, at a telemetry call per datagram. `logit.component.errors` records the cancelled
+  attempt.
 - **Netns-wide UDP counters (`/proc/net/snmp`, `netstat -su`) are deliberately not collected.**
   `Udp: InErrors` / `RcvbufErrors` / `NoPorts` and the `UdpLite` block answer questions the
   per-socket counters can't — most usefully `NoPorts`, datagrams for a port nothing listens on,
