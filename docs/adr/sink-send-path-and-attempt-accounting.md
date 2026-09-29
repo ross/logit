@@ -154,13 +154,29 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - Under TLS, a write `Err` on a line or message stream is `Fault::Ambiguous`. The session may
      have put a record on the wire before the error, and the peer may forward the complete lines
      inside it.
-   - On `logit_out`, a first-write `Err` is `Fault::Clean` under TLS and plaintext alike, and a
-     `write_all` `Err` after a first write that returned `Ok` stays `Ambiguous`. `Clean` holds
-     under TLS even though bytes of the frame may have reached the wire, because the peer then
-     holds a truncated frame that it can't decode or forward. The sink keeps the `io::Error` as
-     context and doesn't discard it. The classification of a `write_all`-remainder failure and of
-     a flush failure is an open question for `sink/w3`: a failure anywhere in the write phase leaves a truncated frame at
-     the peer, so `Clean` may be truthful there too. `sink/w3` settles it after its own review.
+   - On `logit_out`, every failure before the frame is completely written and flushed is
+     `Fault::Clean`, under TLS and plaintext alike: a write `Err`, a write `Ok(0)`, and a flush
+     `Err`, wherever in the frame they fall. `logit_in` fills the whole frame, checks its CRC,
+     decodes, forwards, and only then acks, and it has no partial decode path, so a peer that
+     didn't receive every byte of the frame can't hold the batch. Bytes of the frame may have
+     left the host; `Clean` says what the peer holds, not what left. The sink keeps the
+     `io::Error` in the chain and drops the connection. The one `Ambiguous` window is the ack
+     wait.
+
+     One residual: a TLS 1.3 `KeyUpdate` queued behind the frame. In rustls 0.23.45,
+     `PlaintextSink::write` buffers the plaintext and then calls `maybe_refresh_traffic_keys`.
+     When a record's sequence number reaches the suite's confidentiality limit
+     (`RecordLayer::pre_encrypt_action`), `send_single_fragment` sets
+     `refresh_traffic_keys_pending`, and `maybe_refresh_traffic_keys` queues a `KeyUpdate` record
+     behind the records of the same `write` call. If that call carried the frame's last record,
+     a write or flush can fail on the `KeyUpdate` after the whole frame reached the socket. The
+     attempt is then `Clean` although the peer holds the frame and forwards it, and a resend
+     duplicates the batch. The limit is 2^24 records under one traffic key for the AES-GCM suites
+     (`TLS13_AES_128_GCM_SHA256` and `TLS13_AES_256_GCM_SHA384` in the `ring` provider), so the
+     case is reachable only on a connection that has carried 16 777 216 records, at least one per
+     frame; for `TLS13_CHACHA20_POLY1305_SHA256` the limit is unreachable. It isn't fixed: the
+     write and flush can't tell a `KeyUpdate` failure from a frame failure, and the window is one
+     record in 2^24.
 
    The difference between the line sinks and `logit_out` is framing. A line stream has no frame
    boundary the peer waits for: any prefix that ends at a newline is a complete record it
@@ -176,6 +192,15 @@ nature. The encode-side counters are the only ones that measure the batch and no
    `TcpStream::flush` is a no-op, so the flush costs nothing off TLS. A read that fails on a bad
    record does write (decision 8), but the stall is on the clean path, where a waiting read
    drives nothing, so the flush is needed either way.
+
+   The flush follows the whole write, before `conn.seq` advances and before
+   `logit.proto.frames` and `logit.proto.frame.bytes` count the frame, and it isn't under the
+   sink's `request_timeout`: a large frame on a slow link can outlast that timeout, and the retry
+   budget bounds the flush as it bounds the write. `logit_in` flushes its own control writes
+   (`HelloAck`, `Ack`, and every `Reject`) inside the `handshake_timeout` bound its
+   `write_control` already applies. With one frame in flight, a control message fits the socket
+   of a peer that is waiting for it, so the listener side is a contract fix rather than an
+   observed stall; a tokio-rustls pair over `tokio::io::duplex(16)` reaches it.
 8. **Third-party semantics are pinned by tests, and a dependency bump re-verifies them.** The
    design rests on facts about tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. Tests run
    against a real TLS pair over `tokio::io::duplex` with a small buffer, which makes a mid-record
@@ -231,6 +256,31 @@ nature. The encode-side counters are the only ones that measure the batch and no
       parsed target. A bad endpoint fails startup, not every batch. If a name
       still fails to parse at the send path, the fallback classification is `Fault::Permanent`,
       not `Clean`, so it doesn't retry to budget exhaustion.
+11. **`logit_out` refuses a `HelloAck` that doesn't answer its `Hello`, as `Fault::Permanent`.**
+    A `HelloAck` whose `version` differs from the `Hello`'s, whose `codec` the `Hello` didn't
+    offer, or whose `compression` is unknown or wasn't offered fails the handshake. The peer
+    answers an identical `Hello` the same way, which is the reason `REJECT_VERSION_MISMATCH` and
+    `REJECT_NO_COMMON_CODEC` are `Permanent`, so this is too. An unknown compression byte no
+    longer falls back to none. `logit.output.reconnects` and the first-connection flag change
+    only after the `HelloAck` passes, so a refused handshake is not a connection. `write_loop`
+    then treats a peer that keeps answering this way like one that keeps sending a version
+    reject: each attempt is explicitly `Permanent`, the batch is dropped, and after
+    `PERMANENT_FAILURE_WINDOW` (60 s) of nothing but such outcomes the pipeline ends.
+12. **`logit_out` sends `close_notify`, and `logit_in` reads a close between frames as a close
+    under TLS too.** Before this, `logit_out` never shut its stream down, so under TLS every
+    disconnect reached `logit_in` as `UnexpectedEof`, which `serve_connection` returned as an
+    error and the accept loop logged as `connection_error`; the listener's clean-close path was
+    unreachable under TLS.
+    - `Output::flush`, which `run_output` calls once after the last batch, shuts the pooled
+      connection down within the sink's `request_timeout` and drops it. The shutdown sends
+      `close_notify` under TLS and a FIN under both. A failure isn't reported, since every frame
+      on a pooled connection was acked.
+    - A connection dropped after a failed or cancelled attempt can't send `close_notify` without
+      an await its drop doesn't have. The listener rule covers it.
+    - `logit_in`'s header read treats `UnexpectedEof` with no byte of the next header read as the
+      same close as an `Ok(0)`: no frame is in flight. A close or read error part-way through a
+      header stays an error and counts `logit.proto.errors{reason="truncated_header"}`, which
+      was uncounted; part-way through a body it stays `reason="truncated"`.
 
 ## Alternatives considered
 
@@ -252,9 +302,15 @@ nature. The encode-side counters are the only ones that measure the batch and no
   Rejected. The stale verdict can flip between attempts, so a point can be counted dropped and
   still be sent.
 - **Merging `logit_out` into the shared driver.** Rejected. See decision 5.
-- **Treating a TLS first-write `Err` on `logit_out` as `Ambiguous`, as the line sinks do.**
+- **Treating a TLS write-phase `Err` on `logit_out` as `Ambiguous`, as the line sinks do.**
   Rejected. The peer can't forward a truncated frame, so the batch was never received, and
   `Ambiguous` would drop it under `at_most_once` for no reason.
+- **Keeping `logit_out`'s single first `write` ahead of `write_all`.** It existed to tell "nothing
+  left" (`Clean`) from "something left" (`Ambiguous`). Once every write-phase failure is `Clean`,
+  it tells nothing apart, so the frame goes out through one `write_all` and a flush.
+- **`logit_out` answering a bad `HelloAck` `Clean` or `Ambiguous`.** Rejected. Nothing of a batch
+  was sent, so `Ambiguous` is wrong, and `Clean` retries to budget exhaustion on every batch
+  against a peer that will answer the same way every time.
 - **Flooring `backoff_for` at `base_delay`.** Rejected. See decision 10.
 
 ## Consequences
@@ -268,9 +324,14 @@ nature. The encode-side counters are the only ones that measure the batch and no
 - `logit.output.requests` gains the classes `clean`, `ambiguous`, and `permanent` on the line
   sinks and `collectd_out`, and loses `error`. A dashboard or alert on `class="error"` needs to
   change. This is a pre-release break with no alias.
-- `logit_out` gains a `flush()` after two writes. Under TLS that closes a stall that surfaced as
-  an `Ambiguous` timeout and a dropped batch. `logit_in`'s `Ack` and `Reject` writes may need the
-  same flush. That question is open until the `logit_out` workstream traces it.
+- `logit_out` gains a `flush()` after two writes, and `logit_in` after each control write. Under
+  TLS that closes a stall that surfaced as an `Ambiguous` timeout and a dropped batch.
+- A `logit_out` write-phase failure that used to be `Ambiguous` (a `write_all` remainder) is now
+  `Clean`, so under `at_most_once` the batch is retried where it was dropped.
+- A `logit_out` whose peer answers a `HelloAck` it didn't ask for now fails `Permanent` where it
+  used to connect (a bad compression byte) or fail `Ambiguous` (a codec it never offered).
+- A TLS `logit_in` no longer logs `connection_error` for every `logit_out` disconnect between
+  frames; a truncated header now counts `truncated_header`.
 - `retry_budget: 0s` and `retry_max_delay: 0s` become validation errors. A config that sets
   either fails to load.
 - `collectd_out` rejects `max_packet_bytes` above 65507 where it accepted up to 65535.
@@ -280,9 +341,7 @@ nature. The encode-side counters are the only ones that measure the batch and no
 - `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
-- Left open for later workstreams: the HTTP sinks' `requests` vocabulary, whether `logit_in`'s
-  `Ack` and `Reject` writes need a flush, and the classification of a `logit_out`
-  `write_all`-remainder or flush failure (decision 6), which `sink/w3` settles.
+- Left open for later workstreams: the HTTP sinks' `requests` vocabulary.
 
 ## Running it
 
@@ -359,10 +418,63 @@ rustls, or tokio re-runs `stream_pins` and re-reads the functions each test name
 
 ### `sink/w3`: `logit_out` (WIRE-08)
 
-`sink/w3` lands decisions 6 and 7 for `logit_out`: the flush after the `Hello` and frame writes,
-the rewritten first-write comment with the `io::Error` kept, the connection kept on a
-frame-encode failure, a strict compression byte, and decision 4's classes. It also traces
-`logit_in`'s `Ack` and `Reject` writes.
+`sink/w3` lands decisions 4, 6, 7, 11, and 12 for `logit_out` and `logit_in`. The frame-encode
+failure after a connection is taken keeps no connection, as before: `write_frame_with_flags`
+fails only on a payload over the sanity cap, which the bound check before it excludes, or on a
+zstd frame, which `compression_from_u8` never yields, so the failure is unreachable.
+
+- **Flushes.** `logit_out` writes each frame with one `write_all` and a flush, and
+  `write_control` flushes the `Hello`. `logit_in`'s `write_control` flushes inside its bound.
+  `LogitOutput::connect_and_handshake` is `dial` then `handshake(stream)`, so a test hands the
+  handshake a stream it built.
+- **Faults.** Every write-phase failure is `Clean`, with the `io::Error` in the chain. A
+  `HelloAck` that doesn't answer the `Hello` is `Permanent`, counted as no connection.
+- **`requests`.** `Output::send` wraps one inner attempt and counts `logit.output.requests`
+  once, from `classify` of its result. Connect, handshake, and too-large returns now count.
+- **Close.** `Output::flush` shuts the pooled connection down; `logit_in`'s header read takes
+  `UnexpectedEof` at a frame boundary as a close and counts a truncated header.
+- **Smaller.** `read_control` bounds a control frame at `control::MAX_CONTROL_MESSAGE_BYTES`
+  (4096; the largest message this version writes is a 1033-byte `Reject`), not the 64 MiB data
+  cap. `LogitOutput::observe_batch`'s doc says once per batch.
+
+The tests, in `crates/logit-outputs/src/logit.rs` unless named otherwise:
+
+- Flushes over a real tokio-rustls pair on `tokio::io::duplex`:
+  `a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait` (a 32 KiB frame
+  over a 4 KiB pipe), `the_hello_is_flushed_before_the_hello_ack_wait` (a 16-byte pipe), and in
+  `logit_in`, `hello_ack_and_ack_reach_a_tls_client_over_a_pipe_smaller_than_one_record` and
+  `a_reject_reaches_a_tls_client_over_a_pipe_smaller_than_one_record`. Each timed out before the
+  fix.
+- Write-phase faults: `a_write_that_fails_part_way_through_the_frame_is_clean_and_keeps_the_io_error`,
+  `a_first_write_of_zero_bytes_is_clean_and_keeps_the_io_error`, and
+  `a_failed_flush_is_clean_and_drops_the_connection` over `FakeStream`; and
+  `a_tls_write_error_after_a_whole_record_left_is_clean_and_logit_in_forwards_nothing`, where
+  20 000 bytes of ciphertext reach a real TLS `logit_in` before the socket fails, and the
+  listener counts `truncated` and forwards nothing.
+- `HelloAck` validation: `a_hello_ack_naming_a_codec_never_offered_is_permanent`,
+  `..._an_unknown_compression_...`, `..._a_compression_never_offered_...`, and
+  `a_hello_ack_with_another_protocol_version_is_permanent`, each followed by a good handshake
+  that counts no reconnect.
+- `requests`: `a_refused_connect_counts_one_clean_request`,
+  `a_handshake_reject_counts_one_request_of_its_class`,
+  `each_too_large_return_counts_one_permanent_request_and_keeps_the_connection`, and
+  `every_returned_send_counts_one_request` (five sends, one of each outcome and a second `ok`).
+  The compressed-frame too-large return has no test: `frame::compressed_bound` is lz4's worst
+  case over a payload the check before it already bounded, so lz4 can't exceed it.
+- Close: `flush_sends_close_notify_on_the_pooled_tls_connection`,
+  `logit_in_reads_a_tls_connection_ended_after_an_ack_as_a_clean_close` (flushed, and dropped
+  without `close_notify`), and in `logit_in`,
+  `a_tls_client_gone_without_close_notify_between_frames_is_a_clean_close` and
+  `a_client_gone_mid_header_is_an_error_counted_as_a_truncated_header`.
+- TLS twins of the probe tests (WIRE-09):
+  `a_pooled_tls_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost`
+  and `a_pooled_tls_connection_with_an_unsolicited_reject_is_replaced`; and
+  `a_tls_peer_gone_between_the_frame_and_its_ack_is_ambiguous_and_the_next_send_reconnects`.
+- The control cap: `read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over`,
+  and `the_largest_message_of_each_type_fits_the_control_message_cap` in
+  `crates/logit-proto/src/native/control.rs`.
+
+Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit:: control::`.
 
 ### `sink/w4`: the datagram packer (SINK-04)
 

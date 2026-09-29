@@ -356,7 +356,10 @@ decision record.
 - **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
   and compression negotiated down to what both sides offer, plus its own `max_frame_bytes` and
   `window`) or with `Reject`. A version mismatch or no shared codec is a clean refusal, not a
-  corrupted stream.
+  corrupted stream. `logit_out` refuses a `HelloAck` with another `version`, or a `codec` or
+  `compression` its `Hello` didn't offer, as permanent: the listener would answer the same way
+  again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
+  `logit_out` refuses a longer one on its header.
 - **Sequence numbers are implicit.** TCP is ordered, so the Nth data frame on a connection is seq
   N, and `Ack.seq` is the cumulative count the receiver has forwarded. The native payload carries
   no transport fields.
@@ -380,8 +383,20 @@ decision record.
   and drops it unread. So `logit_out` treats `GOING_AWAY` in place of an `Ack` as a clean fault
   and resends the batch at any delivery posture. An EOF, reset, or ack timeout after a frame left
   stays ambiguous: the batch may have been forwarded.
-- **Every listener write is bounded.** `logit_in` writes `HelloAck`, `Ack`, and every `Reject`
-  within `handshake_timeout`. A peer that stops reading its `Ack`s fills the listener's send
+- **A frame is whole or not held.** `logit_in` reads the whole frame and checks its CRC before it
+  decodes or forwards anything, so a `logit_out` write or flush that fails part-way through a
+  frame is a clean fault, although bytes of the frame may have left. The ack wait is the one
+  ambiguous window.
+- **Every write that awaits a reply is flushed.** Under TLS, a write can return with ciphertext
+  still queued in the session, and a read doesn't send it. So `logit_out` flushes the `Hello` and
+  each frame, and `logit_in` flushes `HelloAck`, `Ack`, and every `Reject`, before either side
+  waits.
+- **Close.** `logit_out` shuts its connection down after its last batch, which under TLS sends
+  `close_notify`. `logit_in` reads a close between frames, including a TLS peer gone without
+  `close_notify`, as the end of the connection, not an error; a close part-way through a frame is
+  an error it counts.
+- **Every listener write is bounded.** `logit_in` writes and flushes `HelloAck`, `Ack`, and every
+  `Reject` within `handshake_timeout`. A peer that stops reading its `Ack`s fills the listener's send
   buffer; the stalled write ends the connection (`logit.proto.errors{reason="ack_write_stalled"}`)
   instead of holding its connection slot and blocking shutdown. `idle_timeout` bounds reads only.
 - **Flow control: negotiated, not yet used.** `Hello`/`HelloAck` both carry `window`, but the sender

@@ -1122,9 +1122,12 @@ the property the minimal-watch-set design is for.
 
 - `logit.proto.frames{direction="in",codec,compression}` and `logit.proto.frame.bytes`: per-frame
   detail at the transport's own unit, as `statsd_in`'s per-datagram pair is.
-- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
+- `logit.proto.errors{reason="magic"|"version"|"crc"|"truncated_header"|"truncated"|"too_large"|"codec"|"handshake"|"decode_budget"|"ack_write_stalled"|"reject_write_stalled"}`
   (count): every way a frame or a handshake can be rejected, each its own reason so a version
-  mismatch doesn't hide behind a generic "bad frame" tag. `too_large` is a header that declared a
+  mismatch doesn't hide behind a generic "bad frame" tag. `truncated_header` is a peer that closed,
+  or a read that failed, part-way through a frame header, and `truncated` the same part-way through
+  a body. A close between frames is the ordinary end of a connection and isn't counted, including
+  a TLS peer gone without `close_notify`. `too_large` is a header that declared a
   payload over `max_frame_bytes`, or a `compressed_len` over `frame::compressed_bound` of it,
   answered `Reject{FRAME_TOO_LARGE}`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
@@ -1144,7 +1147,7 @@ the property the minimal-watch-set design is for.
 
 `Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
 budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an
-idle close).
+idle close, and never a close between frames).
 
 ##### `generate_in`
 
@@ -1726,11 +1729,17 @@ dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsuppor
 - `logit.output.ack.duration` (timer, one per attempt): finer-grained than layer 2's
   `logit.component.send.duration`, because it isolates the ack wait from the
   connect/handshake/write that can precede it on a cold connection.
-- `logit.output.reconnects` (count): every connect *after* the first. A climbing count in steady
-  state means the peer or the network, not this sink, is unstable.
-- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}`: the `Fault` taxonomy as
-  request-outcome classes, the same shape as `influxdb_out`'s HTTP-status classes and
-  `syslog_out`'s `ok`/`error` pair, with this sink's own vocabulary.
+- `logit.output.reconnects` (count): every connect *after* the first whose `HelloAck` passed
+  validation. A climbing count in steady state means the peer or the network, not this sink, is
+  unstable.
+- `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (count, one per attempt
+  that returns): the `Fault` taxonomy as request-outcome classes. A connect or handshake failure
+  and a batch too large to send count as attempts, so the total equals the number of `send` calls
+  that returned. A cancelled attempt (a budget timeout, the shutdown grace) returns nothing and
+  isn't counted; `logit.component.errors` covers it. `clean` covers every failure before the frame
+  is completely written and flushed, and `ambiguous` only the ack wait
+  ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
+  decision 6).
 
 ##### `prometheus_out`
 

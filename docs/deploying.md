@@ -682,9 +682,10 @@ accounting a `Failed` or `Shutdown` close gets.
 
 **On the client side, a pooled sink probes a reused connection before writing to it.** A
 server-side idle close isn't free for a sink holding a pooled connection. Writing into a socket the
-peer already closed either becomes `Fault::Ambiguous` (`logit_out`, whose native protocol's ack
-framing notices the failed write) or is silently lost (`syslog_out`, `statsd_out`, `graphite_out`,
-whose plaintext protocols can't tell the sender anything went wrong). So each of these four pooled
+peer already closed either becomes `Fault::Ambiguous` (`logit_out`, whose ack wait meets the
+close after the write went into the kernel's buffer) or is silently lost (`syslog_out`,
+`statsd_out`, `graphite_out`, whose plaintext protocols can't tell the sender anything went
+wrong). So each of these four pooled
 TCP sinks polls a *reused* pooled connection once before the first write of a send attempt. The
 poll is a single non-cancellable `poll_read`, never a `timeout(read)`, because a timeout on a real
 read could cancel mid-TLS-record and discard bytes that had already arrived. An immediate EOF, or
@@ -693,7 +694,8 @@ unsolicited bytes (the only thing a peer sends unprompted on the native protocol
 written: the ordinary `Clean`/reconnect path, not a lost or ambiguous batch. That catches the
 common case, a peer that idle-closed some time ago. It doesn't catch the peer's FIN racing the
 probe itself (the peer closing *while* the sink writes): that remains `Fault::Ambiguous` on
-`logit_out` and a silent loss on the three plaintext sinks. The probe narrows the window; it doesn't
+`logit_out` when the write completes first, `Fault::Clean` when the write or its flush fails (the
+peer can't hold part of a frame), and a silent loss on the three plaintext sinks. The probe narrows the window; it doesn't
 close it.
 
 ### `collectd_in`: multicast groups and `types_db`
@@ -2431,8 +2433,10 @@ components:
 ```
 
 **Sizing `request_timeout` against `buffer.retry_budget`.** Keep `request_timeout` comfortably
-under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds one attempt: the connect,
-the handshake, and the ack wait all share it, as with `otlp_out`'s timeout. `buffer.retry_budget`
+under `retry_budget`. `logit_out.request_timeout` (default 10s) bounds each step of one attempt
+separately: the connect, the TLS handshake, the `HelloAck` wait, and the ack wait, and at shutdown
+the close. The `Hello` and frame writes and their flushes aren't under it, since a large frame on
+a slow link can outlast it; `retry_budget` bounds them. `buffer.retry_budget`
 (default 60s; see [Sink delivery buffering](#sink-delivery-buffering)) bounds all retried attempts
 together. A `request_timeout` close to or above the retry budget leaves room for at most one attempt
 before the budget expires, which defeats retrying.
@@ -2466,17 +2470,31 @@ risk a duplicate instead of losing that batch, set `buffer.delivery: at_least_on
 close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
 even after a frame left, and the batch is resent under either posture.
 
+**A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
+version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a
+`Reject` for a version mismatch: the batch is dropped, and a minute of nothing else ends the
+pipeline. A stock `logit_in` never answers this way; it points at something else on the port.
+
+**Clean close.** `logit_out` shuts its connection down after its last batch, which under TLS sends
+`close_notify`, and `logit_in` takes a close between frames as the end of a connection, not an
+error, including a TLS peer that went away without `close_notify`. So a `logit_out` restarting or
+reconnecting doesn't show as `connection_error` on the far end.
+
 **What to watch.**
 
 - `logit_out`: `logit.output.requests{class}` (`ok`/`clean`/`ambiguous`/`permanent`, one per `send`
-  attempt), `logit.output.reconnects` (should stay near zero in steady state; a climbing count means
-  the peer or the network is unstable), and `logit.output.ack.duration`.
+  attempt that returns, a failed connect or handshake and a too-large batch included, so the total
+  is the number of attempts; `clean` is any failure before the frame is fully written and flushed,
+  `ambiguous` only a lost or refused ack), `logit.output.reconnects` (should stay near zero in
+  steady state; a climbing count means the peer or the network is unstable), and
+  `logit.output.ack.duration`.
 - `logit_in`: `logit.input.connections` (a gauge that should match the number of connected
   `logit_out` peers), `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   1024-connection cap is binding; raise it or shed load upstream), and `logit.proto.errors{reason}`
-  (`magic`/`version`/`crc`/`truncated`/`too_large`/`codec`/`handshake`/`ack_write_stalled`/
-  `reject_write_stalled`; any of these on a healthy link points at a version-mismatched or
-  misbehaving peer, not routine loss. `ack_write_stalled` is a peer that stopped reading its `Ack`s
+  (`magic`/`version`/`crc`/`truncated_header`/`truncated`/`too_large`/`codec`/`handshake`/
+  `ack_write_stalled`/`reject_write_stalled`; any of these on a healthy link points at a
+  version-mismatched or misbehaving peer, not routine loss, except `truncated_header` and
+  `truncated`, which a `logit_out` whose write failed part-way through a frame also leaves. `ack_write_stalled` is a peer that stopped reading its `Ack`s
   for `handshake_timeout`, and the connection was closed).
 - Both sides: `logit.proto.frames{direction,codec,compression}` and `logit.proto.frame.bytes` for
   throughput.

@@ -218,17 +218,31 @@ saw an EOF, classified it `Fault::Ambiguous`, and dropped the batch at the defau
 `logit.proto.errors{reason}`: `ack_write_stalled` for an `Ack` (the connection ends as an error),
 and `reject_write_stalled` for any `Reject` (the write is abandoned and the connection closes).
 
-## Amendment: `logit_out` flushes before it waits, and its write faults are pinned (2026-09-29)
+## Amendment: both sides flush, a write fault is `Clean`, and a close is clean under TLS (2026-09-29)
 
-[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) records three changes to `logit_out`:
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md), decisions
+4, 6, 7, 11, and 12, records these changes. None changes a byte on the wire.
 
-- It calls `flush()` after the `Hello` write and after the frame write, before waiting for a
-  reply. Under TLS a write can return with ciphertext still queued, and a reply read that
-  processes its records cleanly doesn't push it out, so an unflushed frame ended in an `Ambiguous` ack timeout.
-- A first-write `Err` stays `Fault::Clean`. The reason changes: bytes of the frame may have
-  reached the wire under TLS, but the peer then holds a truncated frame it can't forward. The
-  classification of a `write_all`-remainder or flush failure is an open question for `sink/w3`,
-  because a failure anywhere in the write phase leaves a truncated frame, so `Clean` may be
-  truthful there too.
-- `logit.output.requests` counts every returned attempt, including connect, handshake, and
-  too-large returns, tagged `class=ok|clean|ambiguous|permanent`.
+- **Flushes.** `logit_out` flushes after the `Hello` write and after the frame write, before it
+  waits for a reply, and `logit_in` flushes every control write inside its `handshake_timeout`
+  bound. Under TLS a write can return with ciphertext still queued, and a reply read that
+  processes its records cleanly doesn't send it, so an unflushed frame ended in an `Ambiguous` ack
+  timeout, and under at-most-once a dropped batch the peer never received.
+- **Write faults.** Every `logit_out` failure before the frame is completely written and flushed
+  is `Fault::Clean`, with the `io::Error` kept: `logit_in` holds a batch only once it has the
+  whole frame and its CRC checks, so bytes of the frame reaching the wire don't mean the peer
+  holds the batch. The ack wait is the one `Ambiguous` window. The 2026-09-14 amendment's
+  residual, a peer closing while this sink writes, is now `Clean` when the write or flush fails,
+  and still `Ambiguous` when the write completes and the ack read then meets the close.
+- **`HelloAck` validation.** A `HelloAck` with another `version`, or a `codec` or `compression`
+  the `Hello` didn't offer, fails the handshake `Fault::Permanent`, as `REJECT_VERSION_MISMATCH`
+  and `REJECT_NO_COMMON_CODEC` do. An unknown compression byte used to fall back to none.
+- **Close.** `logit_out`'s `Output::flush` shuts its pooled connection down, which sends
+  `close_notify` under TLS. `logit_in` reads `UnexpectedEof` at a frame boundary, a TLS peer gone
+  without `close_notify`, as a close, not an error; it logged every TLS disconnect as
+  `connection_error` before. A close part-way through a header counts
+  `logit.proto.errors{reason="truncated_header"}`.
+- **Control frames.** `logit_out` bounds a control frame at `control::MAX_CONTROL_MESSAGE_BYTES`
+  (4096 bytes), not the 64 MiB data-frame cap.
+- **`requests`.** `logit.output.requests` counts every returned attempt, including connect,
+  handshake, and too-large returns, tagged `class=ok|clean|ambiguous|permanent`.
