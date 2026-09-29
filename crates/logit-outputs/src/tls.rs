@@ -221,3 +221,127 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::unconstrained;
+
+    use super::*;
+    use crate::test_support::{read_once, tapped_duplex, tls_pair, FakeStream, ReadStep};
+
+    async fn probe(stream: &mut (dyn AsyncStream + '_)) -> PendingClose {
+        let mut buf = [0u8; 1];
+        poll_pending_close(stream, &mut buf).await
+    }
+
+    #[tokio::test]
+    async fn a_pending_poll_is_open() {
+        let fake = FakeStream::new();
+        let mut stream: Box<dyn AsyncStream> = Box::new(fake.clone());
+        assert!(matches!(probe(&mut *stream).await, PendingClose::Open));
+        assert_eq!(fake.state().reads, 1, "the probe polls once");
+    }
+
+    #[tokio::test]
+    async fn an_empty_ready_is_eof() {
+        let mut stream: Box<dyn AsyncStream> = Box::new(FakeStream::new().reading(ReadStep::Eof));
+        assert!(matches!(probe(&mut *stream).await, PendingClose::Eof));
+    }
+
+    #[tokio::test]
+    async fn a_read_error_is_eof() {
+        let fake = FakeStream::new().reading(ReadStep::Fail(io::ErrorKind::ConnectionReset));
+        let mut stream: Box<dyn AsyncStream> = Box::new(fake);
+        assert!(matches!(probe(&mut *stream).await, PendingClose::Eof));
+    }
+
+    #[tokio::test]
+    async fn unsolicited_bytes_are_counted_up_to_the_probe_buffer() {
+        let fake = FakeStream::new().reading(ReadStep::Bytes(b"xyz".to_vec()));
+        let mut stream: Box<dyn AsyncStream> = Box::new(fake);
+        assert!(matches!(probe(&mut *stream).await, PendingClose::Bytes(1)));
+
+        let fake = FakeStream::new().reading(ReadStep::Bytes(b"xyz".to_vec()));
+        let mut stream: Box<dyn AsyncStream> = Box::new(fake);
+        let mut buf = [0u8; 8];
+        let pending = poll_pending_close(&mut *stream, &mut buf).await;
+        assert!(matches!(pending, PendingClose::Bytes(3)));
+    }
+
+    /// Part of a server record is on the pipe when the probe runs. The probe moves it into the
+    /// session and answers `Open`, and the record still completes and decrypts afterwards.
+    #[tokio::test]
+    async fn a_partial_tls_record_probes_open_and_is_still_readable() {
+        unconstrained(async {
+            // Less than one record of the message below, so the pipe holds part of it.
+            const CAPACITY: usize = 4096;
+            let ((client_io, client_tap), (server_io, _)) = tapped_duplex(CAPACITY);
+            let (client, mut server) = tls_pair(client_io, server_io).await;
+            let mut client: Box<dyn AsyncStream> = Box::new(client);
+            // The session tickets first, so the probe below reads record bytes only.
+            assert!(read_once(&mut *client, &mut [0u8; 64]).await.is_pending());
+
+            let message: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+            assert_eq!(server.write(&message).await.unwrap(), message.len());
+            let read_before = client_tap.read();
+
+            assert!(matches!(probe(&mut *client).await, PendingClose::Open));
+            assert_eq!(client_tap.read() - read_before, CAPACITY, "the probe read record bytes");
+
+            let mut got = vec![0u8; message.len()];
+            let (flushed, read) = tokio::join!(server.flush(), client.read_exact(&mut got));
+            flushed.unwrap();
+            read.expect("the record completes");
+            assert_eq!(got, message);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_tls_close_notify_probes_eof() {
+        unconstrained(async {
+            let ((client_io, _), (server_io, _)) = tapped_duplex(4096);
+            let (client, mut server) = tls_pair(client_io, server_io).await;
+            let mut client: Box<dyn AsyncStream> = Box::new(client);
+            server.shutdown().await.unwrap();
+            assert!(matches!(probe(&mut *client).await, PendingClose::Eof));
+        })
+        .await;
+    }
+
+    /// A TLS peer gone without `close_notify` reads as `UnexpectedEof`, an error, and probes
+    /// `Eof` through the error arm.
+    #[tokio::test]
+    async fn a_tls_transport_close_without_close_notify_probes_eof() {
+        unconstrained(async {
+            let ((client_io, _), (server_io, _)) = tapped_duplex(4096);
+            let (client, server) = tls_pair(client_io, server_io).await;
+            let mut client: Box<dyn AsyncStream> = Box::new(client);
+            drop(server);
+            assert!(matches!(probe(&mut *client).await, PendingClose::Eof));
+        })
+        .await;
+    }
+
+    /// An unbracketed IPv6 literal has no unambiguous port colon; the doc leaves the brackets
+    /// to the operator, and the last rows pin what an unbracketed one yields.
+    #[test]
+    fn host_only_takes_the_host_of_a_bare_endpoint() {
+        let cases = [
+            ("statsd.example.com:8125", "statsd.example.com"),
+            ("127.0.0.1:514", "127.0.0.1"),
+            ("[::1]:6514", "::1"),
+            ("[2001:db8::1]:6514", "2001:db8::1"),
+            ("localhost", "localhost"),
+            ("", ""),
+            ("::1", ":"),
+            ("2001:db8::1", "2001:db8:"),
+        ];
+        for (endpoint, want) in cases {
+            assert_eq!(host_only(endpoint), want, "host_only({endpoint:?})");
+        }
+    }
+}
