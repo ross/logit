@@ -1,5 +1,7 @@
 //! Receivers that sink tests send to: a TCP, TLS, or UDP collector that reports each message on
-//! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from.
+//! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from. Also the
+//! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam, and
+//! [`tls_pair`] with [`TapIo`] for tests that need real tokio-rustls behavior.
 //!
 //! A [`Collector`] message depends on how it reads:
 //!
@@ -17,14 +19,17 @@
 //! handshakes, so a rejected client never counts. A connection is counted before its message is
 //! sent, so a test reads the count after [`Collector::take`].
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use logit_pipeline::test_util::RECV_TIMEOUT;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -213,4 +218,327 @@ pub(crate) fn server_tls_config(require_client_auth: bool) -> Arc<rustls::Server
         builder.with_no_client_auth().with_single_cert(chain, key).unwrap()
     };
     Arc::new(cfg)
+}
+
+/// A scripted in-memory stream standing in for the connection behind the sinks'
+/// `Box<dyn AsyncStream>` seam, with shared state a test inspects after the call under test.
+///
+/// Writes are accepted whole unless a [`WriteStep`] is scripted for that call. Accepted bytes
+/// land in [`FakeState::unflushed`]; a successful `flush` moves them to [`FakeState::flushed`], so
+/// a test tells "the stream took it" from "the stream was told to deliver it". Reads follow one
+/// [`ReadStep`], `Pending` by default.
+///
+/// Never wrap this in tokio-rustls. It returns `Ok(0)` or `Pending` without registering a waker,
+/// and tokio-rustls treats an IO `Ok(0)` as would-block, so a TLS write over it can park forever
+/// with nothing to wake it (`crate::stream_pins`). TLS behavior is tested against a real
+/// tokio-rustls pair ([`tls_pair`]) instead.
+#[derive(Clone, Default)]
+pub(crate) struct FakeStream(Arc<Mutex<FakeState>>);
+
+/// What a [`FakeStream`] has seen, and its script.
+#[derive(Default)]
+pub(crate) struct FakeState {
+    /// Accepted by `write` and not yet flushed.
+    pub(crate) unflushed: Vec<u8>,
+    /// Moved out of `unflushed` by a successful `flush`.
+    pub(crate) flushed: Vec<u8>,
+    /// `poll_write` calls, including scripted failures.
+    pub(crate) writes: usize,
+    /// `poll_flush` calls, including a scripted failure.
+    pub(crate) flushes: usize,
+    /// `poll_read` calls.
+    pub(crate) reads: usize,
+    /// Per 1-based write call number.
+    write_steps: Vec<(usize, WriteStep)>,
+    flush_error: Option<io::ErrorKind>,
+    read: ReadStep,
+}
+
+/// A scripted outcome for one `write` call of a [`FakeStream`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteStep {
+    /// Accepts at most this many bytes.
+    Short(usize),
+    /// Returns `Ok(0)`, accepting nothing.
+    Zero,
+    /// Fails with this kind, accepting nothing.
+    Fail(io::ErrorKind),
+}
+
+/// How every `read` of a [`FakeStream`] answers.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ReadStep {
+    /// `Pending`, as a live, quiet peer is. No waker is registered, so a test that awaits a read
+    /// here hangs instead of passing.
+    #[default]
+    Pending,
+    /// `Ready(Ok(()))` with nothing filled: the peer closed.
+    Eof,
+    /// `Ready(Err(kind))`.
+    Fail(io::ErrorKind),
+    /// Unsolicited bytes, handed out across reads; `Pending` once they run out.
+    Bytes(Vec<u8>),
+}
+
+impl FakeStream {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scripts the `call`th write (1-based).
+    pub(crate) fn on_write(self, call: usize, step: WriteStep) -> Self {
+        self.state().write_steps.push((call, step));
+        self
+    }
+
+    /// Every `flush` fails with `kind` and moves nothing.
+    pub(crate) fn failing_flush(self, kind: io::ErrorKind) -> Self {
+        self.state().flush_error = Some(kind);
+        self
+    }
+
+    pub(crate) fn reading(self, step: ReadStep) -> Self {
+        self.state().read = step;
+        self
+    }
+
+    pub(crate) fn state(&self) -> MutexGuard<'_, FakeState> {
+        self.0.lock().unwrap()
+    }
+}
+
+impl AsyncWrite for FakeStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.state();
+        state.writes += 1;
+        let call = state.writes;
+        let step = state.write_steps.iter().find(|(n, _)| *n == call).map(|(_, step)| *step);
+        let accepted = match step {
+            None => buf.len(),
+            Some(WriteStep::Short(n)) => n.min(buf.len()),
+            Some(WriteStep::Zero) => 0,
+            Some(WriteStep::Fail(kind)) => {
+                return Poll::Ready(Err(io::Error::new(kind, "scripted write failure")));
+            }
+        };
+        state.unflushed.extend_from_slice(&buf[..accepted]);
+        Poll::Ready(Ok(accepted))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.state();
+        state.flushes += 1;
+        if let Some(kind) = state.flush_error {
+            return Poll::Ready(Err(io::Error::new(kind, "scripted flush failure")));
+        }
+        let unflushed = std::mem::take(&mut state.unflushed);
+        state.flushed.extend_from_slice(&unflushed);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for FakeStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut state = self.state();
+        state.reads += 1;
+        match &mut state.read {
+            ReadStep::Pending => Poll::Pending,
+            ReadStep::Eof => Poll::Ready(Ok(())),
+            ReadStep::Fail(kind) => {
+                Poll::Ready(Err(io::Error::new(*kind, "scripted read failure")))
+            }
+            ReadStep::Bytes(bytes) if bytes.is_empty() => Poll::Pending,
+            ReadStep::Bytes(bytes) => {
+                let n = bytes.len().min(buf.remaining());
+                buf.put_slice(&bytes[..n]);
+                bytes.drain(..n);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+/// Wraps the IO beneath a real TLS session and counts what crosses it, so a test sees what a TLS
+/// call moved to or from the socket. Its [`Tap`] can also arm write failures.
+pub(crate) struct TapIo<T> {
+    inner: T,
+    tap: Arc<Tap>,
+}
+
+/// A [`TapIo`]'s shared counters and write script.
+#[derive(Default)]
+pub(crate) struct Tap {
+    read: AtomicUsize,
+    written: AtomicUsize,
+    writes: Mutex<TapWrites>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum TapWrites {
+    #[default]
+    Pass,
+    /// Passes this many more bytes, then every write fails with `BrokenPipe`.
+    FailAfter(usize),
+    /// Every write returns `Ok(0)`.
+    Zero,
+}
+
+impl Tap {
+    /// Bytes the wrapped IO has returned from reads.
+    pub(crate) fn read(&self) -> usize {
+        self.read.load(Ordering::SeqCst)
+    }
+
+    /// Bytes the wrapped IO has accepted from writes.
+    pub(crate) fn written(&self) -> usize {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    /// From now on, writes pass `bytes` more bytes in total and then fail with `BrokenPipe`.
+    pub(crate) fn fail_writes_after(&self, bytes: usize) {
+        *self.writes.lock().unwrap() = TapWrites::FailAfter(bytes);
+    }
+
+    /// From now on, every write returns `Ok(0)` without touching the wrapped IO.
+    pub(crate) fn zero_writes(&self) {
+        *self.writes.lock().unwrap() = TapWrites::Zero;
+    }
+}
+
+impl<T> TapIo<T> {
+    pub(crate) fn new(inner: T) -> (Self, Arc<Tap>) {
+        let tap = Arc::new(Tap::default());
+        (Self { inner, tap: Arc::clone(&tap) }, tap)
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TapIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf));
+        this.tap.read.fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+        Poll::Ready(result)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for TapIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut writes = this.tap.writes.lock().unwrap();
+        let limit = match *writes {
+            TapWrites::Pass => buf.len(),
+            TapWrites::Zero => return Poll::Ready(Ok(0)),
+            TapWrites::FailAfter(0) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "armed write failure",
+                )));
+            }
+            TapWrites::FailAfter(left) => left.min(buf.len()),
+        };
+        let result = std::task::ready!(Pin::new(&mut this.inner).poll_write(cx, &buf[..limit]));
+        if let Ok(n) = result {
+            this.tap.written.fetch_add(n, Ordering::SeqCst);
+            if let TapWrites::FailAfter(left) = &mut *writes {
+                *left -= n;
+            }
+        }
+        Poll::Ready(result)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// One end of a [`tapped_duplex`] and its [`Tap`].
+pub(crate) type TappedEnd = (TapIo<DuplexStream>, Arc<Tap>);
+
+/// A tapped `tokio::io::duplex(capacity)` pair: the client end and its [`Tap`], then the server
+/// end and its [`Tap`]. `capacity` bounds each direction's in-flight bytes, which is what makes a
+/// TLS write stop mid-record deterministically.
+pub(crate) fn tapped_duplex(capacity: usize) -> (TappedEnd, TappedEnd) {
+    let (client, server) = tokio::io::duplex(capacity);
+    (TapIo::new(client), TapIo::new(server))
+}
+
+/// A real tokio-rustls client and server over `client_io`/`server_io`, handshake complete. The
+/// server presents `testdata/tls/server.pem`, and the client trusts `ca.pem` and names
+/// `localhost`. Both sides negotiate TLS 1.3, and the server's session tickets, sent after the
+/// handshake, wait unread in the client's inbound direction.
+pub(crate) async fn tls_pair<C, S>(
+    client_io: C,
+    server_io: S,
+) -> (tokio_rustls::client::TlsStream<C>, tokio_rustls::server::TlsStream<S>)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let settings = tls_settings(|s| s.ca_file = Some("ca.pem".to_string()));
+    let client_config = crate::tls::build_client_config(&settings, &testdata_dir()).unwrap();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let acceptor = TlsAcceptor::from(server_tls_config(false));
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    let (client, server) =
+        tokio::join!(connector.connect(name, client_io), acceptor.accept(server_io));
+    (client.expect("client handshake"), server.expect("server handshake"))
+}
+
+/// One `poll_read`, never waiting: `Ready` with the byte count (0 is EOF), or `Pending`.
+///
+/// A tokio IO resource answers `Pending` once the task's cooperative budget runs out, whatever
+/// it holds. A test that reads a `Pending` from here as "nothing available" runs its body under
+/// `tokio::task::unconstrained`.
+pub(crate) async fn read_once<S: AsyncRead + Unpin + ?Sized>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    std::future::poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buf);
+        Poll::Ready(match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        })
+    })
+    .await
+}
+
+/// Everything `stream` yields before a read is `Pending` or reads EOF, one [`read_once`] at a
+/// time; the same budget rule applies. Panics on a read error.
+pub(crate) async fn drain_available<S: AsyncRead + Unpin + ?Sized>(stream: &mut S) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match read_once(stream, &mut buf).await {
+            Poll::Pending | Poll::Ready(Ok(0)) => return out,
+            Poll::Ready(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Poll::Ready(Err(err)) => panic!("draining the stream failed: {err}"),
+        }
+    }
 }

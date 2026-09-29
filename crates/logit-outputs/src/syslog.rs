@@ -1569,7 +1569,9 @@ fn is_message_too_large(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{server_tls_config, testdata_dir, tls_settings, Collector, ReadMode};
+    use crate::test_support::{
+        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode, WriteStep,
+    };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
     use logit_proto::Decoder;
@@ -2395,118 +2397,10 @@ mod tests {
     // -- Sink: TCP over TLS, write/flush semantics --------------------------------------------
     //
     // "The session took the frame but the socket took only part of it" needs a backpressured
-    // socket of known buffer size, so these drive `send_tcp` against a scripted
-    // [`FakeTlsStream`]. The real-TLS tests around them cover the socket level.
-
-    /// An [`AsyncStream`] with `tokio_rustls`' backpressured write semantics: `write` buffers and
-    /// reports success, and only `flush` puts bytes on the notional wire. Failures are scripted
-    /// per call, so each of `send_tcp`'s arms can be reached.
-    #[derive(Clone, Default)]
-    struct FakeTlsStream(Arc<Mutex<FakeState>>);
-
-    #[derive(Default)]
-    struct FakeState {
-        /// Accepted by `write`, not yet flushed: `tokio_rustls`' `sendable_tls`.
-        buffered: Vec<u8>,
-        /// What `flush` has put on the wire.
-        sent: Vec<u8>,
-        writes: usize,
-        flushes: usize,
-        /// `write` fails on this 1-based call number.
-        fail_write_on: Option<usize>,
-        /// The first `write` accepts one byte, so `send_tcp` takes its `write_all` path.
-        short_first_write: bool,
-        fail_flush: bool,
-    }
-
-    impl FakeTlsStream {
-        fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
-            self.0.lock().unwrap()
-        }
-
-        fn failing_write(call: usize) -> Self {
-            let fake = Self::default();
-            fake.state().fail_write_on = Some(call);
-            fake
-        }
-
-        fn failing_flush() -> Self {
-            let fake = Self::default();
-            fake.state().fail_flush = true;
-            fake
-        }
-
-        /// One byte accepted, then the `write_all` of the remainder fails.
-        fn short_then_failing_write() -> Self {
-            let fake = Self::default();
-            let mut state = fake.state();
-            state.short_first_write = true;
-            state.fail_write_on = Some(2);
-            drop(state);
-            fake
-        }
-    }
-
-    impl tokio::io::AsyncWrite for FakeTlsStream {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            let mut state = self.state();
-            state.writes += 1;
-            if state.fail_write_on == Some(state.writes) {
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "scripted write failure",
-                )));
-            }
-            let accepted = if state.short_first_write && state.writes == 1 {
-                buf.len().min(1)
-            } else {
-                buf.len()
-            };
-            state.buffered.extend_from_slice(&buf[..accepted]);
-            std::task::Poll::Ready(Ok(accepted))
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            let mut state = self.state();
-            state.flushes += 1;
-            if state.fail_flush {
-                return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "scripted flush failure",
-                )));
-            }
-            let buffered = std::mem::take(&mut state.buffered);
-            state.sent.extend_from_slice(&buffered);
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
-    impl tokio::io::AsyncRead for FakeTlsStream {
-        /// `Pending`, as a live, quiet stream is, so the reuse probe
-        /// (`crate::tls::poll_pending_close`) keeps it; an empty `Ok(())` would read as EOF. No
-        /// waker is registered, so anything that awaited a read here would hang loudly.
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Pending
-        }
-    }
+    // socket of known buffer size, so these drive `send_tcp` against a scripted [`FakeStream`]
+    // behind the boxed-stream seam, with a TLS dial so `send_tcp` takes its TLS arms. The
+    // real-TLS tests around them cover the socket level, and `crate::stream_pins` pins the
+    // tokio-rustls behavior those arms assume.
 
     /// A default client config, so a [`TcpDial`] reports `is_tls()`; no handshake ever happens.
     fn any_client_config() -> Arc<rustls::ClientConfig> {
@@ -2524,7 +2418,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed() {
-        let fake = FakeTlsStream::default();
+        let fake = FakeStream::new();
         let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
         let cfg = any_client_config();
         let telemetry = Telemetry::default();
@@ -2545,15 +2439,15 @@ mod tests {
         assert_eq!(sent, 1);
         let state = fake.state();
         assert_eq!(state.flushes, 1, "the success path must flush exactly once");
-        assert!(state.buffered.is_empty(), "nothing may be left in the session buffer");
-        assert_eq!(state.sent, b"5 hello".to_vec(), "the whole frame must be on the wire");
+        assert!(state.unflushed.is_empty(), "nothing may be left in the session buffer");
+        assert_eq!(state.flushed, b"5 hello".to_vec(), "the whole frame must be on the wire");
         drop(state);
         assert!(stream.is_some(), "a flushed connection is reusable");
     }
 
     #[tokio::test]
     async fn a_tls_flush_failure_is_ambiguous_and_discards_the_connection() {
-        let fake = FakeTlsStream::failing_flush();
+        let fake = FakeStream::new().failing_flush(std::io::ErrorKind::BrokenPipe);
         let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
         let cfg = any_client_config();
         let telemetry = Telemetry::default();
@@ -2581,7 +2475,7 @@ mod tests {
     /// plaintext counterpart is below).
     #[tokio::test]
     async fn a_tls_write_failure_is_ambiguous_and_never_resent() {
-        let fake = FakeTlsStream::failing_write(1);
+        let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
         let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
         let cfg = any_client_config();
         let telemetry = Telemetry::default();
@@ -2604,13 +2498,15 @@ mod tests {
         assert!(stream.is_none());
         let state = fake.state();
         assert_eq!(state.writes, 1, "exactly one write attempt -- no resend");
-        assert!(state.sent.is_empty());
+        assert!(state.flushed.is_empty());
     }
 
     /// A failure after a partial first write is `Ambiguous` and never resent.
     #[tokio::test]
     async fn a_failure_after_a_partial_write_is_ambiguous_and_never_resent() {
-        let fake = FakeTlsStream::short_then_failing_write();
+        let fake = FakeStream::new()
+            .on_write(1, WriteStep::Short(1))
+            .on_write(2, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
         let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
         let cfg = any_client_config();
         let telemetry = Telemetry::default();
@@ -2633,7 +2529,7 @@ mod tests {
         let state = fake.state();
         assert_eq!(state.writes, 2, "the short write, then the failing remainder -- no resend");
         assert_eq!(state.flushes, 0, "a failed write never reaches the flush");
-        assert!(state.sent.is_empty());
+        assert!(state.flushed.is_empty());
     }
 
     /// On plaintext a failed first write wrote nothing, so `send_tcp` reconnects once and reports
@@ -2644,7 +2540,7 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap().to_string();
         drop(dead); // now nothing is listening there
 
-        let fake = FakeTlsStream::failing_write(1);
+        let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
         let mut stream: Option<Box<dyn AsyncStream>> = Some(Box::new(fake.clone()));
         let telemetry = Telemetry::default();
         let mut connected = true;
