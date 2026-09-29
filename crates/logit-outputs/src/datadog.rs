@@ -1881,6 +1881,46 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
     }
 
+    /// Two batches through the write loop: the first's series request answers `first()` and the
+    /// batch is dropped; the second holds one point 11 min ahead of `NOW`. [`stepping_clock`]
+    /// reads `NOW` for the first batch and `NOW + 2 min` for the second. Against
+    /// `METRIC_MAX_AHEAD` (10 min) the point is 11 min ahead of the first reading, stale, and 9
+    /// min ahead of the second, fresh. `observe_batch` replaces the dropped batch's send time, so
+    /// the point is sent, nothing is counted `stale`, and the clock is read once per batch.
+    async fn assert_a_batch_after_a_dropped_one_reads_the_clock_again(
+        first: fn() -> Reply,
+        config: WriteLoopConfig,
+    ) {
+        let (clock, reads) = stepping_clock(NOW);
+        let script = move |p: &str, k| if p == SERIES && k == 0 { first() } else { accepted(p) };
+        let ahead = NOW + 11 * MINUTE;
+        let batches = vec![batch(vec![gauge(NOW)]), batch(vec![gauge(ahead)])];
+        let build = |addr, probe: &TelemetryProbe| instrumented(addr, probe).with_clock(clock);
+        let (sums, log) = run_dd(script, batches, config, build).await;
+
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(series_points(&log), [vec![NOW], vec![ahead]], "the second point is sent");
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 0.0);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "one read per batch");
+    }
+
+    /// The first batch's request never answers, and the retry budget drops it.
+    #[tokio::test]
+    async fn a_batch_after_one_dropped_at_its_budget_reads_the_clock_again() {
+        let mut config = fast_retry();
+        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+        assert_a_batch_after_a_dropped_one_reads_the_clock_again(|| Reply::Hang, config).await;
+    }
+
+    /// The first batch's request is answered `400`, a permanent failure that drops it at once,
+    /// with no real time involved.
+    #[tokio::test]
+    async fn a_batch_after_one_rejected_permanently_reads_the_clock_again() {
+        let rejected = || Reply::Answer(400, b"bad request".to_vec());
+        assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
+    }
+
     /// The gate re-arms per batch: a second batch counts as the first did.
     #[tokio::test]
     async fn a_second_datadog_batch_counts_its_encode_side_counters() {
