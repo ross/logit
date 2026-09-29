@@ -18,6 +18,8 @@ socket2.workspace = true
 # tail_in/docker_in's checkpoint file (docs/adr/file-tailing-and-docker-json-logs.md).
 serde.workspace = true
 serde_json.workspace = true
+# The checkpoint's head fingerprint (docs/adr/tail-discovery-failure-and-resume-identity.md).
+twox-hash.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
 # (docs/adr/hand-rolled-grpc-over-hyper.md).
 hyper.workspace = true
@@ -52,6 +54,9 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Model tests: `tail::line_verification`'s `LineSplitter`, `docker_verification`'s
+# `DockerDecoder`, and `tail::pattern`'s `matches_name`.
+proptest.workspace = true
 # Arms `logit_pipeline::fault` and compiles `logit_pipeline::test_util` in this crate's tests.
 # Dev-only, so the release binary never has either.
 logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }

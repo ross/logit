@@ -17,6 +17,8 @@ pub mod collectd;
 pub mod datadog;
 pub mod datadog_trace;
 pub mod docker;
+#[cfg(test)]
+mod docker_verification;
 pub mod generate;
 pub mod graphite;
 mod http;

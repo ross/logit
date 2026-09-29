@@ -1,6 +1,6 @@
 ---
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-09-28
 ---
 
 # Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam
@@ -529,3 +529,43 @@ and their reopen without `finish` discards every job the worker hadn't started a
 (`DiskQueue::abandon_queued_persists`), as a `kill -9` would. Without that, the old worker could
 unlink a segment under the reopened queue. Before the helper existed, one generated case failed
 with a peek that stopped responding while draining, which is consistent with that race.
+
+## Amendment: the seam gains read operations, and tail scan and read sites (2026-09-28)
+
+**The seam's operations are no longer mutations only.** `Op` gains `ReadDir`, `Stat`, and `Read`,
+and `sites` gains `TAIL_SCAN` (`"tail.scan"`) and `TAIL_READ` (`"tail.read"`). `fault::check` runs
+at these points:
+
+- `Op::ReadDir`, before each `read_dir` in `crates/logit-inputs/src/tail/pattern.rs`, and again
+  per iterated entry, so an error part-way through a listing can be injected.
+- `Op::Stat`, in `PathPattern::scan_container`, before the per-entry `file_type()` and before the
+  log-path `metadata`.
+- `Op::Stat`, before the per-path `metadata` in `Tailer::scan`.
+- `Op::Open`, before `Tailer::open_tracked` opens a discovered file, so a test can fail the
+  open that follows a good `stat`.
+- `Op::Read`, before `Tailer::open_tracked` reads a resumed file's head, so a test can fail that
+  read with an errno other than a short file.
+- `Op::Read` at `tail.read`, before `Tailer::read_one` reads a tracked file's next chunk, so a
+  test can fail a read on an open file.
+
+The head read stays at `tail.scan`: it's part of opening a discovered file, and a test that fails
+it shouldn't also fail every chunk read under the same directory. `tail.read` is the steady-state
+read, one per chunk, and its failure decides what `drain` reaps.
+
+The call rule, the disarmed cost (one atomic load), the compiled-out form, and
+the scoping are decision 8's, unchanged. Freeze (the crash model) doesn't apply to a read: a rule
+fails one or every hit with an errno, or records hits.
+
+**Why.** [ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md)
+decides that a failed listing retires nothing. Verifying that needs a listing to fail on demand,
+and a real filesystem can't do it: the dev container runs as root, which reads any directory, and
+a directory that fails to list on a real mount fails for reasons a test can't script (a network
+mount dropping, `EMFILE`). The mutation-only seam was the right size for the durability paths,
+where every failure is a write step. The tail scan is the first path whose failures are reads,
+and its tests need the same errno control.
+
+**Consequences.** Decision 8's "every filesystem mutation" rule widens for the tail scan path:
+every discovery syscall there (`read_dir`, each iteration step, `file_type`, and `metadata`)
+needs a `fault::check` before it, or the proptest's failure operations miss it. So does each
+read of an open tail file, which is what lets a test pin the documented loss of a `Draining`
+file's unread tail on a read error (`docs/known-gaps.md`).

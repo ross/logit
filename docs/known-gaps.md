@@ -1959,10 +1959,99 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   flush and no final checkpoint. Nothing is lost: the restart resumes from the last interval
   checkpoint, which lands between passes even under a backlog, so it replays at most one
   `checkpoint_interval` or one 64 KiB chunk per file.
-- **A rotated file still draining at shutdown is orphaned on restart if its new name matches no
-  pattern.** The shutdown checkpoint records its inode and offset, but the restart's scan never
-  finds the file, so the entry is never used and the file's unread tail is lost. A pattern that
-  also matches the rotated name (`app.log*`) avoids it.
+- **A file removed or rotated out of every pattern loses its unread tail at a clean stop or a
+  crash.** It doesn't matter whether a scan noticed first. After a clean stop, the checkpoint
+  records its inode and offset, but the restart's scan never finds the file, so the entry is never
+  used. After a crash, the lines it had read but not yet flushed are gone too. A pattern that also
+  matches the rotated name (`app.log*`) avoids it for a rename, but not for a removal. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 6.
+- **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
+  rotation, and `compress` tails `app.log.N.gz` as text.** The copy `copytruncate` writes is a new
+  inode, so `app.log*` reads it from `0`; a recorded run re-emitted about 1,600 to 2,000 lines per
+  three rotations. A `.gz` file is read as lines of binary, diagnosed `invalid_utf8`.
+  `docs/deploying.md`'s "What to watch for file tailing" has the guidance. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s "Rotation and
+  truncation" section.
+- **Under an exact pattern, `copytruncate` loses the lines written after the tailer's last read
+  and before the truncate.** They exist only in the copy, which the pattern doesn't match. The
+  window is up to one `poll_interval` of writes (or one wake). See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **`tail_in` splits a line held unterminated at a clean stop into two events.** Shutdown emits the
+  partial line as it stands, and the checkpoint records the end of what was read, so the rest of
+  the line, written later, arrives after the restart as a line of its own. A line being dropped
+  for `max_line_bytes` is the exception: its checkpoint stays at its start and it's dropped whole
+  again. See [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
+  "Checkpoints" section.
+- **A `copytruncate` that the writer refills past the old offset before the next check goes
+  undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
+  and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
+  ordinary append: the tailer reads from the old offset in the new content, and the bytes before
+  it aren't emitted during the run. The inode doesn't change under `copytruncate`, so nothing
+  signals it while `logit` runs. With a checkpoint, a restart replays the file through the head fingerprint, so the
+  bytes are recovered late, not lost. A writer that rotates by rename has no such window. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **A resume verifies only the first `min(256, offset)` bytes of a file, so a recycled inode
+  whose new content shares them still resumes at a stale offset.** A checkpoint entry and a
+  de-selection retention carry a hash of the bytes the tailer read from the file's head, and a
+  resume whose file is shorter than that head, differs in those bytes, or is shorter than the
+  offset starts at `0`. For an offset of at most 256, every skipped byte is identical content.
+  Beyond that, a new file with the same first 256 bytes skips the bytes between there and the
+  stale offset. Files that start with a timestamp or a per-file header make it unlikely. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 2.
+- **A directory unreadable at startup replays its files under `read_from: end` once it becomes
+  readable.** `read_from: end` applies only to files the bind-time scan found. A file first
+  listed after that listing failed starts at its beginning, which favors duplicates over loss.
+- **A file under a directory that stays unreadable stays tracked** until the listing recovers or
+  its inode is unlinked. A failed listing retires nothing, and the handle check catches removal
+  and truncation but not a rename. Even an unlinked file stays open until a listing covering its
+  path succeeds, since a draining file is reaped only after a scan that could have rebound it. `ELOOP` on a `docker_in` container's log path (a looping
+  `<id>-json.log` symlink) is treated the same way: unknown, kept, and diagnosed. See [ADR
+  `tail-discovery-failure-and-resume-identity`](adr/tail-discovery-failure-and-resume-identity.md),
+  decision 1.
+- **A read error on a `Draining` file loses its unread tail.** The driver reports a read error as
+  EOF so that a handle that keeps failing is reaped, and the reap drops whatever the file still
+  held. It's diagnosed `read_error`. An `Active` file is never reaped on a read error.
+  `a_read_error_on_a_draining_file_reaps_it_and_loses_its_unread_tail` pins it through the fault
+  seam's `tail.read` site. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **A `containers:` entry that is a container's *name* and also 12 or more hex characters selects
+  any container whose id starts with it.** An entry matches a container if it equals the
+  container's name, or if it is an id prefix: at least 12 hex characters that start the
+  container's id. Naming a container `deadbeefcafe` and listing that name therefore also selects
+  a different container whose id begins `deadbeefcafe`. It falls out of the matching rule, and
+  the remedy is not to give a container a name shaped like an id prefix. See [ADR
+  `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
+- **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
+  *closing* fragment lets the next line on that stream splice onto the held partial.**
+  `docker_in`'s `LineSplitter` drops a json-file line longer than its envelope bound (see
+  `envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it `long_line`, and
+  `DockerDecoder` never learns a line went missing. If the dropped line was a message's closing fragment, the held partial stays open and
+  the next same-stream line joins it. Closing it needs the splitter to report drops in sequence
+  and a `TailDecoder` hook to receive them. See [ADR
+  `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
+  amendment.
+- **An `attrs` object larger than the envelope bound's slack can drop entries as `long_line`.**
+  The bound leaves fixed room for `attrs` beside a worst-case-escaped fragment; an envelope whose
+  `attrs` outgrows it can exceed the bound, and the splitter drops it unseen. `attrs` comes from
+  `--log-opt labels`, `env`, and `tag`. The slack and the bound are `envelope_cap` in
+  `crates/logit-inputs/src/docker.rs`.
+- **`held_from` is the oldest held line across both streams, so a long reassembly on one stream
+  pins the checkpoint.** The other stream's lines after that offset are already emitted, and a
+  crash replays them. Replay, not loss.
+- **A line that never ends pins the checkpoint while it is being dropped.** A `\r`-only progress
+  bar is the case: dockerd writes it as 16 KiB partial entries but never a closing one, because
+  only `\n` ends a message. A drop for `max_line_bytes` therefore runs until a newline that may
+  never come, and a crash replays everything since it began. Replay, not loss, but unbounded.
+  Persisting per-stream drop state in the checkpoint would remove it.
+- **At shutdown, `docker_in`'s unterminated tail is almost always a dockerd write in progress,
+  and it is emitted as a `bad_line`.** `close`'s `take_partial` turns the tail into a rejected
+  line, and the final checkpoint then skips past it, so that line's content never becomes an
+  event. A decoder opt-out from `take_partial` at shutdown would fix it.
 - **`inotify` doesn't reliably fire over network or FUSE-backed mounts** (NFS chief among them) —
   and `watch: auto` falls back to polling only on outright setup failure, not on a mount type it
   can't detect in advance. For a config on such a mount, set `watch: poll` explicitly rather than

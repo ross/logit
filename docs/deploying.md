@@ -1100,7 +1100,11 @@ match `docker_in`'s `root:` default, the only layout this driver understands.
 the first scan with no checkpoint entry naming it. A file discovered later (a new log, a rotated
 one, a newly selected container) always starts at its beginning, since it has nothing "from before
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
-file it names.
+file it names, provided the file still starts with the bytes `logit` read from it. A resume
+re-checks the file's first 256 bytes (fewer for a smaller offset) and its length. A file whose
+head changed, because a new file reused the inode or the file was rewritten while `logit` was
+down, starts at offset 0 instead; `logit.input.files.resume_rejected` and a `resume_rejected`
+diagnostic say so.
 
 **A checkpoint that exists but can't be used replays every file from its beginning.** If
 `checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
@@ -1109,7 +1113,8 @@ file present at the first scan starts at offset 0, even under `read_from: end`. 
 those files, so skipping to their end would lose whatever they gained while `logit` was down.
 Expect a burst of duplicates; `logit.input.checkpoint.errors{op="load"}` and a `checkpoint_error`
 diagnostic say why. Only a missing checkpoint with no `.tmp` beside it is a first run that
-`read_from` decides.
+`read_from` decides. An upgrade that changes the checkpoint format is this case too: every file
+replays once.
 
 **Set `checkpoint_path` for `docker_in`.** It is optional and unset by default, in which case every
 restart re-applies `read_from` as if every file were newly discovered. A long-running container's
@@ -1189,6 +1194,15 @@ see [ADR
 - `logit.input.watch.overflows` (count): the `inotify` event queue overflowed. The driver responds
   with a full rescan instead of losing track of changes, but a sustained nonzero rate means
   `poll_interval` is doing more of the real work than the wake source.
+- `logit.input.scan.errors{op="read_dir"|"stat"}` (count): a pattern's directory couldn't be
+  listed, or a matched path couldn't be `stat`ed, for a reason other than it not existing
+  (`EACCES`, `EIO`, `EMFILE`, a symlink loop). A failed look is no information, so no tracked file
+  it may name is closed: an open file keeps being read, and a truncation or deletion is still seen
+  through the open handle. A file first found only after a failure starts at its beginning, even
+  under `read_from: end`, if the failure hid it from the startup scan. Each failing scan also logs a
+  throttled `logit.component.diagnostics{key="scan_error"}` naming the first failing path and its
+  errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
+  fixed, a file renamed out of that directory stays open.
 - `logit.component.diagnostics{key="long_line"|"truncated"}` (count, via the `Diagnostics` bridge):
   a line dropped whole for exceeding `max_line_bytes`, or a tracked file's length shrinking under
   it (rare, but real for a tool that recreates a log file in place instead of renaming it away
@@ -1206,6 +1220,15 @@ see [ADR
   `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
+
+**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
+`copytruncate` or `compress`, don't use a pattern that matches the rotated names: `app.log*` reads
+every `copytruncate` copy from its beginning, re-emitting the whole file each rotation, and reads a
+`.gz` as lines of binary. With an exact pattern (`app.log`), the writer must reopen its file on
+HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its end at
+least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
+that is lost. `copytruncate` under an exact
+pattern loses what was written after the last read and before the truncate.
 
 ## Series retention
 

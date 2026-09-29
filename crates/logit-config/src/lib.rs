@@ -2535,7 +2535,9 @@ pub struct TailOptions {
     #[schemars(with = "String")]
     pub checkpoint_interval: Duration,
     /// A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream
-    /// JSON parser never sees a value that looks well-formed but isn't the real line. A
+    /// JSON parser never sees a value that looks well-formed but isn't the real line. The length
+    /// counts a trailing `\r`, so a CRLF file has one byte less room per line. Under `docker_in`
+    /// it bounds the reassembled `log` message, not the json-file line that carries it. A
     /// byte-count string. Defaults to `"1MiB"`; `0` is rejected.
     #[serde(default = "default_max_line_bytes", with = "human_bytes")]
     #[schemars(with = "String")]
