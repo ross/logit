@@ -101,8 +101,10 @@
 //! several records weighs as many entries). A request whose encoded body is over a byte limit is
 //! bisected and each half re-encoded, down to one event, and a single event still over the limit
 //! is dropped, counted `records.dropped{reason="oversize"}` for its entries, with a throttled
-//! `oversize` diagnostic. A bisected event's encoder counters (`metrics.degraded`, say) count once
-//! per encode attempt. Datadog's 1 MB per-log limit isn't enforced here: the intake truncates such
+//! `oversize` diagnostic. The re-encodes of a bisection count nothing ([`split_encode`]), so an
+//! event's encoder counters (`metrics.degraded`, say) count once, from the encode of the
+//! count-capped request it fell in; an event the encoder degraded and the bisection then dropped
+//! counts under both. Datadog's 1 MB per-log limit isn't enforced here: the intake truncates such
 //! a log and still accepts it.
 //!
 //! The series wire limit is the intake's: a 512,180 B gzip body drew `413` ("limit=512 kB"). The
@@ -167,7 +169,15 @@
 //! Plus everything [`DatadogEncoder`] counts itself (`logit.output.metrics.skipped`, including
 //! `unsupported_kind`-style skips by `metric_kind`; `metrics.degraded`; `tags.dropped`;
 //! `spans.degraded`; `stats.*`), which this sink doesn't repeat.
+//!
+//! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
+//! What the plan and the encoder decide counts once per batch: `stale`, `needs_agent_processing`,
+//! `not_datadog_origin`, an event too large to send alone, and the encoder's counters and
+//! diagnostics, through handles gated by the sink's `BatchAccounting`. The plan is unit 0 and each
+//! route its own unit, so a route an earlier attempt never reached counts on the attempt that
+//! first encodes it. The transport counters and a `413`'s `oversize` count per attempt.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{
     build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
     split_encode, status_class, Caps, Encoded,
@@ -178,7 +188,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use logit_core::{Diagnostics, EventBatch, MetricKind, Telemetry};
-use logit_pipeline::{Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::{
     is_datadog_event, is_datadog_stats, is_service_check, trace_readiness, DatadogEncoder,
@@ -426,6 +436,103 @@ fn now_nanos() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
+/// Where the sink reads its send time: [`now_nanos`], or a test's scripted clock.
+type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
+
+/// [`plan`]'s result: each route's items, indexed by `Route as usize`, and what the stale filter
+/// and the trace readiness gate dropped, which the sink counts once per batch.
+#[derive(Debug, Default)]
+struct Plan {
+    routes: [Vec<Item>; 8],
+    /// Records dropped `stale`, per route, indexed as `routes`.
+    stale: [usize; 8],
+    /// Spans the trace route drops, per [`TraceReadiness::drop_reason`].
+    needs_agent_processing: usize,
+    not_datadog_origin: usize,
+}
+
+/// Each route's items for `batch` (module doc's "Routes") at send time `now`, after the stale
+/// filter and the trace readiness gate. Counts nothing: [`DatadogOutput::count_plan_drops`] counts
+/// the drops, so the sink can skip them when a retry repeats the plan.
+fn plan(batch: &EventBatch, now: i64) -> Plan {
+    let resource = &batch.resource;
+    let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
+        trace_readiness(batch)
+    } else {
+        Vec::new()
+    };
+    let mut plan = Plan::default();
+    for (index, event) in batch.events.iter().enumerate() {
+        let routes = &mut plan.routes;
+        let mut push = |route: Route, weight: usize| {
+            routes[route as usize].push(Item { index, weight });
+        };
+        if is_datadog_stats(resource, event) {
+            push(Route::Stats, 1);
+            continue;
+        }
+        let stale = &mut plan.stale;
+        let age = now.saturating_sub(event.timestamp);
+        let check = is_service_check(resource, event);
+        if check {
+            if age > CHECK_MAX_AGE {
+                stale[Route::CheckRun as usize] += 1;
+            } else {
+                push(Route::CheckRun, 1);
+            }
+        }
+        let datadog_event = is_datadog_event(resource, event);
+        if datadog_event {
+            if age > LOG_MAX_AGE {
+                stale[Route::Events as usize] += 1;
+            } else {
+                push(Route::Events, 1);
+            }
+        }
+        // A service check's record 0 is the check route's alone.
+        let (mut series, mut samples, mut sketches) = (0, 0, 0);
+        for record in &event.metrics[usize::from(check)..] {
+            match record.kind {
+                MetricKind::Samples(_) => samples += 1,
+                MetricKind::Distribution(_) => sketches += 1,
+                _ => series += 1,
+            }
+        }
+        let metric_stale =
+            age > METRIC_MAX_AGE || event.timestamp.saturating_sub(now) > METRIC_MAX_AHEAD;
+        for (route, n) in [
+            (Route::Series, series),
+            (Route::DistributionPoints, samples),
+            (Route::Sketches, sketches),
+        ] {
+            if n == 0 {
+                continue;
+            }
+            if metric_stale {
+                stale[route as usize] += n;
+            } else {
+                push(route, n);
+            }
+        }
+        if event.log.is_some() && !datadog_event {
+            if age > LOG_MAX_AGE {
+                stale[Route::Logs as usize] += 1;
+            } else {
+                push(Route::Logs, 1);
+            }
+        }
+        if event.span.is_some() {
+            match readiness[index] {
+                Some(TraceReadiness::Ready) => push(Route::Traces, 1),
+                Some(TraceReadiness::NeedsAgentProcessing) => plan.needs_agent_processing += 1,
+                Some(TraceReadiness::NotDatadogOrigin) => plan.not_datadog_origin += 1,
+                None => unreachable!("trace_readiness gives every span event a verdict"),
+            }
+        }
+    }
+    plan
+}
+
 /// The Datadog intake client (module doc).
 ///
 /// Not `Debug`: it holds the API key.
@@ -442,9 +549,19 @@ pub struct DatadogOutput {
     headers: HeaderMap,
     /// Built by [`DatadogOutput::with_tls`]; `None` keeps `reqwest`'s default trust.
     tls: Option<rustls::ClientConfig>,
+    /// Counts through views of `telemetry`/`diag` gated by `accounting`
+    /// ([`DatadogOutput::new_encoder`]).
     encoder: DatadogEncoder,
+    /// Ungated: the transport counters, the server's verdicts, and [`plan`]'s and the oversize
+    /// drops, which [`DatadogOutput::attempt`] skips itself on a repeat encode.
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
+    /// [`now_nanos`], or a test's scripted clock.
+    clock: Clock,
+    /// Replaces every route's [`Route::caps`], so a test can bisect a small body.
+    #[cfg(test)]
+    caps_override: Option<Caps>,
 }
 
 impl DatadogOutput {
@@ -458,7 +575,7 @@ impl DatadogOutput {
             )
         })?;
         api_key.set_sensitive(true);
-        Ok(Self {
+        let mut output = Self {
             api_key,
             site: DEFAULT_SITE.to_string(),
             endpoints: DatadogEndpoints::default(),
@@ -470,7 +587,13 @@ impl DatadogOutput {
             encoder: DatadogEncoder::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
-        })
+            accounting: BatchAccounting::default(),
+            clock: Box::new(now_nanos),
+            #[cfg(test)]
+            caps_override: None,
+        };
+        output.encoder = output.new_encoder();
+        Ok(output)
     }
 
     /// The Datadog site the three intake hosts derive from (`site:`).
@@ -556,10 +679,28 @@ impl DatadogOutput {
         self
     }
 
+    /// The encoder, on views of this sink's handles gated by its batch accounting, so a retried
+    /// batch counts the codec's drops once (`crate::accounting`). `new` and every builder that
+    /// changes what the encoder holds call this, so no builder order leaves it ungated.
     fn new_encoder(&self) -> DatadogEncoder {
+        let gate = self.accounting.gate();
         DatadogEncoder::new()
-            .with_telemetry(self.telemetry.clone())
-            .with_diagnostics(self.diag.clone())
+            .with_telemetry(self.telemetry.gated(gate))
+            .with_diagnostics(self.diag.gated(gate))
+    }
+
+    /// Reads send times from `clock` instead of the wall clock.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// Replaces every route's request limits with `caps`.
+    #[cfg(test)]
+    fn with_caps(mut self, caps: Caps) -> Self {
+        self.caps_override = Some(caps);
+        self
     }
 
     /// `route`'s URL: the `endpoints` base for its intake, else `https://<prefix>.<site>`.
@@ -585,116 +726,70 @@ impl DatadogOutput {
         }
     }
 
-    /// Each route's items for `batch` (module doc's "Routes"), indexed by `Route as usize`, after
-    /// the stale filter and the trace readiness gate have dropped and counted what they drop.
-    fn plan(&self, batch: &EventBatch, now: i64) -> [Vec<Item>; 8] {
-        let resource = &batch.resource;
-        let readiness = if batch.events.iter().any(|e| e.span.is_some()) {
-            trace_readiness(batch)
-        } else {
-            Vec::new()
-        };
-        let mut routes: [Vec<Item>; 8] = Default::default();
-        for (index, event) in batch.events.iter().enumerate() {
-            let mut push = |route: Route, weight: usize| {
-                routes[route as usize].push(Item { index, weight });
-            };
-            if is_datadog_stats(resource, event) {
-                push(Route::Stats, 1);
-                continue;
-            }
-            let age = now.saturating_sub(event.timestamp);
-            let check = is_service_check(resource, event);
-            if check {
-                if age > CHECK_MAX_AGE {
-                    self.dropped(Route::CheckRun, "stale", 1);
-                } else {
-                    push(Route::CheckRun, 1);
-                }
-            }
-            let datadog_event = is_datadog_event(resource, event);
-            if datadog_event {
-                if age > LOG_MAX_AGE {
-                    self.dropped(Route::Events, "stale", 1);
-                } else {
-                    push(Route::Events, 1);
-                }
-            }
-            // A service check's record 0 is the check route's alone.
-            let (mut series, mut samples, mut sketches) = (0, 0, 0);
-            for record in &event.metrics[usize::from(check)..] {
-                match record.kind {
-                    MetricKind::Samples(_) => samples += 1,
-                    MetricKind::Distribution(_) => sketches += 1,
-                    _ => series += 1,
-                }
-            }
-            let metric_stale =
-                age > METRIC_MAX_AGE || event.timestamp.saturating_sub(now) > METRIC_MAX_AHEAD;
-            for (route, n) in [
-                (Route::Series, series),
-                (Route::DistributionPoints, samples),
-                (Route::Sketches, sketches),
-            ] {
-                if n == 0 {
-                    continue;
-                }
-                if metric_stale {
-                    self.dropped(route, "stale", n);
-                } else {
-                    push(route, n);
-                }
-            }
-            if event.log.is_some() && !datadog_event {
-                if age > LOG_MAX_AGE {
-                    self.dropped(Route::Logs, "stale", 1);
-                } else {
-                    push(Route::Logs, 1);
-                }
-            }
-            if event.span.is_some() {
-                match readiness[index] {
-                    Some(TraceReadiness::Ready) => push(Route::Traces, 1),
-                    Some(other) => {
-                        let reason = other.drop_reason().expect("only Ready has no reason");
-                        self.dropped(Route::Traces, reason, 1);
-                    }
-                    None => unreachable!("trace_readiness gives every span event a verdict"),
-                }
-            }
+    /// Counts what [`plan`] dropped, per route and reason.
+    fn count_plan_drops(&self, plan: &Plan) {
+        for route in ROUTES {
+            self.dropped(route, "stale", plan.stale[route as usize]);
         }
-        routes
+        self.dropped(Route::Traces, "needs_agent_processing", plan.needs_agent_processing);
+        self.dropped(Route::Traces, "not_datadog_origin", plan.not_datadog_origin);
     }
 
-    /// [`Output::send`] at a given send time, so tests can pin the stale windows' edges.
-    async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
-        let mut plan = self.plan(batch, now);
+    /// `route`'s request limits: [`Route::caps`], or a test's override.
+    fn caps(&self, route: Route) -> Caps {
+        #[cfg(test)]
+        if let Some(caps) = self.caps_override {
+            return caps;
+        }
+        route.caps()
+    }
+
+    /// One attempt at send time `now`: the plan, then each route's requests in turn. The plan is
+    /// unit 0 of the batch accounting and route `r`'s `split_encode` unit `1 + r as u32`, each
+    /// counting encode-side only on the batch's first encode of it. A route is encoded only once
+    /// the routes before it were sent, so a route an earlier attempt never reached counts on the
+    /// attempt that first encodes it.
+    async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
+        let (first, mut plan) = self.accounting.encode(0, || plan(batch, now));
+        if first {
+            self.count_plan_drops(&plan);
+        }
+        let gate = self.accounting.gate().clone();
         for route in ROUTES {
-            let items = std::mem::take(&mut plan[route as usize]);
+            let items = std::mem::take(&mut plan.routes[route as usize]);
             if items.is_empty() {
                 continue;
             }
-            let body_encoding = route.body_encoding(self.compression);
+            let (body_encoding, caps) = (route.body_encoding(self.compression), self.caps(route));
             let encoder = &mut self.encoder;
-            let split = split_encode(
-                &items,
-                route.caps(),
-                |item| item.weight,
-                |chunk| {
-                    let raw = route.encode(encoder, &sub_batch(batch, chunk))?;
-                    Some(Encoded { raw_len: raw.len(), body: body_encoding.apply(raw), meta: () })
-                },
-            );
-            for (item, raw_len, wire_len) in split.oversize {
-                self.dropped(route, "oversize", item.weight);
-                self.diag.warn_throttled(
-                    "oversize",
-                    format_args!(
-                        "dropped one event on the {} route: it encodes to {raw_len} bytes \
-                         ({wire_len} compressed), over the route's per-request limit",
-                        route.name()
-                    ),
-                );
+            let (first, split) = self.accounting.encode(1 + route as u32, || {
+                split_encode(
+                    &items,
+                    caps,
+                    &gate,
+                    |item| item.weight,
+                    |chunk| {
+                        let raw = route.encode(encoder, &sub_batch(batch, chunk))?;
+                        Some(Encoded {
+                            raw_len: raw.len(),
+                            body: body_encoding.apply(raw),
+                            meta: (),
+                        })
+                    },
+                )
+            });
+            if first {
+                for (item, raw_len, wire_len) in &split.oversize {
+                    self.dropped(route, "oversize", item.weight);
+                    self.diag.warn_throttled(
+                        "oversize",
+                        format_args!(
+                            "dropped one event on the {} route: it encodes to {raw_len} bytes \
+                             ({wire_len} compressed), over the route's per-request limit",
+                            route.name()
+                        ),
+                    );
+                }
             }
             for (chunk, encoded) in split.requests {
                 let entries = chunk.iter().map(|item| item.weight).sum();
@@ -702,6 +797,13 @@ impl DatadogOutput {
             }
         }
         Ok(())
+    }
+
+    /// One attempt at send time `now` ([`DatadogOutput::attempt`]). An `Ok` disarms the batch
+    /// accounting, a batch that sent nothing included.
+    async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
+        let result = self.attempt(batch, now).await;
+        self.accounting.finish(result)
     }
 
     /// The operator's headers with the protocol's `insert`ed over them, so a protocol name
@@ -805,10 +907,16 @@ impl DatadogOutput {
 
 #[async_trait::async_trait]
 impl Output for DatadogOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     /// One request per route the batch needs, sequentially; the first failure aborts the rest
     /// (module doc's "Faults, retries, and duplicate safety").
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        self.send_at(batch, now_nanos()).await
+        let now = (self.clock)();
+        self.send_at(batch, now).await
     }
 
     /// `false`: the module doc's "Faults, retries, and duplicate safety" says why.
@@ -1474,5 +1582,385 @@ mod tests {
     #[test]
     fn datadog_output_is_not_duplicate_safe() {
         assert!(!DatadogOutput::new(KEY).unwrap().duplicate_safe());
+    }
+
+    // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decisions 2 and 3) --
+
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        http_recorder, sum_of, sums_through_write_loop, RecordLog, Recorded, Reply, SumSeries,
+        Sums,
+    };
+    use logit_core::{Sum, Temporality};
+    use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
+
+    const SERIES: &str = "/api/v2/series";
+    const LOGS: &str = "/api/v2/logs";
+
+    /// The retry budget for a test whose first request never answers, so the budget cuts the
+    /// attempt off: 2 s of real time. A paused clock can't stand in, because it runs past the HTTP
+    /// client's own timers while socket I/O is in flight.
+    ///
+    /// - Above it, the sink's request timeout ([`DEFAULT_TIMEOUT`], 10 s) is 8 s away, so the
+    ///   budget, not the client, ends the hung request.
+    /// - Below it, a loopback connect and write take milliseconds, so the first request is on the
+    ///   wire and recorded long before the budget ends, and the next batch's request, which gets
+    ///   its own budget, finishes well inside it on a loaded machine.
+    /// - `drive_write_loop`'s ceiling, `RECV_TIMEOUT` (5 s) plus one budget per batch, is 9 s for
+    ///   the two batches these tests send, above the one cut-off budget and the delivered batch
+    ///   together.
+    const HUNG_REQUEST_BUDGET: Duration = Duration::from_secs(2);
+
+    /// A non-monotonic delta sum, which the series codec skips and counts.
+    fn non_monotonic_delta(ts: i64) -> Event {
+        let sum = Sum { value: 1.0, temporality: Temporality::Delta, monotonic: false };
+        metric(ts, MetricKind::Sum(sum))
+    }
+
+    /// A log with a `timestamp` attribute, which the logs codec drops and counts `reserved_key`.
+    fn log_with_reserved_key(ts: i64, message: &str) -> Event {
+        let mut event = log_event(ts, message);
+        event.attributes.insert("timestamp", Value::str("t"));
+        event
+    }
+
+    /// A sketch of 24 bins of 4e9 each: over a `Dogsketch`'s 2^20 k/n entries, so the sketches
+    /// codec drops it, counts it, and diagnoses it.
+    fn oversized_sketch(ts: i64) -> Event {
+        let mut s = DdSketch::new();
+        for i in 0..24 {
+            s.add_count(f64::from(1u32 << i), 4.0e9);
+        }
+        metric(ts, MetricKind::Distribution(s))
+    }
+
+    /// Two of `plan`'s drops and a codec count on each of the series, sketches, and logs routes;
+    /// the sketches route sends nothing, so the batch is one series and one logs request.
+    fn encode_side_batch() -> EventBatch {
+        batch(vec![
+            gauge(NOW),
+            non_monotonic_delta(NOW),
+            gauge(NOW - 2 * HOUR),
+            oversized_sketch(NOW),
+            log_with_reserved_key(NOW, "kept"),
+            span(3, 5, None, &[("http.route", Value::str("/"))]),
+        ])
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 6] = [
+        (RECORDS_DROPPED, &[("route", "series"), ("reason", "stale")]),
+        (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),
+        ("logit.output.metrics.skipped", &[("metric_kind", "non_monotonic_delta_sum")]),
+        ("logit.output.metrics.skipped", &[("reason", "oversized_sketch")]),
+        ("logit.component.diagnostics", &[("key", "oversized_sketch")]),
+        ("logit.output.tags.dropped", &[("reason", "reserved_key")]),
+    ];
+
+    /// Beyond `logit.output.requests`, what a retried batch counts once per attempt here.
+    const PER_ATTEMPT: [SumSeries<'static>; 2] = [(REQUEST_BYTES, &[]), (RECORDS, &[])];
+
+    /// What an accepting intake answers on `path`.
+    fn accepted(path: &str) -> Reply {
+        Reply::Answer(if path == LOGS { 202 } else { 200 }, b"{}".to_vec())
+    }
+
+    /// `503` on `path`'s first request, then [`accepted`].
+    fn busy_once(path: &str, k: usize) -> Reply {
+        if k == 0 {
+            Reply::Answer(503, Vec::new())
+        } else {
+            accepted(path)
+        }
+    }
+
+    /// An intake answering the `k`th request (from 0) on each path with `script(path, k)`.
+    async fn scripted_intake(
+        script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+    ) -> (SocketAddr, RecordLog) {
+        let per_path: Mutex<HashMap<String, usize>> = Mutex::default();
+        http_recorder(move |_, path, _| {
+            let k = {
+                let mut per_path = per_path.lock().unwrap();
+                let seen = per_path.entry(path.to_string()).or_default();
+                *seen += 1;
+                *seen - 1
+            };
+            script(path, k)
+        })
+        .await
+    }
+
+    fn at_least_once() -> WriteLoopConfig {
+        WriteLoopConfig { delivery_override: Some(DeliveryPosture::AtLeastOnce), ..fast_retry() }
+    }
+
+    /// A sink on `probe`'s handles, with uncompressed bodies and every send time [`NOW`].
+    fn instrumented(addr: SocketAddr, probe: &TelemetryProbe) -> DatadogOutput {
+        let telemetry = probe.telemetry("out", "datadog_out", "sink");
+        sink(addr)
+            .with_compression(DatadogCompression::None)
+            .with_clock(|| NOW)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    /// `batches` through the write loop under `config`, over the sink `build` makes, against a
+    /// [`scripted_intake`]; and the requests it received.
+    async fn run_dd(
+        script: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+        batches: Vec<EventBatch>,
+        config: WriteLoopConfig,
+        build: impl FnOnce(SocketAddr, &TelemetryProbe) -> DatadogOutput,
+    ) -> (Sums, Vec<Recorded>) {
+        let (addr, log) = scripted_intake(script).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = build(addr, &probe);
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, config).await;
+        let log = log.lock().unwrap().clone();
+        (sums, log)
+    }
+
+    fn recorded_paths(log: &[Recorded]) -> Vec<&str> {
+        log.iter().map(|r| r.path.as_str()).collect()
+    }
+
+    fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
+        log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
+    }
+
+    /// Every request to `path` sent the bytes of the single-attempt run's one request there.
+    fn assert_resent_unchanged(single: &[Recorded], retried: &[Recorded], path: &str) {
+        let first = &bodies(single, path)[0];
+        for body in bodies(retried, path) {
+            assert_eq!(&body, first, "{path}: a retry sends the first attempt's bytes");
+        }
+    }
+
+    /// The logs route fails after the series route was sent: the retry re-sends both, and every
+    /// route's encode-side counts, `plan`'s drops, and the codec diagnostic read as after one
+    /// attempt, the logs route's included, which attempt 1 encoded before its request failed.
+    #[tokio::test]
+    async fn a_route_failing_after_another_was_sent_counts_every_routes_encode_side_once() {
+        let batches = || vec![encode_side_batch()];
+        let (single, one) =
+            run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
+        let script = |p: &str, k| if p == LOGS { busy_once(p, k) } else { accepted(p) };
+        let (retried, log) = run_dd(script, batches(), at_least_once(), instrumented).await;
+
+        assert_eq!(recorded_paths(&one), [SERIES, LOGS]);
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS], "two attempts");
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "series"), ("class", "2xx")]), 2.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "logs"), ("class", "5xx")]), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("route", "logs"), ("class", "2xx")]), 1.0);
+        let series_records = sum_of(&single, RECORDS, &[("route", "series")]);
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "series")]), 2.0 * series_records);
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "logs")]), 1.0);
+        let bytes = sum_of(&single, REQUEST_BYTES, &[("route", "series")]);
+        assert_eq!(sum_of(&retried, REQUEST_BYTES, &[("route", "series")]), 2.0 * bytes);
+        for path in [SERIES, LOGS] {
+            assert_resent_unchanged(&one, &log, path);
+        }
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// The series route fails first, so attempt 1 never encodes the sketches and logs routes:
+    /// they count on attempt 2, their first encode, once.
+    #[tokio::test]
+    async fn routes_first_encoded_on_a_retry_count_their_encode_side_then() {
+        let batches = || vec![encode_side_batch()];
+        let (single, one) =
+            run_dd(|p, _| accepted(p), batches(), at_least_once(), instrumented).await;
+        let script = |p: &str, k| if p == SERIES { busy_once(p, k) } else { accepted(p) };
+        let (retried, log) = run_dd(script, batches(), at_least_once(), instrumented).await;
+
+        assert_eq!(recorded_paths(&log), [SERIES, SERIES, LOGS], "logs is reached on attempt 2");
+        assert_eq!(sum_of(&retried, RECORDS, &[("route", "logs")]), 1.0);
+        for path in [SERIES, LOGS] {
+            assert_resent_unchanged(&one, &log, path);
+        }
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// Caps small enough to bisect the logs of [`bisected_logs`]: two count-capped chunks of five
+    /// and four, and in each, two logs fit a request, three don't, and the 2,000-byte log doesn't
+    /// fit alone. The second chunk's encode follows the first chunk's bisection, so it runs with
+    /// the gate as that bisection left it.
+    const SMALL_CAPS: Caps = Caps { entries: 5, raw_bytes: 700, wire_bytes: usize::MAX };
+
+    /// Eight 200-byte logs and one of 2,000 bytes in the middle, each with a `reserved_key`
+    /// attribute the logs codec counts once per record it encodes.
+    fn bisected_logs() -> EventBatch {
+        let mut events: Vec<Event> = (0..8)
+            .map(|i| log_with_reserved_key(NOW, &format!("{i}{}", "y".repeat(199))))
+            .collect();
+        events.insert(4, log_with_reserved_key(NOW, &"x".repeat(2_000)));
+        batch(events)
+    }
+
+    /// Bisection re-encodes records a count-capped chunk already counted, and runs muted: each
+    /// record's `reserved_key` drop counts once, on one attempt and on a retried one. The record
+    /// dropped as oversize at the leaf counts `oversize` once, and its codec count too, from the
+    /// count-capped chunk's encode: a record degraded by its codec and then dropped is reported
+    /// under both counters.
+    #[tokio::test]
+    async fn bisection_counts_each_records_codec_counters_once_on_every_attempt() {
+        let build = |addr, probe: &TelemetryProbe| instrumented(addr, probe).with_caps(SMALL_CAPS);
+        let batches = || vec![bisected_logs()];
+        let (single, one) = run_dd(|p, _| accepted(p), batches(), at_least_once(), build).await;
+        let (retried, log) = run_dd(busy_once, batches(), at_least_once(), build).await;
+
+        let requests = one.len();
+        assert!(requests >= 4, "the nine logs bisect into several requests: {requests}");
+        let sent: usize = one
+            .iter()
+            .map(|r| DatadogDecoder::new().decode_logs(&r.body, NOW).unwrap().events.len())
+            .sum();
+        assert_eq!(sent, 8, "every log but the oversize one, each once");
+        assert_eq!(log.len(), requests + 1, "the first request failed, then all were resent");
+        for sums in [&single, &retried] {
+            assert_eq!(
+                sum_of(sums, "logit.output.tags.dropped", &[("reason", "reserved_key")]),
+                9.0
+            );
+            let oversize = [("route", "logs"), ("reason", "oversize")];
+            assert_eq!(sum_of(sums, RECORDS_DROPPED, &oversize), 1.0);
+            assert_eq!(sum_of(sums, "logit.component.diagnostics", &[("key", "oversize")]), 1.0);
+        }
+        let encode_side: [SumSeries<'static>; 3] = [
+            ("logit.output.tags.dropped", &[("reason", "reserved_key")]),
+            (RECORDS_DROPPED, &[("reason", "oversize")]),
+            ("logit.component.diagnostics", &[("key", "oversize")]),
+        ];
+        assert_counted_once_per_batch(&single, &retried, &encode_side, &PER_ATTEMPT);
+    }
+
+    /// The gate re-arms per batch: a second batch counts as the first did.
+    #[tokio::test]
+    async fn a_second_datadog_batch_counts_its_encode_side_counters() {
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let (sums, _) = run_dd(|p, _| accepted(p), batches, fast_retry(), instrumented).await;
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose logs request never answers is cut off by the retry budget and dropped, and
+    /// the next batch counts its encode-side counters.
+    #[tokio::test]
+    async fn a_datadog_batch_after_one_dropped_at_its_budget_counts_encode_side() {
+        let script = |p: &str, k| if p == LOGS && k == 0 { Reply::Hang } else { accepted(p) };
+        let mut config = fast_retry();
+        config.retry.total_budget = HUNG_REQUEST_BUDGET;
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let (sums, log) = run_dd(script, batches, config, instrumented).await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS]);
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose every point is stale sends nothing and returns `Ok`, leaving the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn datadog_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
+        let (addr, log) = scripted_intake(|p, _| accepted(p)).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe);
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "datadog_out",
+            batch(vec![gauge(NOW - 2 * HOUR)]),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
+        let log = log.lock().unwrap().clone();
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, SERIES, LOGS], "the two direct sends");
+    }
+
+    /// One of the two builders that rebuild the encoder.
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        Diagnostics,
+        Telemetry,
+    }
+
+    /// Both orders of the two encoder-building builders, each after a first call with other
+    /// handles, leave the encoder counting through gated views of the last handles.
+    #[tokio::test]
+    async fn every_datadog_builder_order_gates_the_encoder_on_the_final_handles() {
+        use Builder::{Diagnostics as D, Telemetry as T};
+        for order in [[D, T], [T, D]] {
+            let decoy = Registry::new();
+            let build = |addr: SocketAddr, probe: &TelemetryProbe| -> DatadogOutput {
+                let other = decoy.telemetry_for("other", "datadog_out", "sink");
+                let mut sink = sink(addr)
+                    .with_compression(DatadogCompression::None)
+                    .with_clock(|| NOW)
+                    .with_telemetry(other.clone())
+                    .with_diagnostics(Diagnostics::new("other").with_telemetry(other));
+                let telemetry = probe.telemetry("out", "datadog_out", "sink");
+                for builder in order {
+                    sink = match builder {
+                        Builder::Diagnostics => sink.with_diagnostics(
+                            Diagnostics::new("out").with_telemetry(telemetry.clone()),
+                        ),
+                        Builder::Telemetry => sink.with_telemetry(telemetry.clone()),
+                    };
+                }
+                sink
+            };
+            let batches = || vec![encode_side_batch()];
+            let (single, _) = run_dd(|p, _| accepted(p), batches(), at_least_once(), build).await;
+            let script = |p: &str, k| if p == LOGS { busy_once(p, k) } else { accepted(p) };
+            let (retried, _) = run_dd(script, batches(), at_least_once(), build).await;
+            assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+            let stale = decoy.drain(0).iter().map(|e| e.metrics.len()).sum::<usize>();
+            assert_eq!(stale, 0, "{order:?}: nothing counts through a replaced handle");
+        }
+    }
+
+    /// With no handle builders, the encoder's diagnostics share the sink's throttle and are gated
+    /// too: a retried batch reports its codec diagnostic and its local oversize drop once.
+    #[tokio::test]
+    async fn a_datadog_sink_with_no_handle_builders_reports_each_encode_side_diagnostic_once() {
+        let (addr, log) =
+            scripted_intake(|p, k| if p == LOGS { busy_once(p, k) } else { accepted(p) }).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = sink(addr)
+            .with_compression(DatadogCompression::None)
+            .with_clock(|| NOW)
+            .with_caps(Caps { raw_bytes: 1_000, ..Caps::UNBOUNDED });
+        let mut b = encode_side_batch();
+        b.events.push(log_event(NOW, &"x".repeat(2_000)));
+        sums_through_write_loop(&mut output, &mut probe, "datadog_out", vec![b], at_least_once())
+            .await;
+        assert_eq!(recorded_paths(&log.lock().unwrap()), [SERIES, LOGS, SERIES, LOGS]);
+        assert_eq!(output.diag.occurrences("oversized_sketch"), 1);
+        assert_eq!(output.diag.occurrences("oversize"), 1);
+    }
+
+    /// A `413` answered on a retry is the intake's verdict on that attempt: its entries are
+    /// counted oversize and it is diagnosed, through the sink's ungated handles.
+    #[tokio::test]
+    async fn a_413_answered_on_a_retry_is_counted() {
+        let script = |p: &str, k| match k {
+            0 => Reply::Answer(503, Vec::new()),
+            _ if p == SERIES => Reply::Answer(413, b"too large".to_vec()),
+            _ => accepted(p),
+        };
+        let b = batch(vec![gauge(NOW), gauge(NOW)]);
+        let (sums, log) = run_dd(script, vec![b], at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [SERIES, SERIES]);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        let oversize = [("route", "series"), ("reason", "oversize")];
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &oversize), 2.0);
+        let rejected = [("key", "request_rejected")];
+        assert_eq!(sum_of(&sums, "logit.component.diagnostics", &rejected), 1.0);
     }
 }
