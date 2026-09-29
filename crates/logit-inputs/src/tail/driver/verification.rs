@@ -107,7 +107,9 @@ enum Op {
         lens: Vec<usize>,
     },
     /// logrotate's `copytruncate`: shift, copy `f.log` to a new `f.log.1`, truncate `f.log` in
-    /// place, then scan (failing the listing if `scan_fails`).
+    /// place, then scan (failing the listing if `scan_fails`). The scan checks every tracked copy
+    /// of the truncated inode, bound or draining, so a refill past its offset before the first
+    /// check, the gap size-based detection can't close, never happens here.
     CopyTruncate {
         f: usize,
         scan_fails: bool,
@@ -534,6 +536,13 @@ impl Model {
             }
         }
 
+        // A draining file is checked through its handle, whatever the listing saw.
+        let draining: Vec<FileId> =
+            self.tracked.iter().filter(|(_, t)| t.draining.is_some()).map(|(id, _)| *id).collect();
+        for id in draining {
+            self.truncation_check(id);
+        }
+
         // An unspent entry goes once a listing shows nothing can consume it.
         self.resume.retain(|id, e| !listed(&e.path) || found.contains_key(id));
 
@@ -553,6 +562,9 @@ impl Model {
     fn drain(&mut self) {
         let ids: Vec<FileId> = self.tracked.keys().copied().collect();
         for id in &ids {
+            if self.tracked[id].draining.is_some() {
+                self.truncation_check(*id);
+            }
             self.read(*id);
         }
         for id in ids {
@@ -1313,39 +1325,25 @@ proptest! {
     }
 }
 
-// -- Cases the model found before this test was committed, replayed through the harness. Each has
-// a hand-driven twin in `driver.rs`'s tests.
+// -- Cases with a hand-driven twin in `driver.rs`'s tests, replayed through the harness.
 
-/// An unspent checkpoint entry for an inode a rotation moves onto a still-bound path
-/// (`a_rotation_arm_resumes_a_new_inode_from_its_unspent_checkpoint_entry_in_either_scan_order`).
-#[test]
-fn a_rotated_inode_with_an_unspent_entry_resumes() {
-    use Op::*;
-    run(Case {
-        slots: 1,
-        wildcard: true,
-        max_events: 1,
-        max_line_bytes: 1 << 20,
-        ops: vec![
-            Append { f: 0, lens: vec![20] },
-            RenameRotate { f: 0, scan_between: None },
-            Append { f: 0, lens: vec![20] },
-            Scan(ScanFail::None),
-            Drain,
-            CheckpointTick,
-            Restart { first_scan_fails: true },
-            Scan(ScanFail::Stat(0)),
-            RenameRotate { f: 0, scan_between: None },
-            Scan(ScanFail::None),
-            Drain,
-        ],
-    });
-}
-
-/// A stat race retires the live file, copytruncate empties it, and a refill passes the old
-/// offset (`a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset`).
+/// A stat race retires the live file and `copytruncate` empties it: its scan rebinds it and sees
+/// the truncation, and the refill after is read from `0`
+/// (`a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset`).
 #[test]
 fn a_rebound_inode_truncated_while_draining_is_read_from_zero() {
+    truncated_while_draining(false);
+}
+
+/// The same with `copytruncate`'s listing failing: nothing rebinds the file, and the scan's check
+/// of every draining file sees the truncation
+/// (`a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero`).
+#[test]
+fn a_draining_inode_truncated_under_a_failed_listing_is_read_from_zero() {
+    truncated_while_draining(true);
+}
+
+fn truncated_while_draining(scan_fails: bool) {
     use Op::*;
     run(Case {
         slots: 1,
@@ -1357,7 +1355,7 @@ fn a_rebound_inode_truncated_while_draining_is_read_from_zero() {
             Scan(ScanFail::None),
             Drain,
             Scan(ScanFail::StatGone(0)),
-            CopyTruncate { f: 0, scan_fails: false },
+            CopyTruncate { f: 0, scan_fails },
             Append { f: 0, lens: vec![30, 30] },
             Drain,
         ],

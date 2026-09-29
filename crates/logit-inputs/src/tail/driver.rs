@@ -541,6 +541,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         for (path, meta) in std::mem::take(&mut listing.discovered) {
             self.reconcile_discovered(path, &meta, first, watcher).await;
         }
+        // A `Draining` file is bound to no path, so nothing above looked at it.
+        let draining: Vec<FileId> = self
+            .files
+            .iter()
+            .filter(|(_, f)| f.state == FileState::Draining)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in draining {
+            self.recheck_length(id).await;
+        }
         pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
         if pruned {
             if let Some(cp) = &mut self.checkpoint {
@@ -782,6 +792,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             Err(_) => {}
         }
         self.factory.retain(&path);
+    }
+
+    /// The truncation check for a file no path is bound to: an `fstat` of its handle against its
+    /// offset. `scan` runs it for every `Draining` file, and `drain` before each read of one, since
+    /// the drain loop runs far more often than `scan` and a refill past the offset before the
+    /// first check is the one truncation size-based detection can't see
+    /// (`docs/known-gaps.md`). An `fstat` error says nothing; a later check decides.
+    async fn recheck_length(&mut self, id: FileId) {
+        let Some(tracked) = self.files.get(&id) else { return };
+        let Ok(meta) = tracked.file.metadata().await else { return };
+        self.reconcile_truncation(id, meta.len()).await;
     }
 
     /// Runs [`DecoderFactory::refresh`] for a tracked path found by `scan` and applies the
@@ -1067,6 +1088,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             for id in ids {
                 if *shutdown.borrow() {
                     return DrainEnd::Shutdown;
+                }
+                // One `fstat` per pass, only while the file drains: see `recheck_length`.
+                if self.files.get(&id).is_some_and(|f| f.state == FileState::Draining) {
+                    self.recheck_length(id).await;
                 }
                 if self.read_one(id, sink).await {
                     any_progress = true;
@@ -5171,12 +5196,11 @@ mod tests {
         panic!("the draining file never came first in 64 fresh maps");
     }
 
-    // -- rebinding (found by `verification`'s state-machine proptest)
+    // -- truncation of a file no path is bound to
 
-    /// A `stat` that raced a rename retires the file; logrotate's `copytruncate` then truncates it
-    /// in place and the writer refills it past the old offset before the scan that rebinds it.
-    /// The rebind sees the short length, so it must reset the offset as the same-path arm does,
-    /// or the next read starts mid-line.
+    /// A `stat` that raced a rename retires the file, and `copytruncate` truncates it in place.
+    /// It's still shorter than its offset at the scan that rebinds it, so the rebind resets the
+    /// offset as the same-path arm does; the refill after that is read from `0`, not mid-line.
     #[tokio::test]
     async fn a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset()
     {
@@ -5204,6 +5228,34 @@ mod tests {
             tick(&mut tailer, false).await,
             vec!["three", "four-refilled-past-the-old-offset"]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A draining file truncated in place is checked by `drain` before each read, so a refill
+    /// past the old offset after that check, but before any scan rebinds the file, is still read
+    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps.md`).
+    #[tokio::test]
+    async fn a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero() {
+        let dir = scratch_dir("draining-truncated-refilled");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
+
+        let scope = fault::scope(&dir);
+        scope.fail_nth(STAT, 1, errno::ENOENT);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        drop(scope);
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Draining));
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(0).unwrap();
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0, "seen by the drain");
+        append(&path, b"three-refilled-past-the-old-offset\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["three-refilled-past-the-old-offset"]);
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active), "rebound");
         std::fs::remove_dir_all(&dir).ok();
     }
 
