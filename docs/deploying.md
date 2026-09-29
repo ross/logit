@@ -904,8 +904,9 @@ components:
   resynchronize at. A recorded `datadog` Python client's stream decodes this way, and a real
   Agent 7.83 accepted `statsd_out`'s.
 - **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
-  `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 65),
-  which a client's `unix:///` URL couldn't name.
+  `logit validate` rejects `tls:` under either Unix transport, a relative `bind:`, which a
+  client's `unix:///` URL couldn't name, and a path of 108 bytes or more, which doesn't fit a Unix
+  socket address (rule 65).
 
 ### `collectd_out`: relaying back onto the wire
 
@@ -2296,6 +2297,17 @@ input. Keeping untrusted peers out is your job: use network policy, TLS with `cl
 only peers with a certificate you issued can connect, or a proxy in front of the listener. See
 [ADR `deployment-threat-model`](adr/deployment-threat-model.md), and `docs/known-gaps.md` for
 what isn't defended.
+
+### `syslog_out` over UDP: the message-size bound
+
+`max_message_bytes:` (default `8192`) bounds one encoded message, PRI and header included. Under
+`transport: udp` a message is also one datagram, so it's bounded by the smaller of
+`max_message_bytes` and `65507`, the largest UDP payload: raising `max_message_bytes` past 65507
+changes nothing over UDP. A longer message is truncated, never dropped, and counted
+`logit.output.messages.truncated` with a throttled `message_truncated` diagnostic. Over
+`transport: tcp` only `max_message_bytes` applies. `syslog_out`'s UDP endpoint follows the same
+port and address-family rules as `statsd_out`'s (see
+["`statsd_out`: `transport: tcp` and TLS"](#statsd_out-transport-tcp-and-tls)).
 
 ### Syslog over TLS (RFC 5425)
 
