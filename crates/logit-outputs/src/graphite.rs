@@ -67,12 +67,13 @@
 //! like a collectd COUNTER or statsd `|c`. That's whisper's behavior, not the carbon wire's; a
 //! non-whisper receiver on the same wire could add instead, and this sink can't tell.
 
+use crate::accounting::BatchAccounting;
 use crate::count_request;
 use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use crate::stream::{Dial, PooledStream, Target};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::Output;
+use logit_pipeline::{BatchContext, Output};
 use logit_proto::graphite::{GraphiteEncoder, Protocol};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::time::Duration;
@@ -106,8 +107,11 @@ pub struct GraphiteOutput {
     buf: MessageBuf<usize>,
     /// Reused across `send`s: the packed UDP datagram, or the whole TCP write buffer.
     packet_buf: Vec<u8>,
+    /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
+    /// warnings. The encoder holds views gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl GraphiteOutput {
@@ -132,6 +136,7 @@ impl GraphiteOutput {
             packet_buf: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         }
         .with_max_packet_bytes(logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES)
     }
@@ -145,8 +150,8 @@ impl GraphiteOutput {
         }
     }
 
-    /// Installs `encoder` with this sink's line cap, diagnostics, and telemetry re-applied, so
-    /// builder order doesn't matter (`CollectdOutput::with_encoder` says what goes wrong
+    /// Installs `encoder` with this sink's line cap and its diagnostics and telemetry (gated)
+    /// re-applied, so builder order doesn't matter (`CollectdOutput::with_encoder` says what goes wrong
     /// otherwise).
     ///
     /// Errors on a pickle encoder over UDP, as graph validation does: a pickle frame is bounded
@@ -158,8 +163,8 @@ impl GraphiteOutput {
         }
         self.encoder = encoder
             .with_max_packet_bytes(self.encoder_cap())
-            .with_diagnostics(self.diag.clone())
-            .with_telemetry(self.telemetry.clone());
+            .with_diagnostics(self.diag.gated(self.accounting.gate()))
+            .with_telemetry(self.telemetry.gated(self.accounting.gate()));
         Ok(self)
     }
 
@@ -171,30 +176,40 @@ impl GraphiteOutput {
         self
     }
 
+    /// The encoder gets a view gated by this sink's batch accounting.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
+        self.diag = diag;
         self
     }
 
+    /// The encoder gets a view gated by this sink's batch accounting.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.encoder = self.encoder.with_telemetry(telemetry);
+        self.encoder = self.encoder.with_telemetry(telemetry.gated(self.accounting.gate()));
+        self.telemetry = telemetry;
         self
     }
 }
 
 #[async_trait::async_trait]
 impl Output for GraphiteOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // `Stats` discarded: the encoder already reported them through its own handles.
-        self.encoder.encode_into(batch, &mut self.buf);
+        // `Stats` discarded: the encoder already reported them through its own gated handles.
+        let (first, _stats) =
+            self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.buf));
 
         if self.buf.is_empty() {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
+        }
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = match &mut self.conn {
             Conn::Udp(udp) => {
@@ -208,6 +223,7 @@ impl Output for GraphiteOutput {
                     sink: "graphite_out",
                     diag: &mut self.diag,
                     telemetry: &self.telemetry,
+                    count_local_drops: first,
                 };
                 let (sent, result) =
                     udp.send(&self.endpoint, batch, &mut self.packet_buf, &mut report).await;
@@ -236,6 +252,9 @@ impl Output for GraphiteOutput {
             }
         };
         drop(request_timer);
+        if result.is_ok() {
+            self.accounting.delivered();
+        }
         result
     }
 

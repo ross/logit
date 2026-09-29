@@ -17,7 +17,9 @@
 //!
 //! An entry longer than `cap` never reaches the kernel. Every encoder caps its entries at the
 //! value its sink passes here, so the branch that drops one, counted like `EMSGSIZE`, is a
-//! release-build backstop behind a `debug_assert!`.
+//! release-build backstop behind a `debug_assert!`. That drop is encode-side and counts on a
+//! batch's first encode only ([`Report::count_local_drops`]); an `EMSGSIZE` is the kernel's answer
+//! to one attempt and counts on every attempt. Both count under `reason="oversize_datagram"`.
 //!
 //! [`Sent`] comes back on every exit, so a sink counts what reached the wire before an error as
 //! well as on success. A cancelled send returns nothing, and its counts are lost
@@ -83,11 +85,15 @@ pub(crate) struct Datagrams<'a, M> {
     pub(crate) framing: Framing,
 }
 
-/// Where a send's drops are reported.
+/// Where a send's drops are reported, through the sink's ungated handles.
 pub(crate) struct Report<'a> {
     pub(crate) sink: &'static str,
     pub(crate) diag: &'a mut Diagnostics,
     pub(crate) telemetry: &'a Telemetry,
+    /// Whether this is the batch's first encode (`crate::accounting`): an over-cap entry is an
+    /// encode-side drop, counted once per batch, while an `EMSGSIZE` is the kernel's answer to
+    /// this attempt and counts on every one.
+    pub(crate) count_local_drops: bool,
 }
 
 impl Report<'_> {
@@ -124,6 +130,9 @@ pub(crate) async fn send_datagrams<M>(
             batch.cap
         );
         if entry.len() > batch.cap {
+            if !report.count_local_drops {
+                continue;
+            }
             report.oversize(
                 weight,
                 format_args!(
@@ -469,16 +478,29 @@ mod tests {
         Datagrams { entries, weight: |w| *w, cap, framing: Framing::Packed }
     }
 
-    /// Runs one [`send_datagrams`] over `dest`, reporting into `probe`.
+    /// Runs one [`send_datagrams`] over `dest` for a batch's first encode, reporting into
+    /// `probe`.
     async fn send(
         batch: Datagrams<'_, usize>,
         dest: &mut DatagramDest<'_>,
         packet_buf: &mut Vec<u8>,
         probe: &TelemetryProbe,
     ) -> (Sent, anyhow::Result<()>) {
+        send_encoded(batch, dest, packet_buf, probe, true).await
+    }
+
+    /// [`send`], for a first encode or a repeat one (`count_local_drops`).
+    async fn send_encoded(
+        batch: Datagrams<'_, usize>,
+        dest: &mut DatagramDest<'_>,
+        packet_buf: &mut Vec<u8>,
+        probe: &TelemetryProbe,
+        count_local_drops: bool,
+    ) -> (Sent, anyhow::Result<()>) {
         let mut diag = Diagnostics::default();
         let telemetry = probe.telemetry("out", "test_out", "sink");
-        let mut report = Report { sink: "test_out", diag: &mut diag, telemetry: &telemetry };
+        let mut report =
+            Report { sink: "test_out", diag: &mut diag, telemetry: &telemetry, count_local_drops };
         send_datagrams(batch, dest, packet_buf, &mut report).await
     }
 
@@ -596,6 +618,33 @@ mod tests {
         assert_eq!(script.datagrams(), [b"aa".to_vec(), b"cc".to_vec()]);
         assert_eq!(sent, Sent { entries: 2, weight: 14, datagrams: 2 });
         assert_eq!(probe.sum("logit.output.messages.dropped", &OVERSIZE), 7.0);
+    }
+
+    /// An over-cap entry is an encode-side drop: a repeat encode of the batch skips it without
+    /// counting it again, while an `EMSGSIZE` is the kernel's answer to this attempt and counts.
+    /// Reaches the skip only in a release build, as the test above does.
+    #[tokio::test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "over the 4-byte cap"))]
+    async fn a_repeat_encode_skips_an_over_cap_entry_uncounted_and_counts_an_emsgsize() {
+        let script = ScriptedDest::new([SendStep::TooLarge]);
+        let mut probe = TelemetryProbe::new();
+        let buf = entries(&["aa", "bbbbbbbb", "cc"], 7);
+        let (sent, result) = send_encoded(
+            packed(&buf, 4),
+            &mut DatagramDest::Scripted(&script),
+            &mut Vec::new(),
+            &probe,
+            false,
+        )
+        .await;
+        result.expect("neither drop is a fault");
+        assert_eq!(script.datagrams(), [b"cc".to_vec()]);
+        assert_eq!(sent, Sent { entries: 1, weight: 7, datagrams: 1 });
+        assert_eq!(
+            probe.sum("logit.output.messages.dropped", &OVERSIZE),
+            7.0,
+            "the EMSGSIZE drop of `aa` counts, the repeat skip of `bbbbbbbb` doesn't"
+        );
     }
 
     // -- `transport: unix` -----------------------------------------------------------------------

@@ -169,6 +169,7 @@
 //! called delivered only after a flush. Both transports count `logit.output.requests` tagged
 //! `class=ok|clean|ambiguous|permanent`.
 
+use crate::accounting::BatchAccounting;
 use crate::count_request;
 use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use crate::human::render_value_inline;
@@ -177,6 +178,7 @@ use crate::Output;
 use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
 use logit_core::{interner, AttrMap, Diagnostics, Event, EventBatch, Severity, Telemetry, Value};
+use logit_pipeline::BatchContext;
 use logit_proto::{FramedEncoder, MessageBuf, MAX_UDP_PAYLOAD_BYTES};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1131,8 +1133,11 @@ pub struct SyslogOutput {
     /// TCP only: `Some` exactly when a `tls:` block was configured (module doc's "TLS"). Built
     /// once by [`SyslogOutput::with_tls`], shared by every connect.
     tls: Option<TlsTarget>,
+    /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
+    /// warnings. The encoder holds a view gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl SyslogOutput {
@@ -1158,13 +1163,16 @@ impl SyslogOutput {
             tls: None,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         }
     }
 
     /// Installs `encoder`. Over UDP its `max_message_bytes` is capped at
     /// [`MAX_UDP_PAYLOAD_BYTES`], so a longer message is truncated to fit one datagram (module
-    /// doc's "Sizing") rather than refused by the kernel and dropped.
+    /// doc's "Sizing") rather than refused by the kernel and dropped. The encoder gets this
+    /// sink's diagnostics (gated), whatever the builder order.
     pub fn with_encoder(mut self, encoder: SyslogEncoder) -> Self {
+        let encoder = encoder.with_diagnostics(self.diag.gated(self.accounting.gate()));
         self.encoder = match self.conn {
             Conn::Udp(_) => {
                 let cap = encoder.max_message_bytes().min(MAX_UDP_PAYLOAD_BYTES);
@@ -1208,9 +1216,10 @@ impl SyslogOutput {
         Ok(self)
     }
 
+    /// The encoder gets a view gated by this sink's batch accounting.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
+        self.diag = diag;
         self
     }
 
@@ -1249,15 +1258,26 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
 
 #[async_trait::async_trait]
 impl Output for SyslogOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let stats = self.encoder.encode_into(batch, &mut self.messages);
-        report_encode_stats(&self.telemetry, &stats);
+        let (first, stats) =
+            self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.messages));
+        if first {
+            report_encode_stats(&self.telemetry, &stats);
+        }
         if self.messages.is_empty() {
             // Every event was skipped or dropped: nothing to write.
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.messages.total_bytes() as f64, &[]);
+        if first {
+            let bytes = self.messages.total_bytes() as f64;
+            self.telemetry.count("logit.output.batch.bytes", bytes, &[]);
+        }
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let result = match &mut self.conn {
             // One datagram per message, never packed, which would depend on the receiver
@@ -1269,8 +1289,12 @@ impl Output for SyslogOutput {
                     cap: MAX_UDP_PAYLOAD_BYTES,
                     framing: Framing::OnePerEntry,
                 };
-                let mut report =
-                    Report { sink: "syslog_out", diag: &mut self.diag, telemetry: &self.telemetry };
+                let mut report = Report {
+                    sink: "syslog_out",
+                    diag: &mut self.diag,
+                    telemetry: &self.telemetry,
+                    count_local_drops: first,
+                };
                 let (sent, result) =
                     udp.send(&self.endpoint, batch, &mut self.frame_buf, &mut report).await;
                 // What reached the kernel, even when the batch then failed.
@@ -1294,6 +1318,9 @@ impl Output for SyslogOutput {
             }
         };
         drop(request_timer);
+        if result.is_ok() {
+            self.accounting.delivered();
+        }
         result
     }
 

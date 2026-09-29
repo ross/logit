@@ -50,10 +50,11 @@
 //! redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE it carries, as a statsd `|c`
 //! would.
 
+use crate::accounting::BatchAccounting;
 use crate::count_request;
 use crate::datagram::{Datagrams, Framing, Report, UdpDest};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::Output;
+use logit_pipeline::{BatchContext, Output};
 use logit_proto::collectd::{CollectdEncoder, DEFAULT_MAX_PACKET_BYTES};
 use logit_proto::{FramedEncoder, MessageBuf};
 
@@ -68,8 +69,11 @@ pub struct CollectdOutput {
     buf: MessageBuf<usize>,
     /// Handed to the shared datagram path, which only clears it: each entry is already a datagram.
     packet_buf: Vec<u8>,
+    /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
+    /// warnings. The encoder holds views gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl CollectdOutput {
@@ -88,18 +92,19 @@ impl CollectdOutput {
             packet_buf: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         })
     }
 
-    /// Installs `encoder` with this sink's cap, diagnostics, and telemetry re-applied, so builder
-    /// order doesn't matter. A bare assignment would revert a prior `with_max_packet_bytes` to the
+    /// Installs `encoder` with this sink's cap and its diagnostics and telemetry (gated)
+    /// re-applied, so builder order doesn't matter. A bare assignment would revert a prior `with_max_packet_bytes` to the
     /// encoder's uncapped default (every datagram then fails `EMSGSIZE` while counting
     /// `requests{class="ok"}`) and drop both handles, silencing the codec's own counters.
     pub fn with_encoder(mut self, encoder: CollectdEncoder) -> Self {
         self.encoder = encoder
             .with_max_packet_bytes(self.max_packet_bytes)
-            .with_diagnostics(self.diag.clone())
-            .with_telemetry(self.telemetry.clone());
+            .with_diagnostics(self.diag.gated(self.accounting.gate()))
+            .with_telemetry(self.telemetry.gated(self.accounting.gate()));
         self
     }
 
@@ -110,19 +115,19 @@ impl CollectdOutput {
         self
     }
 
-    /// Shared with the encoder, so the sink's `oversize_datagram` and the codec's `no_host` etc.
-    /// report under one component id.
+    /// Shared with the encoder, gated by this sink's batch accounting, so the sink's
+    /// `oversize_datagram` and the codec's `no_host` etc. report under one component id.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
+        self.diag = diag;
         self
     }
 
-    /// Shared with the encoder, which emits its own `logit.output.*` counters directly rather than
-    /// leaving them to the sink as `StatsdOutput`'s encoder does.
+    /// Shared with the encoder, gated by this sink's batch accounting. The encoder emits its own
+    /// `logit.output.*` counters rather than leaving them to the sink as `StatsdOutput`'s does.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.encoder = self.encoder.with_telemetry(telemetry);
+        self.encoder = self.encoder.with_telemetry(telemetry.gated(self.accounting.gate()));
+        self.telemetry = telemetry;
         self
     }
 }
@@ -131,15 +136,23 @@ impl CollectdOutput {
 /// `send_to`, so the trait's no-op is right.
 #[async_trait::async_trait]
 impl Output for CollectdOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // `Stats` discarded: the encoder already reported them through its own handles.
-        self.encoder.encode_into(batch, &mut self.buf);
+        // `Stats` discarded: the encoder already reported them through its own gated handles.
+        let (first, _stats) =
+            self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.buf));
 
         if self.buf.is_empty() {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", self.buf.total_bytes() as f64, &[]);
+        }
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         // The encoder chose every datagram boundary, so each entry goes out as it is.
         let datagrams = Datagrams {
@@ -148,8 +161,12 @@ impl Output for CollectdOutput {
             cap: self.max_packet_bytes,
             framing: Framing::OnePerEntry,
         };
-        let mut report =
-            Report { sink: "collectd_out", diag: &mut self.diag, telemetry: &self.telemetry };
+        let mut report = Report {
+            sink: "collectd_out",
+            diag: &mut self.diag,
+            telemetry: &self.telemetry,
+            count_local_drops: first,
+        };
         let (sent, result) =
             self.udp.send(&self.endpoint, datagrams, &mut self.packet_buf, &mut report).await;
         drop(request_timer);
@@ -159,6 +176,9 @@ impl Output for CollectdOutput {
         self.telemetry.count("logit.output.messages", sent.weight as f64, &[]);
         self.telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
         count_request(&self.telemetry, &result);
+        if result.is_ok() {
+            self.accounting.delivered();
+        }
         result
     }
 

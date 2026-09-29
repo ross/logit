@@ -14,6 +14,7 @@
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
 use crate::Output;
 use anyhow::Context;
@@ -22,7 +23,7 @@ use logit_core::interner::resolve;
 use logit_core::{
     DdSketch, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
 };
-use logit_pipeline::Fault;
+use logit_pipeline::{BatchContext, Fault};
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
 // `write!` into a `String`: formats straight into the output buffer, no `String` per number
@@ -52,8 +53,10 @@ pub struct InfluxDbOutput {
     /// attempt, so there's no retry budget to clamp it against.
     request_timeout: Duration,
     /// Layer-3 detail (`docs/design/internal-telemetry.md`): the response class, which
-    /// `run_output`'s `logit.component.send.*` can't see inside one `send`.
+    /// `run_output`'s `logit.component.send.*` can't see inside one `send`. Ungated; the encoder's
+    /// diagnostics are gated by `accounting` (`crate::accounting`).
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl InfluxDbOutput {
@@ -67,6 +70,7 @@ impl InfluxDbOutput {
             encoder: InfluxLineEncoder::default(),
             request_timeout: DEFAULT_TIMEOUT,
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         }
     }
 
@@ -77,10 +81,11 @@ impl InfluxDbOutput {
         self
     }
 
-    /// Attaches the encoder's diagnostics handle (per-metric encode failures). Retry diagnostics
-    /// come from `logit-pipeline`'s writer, not this sink.
+    /// Attaches the encoder's diagnostics handle (per-metric encode failures), gated by this
+    /// sink's batch accounting. Retry diagnostics come from `logit-pipeline`'s writer, not this
+    /// sink.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
         self
     }
 
@@ -113,15 +118,21 @@ fn build_client(timeout: Duration) -> reqwest::Client {
 
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     /// One attempt per call, no loop or sleep: retry timing and budget belong to
     /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
     /// outcome and attaches it as `.context(fault)`.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let body = self.encoder.encode(batch)?;
+        let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
+        let body = body?;
         // Before the empty-body return: a batch whose every line was unencodable still normalized
         // its tags, and an operator chasing a missing tag value needs to see that. Guarded so an
         // ordinary batch doesn't upsert a permanent zero series.
-        if self.encoder.multi_value_tags > 0 {
+        if first && self.encoder.multi_value_tags > 0 {
             self.telemetry.count(
                 "logit.output.tags.normalized",
                 self.encoder.multi_value_tags as f64,
@@ -134,7 +145,9 @@ impl Output for InfluxDbOutput {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", body.len() as f64, &[]);
+        }
 
         let write_url = format!("{}/api/v2/write", self.url.trim_end_matches('/'));
 
@@ -162,6 +175,7 @@ impl Output for InfluxDbOutput {
                     1.0,
                     &[("class", status_class(resp.status()))],
                 );
+                self.accounting.delivered();
                 Ok(())
             }
             Ok(resp) => {

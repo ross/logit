@@ -316,6 +316,7 @@
 //! `key_str.starts_with("statsd.")` check in [`build_tag_suffix`] keeps them out of every line's
 //! `|#k:v,...` segment.
 
+use crate::accounting::BatchAccounting;
 use crate::count_request;
 use crate::datagram::{
     send_datagrams, DatagramDest, Datagrams, Framing, Report, Sent, UdpDest, UnixDest, UnixSocket,
@@ -329,6 +330,7 @@ use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
     Value,
 };
+use logit_pipeline::BatchContext;
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1563,8 +1565,11 @@ pub struct StatsdOutput {
     /// TCP only. `Some` exactly when a `tls:` block was configured (presence turns TLS on). Built
     /// once by [`StatsdOutput::with_tls`] and shared by every connect.
     tls: Option<TlsTarget>,
+    /// Ungated: the transport's counts, the `oversize_datagram` drops, and the sink's own
+    /// warnings. The encoder holds a view gated by `accounting` (`crate::accounting`).
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl StatsdOutput {
@@ -1604,6 +1609,7 @@ impl StatsdOutput {
             tls: None,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            accounting: BatchAccounting::default(),
         }
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
@@ -1619,9 +1625,12 @@ impl StatsdOutput {
         }
     }
 
-    /// Installs `encoder`, overriding its line cap with this sink's, whatever the builder order.
+    /// Installs `encoder`, overriding its line cap and diagnostics with this sink's (gated),
+    /// whatever the builder order.
     pub fn with_encoder(mut self, encoder: StatsdEncoder) -> Self {
-        self.encoder = encoder.with_max_packet_bytes(self.encoder_cap());
+        self.encoder = encoder
+            .with_max_packet_bytes(self.encoder_cap())
+            .with_diagnostics(self.diag.gated(self.accounting.gate()));
         self
     }
 
@@ -1676,9 +1685,10 @@ impl StatsdOutput {
         Ok(self)
     }
 
+    /// The encoder gets a view gated by this sink's batch accounting.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.encoder = self.encoder.with_diagnostics(diag.gated(self.accounting.gate()));
+        self.diag = diag;
         self
     }
 
@@ -1688,87 +1698,102 @@ impl StatsdOutput {
     }
 }
 
+/// Counts one `encode_into` call's [`EncodeStats`].
+fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
+    telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_gauge_delta as f64,
+        &[("reason", "unresolved_gauge_delta")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_unsupported_kind as f64,
+        &[("reason", "unsupported_kind")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_no_recorded_value as f64,
+        &[("reason", "no_recorded_value")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_unencodable_value as f64,
+        &[("reason", "unencodable_value")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_empty_name as f64,
+        &[("reason", "empty_name")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_oversize_line as f64,
+        &[("reason", "oversize_line")],
+    );
+    telemetry.count(
+        "logit.output.tags.dropped",
+        stats.tags_dropped_dialect as f64,
+        &[("reason", "dialect")],
+    );
+    telemetry.count(
+        "logit.output.tags.dropped",
+        stats.tags_dropped_unrepresentable as f64,
+        &[("reason", "unrepresentable")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_dialect_fields as f64,
+        &[("reason", "dialect_field")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_dialect_events as f64,
+        &[("reason", "dialect_event")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_invalid_service_check as f64,
+        &[("reason", "invalid_service_check")],
+    );
+    telemetry.count(
+        "logit.output.messages.dropped",
+        stats.dropped_invalid_event_fields as f64,
+        &[("reason", "invalid_event_field")],
+    );
+    telemetry.count(
+        "logit.output.messages.normalized",
+        stats.type_normalized_dialect as f64,
+        &[("reason", "dialect")],
+    );
+    telemetry.count(
+        "logit.output.messages.normalized",
+        stats.members_sanitized as f64,
+        &[("reason", "member_sanitized")],
+    );
+}
+
 #[async_trait::async_trait]
 impl Output for StatsdOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let stats = self.encoder.encode_into(batch, &mut self.lines);
-        self.telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_gauge_delta as f64,
-            &[("reason", "unresolved_gauge_delta")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_unsupported_kind as f64,
-            &[("reason", "unsupported_kind")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_no_recorded_value as f64,
-            &[("reason", "no_recorded_value")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_unencodable_value as f64,
-            &[("reason", "unencodable_value")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_empty_name as f64,
-            &[("reason", "empty_name")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_oversize_line as f64,
-            &[("reason", "oversize_line")],
-        );
-        self.telemetry.count(
-            "logit.output.tags.dropped",
-            stats.tags_dropped_dialect as f64,
-            &[("reason", "dialect")],
-        );
-        self.telemetry.count(
-            "logit.output.tags.dropped",
-            stats.tags_dropped_unrepresentable as f64,
-            &[("reason", "unrepresentable")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_dialect_fields as f64,
-            &[("reason", "dialect_field")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_dialect_events as f64,
-            &[("reason", "dialect_event")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_invalid_service_check as f64,
-            &[("reason", "invalid_service_check")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.dropped",
-            stats.dropped_invalid_event_fields as f64,
-            &[("reason", "invalid_event_field")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.normalized",
-            stats.type_normalized_dialect as f64,
-            &[("reason", "dialect")],
-        );
-        self.telemetry.count(
-            "logit.output.messages.normalized",
-            stats.members_sanitized as f64,
-            &[("reason", "member_sanitized")],
-        );
+        let (first, stats) =
+            self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.lines));
+        if first {
+            report_encode_stats(&self.telemetry, &stats);
+        }
 
         if self.lines.is_empty() {
             return Ok(());
         }
 
-        self.telemetry.count("logit.output.batch.bytes", self.lines.total_bytes() as f64, &[]);
+        if first {
+            self.telemetry.count("logit.output.batch.bytes", self.lines.total_bytes() as f64, &[]);
+        }
         let request_timer = self.telemetry.timer("logit.output.request.duration");
         let batch = Datagrams {
             entries: &self.lines,
@@ -1776,8 +1801,12 @@ impl Output for StatsdOutput {
             cap: self.max_packet_bytes,
             framing: Framing::Packed,
         };
-        let mut report =
-            Report { sink: "statsd_out", diag: &mut self.diag, telemetry: &self.telemetry };
+        let mut report = Report {
+            sink: "statsd_out",
+            diag: &mut self.diag,
+            telemetry: &self.telemetry,
+            count_local_drops: first,
+        };
         let result = match &mut self.conn {
             Conn::Udp(udp) => {
                 let (sent, result) =
@@ -1825,6 +1854,9 @@ impl Output for StatsdOutput {
             }
         };
         drop(request_timer);
+        if result.is_ok() {
+            self.accounting.delivered();
+        }
         result
     }
 

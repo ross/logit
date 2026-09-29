@@ -3,6 +3,7 @@
 //! The trait lives in `logit-pipeline`, not here, so the runtime never depends on a concrete
 //! protocol (`docs/design/pipeline-graph.md`'s "Crate layout").
 
+mod accounting;
 mod attrs;
 pub mod collectd;
 pub mod datadog;
