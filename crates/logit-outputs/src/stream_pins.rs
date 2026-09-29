@@ -62,11 +62,12 @@ async fn a_tls_write_returns_ok_with_ciphertext_still_queued_in_the_session() {
     .await;
 }
 
-/// tokio-rustls `common/mod.rs`, `Stream::poll_fill_buf`: a read calls `read_io` and never
-/// `write_io`. A reader waiting for a reply doesn't push out an unflushed request, even with room
-/// in the socket for it.
+/// tokio-rustls `common/mod.rs`, `Stream::poll_fill_buf` and `Stream::read_io`: a read that
+/// processes its records cleanly calls only `read_io`, so a reader waiting for a reply doesn't
+/// push out an unflushed request, even with room in the socket for it. The exception, a read that
+/// fails on a bad record, is pinned by the next test.
 #[tokio::test]
-async fn a_tls_read_never_drives_queued_ciphertext_to_the_socket() {
+async fn a_tls_read_that_succeeds_leaves_queued_ciphertext_queued() {
     unconstrained(async {
         let ((client_io, client_tap), (server_io, server_tap)) = tapped_duplex(CAPACITY);
         let (mut client, mut server) = tls_pair(client_io, server_io).await;
@@ -86,6 +87,41 @@ async fn a_tls_read_never_drives_queued_ciphertext_to_the_socket() {
         assert_eq!(client_tap.written(), written, "a read moved queued ciphertext");
         assert!(drain_available(&mut server).await.is_empty());
         assert!(client.get_ref().1.wants_write(), "the queued ciphertext is still queued");
+    })
+    .await;
+}
+
+/// tokio-rustls `common/mod.rs`, `Stream::read_io`: when `process_new_packets` fails, the
+/// `map_err` closure makes one last-gasp `write_io` for the alert before returning
+/// `InvalidData`. rustls's `write_tls` drains the send queue from the front, so queued
+/// application ciphertext reaches the socket ahead of the alert.
+#[tokio::test]
+async fn a_tls_read_failing_on_a_bad_record_sends_queued_ciphertext() {
+    unconstrained(async {
+        let ((client_io, client_tap), (server_io, _)) = tapped_duplex(CAPACITY);
+        let (mut client, mut server) = tls_pair(client_io, server_io).await;
+        let payload = payload(100_000);
+        let n = client.write(&payload).await.expect("the session accepts plaintext");
+        assert_eq!(n, RUSTLS_BUFFER_LIMIT, "ciphertext is queued in the session");
+        let written = client_tap.written();
+        // The server takes everything on the pipe, so the client's direction has room again.
+        drain_available(&mut server).await;
+
+        // An application-data record header and a body no key decrypts, written raw toward the
+        // client, around the server's session.
+        let mut bad_record = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+        bad_record.extend_from_slice(&[0xAB; 32]);
+        server.get_mut().0.write_all(&bad_record).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let read = read_once(&mut client, &mut buf).await;
+        let Poll::Ready(Err(err)) = read else { panic!("expected a failed read, got {read:?}") };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let after = client_tap.written();
+        assert!(
+            after > written,
+            "the failed read wrote nothing ({written} bytes before and after)"
+        );
     })
     .await;
 }
