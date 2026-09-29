@@ -1,5 +1,8 @@
 //! Receivers that sink tests send to: a TCP, TLS, or UDP collector that reports each message on
-//! a channel, and the `testdata/tls` fixtures a TLS collector and client are built from. Also the
+//! a channel, [`http_recorder`] for the HTTP sinks, which records each request and answers it by
+//! its index, and the `testdata/tls` fixtures a TLS collector and client are built from. The
+//! attempt-accounting helpers run a sink through the real write loop and compare its counters;
+//! [`HUNG_REQUEST_BUDGET`] is the retry budget for an HTTP request that never answers. Also the
 //! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
 //! [`ScriptedDial`] for the fresh connections `crate::stream`'s driver dials, and [`tls_pair`]
 //! with [`TapIo`] for tests that need real tokio-rustls behavior. [`ScriptedDest`] is the datagram
