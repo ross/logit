@@ -60,7 +60,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
-| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | Partly done (sink/w5, #454): confirmed for every sink. `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, and `influxdb_out` count encode-side counters once per batch through a gate `observe_batch` arms; `stdio_out`/`file_out` count after the write. The HTTP sinks, and `datadog_out`'s per-attempt clock, are `sink/w6`'s. Server-verdict and kernel drops still repeat per attempt |
+| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | Partly done (sink/w5, #454): confirmed for every sink. `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, and `influxdb_out` count encode-side counters once per batch through a gate `observe_batch` arms; `stdio_out`/`file_out` count after the write. `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out` follow (sink/w6). The two Datadog sinks, and `datadog_out`'s per-attempt clock, are `sink/w7`'s. Server-verdict and kernel drops still repeat per attempt |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
 | 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
@@ -126,7 +126,7 @@ Entries that share a mechanism and should be verified together, in suggested ord
    manual `logrotate` run
    ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
-6. **Sink send path (in progress: `sink/w0`–`w7`)** — SINK-01..06, WIRE-08/09, RT-05. One shared
+6. **Sink send path (in progress: `sink/w0`–`w8`)** — SINK-01..06, WIRE-08/09, RT-05. One shared
    pooled-stream driver and datagram packer for the copied send paths, fault injection against
    them and against real TLS pairs (RST mid-write, blackhole, a stalled handshake, a partial
    record under a `Pending` poll), and attempt accounting that counts encode-side drops once per
@@ -311,7 +311,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
-| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w6) |
+| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w7) |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
@@ -7117,7 +7117,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     ~~No test appears to cover cancellation mid-`write_all`. Medium confidence.~~ **Resolved
     (sink/w2, #451):** covered by
     `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`. The
-    truncated line at the peer stands: the cancellation is the runtime's, and `sink/w6` records
+    truncated line at the peer stands: the cancellation is the runtime's, and `sink/w8` records
     it in `docs/design/pipeline-graph.md`'s "Cancellation points".
   - The reused-connection probe costs one extra `poll_read` per batch on the hot path; cheap, but
     it is per-`send`, not per-idle-period. Low concern.
@@ -7630,9 +7630,26 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     `EMSGSIZE` does under the same reason.
   - The cancelled-attempt asymmetry stays as documented: a cancelled attempt's encode-side counts
     stand (the batch's one count), and it counts no `requests`.
-  - Still open, `sink/w6`: `otlp_out`, `prometheus_out`'s remote-write mode, `datadog_out`,
-    `datadog_trace_out`, and `splunk_hec_out` count their encode-side counters per attempt
-    (`docs/known-gaps.md`), and `datadog_out` reads its clock per attempt.
+- **Verified (sink/w6), `otlp_out`, `prometheus_out`'s remote-write mode, and
+  `splunk_hec_out`:** findings. The inflation was real in all three: before the fix, a batch
+  delivered on its second attempt read every codec counter and diagnostic twice
+  (`metrics.skipped`, the `gauge_delta_unresolved` and `delta_temporality_unresolved`
+  diagnostics, `splunk_hec_out`'s `blank_event` and `max_body_bytes` oversize drop). Each now runs
+  its whole encode as unit 0 of a `BatchAccounting`, with its encoder on gated views built in one
+  encoder-building function its constructor and builders call (ADR decision 14).
+  - `PrometheusOutput`, the enum `build_spec` boxes, didn't forward `observe_batch`, so a gate on
+    the remote-write mode would never have armed in a running pipeline, while a test driving
+    `RemoteWriteOutput` directly passed. It forwards it now, and the retry test drives the enum.
+    No other `Output` wrapper delegates.
+  - `splunk_hec_out` counted `request.bytes` for a request whose connection was refused, on
+    `/event` and on every refused `/ack` poll. It counts only an answered request or one that
+    failed after it may have left.
+  - Tests per sink through `drive_write_loop`: a retry against a single-attempt run with the
+    request bodies compared, a verdict on a repeat attempt counted, a second batch, a batch after
+    one the budget cut off, direct sends after a batch that sent nothing, every builder order
+    after decoy handles, and a sink with no handle builders.
+  - Still open, `sink/w7`: `datadog_out` and `datadog_trace_out` count their encode-side counters
+    per attempt (`docs/known-gaps.md`), and `datadog_out` reads its clock per attempt.
 
 ---
 

@@ -1470,19 +1470,24 @@ The datagram sinks count an oversize drop at one of two points, and in each sink
 A sink counter falls in one of three classes
 ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
 decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `influxdb_out`,
-`stdio_out`, and `file_out`:
+`stdio_out`, `file_out`, `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out`:
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out` and `collectd_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`); `file.rotations`; and every `logit.component.diagnostics` count an encoder emits |
-| Transport | once per attempt | `requests`, `request.duration`, `reconnects`, and what the attempt sent: `messages`, `datagrams`, `datapoints` |
-| Kernel verdict and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, and `splunk_hec_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`, `labels.dropped`, `labels.normalized`, `spans.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `file.rotations`; and every `logit.component.diagnostics` count an encoder emits |
+| Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `otlp_out`'s `records.rejected`; and the diagnostics a verdict raises (`remote_write_rejected`, `otlp_partial_success`, `invalid_event`, `token_rejected`, `request_rejected`, `ack_unsupported`, `ack_timeout`, and `oversize` for Splunk Cloud's answer) |
 
-The five sinks with encoders count the first class through a gate `Output::observe_batch` arms
+The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
-delivered the batch. A caller that sends without `observe_batch` counts every `send`. The HTTP
-sinks (`otlp_out`, `prometheus_out`'s remote-write, `datadog_out`, `datadog_trace_out`,
-`splunk_hec_out`) still count their encode-side counters once per attempt (`docs/known-gaps.md`).
+delivered the batch. A caller that sends without `observe_batch` counts every `send`.
+`prometheus_out`'s registry mode has no gate: its `send` never fails, so nothing repeats.
+`datadog_out` and `datadog_trace_out` still count their encode-side counters once per attempt
+(`docs/known-gaps.md`).
+
+`splunk_hec_out`'s `records.dropped{reason="oversize"}` mixes two classes: an object over
+`max_body_bytes` is dropped before any request and counts once per batch, and a lone object Splunk
+Cloud answered as over its cap counts on each attempt that gets that answer.
 
 `oversize_datagram` counts per attempt for both of its causes, the kernel's `EMSGSIZE` and the
 packer's skip of an entry over the cap (a backstop no encoder reaches), so a batch retried after a
@@ -1688,7 +1693,8 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   shared `gauge_delta_unresolved`.
 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
-attempt.
+attempt. The encoder's counters and diagnostics count once per batch; `requests`,
+`records.rejected`, and `otlp_partial_success` once per attempt (the class table above).
 
 ##### `datadog_out`
 
@@ -1747,9 +1753,9 @@ quoting 256 bytes of the body), `oversize` (a trace or stats group dropped for i
 |---|---|---|
 | `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
 | `logit.output.request.duration{route}` | timing | one per request |
-| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression, for a request that got an answer or failed after it may have left (a timeout); a refused connection counts none |
 | `logit.output.records` | count | records in a body Splunk accepted: one per log or span object, one per `metric_name:` field; also the records ahead of an object a `400` code 6 named, which are assumed indexed |
-| `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent |
+| `logit.output.records.dropped{reason="oversize"}` | count | an object larger than `max_body_bytes` alone, never sent, once per batch; or a lone object Splunk Cloud answered as over its cap (`400` code 6 at object 0 of a body over 5 MiB), on each attempt that gets that answer |
 | `logit.output.records.dropped{reason="invalid_event"}` | count | the object a `400` code 6 named, dropped before the rest of its body is resent once |
 | `logit.output.requests.rejected{code}` | count | one per `/event` request answered with a non-retryable status: `code` is the body's HEC code when Splunk documents it (`4` for an invalid token, `6` for invalid data, …), else `other` |
 | `logit.output.acks{result}` | count | under `ack: true`, one per `/event` request: `acked`, `timeout` (still unacknowledged at `ack_timeout`, which fails the batch as ambiguous), or `unsupported` (a `200` with no `ackId`, or a poll answered `400` code 14: the token doesn't acknowledge, and the request counts as delivered) |
@@ -1762,8 +1768,11 @@ submodules, under this component's id, and this sink doesn't repeat them.
 
 `Diagnostics` keys, each throttled: `token_rejected` (a `401` or `403`), `request_rejected` (any
 other non-retryable `4xx` or `3xx`, quoting 256 bytes of the body), `invalid_event` (an object
-dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsupported`, and
-`ack_timeout`. The token never appears in any of them.
+dropped on a code 6), `oversize` (an object dropped for its size, or a body split on Splunk
+Cloud's oversize answer), `ack_unsupported`, and `ack_timeout`. The token never appears in any of
+them. The class table above says which count once per batch: the codec's counters, and the
+`max_body_bytes` drop with its `oversize` diagnostic; everything Splunk's answer decides counts per
+attempt.
 
 ##### `logit_out`
 
@@ -1830,8 +1839,9 @@ dropped on a code 6), `oversize` (an object dropped for its size), `ack_unsuppor
 A batch that produces no series issues no request and reports none of the three.
 
 **The codec's `PrometheusEncoder` counts in both modes.** In registry mode it's shared by `send`
-and render, so both total under one component; in sender mode it's a plain field with one
-direction.
+and render, so both total under one component, and counts on every `send` and every render; in
+sender mode it's a plain field with one direction, and counts once per batch however many attempts
+it takes (the class table above).
 
 - `logit.output.metrics.skipped{metric_kind="delta_sum"|"delta_histogram"|"gauge_delta"|
   "exponential_histogram"}` and `{reason="no_recorded_value"|"type_conflict"|"name_collision"}`.
@@ -1861,9 +1871,9 @@ Some reasons exist only on one path:
 `Diagnostics` keys: `delta_temporality_unresolved` (both delta arms, naming the `aggregate` with
 `temporality: cumulative` fix); the shared `gauge_delta_unresolved` key `influxdb_out`/`statsd_out`
 use; `prometheus_exponential_histogram_skipped`; `prometheus_accept_failed` from the
-registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx in sender mode,
-carrying the status and the first 256 bytes of the response body, read bounded rather than read
-whole and then trimmed.
+registry-mode listener's accept loop; and `remote_write_rejected`, one per non-2xx answer in
+sender mode, a `503` that is retried included, carrying the status and the first 256 bytes of the
+response body, read bounded rather than read whole and then trimmed.
 
 Retry is layer 2 in both modes: in registry mode `send` is an in-memory upsert with nothing to
 retry, and in sender mode one `send` is one attempt by design, with `write_loop` owning the retry.

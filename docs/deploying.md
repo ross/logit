@@ -289,13 +289,15 @@ buffering:
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 - **A retried batch doesn't inflate a sink's drop counters.** On `statsd_out`, `syslog_out`,
-  `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, and `file_out`, what the encoder
-  decided (`logit.output.messages.dropped`, `tags.dropped`, `*.normalized`, `batch.bytes`, and
-  their diagnostics) counts once per batch, however many attempts it took. What an attempt did
-  (`logit.output.requests`, `reconnects`, `messages`) counts per attempt, and so does a datagram the
-  kernel refused (`oversize_datagram`). The HTTP sinks still count their encode-side drops once per
-  attempt, so on an unhealthy `otlp_out`, `prometheus_out` in remote-write mode, `datadog_out`,
-  `datadog_trace_out`, or `splunk_hec_out` those counters grow with retries
+  `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, `file_out`, `otlp_out`,
+  `prometheus_out` in remote-write mode, and `splunk_hec_out`, what the encoder decided
+  (`logit.output.messages.dropped`, `metrics.skipped`, `tags.dropped`, `*.normalized`,
+  `batch.bytes`, and their diagnostics) counts once per batch, however many attempts it took. What
+  an attempt did (`logit.output.requests`, `request.bytes`, `reconnects`, `messages`) counts per
+  attempt, and so does a drop a kernel or a destination decided: a datagram refused as too large
+  (`oversize_datagram`), a Splunk code 6 or Splunk Cloud's oversize answer, an OTLP partial success.
+  `datadog_out` and `datadog_trace_out` still count their encode-side drops once per attempt, so on
+  an unhealthy one those counters grow with retries
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
 

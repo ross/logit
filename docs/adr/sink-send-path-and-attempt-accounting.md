@@ -356,6 +356,23 @@ nature. The encode-side counters are the only ones that measure the batch and no
     policy tracks, rotating the next file early. `logit.output.file.rotations` counts a rotation
     whose commit-point rename landed even when the re-open after it fails
     (`FileTarget::awaiting_reopen`). `StreamOutput` needs no gate: its encoders count nothing.
+14. **Three rules keep decision 2 whole across builders, wrappers, and the transport counters**
+    (added by `sink/w6`).
+    - **A type that implements `Output` by delegating to another forwards `observe_batch`.** The
+      trait's default is a no-op, so a wrapper that forwards `send` and not `observe_batch` leaves
+      the inner sink's gate unarmed on every batch, and a test that drives the inner sink directly
+      still passes. `PrometheusOutput`, the enum `build_spec` boxes for `prometheus_out`, was such
+      a wrapper.
+    - **The gate is installed where the encoder is built, and the constructor builds it there
+      too.** Each sink has one function that builds its encoder on gated views of its current
+      handles, and its constructor and every builder that replaces a handle or rebuilds the
+      encoder call it. A sink built with no handle builders, or with them in any order, has an
+      encoder on gated views of its last handles, and the constructor gives the sink and the
+      encoder one `Diagnostics`, so both share one throttle.
+    - **`logit.output.request.bytes` counts the bytes of a request that was sent.** A request
+      that got an answer counts, and so does one that failed in a way that may have sent it (a
+      timeout, a reset); one that failed `Fault::Clean` never connected and counts nothing. It
+      stays a transport counter, once per attempt that sends.
 
 ## Alternatives considered
 
@@ -453,6 +470,8 @@ nature. The encode-side counters are the only ones that measure the batch and no
   unhealthy stop growing by the attempt count. A server-verdict drop still grows with retries,
   and decision 1 says so.
 - `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
+- `logit.output.request.bytes` no longer counts a request whose connection was refused, so on a
+  sink whose destination is down it stops growing while `requests{class="network_error"}` does.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
 - Left open for later workstreams: the HTTP sinks' `requests` vocabulary.
@@ -759,7 +778,8 @@ graphite:: collectd:: graph::`.
 
 `sink/w5` lands decisions 1 and 2 for `statsd_out`, `syslog_out`, `graphite_out`,
 `collectd_out`, and `influxdb_out`, decision 13 for `stdio_out` and `file_out`, and decision 10's
-graph rule. The multi-request HTTP sinks wait for `sink/w6`.
+graph rule. `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out` follow in
+`sink/w6`, and `datadog_out` and `datadog_trace_out` in `sink/w7`.
 
 - **The gate.** `CountGate`, `Telemetry::gated`/`is_muted`, and `Diagnostics::gated` in
   `logit-core`; `BatchAccounting` in `crates/logit-outputs/src/accounting.rs`. The five sinks
@@ -808,14 +828,86 @@ graph rule. The multi-request HTTP sinks wait for `sink/w6`.
 Run them with `script/test -p logit-core -p logit-outputs -p logit-pipeline accounting:: telemetry::
 diag:: retry_counts stdio:: datagram:: runtime::tests graph::tests::a_sinks_buffer`.
 
-### `sink/w6`: the multi-request HTTP sinks
+### `sink/w6`: `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out`
 
-`sink/w6` lands decisions 2 and 3 for `otlp_out`, `prometheus_out`'s remote-write mode,
-`datadog_out`, `datadog_trace_out`, and `splunk_hec_out`: per-route units and `split_encode`'s
-bisection for the two Datadog sinks, and `datadog_out`'s per-batch `now`.
+`sink/w6` lands decision 2 for the three HTTP sinks that encode a batch in one piece, and decision
+14. Each is `influxdb_out`'s shape: one unit, the whole encode.
 
-### `sink/w7`: close-out
+- **The delegation gap.** `PrometheusOutput` forwarded `bind`, `send`, `flush`, and
+  `duplicate_safe` to its mode but not `observe_batch`, and `build_spec` boxes the enum, so a gate
+  on `RemoteWriteOutput` would never have armed in a running pipeline. It forwards
+  `observe_batch` to both modes now; `ExposeOutput` keeps the trait's no-op. No other type in
+  `logit-outputs` or `logit-pipeline` implements `Output` by delegation.
+- **The encode.** Each sink holds a `BatchAccounting`, arms it in `observe_batch`, and its `send`
+  wraps an inherent `attempt` through `BatchAccounting::finish`, so every `Ok`, a batch that sent
+  nothing included, disarms. Unit 0 is `RemoteWriteOutput::attempt`'s partition,
+  `events_to_families`, `encode_counted`, and compression; `OtlpOutput::attempt`'s
+  `encode_signals`, which encodes every signal before the first request, on HTTP and gRPC alike;
+  and `SplunkHecOutput::attempt`'s `encode_objects`. Each `attempt` is the old `send`, in the same
+  order, with the same early returns and fault classification.
+- **The gated handles** (decision 14): `new_sender_encoder` in `prometheus_out`, `new_encoder` in
+  `otlp_out`, and `SplunkHecOutput::new_encoder`, each called by the constructor and by every
+  builder that rebuilds the encoder (`with_diagnostics` and `with_telemetry`, and
+  `with_multi_value` in `splunk_hec_out`). `ExposeOutput` stays ungated: its `send` never fails,
+  and its scrape task counts render-side drops through the same encoder.
+- **`splunk_hec_out`'s `max_body_bytes` drop** is decided in `send_objects` before the first
+  request, so it is encode-side: its `records.dropped{reason="oversize"}` and `oversize`
+  diagnostic are skipped when `encode` reports a repeat.
+- **What stays per attempt, on ungated handles**: `requests` and `request.duration` on all three;
+  `samples` and the `remote_write_rejected` diagnostic, which fires on every non-2xx answer, a
+  retried `503` included; `records.rejected` and `otlp_partial_success`; and everything Splunk's
+  answer decides: `records`, `request.bytes`, `requests.rejected`, `acks`, a code 6's
+  `records.dropped{reason="invalid_event"}` and resend, Splunk Cloud's oversize answer and split,
+  and the `token_rejected`, `request_rejected`, `invalid_event`, and `ack_*` diagnostics. Gating
+  them instead would change nothing (the Alternatives' "Gating the sink's own handles too"): the
+  gate is muted only inside the encode closure, where none of them is counted.
+- **`request.bytes`** (decision 14): `SplunkHecOutput::post` counts it on an answer and on an
+  error that isn't `Fault::Clean`, on the `event` and `ack` routes alike. A refused connection
+  counted 82 bytes for one log before, and a refused `/ack` poll 108.
+- **Test support.** `test_support::assert_counted_once_per_batch` takes a per-sink list of series
+  counted per attempt beyond `requests`, `reconnects`, `component.errors`, and
+  `component.retries`, and refuses one that covers a named encode-side series.
+  `assert_direct_sends_count_after_an_empty_batch` asserts first that its empty batch was
+  delivered and sent nothing, for `sink/w5`'s five sinks as well. `http_recorder` is an HTTP
+  server that records each request and answers it by its index.
+- **Tests**, each shown to fail on a planted bug:
+  - A retry through `drive_write_loop` against a single-attempt run, comparing every series but
+    the per-attempt ones, and asserting that the second request's body is the first's:
+    `prometheus::tests::a_remote_write_retry_counts_encode_side_counters_once` (a `503`, then a
+    `200`, driven through `PrometheusOutput`),
+    `otlp::tests::an_http_retry_counts_encode_side_counters_once` (a `503`, then a `200`
+    carrying a partial success, under `delivery: at_least_once`, since a `503` is `Ambiguous`),
+    `otlp::tests::a_grpc_retry_counts_encode_side_counters_once`
+    (`UNAVAILABLE`, then `OK`), and `splunk::tests::a_hec_retry_counts_encode_side_counters_once`
+    (a `503` code 9, then a `200`, with a blank log, a histogram under `multi_value: skip`, and a
+    log over `max_body_bytes`). Before the fix every encode-side counter and diagnostic read 2
+    where a single attempt read 1.
+  - A verdict on a repeat attempt, counted:
+    `prometheus::tests::a_rejection_on_a_remote_write_retry_is_counted_and_diagnosed` (a `503`,
+    then a `400`) and `splunk::tests::a_code_6_answered_on_a_retry_is_counted` (busy, then code 6,
+    then the resend accepted).
+  - Per sink, a second batch counts again, a batch after one the retry budget cut off counts, and
+    direct sends after a batch that sent nothing count every time (`a_second_*_batch_*`,
+    `*_after_one_dropped_at_its_budget_*`, `*_direct_sends_after_a_batch_that_sent_nothing_*`).
+  - Builder order: `every_*_builder_order_gates_the_encoder_on_the_final_handles` (both orders
+    for `otlp_out` and `prometheus_out`, all six of `splunk_hec_out`'s three builders, each after a
+    first call with other handles that must count nothing), and
+    `*_with_no_handle_builders_*` (a retried batch reports its codec diagnostic once, read from
+    the sink's own throttle).
+  - `prometheus::tests::an_exposition_sink_counts_every_send_and_render_after_observe_batch`.
+  - `request.bytes`: `splunk::tests::a_refused_connection_counts_no_request_bytes`,
+    `a_refused_ack_poll_counts_no_request_bytes`, and
+    `an_answered_or_timed_out_request_counts_its_bytes`.
 
-`sink/w7` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
+Run them with `script/test -p logit-outputs prometheus:: otlp:: splunk::`.
+
+### `sink/w7`: `datadog_out` and `datadog_trace_out`
+
+`sink/w7` lands decisions 2 and 3 and decision 14's `request.bytes` rule for the two Datadog
+sinks: per-route units, `split_encode`'s bisection, and `datadog_out`'s per-batch `now`.
+
+### `sink/w8`: close-out
+
+`sink/w8` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
 `write_all` on the pooled sinks and the datagram loop, updates `docs/known-gaps.md`,
 `docs/design/internal-telemetry.md`, and `docs/deploying.md`, and closes the inventory rows.

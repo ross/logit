@@ -624,14 +624,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 on a UDP socket because a datagram is
   charged and uncharged inside one `sendmsg`, so a send-buffer gauge would be a flat zero. It was
   deliberately not built; `SockMeminfo` carries the field only because the option returns it.
-- **The HTTP sinks count their encode-side counters once per attempt.** `otlp_out`,
-  `prometheus_out`'s remote-write mode, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`
-  re-encode a batch on every attempt and count its drops, normalizations, and diagnostics each
-  time, so on an unhealthy destination those counters grow with the retries. The line, datagram,
-  InfluxDB, and file sinks count them once per batch
+- **The Datadog sinks count their encode-side counters once per attempt.** `datadog_out` and
+  `datadog_trace_out` re-encode a batch on every attempt and count its drops, normalizations, and
+  diagnostics each time, so on an unhealthy destination those counters grow with the retries.
+  Every other sink with an encoder counts them once per batch
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
-  decision 2); `sink/w6` brings the HTTP sinks onto the same gate, with per-route units for the
-  two Datadog sinks and `datadog_out`'s per-batch clock.
+  decision 2); `sink/w7` brings the two Datadog sinks onto the same gate, with per-route units and
+  `datadog_out`'s per-batch clock.
 - **A cancelled datagram send loses the counts of what it already sent.** A UDP sink, or
   `statsd_out` under `transport: unix`, counts `logit.output.messages` and
   `logit.output.datagrams` (and `graphite_out`'s `datapoints`) once `send_datagrams` returns, on
@@ -1683,6 +1682,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
   raced a close; it counts `send_failed` lines but can't force the race.
+- **`otlp_out` reports a connect failure `Clean` after an earlier request of the same batch
+  succeeded.** One `send` is one request per signal, sequentially, and a connect failure is
+  `Fault::Clean` on either transport (`crate::http`'s `classify_reqwest_error` over HTTP,
+  `grpc_roundtrip`'s `is_connect()` over gRPC). `write_loop` retries `Clean` under every delivery
+  posture, and the retry re-sends every signal, the ones already accepted included.
+  - **Consequence:** under the default at-most-once posture, a collector restarted between a
+    mixed batch's traces request and its metrics request gets the traces twice.
+  - **Fix:** `splunk_hec_out`'s rule, as for `datadog_out` in the Datadog section: once a
+    request of the `send` is accepted, a later `Clean` failure is `Fault::Ambiguous`
+    (`crates/logit-outputs/src/splunk.rs`'s `after_delivery`).
 - **An OTLP timestamp past `i64::MAX` saturates to `i64::MAX`.** A wire timestamp
   (`time_unix_nano`, `observed_time_unix_nano`, `start_time_unix_nano`, and the span, span event,
   and exemplar times) past `i64::MAX` nanoseconds decodes as `i64::MAX` through one helper, and
