@@ -128,7 +128,7 @@ impl RotationState {
         false
     }
 
-    /// Records `len` bytes written at `now_unix`, once per `send` after any rotation. Sets
+    /// Records `len` bytes written at `now_unix`, once per `send` after its write succeeded. Sets
     /// `period` if unset: the first write to a new or just-rotated file.
     fn note_written(&mut self, now_unix: i64, len: usize) {
         if self.policy.interval.is_some() && self.period.is_none() {
@@ -239,6 +239,13 @@ impl FileTarget {
             fault_io!(ACTIVE_FLUSH, &self.path, 0, file.flush().await)?;
         }
         Ok(())
+    }
+
+    /// Whether a rotation committed its rename and the re-open after it failed, leaving no open
+    /// handle until [`FileTarget::write_all`] re-opens one. How a caller tells that `Err` from
+    /// [`FileTarget::rotate`] apart from one before the commit point.
+    pub fn awaiting_reopen(&self) -> bool {
+        self.file.is_none()
     }
 
     /// See [`RotationState::should_rotate`].
@@ -964,9 +971,10 @@ mod tests {
         if target.should_rotate(0, bytes.len()) {
             let _ = target.rotate(&mut diag()).await?;
         }
-        target.note_written(0, bytes.len());
         target.write_all(bytes).await?;
-        target.flush().await
+        target.flush().await?;
+        target.note_written(0, bytes.len());
+        Ok(())
     }
 
     /// Ten bytes, so under [`one_line_per_file`] every file holds exactly one line.
