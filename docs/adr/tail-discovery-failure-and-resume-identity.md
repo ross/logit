@@ -443,7 +443,7 @@ dirtying the checkpoint, the rotation count, the head check, the pending-bytes s
 rebind's ownership check, the link-count check) each fail it.
 
 The model found three driver bugs, all fixed here, each with a hand-driven test in `driver.rs`;
-the first and third are also replayed through the harness:
+the first and second are also replayed through the harness:
 
 - **A rebind never checked for truncation.** A file retired by a `stat` that raced a rename, then
   truncated in place (`copytruncate`) and still shorter than its old offset at the scan that

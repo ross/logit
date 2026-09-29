@@ -827,7 +827,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// If `len`, the file's current size, is below the offset already read, the file was
     /// truncated in place: seek to `0` and reset the splitter and decoder. `len` must come from
-    /// the same inode as `id`. Called by `scan` and [`Tailer::on_data_wake`].
+    /// the same inode as `id`. Called by `scan`, [`Tailer::on_data_wake`], and `drain` (through
+    /// [`Tailer::recheck_length`]).
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
