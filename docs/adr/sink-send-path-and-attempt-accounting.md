@@ -660,6 +660,8 @@ Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit
 - **Tests**, each shown to fail on a planted bug:
   - `datagram::tests`: `only_emsgsize_is_a_message_too_large`,
     `pick_addr_takes_the_first_ipv4_address_else_the_first_ipv6_one`,
+    `resolution_selects_the_socket_of_the_chosen_address_family` (never skipped: it binds the IPv6
+    slot, or fails `Clean` naming it on a host with no IPv6),
     `emsgsize_then_a_failure_with_nothing_sent_is_clean`,
     `sent_then_emsgsize_then_a_failure_is_ambiguous`,
     `a_failure_after_two_datagrams_returns_what_the_two_carried`, `one_per_entry_never_packs`,
