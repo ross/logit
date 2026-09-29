@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-13
+updated: 2026-09-29
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -283,3 +283,12 @@ side. The asymmetry this ADR recorded as deliberate no longer holds; see
 (RFC 6587 framing auto-detection, the connection-cap/handshake-timeout accept loop, and why no
 receive queue is needed on this transport) and `docs/known-gaps.md` for the closed/narrowed gap
 entries.
+
+## Amendment: the shared stream driver (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `syslog_out`'s pooled TCP and TLS send onto a driver shared with `statsd_out` and
+`graphite_out`. `logit.output.requests` is tagged `class=ok|clean|ambiguous|permanent` and counts
+connect failures. A TLS server name is parsed at construction, so a bad endpoint fails startup
+instead of retrying to budget exhaustion. Under TLS a write `Err` may follow a record that
+reached the wire, so it is `Ambiguous`. `syslog_out`'s UDP path still sends one datagram per
+message and uses the shared errno helper for an oversize datagram.

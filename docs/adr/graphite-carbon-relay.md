@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-14
+updated: 2026-09-29
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -450,3 +450,11 @@ a `JoinSet` of connection tasks *after* `accept` failed and an idle client would
 that drain forever; its regression test drove a real `accept` failure through
 `libc::shutdown(SHUT_RD)`. The shared driver returns an accept error straight out of its loop with
 nothing to park on, so both the signal and the test are gone rather than ported.
+
+## Amendment: `graphite_out` joins the shared stream driver and datagram packer (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `graphite_out`'s pooled TCP send onto the driver `statsd_out` and `syslog_out` share,
+and its UDP packing onto the packer `statsd_out` shares. `graphite_out` gains the `flush()` after
+each write and `logit.output.reconnects`, and its `logit.output.requests` is tagged
+`class=ok|clean|ambiguous|permanent`. The pickle and plaintext encoders, and `duplicate_safe`, are
+unchanged.

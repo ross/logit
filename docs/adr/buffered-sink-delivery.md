@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-26
+updated: 2026-09-29
 ---
 
 # Buffered, decoupled sink delivery
@@ -309,3 +309,12 @@ rest:
 
 A grace that expires while no send is in flight, such as during a backoff sleep, will leave the
 batch uncommitted under either posture.
+
+## Amendment: attempt accounting (2026-09-29)
+
+This record says `send` is one attempt and the runtime owns retry. [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) adds what that means for
+counters. Encode-side counters count once per batch, through a sink-owned gate that
+`Output::observe_batch` resets, and transport counters count once per attempt. Server-verdict
+drops count per attempt and repeat on a retried batch. `Output::observe_batch` runs once per
+batch, not once per attempt. Zero `retry_budget` and `retry_max_delay` values are rejected at
+config load. `Output` gains no method and no parameter.

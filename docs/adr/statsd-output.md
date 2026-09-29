@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-24
+updated: 2026-09-29
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -748,3 +748,12 @@ A message containing `|` no longer relays byte-for-byte; the substitution joins 
 permitted normalizations. `docs/design/data-model.md`'s `statsd.service_check.message` row carries
 the rule, and [ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md)'s W7a
 amendment records the same finding from the Datadog side.
+
+## Amendment: the shared stream driver and datagram packer (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) moves `statsd_out`'s pooled TCP and Unix stream send onto a driver shared with `syslog_out` and
+`graphite_out`, and its datagram packing onto a packer shared with `graphite_out` and the Unix
+datagram transport. It also changes three behaviors: `logit.output.requests` is tagged
+`class=ok|clean|ambiguous|permanent` and counts connect failures, an over-cap entry is dropped and
+counted `oversize_datagram` before any I/O, and a TLS server name is parsed at construction, so a
+bad endpoint fails startup. A TLS write `Err` is `Ambiguous`.

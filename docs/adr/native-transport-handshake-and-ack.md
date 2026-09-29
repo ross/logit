@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-25
+updated: 2026-09-29
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -217,3 +217,15 @@ saw an EOF, classified it `Fault::Ambiguous`, and dropped the batch at the defau
 **Write-stall accounting.** The bounded writes of the amendment above are counted under
 `logit.proto.errors{reason}`: `ack_write_stalled` for an `Ack` (the connection ends as an error),
 and `reject_write_stalled` for any `Reject` (the write is abandoned and the connection closes).
+
+## Amendment: `logit_out` flushes before it waits, and its write faults are pinned (2026-09-29)
+
+[ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) records three changes to `logit_out`:
+
+- It calls `flush()` after the `Hello` write and after the frame write, before waiting for a
+  reply. Under TLS a write can return with ciphertext still queued, and a reply read doesn't push
+  it out, so an unflushed frame ended in an `Ambiguous` ack timeout.
+- A first-write `Err` stays `Fault::Clean`. The reason changes: bytes of the frame may have
+  reached the wire under TLS, but the peer then holds a truncated frame it can't forward.
+- `logit.output.requests` counts every returned attempt, including connect, handshake, and
+  too-large returns, tagged `class=ok|clean|ambiguous|permanent`.
