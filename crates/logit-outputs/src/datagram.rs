@@ -17,9 +17,9 @@
 //!
 //! An entry longer than `cap` never reaches the kernel. Every encoder caps its entries at the
 //! value its sink passes here, so the branch that drops one, counted like `EMSGSIZE`, is a
-//! backstop that costs one comparison per entry. That drop is encode-side and counts on a batch's
-//! first encode only ([`Report::count_local_drops`]); an `EMSGSIZE` is the kernel's answer to one
-//! attempt and counts on every attempt. Both count under `reason="oversize_datagram"`.
+//! backstop that costs one comparison per entry. It counts on every attempt that reaches it, as an
+//! `EMSGSIZE` does, so a retried batch can count it again but never loses it: a backstop's count
+//! doesn't depend on which attempt reached it.
 //!
 //! [`Sent`] comes back on every exit, so a sink counts what reached the wire before an error as
 //! well as on success. A cancelled send returns nothing, and its counts are lost
@@ -85,15 +85,12 @@ pub(crate) struct Datagrams<'a, M> {
     pub(crate) framing: Framing,
 }
 
-/// Where a send's drops are reported, through the sink's ungated handles.
+/// Where a send's drops are reported, through the sink's ungated handles: both of its drops count
+/// per attempt.
 pub(crate) struct Report<'a> {
     pub(crate) sink: &'static str,
     pub(crate) diag: &'a mut Diagnostics,
     pub(crate) telemetry: &'a Telemetry,
-    /// Whether this is the batch's first encode (`crate::accounting`): an over-cap entry is an
-    /// encode-side drop, counted once per batch, while an `EMSGSIZE` is the kernel's answer to
-    /// this attempt and counts on every one.
-    pub(crate) count_local_drops: bool,
 }
 
 impl Report<'_> {
@@ -123,9 +120,6 @@ pub(crate) async fn send_datagrams<M>(
     for (entry, meta) in batch.entries.iter_with() {
         let weight = (batch.weight)(meta);
         if entry.len() > batch.cap {
-            if !report.count_local_drops {
-                continue;
-            }
             report.oversize(
                 weight,
                 format_args!(
@@ -479,29 +473,16 @@ mod tests {
         Datagrams { entries, weight: |w| *w, cap, framing: Framing::Packed }
     }
 
-    /// Runs one [`send_datagrams`] over `dest` for a batch's first encode, reporting into
-    /// `probe`.
+    /// Runs one [`send_datagrams`] over `dest`, reporting into `probe`.
     async fn send(
         batch: Datagrams<'_, usize>,
         dest: &mut DatagramDest<'_>,
         packet_buf: &mut Vec<u8>,
         probe: &TelemetryProbe,
     ) -> (Sent, anyhow::Result<()>) {
-        send_encoded(batch, dest, packet_buf, probe, true).await
-    }
-
-    /// [`send`], for a first encode or a repeat one (`count_local_drops`).
-    async fn send_encoded(
-        batch: Datagrams<'_, usize>,
-        dest: &mut DatagramDest<'_>,
-        packet_buf: &mut Vec<u8>,
-        probe: &TelemetryProbe,
-        count_local_drops: bool,
-    ) -> (Sent, anyhow::Result<()>) {
         let mut diag = Diagnostics::default();
         let telemetry = probe.telemetry("out", "test_out", "sink");
-        let mut report =
-            Report { sink: "test_out", diag: &mut diag, telemetry: &telemetry, count_local_drops };
+        let mut report = Report { sink: "test_out", diag: &mut diag, telemetry: &telemetry };
         send_datagrams(batch, dest, packet_buf, &mut report).await
     }
 
@@ -650,28 +631,90 @@ mod tests {
         assert_eq!(probe.sum("logit.output.messages.dropped", &OVERSIZE), 7.0);
     }
 
-    /// An over-cap entry is an encode-side drop: a repeat encode of the batch skips it without
-    /// counting it again, while an `EMSGSIZE` is the kernel's answer to this attempt and counts.
+    /// Every attempt that reaches an over-cap entry counts it, as the kernel's `EMSGSIZE` counts
+    /// every datagram it refuses: two attempts at one batch count both drops twice.
     #[tokio::test]
-    async fn a_repeat_encode_skips_an_over_cap_entry_uncounted_and_counts_an_emsgsize() {
-        let script = ScriptedDest::new([SendStep::TooLarge]);
+    async fn every_attempt_that_reaches_an_over_cap_entry_counts_it_as_emsgsize_does() {
+        let script = ScriptedDest::new([
+            SendStep::TooLarge,
+            SendStep::Accept,
+            SendStep::TooLarge,
+            SendStep::Accept,
+        ]);
         let mut probe = TelemetryProbe::new();
         let buf = entries(&["aa", "bbbbbbbb", "cc"], 7);
-        let (sent, result) = send_encoded(
-            packed(&buf, 4),
-            &mut DatagramDest::Scripted(&script),
-            &mut Vec::new(),
-            &probe,
-            false,
+        for _ in 0..2 {
+            let (_sent, result) = send(
+                packed(&buf, 4),
+                &mut DatagramDest::Scripted(&script),
+                &mut Vec::new(),
+                &probe,
+            )
+            .await;
+            result.expect("neither drop is a fault");
+        }
+        assert_eq!(script.datagrams(), [b"cc".to_vec(), b"cc".to_vec()]);
+        assert_eq!(
+            probe.sum("logit.output.messages.dropped", &OVERSIZE),
+            28.0,
+            "the over-cap `bbbbbbbb` and the refused `aa`, on each of two attempts"
+        );
+    }
+
+    /// A sink over [`send_datagrams`] as the datagram sinks build one, for entries no encoder
+    /// produces: an entry over the cap.
+    struct PackerSink {
+        entries: MessageBuf<usize>,
+        cap: usize,
+        script: Arc<ScriptedDest>,
+        diag: Diagnostics,
+        telemetry: Telemetry,
+    }
+
+    #[async_trait::async_trait]
+    impl logit_pipeline::Output for PackerSink {
+        async fn send(&mut self, _batch: &logit_core::EventBatch) -> anyhow::Result<()> {
+            let mut report =
+                Report { sink: "test_out", diag: &mut self.diag, telemetry: &self.telemetry };
+            let batch = packed(&self.entries, self.cap);
+            let mut dest = DatagramDest::Scripted(&self.script);
+            send_datagrams(batch, &mut dest, &mut Vec::new(), &mut report).await.1
+        }
+    }
+
+    /// An over-cap entry the packer never reached on a failed attempt is counted on the retry that
+    /// reaches it: attempt 1 fails sending `aa`, ahead of the over-cap `bbbbbbbb`.
+    #[tokio::test]
+    async fn an_over_cap_entry_first_reached_on_a_retry_is_counted() {
+        let script = ScriptedDest::new([SendStep::Fail(io::ErrorKind::ConnectionRefused)]);
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "test_out", "sink");
+        let mut sink = PackerSink {
+            entries: entries(&["aa", "cc", "bbbbbbbb"], 7),
+            cap: 4,
+            script: Arc::clone(&script),
+            diag: Diagnostics::default(),
+            telemetry: telemetry.clone(),
+        };
+        let batch = logit_core::EventBatch {
+            resource: Arc::new(logit_core::Resource::default()),
+            scope: None,
+            events: Vec::new(),
+        };
+        logit_pipeline::test_util::drive_write_loop(
+            &mut sink,
+            vec![batch],
+            crate::test_support::fast_retry(),
+            telemetry,
         )
-        .await;
-        result.expect("neither drop is a fault");
-        assert_eq!(script.datagrams(), [b"cc".to_vec()]);
-        assert_eq!(sent, Sent { entries: 1, weight: 7, datagrams: 1 });
+        .await
+        .expect("delivered on the retry");
+        assert_eq!(script.datagrams(), [b"aa".to_vec(), b"cc".to_vec()]);
+        assert_eq!(probe.sum("logit.component.retries", &[]), 1.0);
         assert_eq!(
             probe.sum("logit.output.messages.dropped", &OVERSIZE),
             7.0,
-            "the EMSGSIZE drop of `aa` counts, the repeat skip of `bbbbbbbb` doesn't"
+            "the over-cap entry's weight, counted on the attempt that reached it"
         );
     }
 

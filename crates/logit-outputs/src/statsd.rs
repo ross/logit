@@ -1801,12 +1801,8 @@ impl StatsdOutput {
             cap: self.max_packet_bytes,
             framing: Framing::Packed,
         };
-        let mut report = Report {
-            sink: "statsd_out",
-            diag: &mut self.diag,
-            telemetry: &self.telemetry,
-            count_local_drops: first,
-        };
+        let mut report =
+            Report { sink: "statsd_out", diag: &mut self.diag, telemetry: &self.telemetry };
         let result = match &mut self.conn {
             Conn::Udp(udp) => {
                 let (sent, result) =

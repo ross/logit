@@ -1462,7 +1462,7 @@ The datagram sinks count an oversize drop at one of two points, and in each sink
 
 | Counter | Reason | Where | Unit |
 |---|---|---|---|
-| `logit.output.messages.dropped` | `oversize_datagram` | the kernel refused a datagram with `EMSGSIZE` | `statsd_out`: entries (lines); `graphite_out`: datapoints; `collectd_out`: value lists (a notification counts one); `syslog_out`: messages |
+| `logit.output.messages.dropped` | `oversize_datagram` | the kernel refused a datagram with `EMSGSIZE`, or the packer skipped an entry over the cap | `statsd_out`: entries (lines); `graphite_out`: datapoints; `collectd_out`: value lists (a notification counts one); `syslog_out`: messages |
 | `logit.output.messages.dropped` | `oversize_line` | `statsd_out`'s encoder: one line over `max_packet_bytes` | lines |
 | `logit.output.metrics.skipped` | `oversize_line` | `graphite_out`'s encoder: one plaintext line over `max_packet_bytes` | lines |
 | `logit.output.metrics.skipped` | `oversize_value_list`, `oversize_notification` | `collectd_out`'s encoder: one value list or notification over `max_packet_bytes` | value lists, notifications |
@@ -1476,7 +1476,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.dropped`, `tags.normalized`, `messages.normalized`, `messages.truncated`, `events.skipped`, `structured_data.dropped`; the codec counters of `graphite_out` and `collectd_out` (`metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `identity.sanitized`); `file.rotations`; and every `logit.component.diagnostics` count an encoder emits |
 | Transport | once per attempt | `requests`, `request.duration`, `reconnects`, and what the attempt sent: `messages`, `datagrams`, `datapoints` |
-| Kernel verdict | once per attempt the kernel refuses a datagram | `messages.dropped{reason="oversize_datagram"}` from `EMSGSIZE` |
+| Kernel verdict and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap |
 
 The five sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -1484,10 +1484,10 @@ delivered the batch. A caller that sends without `observe_batch` counts every `s
 sinks (`otlp_out`, `prometheus_out`'s remote-write, `datadog_out`, `datadog_trace_out`,
 `splunk_hec_out`) still count their encode-side counters once per attempt (`docs/known-gaps.md`).
 
-`oversize_datagram` mixes two classes under one reason. The packer's skip of an entry over the cap,
-a backstop no encoder reaches, is encode-side and counts once per batch; the kernel's
-`EMSGSIZE` counts on every attempt, so a batch retried after a later failure counts it again.
-`crates/logit-outputs/src/datagram.rs`'s module doc has the send side's rules.
+`oversize_datagram` counts per attempt for both of its causes, the kernel's `EMSGSIZE` and the
+packer's skip of an entry over the cap (a backstop no encoder reaches), so a batch retried after a
+later failure can count it again. `crates/logit-outputs/src/datagram.rs`'s module doc has the send
+side's rules.
 
 The same four sinks, and `statsd_out` under `transport: unix`, count `logit.output.messages`,
 `logit.output.datagrams`, and `graphite_out`'s `logit.output.datapoints` for every datagram the

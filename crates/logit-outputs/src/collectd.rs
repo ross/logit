@@ -155,12 +155,8 @@ impl CollectdOutput {
             cap: self.max_packet_bytes,
             framing: Framing::OnePerEntry,
         };
-        let mut report = Report {
-            sink: "collectd_out",
-            diag: &mut self.diag,
-            telemetry: &self.telemetry,
-            count_local_drops: first,
-        };
+        let mut report =
+            Report { sink: "collectd_out", diag: &mut self.diag, telemetry: &self.telemetry };
         let (sent, result) =
             self.udp.send(&self.endpoint, datagrams, &mut self.packet_buf, &mut report).await;
         drop(request_timer);

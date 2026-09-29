@@ -7623,6 +7623,11 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     and rotated early, and a rotation whose re-open failed never counted in `file.rotations`. Both
     count after the write now
     (`a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`).
+  - The datagram packer's skip of an entry over the cap counts on every attempt that reaches it,
+    not once per batch: a first attempt that fails ahead of the entry never reaches it, and a
+    once-per-batch count lost the drop on the retry
+    (`an_over_cap_entry_first_reached_on_a_retry_is_counted`). It can repeat on a retry, as
+    `EMSGSIZE` does under the same reason.
   - The cancelled-attempt asymmetry stays as documented: a cancelled attempt's encode-side counts
     stand (the batch's one count), and it counts no `requests`.
   - Still open, `sink/w6`: `otlp_out`, `prometheus_out`'s remote-write mode, `datadog_out`,

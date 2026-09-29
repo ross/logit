@@ -223,7 +223,6 @@ impl GraphiteOutput {
                     sink: "graphite_out",
                     diag: &mut self.diag,
                     telemetry: &self.telemetry,
-                    count_local_drops: first,
                 };
                 let (sent, result) =
                     udp.send(&self.endpoint, batch, &mut self.packet_buf, &mut report).await;

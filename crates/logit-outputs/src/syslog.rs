@@ -1289,12 +1289,8 @@ impl SyslogOutput {
                     cap: MAX_UDP_PAYLOAD_BYTES,
                     framing: Framing::OnePerEntry,
                 };
-                let mut report = Report {
-                    sink: "syslog_out",
-                    diag: &mut self.diag,
-                    telemetry: &self.telemetry,
-                    count_local_drops: first,
-                };
+                let mut report =
+                    Report { sink: "syslog_out", diag: &mut self.diag, telemetry: &self.telemetry };
                 let (sent, result) =
                     udp.send(&self.endpoint, batch, &mut self.frame_buf, &mut report).await;
                 // What reached the kernel, even when the batch then failed.

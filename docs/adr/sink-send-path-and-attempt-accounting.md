@@ -84,8 +84,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
      a Splunk code 6 and the oversize split, an HTTP 413, an OTLP `partial_success`, and
      `EMSGSIZE`. They count per attempt. A batch retried after such a verdict counts the verdict
      again, because each attempt got its own answer. Counting them once would need the sink to
-     remember what an earlier attempt learned, and a retry might get a different answer. An
-     `EMSGSIZE` drop repeats in two sequences: drops followed by a failure before any datagram of
+     remember what an earlier attempt learned, and a retry might get a different answer. The
+     datagram packer's skip of an entry over the cap joins this class (decision 9), though no
+     peer decided it. An `EMSGSIZE` drop repeats in two sequences: drops followed by a failure before any datagram of
      the attempt was sent, under either posture, since that failure is `Clean` and `Clean` retries
      under both; and any `Ambiguous` retry under `at_least_once`, which is `graphite_out`'s
      default.
@@ -117,8 +118,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
    - An unarmed gate never mutes. A caller of `send` that never calls `observe_batch` (a unit
      test, a benchmark, `logit_pipeline::send_batch`) sees every encode counted.
    - The encode-side counts a sink emits itself (`statsd_out`'s and `syslog_out`'s `EncodeStats`,
-     `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`, the datagram packer's
-     over-cap skip) are skipped when `encode` reports a repeat.
+     `influxdb_out`'s `tags.normalized`, every sink's `batch.bytes`) are skipped when `encode`
+     reports a repeat. The datagram packer's over-cap skip isn't one of them: it counts per
+     attempt (decision 9).
    - A unit is a batch, or a route for `datadog_out` and `datadog_trace_out`, which encode each
      route lazily and can encode one route after an await that another attempt already passed.
    - `Output` gains no method and no parameter.
@@ -269,7 +271,12 @@ nature. The encode-side counters are the only ones that measure the batch and no
      pre-pass would scan for something the code can't produce. The packer has one branch, a
      comparison per entry, that skips an over-cap entry and counts it
      `messages.dropped{reason="oversize_datagram"}` in the weight unit. It has no
-     `debug_assert!` in front of it, so a debug build's tests reach the branch too.
+     `debug_assert!` in front of it, so a debug build's tests reach the branch too. It counts on
+     every attempt that reaches it, through the sink's ungated handle, as `EMSGSIZE` does. A
+     first attempt can fail on a datagram ahead of the entry and never reach it, so counting
+     only on a batch's first encode could lose the drop; a backstop's count must not depend on
+     which attempt reached it. A retried batch can count it again, as it can an `EMSGSIZE`
+     (amended by `sink/w5`).
      `GraphiteOutput::with_encoder` refuses a pickle encoder on UDP, as rule 46 does in config: it
      was the one builder path that could put an entry past the cap, since a pickle frame is bounded
      by `max_frame_bytes`, not by the datagram cap.
@@ -759,9 +766,8 @@ graph rule. The multi-request HTTP sinks wait for `sink/w6`.
   override `observe_batch`, run their encode through `BatchAccounting::encode`, hand their encoder
   gated views in every builder order, and keep ungated handles. `null_out`, `logit_out`, and
   `prometheus_out` count nothing encode-side that a retry repeats, and have no gate.
-- **The packer.** `datagram::Report::count_local_drops` carries the batch's first-encode flag, so
-  the over-cap skip counts once per batch while `EMSGSIZE` counts per attempt. Both keep the reason
-  `oversize_datagram`.
+- **The packer.** The over-cap skip counts on every attempt that reaches it, as `EMSGSIZE` does,
+  so the reason `oversize_datagram` is per attempt for both of its causes (decision 9).
 - **`StreamOutput`.** Decision 13.
 - **The runtime.** Rule 15 rejects the two zero durations; `deliver_with_retry` asserts them
   nonzero and saturates its attempt count. `logit_pipeline::test_util::drive_write_loop` runs the
@@ -790,7 +796,9 @@ graph rule. The multi-request HTTP sinks wait for `sink/w6`.
     cut off counts, and direct `send`s with no `observe_batch` count every time.
   - `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`,
     over the `fault` seam.
-  - `datagram::tests::a_repeat_encode_skips_an_over_cap_entry_uncounted_and_counts_an_emsgsize`.
+  - `datagram::tests::an_over_cap_entry_first_reached_on_a_retry_is_counted` (attempt 1 fails
+    on a datagram ahead of the entry; through `drive_write_loop`) and
+    `every_attempt_that_reaches_an_over_cap_entry_counts_it_as_emsgsize_does`.
   - `runtime::tests`: `backoff_for_doubles_from_base_and_is_capped_at_max_for_every_attempt`,
     `every_attempt_records_one_send_duration_sample_and_every_retry_one_error`, and
     `an_attempt_cut_off_by_the_budget_is_ambiguous`; `graph::tests`'s two zero-duration rejects.
