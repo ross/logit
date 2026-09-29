@@ -294,8 +294,8 @@ buffering:
   their diagnostics) counts once per batch, however many attempts it took. What an attempt did
   (`logit.output.requests`, `reconnects`, `messages`) counts per attempt, and so does a datagram the
   kernel refused (`oversize_datagram`). The HTTP sinks still count their encode-side drops once per
-  attempt, so on an unhealthy `otlp_out`, `prometheus_out`, `datadog_out`, `datadog_trace_out`, or
-  `splunk_hec_out` those counters grow with retries
+  attempt, so on an unhealthy `otlp_out`, `prometheus_out` in remote-write mode, `datadog_out`,
+  `datadog_trace_out`, or `splunk_hec_out` those counters grow with retries
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
   decision 1).
 

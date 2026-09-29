@@ -765,7 +765,9 @@ graph rule. The multi-request HTTP sinks wait for `sink/w6`.
   `logit-core`; `BatchAccounting` in `crates/logit-outputs/src/accounting.rs`. The five sinks
   override `observe_batch`, run their encode through `BatchAccounting::encode`, hand their encoder
   gated views in every builder order, and keep ungated handles. `null_out`, `logit_out`, and
-  `prometheus_out` count nothing encode-side that a retry repeats, and have no gate.
+  `prometheus_out`'s expose mode have no gate: they count nothing encode-side that a retry
+  repeats, and expose mode's `send` never fails. `prometheus_out`'s remote-write mode re-encodes
+  on every attempt and is gated in `sink/w6`.
 - **The packer.** The over-cap skip counts on every attempt that reaches it, as `EMSGSIZE` does,
   so the reason `oversize_datagram` is per attempt for both of its causes (decision 9).
 - **`StreamOutput`.** Decision 13.
