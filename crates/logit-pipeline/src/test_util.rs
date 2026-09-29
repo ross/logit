@@ -114,6 +114,11 @@ impl Totals {
         self.sums.iter().filter(|(key, _)| matches(key, name, tags)).map(|(_, v)| v).sum()
     }
 
+    /// Every `Sum` series: its name, its sorted tags, and its total. For comparing whole runs.
+    pub fn sums(&self) -> impl Iterator<Item = (&str, &[(String, String)], f64)> {
+        self.sums.iter().map(|((name, tags), v)| (name.as_str(), tags.as_slice(), *v))
+    }
+
     /// Whether any point of any kind named `name` with tags including `tags` has been folded.
     pub fn has(&self, name: &str, tags: &[(&str, &str)]) -> bool {
         self.seen.iter().any(|key| matches(key, name, tags))

@@ -1138,6 +1138,9 @@ pub struct SyslogOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// Replaces the stream transports' dial target with scripted connections.
+    #[cfg(test)]
+    dial_script: Option<std::sync::Arc<crate::test_support::ScriptedDial>>,
 }
 
 impl SyslogOutput {
@@ -1164,6 +1167,8 @@ impl SyslogOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
+            #[cfg(test)]
+            dial_script: None,
         }
     }
 
@@ -1305,11 +1310,10 @@ impl Output for SyslogOutput {
             // The driver counts `requests` for this arm.
             Conn::Tcp { pool, connect_timeout } => {
                 frame_octet_counting(&self.messages, &mut self.frame_buf);
-                let dial = Dial {
-                    target: Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() },
-                    connect_timeout: *connect_timeout,
-                    sink: "syslog_out",
-                };
+                let target = Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "syslog_out" };
                 let result = pool.send(&dial, &self.frame_buf, &self.telemetry).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.messages.len() as f64, &[]);
@@ -1346,8 +1350,9 @@ impl Output for SyslogOutput {
 mod tests {
     use super::*;
     use crate::test_support::{
-        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode,
-        ScriptedDest, SendStep, WriteStep,
+        assert_counted_once_per_batch, fast_retry, server_tls_config, sum_of,
+        sums_through_write_loop, testdata_dir, tls_settings, Collector, DialStep, FakeStream,
+        ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, Registry, Resource};
     use logit_inputs::syslog::SyslogDecoder;
@@ -3340,5 +3345,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A truncated message with its diagnostic, and a skipped metric-only event.
+    fn encode_side_batch() -> EventBatch {
+        batch_with(vec![log_event(0, &"x".repeat(300), None), metric_event(0)])
+    }
+
+    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 4] = [
+        ("logit.output.messages.truncated", &[]),
+        ("logit.output.events.skipped", &[]),
+        ("logit.component.diagnostics", &[("key", "message_truncated")]),
+        ("logit.output.batch.bytes", &[]),
+    ];
+
+    /// Runs [`encode_side_batch`] through the write loop over the sink `build` makes, once with a
+    /// first attempt that fails `Fault::Clean` and once without, with the builders `build_spec`
+    /// calls, and compares.
+    async fn assert_a_retry_counts_encode_side_once(build: impl Fn(bool) -> SyslogOutput) {
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "syslog_out", "sink");
+            let mut output = build(fail_first)
+                .with_encoder(SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(128))
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            let batches = vec![encode_side_batch()];
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "syslog_out",
+                    batches,
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
+
+    #[tokio::test]
+    async fn a_udp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = SyslogOutput::udp("127.0.0.1:514").unwrap();
+            output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new(steps)));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_tcp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let connect = DialStep::Connect(Box::new(FakeStream::new()));
+            let steps = if fail_first { vec![DialStep::Refuse, connect] } else { vec![connect] };
+            let mut output = SyslogOutput::tcp("127.0.0.1:514", Duration::from_secs(1));
+            output.dial_script = Some(Arc::new(ScriptedDial::new(false, steps)));
+            output
+        })
+        .await;
     }
 }

@@ -83,6 +83,18 @@ pub(crate) enum Target<'a> {
     Scripted(&'a crate::test_support::ScriptedDial),
 }
 
+/// `target`, or `script` in its place when a test installed one on a sink.
+#[cfg(test)]
+pub(crate) fn scripted_or<'a>(
+    target: Target<'a>,
+    script: &'a Option<Arc<crate::test_support::ScriptedDial>>,
+) -> Target<'a> {
+    match script {
+        Some(script) => Target::Scripted(script),
+        None => target,
+    }
+}
+
 /// What [`connect`] needs, borrowed per `send` from the sink's fields.
 pub(crate) struct Dial<'a> {
     pub(crate) target: Target<'a>,

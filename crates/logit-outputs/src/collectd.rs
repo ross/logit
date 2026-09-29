@@ -192,7 +192,10 @@ impl Output for CollectdOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Collector, ScriptedDest, SendStep};
+    use crate::test_support::{
+        assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop, Collector,
+        ScriptedDest, SendStep,
+    };
     use logit_core::interner::intern;
     use logit_core::{
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Sum,
@@ -584,5 +587,46 @@ mod tests {
             counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")),
             "expected a no_host diagnostic via the shared Diagnostics handle"
         );
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    #[tokio::test]
+    async fn a_retry_counts_encode_side_counters_once() {
+        // A value list that encodes, and one the codec skips for want of a host, with its
+        // diagnostic.
+        let batch = || batch_with(vec![relay_event("web1", "load", 1.0), counter_event("x", 1.0)]);
+        const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
+            ("logit.output.metrics.skipped", &[("reason", "no_host")]),
+            ("logit.component.diagnostics", &[("key", "no_host")]),
+            ("logit.output.batch.bytes", &[]),
+        ];
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "collectd_out", "sink");
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = CollectdOutput::udp("127.0.0.1:25826")
+                .unwrap()
+                .with_encoder(CollectdEncoder::new())
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            output.udp = UdpDest::Scripted(ScriptedDest::new(steps));
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "collectd_out",
+                    vec![batch()],
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
     }
 }

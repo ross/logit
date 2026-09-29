@@ -1605,4 +1605,53 @@ mod tests {
         assert_eq!(value("logit.output.requests", Some(("class", "5xx"))), 1.0);
         assert!(value("logit.output.batch.bytes", None) > 0.0);
     }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A 503 then a 204: the batch is delivered on its second attempt, and every encode-side
+    /// counter and diagnostic reads as it does after one attempt.
+    #[tokio::test]
+    async fn a_retry_counts_encode_side_counters_once() {
+        use crate::test_support::{
+            assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop,
+        };
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        // A collapsed multi-value tag, and a gauge delta skipped with its diagnostic.
+        let batch = || {
+            let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
+            tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+        };
+        const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
+            ("logit.output.tags.normalized", &[("reason", "multi_value")]),
+            ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+            ("logit.output.batch.bytes", &[]),
+        ];
+        let mut runs = Vec::new();
+        for responses in [vec![RESP_204], vec![RESP_503, RESP_204]] {
+            let (addr, _count) = canned_server(responses).await;
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+            let mut output = output_against(addr)
+                .await
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "influxdb_out",
+                    vec![batch()],
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "2xx")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "5xx")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "2xx")]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
 }

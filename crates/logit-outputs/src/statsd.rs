@@ -1570,6 +1570,9 @@ pub struct StatsdOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// Replaces the stream transports' dial target with scripted connections.
+    #[cfg(test)]
+    dial_script: Option<std::sync::Arc<crate::test_support::ScriptedDial>>,
 }
 
 impl StatsdOutput {
@@ -1610,6 +1613,8 @@ impl StatsdOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
+            #[cfg(test)]
+            dial_script: None,
         }
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
@@ -1830,11 +1835,10 @@ impl Output for StatsdOutput {
             // frame is delivered.
             Conn::Tcp { pool, connect_timeout } => {
                 build_lf_frame(&self.lines, &mut self.packet_buf);
-                let dial = Dial {
-                    target: Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() },
-                    connect_timeout: *connect_timeout,
-                    sink: "statsd_out",
-                };
+                let target = Target::Tcp { endpoint: &self.endpoint, tls: self.tls.as_ref() };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }
@@ -1844,11 +1848,10 @@ impl Output for StatsdOutput {
                     self.max_packet_bytes,
                     &mut self.packet_buf,
                 );
-                let dial = Dial {
-                    target: Target::Unix { path: Path::new(&self.endpoint) },
-                    connect_timeout: *connect_timeout,
-                    sink: "statsd_out",
-                };
+                let target = Target::Unix { path: Path::new(&self.endpoint) };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "statsd_out" };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }
@@ -1950,8 +1953,9 @@ fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, fram
 mod tests {
     use super::*;
     use crate::test_support::{
-        server_tls_config, testdata_dir, tls_settings, Collector, FakeStream, ReadMode,
-        ScriptedDest, SendStep, WriteStep,
+        assert_counted_once_per_batch, fast_retry, server_tls_config, sum_of,
+        sums_through_write_loop, testdata_dir, tls_settings, Collector, DialStep, FakeStream,
+        ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_inputs::statsd::StatsdDecoder;
@@ -5042,6 +5046,171 @@ mod tests {
                     line
                 );
             }
+        }
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A dropped tag, a dropped gauge delta with its diagnostic, and one line that encodes.
+    fn encode_side_batch() -> EventBatch {
+        batch_with(vec![
+            metric_event("hits", MetricKind::counter(1.0), &[("bad", Value::Null)]),
+            metric_event("conns", MetricKind::GaugeDelta(5.0), &[]),
+        ])
+    }
+
+    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 4] = [
+        ("logit.output.messages.dropped", &[("reason", "unresolved_gauge_delta")]),
+        ("logit.output.tags.dropped", &[("reason", "unrepresentable")]),
+        ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+        ("logit.output.batch.bytes", &[]),
+    ];
+
+    /// `output` with the builders `build_spec` calls, over `probe`'s component `out`.
+    fn instrumented(output: StatsdOutput, probe: &TelemetryProbe) -> StatsdOutput {
+        let telemetry = probe.telemetry("out", "statsd_out", "sink");
+        output
+            .with_encoder(StatsdEncoder::new(Format::DogStatsd))
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    /// Runs [`encode_side_batch`] through the write loop over the sink `build` makes, once with a
+    /// first attempt that fails `Fault::Clean` (`fail_first`) and once without, and compares.
+    async fn assert_a_retry_counts_encode_side_once(build: impl Fn(bool) -> StatsdOutput) {
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let mut output = instrumented(build(fail_first), &probe);
+            let sums = sums_through_write_loop(
+                &mut output,
+                &mut probe,
+                "statsd_out",
+                vec![encode_side_batch()],
+                fast_retry(),
+            )
+            .await;
+            runs.push(sums);
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.component.retries", &[]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
+
+    #[tokio::test]
+    async fn a_udp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = StatsdOutput::udp("127.0.0.1:8125").unwrap();
+            output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new(steps)));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_unix_datagram_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            // Not a gone receiver, so the socket is kept and the retry sends on it.
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::Other));
+            let mut output = StatsdOutput::unix_datagram("/nonexistent", Duration::from_secs(1));
+            output.conn = Conn::UnixDatagram {
+                socket: Some(UnixSocket::Scripted(ScriptedDest::new(steps))),
+                send_timeout: Duration::from_secs(1),
+                has_connected_once: true,
+            };
+            output
+        })
+        .await;
+    }
+
+    /// A refused dial, then a connection that takes the frame.
+    fn refuse_then_connect(fail_first: bool) -> Arc<ScriptedDial> {
+        let connect = DialStep::Connect(Box::new(FakeStream::new()));
+        let steps = if fail_first { vec![DialStep::Refuse, connect] } else { vec![connect] };
+        Arc::new(ScriptedDial::new(false, steps))
+    }
+
+    #[tokio::test]
+    async fn a_tcp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let mut output = StatsdOutput::tcp("127.0.0.1:8125", Duration::from_secs(1));
+            output.dial_script = Some(refuse_then_connect(fail_first));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_unix_stream_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let mut output = StatsdOutput::unix_stream("/nonexistent", Duration::from_secs(1));
+            output.dial_script = Some(refuse_then_connect(fail_first));
+            output
+        })
+        .await;
+    }
+
+    /// The gate re-arms per batch: a second batch through the same loop counts as the first did.
+    #[tokio::test]
+    async fn a_second_batch_through_the_write_loop_counts_its_encode_side_counters() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, fast_retry())
+                .await;
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose one attempt the retry budget cuts off is dropped, and the next batch counts
+    /// its encode-side counters: the cut left no gate muted and the next batch re-armed it.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_after_one_dropped_at_its_budget_counts_its_encode_side_counters() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        let script = ScriptedDest::new([SendStep::Park]);
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let mut config = fast_retry();
+        config.retry.total_budget = Duration::from_millis(50);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "statsd_out", batches, config).await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(script.datagrams().len(), 1, "the second batch's one datagram");
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// With no `observe_batch`, as a caller outside the runtime sends, every `send` counts, and
+    /// so does a direct `send` after a batch the write loop delivered.
+    #[tokio::test]
+    async fn a_send_with_no_observe_batch_counts_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        let _ = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "statsd_out",
+            vec![encode_side_batch()],
+            fast_retry(),
+        )
+        .await;
+        for _ in 0..2 {
+            output.send(&encode_side_batch()).await.expect("accepted");
+        }
+        let totals = probe.poll();
+        for (name, tags) in &ENCODE_SIDE[..3] {
+            assert_eq!(totals.sum(name, tags), 3.0, "{name} {tags:?}");
         }
     }
 }

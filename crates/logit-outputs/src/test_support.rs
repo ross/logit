@@ -719,3 +719,81 @@ pub(crate) async fn drain_available<S: AsyncRead + Unpin + ?Sized>(stream: &mut 
         }
     }
 }
+
+/// Every `Sum` series a sink and the runtime counted, keyed by name and sorted tags.
+pub(crate) type Sums = std::collections::BTreeMap<(String, Vec<(String, String)>), f64>;
+
+/// Counters that count once per attempt, which a retried batch counts once more per retry.
+const PER_ATTEMPT: [&str; 4] = [
+    "logit.output.requests",
+    "logit.output.reconnects",
+    "logit.component.errors",
+    "logit.component.retries",
+];
+
+/// A write-loop config whose retries take a millisecond.
+pub(crate) fn fast_retry() -> logit_pipeline::WriteLoopConfig {
+    logit_pipeline::WriteLoopConfig {
+        retry: logit_pipeline::RetryConfig {
+            total_budget: Duration::from_secs(5),
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        },
+        ..logit_pipeline::WriteLoopConfig::default()
+    }
+}
+
+/// Runs `batches` through the runtime's write loop over `output`, whose telemetry is `probe`'s
+/// component `out`, and returns every `Sum` series counted.
+pub(crate) async fn sums_through_write_loop<O: logit_pipeline::Output + Send>(
+    output: &mut O,
+    probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    kind: &'static str,
+    batches: Vec<logit_core::EventBatch>,
+    config: logit_pipeline::WriteLoopConfig,
+) -> Sums {
+    let telemetry = probe.telemetry("out", kind, "sink");
+    logit_pipeline::test_util::drive_write_loop(output, batches, config, telemetry)
+        .await
+        .expect("write_loop ends Ok");
+    probe.poll().sums().map(|(name, tags, v)| ((name.to_string(), tags.to_vec()), v)).collect()
+}
+
+/// `sums` without the [`PER_ATTEMPT`] counters.
+fn once_per_batch(sums: &Sums) -> Sums {
+    sums.iter()
+        .filter(|((name, _), _)| !PER_ATTEMPT.contains(&name.as_str()))
+        .map(|(key, v)| (key.clone(), *v))
+        .collect()
+}
+
+/// The total of every series in `sums` named `name` whose tags include `tags`.
+pub(crate) fn sum_of(sums: &Sums, name: &str, tags: &[(&str, &str)]) -> f64 {
+    sums.iter()
+        .filter(|((n, t), _)| {
+            n == name && tags.iter().all(|(k, v)| t.iter().any(|(tk, tv)| tk == k && tv == v))
+        })
+        .map(|(_, v)| v)
+        .sum()
+}
+
+/// Asserts a retried run counted every series outside [`PER_ATTEMPT`] as a single-attempt run of
+/// the same batch did, and that each of `encode_side` was counted at all, so the comparison has
+/// something to compare.
+pub(crate) fn assert_counted_once_per_batch(
+    single: &Sums,
+    retried: &Sums,
+    encode_side: &[(&str, &[(&str, &str)])],
+) {
+    for (name, tags) in encode_side {
+        assert!(sum_of(single, name, tags) > 0.0, "{name} {tags:?} was never counted: {single:?}");
+    }
+    let (single, retried) = (once_per_batch(single), once_per_batch(retried));
+    let keys: std::collections::BTreeSet<_> = single.keys().chain(retried.keys()).collect();
+    let differing: Vec<_> = keys
+        .into_iter()
+        .map(|key| (key, single.get(key).copied(), retried.get(key).copied()))
+        .filter(|(_, single, retried)| single.unwrap_or(0.0) != retried.unwrap_or(0.0))
+        .collect();
+    assert!(differing.is_empty(), "(series, single attempt, retried) that differ: {differing:?}");
+}

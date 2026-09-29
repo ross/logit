@@ -112,6 +112,9 @@ pub struct GraphiteOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
+    /// Replaces the stream transports' dial target with scripted connections.
+    #[cfg(test)]
+    dial_script: Option<std::sync::Arc<crate::test_support::ScriptedDial>>,
 }
 
 impl GraphiteOutput {
@@ -137,6 +140,8 @@ impl GraphiteOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting: BatchAccounting::default(),
+            #[cfg(test)]
+            dial_script: None,
         }
         .with_max_packet_bytes(logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES)
     }
@@ -238,11 +243,10 @@ impl Output for GraphiteOutput {
             Conn::Tcp { pool, connect_timeout } => {
                 let datapoints =
                     build_tcp_frame(&self.buf, self.encoder.protocol(), &mut self.packet_buf);
-                let dial = Dial {
-                    target: Target::Tcp { endpoint: &self.endpoint, tls: None },
-                    connect_timeout: *connect_timeout,
-                    sink: "graphite_out",
-                };
+                let target = Target::Tcp { endpoint: &self.endpoint, tls: None };
+                #[cfg(test)]
+                let target = crate::stream::scripted_or(target, &self.dial_script);
+                let dial = Dial { target, connect_timeout: *connect_timeout, sink: "graphite_out" };
                 let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.buf.len() as f64, &[]);
@@ -291,7 +295,10 @@ fn build_tcp_frame(buf: &MessageBuf<usize>, protocol: Protocol, frame: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Collector, FakeStream, ReadMode, ScriptedDest, SendStep};
+    use crate::test_support::{
+        assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop, Collector,
+        DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep,
+    };
     use logit_core::interner::intern;
     use logit_core::{
         AttrMap, BodyFormat, Event, LogRecord, MetricKind, MetricRecord, Registry, Resource, Value,
@@ -891,5 +898,108 @@ mod tests {
             "expected the codec's own skipped-kind counter, fed through this sink's shared \
              Telemetry"
         );
+    }
+
+    // -- Attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    /// A gauge that encodes, and a gauge delta the codec skips with its diagnostic.
+    fn encode_side_batch() -> EventBatch {
+        let delta = MetricRecord::new(intern("conns"), MetricKind::GaugeDelta(5.0));
+        batch_with(vec![
+            tagged_event("load", 1.0, ("host", "a")),
+            Event::metric(TS, AttrMap::new(), delta),
+        ])
+    }
+
+    const ENCODE_SIDE: [(&str, &[(&str, &str)]); 3] = [
+        ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+        ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+        ("logit.output.batch.bytes", &[]),
+    ];
+
+    /// Runs [`encode_side_batch`] through the write loop over the sink `build` makes, once with a
+    /// first attempt that fails `Fault::Clean` and once without, with the builders `build_spec`
+    /// calls, and compares.
+    async fn assert_a_retry_counts_encode_side_once(build: impl Fn(bool) -> GraphiteOutput) {
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "graphite_out", "sink");
+            let mut output = build(fail_first)
+                .with_encoder(GraphiteEncoder::new())
+                .unwrap()
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry);
+            let batches = vec![encode_side_batch()];
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "graphite_out",
+                    batches,
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        assert_eq!(sum_of(single, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
+
+    #[tokio::test]
+    async fn a_udp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = GraphiteOutput::udp("127.0.0.1:2003").unwrap();
+            output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new(steps)));
+            output
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_tcp_retry_counts_encode_side_counters_once() {
+        assert_a_retry_counts_encode_side_once(|fail_first| {
+            let connect = DialStep::Connect(Box::new(FakeStream::new()));
+            let steps = if fail_first { vec![DialStep::Refuse, connect] } else { vec![connect] };
+            let mut output = GraphiteOutput::tcp("127.0.0.1:2003", Duration::from_secs(1));
+            output.dial_script = Some(Arc::new(ScriptedDial::new(false, steps)));
+            output
+        })
+        .await;
+    }
+
+    /// Either builder order leaves the encoder counting through the gated view: the sink's
+    /// handles first and the encoder last, as a test or tool might.
+    #[tokio::test]
+    async fn an_encoder_installed_after_the_handles_counts_encode_side_once_too() {
+        let mut runs = Vec::new();
+        for fail_first in [false, true] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "graphite_out", "sink");
+            let steps = fail_first.then_some(SendStep::Fail(std::io::ErrorKind::ConnectionRefused));
+            let mut output = GraphiteOutput::udp("127.0.0.1:2003")
+                .unwrap()
+                .with_telemetry(telemetry.clone())
+                .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry))
+                .with_encoder(GraphiteEncoder::new())
+                .unwrap();
+            output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new(steps)));
+            let batches = vec![encode_side_batch()];
+            runs.push(
+                sums_through_write_loop(
+                    &mut output,
+                    &mut probe,
+                    "graphite_out",
+                    batches,
+                    fast_retry(),
+                )
+                .await,
+            );
+        }
+        assert_counted_once_per_batch(&runs[0], &runs[1], &ENCODE_SIDE);
     }
 }
