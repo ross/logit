@@ -133,16 +133,9 @@ impl CollectdOutput {
     }
 }
 
-/// No `flush` override: `send` retains nothing between calls, and a datagram leaves in its
-/// `send_to`, so the trait's no-op is right.
-#[async_trait::async_trait]
-impl Output for CollectdOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
-        self.accounting.observe();
-    }
-
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+impl CollectdOutput {
+    /// One `Output::send` attempt.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         // `Stats` discarded: the encoder already reported them through its own gated handles.
         let (first, _stats) =
             self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.buf));
@@ -177,10 +170,24 @@ impl Output for CollectdOutput {
         self.telemetry.count("logit.output.messages", sent.weight as f64, &[]);
         self.telemetry.count("logit.output.datagrams", sent.datagrams as f64, &[]);
         count_request(&self.telemetry, &result);
-        if result.is_ok() {
-            self.accounting.delivered();
-        }
         result
+    }
+}
+
+/// No `flush` override: `send` retains nothing between calls, and a datagram leaves in its
+/// `send_to`, so the trait's no-op is right.
+#[async_trait::async_trait]
+impl Output for CollectdOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`CollectdOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// A redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE; there's no
@@ -194,8 +201,8 @@ impl Output for CollectdOutput {
 mod tests {
     use super::*;
     use crate::test_support::{
-        assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop, Collector,
-        ScriptedDest, SendStep,
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        sum_of, sums_through_write_loop, Collector, ScriptedDest, SendStep,
     };
     use logit_core::interner::intern;
     use logit_core::{
@@ -629,5 +636,33 @@ mod tests {
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "clean")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
         assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
+
+    /// A batch the encoder skips whole returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "collectd_out", "sink");
+        let mut output = CollectdOutput::udp("127.0.0.1:25826")
+            .unwrap()
+            .with_encoder(CollectdEncoder::new())
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        output.udp = UdpDest::Scripted(ScriptedDest::new([]));
+        let batch = || batch_with(vec![relay_event("web1", "load", 1.0), counter_event("x", 1.0)]);
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "collectd_out",
+            batch_with(vec![log_event()]),
+            batch,
+            &[
+                ("logit.output.metrics.skipped", &[("reason", "no_host")]),
+                ("logit.component.diagnostics", &[("key", "no_host")]),
+                ("logit.output.batch.bytes", &[]),
+            ],
+        )
+        .await;
     }
 }

@@ -1778,14 +1778,9 @@ fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     );
 }
 
-#[async_trait::async_trait]
-impl Output for StatsdOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
-        self.accounting.observe();
-    }
-
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+impl StatsdOutput {
+    /// One `Output::send` attempt.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (first, stats) =
             self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.lines));
         if first {
@@ -1857,10 +1852,22 @@ impl Output for StatsdOutput {
             }
         };
         drop(request_timer);
-        if result.is_ok() {
-            self.accounting.delivered();
-        }
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for StatsdOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`StatsdOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `send` flushes and retains nothing between calls, so this only flushes a stream as a
@@ -1954,9 +1961,9 @@ fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, fram
 mod tests {
     use super::*;
     use crate::test_support::{
-        assert_counted_once_per_batch, fast_retry, server_tls_config, sum_of,
-        sums_through_write_loop, testdata_dir, tls_settings, Collector, DialStep, FakeStream,
-        ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        server_tls_config, sum_of, sums_through_write_loop, testdata_dir, tls_settings, Collector,
+        DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep, WriteStep,
     };
     use logit_core::{interner::intern, AttrMap, BodyFormat, LogRecord, MetricRecord, Resource};
     use logit_inputs::statsd::StatsdDecoder;
@@ -5213,5 +5220,23 @@ mod tests {
         for (name, tags) in &ENCODE_SIDE[..3] {
             assert_eq!(totals.sum(name, tags), 3.0, "{name} {tags:?}");
         }
+    }
+
+    /// A batch the encoder skips whole returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(StatsdOutput::udp("127.0.0.1:8125").unwrap(), &probe);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "statsd_out",
+            batch_with(vec![log_event(0)]),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
     }
 }

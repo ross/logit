@@ -797,3 +797,32 @@ pub(crate) fn assert_counted_once_per_batch(
         .collect();
     assert!(differing.is_empty(), "(series, single attempt, retried) that differ: {differing:?}");
 }
+
+/// Runs `empty`, a batch the encoder skips whole, through the write loop, then sends `batch`
+/// twice directly with no `observe_batch`, and asserts each of `encode_side` counted both direct
+/// sends: a batch that encoded to nothing leaves the sink's accounting disarmed.
+pub(crate) async fn assert_direct_sends_count_after_an_empty_batch<O>(
+    output: &mut O,
+    probe: &mut logit_pipeline::test_util::TelemetryProbe,
+    kind: &'static str,
+    empty: logit_core::EventBatch,
+    batch: impl Fn() -> logit_core::EventBatch,
+    encode_side: &[(&str, &[(&str, &str)])],
+) where
+    O: logit_pipeline::Output + Send,
+{
+    let before = sums_through_write_loop(output, probe, kind, vec![empty], fast_retry()).await;
+    let mut after: Vec<Sums> = Vec::new();
+    for _ in 0..2 {
+        output.send(&batch()).await.expect("a direct send delivers");
+        let sums = probe.poll().sums().map(|(n, t, v)| ((n.to_string(), t.to_vec()), v));
+        after.push(sums.collect());
+    }
+    for (name, tags) in encode_side {
+        let base = sum_of(&before, name, tags);
+        let first = sum_of(&after[0], name, tags) - base;
+        let second = sum_of(&after[1], name, tags) - base;
+        assert!(first > 0.0, "{name} {tags:?}: the first direct send counted nothing");
+        assert_eq!(second, 2.0 * first, "{name} {tags:?}: the second direct send wasn't counted");
+    }
+}

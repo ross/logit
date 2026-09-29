@@ -116,17 +116,11 @@ fn build_client(timeout: Duration) -> reqwest::Client {
         .expect("reqwest client should build with default TLS settings")
 }
 
-#[async_trait::async_trait]
-impl Output for InfluxDbOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
-        self.accounting.observe();
-    }
-
+impl InfluxDbOutput {
     /// One attempt per call, no loop or sleep: retry timing and budget belong to
     /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
     /// outcome and attaches it as `.context(fault)`.
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (first, body) = self.accounting.encode(0, || self.encoder.encode(batch));
         let body = body?;
         // Before the empty-body return: a batch whose every line was unencodable still normalized
@@ -175,7 +169,6 @@ impl Output for InfluxDbOutput {
                     1.0,
                     &[("class", status_class(resp.status()))],
                 );
-                self.accounting.delivered();
                 Ok(())
             }
             Ok(resp) => {
@@ -200,6 +193,21 @@ impl Output for InfluxDbOutput {
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for InfluxDbOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`InfluxDbOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// Every point's timestamp derives from `event.timestamp`, and the per-batch collision map
@@ -1654,5 +1662,52 @@ mod tests {
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "5xx")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "2xx")]), 1.0);
         assert_counted_once_per_batch(single, retried, &ENCODE_SIDE);
+    }
+
+    /// A batch that encodes to an empty body returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        use crate::test_support::assert_direct_sends_count_after_an_empty_batch;
+        use logit_pipeline::test_util::TelemetryProbe;
+
+        let (addr, _count) = canned_server(vec![RESP_204]).await;
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+        let mut output = output_against(addr)
+            .await
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let log = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str("hello"),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let batch = || {
+            let mut tagged = metric_event("hits", MetricKind::counter(1.0), &[]);
+            tagged.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
+            batch_with(vec![tagged, metric_event("conns", MetricKind::GaugeDelta(5.0), &[])])
+        };
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "influxdb_out",
+            batch_with(vec![log]),
+            batch,
+            &[
+                ("logit.output.tags.normalized", &[("reason", "multi_value")]),
+                ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+                ("logit.output.batch.bytes", &[]),
+            ],
+        )
+        .await;
     }
 }

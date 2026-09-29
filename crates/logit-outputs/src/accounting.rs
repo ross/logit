@@ -65,8 +65,17 @@ impl BatchAccounting {
     }
 
     /// Disarms after an `Ok` send, so a later `send` with no `observe_batch` counts.
-    pub(crate) fn delivered(&mut self) {
+    fn delivered(&mut self) {
         self.armed = false;
+    }
+
+    /// Passes `result` through, disarming on `Ok`. Each sink's `send` returns through this at its
+    /// one exit, so no early `Ok` leaves the accounting armed.
+    pub(crate) fn finish<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if result.is_ok() {
+            self.delivered();
+        }
+        result
     }
 }
 

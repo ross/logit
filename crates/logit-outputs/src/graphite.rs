@@ -196,14 +196,9 @@ impl GraphiteOutput {
     }
 }
 
-#[async_trait::async_trait]
-impl Output for GraphiteOutput {
-    /// Arms this sink's batch accounting (`crate::accounting`).
-    fn observe_batch(&mut self, _ctx: BatchContext) {
-        self.accounting.observe();
-    }
-
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+impl GraphiteOutput {
+    /// One `Output::send` attempt.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         // `Stats` discarded: the encoder already reported them through its own gated handles.
         let (first, _stats) =
             self.accounting.encode(0, || self.encoder.encode_into(batch, &mut self.buf));
@@ -256,10 +251,22 @@ impl Output for GraphiteOutput {
             }
         };
         drop(request_timer);
-        if result.is_ok() {
-            self.accounting.delivered();
-        }
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for GraphiteOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`GraphiteOutput::attempt`]). An `Ok` disarms the batch accounting on every
+    /// path, a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `send` pools a connection only after flushing it; this is the shutdown backstop.
@@ -296,8 +303,9 @@ fn build_tcp_frame(buf: &MessageBuf<usize>, protocol: Protocol, frame: &mut Vec<
 mod tests {
     use super::*;
     use crate::test_support::{
-        assert_counted_once_per_batch, fast_retry, sum_of, sums_through_write_loop, Collector,
-        DialStep, FakeStream, ReadMode, ScriptedDest, ScriptedDial, SendStep,
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        sum_of, sums_through_write_loop, Collector, DialStep, FakeStream, ReadMode, ScriptedDest,
+        ScriptedDial, SendStep,
     };
     use logit_core::interner::intern;
     use logit_core::{
@@ -1001,5 +1009,29 @@ mod tests {
             );
         }
         assert_counted_once_per_batch(&runs[0], &runs[1], &ENCODE_SIDE);
+    }
+
+    /// A batch the encoder skips whole returns `Ok` early and still leaves the accounting
+    /// disarmed, so later direct sends count.
+    #[tokio::test]
+    async fn direct_sends_after_a_batch_that_encoded_nothing_count_every_time() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "graphite_out", "sink");
+        let mut output = GraphiteOutput::udp("127.0.0.1:2003")
+            .unwrap()
+            .with_encoder(GraphiteEncoder::new())
+            .unwrap()
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        output.conn = Conn::Udp(UdpDest::Scripted(ScriptedDest::new([])));
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "graphite_out",
+            batch_with(vec![log_event()]),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
     }
 }
