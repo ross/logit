@@ -249,7 +249,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
 | [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | findings → #451 |
-| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | findings → #453 |
+| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/datagram.rs` (`send_datagrams`) | findings → #453 |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | findings → #454 |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
@@ -7446,10 +7446,10 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     greedy packing. Planted off-by-one checks in both directions and a separator counted twice
     each fail it.
   - An entry over the cap: every encoder caps its entries at the value its sink passes the
-    packer, and the packer has a `debug_assert!` plus a release-build branch that skips and counts
-    such an entry (`an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent`, run
-    in release to reach the branch). `GraphiteOutput::with_encoder` refuses pickle on UDP, the one
-    builder path that could have produced one.
+    packer, and the packer has a branch that skips and counts such an entry
+    (`an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent`, and the proptest,
+    whose cap is drawn apart from its entries). `GraphiteOutput::with_encoder` refuses pickle on
+    UDP, the one builder path that could have produced one.
   - Entries, not `\n` bytes: the scripted destination records the entry count per datagram, and
     the proptest's entries carry embedded `\n`s, as the negative-gauge pair does.
   - Resets on every exit: the packer's per-datagram counts are locals reset after each send and

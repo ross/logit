@@ -17,9 +17,9 @@
 //!
 //! An entry longer than `cap` never reaches the kernel. Every encoder caps its entries at the
 //! value its sink passes here, so the branch that drops one, counted like `EMSGSIZE`, is a
-//! release-build backstop behind a `debug_assert!`. That drop is encode-side and counts on a
-//! batch's first encode only ([`Report::count_local_drops`]); an `EMSGSIZE` is the kernel's answer
-//! to one attempt and counts on every attempt. Both count under `reason="oversize_datagram"`.
+//! backstop that costs one comparison per entry. That drop is encode-side and counts on a batch's
+//! first encode only ([`Report::count_local_drops`]); an `EMSGSIZE` is the kernel's answer to one
+//! attempt and counts on every attempt. Both count under `reason="oversize_datagram"`.
 //!
 //! [`Sent`] comes back on every exit, so a sink counts what reached the wire before an error as
 //! well as on success. A cancelled send returns nothing, and its counts are lost
@@ -122,13 +122,6 @@ pub(crate) async fn send_datagrams<M>(
     packet_buf.clear();
     for (entry, meta) in batch.entries.iter_with() {
         let weight = (batch.weight)(meta);
-        debug_assert!(
-            entry.len() <= batch.cap,
-            "{}: a {}-byte entry over the {}-byte cap its encoder applies",
-            report.sink,
-            entry.len(),
-            batch.cap
-        );
         if entry.len() > batch.cap {
             if !report.count_local_drops {
                 continue;
@@ -255,16 +248,7 @@ impl UdpDest {
                 let addr = pick_addr(addrs)
                     .with_context(|| format!("{sink} endpoint {endpoint} resolved to no addresses"))
                     .context(Fault::Clean)?;
-                let socket: &UdpSocket = if addr.is_ipv4() {
-                    v4
-                } else {
-                    match v6 {
-                        Some(socket) => socket,
-                        slot @ None => {
-                            slot.insert(bind_udp("[::]:0", sink, "IPv6").context(Fault::Clean)?)
-                        }
-                    }
-                };
+                let socket = socket_for(addr, v4, v6, sink)?;
                 Ok(DatagramDest::Udp { socket, addr })
             }
             #[cfg(test)]
@@ -285,6 +269,23 @@ impl UdpDest {
             Ok(mut dest) => send_datagrams(batch, &mut dest, packet_buf, report).await,
             Err(err) => (Sent::default(), Err(err)),
         }
+    }
+}
+
+/// The socket of `addr`'s family: `v4`, or `v6`, bound here on first use. A failed IPv6 bind is
+/// `Fault::Clean`.
+fn socket_for<'a>(
+    addr: SocketAddr,
+    v4: &'a UdpSocket,
+    v6: &'a mut Option<UdpSocket>,
+    sink: &str,
+) -> anyhow::Result<&'a UdpSocket> {
+    if addr.is_ipv4() {
+        return Ok(v4);
+    }
+    match v6 {
+        Some(socket) => Ok(socket),
+        slot @ None => Ok(slot.insert(bind_udp("[::]:0", sink, "IPv6").context(Fault::Clean)?)),
     }
 }
 
@@ -526,6 +527,37 @@ mod tests {
         assert_eq!(pick_addr([]), None, "nothing to send to: resolution's error");
     }
 
+    /// The socket choice behind `UdpDest::resolve`, with no packet sent, so it runs where IPv6
+    /// loopback isn't routable. An IPv4 answer uses the IPv4 socket and binds no IPv6 one; an
+    /// IPv6-only answer binds the IPv6 slot, or fails `Clean` naming it where the host has no
+    /// IPv6 at all. Never skipped.
+    #[tokio::test]
+    async fn resolution_selects_the_socket_of_the_chosen_address_family() {
+        let UdpDest::Sockets { v4, mut v6 } = UdpDest::bind("test_out").unwrap() else {
+            unreachable!("bind builds real sockets")
+        };
+        let v4_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let v6_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+
+        let chosen = pick_addr([v6_addr, v4_addr]).unwrap();
+        let socket = socket_for(chosen, &v4, &mut v6, "test_out").unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv4());
+        assert!(v6.is_none(), "an IPv4 answer binds no IPv6 socket");
+
+        let chosen = pick_addr([v6_addr]).unwrap();
+        match socket_for(chosen, &v4, &mut v6, "test_out") {
+            Ok(socket) => {
+                assert!(socket.local_addr().unwrap().is_ipv6());
+                assert!(v6.is_some(), "the IPv6 slot keeps the socket for later batches");
+            }
+            Err(err) => {
+                println!("this environment can't bind an IPv6 socket: {err:#}");
+                assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+                assert!(format!("{err:#}").contains("IPv6 UDP socket"), "{err:#}");
+            }
+        }
+    }
+
     /// Nothing reached the wire: an `EMSGSIZE` drop sends nothing, so the failure after it is
     /// `Clean`, and the dropped datagram's weight is counted.
     #[tokio::test]
@@ -602,11 +634,9 @@ mod tests {
         assert_eq!(counts, [Some(1), Some(1), Some(1)]);
     }
 
-    /// An entry over the cap never reaches the kernel. Every encoder caps its entries, so a debug
-    /// build stops at the `debug_assert!`; a release build drops the entry, counted in the
-    /// weight unit, and sends the entries around it.
+    /// An entry over the cap never reaches the kernel: it's dropped, counted in the weight unit,
+    /// and the entries around it are sent.
     #[tokio::test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "over the 4-byte cap"))]
     async fn an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent() {
         let script = ScriptedDest::new([]);
         let mut probe = TelemetryProbe::new();
@@ -622,9 +652,7 @@ mod tests {
 
     /// An over-cap entry is an encode-side drop: a repeat encode of the batch skips it without
     /// counting it again, while an `EMSGSIZE` is the kernel's answer to this attempt and counts.
-    /// Reaches the skip only in a release build, as the test above does.
     #[tokio::test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "over the 4-byte cap"))]
     async fn a_repeat_encode_skips_an_over_cap_entry_uncounted_and_counts_an_emsgsize() {
         let script = ScriptedDest::new([SendStep::TooLarge]);
         let mut probe = TelemetryProbe::new();
@@ -778,18 +806,19 @@ mod tests {
 
         /// Splitting a datagram on `\n` doesn't recover its entries (an entry can hold one), so
         /// the entry boundaries are checked against the counts the packer reports per datagram.
+        /// The cap is drawn apart from the entries, so some cases hold entries over it, which
+        /// must be dropped and counted, and the rest packed as if they weren't there.
         #[test]
         fn packing_never_exceeds_the_cap_never_splits_an_entry_and_reconciles(
             batch in prop::collection::vec((arb_entry(), 1usize..=5), 0..40),
-            slack in 0usize..60,
+            cap in 1usize..48,
         ) {
-            let cap = batch.iter().map(|(entry, _)| entry.len()).max().unwrap_or(1) + slack;
             let mut buf = MessageBuf::<usize>::default();
             for (entry, weight) in &batch {
                 buf.push_with(entry, *weight);
             }
             let script = ScriptedDest::new([]);
-            let probe = TelemetryProbe::new();
+            let mut probe = TelemetryProbe::new();
             let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
             let (sent, result) = runtime.block_on(send(
                 packed(&buf, cap),
@@ -807,8 +836,14 @@ mod tests {
                 prop_assert!(datagram.len() <= cap, "{} bytes, cap {cap}", datagram.len());
                 prop_assert!(datagram[0] != b'\n' && datagram[datagram.len() - 1] != b'\n');
             }
-            let entries: Vec<&[u8]> = batch.iter().map(|(entry, _)| entry.as_slice()).collect();
+            // Over-cap entries are absent from every datagram; the rest appear in order.
+            let (kept, over): (Vec<_>, Vec<_>) =
+                batch.iter().partition(|(entry, _)| entry.len() <= cap);
+            let entries: Vec<&[u8]> = kept.iter().map(|(entry, _)| entry.as_slice()).collect();
             prop_assert_eq!(datagrams.join(&b'\n'), entries.join(&b'\n'));
+            let over_weight: usize = over.iter().map(|(_, weight)| weight).sum();
+            let dropped = probe.sum("logit.output.messages.dropped", &OVERSIZE);
+            prop_assert_eq!(dropped, over_weight as f64, "over-cap weight counted");
 
             // Each datagram is a run of whole entries, as many as the packer said it holds, and
             // the next entry would not have fit.
@@ -825,7 +860,7 @@ mod tests {
             }
             prop_assert_eq!(next, entries.len());
 
-            let weight: usize = batch.iter().map(|(_, weight)| weight).sum();
+            let weight: usize = kept.iter().map(|(_, weight)| weight).sum();
             let expected = Sent { entries: entries.len(), weight, datagrams: datagrams.len() };
             prop_assert_eq!(sent, expected);
         }

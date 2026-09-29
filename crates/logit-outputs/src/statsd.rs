@@ -424,9 +424,9 @@ pub struct StatsdEncoder {
     format: Format,
     relative_gauges: bool,
     /// The longest line this encoder emits. A longer line is dropped whole
-    /// (`EncodeStats::dropped_oversize_line`), never truncated, since the UDP packer
-    /// (`StatsdOutput::send_udp`) could never fit it in a datagram. `usize::MAX` (the default,
-    /// and TCP's) is uncapped. `StatsdOutput` sets it once for its transport.
+    /// (`EncodeStats::dropped_oversize_line`), never truncated, since the datagram packer
+    /// (`crate::datagram::send_datagrams`) could never fit it in a datagram. `usize::MAX` (the
+    /// default, and TCP's) is uncapped. `StatsdOutput` sets it once for its transport.
     max_packet_bytes: usize,
     diag: Diagnostics,
     /// The current event's `|#k:v,k:v` tag segment, built once and shared across its metrics
@@ -1920,9 +1920,9 @@ fn build_lf_frame(lines: &MessageBuf, frame: &mut Vec<u8>) {
 }
 
 /// Packs `lines` into packets of at most `max_packet_bytes` (newline-joined, no trailing newline,
-/// as [`StatsdOutput::send_udp`] packs a datagram) and writes each into `frame` after its length as
-/// a 4-byte little-endian integer: the `unix_stream` framing. The encoder already dropped any line
-/// over the cap, so every line fits a packet alone.
+/// as [`crate::datagram::send_datagrams`] packs a datagram) and writes each into `frame` after its
+/// length as a 4-byte little-endian integer: the `unix_stream` framing. The encoder already dropped
+/// any line over the cap, so every line fits a packet alone.
 fn build_length_prefixed_frame(lines: &MessageBuf, max_packet_bytes: usize, frame: &mut Vec<u8>) {
     const PREFIX: usize = 4;
     fn close(frame: &mut [u8], start: usize) {

@@ -1485,7 +1485,7 @@ sinks (`otlp_out`, `prometheus_out`'s remote-write, `datadog_out`, `datadog_trac
 `splunk_hec_out`) still count their encode-side counters once per attempt (`docs/known-gaps.md`).
 
 `oversize_datagram` mixes two classes under one reason. The packer's skip of an entry over the cap,
-a release-build backstop no encoder reaches, is encode-side and counts once per batch; the kernel's
+a backstop no encoder reaches, is encode-side and counts once per batch; the kernel's
 `EMSGSIZE` counts on every attempt, so a batch retried after a later failure counts it again.
 `crates/logit-outputs/src/datagram.rs`'s module doc has the send side's rules.
 

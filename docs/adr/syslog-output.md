@@ -163,6 +163,15 @@ JSON-bodied message on every modern relay chain. An oversize MSG is truncated on
 boundary (never the header); an oversize header (only reachable with an absurdly small
 `max_message_bytes`) drops the whole message instead of emitting a malformed one.
 
+**Amendment (2026-09-29): over UDP the bound is at most 65507.** A UDP message is one datagram,
+and the kernel refuses a UDP payload over 65507 bytes with `EMSGSIZE`, which dropped the whole
+message. `SyslogOutput::with_encoder` now caps the encoder at `min(max_message_bytes, 65507)` under
+`transport: udp`, so a longer message is truncated by the rule above and counted
+`logit.output.messages.truncated`, and an operator's `max_message_bytes` above 65507 has no further
+effect over UDP. TCP is unchanged
+([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decision 9).
+
 ### No `logit_proto::Encoder`
 
 That trait returns one opaque `Bytes` per batch with no framing metadata, which cannot express

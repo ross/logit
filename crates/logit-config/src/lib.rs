@@ -594,8 +594,9 @@ fn default_span_sample_rate() -> f64 {
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics, over UDP (the default), TCP, or a Unix socket.
     ///
-    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path under
-    /// `unix`/`unix_stream` (the Datadog Agent's is `/var/run/datadog/dsd.socket`). The directory
+    /// `bind` is a `host:port` under `udp`/`tcp`, and the socket file's absolute path, shorter than
+    /// 108 bytes, under `unix`/`unix_stream` (the Datadog Agent's is
+    /// `/var/run/datadog/dsd.socket`). The directory
     /// must exist; a stale socket file left by an earlier run is replaced, and anything else at the
     /// path is refused. The socket file is made mode `0722`, as the Agent's is, so a client running
     /// as any user can send; restrict access with the directory's permissions. To listen on UDP and
@@ -1961,7 +1962,10 @@ pub enum ComponentKind {
         app_name: Option<String>,
         /// Bounds one encoded message (PRI + header + MSG). A byte-count string. Defaults to
         /// `"8192"`, Grafana Alloy's syslog receiver default, rather than RFC 3164's traditional
-        /// 1024, which would truncate a JSON-bodied message on every modern relay chain.
+        /// 1024, which would truncate a JSON-bodied message on every modern relay chain. Under
+        /// `transport: udp` a message is bounded by the smaller of this and `65507`, the largest
+        /// UDP payload; a longer one is truncated and counted
+        /// `logit.output.messages.truncated`.
         #[serde(default = "default_max_message_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_message_bytes: u64,
@@ -2929,8 +2933,8 @@ pub struct SyslogStructuredData {
 /// it. A TCP message is one LF-delimited line in both directions.
 ///
 /// `unix` and `unix_stream` are the Datadog Agent's two DogStatsD Unix sockets. Under either,
-/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, not a
-/// `host:port`, and `tls:` is rejected.
+/// `statsd_in`'s `bind` and `statsd_out`'s `endpoint` are the socket's absolute path, shorter than
+/// 108 bytes, not a `host:port`, and `tls:` is rejected.
 // Its own enum rather than a shared one: schemars publishes a type's name into the schema's
 // `$defs`, so sharing would document this transport by pointing at a syslog-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
