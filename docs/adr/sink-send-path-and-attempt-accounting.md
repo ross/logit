@@ -86,10 +86,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
      again, because each attempt got its own answer. Counting them once would need the sink to
      remember what an earlier attempt learned, and a retry might get a different answer. The
      datagram packer's skip of an entry over the cap joins this class (decision 9), though no
-     peer decided it. An `EMSGSIZE` drop repeats in two sequences: drops followed by a failure before any datagram of
-     the attempt was sent, under either posture, since that failure is `Clean` and `Clean` retries
-     under both; and any `Ambiguous` retry under `at_least_once`, which is `graphite_out`'s
-     default.
+     peer decided it. An `EMSGSIZE` drop repeats in two sequences: drops followed by a failure
+     before any datagram of the attempt was sent, under either posture, since that failure is
+     `Clean` and `Clean` retries under both; and any `Ambiguous` retry under `at_least_once`,
+     which is `graphite_out`'s default.
 
    `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
    repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
