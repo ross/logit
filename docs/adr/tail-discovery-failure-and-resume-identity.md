@@ -442,14 +442,21 @@ run in about 1.4 s, and 1000 in about 23 s. Seven driver mutations (the reap gra
 dirtying the checkpoint, the rotation count, the head check, the pending-bytes subtraction, the
 rebind's ownership check, the link-count check) each fail it.
 
-The model found two driver bugs before it was committed, both fixed here, each with a
-hand-driven test in `driver.rs` and a replay through the harness:
+The model found three driver bugs, all fixed here, each with a hand-driven test in `driver.rs`;
+the first and third are also replayed through the harness:
 
 - **A rebind never checked for truncation.** A file retired by a `stat` that raced a rename, then
-  truncated in place (`copytruncate`) and refilled past its old offset before the scan that
-  rebinds it, was read from that offset: a mid-line fragment emitted as a line, and the refill's
-  first lines lost. The rebind now runs the same-path arm's truncation check against the scan's
-  `stat`.
+  truncated in place (`copytruncate`) and still shorter than its old offset at the scan that
+  rebinds it, kept that offset: once refilled past it, it was read from mid-line, a fragment
+  emitted as a line and the refill's first lines lost. The rebind now runs the same-path arm's
+  truncation check against the scan's `stat`.
+- **Nothing checked a draining file for truncation.** A `Draining` file is bound to no path, so
+  neither the scan's truncation checks nor a data wake reached it, and a refill after the
+  truncation but before a rebind (or before the reap, with no rebind) was read from the old
+  offset. Every scan now `fstat`s each `Draining` file's handle, and `drain` does before each read
+  of one; only a refill past the offset before the first such check stays unseen, the documented
+  size-detection gap. The model's `CopyTruncate` always scans before any append, so that gap
+  can't occur in it.
 - **The rotation arm ignored an unspent checkpoint entry.** An inode whose entry survived a
   restart unspent (its `stat` failed), then rotated onto a path still bound to another inode,
   was opened at `0` and replayed, but only in the scan order where that path was reached before

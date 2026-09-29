@@ -209,7 +209,8 @@ that matches a file both before and after a rename (`app.log*` matching both `ap
 so no duplicate re-emission occurs. The rebind runs the same truncation check against the new
 path's length (amended 2026-09-28): an inode retired by a `stat` that raced a rename, then
 truncated in place before the scan that rebinds it, would otherwise keep its old offset and be
-read from mid-line once refilled past it.
+read from mid-line once refilled past it. For the same reason a draining file, bound to no path,
+has its handle's length checked at every scan and before each `drain` read of it.
 
 ### Checkpoints: optional, written on an interval, only when dirty
 
