@@ -5,16 +5,19 @@
 //! A caller builds the frame with its own framing and counts its own encode-side and per-message
 //! results; [`PooledStream::send`] sees only the bytes. The driver owns the rest:
 //!
-//! | Where it fails | Fault | Retried inside `send` |
-//! |---|---|---|
-//! | Dial: TCP connect, TLS handshake, or Unix connect, each under `connect_timeout` | `Clean` | no |
-//! | Probe of a reused connection says anything but open | none; the driver redials | the redial doesn't consume the retry |
-//! | Plaintext first `write`: `Err`, or `Ok(0)` read as `WriteZero` | `Clean` | once, on a fresh connection |
-//! | TLS first `write`: `Err` | `Ambiguous` | no |
-//! | `write_all` of the remainder, or `flush` | `Ambiguous` | no |
+//! - **Dial** (TCP connect, TLS handshake, or Unix connect, each under `connect_timeout`):
+//!   `Fault::Clean`, not retried inside `send`.
+//! - **Probe of a reused connection** answers anything but open: no fault; the driver redials, and
+//!   the redial doesn't consume the retry.
+//! - **Plaintext first `write`** fails (`Err`, or `Ok(0)` read as `WriteZero`): retried once on
+//!   a fresh connection; a second failure is `Fault::Clean`.
+//! - **TLS first `write`** fails: `Fault::Ambiguous`, never retried.
+//! - **`write_all` of the remainder, or `flush`**, fails: `Fault::Ambiguous`, never retried.
 //!
-//! A TLS write `Err` is `Ambiguous` because rustls may have put whole records on the wire first,
-//! and a line or message stream's receiver keeps every complete line in them
+//! A TLS write `Err` is `Ambiguous` because rustls may have put whole records on the wire first.
+//! rustls splits what each session write accepted into records of at most 16384 bytes of
+//! plaintext, with no regard for line or message boundaries, so a record can end mid-line, but a
+//! line or message stream's receiver keeps every complete line or message in what arrived
 //! (`crate::stream_pins` pins the tokio-rustls side). `flush` runs before a connection is pooled
 //! and before `Ok`, because a TLS write's `Ok` can leave ciphertext queued in the session.
 //!

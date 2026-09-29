@@ -42,7 +42,7 @@
 //!   `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled diagnostic, and
 //!   sending continues. Any other UDP send error is [`Fault::Clean`] if no datagram of the batch
 //!   was sent yet, else [`Fault::Ambiguous`].
-//! - TCP: `crate::stream`'s module doc has the fault table. A connect failure or timeout is
+//! - TCP: `crate::stream`'s module doc lists the fault rules. A connect failure or timeout is
 //!   [`Fault::Clean`]. A first write that accepted nothing is retried once on a fresh connection.
 //!   A failure after a byte left, or of the flush, is [`Fault::Ambiguous`] and never retried by
 //!   this sink.

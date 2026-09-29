@@ -161,8 +161,8 @@
 //! after the first counts `logit.output.reconnects`, TLS or plaintext.
 //!
 //! TCP sends one octet-counted frame per batch through the pooled-stream driver in
-//! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc has the fault
-//! table. On TLS a write `Err` is `Fault::Ambiguous` and never retried, and on both a batch is
+//! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
+//! fault rules. On TLS a write `Err` is `Fault::Ambiguous` and never retried, and on both a batch is
 //! called delivered only after a flush. Both transports count `logit.output.requests` tagged
 //! `class=ok|clean|ambiguous|permanent`.
 
@@ -1940,9 +1940,9 @@ mod tests {
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
     }
 
-    /// The reuse probe (`crate::stream::PooledStream::send`): a message sent after the receiver closed the
-    /// pooled connection still arrives. Asserted at the collector, since a write into a FIN'd
-    /// socket succeeds locally and `send` would return `Ok` either way.
+    /// The reuse probe (`crate::stream::PooledStream::send`): a message sent after the receiver
+    /// closed the pooled connection still arrives. Asserted at the collector, since a write into a
+    /// FIN'd socket succeeds locally and `send` would return `Ok` either way.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {

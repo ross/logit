@@ -190,7 +190,7 @@
 //! connect after the first counts `logit.output.reconnects`, on TLS and plaintext alike.
 //!
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
-//! and `graphite_out`; its module doc has the fault table. On TLS a write `Err` is
+//! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
 //! `Fault::Ambiguous` and never retried, since a resend would increment a counter twice
 //! ([`StatsdOutput::duplicate_safe`]). Every transport counts `logit.output.requests` tagged
 //! `class=ok|clean|ambiguous|permanent`.
