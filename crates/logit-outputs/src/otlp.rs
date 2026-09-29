@@ -1279,29 +1279,36 @@ mod tests {
         );
     }
 
-    /// Also captures the framed request body, to inspect the compressed flag and payload.
-    async fn canned_grpc_server_capturing_request(
-    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Option<(HeaderMap, Bytes)>>>) {
+    /// Every request a [`recording_grpc_server`] received: its headers and framed body.
+    type GrpcLog = Arc<std::sync::Mutex<Vec<(HeaderMap, Bytes)>>>;
+
+    /// An HTTP/2 peer answering the `n`th call with `grpc-status` `statuses[n]`, the last to every
+    /// later one, and recording each request's headers and framed body.
+    async fn recording_grpc_server(statuses: &'static [u32]) -> (std::net::SocketAddr, GrpcLog) {
         use hyper::service::service_fn;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let captured = Arc::new(std::sync::Mutex::new(None));
-        let captured_task = captured.clone();
+        let log: GrpcLog = Arc::default();
+        let task_log = log.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { return };
-                let io = TokioIo::new(stream);
-                let captured = captured_task.clone();
+                let log = task_log.clone();
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
-                        let captured = captured.clone();
+                        let log = log.clone();
                         async move {
                             let headers = req.headers().clone();
                             let body = req.into_body().collect().await.unwrap().to_bytes();
-                            *captured.lock().unwrap() = Some((headers, body));
+                            let n = {
+                                let mut log = log.lock().unwrap();
+                                log.push((headers, body));
+                                log.len() - 1
+                            };
+                            let status = statuses[n.min(statuses.len() - 1)];
                             let mut trailers = HeaderMap::new();
-                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            trailers.insert("grpc-status", status.to_string().parse().unwrap());
                             let resp_body = TestGrpcBody {
                                 data: Some(Bytes::from(grpc_frame(&[], false))),
                                 trailers: Some(trailers),
@@ -1316,12 +1323,18 @@ mod tests {
                         }
                     });
                     let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                        .serve_connection(io, svc)
+                        .serve_connection(TokioIo::new(stream), svc)
                         .await;
                 });
             }
         });
-        (addr, captured)
+        (addr, log)
+    }
+
+    /// Always answers `grpc-status: 0`, recording the framed request body, to inspect the
+    /// compressed flag and payload.
+    async fn canned_grpc_server_capturing_request() -> (std::net::SocketAddr, GrpcLog) {
+        recording_grpc_server(&[0]).await
     }
 
     #[tokio::test]
@@ -1331,7 +1344,7 @@ mod tests {
         output.send(&metric_batch()).await.expect("should succeed");
 
         let (headers, body) =
-            captured.lock().unwrap().clone().expect("request should have been captured");
+            captured.lock().unwrap().last().cloned().expect("request should have been captured");
         assert_eq!(headers.get("grpc-encoding").map(|v| v.to_str().unwrap()), Some("gzip"));
         assert_eq!(body[0], 1, "the frame's compressed flag should be set");
 
@@ -1355,7 +1368,7 @@ mod tests {
         output.send(&metric_batch()).await.expect("should succeed");
 
         let (headers, body) =
-            captured.lock().unwrap().clone().expect("request should have been captured");
+            captured.lock().unwrap().last().cloned().expect("request should have been captured");
         assert!(headers.get("grpc-encoding").is_none());
         assert_eq!(body[0], 0, "the frame's compressed flag should not be set");
     }
@@ -1840,56 +1853,6 @@ mod tests {
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &[]);
     }
 
-    /// A gRPC receiver answering the `n`th call with `statuses[n]`, the last to every later one;
-    /// and the framed request bodies it received.
-    async fn scripted_grpc(
-        statuses: &'static [u32],
-    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<Bytes>>>) {
-        use hyper::service::service_fn;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let bodies: Arc<std::sync::Mutex<Vec<Bytes>>> = Arc::default();
-        let task_bodies = bodies.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
-                let bodies = task_bodies.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
-                        let bodies = bodies.clone();
-                        async move {
-                            let body = req.into_body().collect().await.unwrap().to_bytes();
-                            let n = {
-                                let mut bodies = bodies.lock().unwrap();
-                                bodies.push(body);
-                                bodies.len() - 1
-                            };
-                            let status = statuses[n.min(statuses.len() - 1)];
-                            let mut trailers = HeaderMap::new();
-                            trailers.insert("grpc-status", status.to_string().parse().unwrap());
-                            let resp_body = TestGrpcBody {
-                                data: Some(Bytes::from(grpc_frame(&[], false))),
-                                trailers: Some(trailers),
-                            };
-                            Ok::<_, std::convert::Infallible>(
-                                http::Response::builder()
-                                    .status(200)
-                                    .header("content-type", "application/grpc+proto")
-                                    .body(resp_body)
-                                    .unwrap(),
-                            )
-                        }
-                    });
-                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-        (addr, bodies)
-    }
-
     /// The gRPC transport runs the same encode: `UNAVAILABLE` then `OK` counts encode-side once
     /// and resends the same bytes.
     #[tokio::test]
@@ -1898,7 +1861,7 @@ mod tests {
         let mut sent = Vec::new();
         let scripts: [&'static [u32]; 2] = [&[0], &[14, 0]];
         for statuses in scripts {
-            let (addr, bodies) = scripted_grpc(statuses).await;
+            let (addr, log) = recording_grpc_server(statuses).await;
             let mut probe = TelemetryProbe::new();
             let mut output = instrumented(grpc_output(addr), &probe);
             let batches = vec![encode_side_batch()];
@@ -1906,7 +1869,7 @@ mod tests {
                 sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying())
                     .await,
             );
-            sent.push(bodies.lock().unwrap().clone());
+            sent.push(log.lock().unwrap().iter().map(|(_, body)| body.clone()).collect::<Vec<_>>());
         }
         let (single, retried) = (&runs[0], &runs[1]);
         let unavailable = [("signal", "metrics"), ("class", "unavailable")];
