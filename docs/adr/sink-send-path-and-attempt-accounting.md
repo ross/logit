@@ -1,0 +1,309 @@
+---
+created: 2026-09-29
+updated: 2026-09-29
+---
+
+# Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
+
+## Status
+Accepted
+
+## Context
+
+`docs/plans/critical-sections-inventory.md` groups nine entries as cluster 6, "Sink send path":
+
+- SINK-01, SINK-02, and SINK-03 cover the pooled-TCP send machine that `statsd_out`,
+  `syslog_out`, and `graphite_out` each carry a copy of, its dial, and the half-open probe.
+- SINK-04 covers UDP datagram packing and `EMSGSIZE` handling.
+- SINK-05 and SINK-06 cover the `Output` trait contract and encode-side counters emitted per
+  `send`.
+- WIRE-08 and WIRE-09 cover `logit_out`'s send path and the close probe.
+- RT-05 covers `deliver_with_retry` and `backoff_for`.
+
+Top leads 12 and 14 sit on the same code. Read-only passes checked the entries against `main`
+and against the pinned sources of tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. They
+found the following.
+
+- **A TLS write can return before its bytes are queued for the socket (WIRE-08).**
+  tokio-rustls's `poll_write` returns `Ok(n)` with up to 64 KiB of ciphertext still queued in
+  the session whenever a socket write goes `Pending`, and `poll_read` never drives writes.
+  `logit_out` writes a frame and then waits for an `Ack` without calling `flush()`. Under TLS the
+  peer never receives the queued tail, so the wait ends in a timeout, classified `Ambiguous`.
+  Under the default `at_most_once` posture that drops a batch the peer never saw. The same shape
+  exists at `Hello`/`HelloAck`. `logit_in`'s unflushed `Ack` and `Reject` writes have the same
+  shape but weren't traced.
+- **The `logit_out` first-write verdict has the wrong premise and the right answer (WIRE-08).**
+  `send` classifies a first-write `Err` as `Fault::Clean` on the premise that nothing left the
+  host, and discards the `io::Error`. Under TLS an `Err` can follow bytes of this frame reaching
+  the wire. The verdict is still safe, because the peer then holds a truncated frame it can't
+  forward.
+- **The pooled-TCP send machine exists in three drifting copies (SINK-01, SINK-02).**
+  `graphite_out` has no `flush()`, no `is_tls` guard, no `logit.output.reconnects`, and a
+  concrete `TcpStream` with no injection point for a test. `statsd_out` and `syslog_out` classify
+  an invalid TLS server name as `Fault::Clean`, so a bad endpoint retries to budget exhaustion on
+  every batch.
+- **`logit.output.requests` means different things per sink (WIRE-08).** The three line sinks
+  use `class=ok|error` and count connect failures. `logit_out` uses four fault classes and skips
+  connect, handshake, frame-encode, and all three too-large returns.
+- **Encode-side counters repeat on every retry (SINK-06, lead 12).** Every sink re-encodes per
+  attempt and re-emits its drop and normalization counters. Codecs that emit their own counters
+  (graphite, collectd, OTLP, Prometheus, Datadog, Splunk) do the same through the `Telemetry`
+  handle. `datadog_out` also reads the clock per attempt, so its stale-point drops can differ
+  between attempts of one batch.
+- **`retry_max_delay: 0s` spins (RT-05).** It's operator-reachable and unvalidated.
+  `backoff_for` returns 0 and `deliver_with_retry` loops until the budget ends.
+- **The UDP packer trusts the encoder's cap (SINK-04).** It appends an entry of any length into
+  an empty buffer. `is_message_too_large` is four copies whose `InvalidInput` fallback swallows
+  errors that aren't `EMSGSIZE`. `collectd_out` accepts `max_packet_bytes` up to 65535, but a UDP
+  payload can't exceed 65507. The four UDP sinks bind `0.0.0.0:0` and use the first resolved
+  address, so an IPv6 endpoint fails `Clean` on every batch.
+- **Prose that is wrong (SINK-03, WIRE-09).** `poll_pending_close`'s doc says a `Pending` poll
+  consumes nothing and that a cancelled read loses data. A `Pending` poll can move a partial
+  record from the socket into the TLS session, and a cancelled read loses nothing. The behavior
+  is sound: the session keeps the record, and the probe never drops the stream on `Pending`.
+  The statsd and syslog claim that each record is a run of complete lines is wrong for the same
+  reason.
+- **`observe_batch` runs once per batch (SINK-05).** The trait doc and `LogitOutput`'s doc say
+  once per attempt. `write_loop` calls it before `deliver_with_retry`.
+
+The transport counters, and the drop counters a peer's verdict produces, are per attempt by
+nature. The encode-side counters are the only ones that measure the batch and not the attempt.
+
+## Decision
+
+1. **Sink counters fall into three classes, and each class has one rule.**
+   - **Encode-side** counters describe the batch: `logit.output.messages.dropped` for a reason
+     the encoder decided, `logit.output.tags.dropped`, `logit.output.batch.bytes`, normalization
+     counts, and the counters a codec emits inside `encode_into`. They count once per batch,
+     however many attempts it takes.
+   - **Transport** counters describe an attempt: `logit.output.requests`,
+     `logit.output.request.duration`, `logit.output.ack.duration`, and
+     `logit.output.request.bytes`. They count once per attempt.
+   - **Server-verdict and kernel drops** count what a peer or the kernel refused on an attempt:
+     a Splunk code 6 and the oversize split, an HTTP 413, an OTLP `partial_success`, and
+     `EMSGSIZE`. They count per attempt. A batch retried after such a verdict counts the verdict
+     again, because each attempt got its own answer. Counting them once would need the sink to
+     remember what an earlier attempt learned, and a retry might get a different answer.
+
+   `docs/design/internal-telemetry.md` and `docs/deploying.md` state the third class's
+   repetition, so an operator reading a drop counter on an unhealthy sink knows what it measures.
+2. **A sink-owned gate makes encode-side counters count once per batch.**
+   - `Output::observe_batch`, which `write_loop` calls once per batch before its retry loop,
+     resets a gate the sink owns.
+   - The sink closes the gate after the first encode of each unit. A unit is a batch, or a route
+     for `datadog_out` and `datadog_trace_out`, which encode each route lazily and can encode one
+     route after an await that another attempt already passed.
+   - Codecs count through a gated view of `Telemetry`. While the gate is closed, the view drops
+     `count` calls and skips the diagnostic throttle bump, so a repeated warning doesn't advance
+     the throttle's window for an attempt that reports nothing.
+   - The gate defaults to open. A caller of `send` that never calls `observe_batch` (a unit test,
+     a tool) sees today's behavior.
+   - `Output` gains no method and no parameter.
+
+   `datadog_out`'s `split_encode` bisection re-encodes count through the same gated view, so a
+   bisection triggered by a retry doesn't count a second time.
+3. **`datadog_out` fixes `now` once per batch, in `observe_batch`.** Staleness isn't monotonic
+   in `now`: a point is stale when it's older than `METRIC_MAX_AGE` or more than
+   `METRIC_MAX_AHEAD` in the future. With a clock read per attempt, a point that was ahead of the
+   window on attempt 1 can fall inside it on attempt 2, so the sink counts it dropped and later
+   delivers it. With one `now`, every attempt reaches the same verdict for every point. The
+   trade-off is that a batch retried for `retry_budget` can send a point up to that long past the
+   end of its window.
+4. **`logit.output.requests` counts every attempt that returns, tagged
+   `class=ok|clean|ambiguous|permanent`.** This applies to `statsd_out`, `syslog_out`,
+   `graphite_out`, `collectd_out`, and `logit_out`, so the label set is the one `Fault` defines.
+   - A connect failure, a handshake failure, and a too-large return are attempts and count.
+     `logit_out`'s pre-connect too-large `Permanent` counts as `class=permanent`, and the docs
+     say so.
+   - An empty batch that returns before any I/O isn't an attempt and doesn't count.
+   - A cancelled attempt (a budget timeout or the shutdown grace dropping the future) is
+     uncounted at the sink, because a dropped future can't run code after its last await.
+     `logit.component.errors` and the drop counters cover it.
+   - `logit.output.request.duration` records on a cancelled attempt, because its timer records
+     in `Drop`. `requests` doesn't. The docs say so, and the code doesn't change.
+
+   The HTTP sinks' `requests` vocabulary differs from this one. Aligning it is follow-up work
+   outside this decision.
+5. **`statsd_out`, `syslog_out`, and `graphite_out` share one pooled-stream driver.** The
+   callers build the frame and count their own encode-side and per-message results. The driver
+   takes `&[u8]` and owns:
+   - the dial (TCP, TCP with TLS, and Unix stream), through a free `connect` function;
+   - the probe on a reused connection (`poll_pending_close`);
+   - the first `write` followed by `write_all` for the remainder;
+   - the `flush` after the write;
+   - one reconnect on a plaintext first-write failure;
+   - fault classification;
+   - `logit.output.reconnects` and `logit.output.requests`.
+
+   `graphite_out` gains the `flush` and `logit.output.reconnects` it lacks. The driver's
+   connection holds a `has_connected_once` flag so the first dial doesn't count as a reconnect.
+   `logit_out` keeps its own `send` and calls the shared `connect`. Its protocol is framed and
+   acked: it must interleave a `Hello` exchange, read a reply before it can classify a write's
+   outcome, and check `Ack.seq`. The driver's one-write, one-flush shape would need those
+   hooks, and they'd be a second protocol inside a shared component. Sharing the dial without
+   sharing the send keeps the drift risk in the part that was copied, which is the dial.
+6. **The fault rule for a write depends on the transport and on the protocol's framing.**
+   - On a plaintext line or message stream, a first-write `Err` is `Fault::Clean`. Nothing of
+     this frame reached the peer, so the driver reconnects once and retries the frame itself,
+     and a second failure returns `Clean` to `write_loop`.
+   - Under TLS, a write `Err` on a line or message stream is `Fault::Ambiguous`. The session may
+     have put a record on the wire before the error, and the peer may forward the complete lines
+     inside it.
+   - On `logit_out`, a first-write `Err` is `Fault::Clean` under TLS and plaintext alike, and a
+     `write_all` `Err` after a first write that returned `Ok` stays `Ambiguous`. `Clean` holds
+     under TLS even though bytes of the frame may have reached the wire, because the peer then
+     holds a truncated frame that it can't decode or forward. The sink keeps the `io::Error` as
+     context and doesn't discard it.
+
+   The difference between the line sinks and `logit_out` is framing. A line stream has no frame
+   boundary the peer waits for: any prefix that ends at a newline is a complete record it
+   forwards. A `logit_out` frame carries a length and a CRC-32C, so a prefix is never forwarded.
+7. **`logit_out` calls `flush()` after the frame write and after the `Hello` write, before it
+   waits for a reply.** Without the flush, the failure in the Context section follows. tokio-rustls
+   0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued in the session, and
+   `poll_read` doesn't drive the writes that queued it. So the peer never receives the tail of
+   the frame or the `Hello`, and the sink waits for a reply the peer can't send. The timeout is
+   `Ambiguous`, and under `at_most_once` it drops a batch the peer never received. The
+   handshake shape is the same: a `Hello` split across a `Pending` socket write stalls the
+   `HelloAck` wait. A flush after the write closes both. Plaintext `TcpStream::flush` is a no-op,
+   so the flush costs nothing off TLS.
+8. **Third-party semantics are pinned by tests, and a dependency bump re-verifies them.** The
+   design rests on facts about tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. Tests run
+   against a real TLS pair over `tokio::io::duplex` with a small buffer, which makes a mid-record
+   `Pending` deterministic. A bump of any of the three crates is a trigger to re-run them and
+   re-read the sources. The pinned facts are:
+   - `poll_write` returns `Ok(n)` with ciphertext still queued whenever the socket write goes
+     `Pending`, up to 64 KiB.
+   - `poll_flush` drives that queue to the socket.
+   - `poll_read` never drives writes, so a reader waiting for a reply doesn't push out an
+     unflushed request.
+   - A `Pending` `poll_read` can move a partial record into the session. The session keeps it,
+     and a later read completes the record.
+   - Dropping a read future loses nothing the session already holds.
+   - A fake stream that returns `Ok(0)` under tokio-rustls returns `Pending` and registers no
+     waker, so the plaintext seam takes a `FakeStream` and TLS tests take the real pair.
+
+   Each fact gets a test.
+9. **`statsd_out` and `graphite_out` share one datagram packer, and the four UDP sinks share one
+   errno helper.**
+   - The packer is generic over entry weight (entries for statsd, datapoints for graphite) and
+     sends through a destination seam that tests can make fail. The seam keeps `UnixDest`'s
+     reconnect-once rule, so the Unix datagram transport uses the same packer.
+   - The over-cap scan runs as a pre-pass before any I/O. An entry longer than the datagram cap
+     is dropped and counted `oversize_datagram` up front, an encode-side count that goes through
+     decision 2's gate, so the packer never emits a datagram
+     over the cap and a partial batch never depends on where the oversize entry falls.
+   - `is_message_too_large` is one function that tests `EMSGSIZE`. The `InvalidInput` fallback
+     is removed. It only ever caught `EINVAL`, and it counted unrelated errors as an oversize
+     datagram.
+   - The datagram ceiling is 65507 bytes, the largest UDP payload over IPv4. `collectd_out`'s
+     `max_packet_bytes` bound becomes 65507, and `statsd_out` and `graphite_out` get the same
+     bound.
+   - A UDP sink binds its socket by the resolved address's family, so an IPv6 endpoint works.
+     A name that resolves to `::1` first no longer fails `Clean` on every batch.
+   - `syslog_out` sends one datagram per message and `collectd_out` sends the codec's datagrams
+     unpacked. They use the shared errno helper and not the packer.
+10. **Config validation rejects the values that make retry spin or a bad endpoint retry forever.**
+    - A graph rule rejects `retry_budget: 0s` and `retry_max_delay: 0s`, as the graph does for
+      other durations where zero breaks the component. `backoff_for` isn't floored at
+      `base_delay`: a floor would override a `retry_max_delay` an operator set below 200 ms,
+      which is a valid choice.
+    - Each TLS sink parses the endpoint's server name once, in `with_tls`, and stores the
+      parsed target. A bad endpoint fails startup, not every batch. If a name
+      still fails to parse at the send path, the fallback classification is `Fault::Permanent`,
+      not `Clean`, so it doesn't retry to budget exhaustion.
+
+## Alternatives considered
+
+- **A runtime-set attempt number on the component's `Telemetry` handle, with encode-side counts
+  muted after attempt 1.** Rejected. It loses counts wherever encoding follows an await:
+  `datadog_out` and `datadog_trace_out` encode per route, lazily, so a route first encoded on
+  attempt 2 would be muted although nothing counted it on attempt 1. Its appeal, no per-sink
+  state, doesn't survive that case.
+- **An attempt parameter on `Output::send`.** Rejected. It changes every implementation and every
+  call site, including tests that call `send` directly, for a fact only the sinks with
+  encode-side counters need.
+- **Memoizing the encoded bytes per batch.** Rejected. It moves the counting problem to a cache
+  that must be invalidated per batch and held across a `Delivered` that may be shared. It also
+  doesn't cover codec counters that are emitted as a side effect of encoding and never appear in
+  the bytes.
+- **Counting server-verdict drops once per batch.** Rejected. See decision 1: each attempt gets
+  its own verdict, and a later attempt can get a different one.
+- **A per-attempt clock in `datadog_out`, with the gated view alone covering counters.**
+  Rejected. The stale verdict can flip between attempts, so a point can be counted dropped and
+  still be sent.
+- **Merging `logit_out` into the shared driver.** Rejected. See decision 5.
+- **Treating a TLS first-write `Err` on `logit_out` as `Ambiguous`, as the line sinks do.**
+  Rejected. The peer can't forward a truncated frame, so the batch was never received, and
+  `Ambiguous` would drop it under `at_most_once` for no reason.
+- **Flooring `backoff_for` at `base_delay`.** Rejected. See decision 10.
+
+## Consequences
+
+- One pooled-stream driver and one datagram packer replace three and two copies. A fix to a fault
+  arm or to packing lands once, and each driver test covers three sinks.
+- A sink with encode-side counters owns a gate and closes it after each unit's first encode. A
+  new sink or codec that counts encode-side must count through the gated view. A test that runs
+  a sink through `write_loop` with a first attempt that fails `Clean` must match the counters of
+  a single-attempt run, and each sink gets one.
+- `logit.output.requests` gains the classes `clean`, `ambiguous`, and `permanent` on the line
+  sinks and `collectd_out`, and loses `error`. A dashboard or alert on `class="error"` needs to
+  change. This is a pre-release break with no alias.
+- `logit_out` gains a `flush()` after two writes. Under TLS that closes a stall that surfaced as
+  an `Ambiguous` timeout and a dropped batch. `logit_in`'s `Ack` and `Reject` writes may need the
+  same flush. That question is open until the `logit_out` workstream traces it.
+- `retry_budget: 0s` and `retry_max_delay: 0s` become validation errors. A config that sets
+  either fails to load.
+- `collectd_out` rejects `max_packet_bytes` above 65507 where it accepted up to 65535.
+- Encode-side counts lose their inflation on retry, and the drop counters read while a sink is
+  unhealthy stop growing by the attempt count. A server-verdict drop still grows with retries,
+  and decision 1 says so.
+- `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
+- The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
+  tokio.
+- Left open for later workstreams: the HTTP sinks' `requests` vocabulary, and whether
+  `logit_in`'s `Ack` and `Reject` writes need a flush.
+
+## Running it
+
+Each workstream fills in its subsection in the PR that lands it, and updates its inventory rows.
+No code from this record exists until a workstream lands it.
+
+### `sink/w1`: pinned TLS semantics and one fake stream (SINK-03, WIRE-09)
+
+`sink/w1` reads tokio-rustls 0.26.5 and rustls 0.23.45 in the dev container's cargo registry and
+pins decision 8's facts with tests against a real TLS pair. It adds one `FakeStream` in
+`crates/logit-outputs/src/test_support.rs` to replace the two drifted `FakeTlsStream` copies, a
+test module for `crates/logit-outputs/src/tls.rs`, and corrects `poll_pending_close`'s doc and
+the "complete lines" prose.
+
+### `sink/w2`: the pooled-stream driver (SINK-01, SINK-02)
+
+`sink/w2` lands decision 5's driver in `crates/logit-outputs/src/stream.rs`, moves `statsd_out`,
+`syslog_out`, and `graphite_out` onto it, and lands decision 4's counter classes and decision
+10's server-name parsing for those sinks.
+
+### `sink/w3`: `logit_out` (WIRE-08)
+
+`sink/w3` lands decisions 6 and 7 for `logit_out`: the flush after the `Hello` and frame writes,
+the rewritten first-write comment with the `io::Error` kept, the connection kept on a
+frame-encode failure, a strict compression byte, and decision 4's classes. It also traces
+`logit_in`'s `Ack` and `Reject` writes.
+
+### `sink/w4`: the datagram packer (SINK-04)
+
+`sink/w4` lands decision 9: `crates/logit-outputs/src/datagram.rs`, the shared packer and
+`is_message_too_large`, the 65507 ceiling, and binding by address family.
+
+### `sink/w5`: attempt accounting and backoff (SINK-05, SINK-06, RT-05)
+
+`sink/w5` lands decisions 1 to 3 in `crates/logit-pipeline/src/runtime.rs` and every sink: the
+gate, the gated `Telemetry` view, `datadog_out`'s per-batch `now`, and the graph rule from
+decision 10. It corrects the `Output::observe_batch` doc and the `duplicate_safe` docs that omit
+the `buffer.delivery` override.
+
+### `sink/w6`: close-out
+
+`sink/w6` adds the "Cancellation points" rows in `docs/design/pipeline-graph.md` for a dropped
+`write_all` on the pooled sinks and the datagram loop, updates `docs/known-gaps.md`,
+`docs/design/internal-telemetry.md`, and `docs/deploying.md`, and closes the inventory rows.
