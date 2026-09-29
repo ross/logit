@@ -22,7 +22,7 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   runtime *assumes* a rule holds (RT-14).
 - **"Observed concerns" are unverified.** They are leads a surveyor noticed while reading. Some
   will be wrong. A deep-dive session's first job is to refute or confirm them.
-- **Totals:** 135 entries — 43 P0, 62 P1, 30 P2. P0 = custom logic on the main data path where
+- **Totals:** 135 entries — 42 P0, 62 P1, 31 P2. P0 = custom logic on the main data path where
   being wrong means silent loss/duplication/corruption, a crash, a hang, or a remote DoS.
 - **Progress (2026-09-28, at `tailbk/w6`'s head):** 58 of 135
   entries done (34 P0, 20 P1, 4 P2): 54 with findings and four reviewed clean. The seven finished
@@ -1554,10 +1554,13 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`tail/driver/verification.rs`, 64 cases, 1000 run locally), whose model pins, after every op,
   what each scan retires, rebinds, opens, and finds truncated under the recorded `logrotate`
   sequences (a scan between each rotation step, a writer appending to the renamed inode, a
-  `copytruncate` copy) and under failed listings and `stat`s. It found one bug, fixed: a rebind
-  skipped the truncation check, so an inode retired by a `stat` race and then truncated and
-  refilled past its offset was read from mid-line
-  (`a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset`).
+  `copytruncate` copy) and under failed listings and `stat`s. It found two bugs, fixed. An inode
+  retired by a `stat` race and truncated in place kept its offset: the rebinding scan skipped the
+  truncation check though the file was still short
+  (`a_rebound_inode_truncated_while_draining_is_read_from_zero_not_from_its_stale_offset`), and
+  nothing checked a `Draining` file at all, so a refill before the rebind was read from mid-line.
+  Every scan now `fstat`s each draining file, and `drain` does before each read of one
+  (`a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero`).
   Named tests pin a rotation chain in all six scan orders, a two-inode swap, a `copytruncate` before
   any read, the orphan gaps at a restart and a crash, and `files.open` sampled at the scan.
 
