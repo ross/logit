@@ -865,3 +865,70 @@ pub(crate) async fn assert_direct_sends_count_after_an_empty_batch<O>(
         assert_eq!(second, 2.0 * first, "{name} {tags:?}: the second direct send wasn't counted");
     }
 }
+
+/// One request an [`http_recorder`] received, its body as it arrived (still compressed).
+#[derive(Clone, Debug)]
+pub(crate) struct Recorded {
+    pub(crate) path: String,
+    pub(crate) body: Vec<u8>,
+}
+
+/// How an [`http_recorder`] answers one request.
+pub(crate) enum Reply {
+    /// A status and a body.
+    Answer(u16, Vec<u8>),
+    /// No answer, ever: the request stays in flight until the client gives up on it.
+    Hang,
+}
+
+/// The requests an [`http_recorder`] received, in arrival order.
+pub(crate) type RecordLog = Arc<Mutex<Vec<Recorded>>>;
+
+/// An HTTP/1.1 server on `127.0.0.1` that records every request, then answers the `n`th (from 0)
+/// with `respond(n, path, body)`. A request is recorded before it is answered, so the log counts
+/// the attempts a sink made, a hung one included.
+pub(crate) async fn http_recorder(
+    respond: impl Fn(usize, &str, &[u8]) -> Reply + Send + Sync + 'static,
+) -> (SocketAddr, RecordLog) {
+    use http_body_util::BodyExt as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log: RecordLog = Arc::default();
+    let respond = Arc::new(respond);
+    let task_log = Arc::clone(&log);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (log, respond) = (Arc::clone(&task_log), Arc::clone(&respond));
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: http::Request<_>| {
+                    let (log, respond) = (Arc::clone(&log), Arc::clone(&respond));
+                    async move {
+                        let path = req.uri().path().to_string();
+                        let incoming: hyper::body::Incoming = req.into_body();
+                        let body = incoming.collect().await.unwrap().to_bytes().to_vec();
+                        let n = {
+                            let mut log = log.lock().unwrap();
+                            log.push(Recorded { path: path.clone(), body: body.clone() });
+                            log.len() - 1
+                        };
+                        let (status, body) = match respond(n, &path, &body) {
+                            Reply::Answer(status, body) => (status, body),
+                            Reply::Hang => std::future::pending().await,
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            http::Response::builder()
+                                .status(status)
+                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    (addr, log)
+}

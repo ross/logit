@@ -220,6 +220,7 @@
 //! mutual TLS, or `insecure_skip_verify` (which logs a startup warning). None of that gives the
 //! exposition server TLS.
 
+use crate::accounting::BatchAccounting;
 use crate::http::{
     body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
     status_class, ERROR_BODY_SNIPPET_BYTES,
@@ -233,7 +234,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
-use logit_pipeline::{Fault, Output};
+use logit_pipeline::{BatchContext, Fault, Output};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
@@ -518,13 +519,23 @@ impl From<RemoteWriteOutput> for PrometheusOutput {
     }
 }
 
-/// Pure delegation: every contract, [`Output::duplicate_safe`]'s included, is the mode's.
+/// Pure delegation: every contract, [`Output::duplicate_safe`]'s included, is the mode's. Every
+/// method is forwarded, [`Output::observe_batch`] too: `build_spec` boxes this enum, so a method
+/// left to the trait's default never reaches the mode (ADR `sink-send-path-and-attempt-accounting`,
+/// decision 2).
 #[async_trait::async_trait]
 impl Output for PrometheusOutput {
     async fn bind(&mut self) -> anyhow::Result<()> {
         match self {
             PrometheusOutput::Expose(output) => output.bind().await,
             PrometheusOutput::Send(output) => output.bind().await,
+        }
+    }
+
+    fn observe_batch(&mut self, ctx: BatchContext) {
+        match self {
+            PrometheusOutput::Expose(output) => output.observe_batch(ctx),
+            PrometheusOutput::Send(output) => output.observe_batch(ctx),
         }
     }
 
@@ -755,15 +766,20 @@ pub struct RemoteWriteOutput {
     /// Built by [`RemoteWriteOutput::with_tls`] from `endpoint_tls:`. `None` keeps `reqwest`'s
     /// default trust (the bundled Mozilla roots).
     tls: Option<rustls::ClientConfig>,
-    /// Rebuilt from `telemetry`/`diag` by the builders, as in [`ExposeOutput`].
+    /// Rebuilt from `telemetry`/`diag` by the builders, as in [`ExposeOutput`], on views gated by
+    /// `accounting` ([`new_sender_encoder`]).
     encoder: PrometheusEncoder,
+    /// Ungated: the requests, samples, and `remote_write_rejected` a receiver's answer decides.
     diag: Diagnostics,
     telemetry: Telemetry,
+    accounting: BatchAccounting,
 }
 
 impl RemoteWriteOutput {
     /// `endpoint` is the receiver's absolute write URL, path included, resolved per request.
     pub fn new(endpoint: impl Into<String>) -> Self {
+        let accounting = BatchAccounting::default();
+        let (diag, telemetry) = (Diagnostics::default(), Telemetry::default());
         Self {
             endpoint: endpoint.into(),
             version: remote_write::Version::V1,
@@ -772,9 +788,10 @@ impl RemoteWriteOutput {
             client: build_client(DEFAULT_ENDPOINT_TIMEOUT, None),
             headers: HeaderMap::new(),
             tls: None,
-            encoder: new_sender_encoder(&Telemetry::default(), &Diagnostics::default()),
-            diag: Diagnostics::default(),
-            telemetry: Telemetry::default(),
+            encoder: new_sender_encoder(&telemetry, &diag, accounting.gate()),
+            diag,
+            telemetry,
+            accounting,
         }
     }
 
@@ -852,13 +869,13 @@ impl RemoteWriteOutput {
     /// `remote_write_rejected`.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
-        self.encoder = new_sender_encoder(&self.telemetry, &self.diag);
+        self.encoder = new_sender_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
-        self.encoder = new_sender_encoder(&self.telemetry, &self.diag);
+        self.encoder = new_sender_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
 
@@ -898,44 +915,47 @@ impl RemoteWriteOutput {
 /// The sender's encoder, built in one place so `new` and the builders can't drift (module doc's
 /// "The wire"): `with_timestamps_always` because the wire can't omit a timestamp,
 /// `with_stale_markers` because remote-write, unlike an exposition, can say "this series is gone".
-fn new_sender_encoder(telemetry: &Telemetry, diag: &Diagnostics) -> PrometheusEncoder {
+/// Its handles are views gated by `gate`, so a retried batch counts its codec's drops once
+/// (`crate::accounting`).
+fn new_sender_encoder(
+    telemetry: &Telemetry,
+    diag: &Diagnostics,
+    gate: &logit_core::CountGate,
+) -> PrometheusEncoder {
     PrometheusEncoder::new()
         .with_stale_markers(true)
         .with_timestamps_always(true)
-        .with_telemetry(telemetry.clone())
-        .with_diagnostics(diag.clone())
+        .with_telemetry(telemetry.gated(gate))
+        .with_diagnostics(diag.gated(gate))
 }
 
-#[async_trait::async_trait]
-impl Output for RemoteWriteOutput {
-    /// Nothing to bind: this sink dials out per request.
-    async fn bind(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
+impl RemoteWriteOutput {
     /// One batch, one request, one attempt (module doc's "The wire" and "Faults, retries and
-    /// duplicate safety").
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let resource = batch.resource.as_ref();
-        let groups: Vec<Vec<MetricFamily>> = Self::partition(batch)
-            .into_values()
-            .map(|events| {
-                events_to_families(
-                    events.into_iter().map(|event| (resource, event)),
-                    &mut self.encoder,
-                )
-            })
-            .collect();
-        // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but it
-        // would count a `requests{class="2xx"}` an operator reads as a delivery.
-        if groups.iter().all(Vec::is_empty) {
+    /// duplicate safety"). The whole encode is unit 0 of the batch accounting.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let (version, encoding) = (self.version, self.encoding);
+        let encoder = &mut self.encoder;
+        let (_, encoded) = self.accounting.encode(0, || {
+            let resource = batch.resource.as_ref();
+            let groups: Vec<Vec<MetricFamily>> = Self::partition(batch)
+                .into_values()
+                .map(|events| {
+                    events_to_families(events.into_iter().map(|event| (resource, event)), encoder)
+                })
+                .collect();
+            // No request for a batch that produced nothing: an empty `WriteRequest` is legal, but
+            // it would count a `requests{class="2xx"}` an operator reads as a delivery.
+            if groups.iter().all(Vec::is_empty) {
+                return Ok(None);
+            }
+            let (body, samples) = remote_write::encode_counted(&groups, version, encoder);
+            // Errors only on a Snappy body past `u32::MAX`; reported, not unwrapped, so an absurd
+            // batch fails alone.
+            compression::compress(encoding, &body).map(|compressed| Some((compressed, samples)))
+        });
+        let Some((compressed, samples)) = encoded? else {
             return Ok(());
-        }
-        let (body, samples) =
-            remote_write::encode_counted(&groups, self.version, &mut self.encoder);
-        // Errors only on a Snappy body past `u32::MAX`; reported, not unwrapped, so an absurd
-        // batch fails alone.
-        let compressed = compression::compress(self.encoding, &body)?;
+        };
 
         let request_timer = self.telemetry.timer(REQUEST_DURATION);
         let result = self
@@ -994,6 +1014,26 @@ impl Output for RemoteWriteOutput {
                 Err(anyhow::Error::new(err)).context(fault)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for RemoteWriteOutput {
+    /// Nothing to bind: this sink dials out per request.
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`RemoteWriteOutput::attempt`]). An `Ok` disarms the batch accounting on
+    /// every path, a batch that sent no request included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// Nothing is buffered: `send` has issued its request, if any, before returning.
@@ -2647,5 +2687,279 @@ mod tests {
         sink.bind().await.expect("the exposition half binds");
         sink.send(&fixture_batch()).await.expect("the exposition half never fails a send");
         sink.flush().await.expect("the exposition half aborts its accept loop");
+    }
+
+    // -- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----------
+
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        http_recorder, sum_of, sums_through_write_loop, RecordLog, Reply, SumSeries, Sums,
+    };
+    use logit_pipeline::test_util::TelemetryProbe;
+
+    fn delta_sum(value: f64) -> MetricKind {
+        MetricKind::Sum(Sum { value, temporality: Temporality::Delta, monotonic: true })
+    }
+
+    /// A delta `Sum` the codec skips with its diagnostic, and nothing else: a batch that sends
+    /// no request.
+    fn nothing_to_send_batch() -> EventBatch {
+        batch(vec![Event::metric(
+            1_000_000_000,
+            AttrMap::new(),
+            MetricRecord::new(intern("requests"), delta_sum(1.0)),
+        )])
+    }
+
+    /// A counter that is sent, and [`nothing_to_send_batch`]'s delta `Sum`.
+    fn encode_side_batch() -> EventBatch {
+        let mut batch = nothing_to_send_batch();
+        batch.events.push(Event::metric(
+            1_000_000_000,
+            AttrMap::new(),
+            MetricRecord::new(intern("http_requests"), cumulative_counter(5.0)),
+        ));
+        batch
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 2] = [
+        ("logit.output.metrics.skipped", &[("metric_kind", "delta_sum")]),
+        ("logit.component.diagnostics", &[("key", "delta_temporality_unresolved")]),
+    ];
+
+    /// The diagnostic for a non-2xx answer: the receiver's verdict on one attempt.
+    const REJECTED: (&str, &str) = ("key", "remote_write_rejected");
+
+    /// Beyond `logit.output.requests`, what a retried batch counts once per attempt.
+    const PER_ATTEMPT: [SumSeries<'static>; 1] = [("logit.component.diagnostics", &[REJECTED])];
+
+    /// A receiver answering the `n`th request with `statuses[n]`, the last one to every later
+    /// request.
+    async fn scripted_receiver(statuses: &'static [u16]) -> (String, RecordLog) {
+        let (addr, log) = http_recorder(move |n, _, _| {
+            Reply::Answer(statuses[n.min(statuses.len() - 1)], Vec::new())
+        })
+        .await;
+        (format!("http://{addr}/api/v1/write"), log)
+    }
+
+    /// A remote-write `prometheus_out` built as `build_spec` builds it, counting into `probe`.
+    fn instrumented_sender(url: &str, probe: &TelemetryProbe) -> PrometheusOutput {
+        let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+        RemoteWriteOutput::new(url)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .into()
+    }
+
+    /// [`encode_side_batch`] through the write loop over `output`, its receiver answering
+    /// `statuses`, and the request bodies it received.
+    async fn run_encode_side_batch(
+        statuses: &'static [u16],
+        build: impl FnOnce(&str, &TelemetryProbe) -> PrometheusOutput,
+    ) -> (Sums, Vec<Vec<u8>>) {
+        let (url, log) = scripted_receiver(statuses).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = build(&url, &probe);
+        let batches = vec![encode_side_batch()];
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            batches,
+            fast_retry(),
+        )
+        .await;
+        let log = log.lock().unwrap();
+        assert!(log.iter().all(|r| r.path == "/api/v1/write"), "{log:?}");
+        (sums, log.iter().map(|r| r.body.clone()).collect())
+    }
+
+    /// A `503` then a `200`: delivered on the second attempt, with every encode-side counter and
+    /// diagnostic read as after one attempt, and the second request's body the first's. Driven
+    /// through [`PrometheusOutput`], the type `build_spec` boxes, so its `observe_batch` is the
+    /// one the runtime calls.
+    #[tokio::test]
+    async fn a_remote_write_retry_counts_encode_side_counters_once() {
+        let (single, one) = run_encode_side_batch(&[200], instrumented_sender).await;
+        let (retried, bodies) = run_encode_side_batch(&[503, 200], instrumented_sender).await;
+        assert_eq!(sum_of(&single, REQUESTS, &[("class", "2xx")]), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("class", "5xx")]), 1.0);
+        assert_eq!(sum_of(&retried, REQUESTS, &[("class", "2xx")]), 1.0);
+        assert_eq!(bodies.len(), 2, "one request per attempt");
+        assert_eq!(bodies[0], bodies[1], "the retry sends the first attempt's bytes");
+        assert_eq!(one[0], bodies[1]);
+        assert_eq!(sum_of(&retried, "logit.component.diagnostics", &[REJECTED]), 1.0);
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// A rejection answered on a retry is the receiver's verdict on that attempt, counted and
+    /// diagnosed through the sink's ungated handles: `remote_write_rejected` once per non-2xx
+    /// answer, the `503` and the `400`.
+    #[tokio::test]
+    async fn a_rejection_on_a_remote_write_retry_is_counted_and_diagnosed() {
+        let (sums, bodies) = run_encode_side_batch(&[503, 400], instrumented_sender).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(sum_of(&sums, REQUESTS, &[("class", "4xx")]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.diagnostics", &[REJECTED]), 2.0);
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 1.0, "{name} {tags:?}");
+        }
+    }
+
+    /// The gate re-arms per batch: a second batch counts as the first did.
+    #[tokio::test]
+    async fn a_second_remote_write_batch_counts_its_encode_side_counters() {
+        let (url, _log) = scripted_receiver(&[200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            batches,
+            fast_retry(),
+        )
+        .await;
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
+    /// the next batch counts its encode-side counters.
+    #[tokio::test]
+    async fn a_remote_write_batch_after_one_dropped_at_its_budget_counts_encode_side() {
+        let (addr, log) =
+            http_recorder(
+                |n, _, _| {
+                    if n == 0 {
+                        Reply::Hang
+                    } else {
+                        Reply::Answer(200, Vec::new())
+                    }
+                },
+            )
+            .await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&format!("http://{addr}/api/v1/write"), &probe);
+        let mut config = fast_retry();
+        config.retry.total_budget = Duration::from_secs(2);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "prometheus_out", batches, config)
+                .await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch that sends no request returns `Ok` early and leaves the accounting disarmed, so
+    /// later direct sends count.
+    #[tokio::test]
+    async fn remote_write_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
+        let (url, log) = scripted_receiver(&[200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            nothing_to_send_batch(),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 2, "the two direct sends, and nothing before them");
+    }
+
+    /// Either order of the handle builders, each after a first call with other handles, leaves
+    /// the encoder counting through gated views of the last handles.
+    #[tokio::test]
+    async fn every_remote_write_builder_order_gates_the_encoder_on_the_final_handles() {
+        for telemetry_last in [false, true] {
+            let decoy = logit_core::Registry::new();
+            let build = |url: &str, probe: &TelemetryProbe| -> PrometheusOutput {
+                let other = decoy.telemetry_for("other", "prometheus_out", "sink");
+                let sink = RemoteWriteOutput::new(url)
+                    .with_telemetry(other.clone())
+                    .with_diagnostics(Diagnostics::new("other").with_telemetry(other));
+                let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+                let diag = Diagnostics::new("out").with_telemetry(telemetry.clone());
+                if telemetry_last {
+                    sink.with_diagnostics(diag).with_telemetry(telemetry).into()
+                } else {
+                    sink.with_telemetry(telemetry).with_diagnostics(diag).into()
+                }
+            };
+            let (single, _) = run_encode_side_batch(&[200], build).await;
+            let (retried, _) = run_encode_side_batch(&[503, 200], build).await;
+            assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+            let stale = decoy.drain(0).iter().map(|e| e.metrics.len()).sum::<usize>();
+            assert_eq!(stale, 0, "nothing counts through a replaced handle");
+        }
+    }
+
+    /// With no handle builders, the encoder's diagnostics share the sink's throttle and are gated
+    /// too: a retried batch reports its codec diagnostic once.
+    #[tokio::test]
+    async fn a_remote_write_sink_with_no_handle_builders_reports_a_codec_diagnostic_once() {
+        let (url, log) = scripted_receiver(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output: PrometheusOutput = RemoteWriteOutput::new(&url).into();
+        let batches = vec![encode_side_batch()];
+        sums_through_write_loop(&mut output, &mut probe, "prometheus_out", batches, fast_retry())
+            .await;
+        assert_eq!(log.lock().unwrap().len(), 2);
+        let PrometheusOutput::Send(sender) = &output else { unreachable!("built as a sender") };
+        assert_eq!(sender.diag.occurrences("delta_temporality_unresolved"), 1);
+    }
+
+    /// The exposition mode has no gate: after `observe_batch`, a repeated `send` and every render
+    /// still count.
+    #[tokio::test]
+    async fn an_exposition_sink_counts_every_send_and_render_after_observe_batch() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "prometheus_out", "sink");
+        let mut record = MetricRecord::new(intern("hits"), cumulative_counter(2.0));
+        record.exemplars = vec![
+            Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
+            Exemplar { timestamp: 0, value: 2.0, trace: None, filtered_attributes: AttrMap::new() },
+        ];
+        let b = batch(vec![
+            Event::metric(0, AttrMap::new(), record),
+            metric_event("requests", delta_sum(1.0), &[]),
+        ]);
+        let mut sink: PrometheusOutput = ExposeOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .into();
+        sink.bind().await.unwrap();
+        let PrometheusOutput::Expose(expose) = &sink else { unreachable!("built to expose") };
+        let url = format!("http://{}/metrics", expose.local_addr().unwrap());
+        sink.observe_batch(logit_pipeline::BatchContext::default());
+        for _ in 0..2 {
+            sink.send(&b).await.unwrap();
+            get(&url, &[("accept", OM_ACCEPT)]).await.text().await.unwrap();
+        }
+        let events = registry.drain(0);
+        assert_eq!(
+            tagged(&events, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
+            2.0
+        );
+        assert_eq!(
+            tagged(&events, "logit.component.diagnostics", "key", "delta_temporality_unresolved"),
+            2.0
+        );
+        assert_eq!(
+            tagged(&events, "logit.output.metrics.degraded", "reason", "exemplar_dropped"),
+            2.0
+        );
     }
 }
