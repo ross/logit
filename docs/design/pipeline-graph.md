@@ -286,7 +286,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 12. A `set` with neither `resource` nor `attributes`, or with an empty key.
 13. More than one `internal` component.
 14. A non-default `buffer:` on a non-sink.
-15. A sink `buffer.max_batches` or `buffer.max_bytes` of `0`.
+15. A sink `buffer.max_batches` or `buffer.max_bytes` of `0`, or `buffer.retry_budget` or
+    `buffer.retry_max_delay` of `0s`.
 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`.
 17. A non-default `receive:` outside a datagram, stream, or tail listener, or a receive-queue field
     on a stream or tail listener.

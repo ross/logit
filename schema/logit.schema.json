@@ -108,12 +108,12 @@
           ]
         },
         "retry_budget": {
-          "description": "Hard ceiling on the total time spent retrying one batch, across every attempt and backoff sleep. Defaults to `60s`.",
+          "description": "Hard ceiling on the total time spent retrying one batch, across every attempt and backoff sleep. Must be greater than `0s`. Defaults to `60s`.",
           "default": "60s",
           "type": "string"
         },
         "retry_max_delay": {
-          "description": "Cap on the exponential backoff between retry attempts. Defaults to `10s`.",
+          "description": "Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles. A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.",
           "default": "10s",
           "type": "string"
         },

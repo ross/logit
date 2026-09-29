@@ -3200,11 +3200,12 @@ pub struct BufferConfig {
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
     /// Hard ceiling on the total time spent retrying one batch, across every attempt and backoff
-    /// sleep. Defaults to `60s`.
+    /// sleep. Must be greater than `0s`. Defaults to `60s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_budget: Duration,
-    /// Cap on the exponential backoff between retry attempts. Defaults to `10s`.
+    /// Cap on the exponential backoff between retry attempts, which starts at 200 ms and doubles.
+    /// A value below 200 ms caps every backoff. Must be greater than `0s`. Defaults to `10s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_max_delay: Duration,

@@ -41,6 +41,9 @@
 //! 14. A non-default `buffer:` on a non-sink: only a sink has a delivery queue
 //!     (`docs/adr/buffered-sink-delivery.md`).
 //! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0`: no batch could ever be queued.
+//!     Or its `buffer.retry_budget` or `buffer.retry_max_delay` of `0s`: a zero budget times out
+//!     every attempt before it starts, and a zero delay retries with no pause until the budget
+//!     ends (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 10).
 //! 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`: a typo, not a value
 //!     to clamp (NaN would keep every span).
 //! 17. A non-default `receive:` outside a datagram, stream, or tail listener (explicit predicates,
@@ -931,7 +934,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 15: `max_batches: 0` or `max_bytes: 0` makes every push overflow, even into an empty
     // queue. `SinkQueue::push` tolerates that at runtime rather than hanging, but a sink that can
-    // never queue a batch is a config mistake.
+    // never queue a batch is a config mistake. A zero retry duration breaks `deliver_with_retry`
+    // (the module doc's rule 15).
     for (id, component) in &components {
         if role(&component.kind) == Role::Sink {
             if component.buffer.max_batches == 0 {
@@ -944,6 +948,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'buffer.max_bytes' must be at least 1 -- 0 means no batch \
                      can ever be queued"
+                );
+            }
+            if component.buffer.retry_budget.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.retry_budget' must be greater than 0s -- 0 would \
+                     time out every delivery attempt before it started"
+                );
+            }
+            if component.buffer.retry_max_delay.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.retry_max_delay' must be greater than 0s -- 0 \
+                     would retry a failing batch with no pause until its retry budget ran out"
                 );
             }
         }
@@ -7520,6 +7536,56 @@ mod tests {
         ]));
         assert!(err.contains("'out'"), "got: {err}");
         assert!(err.contains("max_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_a_zero_retry_budget_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "out",
+                vec!["in"],
+                sink(),
+                BufferConfig { retry_budget: Duration::ZERO, ..BufferConfig::default() },
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'buffer.retry_budget' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_sinks_buffer_with_a_zero_retry_max_delay_is_rejected() {
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "out",
+                vec!["in"],
+                sink(),
+                BufferConfig { retry_max_delay: Duration::ZERO, ..BufferConfig::default() },
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'buffer.retry_max_delay' must be greater than 0s"), "got: {err}");
+    }
+
+    /// The smallest nonzero values pass: a `retry_max_delay` below the 200 ms base delay is a
+    /// valid choice that caps every backoff.
+    #[test]
+    fn a_sinks_buffer_with_nonzero_retry_durations_validates_fine() {
+        resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            (
+                "out",
+                vec!["in"],
+                sink(),
+                BufferConfig {
+                    retry_budget: Duration::from_nanos(1),
+                    retry_max_delay: Duration::from_nanos(1),
+                    ..BufferConfig::default()
+                },
+            ),
+        ]))
+        .expect("nonzero retry durations are valid");
     }
 
     #[test]
