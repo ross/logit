@@ -36,6 +36,12 @@ const MAX_REJECT_MESSAGE_BYTES: usize = 1024;
 /// peer's declared count sizes an allocation.
 const MAX_CHOICE_LIST_ENTRIES: usize = 16;
 
+/// The longest control message payload a reader accepts, checked against a frame header before
+/// the body is allocated. The longest message this version writes is a `Reject` whose message is
+/// at [`MAX_REJECT_MESSAGE_BYTES`], 1033 bytes; the rest is room for fields a later version adds,
+/// which a reader skips.
+pub const MAX_CONTROL_MESSAGE_BYTES: u32 = 4096;
+
 const MSG_HELLO: u8 = 1;
 const MSG_HELLO_ACK: u8 = 2;
 const MSG_ACK: u8 = 3;
@@ -464,6 +470,35 @@ mod tests {
             Reject { code: REJECT_INTERNAL, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES + 1) };
         let mut encoded = reject.encode();
         assert!(matches!(Reject::decode(&mut encoded), Err(CodecError::Malformed(_))));
+    }
+
+    /// Every message this version writes, at its largest, fits [`MAX_CONTROL_MESSAGE_BYTES`], and
+    /// the largest is the 1033-byte `Reject` its doc names.
+    #[test]
+    fn the_largest_message_of_each_type_fits_the_control_message_cap() {
+        let largest = [
+            Hello {
+                version: u16::MAX,
+                codecs: vec![u8::MAX; MAX_CHOICE_LIST_ENTRIES],
+                compressions: vec![u8::MAX; MAX_CHOICE_LIST_ENTRIES],
+                max_frame_bytes: u32::MAX,
+                window: u32::MAX,
+            }
+            .encode(),
+            HelloAck {
+                version: u16::MAX,
+                codec: u8::MAX,
+                compression: u8::MAX,
+                max_frame_bytes: u32::MAX,
+                window: u32::MAX,
+            }
+            .encode(),
+            Ack { seq: u64::MAX }.encode(),
+            Reject { code: u16::MAX, message: "x".repeat(MAX_REJECT_MESSAGE_BYTES) }.encode(),
+        ];
+        let lens: Vec<usize> = largest.iter().map(Bytes::len).collect();
+        assert_eq!(lens.iter().max(), Some(&1033), "{lens:?}");
+        assert!(lens.iter().all(|&len| len <= MAX_CONTROL_MESSAGE_BYTES as usize), "{lens:?}");
     }
 
     /// 342 bytes of `0xFF` pass the byte cap, and each becomes a 3-byte U+FFFD under the lossy
