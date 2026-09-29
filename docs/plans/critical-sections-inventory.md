@@ -35,8 +35,10 @@ This is a **work list for future deep-dive verification sessions**, not a list o
   clean, aggregate (#400, #402, #405, #407, #410), which closed XFORM-01..05 and CORE-07
   with findings, tail bookkeeping (#437, #440, #442–#445, #447), which closed TAIL-01..04,
   TAIL-09..12 with findings, and the sink send path (#449–#456, #457), which also closed leads
-  12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings. The rest of the
-  list is `unreviewed`. The index's **Status** column is the source of truth.
+  12 and 14 and closed SINK-01..06, WIRE-08, WIRE-09, and RT-05 with findings. It also found two
+  defects the survey didn't name: bisection inflating codec counters on a single attempt in the
+  Datadog sinks (#456), and `PrometheusOutput` not forwarding `observe_batch` (#455). The rest of
+  the list is `unreviewed`. The index's **Status** column is the source of truth.
 
 Two corrections to assumptions going in: `graphite/pickle.rs` and `logit-cli/src/pipeline.rs`
 contain **no** `unsafe` (grep hits were comments/tests). Production `unsafe` lives in exactly three

@@ -1055,8 +1055,8 @@ inventory rows.
   frame's first record, a connect failure `Clean` after an accepted request (three sinks), drops a
   peer or the kernel decided that repeat on retry, per-body and double-reported Datadog codec
   counters, the `fault` seam's rule ordering, the Splunk test under plain `cargo test`, `file_out`'s
-  size bookkeeping after a failed flush, the skipped IPv6 tests, the IPv4 preference, and the HTTP
-  sinks' `requests` vocabulary.
+  size bookkeeping after a failed flush, the skipped IPv6 tests, the IPv4 preference, the HTTP
+  sinks' `requests` vocabulary, and a sink's reuse of a failed batch's armed gate and send time.
 - **Counter docs.** `docs/design/internal-telemetry.md`'s class table under "Outputs" is the one
   statement of the three counter classes. Each sink's section and `docs/deploying.md` point at it.
 - **Inventory.** SINK-01..06, WIRE-08, WIRE-09, and RT-05 are `findings`, top leads 12 and 14 are
