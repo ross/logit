@@ -304,6 +304,48 @@ pub async fn spawn_input<I: Input + Send + 'static>(mut input: I, sink: Fanout) 
     Running { shutdown, handle }
 }
 
+/// Runs the runtime's own `write_loop` over `output` until a closed in-memory queue holding
+/// `batches` is drained, with no shutdown, and returns its result. `telemetry` is the runtime's
+/// handle for the component, so pass one from the registry the sink counts into to read both.
+///
+/// Every batch goes through `write_loop`'s real `Output::observe_batch` call site and
+/// `deliver_with_retry`, so a test sees the per-attempt and per-batch counts a running pipeline
+/// produces. Panics if the loop is still running after [`RECV_TIMEOUT`] plus every batch's retry
+/// budget.
+pub async fn drive_write_loop<O: crate::Output + Send>(
+    output: &mut O,
+    batches: Vec<EventBatch>,
+    config: crate::WriteLoopConfig,
+    telemetry: Telemetry,
+) -> anyhow::Result<()> {
+    let store = Arc::new(crate::SinkStore::Memory(crate::SinkQueue::new(
+        crate::SinkQueueConfig::default(),
+        telemetry.clone(),
+    )));
+    let ceiling = RECV_TIMEOUT.saturating_add(
+        config.retry.total_budget.saturating_mul(u32::try_from(batches.len()).unwrap_or(u32::MAX)),
+    );
+    for batch in batches {
+        store.push((Arc::new(batch), crate::TraceContext::default().into())).await;
+    }
+    store.close();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::time::timeout(
+        ceiling,
+        crate::runtime::write_loop(
+            "out".to_string(),
+            output,
+            store,
+            telemetry,
+            config,
+            shutdown_rx,
+            &AtomicU64::new(0),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("write_loop still running after {ceiling:?}"))
+}
+
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A new, empty directory at `{tmp}/logit-test-{label}-{pid}-{seq}`. A leftover directory at that
