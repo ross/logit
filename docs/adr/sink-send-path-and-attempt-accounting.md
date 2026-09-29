@@ -248,9 +248,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
      script.
    - **No over-cap pre-pass.** Every encoder caps its entries at the value its sink passes the
      packer, on every builder path and transport, and `MessageBuf` has no remove API, so a
-     pre-pass would scan for something the code can't produce. The packer has a `debug_assert!`
-     and one release-build branch that skips an over-cap entry and counts it
-     `messages.dropped{reason="oversize_datagram"}` in the weight unit.
+     pre-pass would scan for something the code can't produce. The packer has one branch, a
+     comparison per entry, that skips an over-cap entry and counts it
+     `messages.dropped{reason="oversize_datagram"}` in the weight unit. It has no
+     `debug_assert!` in front of it, so a debug build's tests reach the branch too.
      `GraphiteOutput::with_encoder` refuses a pickle encoder on UDP, as rule 46 does in config: it
      was the one builder path that could put an entry past the cap, since a pickle frame is bounded
      by `max_frame_bytes`, not by the datagram cap.
@@ -352,8 +353,8 @@ nature. The encode-side counters are the only ones that measure the batch and no
 - **Flooring `backoff_for` at `base_delay`.** Rejected. See decision 10.
 - **Scanning a batch for over-cap entries before any datagram is sent.** Rejected. No encoder can
   produce such an entry once `GraphiteOutput::with_encoder` refuses pickle on UDP, and dropping one
-  would need a remove API `MessageBuf` doesn't have. A `debug_assert!` and a skip-and-count branch
-  cover the invariant at no cost per batch.
+  would need a remove API `MessageBuf` doesn't have. A skip-and-count branch in the packing loop
+  covers the invariant for one comparison per entry.
 - **A destination trait for the packer.** Rejected for an enum: the destinations are a closed set
   of two plus a test double, as the stream driver's `Target` is, and an enum keeps the send
   future's type concrete.
@@ -662,8 +663,7 @@ Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit
     `emsgsize_then_a_failure_with_nothing_sent_is_clean`,
     `sent_then_emsgsize_then_a_failure_is_ambiguous`,
     `a_failure_after_two_datagrams_returns_what_the_two_carried`, `one_per_entry_never_packs`,
-    `an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent` (a `should_panic`
-    on the `debug_assert!` in a debug build; its release run exercises the skip branch),
+    `an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent`,
     `the_reconnect_once_rule_survives_an_emsgsize_dropped_first_datagram`,
     `a_timed_out_unix_send_drops_the_socket_and_the_next_send_reconnects`,
     `a_unix_send_parked_past_send_timeout_times_out_and_drops_the_socket` (paused clock),
@@ -672,7 +672,9 @@ Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit
     cap, non-empty, with no leading or trailing `\n`; the datagrams joined by `\n` equal the
     entries joined by `\n`; each datagram is the run of whole entries the packer reports it holds,
     and the next entry wouldn't have fit; entries, weight, and datagrams reconcile. Entries hold
-    embedded `\n`s, so splitting a datagram on `\n` isn't used to recover them.
+    embedded `\n`s, so splitting a datagram on `\n` isn't used to recover them. The cap is drawn
+    apart from the entries, so some cases hold entries over it: each is absent from every
+    datagram and counted `oversize_datagram` in the weight unit, and the rest satisfy the above.
   - A real kernel `EMSGSIZE` through each sink's builders, with exact drop counts in the sink's
     unit, `send` returning `Ok`, `requests{class="ok"}`, sent plus dropped equal to what was
     encoded, and the datagrams around the refused one arriving:

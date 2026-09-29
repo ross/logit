@@ -17,7 +17,7 @@
 //!
 //! An entry longer than `cap` never reaches the kernel. Every encoder caps its entries at the
 //! value its sink passes here, so the branch that drops one, counted like `EMSGSIZE`, is a
-//! release-build backstop behind a `debug_assert!`.
+//! backstop that costs one comparison per entry.
 //!
 //! [`Sent`] comes back on every exit, so a sink counts what reached the wire before an error as
 //! well as on success. A cancelled send returns nothing, and its counts are lost
@@ -116,13 +116,6 @@ pub(crate) async fn send_datagrams<M>(
     packet_buf.clear();
     for (entry, meta) in batch.entries.iter_with() {
         let weight = (batch.weight)(meta);
-        debug_assert!(
-            entry.len() <= batch.cap,
-            "{}: a {}-byte entry over the {}-byte cap its encoder applies",
-            report.sink,
-            entry.len(),
-            batch.cap
-        );
         if entry.len() > batch.cap {
             report.oversize(
                 weight,
@@ -580,11 +573,9 @@ mod tests {
         assert_eq!(counts, [Some(1), Some(1), Some(1)]);
     }
 
-    /// An entry over the cap never reaches the kernel. Every encoder caps its entries, so a debug
-    /// build stops at the `debug_assert!`; a release build drops the entry, counted in the
-    /// weight unit, and sends the entries around it.
+    /// An entry over the cap never reaches the kernel: it's dropped, counted in the weight unit,
+    /// and the entries around it are sent.
     #[tokio::test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "over the 4-byte cap"))]
     async fn an_entry_over_the_cap_is_dropped_and_counted_and_its_neighbours_are_sent() {
         let script = ScriptedDest::new([]);
         let mut probe = TelemetryProbe::new();
@@ -729,18 +720,19 @@ mod tests {
 
         /// Splitting a datagram on `\n` doesn't recover its entries (an entry can hold one), so
         /// the entry boundaries are checked against the counts the packer reports per datagram.
+        /// The cap is drawn apart from the entries, so some cases hold entries over it, which
+        /// must be dropped and counted, and the rest packed as if they weren't there.
         #[test]
         fn packing_never_exceeds_the_cap_never_splits_an_entry_and_reconciles(
             batch in prop::collection::vec((arb_entry(), 1usize..=5), 0..40),
-            slack in 0usize..60,
+            cap in 1usize..48,
         ) {
-            let cap = batch.iter().map(|(entry, _)| entry.len()).max().unwrap_or(1) + slack;
             let mut buf = MessageBuf::<usize>::default();
             for (entry, weight) in &batch {
                 buf.push_with(entry, *weight);
             }
             let script = ScriptedDest::new([]);
-            let probe = TelemetryProbe::new();
+            let mut probe = TelemetryProbe::new();
             let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
             let (sent, result) = runtime.block_on(send(
                 packed(&buf, cap),
@@ -758,8 +750,14 @@ mod tests {
                 prop_assert!(datagram.len() <= cap, "{} bytes, cap {cap}", datagram.len());
                 prop_assert!(datagram[0] != b'\n' && datagram[datagram.len() - 1] != b'\n');
             }
-            let entries: Vec<&[u8]> = batch.iter().map(|(entry, _)| entry.as_slice()).collect();
+            // Over-cap entries are absent from every datagram; the rest appear in order.
+            let (kept, over): (Vec<_>, Vec<_>) =
+                batch.iter().partition(|(entry, _)| entry.len() <= cap);
+            let entries: Vec<&[u8]> = kept.iter().map(|(entry, _)| entry.as_slice()).collect();
             prop_assert_eq!(datagrams.join(&b'\n'), entries.join(&b'\n'));
+            let over_weight: usize = over.iter().map(|(_, weight)| weight).sum();
+            let dropped = probe.sum("logit.output.messages.dropped", &OVERSIZE);
+            prop_assert_eq!(dropped, over_weight as f64, "over-cap weight counted");
 
             // Each datagram is a run of whole entries, as many as the packer said it holds, and
             // the next entry would not have fit.
@@ -776,7 +774,7 @@ mod tests {
             }
             prop_assert_eq!(next, entries.len());
 
-            let weight: usize = batch.iter().map(|(_, weight)| weight).sum();
+            let weight: usize = kept.iter().map(|(_, weight)| weight).sum();
             let expected = Sent { entries: entries.len(), weight, datagrams: datagrams.len() };
             prop_assert_eq!(sent, expected);
         }
