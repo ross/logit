@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-28
+updated: 2026-09-29
 ---
 
 # Verification plan: critical sections inventory
@@ -60,9 +60,9 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 9 | `write_record`'s torn-write repair ignores `set_len`'s result yet rewinds in-memory lengths — a failed truncate desynchronizes `len` from the `O_APPEND` file | DISK-03 | **Done** (#331) |
 | 10 | Every spool `fsync` and the rotation `create` are `let _ =` — the durability policy is unobservable when it fails | DISK-04 | **Done**: fsyncs observed and counted (#324) |
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
-| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | open |
+| 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating exactly the counters read when a sink is unhealthy | SINK-06, RT-05 | in progress (sink/w5): confirmed for every sink, and `datadog_out` also reads its clock per attempt; encode-side counters will count once per batch through a sink-owned gate, and server-verdict drops still repeat per attempt |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
-| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | open |
+| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | in progress (sink/w2): confirmed, and statsd and syslog classify an invalid TLS server name as `Clean`; one shared driver replaces the three copies |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
@@ -126,8 +126,12 @@ Entries that share a mechanism and should be verified together, in suggested ord
    manual `logrotate` run
    ([ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md)).
 5. **`libc` surface (done, #280–#283)** — NET-01, NET-11, NET-12, TAIL-07. miri where possible, strace otherwise.
-6. **Sink send path** — SINK-01..06, WIRE-08/09, RT-05. Mechanical diff of the three copies first,
-   then fault injection (RST mid-write, blackhole, close_notify), then the retry-counter question.
+6. **Sink send path (in progress: `sink/w0`–`w6`)** — SINK-01..06, WIRE-08/09, RT-05. One shared
+   pooled-stream driver and datagram packer for the copied send paths, fault injection against
+   them and against real TLS pairs (RST mid-write, blackhole, a stalled handshake, a partial
+   record under a `Pending` poll), and attempt accounting that counts encode-side drops once per
+   batch
+   ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)).
 7. **Lua boundary (done, #383, #385, #388, #386, #391, #392)** — CORE-15..19, RT-11. Adversarial scripts: re-entrancy under a held `RefCell`
    borrow, a proxy held past its scope, infinite loop, deep/huge table.
 8. **Aggregate (done, #400, #402, #405, #407, #410)** — XFORM-01..05, CORE-07. Proptest against a naive
@@ -232,7 +236,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-03](#wire-03--record-tlv-decode-default-elision-encoding-required-fields-and-opaque-sketch-blobs) | P0 | Record TLV decode: default-elision encoding, required fields, and opaque sketch blobs | `crates/logit-proto/src/native/record.rs` (`write_field`, `read_record_list_into`, `read_metric_kind`) | findings → #370 |
 | [WIRE-05](#wire-05--control-message-tlv-and-the-hellohelloack-negotiation-state-machine) | P0 | Control-message TLV and the `Hello`/`HelloAck` negotiation state machine | `crates/logit-proto/src/native/control.rs` (`Hello`, `HelloAck`, `ControlMessage::decode`) | unreviewed |
 | [WIRE-06](#wire-06--logit_in-per-connection-frame-loop-eager-body-allocation-idle-bounds-ack-as-backpressure) | P0 | `logit_in` per-connection frame loop: eager body allocation, idle bounds, ack-as-backpressure | `crates/logit-inputs/src/logit.rs` (`serve_connection`, `read_frame_body`) | findings → #372 |
-| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | unreviewed |
+| [WIRE-08](#wire-08--logit_out-send-path-one-frame-in-flight-partial-write-semantics-fault-classification) | P0 | `logit_out` send path: one-frame-in-flight, partial-write semantics, fault classification | `crates/logit-outputs/src/logit.rs` (`Conn`, `LogitOutput`, `Output::send`) | in-progress (sink/w3) |
 | [WIRE-10](#wire-10--hand-rolled-grpc-server-framing-length-prefixed-messages-trailers-gzip-bounds) | P0 | Hand-rolled gRPC server framing: length-prefixed messages, trailers, gzip bounds | `crates/logit-inputs/src/otlp.rs` (`handle_grpc`, `grpc_unframe`, `inflate`) | findings → #374 |
 | [WIRE-11](#wire-11--shared-hyper-connection-lifecycle-idle-tracking-graceful-shutdown-body-stall-bounds) | P0 | Shared hyper connection lifecycle: idle tracking, graceful shutdown, body stall bounds | `crates/logit-inputs/src/http.rs` (`Activity`, `drive_with_idle`) | findings → #374 |
 | [WIRE-15](#wire-15--prometheus_in-remote-write-receiver-ingress-permits-deadlines-body-limits-snappy-bounds-version-dispatch) | P0 | `prometheus_in` remote-write receiver ingress: permits, deadlines, body limits, snappy bounds, version dispatch | `crates/logit-inputs/src/prometheus.rs` (`PrometheusReceiver`, `write_response`, `MAX_REQUEST_BYTES`) | findings → #374 |
@@ -244,9 +248,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
-| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | unreviewed |
-| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | unreviewed |
-| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | unreviewed |
+| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | in-progress (sink/w2) |
+| [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | in-progress (sink/w4) |
+| [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | in-progress (sink/w5) |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs` (`UdpListener`'s `Input::run_until_shutdown`) | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs` (`serve_connection`) | unreviewed |
@@ -263,7 +267,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs` (`DiskQueue` fields, `closed`, `close`) | reviewed @510291b1 |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs` (`FileTarget::rotate`, `promote_staged`, `staging_path`) | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs` (`MAX_SANE_*`, `read_frame_with_header`, `resync`) | findings → #367 |
-| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | unreviewed |
+| [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs` (`deliver_with_retry`, `backoff_for`) | in-progress (sink/w5) |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs` (`Fanout`, `Fanout::deliver`, `Fanout::stamp`) | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs` (`BoundedQueue`, `SinkQueue`, `SinkStore`) | findings → #403 |
 | [RT-08](#rt-08--run_transform-flush-deadline-race-close-time-flush-and-cadence-math) | P1 | `run_transform`: flush-deadline race, close-time flush, and cadence math | `runtime.rs` (`run_transform`, `run_flush`, `advance_flush_deadline`) | unreviewed |
@@ -272,7 +276,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
 | [WIRE-04](#wire-04--batch-framing-v1v2-and-the-mandatory-provenance-trailer) | P1 | Batch framing v1/v2 and the mandatory provenance trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_batch_v2`, `CODEC_NATIVE_V2`) | unreviewed |
 | [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
-| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | unreviewed |
+| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | in-progress (sink/w1) |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
 | [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/prometheus.rs` (`PrometheusInput::tick`, `scrape_target`, `MAX_SCRAPE_BYTES`) | unreviewed |
@@ -305,9 +309,9 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
-| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | unreviewed |
-| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | unreviewed |
-| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | unreviewed |
+| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | in-progress (sink/w2) |
+| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | in-progress (sink/w1) |
+| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w5) |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
@@ -3458,6 +3462,11 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
   the `fast_retry_config` helper. Governed by `docs/adr/buffered-sink-delivery.md`.
 - **Priority:** **P1** — custom timing logic on the hot path, but well covered and failure modes are bounded
   (too many or too few retries, not corruption).
+- **Correction (2026-09-29, `sink/w0`):** ~~`base_delay: 0` is unreachable today.~~ The zero-backoff
+  spin is reachable through `retry_max_delay: 0s`: `write_config` passes
+  `buffer.retry_max_delay` as `RetryConfig::max_delay`, and `backoff_for` ends in
+  `backoff.min(retry.max_delay)`, so it returns zero for every attempt and `deliver_with_retry`
+  loops until the budget ends. A zero `retry_budget` is unvalidated too.
 
 ---
 
@@ -4589,6 +4598,16 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `logit.output.requests` totals equal the number of `send` calls.
 - **Priority:** P0 — this is the sink side of the only lossless-transit-critical native path, the
   classification decides duplicate-versus-drop, and the TLS write assumption is unverified.
+- **Correction (2026-09-29, `sink/w0`):** the first-write `Clean` verdict holds for a framed
+  protocol: under TLS an `Err` can follow bytes of this frame reaching the wire, but the peer then
+  holds a truncated frame it can't forward. The premise in `send`'s comment (nothing left the
+  host) is wrong, and the `io::Error` is discarded. The real defect is the missing `flush()`:
+  tokio-rustls 0.26.5's `poll_write` can return `Ok(n)` with ciphertext still queued, and
+  `poll_read` never drives writes, so `send` waits for an `Ack` the peer can't send. The same
+  shape exists at `Hello`/`HelloAck`. ~~`Output::flush` is or isn't needed after a write under
+  TLS.~~ It is needed. A third too-large path exists beyond the two the entry names: the
+  compressed-frame check against `frame::compressed_bound`, which also returns `Permanent`
+  without counting `logit.output.requests`.
 
 ---
 
@@ -4635,6 +4654,11 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 - **Priority:** P1 — small, well-argued, and covered end-to-end against a real listener; the
   correctness claim rests on a third-party crate's internal behavior, which is worth one
   source-level confirmation.
+- **Correction (2026-09-29, `sink/w0`):** ~~Callers are `logit.rs` and, out of area, `syslog.rs`.~~
+  `poll_pending_close` has four callers: `statsd.rs`, `syslog.rs`, `graphite.rs`, and `logit.rs`.
+  Its doc is wrong on two points: a `Pending` poll can move a partial record from the socket into
+  the TLS session, and a cancelled read loses nothing. The behavior is sound. The
+  "none spotted" concern line stands for the code and not for the prose.
 
 ---
 
@@ -7181,6 +7205,15 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `send_udp`/`flush_datagram` against each other.
 - **Priority:** P0 — the packer is custom, runs on every UDP batch, and both the oversize path and
   the partial-batch fault rule decide between silent loss and duplication.
+- **Correction (2026-09-29, `sink/w0`):** ~~`statsd.rs`'s `send_udp` and `flush_datagram` hold the
+  packer, and `graphite.rs`'s copy is near-verbatim.~~ `statsd.rs`'s packer now lives in
+  `send_datagrams` over `DatagramDest` (`Udp` and `Unix`, with `UnixDest`'s reconnect-once rule), shared
+  with the Unix datagram transport. `graphite.rs` keeps the old inline `send_udp`/`flush_datagram`
+  copy. Confirmed still true: an entry of any length is appended into an empty buffer, so the cap
+  rests on the encoder cap alone; `is_message_too_large` has four copies whose `InvalidInput`
+  fallback also catches errors that aren't `EMSGSIZE`; `collectd_out` accepts `max_packet_bytes` up
+  to 65535 against a 65507-byte UDP payload ceiling; and all four UDP sinks bind `0.0.0.0:0`, so
+  an IPv6 endpoint fails `Clean` on every batch.
 
 ---
 
@@ -7238,6 +7271,12 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `false` sinks.
 - **Priority:** P0 — this is the contract every other entry in this file depends on, and it decides
   loss vs. duplication for the whole sink side.
+- **Correction (2026-09-29, `sink/w0`):** ~~`bind()` is unimplemented (default) for every sink here,
+  and only `prometheus_out` overrides it.~~ Two sinks override `bind`: `prometheus_out` (`PrometheusOutput`,
+  which delegates to `ExposeOutput` and `RemoteWriteOutput`) and `splunk_hec_out`
+  (`SplunkHecOutput`, which builds its HTTP client and opens nothing). Also confirmed: a grep of
+  `crates/logit-outputs/src` finds no `duplicate_safe` doc that mentions the `buffer.delivery`
+  override, which can change the posture.
 
 ---
 
@@ -7284,6 +7323,11 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `observe_batch` already exists as a per-batch, per-attempt hook, `Output::observe_batch`).
 - **Priority:** P1 — no data is lost, but the drop accounting an operator uses to reconcile a relay
   is wrong exactly when the sink is unhealthy.
+- **Correction (2026-09-29, `sink/w0`):** ~~`Output::observe_batch` is a per-batch, per-attempt hook.~~
+  `write_loop` calls `observe_batch` once per batch, before `deliver_with_retry`'s retry loop, so it
+  is per batch. The trait doc and `LogitOutput`'s field doc say it runs before each attempt and
+  are wrong. A once-per-batch hook is what lets a sink reset a gate there, and the retry-counter
+  question is settled that way in the ADR.
 
 ---
 
