@@ -77,7 +77,9 @@
 //! The send time is read once per batch, in `observe_batch`, and every attempt at the batch
 //! measures from it: staleness isn't monotonic in the clock (a point too far ahead becomes fresh),
 //! so a clock read per attempt could drop a point on one attempt and send it on the next. An `Ok`
-//! clears it; a `send` with no `observe_batch` reads the clock itself. A batch retried for
+//! clears it, and the next `observe_batch` replaces it. A `send` with no `observe_batch` reads the
+//! clock itself only when no earlier batch left a time behind: after a batch whose last attempt
+//! failed, it reuses that batch's time (`docs/known-gaps.md`). A batch retried for
 //! `retry_budget` can send a point up to that long past its window.
 //!
 //! The series window is the documented one, and stricter than the intake, which stored older
@@ -564,7 +566,8 @@ pub struct DatadogOutput {
     telemetry: Telemetry,
     accounting: BatchAccounting,
     /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
-    /// reaches the same stale verdict; cleared by an `Ok`. `None` reads the clock per `send`.
+    /// reaches the same stale verdict; cleared by an `Ok`, replaced by the next `observe_batch`.
+    /// `None` reads the clock per `send`.
     batch_now: Option<i64>,
     /// [`now_nanos`], or a test's scripted clock.
     clock: Clock,
@@ -933,8 +936,8 @@ impl Output for DatadogOutput {
     }
 
     /// One request per route the batch needs, sequentially; the first failure aborts the rest
-    /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one
-    /// `observe_batch` fixed, or the clock's when nothing armed the batch.
+    /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one the last
+    /// `observe_batch` fixed until an `Ok` clears it, else the clock's.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
@@ -1919,6 +1922,44 @@ mod tests {
     async fn a_batch_after_one_rejected_permanently_reads_the_clock_again() {
         let rejected = || Reply::Answer(400, b"bad request".to_vec());
         assert_a_batch_after_a_dropped_one_reads_the_clock_again(rejected, fast_retry()).await;
+    }
+
+    /// Pins a documented corner (`docs/known-gaps.md`): after a batch whose last attempt failed,
+    /// a `send` with no `observe_batch` reuses that batch's send time and finds the gate armed.
+    /// The failed batch fixed `NOW`, so the direct send's point 11 min ahead is stale there and
+    /// dropped (it would be fresh at the clock's next reading, `NOW + 2 min`), and its `stale`
+    /// drop is muted, since the failed batch already encoded the plan's unit. Its `Ok` clears
+    /// both, so the next direct send reads the clock and sends the same point.
+    #[tokio::test]
+    async fn a_direct_send_after_a_failed_batch_reuses_its_send_time_and_armed_gate() {
+        let (clock, reads) = stepping_clock(NOW);
+        let rejected_first = |p: &str, k| {
+            if p == SERIES && k == 0 {
+                Reply::Answer(400, Vec::new())
+            } else {
+                accepted(p)
+            }
+        };
+        let (addr, log) = per_path_recorder(rejected_first).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented(addr, &probe).with_clock(clock);
+        let batches = vec![batch(vec![gauge(NOW)])];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "datadog_out", batches, fast_retry())
+                .await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+
+        let ahead = NOW + 11 * MINUTE;
+        output.send(&batch(vec![gauge(ahead)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the failed batch's time is reused");
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW]], "the point is dropped");
+        let sums: Sums =
+            probe.poll().sums().map(|(n, t, v)| ((n.to_string(), t.to_vec()), v)).collect();
+        assert_eq!(sum_of(&sums, RECORDS_DROPPED, &[("reason", "stale")]), 0.0, "and muted");
+
+        output.send(&batch(vec![gauge(ahead)])).await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(series_points(&log.lock().unwrap()), [vec![NOW], vec![ahead]]);
     }
 
     /// The gate re-arms per batch: a second batch counts as the first did.
