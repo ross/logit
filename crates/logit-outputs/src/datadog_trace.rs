@@ -1444,7 +1444,7 @@ mod tests {
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
         http_recorder, refused_addr, sum_of, sums_through_write_loop, RecordLog, Recorded,
-        Reply as Answer, SumSeries, Sums,
+        Reply as Answer, SumSeries, Sums, HUNG_REQUEST_BUDGET,
     };
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
@@ -1452,20 +1452,6 @@ mod tests {
 
     const TRACES: &str = "/v0.4/traces";
     const STATS: &str = "/v0.6/stats";
-
-    /// The retry budget for a test whose first request never answers, so the budget cuts the
-    /// attempt off: 2 s of real time. A paused clock can't stand in, because it runs past the HTTP
-    /// client's own timers while socket I/O is in flight.
-    ///
-    /// - Above it, the sink's request timeout ([`DEFAULT_TIMEOUT`], 10 s) is 8 s away, so the
-    ///   budget, not the client, ends the hung request.
-    /// - Below it, a loopback connect and write take milliseconds, so the first request is on the
-    ///   wire and recorded long before the budget ends, and the next batch's request, which gets
-    ///   its own budget, finishes well inside it on a loaded machine.
-    /// - `drive_write_loop`'s ceiling, `RECV_TIMEOUT` (5 s) plus one budget per batch, is 9 s for
-    ///   the two batches these tests send, above the one cut-off budget and the delivered batch
-    ///   together.
-    const HUNG_REQUEST_BUDGET: Duration = Duration::from_secs(2);
 
     /// A resource whose runtime id has no v0.4 field (the trace codec counts it `no_wire_form`
     /// once per request body) and whose language isn't a legal header value (the sink leaves the

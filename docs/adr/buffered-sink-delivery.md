@@ -328,5 +328,7 @@ decisions 2, 10, and 13). The gate lives in `logit_core::Telemetry`, armed by `o
 mutes only during an encode that repeats one an earlier attempt at the batch already counted; an
 unarmed gate never mutes, so a caller that never calls `observe_batch` counts every `send`.
 `sink/w6` gates `otlp_out`, `prometheus_out`'s remote-write mode, and `splunk_hec_out` the same
-way. `datadog_out` and `datadog_trace_out` follow in `sink/w7`, and until then count their
-encode-side counters once per attempt (`docs/known-gaps.md`).
+way. `datadog_out` and `datadog_trace_out` are gated too, per unit: `datadog_out`'s plan and
+each route, and `datadog_trace_out`'s trace and stats routes, with a bisection's re-encodes muted
+([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+decision 2).

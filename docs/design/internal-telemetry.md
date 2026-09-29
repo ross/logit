@@ -1489,8 +1489,9 @@ The two Datadog sinks encode a batch in units: `datadog_out`'s plan (the stale f
 readiness gate) and each of its routes, and `datadog_trace_out`'s trace and stats routes. Each
 unit counts on the batch's first encode of it, so a route an earlier attempt never reached counts
 on the attempt that first encodes it. A request over a route's byte limit is bisected and each
-half re-encoded; the re-encodes count nothing, so a record's codec counters count once however
-deep the bisection goes. A record the codec degraded and the sink then dropped as `oversize`
+half re-encoded; the re-encodes count nothing, so a codec counter for a record counts once per
+record, at the record's first encode, however deep the bisection goes, on a single attempt as on
+a retried batch. A record the codec degraded and the sink then dropped as `oversize`
 counts under both counters.
 
 A few Datadog codec counters describe a request body, not a record, and count once per body the

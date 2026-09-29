@@ -739,8 +739,9 @@ const PER_ATTEMPT: [&str; 4] = [
 /// client's own timers while socket I/O is in flight.
 ///
 /// - Above it, the sink's request timeout (10 s by default: `otlp_out`'s `DEFAULT_TIMEOUT`,
-///   `prometheus_out`'s `DEFAULT_ENDPOINT_TIMEOUT`, `splunk_hec_out`'s `DEFAULT_TIMEOUT`) is 8 s
-///   away, so the budget, not the client, ends the hung request.
+///   `prometheus_out`'s `DEFAULT_ENDPOINT_TIMEOUT`, and the `DEFAULT_TIMEOUT` of `splunk_hec_out`,
+///   `datadog_out`, and `datadog_trace_out`) is 8 s away, so the budget, not the client, ends the
+///   hung request.
 /// - Below it, a loopback connect and write take milliseconds, so the first request is on the wire
 ///   and recorded long before the budget ends, and the next batch's request, which gets its own
 ///   budget, finishes well inside it on a loaded machine.
