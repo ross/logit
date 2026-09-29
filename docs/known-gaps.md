@@ -774,7 +774,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 - **`logit_in`'s `idle_timeout` bounds reads only; a blocked write is bounded by
   `handshake_timeout`.** `idle_timeout` can't reach a write that a peer has stopped reading, so
   `logit_in` writes every `HelloAck`, `Ack`, and `Reject` (`GOING_AWAY` included) within
-  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded writes").
+  `handshake_timeout` instead (`crates/logit-inputs/src/logit.rs`'s module doc, "Bounded, flushed writes").
   A peer that sends frames but never reads its `Ack`s is disconnected once the listener's send
   buffer fills and one `Ack` write stalls for `handshake_timeout`
   (`logit.proto.errors{reason="ack_write_stalled"}`). The cost is one knob covering two waits: an
