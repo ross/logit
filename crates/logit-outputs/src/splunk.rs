@@ -32,7 +32,8 @@
 //! then packs the objects greedily, in order, into bodies of at most `max_body_bytes` before
 //! compression, concatenated with no separator. An object over the cap alone is never sent,
 //! counted `logit.output.records.dropped{reason="oversize"}` for its records, with a throttled
-//! `oversize` diagnostic, and packing carries on past it. Bodies go out sequentially as
+//! `oversize` diagnostic, once per batch however many attempts it takes (`crate::accounting`),
+//! and packing carries on past it. Bodies go out sequentially as
 //! `POST {endpoint}/event`, with these headers:
 //!
 //! | Header | Value |
@@ -118,7 +119,7 @@
 //! |---|---|
 //! | `logit.output.requests{route, class}` | one per request; `route` is `event` or `ack`, `class` is [`crate::http::status_class`]'s, or `network_error` |
 //! | `logit.output.request.duration{route}` | one timer per request |
-//! | `logit.output.request.bytes{route}` | the body as sent, after compression |
+//! | `logit.output.request.bytes{route}` | the body as sent, after compression, for a request that got an answer or failed after it may have left; a refused connection counts none |
 //! | `logit.output.records` | records in a body Splunk accepted, and those ahead of a code-6 object |
 //! | `logit.output.records.dropped{reason}` | `oversize` or `invalid_event`, as above |
 //! | `logit.output.requests.rejected{code}` | one per rejected `/event` request, as above |

@@ -20,10 +20,15 @@ use logit_core::EventBatch;
 /// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing,
 /// budget, and the retryable/permanent decision, from [`is_retryable`] and
 /// [`Output::duplicate_safe`]. A sink runs no retry loop of its own. Inside one attempt it may
-/// resend once, bounded, on a verdict that proves the resend safe: the pooled-stream driver's one
-/// reconnect after a plaintext first write that accepted nothing (`PooledStream::send` in
-/// `logit-outputs`), and `splunk_hec_out`'s resend of the rest of a body after a code 6 dropped
-/// one of its objects (`SplunkHecOutput::send_body`).
+/// resend, bounded, on a verdict that proves the resend safe, or poll, bounded, for a verdict:
+/// - the pooled-stream driver's one reconnect after a plaintext first write that accepted nothing
+///   (`PooledStream::send` in `logit-outputs`);
+/// - `splunk_hec_out`'s resend of the rest of a body after a code 6 dropped one of its objects
+///   (`SplunkHecOutput::send_once`);
+/// - `splunk_hec_out`'s one split of a body Splunk Cloud answered as over its cap, each half sent
+///   once (`SplunkHecOutput::send_body`);
+/// - `splunk_hec_out`'s `/ack` poll under `ack: true`, until every id is acknowledged or
+///   `ack_timeout` passes (`SplunkHecOutput::await_acks`).
 #[async_trait::async_trait]
 pub trait Output {
     /// Opens whatever this sink must open before it can serve anything: a listening socket, in
@@ -63,7 +68,9 @@ pub trait Output {
     /// (`docs/adr/batch-provenance-on-delivered.md`); `logit_out` threads it across the wire, and
     /// a sink with encode-side counters arms its once-per-batch accounting here
     /// (`docs/adr/sink-send-path-and-attempt-accounting.md`, decision 2). A caller outside the
-    /// runtime that never calls it gets every `send` counted. Default no-op.
+    /// runtime that never calls it gets every `send` counted. Default no-op, so a type that
+    /// implements `Output` by delegating to another must forward this too, or the inner sink's
+    /// accounting never arms (`prometheus_out`'s `PrometheusOutput`).
     fn observe_batch(&mut self, ctx: BatchContext) {
         let _ = ctx;
     }

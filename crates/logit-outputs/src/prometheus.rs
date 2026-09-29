@@ -203,7 +203,8 @@
 //! `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from [`text::write_with`] add up as one
 //! component's totals. The lock order that implies (encoder before registry) is on
 //! [`ExposeOutput::encoder`]. Sender mode has one direction and `&mut self`, so its encoder is a
-//! plain field.
+//! plain field, counting once per batch however many attempts it takes (`crate::accounting`);
+//! registry mode's `send` never fails, so it has no gate.
 //!
 //! ## Security posture: no TLS, no auth on `bind:`
 //!
