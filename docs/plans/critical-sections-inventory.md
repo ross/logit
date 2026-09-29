@@ -276,7 +276,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
 | [WIRE-04](#wire-04--batch-framing-v1v2-and-the-mandatory-provenance-trailer) | P1 | Batch framing v1/v2 and the mandatory provenance trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_batch_v2`, `CODEC_NATIVE_V2`) | unreviewed |
 | [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
-| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | in-progress (sink/w1) |
+| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | findings → sink/w1 |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
 | [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/prometheus.rs` (`PrometheusInput::tick`, `scrape_target`, `MAX_SCRAPE_BYTES`) | unreviewed |
@@ -310,7 +310,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | in-progress (sink/w2) |
-| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | in-progress (sink/w1) |
+| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → sink/w1 |
 | [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w5) |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
@@ -4659,6 +4659,33 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   Its doc is wrong on two points: a `Pending` poll can move a partial record from the socket into
   the TLS session, and a cancelled read loses nothing. The behavior is sound. The
   "none spotted" concern line stands for the code and not for the prose.
+- **Verified (sink/w1):** findings, prose only; no behavior change. Read against tokio-rustls
+  0.26.5 (`common/mod.rs`, `Stream::poll_fill_buf`) and rustls 0.23.45, and pinned with a real TLS
+  pair over `tokio::io::duplex` in `crates/logit-outputs/src/stream_pins.rs` and `tls.rs`'s new
+  test module.
+  - ~~`Poll::Pending` implies nothing was consumed from the TLS session and from the kernel
+    socket.~~ **Refuted:** a `Pending` poll reads what the socket holds into the session, part of
+    a record or whole post-handshake records. No plaintext is consumed, and the session keeps
+    those bytes: `a_partial_tls_record_survives_a_dropped_read`,
+    `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending`, and
+    `a_partial_tls_record_probes_open_and_is_still_readable` (the probe answers `Open`, and the
+    record completes afterwards). `poll_pending_close`'s doc now says so, and why the probe is one
+    poll: it must not wait.
+  - Both consuming verdicts drop the connection at all four call sites (`statsd.rs`,
+    `syslog.rs`, `graphite.rs`, `logit.rs`: the `_closed` arm drops `conn` and dials fresh),
+    confirmed by reading.
+  - The waker: `poll_pending_close` registers the task's waker with the IO once and never awaits
+    again. tokio 1.53.1 keeps one `AsyncRead` waker per socket (`runtime/io/scheduled_io.rs`,
+    `Waiters::reader`), which the next poll overwrites and the stream's drop frees, so nothing
+    accumulates. Confirmed by reading.
+  - `host_only`: `host_only_takes_the_host_of_a_bare_endpoint` pins `host:port`, bracketed IPv6,
+    a bare host, the empty string, and bare unbracketed IPv6, which yields a truncated host
+    (`::1` to `:`), as the doc's "the brackets are the operator's to write" allows.
+  - The four arms over `FakeStream`: `a_pending_poll_is_open`, `an_empty_ready_is_eof`,
+    `a_read_error_is_eof`, `unsolicited_bytes_are_counted_up_to_the_probe_buffer`. Real-TLS
+    closes: `a_tls_close_notify_probes_eof`, `a_tls_transport_close_without_close_notify_probes_eof`.
+  - The suggested TLS twins of the two `logit_out` probe tests and the FIN-between-probe-and-write
+    test belong to `sink/w3` and `sink/w2`.
 
 ---
 
@@ -7096,8 +7123,9 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `logit.rs`, another agent's area).
 - **What it does:** Wraps a single `AsyncRead::poll_read` in `poll_fn`, mapping `Pending` → still
   open, `Ready(Ok)` with an empty buffer → peer EOF, `Ready(Ok)` with bytes → unsolicited data,
-  `Ready(Err)` → treat as closed. Deliberately *not* `timeout(read)`, because a cancelled read on a
-  `tokio-rustls` stream can discard a partially received record.
+  `Ready(Err)` → treat as closed. Deliberately *not* `timeout(read)`, ~~because a cancelled read on a
+  `tokio-rustls` stream can discard a partially received record~~ because the probe must not wait
+  (a cancelled read loses nothing; see the Verified bullet).
 - **Why sensitive:** custom (hand-rolled `poll_fn` over a trait object rather than any crate API);
   cancellation (the entire justification for the shape is cancel-safety of the read);
   data-loss (the answer decides whether a batch is written into a dead socket, which is exactly
@@ -7116,11 +7144,14 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     those receivers speaks back), so discarding those bytes loses nothing.
   - The probe is only ever applied to a *reused* connection, never a freshly dialled one.
 - **Observed concerns (unverified):** The doc comment on `poll_pending_close` (its point-in-time paragraph) states the residual honestly (a
-  FIN arriving between probe and write is unchanged). The one thing not argued: `Ready(Err(_)) →
+  FIN arriving between probe and write is unchanged). ~~The one thing not argued: `Ready(Err(_)) →
   Eof` (the last arm of the `poll_fn` closure) swallows the error kind entirely, so a genuinely transient read error is
   indistinguishable from a closed peer and silently costs a reconnect. Low confidence this matters
-  in practice; worth a one-line justification. No test in `tls.rs` itself (it has no test module) —
-  the probe is only covered indirectly through each sink's pooled-connection tests.
+  in practice; worth a one-line justification.~~ **Resolved (sink/w1):** the arm now says why: a
+  reset, a TLS close without `close_notify`, or a bad record leaves nothing to write to, and a
+  transient error costs one reconnect with nothing written. ~~No test in `tls.rs` itself (it has no test module) —
+  the probe is only covered indirectly through each sink's pooled-connection tests.~~
+  **Resolved (sink/w1):** `tls.rs` has a test module.
 - **Existing coverage:** indirect only — the test named
   `a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost`
   in each of `statsd.rs`, `syslog.rs` and `graphite.rs`.
@@ -7131,6 +7162,26 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   against the pinned `tokio-rustls` version's `poll_read`.
 - **Priority:** P1 — a wrong answer costs one reconnect (cheap) or one dead-socket write (silent
   loss), but the logic is small and the callers' tests exercise the main paths.
+- **Verified (sink/w1):** findings, prose only; no behavior change.
+  - All four arms, over the shared `FakeStream`: `a_pending_poll_is_open` (one poll, `Open`),
+    `an_empty_ready_is_eof`, `a_read_error_is_eof`,
+    `unsolicited_bytes_are_counted_up_to_the_probe_buffer`. Each fails on a swapped or rewritten
+    arm.
+  - A partial TLS record held across the probe: `a_partial_tls_record_probes_open_and_is_still_readable`
+    (the probe reads 4096 bytes of a 10 000-byte record into the session, answers `Open`, and the
+    record completes and decrypts afterwards). `a_partial_tls_record_survives_a_dropped_read`
+    pins the same for a dropped read future, against tokio-rustls 0.26.5 directly.
+  - A key update or other post-handshake message read by the probe: the session keeps its state,
+    and a read never drives writes (`a_tls_read_never_drives_queued_ciphertext_to_the_socket`),
+    so any reply rustls queues goes out with the next write's flush.
+    `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending` pins that the session
+    tickets after a TLS 1.3 handshake read as `Open`, not `Eof` or `Bytes`.
+  - Closes: `a_tls_close_notify_probes_eof`, and
+    `a_tls_transport_close_without_close_notify_probes_eof` through the error arm.
+  - The probe runs only on a connection taken from `*stream`, never a fresh dial (the `Some` arm
+    of each `send_tcp`), confirmed by reading.
+  - `Bytes` in steady state for statsd, syslog, and graphite needs a receiver that sends
+    application data; none does, and TLS post-handshake records carry none.
 
 ---
 
