@@ -39,6 +39,7 @@
 //! successful `send` (the accepted part landed; a retry would duplicate it), counted as
 //! `logit.output.records.rejected{signal}` with a throttled `otlp_partial_success` warning.
 
+use crate::accounting::BatchAccounting;
 use crate::Output;
 use anyhow::Context;
 use bytes::Bytes;
@@ -48,8 +49,8 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as GrpcClient;
 use hyper_util::rt::TokioExecutor;
-use logit_core::{Diagnostics, EventBatch, Telemetry};
-use logit_pipeline::Fault;
+use logit_core::{CountGate, Diagnostics, EventBatch, Telemetry};
+use logit_pipeline::{BatchContext, Fault};
 use logit_proto::otlp::OtlpEncoder;
 use logit_proto::{Signal, SignalEncoder};
 // For the test module's TLS server (`test_server_tls_config`); client TLS lives in `crate::tls`.
@@ -113,9 +114,12 @@ pub struct OtlpOutput {
     /// the default trust store and rebuilt when [`OtlpOutput::with_tls`] sets a non-empty `tls:`.
     grpc_client: GrpcClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     request_timeout: Duration,
+    /// Counts through views of `telemetry`/`diag` gated by `accounting` ([`new_encoder`]).
     encoder: OtlpEncoder,
+    /// Ungated: the requests and partial successes a receiver's answer decides.
     telemetry: Telemetry,
     diag: Diagnostics,
+    accounting: BatchAccounting,
     /// Extra headers on every export request, both transports. Applied per request, never as
     /// `reqwest` `default_headers`: `with_timeout` rebuilds `client`, which would drop them if
     /// called afterward. `client` stays a function of timeout and TLS settings only.
@@ -129,15 +133,18 @@ pub struct OtlpOutput {
 
 impl OtlpOutput {
     pub fn new(endpoint: String, transport: OtlpTransport) -> anyhow::Result<Self> {
+        let accounting = BatchAccounting::default();
+        let (telemetry, diag) = (Telemetry::default(), Diagnostics::default());
         Ok(Self {
             endpoint,
             transport,
             client: build_client(DEFAULT_TIMEOUT, None),
             grpc_client: build_grpc_client(&default_client_tls_config()),
             request_timeout: DEFAULT_TIMEOUT,
-            encoder: OtlpEncoder::new(),
-            telemetry: Telemetry::default(),
-            diag: Diagnostics::default(),
+            encoder: new_encoder(&telemetry, &diag, accounting.gate()),
+            telemetry,
+            diag,
+            accounting,
             headers: HeaderMap::new(),
             paths: SignalPaths::default(),
             compression: OtlpCompression::default(),
@@ -234,18 +241,19 @@ impl OtlpOutput {
         override_path.as_deref().unwrap_or_else(|| signal.path())
     }
 
-    /// Attaches the diagnostics handle, to this output and to its encoder's lossy-metric paths.
+    /// Attaches the diagnostics handle, to this output and, gated, to its encoder's lossy-metric
+    /// paths.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.encoder = self.encoder.with_diagnostics(diag);
+        self.diag = diag;
+        self.encoder = new_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
 
-    /// Attaches the layer-3 telemetry handle, also threaded into the encoder for its
+    /// Attaches the layer-3 telemetry handle, also threaded, gated, into the encoder for its
     /// lossy-metric-path counters (`logit-proto`'s `otlp::metrics` module doc).
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.encoder = self.encoder.with_telemetry(telemetry);
+        self.telemetry = telemetry;
+        self.encoder = new_encoder(&self.telemetry, &self.diag, self.accounting.gate());
         self
     }
 
@@ -393,22 +401,42 @@ impl OtlpOutput {
             .context(grpc_fault(code))
         }
     }
-}
 
-#[async_trait::async_trait]
-impl Output for OtlpOutput {
     /// One attempt per request, no retry in the sink (`docs/adr/buffered-sink-delivery.md`). The
     /// first failing request aborts the rest; `write_loop` then retries the whole batch, which is
-    /// why [`OtlpOutput::duplicate_safe`] matters here.
-    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let payloads = self.encoder.encode_signals(batch)?;
-        for (signal, payload) in payloads {
+    /// why [`OtlpOutput::duplicate_safe`] matters here. Every signal is encoded before the first
+    /// request, as unit 0 of the batch accounting.
+    async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
+        for (signal, payload) in payloads? {
             match self.transport {
                 OtlpTransport::Http => self.send_http(signal, payload).await?,
                 OtlpTransport::Grpc => self.send_grpc(signal, payload).await?,
             }
         }
         Ok(())
+    }
+}
+
+/// The encoder, on views of `telemetry` and `diag` gated by `gate`, so a retried batch counts its
+/// codec's drops once (`crate::accounting`). Built here for `new` and both handle builders, so no
+/// builder order leaves it on an ungated or replaced handle.
+fn new_encoder(telemetry: &Telemetry, diag: &Diagnostics, gate: &CountGate) -> OtlpEncoder {
+    OtlpEncoder::new().with_telemetry(telemetry.gated(gate)).with_diagnostics(diag.gated(gate))
+}
+
+#[async_trait::async_trait]
+impl Output for OtlpOutput {
+    /// Arms this sink's batch accounting (`crate::accounting`).
+    fn observe_batch(&mut self, _ctx: BatchContext) {
+        self.accounting.observe();
+    }
+
+    /// One attempt ([`OtlpOutput::attempt`]). An `Ok` disarms the batch accounting on every path,
+    /// a batch that encoded to nothing included.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let result = self.attempt(batch).await;
+        self.accounting.finish(result)
     }
 
     /// `false`, for two independent reasons, either sufficient:
@@ -1702,5 +1730,296 @@ mod tests {
             Err(err) => err,
         };
         assert!(format!("{err:?}").contains("does-not-exist.pem"), "got: {err:?}");
+    }
+
+    // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) ----
+
+    use crate::test_support::{
+        assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch, fast_retry,
+        http_recorder, sum_of, sums_through_write_loop, RecordLog, Reply, SumSeries, Sums,
+    };
+    use logit_pipeline::test_util::TelemetryProbe;
+    use logit_pipeline::{DeliveryPosture, WriteLoopConfig};
+
+    /// A gauge delta the codec skips with its diagnostic, and nothing else: a batch that sends no
+    /// request.
+    fn nothing_to_send_batch() -> EventBatch {
+        let name = logit_core::interner::intern("conns");
+        let delta = MetricRecord::new(name, MetricKind::GaugeDelta(5.0));
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![Event::metric(1, AttrMap::new(), delta)],
+        }
+    }
+
+    /// A counter that is sent, and [`nothing_to_send_batch`]'s gauge delta: one metrics request.
+    fn encode_side_batch() -> EventBatch {
+        let mut batch = nothing_to_send_batch();
+        batch.events.extend(metric_batch().events);
+        batch
+    }
+
+    const ENCODE_SIDE: [SumSeries<'static>; 2] = [
+        ("logit.output.metrics.skipped", &[("metric_kind", "gauge_delta")]),
+        ("logit.component.diagnostics", &[("key", "gauge_delta_unresolved")]),
+    ];
+
+    /// An `Export*ServiceResponse` whose `partial_success` rejects two data points.
+    fn partial_success() -> Vec<u8> {
+        let sub = [0x08, 2];
+        let mut body = vec![0x0a, sub.len() as u8];
+        body.extend_from_slice(&sub);
+        body
+    }
+
+    /// `write_loop` retries an `Ambiguous` answer only at least once, and `otlp_out`'s own posture
+    /// is at most once.
+    fn retrying() -> WriteLoopConfig {
+        WriteLoopConfig { delivery_override: Some(DeliveryPosture::AtLeastOnce), ..fast_retry() }
+    }
+
+    fn instrumented(output: OtlpOutput, probe: &TelemetryProbe) -> OtlpOutput {
+        let telemetry = probe.telemetry("out", "otlp_out", "sink");
+        output
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    fn instrumented_http(addr: std::net::SocketAddr, probe: &TelemetryProbe) -> OtlpOutput {
+        instrumented(http_output(addr), probe)
+    }
+
+    /// An HTTP receiver answering the `n`th request with `statuses[n]`, the last to every later
+    /// one; a `200` carries [`partial_success`].
+    async fn scripted_http(statuses: &'static [u16]) -> (std::net::SocketAddr, RecordLog) {
+        http_recorder(move |n, _, _| {
+            let status = statuses[n.min(statuses.len() - 1)];
+            let body = if status == 200 { partial_success() } else { Vec::new() };
+            Reply::Answer(status, body)
+        })
+        .await
+    }
+
+    /// [`encode_side_batch`] through the write loop under [`retrying`], over the sink `build`
+    /// makes, against [`scripted_http`]; and the request bodies it received.
+    async fn run_http(
+        statuses: &'static [u16],
+        build: impl FnOnce(std::net::SocketAddr, &TelemetryProbe) -> OtlpOutput,
+    ) -> (Sums, Vec<Vec<u8>>) {
+        let (addr, log) = scripted_http(statuses).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = build(addr, &probe);
+        let batches = vec![encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        let bodies = log.lock().unwrap().iter().map(|r| r.body.clone()).collect();
+        (sums, bodies)
+    }
+
+    const METRICS_5XX: [(&str, &str); 2] = [("signal", "metrics"), ("class", "5xx")];
+    const METRICS_2XX: [(&str, &str); 2] = [("signal", "metrics"), ("class", "2xx")];
+
+    /// A `503` then a `200` with a partial success, under at-least-once: delivered on the second
+    /// attempt, with every encode-side counter read as after one attempt, the second request's
+    /// body the first's, and the partial success, a verdict on the second attempt, counted.
+    #[tokio::test]
+    async fn an_http_retry_counts_encode_side_counters_once() {
+        let (single, one) = run_http(&[200], instrumented_http).await;
+        let (retried, bodies) = run_http(&[503, 200], instrumented_http).await;
+        assert_eq!(sum_of(&single, "logit.output.requests", &METRICS_2XX), 1.0);
+        assert_eq!(sum_of(&retried, "logit.output.requests", &METRICS_5XX), 1.0);
+        assert_eq!(sum_of(&retried, "logit.output.requests", &METRICS_2XX), 1.0);
+        assert_eq!(bodies.len(), 2, "one request per attempt");
+        assert_eq!(bodies[0], bodies[1], "the retry sends the first attempt's bytes");
+        assert_eq!(one[0], bodies[1]);
+        let rejected = [("signal", "metrics")];
+        assert_eq!(sum_of(&retried, "logit.output.records.rejected", &rejected), 2.0);
+        let partial = [("key", "otlp_partial_success")];
+        assert_eq!(sum_of(&retried, "logit.component.diagnostics", &partial), 1.0);
+        assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &[]);
+    }
+
+    /// A gRPC receiver answering the `n`th call with `statuses[n]`, the last to every later one;
+    /// and the framed request bodies it received.
+    async fn scripted_grpc(
+        statuses: &'static [u32],
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<Bytes>>>) {
+        use hyper::service::service_fn;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Arc<std::sync::Mutex<Vec<Bytes>>> = Arc::default();
+        let task_bodies = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let bodies = task_bodies.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let bodies = bodies.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let n = {
+                                let mut bodies = bodies.lock().unwrap();
+                                bodies.push(body);
+                                bodies.len() - 1
+                            };
+                            let status = statuses[n.min(statuses.len() - 1)];
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", status.to_string().parse().unwrap());
+                            let resp_body = TestGrpcBody {
+                                data: Some(Bytes::from(grpc_frame(&[], false))),
+                                trailers: Some(trailers),
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/grpc+proto")
+                                    .body(resp_body)
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        (addr, bodies)
+    }
+
+    /// The gRPC transport runs the same encode: `UNAVAILABLE` then `OK` counts encode-side once
+    /// and resends the same bytes.
+    #[tokio::test]
+    async fn a_grpc_retry_counts_encode_side_counters_once() {
+        let mut runs = Vec::new();
+        let mut sent = Vec::new();
+        let scripts: [&'static [u32]; 2] = [&[0], &[14, 0]];
+        for statuses in scripts {
+            let (addr, bodies) = scripted_grpc(statuses).await;
+            let mut probe = TelemetryProbe::new();
+            let mut output = instrumented(grpc_output(addr), &probe);
+            let batches = vec![encode_side_batch()];
+            runs.push(
+                sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying())
+                    .await,
+            );
+            sent.push(bodies.lock().unwrap().clone());
+        }
+        let (single, retried) = (&runs[0], &runs[1]);
+        let unavailable = [("signal", "metrics"), ("class", "unavailable")];
+        assert_eq!(sum_of(retried, "logit.output.requests", &unavailable), 1.0);
+        assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sent[1].len(), 2, "one call per attempt");
+        assert_eq!(sent[1][0], sent[1][1], "the retry sends the first attempt's bytes");
+        assert_eq!(sent[0][0], sent[1][1]);
+        assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
+    }
+
+    /// The gate re-arms per batch: a second batch counts as the first did.
+    #[tokio::test]
+    async fn a_second_otlp_batch_counts_its_encode_side_counters() {
+        let (addr, _log) = scripted_http(&[200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, fast_retry())
+                .await;
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch whose one request never answers is cut off by the retry budget and dropped, and
+    /// the next batch counts its encode-side counters.
+    #[tokio::test]
+    async fn an_otlp_batch_after_one_dropped_at_its_budget_counts_encode_side() {
+        let (addr, log) =
+            http_recorder(
+                |n, _, _| {
+                    if n == 0 {
+                        Reply::Hang
+                    } else {
+                        Reply::Answer(200, Vec::new())
+                    }
+                },
+            )
+            .await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        let mut config = fast_retry();
+        config.retry.total_budget = Duration::from_secs(2);
+        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let sums =
+            sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, config).await;
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(log.lock().unwrap().len(), 2, "the hung request, then the second batch's");
+        for (name, tags) in ENCODE_SIDE {
+            assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
+        }
+    }
+
+    /// A batch that sends no request returns `Ok` early and leaves the accounting disarmed, so
+    /// later direct sends count.
+    #[tokio::test]
+    async fn otlp_direct_sends_after_a_batch_that_sent_nothing_count_every_time() {
+        let (addr, log) = scripted_http(&[200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_http(addr, &probe);
+        assert_direct_sends_count_after_an_empty_batch(
+            &mut output,
+            &mut probe,
+            "otlp_out",
+            nothing_to_send_batch(),
+            encode_side_batch,
+            &ENCODE_SIDE,
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 2, "the two direct sends, and nothing before them");
+    }
+
+    /// Either order of the handle builders, each after a first call with other handles, leaves
+    /// the encoder counting through gated views of the last handles.
+    #[tokio::test]
+    async fn every_otlp_builder_order_gates_the_encoder_on_the_final_handles() {
+        for telemetry_last in [false, true] {
+            let decoy = Registry::new();
+            let build = |addr: std::net::SocketAddr, probe: &TelemetryProbe| -> OtlpOutput {
+                let other = decoy.telemetry_for("other", "otlp_out", "sink");
+                let sink = http_output(addr)
+                    .with_telemetry(other.clone())
+                    .with_diagnostics(Diagnostics::new("other").with_telemetry(other));
+                let telemetry = probe.telemetry("out", "otlp_out", "sink");
+                let diag = Diagnostics::new("out").with_telemetry(telemetry.clone());
+                if telemetry_last {
+                    sink.with_diagnostics(diag).with_telemetry(telemetry)
+                } else {
+                    sink.with_telemetry(telemetry).with_diagnostics(diag)
+                }
+            };
+            let (single, _) = run_http(&[200], build).await;
+            let (retried, _) = run_http(&[503, 200], build).await;
+            assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &[]);
+            let stale = decoy.drain(0).iter().map(|e| e.metrics.len()).sum::<usize>();
+            assert_eq!(stale, 0, "nothing counts through a replaced handle");
+        }
+    }
+
+    /// With no handle builders, the encoder's diagnostics share the sink's throttle and are gated
+    /// too: a retried batch reports its codec diagnostic once.
+    #[tokio::test]
+    async fn an_otlp_sink_with_no_handle_builders_reports_a_codec_diagnostic_once() {
+        let (addr, log) = scripted_http(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = http_output(addr);
+        let batches = vec![encode_side_batch()];
+        sums_through_write_loop(&mut output, &mut probe, "otlp_out", batches, retrying()).await;
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert_eq!(output.diag.occurrences("gauge_delta_unresolved"), 1);
+        assert_eq!(output.diag.occurrences("otlp_partial_success"), 1);
     }
 }
