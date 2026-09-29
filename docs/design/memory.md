@@ -680,7 +680,7 @@ But not every allocation constant exercises a `Telemetry::span` call site:
 
 - `fanout_send_*` (`Fanout::send`/`send_blocking`, the listener span site) build their `Fanout` via
   `Fanout::new` with **no** `.with_telemetry(...)` call. That is `Telemetry::default()`, fully
-  disabled (`self.0` is `None`), and `Telemetry::span` returns `SpanGuard::disabled()` on its first
+  disabled (its buffer is `None`), and `Telemetry::span` returns `SpanGuard::disabled()` on its first
   line, *before* calling `trace_is_sampled`. These constants prove the disabled path is free, not a
   live registry sampling below `1.0`.
 - `process_batch_*`/`send_batch_*`'s "telemetry live" variants attach a real `Telemetry` from a

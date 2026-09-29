@@ -1,6 +1,7 @@
 //! Shared test helpers for every crate's tests: a named wait, an accumulating telemetry reader, a
-//! channel receive under one timeout, socket close checks, a bind-first input spawn, and a unique
-//! scratch directory. The rules they encode are in `docs/adr/test-timing-and-observables.md`.
+//! channel receive under one timeout, socket close checks, a bind-first input spawn, the runtime's
+//! own sink write loop over a queue of batches ([`drive_write_loop`]), and a unique scratch
+//! directory. The rules they encode are in `docs/adr/test-timing-and-observables.md`.
 //!
 //! Compiled for this crate's own tests and, elsewhere, only through the dev-only `test-util`
 //! feature; `script/lint` fails if `logit-cli`'s release graph enables it.

@@ -311,7 +311,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
-| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w6); line, datagram, InfluxDB, and file sinks → #454 |
+| [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w6) |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
 | [NET-05](#net-05--udp-bind-path-socket2-socket-creation-so_rcvbuf-multicast-join-address-fallback) | P2 | UDP bind path: `socket2` socket creation, `SO_RCVBUF`, multicast join, address fallback | `crates/logit-inputs/src/udp.rs` (`bind_socket`, `bind_first_available`, `bind_one`, `finish_bind`) | unreviewed |
@@ -7604,7 +7604,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   is per batch. The trait doc and `LogitOutput`'s field doc say it runs before each attempt and
   are wrong. A once-per-batch hook is what lets a sink reset a gate there, and the retry-counter
   question is settled that way in the ADR.
-- **Verified (sink/w5, #454), for the line, datagram, InfluxDB, and file sinks:** findings. The inflation
+- **Verified (sink/w5), line, datagram, InfluxDB, and file sinks → #454:** findings. The inflation
   was real in all five encoding sinks: with the gate never armed, a batch delivered on its second
   attempt read every encode-side counter and diagnostic twice (`batch.bytes`, the drop and
   normalization counters, and `logit.component.diagnostics`). The fix
