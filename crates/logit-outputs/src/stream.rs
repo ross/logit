@@ -314,8 +314,8 @@ mod tests {
     use std::pin::{pin, Pin};
     use std::task::Poll;
 
-    use logit_pipeline::test_util::{scratch_dir, TelemetryProbe, RECV_TIMEOUT};
-    use tokio::io::AsyncReadExt;
+    use logit_pipeline::test_util::{scratch_dir, wait_until, TelemetryProbe, RECV_TIMEOUT};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UnixListener};
 
     use super::*;
@@ -380,8 +380,9 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             sink: "test_out",
         };
-        // Connected before, so a wrongly counted reconnect would show.
-        let mut pool = PooledStream { stream: None, has_connected_once: true };
+        // A pooled connection the probe finds closed, so the refused dial is a redial: a wrongly
+        // counted reconnect would show, and so would the closed connection put back.
+        let mut pool = PooledStream::pooled(Box::new(FakeStream::new().reading(ReadStep::Eof)));
 
         let err = pool.send(&dial, FRAME, &telemetry).await.expect_err("nothing listens");
 
@@ -622,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_send_dropped_while_dialing_leaves_the_pool_empty() {
+    async fn a_send_dropped_while_dialing_counts_nothing_and_the_next_send_dials_again() {
         let fresh = FakeStream::new();
         let script = ScriptedDial::new(false, [DialStep::Hang, connect_to(&fresh)]);
         let (mut probe, telemetry) = sink_telemetry();
@@ -634,7 +635,6 @@ mod tests {
             assert!(poll_once(&mut send).await.is_pending());
         }
         assert_eq!(script.dials(), 1, "dropped inside the dial");
-        assert!(pool.is_empty());
 
         pool.send(&scripted(&script), FRAME, &telemetry).await.expect("the next send works");
         assert_eq!(fresh.state().flushed, FRAME);
@@ -841,21 +841,53 @@ mod tests {
         conn
     }
 
+    /// The probe's answer now, from one poll with no task to wake: it reads the readiness the I/O
+    /// driver has already stored for the socket.
+    fn probe_now(stream: &mut (dyn AsyncStream + '_)) -> PendingClose {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match pin!(poll_pending_close(stream, &mut [0u8; 1])).poll(&mut cx) {
+            Poll::Ready(answer) => answer,
+            Poll::Pending => unreachable!("poll_pending_close answers on its first poll"),
+        }
+    }
+
+    /// The peer half-closes the pooled connection: it sends its FIN but keeps reading, so a write
+    /// on that connection would still land there. The frame arriving on a second connection, with
+    /// nothing more on the first, is what only the probe's redial produces. The test waits until
+    /// the pooled stream probes `Eof`, so the driver's own probe sees the FIN; without the wait,
+    /// nothing runs the I/O driver between the close and the `send`, and the probe answers open.
+    /// Whether the retry survives is the scripted tests' to prove: a real socket can't count
+    /// dials.
     #[tokio::test]
-    async fn unix_stream_redials_after_the_peer_closes_a_pooled_connection() {
-        let dir = scratch_dir("stream-unix-close");
+    async fn unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed() {
+        let dir = scratch_dir("stream-unix-probe");
         let path = dir.join("s.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::default();
 
         pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("first");
-        drop(accept_frame(&listener).await); // the peer closes its end
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("second, on a redial");
-        let _second = accept_frame(&listener).await;
+        let mut first = accept_frame(&listener).await;
+        first.shutdown().await.unwrap();
+        let pooled = pool.stream_mut().expect("the first send pooled its connection");
+        wait_until("the pooled connection to probe Eof", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
 
+        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("second, on the redial");
+
+        let _second = accept_frame(&listener).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(RECV_TIMEOUT, first.read_to_end(&mut rest))
+            .await
+            .expect("the driver dropped the first connection")
+            .unwrap();
+        assert!(rest.is_empty(), "the second frame never went to the first connection");
         assert_eq!(reconnects(&mut probe), 1.0);
-        assert_eq!(probe.sum("logit.output.requests", &[("class", "ok")]), 2.0);
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.requests", &[("class", "ok")]), 2.0);
+        assert_eq!(totals.sum("logit.output.requests", &[]), 2.0, "no other class");
     }
 
     /// The peer stops reading, so the pooled connection probes open and its first write fails
@@ -893,7 +925,9 @@ mod tests {
         assert!(pool.is_empty());
         assert_one_request(&mut probe, "clean");
 
-        // The receiver goes away: the probe sees the close and the redial finds no socket.
+        // The receiver goes away. Nothing awaits between the close and the next `send`, so the
+        // I/O driver hasn't stored the hang-up: the probe answers open, the write fails with
+        // `EPIPE`, and the `Clean` comes from the retry's dial finding no socket.
         let listener = UnixListener::bind(&path).unwrap();
         pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("delivered");
         let conn = accept_frame(&listener).await;
