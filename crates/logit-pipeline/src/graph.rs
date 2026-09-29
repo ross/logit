@@ -102,9 +102,11 @@
 //! 37. A `has_provenance`/`drop_provenance` with neither `origin` nor `previous`, or an empty or
 //!     repeated entry. Oriented like 36, not 21: an empty field is left out of the match
 //!     (`docs/adr/provenance-filtering-components.md`).
-//! 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, and a `collectd_out`
-//!     value outside `1024..=65535`: above it every send fails `EMSGSIZE` while reporting success
-//!     (`docs/adr/collectd-binary-relay.md`).
+//! 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`; above
+//!     `MAX_UDP_PAYLOAD_BYTES` (65507) on `collectd_out` or a UDP `statsd_out`/`graphite_out`,
+//!     since every datagram that size fails `EMSGSIZE` while the send reports success; and on
+//!     `collectd_out` below collectd's own floor of 1024 (`docs/adr/collectd-binary-relay.md`,
+//!     `docs/adr/sink-send-path-and-attempt-accounting.md`).
 //! 39. An `aggregate` bound that can hold nothing: under `temporality: cumulative`, a
 //!     `series_retention` or `max_retained_series` of `0` (nothing survives a flush, so each
 //!     window's increment would be labeled a running total); in either mode, `series_retention`
@@ -189,9 +191,10 @@
 //!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 65. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
-//!     `transport: unix`/`unix_stream` (a client names the socket as `unix:///<path>`), or `tls:`
-//!     under either: a Unix socket is always plaintext. `unix` is a datagram transport for 17/18/57
-//!     and 45/53, `unix_stream` a stream one (`docs/adr/datadog-agent-and-intake-relay.md`).
+//!     `transport: unix`/`unix_stream` (a client names the socket as `unix:///<path>`) or is 108
+//!     bytes or longer (`sockaddr_un`'s `sun_path` can't hold it), or `tls:` under either: a Unix
+//!     socket is always plaintext. `unix` is a datagram transport for 17/18/57 and 45/53,
+//!     `unix_stream` a stream one (`docs/adr/datadog-agent-and-intake-relay.md`).
 //! 66. A `datadog_out` with an empty `api_key` or one with leading or trailing whitespace, an
 //!     empty `site` or one with a scheme or `/`, an `endpoints` entry that isn't an absolute
 //!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name rule 22 would reject against
@@ -219,6 +222,9 @@
 //!     (`docs/adr/lua-runaway-script-bounds.md`).
 //! 72. A `stdio_out`/`file_out` `message:` other than `escaped` outside `format: human`, where it
 //!     would do nothing (`docs/adr/human-render-block-format.md`).
+//! 73. A UDP sink `endpoint` (`statsd_out`, `graphite_out`, `syslog_out` on `transport: udp`, and
+//!     `collectd_out`) on port 0, which the kernel refuses every datagram to
+//!     (`docs/adr/sink-send-path-and-attempt-accounting.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -235,6 +241,7 @@ use logit_config::{
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use logit_proto::splunk::response::SPLUNK_CLOUD_BODY_CAP;
+use logit_proto::MAX_UDP_PAYLOAD_BYTES;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
@@ -243,6 +250,10 @@ use std::time::Duration;
 /// sender has reason to ask for. The default (`logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES`,
 /// Twisted's `MAX_LENGTH`, 1 MiB) sits inside. One const, so both kinds check the same range.
 const GRAPHITE_FRAME_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=16 * 1024 * 1024;
+
+/// Rule 65's bound: Linux's `sockaddr_un.sun_path` holds 108 bytes including the terminating NUL,
+/// and std refuses a path that doesn't leave room for it.
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 
 /// A component's arity class, fixed by its `kind` (`docs/design/pipeline-graph.md`'s arity
 /// table) -- never derived from topology, so a typo'd source reference can't silently reclassify
@@ -1663,12 +1674,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 38: `max_packet_bytes: 0` is an impossible bound on all three sinks. `collectd_out` also
-    // requires collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`): above
-    // the UDP payload ceiling every datagram fails `EMSGSIZE`, which `collectd_out` counts as a
+    // Rule 38: `max_packet_bytes: 0` is an impossible bound on all three sinks. Over UDP a
+    // datagram above `MAX_UDP_PAYLOAD_BYTES` fails `EMSGSIZE`, which each sink counts as a
     // per-datagram drop, not a `Fault`, so it would report `requests{class="ok"}` while delivering
-    // nothing. `statsd_out` starts a new datagram at the cap and `graphite_out` counts an oversize
-    // one `oversize_datagram`; neither ADR claims a range, so both keep only the zero check.
+    // nothing: that bounds `collectd_out` (UDP only) and the UDP transports of `statsd_out` and
+    // `graphite_out`. A Unix datagram's limit is its socket's send buffer, which validation can't
+    // see. `collectd_out` also keeps collectd's own `MaxPacketSize` floor of 1024
+    // (`docs/adr/collectd-binary-relay.md`).
+    let udp_ceiling = MAX_UDP_PAYLOAD_BYTES as u64;
     for (id, component) in &components {
         if matches!(
             &component.kind,
@@ -1682,15 +1695,33 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             );
         }
         if let ComponentKind::CollectdOut { max_packet_bytes, .. } = &component.kind {
-            if !(1024..=65535).contains(max_packet_bytes) {
+            if !(1024..=udp_ceiling).contains(max_packet_bytes) {
                 anyhow::bail!(
                     "component '{id}': max_packet_bytes: {max_packet_bytes} is outside \
-                     1024..=65535 -- collectd's own MaxPacketSize range; a value above 65535 \
-                     packs datagrams no UDP socket can send (every send would fail EMSGSIZE, \
-                     silently reported as requests{{class=\"ok\"}}) and a value below 1024 is \
-                     narrower than collectd itself allows"
+                     1024..={udp_ceiling} -- a value above {udp_ceiling}, the largest UDP \
+                     payload, packs datagrams no UDP socket can send (every send would fail \
+                     EMSGSIZE, silently reported as requests{{class=\"ok\"}}), and a value below \
+                     1024 is narrower than collectd's own MaxPacketSize allows"
                 );
             }
+        }
+        let udp_max_packet_bytes = match &component.kind {
+            ComponentKind::StatsdOut {
+                transport: StatsdTransport::Udp, max_packet_bytes, ..
+            }
+            | ComponentKind::GraphiteOut {
+                transport: GraphiteTransport::Udp,
+                max_packet_bytes,
+                ..
+            } => *max_packet_bytes,
+            _ => continue,
+        };
+        if udp_max_packet_bytes > udp_ceiling {
+            anyhow::bail!(
+                "component '{id}': max_packet_bytes: {udp_max_packet_bytes} is above \
+                 {udp_ceiling}, the largest UDP payload -- every datagram that size would fail \
+                 EMSGSIZE and be dropped, silently reported as requests{{class=\"ok\"}}"
+            );
         }
     }
 
@@ -2884,8 +2915,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // Rule 65: `statsd_in`/`statsd_out` on a Unix socket (`docs/adr/datadog-agent-and-intake-relay.md`).
     // The address field holds the socket's path, and a relative one would resolve against whatever
     // directory `logit` was started in, which a client's `DD_DOGSTATSD_URL=unix:///...` can't
-    // follow (rule 64's reasoning). A Unix socket is always plaintext, so `tls:` could never take
-    // effect; rules 43/52 cover `tls:` under UDP.
+    // follow (rule 64's reasoning). A path too long for `sockaddr_un` fails every connect or bind;
+    // on `statsd_out`'s `transport: unix` that failure is a fault on every batch. A Unix socket is
+    // always plaintext, so `tls:` could never take effect; rules 43/52 cover `tls:` under UDP.
     for (id, component) in &components {
         let (kind_name, field, address, transport, has_tls) = match &component.kind {
             ComponentKind::StatsdIn { bind, transport, tls, .. } => {
@@ -2906,6 +2938,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 "component '{id}': {kind_name} '{field}' must be the socket's absolute path under \
                  'transport: {transport_name}', got '{address}' -- clients name it as \
                  unix:///<path>"
+            );
+        }
+        if address.len() > UNIX_SOCKET_PATH_MAX_BYTES {
+            anyhow::bail!(
+                "component '{id}': {kind_name} '{field}' is a {}-byte socket path -- a Unix \
+                 socket path must be shorter than 108 bytes, the size of sockaddr_un's sun_path; \
+                 use a shorter directory",
+                address.len()
             );
         }
         if has_tls {
@@ -3340,6 +3380,32 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if format != StreamFormat::Human && message != MessageMode::Escaped {
                 anyhow::bail!("component '{id}': 'message' only applies under 'format: human'");
             }
+        }
+    }
+
+    // Rule 73: a UDP sink endpoint on port 0. The kernel refuses every send to it with `EINVAL`,
+    // so every batch would fail. The port is the text after the last `:`, which is there for an
+    // IP literal and a hostname alike, and `!env` has already been resolved.
+    for (id, component) in &components {
+        let (kind_name, endpoint) = match &component.kind {
+            ComponentKind::StatsdOut { endpoint, transport: StatsdTransport::Udp, .. } => {
+                ("statsd_out", endpoint)
+            }
+            ComponentKind::GraphiteOut { endpoint, transport: GraphiteTransport::Udp, .. } => {
+                ("graphite_out", endpoint)
+            }
+            ComponentKind::SyslogOut { endpoint, transport: SyslogTransport::Udp, .. } => {
+                ("syslog_out", endpoint)
+            }
+            ComponentKind::CollectdOut { endpoint, .. } => ("collectd_out", endpoint),
+            _ => continue,
+        };
+        let port = endpoint.rsplit_once(':').map(|(_, port)| port.parse::<u16>());
+        if let Some(Ok(0)) = port {
+            anyhow::bail!(
+                "component '{id}': {kind_name} 'endpoint' '{endpoint}' names port 0 -- no UDP \
+                 datagram can be sent to port 0; give the receiver's port"
+            );
         }
     }
 
@@ -9123,24 +9189,24 @@ mod tests {
             ("in", vec![], listener()),
             ("out", vec!["in"], collectd_out(1023)),
         ]));
-        assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
+        assert!(err.contains("'out'") && err.contains("1024..=65507"), "got: {err}");
     }
 
-    /// Rule 38's `collectd_out` range check, above `u16::MAX`: every send would fail `EMSGSIZE`
-    /// while reporting success.
+    /// Rule 38's `collectd_out` range check, above the largest UDP payload: the kernel would
+    /// refuse every datagram with `EMSGSIZE`.
     #[test]
-    fn a_max_packet_bytes_above_65535_is_rejected_for_collectd_out() {
+    fn a_max_packet_bytes_above_the_udp_payload_ceiling_is_rejected_for_collectd_out() {
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
-            ("out", vec!["in"], collectd_out(65536)),
+            ("out", vec!["in"], collectd_out(65508)),
         ]));
-        assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
+        assert!(err.contains("'out'") && err.contains("1024..=65507"), "got: {err}");
     }
 
-    /// Both ends of `1024..=65535` are legal.
+    /// Both ends of `1024..=65507` are legal.
     #[test]
     fn max_packet_bytes_at_either_bound_is_accepted_for_collectd_out() {
-        for bound in [1024u64, 65535] {
+        for bound in [1024u64, 65507] {
             resolve(cfg(vec![
                 ("in", vec![], listener()),
                 ("out", vec!["in"], collectd_out(bound)),
@@ -11397,6 +11463,134 @@ mod tests {
                 ("out", vec!["script"], sink()),
             ]))
             .expect("an unset or nonzero max_memory is valid");
+        }
+    }
+
+    // ---- Datagram sinks: rule 38's UDP ceiling, rule 65's path length, rule 73 -----------------
+
+    fn graphite_out_on(transport: GraphiteTransport, max_packet_bytes: u64) -> ComponentKind {
+        graphite_out(
+            transport,
+            GraphiteProtocol::Plaintext,
+            max_packet_bytes,
+            1 << 20,
+            Duration::from_secs(5),
+        )
+    }
+
+    /// Rule 38: above the largest UDP payload the kernel refuses every datagram with `EMSGSIZE`,
+    /// which a UDP `statsd_out` or `graphite_out` counts as a drop under an `ok` request.
+    #[test]
+    fn a_udp_max_packet_bytes_above_the_udp_payload_ceiling_is_rejected() {
+        for kind in [statsd_out(65508), graphite_out_on(GraphiteTransport::Udp, 65508)] {
+            let err = expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]));
+            assert!(err.contains("'out'") && err.contains("max_packet_bytes: 65508"), "{err}");
+            assert!(err.contains("65507"), "{err}");
+        }
+    }
+
+    /// Rule 38: the ceiling itself is legal on UDP, and it binds only UDP. A Unix datagram's
+    /// limit is the socket's send buffer, and TCP ignores the field.
+    #[test]
+    fn the_udp_payload_ceiling_binds_only_the_udp_transports() {
+        let mut unix = statsd_out_on(DSD_SOCKET, StatsdTransport::Unix);
+        let mut unix_stream = statsd_out_on(DSD_SOCKET, StatsdTransport::UnixStream);
+        for kind in [&mut unix, &mut unix_stream] {
+            if let ComponentKind::StatsdOut { max_packet_bytes, .. } = kind {
+                *max_packet_bytes = 100_000;
+            }
+        }
+        let fine = [
+            statsd_out(65507),
+            graphite_out_on(GraphiteTransport::Udp, 65507),
+            unix,
+            unix_stream,
+            graphite_out_on(GraphiteTransport::Tcp, 100_000),
+        ];
+        for kind in fine {
+            let name = kind_name(&kind);
+            resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+                .unwrap_or_else(|err| panic!("{name} should resolve, got: {err}"));
+        }
+    }
+
+    /// Rule 65: a socket path of 108 bytes or more doesn't fit `sockaddr_un`'s `sun_path`, so
+    /// every connect or bind would fail. 107 bytes is the longest that fits.
+    #[test]
+    fn a_unix_socket_path_too_long_for_sockaddr_un_is_rejected_on_both_statsd_kinds() {
+        let too_long = format!("/{}", "p".repeat(107));
+        let longest = format!("/{}", "p".repeat(106));
+        for transport in UNIX_TRANSPORTS {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], listener()),
+                ("out", vec!["in"], statsd_out_on(&too_long, transport)),
+            ]));
+            assert!(err.contains("'out'") && err.contains("108 bytes"), "{transport:?}: {err}");
+
+            let err = expect_err(cfg(vec![
+                ("in", vec![], statsd_in_on(&too_long, transport)),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains("'in'") && err.contains("108 bytes"), "{transport:?}: {err}");
+
+            resolve(cfg(vec![
+                ("in", vec![], statsd_in_on(&longest, transport)),
+                ("out", vec!["in"], statsd_out_on(&longest, transport)),
+            ]))
+            .unwrap_or_else(|err| panic!("{transport:?}: a 107-byte path fits, got: {err}"));
+        }
+    }
+
+    /// The four UDP sinks, each on its UDP transport with `endpoint` set.
+    fn udp_sinks_at(endpoint: &str) -> Vec<ComponentKind> {
+        let mut kinds = vec![
+            statsd_out(1432),
+            graphite_out_on(GraphiteTransport::Udp, 1432),
+            collectd_out(1452),
+            syslog_out_with_tls(logit_config::SyslogTransport::Udp, None),
+        ];
+        for kind in &mut kinds {
+            match kind {
+                ComponentKind::StatsdOut { endpoint: e, .. }
+                | ComponentKind::GraphiteOut { endpoint: e, .. }
+                | ComponentKind::CollectdOut { endpoint: e, .. }
+                | ComponentKind::SyslogOut { endpoint: e, .. } => *e = endpoint.to_string(),
+                _ => unreachable!(),
+            }
+        }
+        kinds
+    }
+
+    /// Rule 73: the kernel refuses a UDP send to port 0, so every batch would fail, whether the
+    /// host is an IP literal or a name.
+    #[test]
+    fn a_udp_sink_endpoint_with_port_zero_is_rejected() {
+        for endpoint in ["127.0.0.1:0", "[::1]:0", "collector.internal:0"] {
+            for kind in udp_sinks_at(endpoint) {
+                let name = kind_name(&kind);
+                let err =
+                    expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]));
+                assert!(
+                    err.contains("'out'") && err.contains("port 0"),
+                    "{name} {endpoint}: {err}"
+                );
+            }
+        }
+    }
+
+    /// Rule 73 reads only the UDP transports, and a real port passes.
+    #[test]
+    fn a_nonzero_port_and_the_stream_transports_pass_rule_73() {
+        let mut kinds = udp_sinks_at("collector.internal:8125");
+        let mut tcp_graphite = graphite_out_on(GraphiteTransport::Tcp, 1432);
+        if let ComponentKind::GraphiteOut { endpoint, .. } = &mut tcp_graphite {
+            *endpoint = "carbon:0".to_string();
+        }
+        kinds.push(tcp_graphite);
+        for kind in kinds {
+            let name = kind_name(&kind);
+            resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+                .unwrap_or_else(|err| panic!("{name} should resolve, got: {err}"));
         }
     }
 }
