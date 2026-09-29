@@ -499,14 +499,47 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let settings = tls_settings(|s| s.ca_file = Some("ca.pem".to_string()));
-    let client_config = crate::tls::build_client_config(&settings, &testdata_dir()).unwrap();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let acceptor = TlsAcceptor::from(server_tls_config(false));
+    tls_pair_with(client_io, server_io, server_tls_config(false)).await
+}
+
+/// [`tls_pair`] with a server that sends no TLS 1.3 session tickets. Over a pipe too small to hold
+/// the tickets, the server's accept waits for the client to read them, and the client has
+/// returned from its handshake, so a [`tls_pair`] there never completes.
+pub(crate) async fn tls_pair_without_tickets<C, S>(
+    client_io: C,
+    server_io: S,
+) -> (tokio_rustls::client::TlsStream<C>, tokio_rustls::server::TlsStream<S>)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut config = (*server_tls_config(false)).clone();
+    config.send_tls13_tickets = 0;
+    tls_pair_with(client_io, server_io, Arc::new(config)).await
+}
+
+async fn tls_pair_with<C, S>(
+    client_io: C,
+    server_io: S,
+    server_config: Arc<rustls::ServerConfig>,
+) -> (tokio_rustls::client::TlsStream<C>, tokio_rustls::server::TlsStream<S>)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let connector = tls_client_connector();
+    let acceptor = TlsAcceptor::from(server_config);
     let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
     let (client, server) =
         tokio::join!(connector.connect(name, client_io), acceptor.accept(server_io));
     (client.expect("client handshake"), server.expect("server handshake"))
+}
+
+/// A tokio-rustls client trusting `testdata/tls/ca.pem`, built as a sink builds its own.
+pub(crate) fn tls_client_connector() -> tokio_rustls::TlsConnector {
+    let settings = tls_settings(|s| s.ca_file = Some("ca.pem".to_string()));
+    let client_config = crate::tls::build_client_config(&settings, &testdata_dir()).unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(client_config))
 }
 
 /// One `poll_read`, never waiting: `Ready` with the byte count (0 is EOF), or `Pending`.
