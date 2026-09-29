@@ -146,7 +146,10 @@ ahead, logs and events older than 18 hours, and service checks older than 10 min
 `buffer.disk:` holds batches through a Datadog outage, but on replay after an outage longer than
 an hour, the metrics are dropped as stale, not delivered late. The 1-hour window is the documented
 one and stricter than what the intake stored in testing
-([the plan's "Timestamp windows"](plans/datadog-relay.md#11-timestamp-windows-w5)).
+([the plan's "Timestamp windows"](plans/datadog-relay.md#11-timestamp-windows-w5)). The windows are
+measured from one send time per batch, read when the batch is first tried, so every retry of it
+drops the same points and each counts once. A batch retried for up to `retry_budget` can therefore
+send a point that far past the end of its window.
 
 ### `at_least_once` duplicates everything but series
 

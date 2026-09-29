@@ -288,18 +288,16 @@ buffering:
   (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
-- **A retried batch doesn't inflate a sink's drop counters.** On `statsd_out`, `syslog_out`,
-  `graphite_out`, `collectd_out`, `influxdb_out`, `stdio_out`, `file_out`, `otlp_out`,
-  `prometheus_out` in remote-write mode, and `splunk_hec_out`, what the encoder decided
-  (`logit.output.messages.dropped`, `metrics.skipped`, `tags.dropped`, `*.normalized`,
-  `batch.bytes`, and their diagnostics) counts once per batch, however many attempts it took. What
-  an attempt did (`logit.output.requests`, `request.bytes`, `reconnects`, `messages`) counts per
-  attempt, and so does a drop a kernel or a destination decided: a datagram refused as too large
-  (`oversize_datagram`), a Splunk code 6 or Splunk Cloud's oversize answer, an OTLP partial success.
-  `datadog_out` and `datadog_trace_out` still count their encode-side drops once per attempt, so on
-  an unhealthy one those counters grow with retries
+- **A retried batch doesn't inflate a sink's drop counters.** On every sink, what the encoder
+  decided (`logit.output.messages.dropped`, `metrics.skipped`, `tags.dropped`, `*.normalized`,
+  `batch.bytes`, `datadog_out`'s `stale` drops, and their diagnostics) counts once per batch,
+  however many attempts it took; no sink counts an encode-side drop per attempt. What an attempt
+  did (`logit.output.requests`, `request.bytes`, `reconnects`, `messages`) counts per attempt, and
+  so does a drop a kernel or a destination decided: a datagram refused as too large
+  (`oversize_datagram`), a Splunk code 6 or Splunk Cloud's oversize answer, an OTLP partial
+  success, a Datadog `413`
   ([ADR `sink-send-path-and-attempt-accounting`](adr/sink-send-path-and-attempt-accounting.md),
-  decision 1).
+  decision 1). A refused connection counts no `request.bytes`.
 
 ### Durable buffering
 
