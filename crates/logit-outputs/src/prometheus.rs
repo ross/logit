@@ -135,7 +135,7 @@
 //! | Outcome | Result |
 //! |---|---|
 //! | 2xx | `Ok` |
-//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied |
+//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied. The status and the first 256 bytes of the response body are in the message and in a throttled `remote_write_rejected` diagnostic, as below, so a retried `503` reports once per attempt |
 //! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange. Under `compression: zstd`, a `415` or `400` also names `compression: snappy` as the likely remedy, since those are the statuses a receiver that doesn't take zstd answers |
 //! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
