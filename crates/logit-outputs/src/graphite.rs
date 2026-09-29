@@ -156,8 +156,8 @@ impl GraphiteOutput {
     }
 
     /// Installs `encoder` with this sink's line cap and its diagnostics and telemetry (gated)
-    /// re-applied, so builder order doesn't matter (`CollectdOutput::with_encoder` says what goes wrong
-    /// otherwise).
+    /// re-applied, so builder order doesn't matter (`CollectdOutput::with_encoder` says what goes
+    /// wrong otherwise).
     ///
     /// Errors on a pickle encoder over UDP, as graph validation does: a pickle frame is bounded
     /// by `max_frame_bytes`, not by the datagram cap, and its length prefix means nothing in a

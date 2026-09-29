@@ -3481,7 +3481,7 @@ and out of scope. The only `unsafe` in `logit-pipeline` is in `sockstat.rs` (`me
     attempt that another follows, over `Clean`, `Ambiguous`, and `Permanent` outcomes and both
     postures (`every_attempt_records_one_send_duration_sample_and_every_retry_one_error`; a
     cancelled timer and a retry counted on a drop each fail it).
-  - An attempt the budget cuts off is `Ambiguous` and ends exactly at the budget
+  - An attempt the budget cuts off is `Ambiguous` and ends when the budget does
     (`an_attempt_cut_off_by_the_budget_is_ambiguous`, paused clock; `Clean` fails it).
   - `attempt` uses `saturating_add`, so it can't wrap even past `u32::MAX` attempts.
 

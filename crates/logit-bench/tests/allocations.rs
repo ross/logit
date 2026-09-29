@@ -2599,9 +2599,9 @@ fn send_batch_failing_first_call_after_a_drain() {
 }
 
 /// A sink's receive counts and one `send` (`logit_pipeline::send_batch`), telemetry disabled: 1,
-/// from neither telemetry nor dispatch. `Output` is `#[async_trait]`, which boxes every `send`'s future
-/// (16 bytes); calling `NoopOutput::send` directly, with no `dyn Output`, costs the same 1. It's a
-/// per-batch cost on every sink (`docs/known-gaps.md`).
+/// from neither telemetry nor dispatch. `Output` is `#[async_trait]`, which boxes every `send`'s
+/// future (16 bytes); calling `NoopOutput::send` directly, with no `dyn Output`, costs the same 1.
+/// It's a per-batch cost on every sink (`docs/known-gaps.md`).
 #[test]
 fn send_batch_through_a_noop_output_disabled_telemetry() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");

@@ -97,9 +97,10 @@ impl CollectdOutput {
     }
 
     /// Installs `encoder` with this sink's cap and its diagnostics and telemetry (gated)
-    /// re-applied, so builder order doesn't matter. A bare assignment would revert a prior `with_max_packet_bytes` to the
-    /// encoder's uncapped default (every datagram then fails `EMSGSIZE` while counting
-    /// `requests{class="ok"}`) and drop both handles, silencing the codec's own counters.
+    /// re-applied, so builder order doesn't matter. A bare assignment would revert a prior
+    /// `with_max_packet_bytes` to the encoder's uncapped default (every datagram then fails
+    /// `EMSGSIZE` while counting `requests{class="ok"}`) and drop both handles, silencing the
+    /// codec's own counters.
     pub fn with_encoder(mut self, encoder: CollectdEncoder) -> Self {
         self.encoder = encoder
             .with_max_packet_bytes(self.max_packet_bytes)
