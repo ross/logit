@@ -192,8 +192,10 @@ nature. The encode-side counters are the only ones that measure the batch and no
      an empty `Ready(Ok)`.
    - A write `Err` can follow ciphertext from the same call reaching the peer.
    - `write_all` maps an `Ok(0)` write to `ErrorKind::WriteZero`.
-   - A fake stream that returns `Ok(0)` under tokio-rustls returns `Pending` and registers no
-     waker, so the plaintext seam takes a `FakeStream` and TLS tests take the real pair.
+   - tokio-rustls treats an IO `Ok(0)` as would-block: a write still returns `Ok(n)` for what the
+     session took, a write into a full session returns `Pending` with no waker held, and a flush
+     fails with `WriteZero`. So the plaintext seam takes a `FakeStream` and TLS tests take the
+     real pair.
 
    Each fact gets a test.
 9. **`statsd_out` and `graphite_out` share one datagram packer, and the four UDP sinks share one
