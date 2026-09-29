@@ -123,14 +123,15 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   Revisit if a reconciliation shows a sink's `received` short of its producers' `sent` after a
   shutdown with no `closed_consumer` drops.
 - **The `fault` seam's rules on one point don't each see every hit.** `logit_pipeline::fault`
-  (a test-only seam) checks a scope's rules in the order they were added, and a rule that fails
-  an operation returns before any later rule counts it. So
-  `scope.fail_nth(p, 1, E).fail_nth(p, 2, E)` fails only the first operation at `p`: the second
-  rule's first hit is the second operation, which it lets through. A test that wants the first
-  two to fail adds two `fail_nth(p, 1, E)` rules, as
+  (a test-only seam) checks a scope's rules on a point in the order they were added, and a rule
+  that fails an operation returns before any later rule counts it. So a rule counts only the hits
+  no earlier rule on that point failed, and `scope.fail_nth(p, 1, E).fail_nth(p, 2, E)` fails the
+  first and the third operation at `p`, not the first two: the second rule never sees hit 1, lets
+  hit 2 through as its first, and fails hit 3 as its second. A test that wants the first two to
+  fail adds two `fail_nth(p, 1, E)` rules, as
   `stdio::tests::a_rotation_whose_reopen_fails_counts_once_and_the_retries_count_no_bytes_twice`
-  does. Nothing shipped is affected. Revisit when a test needs a failure at two hit numbers of
-  one point that aren't consecutive from the first.
+  does. Nothing shipped is affected. Revisit when a test needs rules on one point to count the same
+  hits, say `n`th operations named by their absolute position whatever earlier rules failed.
 
 ## Event model and interner
 
@@ -1933,7 +1934,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   counted as the grace decides (ADR
   [`shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md),
   decision 3), but nothing marks the torn record, and the next run appends after it. Open, for the
-  sink send path's verification cluster.
+  sink send path's verification cluster. A write that succeeds followed by a flush that fails
+  leaves `FileTarget::note_written` uncalled for bytes that may have reached the file, so a size
+  rotation can come late; the error carries no `Fault`, so the batch isn't retried.
 - ~~**`influxdb_out`'s line encoder allocates ~180 times per event**~~ **Closed.** It was the
   largest single cost in the pipeline, roughly twice the end-to-end cost of ingesting an event. Now
   30 allocations per 100-event batch (from 18,024) and 2.6× faster: escaping and formatting go
