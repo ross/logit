@@ -62,7 +62,7 @@ The surveyors' highest-value suspicions, roughly by blast radius. Each is detail
 | 11 | `drain_inbox` cancelled while parked in `store.push` under `overflow: block` loses one in-hand batch **uncounted**; shutdown's `batches_dropped` log ignores `finish_and_flush` drops | RT-03 | **Done**: the in-hand batch is swept and counted (#333); `batches_dropped` sums every sink and Lua-boundary shutdown drop through `count_shutdown_drop`, and the sweep counts `received` (findings → #404) |
 | 12 | `deliver_with_retry` re-calls `send`, so every sink re-encodes and **re-emits its drop/normalization counters on each retry** — inflating the counters read when a sink is unhealthy | SINK-06, RT-05 | in progress (sink/w5): confirmed for every sink, and `datadog_out` also reads its clock per attempt; encode-side counters will count once per batch through a sink-owned gate, and server-verdict drops still repeat per attempt |
 | 13 | TCP accept loop's `accepted?` makes any `accept()` error (`EMFILE`, `ECONNABORTED`, `ENOBUFS`) fatal to the listener; `logit_in`/`otlp_in` likely share the shape | NET-10, WIRE-07 | **Done** (findings → #377): all nine input accept loops share the shape, and now classify each error, back off on fd exhaustion, and end only on a fatal one |
-| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | in progress (sink/w2): confirmed, and statsd and syslog classify an invalid TLS server name as `Clean`; one shared driver replaces the three copies |
+| 14 | One hand-rolled pooled-TCP send machine in three drifting copies (statsd/syslog/graphite): graphite lacks the pre-delivery `flush()`, the `is_tls` guard, and `logit.output.reconnects` | SINK-01 | **Done** (findings → #451): confirmed, and statsd and syslog classified an invalid TLS server name as `Clean`; one driver (`crates/logit-outputs/src/stream.rs`) replaces the three copies, graphite gains the flush and `reconnects`, and a bad server name fails startup |
 | 15 | OTLP decode casts every wire `u64` timestamp `as i64` unguarded — ≥2^63 silently wraps negative (encode side has `.max(0)`) | CODEC-17 | findings → #366 |
 | 16 | `parse_traceparent` slices a `str` at fixed byte offsets after only a length check — non-ASCII input can panic | CORE-11 | open |
 | 17 | The process-wide interner never evicts and is fed from the network (native dictionary entries, trailer strings, Lua `telemetry` names) | CORE-01, WIRE-02, CORE-19 | CORE-19 half `reviewed`, #392: every Lua feeder is listed in `docs/known-gaps.md`'s interner entry and `docs/design/lua-api.md`'s Limits list; the rest open |
@@ -248,7 +248,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [CORE-17](#core-17--lua-attribute-writes-refcell-borrow-discipline-value-identity-preservation-and-unbounded-table-recursion) | P0 | Lua attribute writes: `RefCell` borrow discipline, value-identity preservation, and unbounded table recursion | `crates/logit-script/src/proxy.rs` (`AttrsProxy`), `crates/logit-script/src/value.rs` (`lua_to_value`) | findings → #385 |
 | [XFORM-02](#xform-02--aggregate-per-event-merge-dispatch-process) | P0 | Aggregate: per-event merge dispatch (`process`) | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::process`) | findings → #405 |
 | [XFORM-03](#xform-03--aggregate-flush-series-retention-and-the-cardinality-cap) | P0 | Aggregate: flush, series retention, and the cardinality cap | `crates/logit-transforms/src/aggregate.rs` (`Aggregator::flush`) | findings → #407 |
-| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | in-progress (sink/w2) |
+| [SINK-01](#sink-01--the-copied-pooled-tcp-send-path-statsd--syslog--graphite--probe-one-write-then-write_all-one-reconnect) | P0 | The copied pooled-TCP send path (statsd / syslog / graphite) — probe, one-write-then-write_all, one reconnect | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send_tcp`) | findings → #451 |
 | [SINK-04](#sink-04--udp-datagram-packing-emsgsize-handling-and-partial-batch-fault-classification) | P0 | UDP datagram packing, `EMSGSIZE` handling, and partial-batch fault classification | `crates/logit-outputs/src/statsd.rs` (`send_udp`, `flush_datagram`) | in-progress (sink/w4) |
 | [SINK-05](#sink-05--the-output-trait-contract-each-sink-relies-on-retry-posture-cancellation-shutdown) | P0 | The `Output` trait contract each sink relies on (retry, posture, cancellation, shutdown) | `crates/logit-pipeline/src/output.rs` (`Output`, `Fault`, `classify`) | in-progress (sink/w5) |
 | [SINK-09](#sink-09--allocate_timestamp--the-per-series-union-find-collision-allocator-behind-duplicate_safe--true) | P0 | `allocate_timestamp` — the per-series union-find collision allocator behind `duplicate_safe() == true` | `crates/logit-outputs/src/influxdb.rs` (`allocate_timestamp`, `encode_metric_line`) | unreviewed |
@@ -309,7 +309,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-06](#xform-06--jsonrs-zero-copy-json-into-attributes-parsing) | P1 | json.rs: zero-copy JSON-into-attributes parsing | `crates/logit-transforms/src/json.rs` (`JsonParser::process`, `borrowed_str_bytes`) | unreviewed |
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-transforms/src/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | unreviewed |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
-| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | in-progress (sink/w2) |
+| [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/statsd.rs` (`TcpDial::connect`) | findings → #451 |
 | [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
 | [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/statsd.rs` (`StatsdOutput::send`) | in-progress (sink/w5) |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
@@ -7017,23 +7017,30 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   - The returned message count (`lines.len()` / `messages.len()` / `buf.len()`) equals what was
     actually framed, including the negative-gauge pair counted as one.
 - **Observed concerns (unverified):**
-  - **Divergence: `graphite_out::send_tcp` never `flush()`es before reporting the batch delivered**
+  - ~~**Divergence: `graphite_out::send_tcp` never `flush()`es before reporting the batch delivered**
     (the `rest_result` match in `GraphiteOutput::send_tcp`), where statsd and syslog
     both do and both document the flush as load-bearing. Benign *today*
     because `Conn::Tcp` in `graphite.rs` holds a bare `TcpStream` (whose `poll_flush` is a documented no-op)
     and graphite has no TLS, but the copied family has drifted and the invariant that made the
     flush necessary is not stated in graphite. High confidence on the divergence; low on current
-    impact.
-  - **Divergence: graphite's `Conn::Tcp` is `Option<TcpStream>`, not `Option<Box<dyn AsyncStream>>`**,
+    impact.~~ **Resolved (sink/w2, #451):** graphite sends through the shared driver, which
+    flushes before it pools a connection or returns `Ok`.
+  - ~~**Divergence: graphite's `Conn::Tcp` is `Option<TcpStream>`, not `Option<Box<dyn AsyncStream>>`**,
     so it has no `is_tls()` guard on the retry arm (`Err(_) if !retried_after_a_zero_byte_failure` in `GraphiteOutput::send_tcp`). Correct now; it is the
     exact line that becomes wrong the day graphite gains a `tls:` block. Medium confidence this is
-    worth a comment rather than a change.
+    worth a comment rather than a change.~~ **Resolved (sink/w2, #451):** graphite holds a
+    `Box<dyn AsyncStream>` in the driver's pool, and the driver's `is_tls` guard covers every
+    caller.
   - `conn.write_all(&frame_buf[n..])` after a short first write (in each `send_tcp`)
     is the non-cancel-safe call; if the runtime's budget
     timeout fires inside it the peer holds a *partial* frame. For syslog's octet-counted framing a
     receiver will block on an incomplete length prefix until the connection closes (fine); for
     statsd/graphite plaintext a truncated final line is a corrupt datapoint the receiver may accept.
-    No test appears to cover cancellation mid-`write_all`. Medium confidence.
+    ~~No test appears to cover cancellation mid-`write_all`. Medium confidence.~~ **Resolved
+    (sink/w2, #451):** covered by
+    `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`. The
+    truncated line at the peer stands: the cancellation is the runtime's, and `sink/w6` records
+    it in `docs/design/pipeline-graph.md`'s "Cancellation points".
   - The reused-connection probe costs one extra `poll_read` per batch on the hot path; cheap, but
     it is per-`send`, not per-idle-period. Low concern.
 - **Existing coverage:** `statsd.rs` tests `tcp_reconnects_exactly_once_after_the_peer_resets_an_inherited_connection`,
@@ -7062,6 +7069,42 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `write_all` and asserts `*stream` is `None` afterwards.
 - **Priority:** P0 — main data path, fully hand-rolled, and a classification or flush mistake is
   silent loss or duplication at the receiver.
+- **Verified (sink/w2, #451):** findings; the three copies are one driver,
+  `crates/logit-outputs/src/stream.rs` (`PooledStream::send`), and every invariant has a test in
+  `stream::tests`, each shown to fail on a planted bug.
+  - A diff of the three copies found no drift beyond the known ones: graphite's missing flush,
+    missing `is_tls` guard, concrete `TcpStream`, and missing `reconnects`, plus the error class
+    `requests` used (`ok|error`). The driver takes the statsd/syslog behavior for all three.
+  - `*stream` is never written through: the connection is taken into a local for the whole
+    attempt and put back only after the flush. Dropped `send`s inside `write_all`, a dial, and the
+    redial after a probe each leave the pool empty, and the next `send` dials fresh
+    (`a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`,
+    `a_send_dropped_while_dialing_leaves_the_pool_empty`,
+    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`). The probe never
+    suspends, so there is no await inside it to drop at.
+  - The probe redial doesn't consume the retry: after an `Eof` or unsolicited-bytes probe, the
+    redialed connection's first write fails and the retry still delivers
+    (`a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`,
+    `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`).
+  - The loop is bounded: one `send` dials at most twice, the probe redial and one retry, over
+    every probe answer on plaintext and TLS (`one_send_dials_at_most_the_probe_redial_and_one_retry`).
+  - On TLS a write `Err` is `Ambiguous` and never retried, over a real tokio-rustls pair
+    (`a_tls_write_error_is_ambiguous_and_never_retried`).
+  - A connection is pooled only after its flush: `a_tls_send_returns_only_once_the_peer_can_read_the_whole_frame`
+    (a 100 000-byte frame over a 4096-byte pipe, the peer reading it all with the client no
+    longer polled), and `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`,
+    `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`, and
+    `a_real_reset_mid_frame_is_ambiguous` (a loopback RST inside `write_all`) for the failures.
+  - `Ok(0)` is `WriteZero` and retried once on plaintext
+    (`a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`).
+  - The message counts: each sink counts its own after the driver returns `Ok`, and the wiring
+    tests assert them (`the_stream_transports_report_their_counts_through_the_driver` in statsd,
+    with the negative-gauge pair counted once; `tcp_and_tls_report_their_counts_through_the_driver`
+    in syslog; `plaintext_and_pickle_over_tcp_report_their_own_counts` in graphite).
+  - A FIN that arrives between the probe and the write stays undetected on a plaintext line
+    stream: the write lands in the local socket buffer and succeeds. That is the residual
+    `poll_pending_close`'s doc states. `unix_stream_retries_a_first_write_the_peer_refused` covers
+    the case where the write does fail (a peer's `SHUT_RD` on a Unix stream gives `EPIPE`).
 
 ---
 
@@ -7091,13 +7134,19 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   - `host_only` (`crates/logit-outputs/src/tls.rs`) yields the right SNI for `host:port`, `[::1]:port`, and a bare
     host with no port.
 - **Observed concerns (unverified):**
-  - `graphite_out` has **no reconnect counter at all** (the doc comment on `connect` in `graphite.rs` says so explicitly),
+  - ~~`graphite_out` has **no reconnect counter at all** (the doc comment on `connect` in `graphite.rs` says so explicitly),
     so the probe-driven reconnect this sink also performs is invisible to an operator. Consistent
     with its ADR, but it makes the one sink whose `duplicate_safe()` is `true` also the one whose
-    connection churn cannot be observed. High confidence, design-level.
+    connection churn cannot be observed. High confidence, design-level.~~ **Resolved (sink/w2,
+    #451):** graphite counts `logit.output.reconnects` through the driver
+    (`tcp_counts_every_connect_after_the_first_as_a_reconnect`).
   - `host_only` on an unbracketed IPv6 endpoint splits on the last colon and produces a wrong SNI;
     documented in `host_only`'s doc comment in `tls.rs` as the operator's problem, but nothing validates it and a wrong
-    SNI surfaces as a confusing handshake failure. Low/medium.
+    SNI surfaces as a confusing handshake failure. Low/medium. **Partly resolved (sink/w2,
+    #451):** the name is parsed once, in `with_tls`, and a host that is neither an IP literal nor
+    a DNS name fails startup naming the endpoint, so an unbracketed IPv6 endpoint with no port
+    (`2001:db8::1` gives `2001:db8:`) fails there. One with a port (`::1:6514`) splits on the
+    port's colon and yields `::1`. The brackets stay the operator's to write.
   - A `connect` that succeeds and *then* has its future dropped by the budget timeout has already
     incremented `reconnects` (deliberate, per the comment) — worth confirming that is the intended
     reading of the metric.
@@ -7114,6 +7163,27 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
   `Clean`.
 - **Priority:** P1 — wrong here means a stalled or mis-budgeted connect and a misleading metric,
   not silent corruption.
+- **Verified (sink/w2, #451):** findings; the two `TcpDial` copies and graphite's `connect` are one
+  free `connect(&Dial)` in `crates/logit-outputs/src/stream.rs` that counts nothing, and
+  `PooledStream` counts `reconnects` after it succeeds.
+  - `has_connected_once` is set by the first successful dial only; a failed dial counts nothing
+    and doesn't set it; a probe-driven redial counts; the first lazy connect doesn't
+    (`reconnects_count_every_successful_dial_after_the_first`,
+    `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`). It lives in the pool,
+    not the sink, because a sink holds one transport for its life; `statsd_out`'s
+    `transport: unix` keeps its own flag in its `Conn` arm.
+  - The per-phase bound: `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout`
+    (a peer that accepts TCP and never answers the ClientHello; the handshake times out `Clean` on a
+    paused clock, and the dial takes less than twice `connect_timeout`). A `send` makes at most two
+    dials, so its connect time is at most four times `connect_timeout`, inside
+    `deliver_with_retry`'s budget as before.
+  - The invalid-SNI `Clean` (F11) is fixed at construction: `TlsTarget::new` parses the name in
+    `with_tls`, so a bad endpoint fails startup (`a_tls_target_needs_a_server_name_in_the_endpoint_host`,
+    `with_tls_rejects_an_endpoint_with_no_valid_server_name` in statsd and syslog, and
+    `logit-cli`'s `a_tls_statsd_output_endpoint_with_no_valid_server_name_fails_startup`). The send
+    path parses no name, so the `Permanent` fallback the ADR names has nothing to catch.
+  - A connect that succeeds and is then dropped by the budget timeout has already counted its
+    reconnect. That is the intended reading: the connection was made.
 
 ---
 
