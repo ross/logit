@@ -471,7 +471,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
   and decision 1 says so.
 - `datadog_out` can send a point up to `retry_budget` past its window, which decision 3 accepts.
 - `logit.output.request.bytes` no longer counts a request whose connection was refused, so on a
-  sink whose destination is down it stops growing while `requests{class="network_error"}` does.
+  sink whose destination is down it stops growing while `requests{class="network_error"}` does:
+  on `splunk_hec_out` as of `sink/w6`, and on `datadog_out` and `datadog_trace_out` from
+  `sink/w7`.
 - The pinned third-party facts cost a re-verification on each bump of tokio-rustls, rustls, or
   tokio.
 - Left open for later workstreams: the HTTP sinks' `requests` vocabulary.
