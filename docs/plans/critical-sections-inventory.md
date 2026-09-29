@@ -7077,12 +7077,19 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
     missing `is_tls` guard, concrete `TcpStream`, and missing `reconnects`, plus the error class
     `requests` used (`ok|error`). The driver takes the statsd/syslog behavior for all three.
   - `*stream` is never written through: the connection is taken into a local for the whole
-    attempt and put back only after the flush. Dropped `send`s inside `write_all`, a dial, and the
-    redial after a probe each leave the pool empty, and the next `send` dials fresh
+    attempt and put back only after the flush. A `send` dropped inside `write_all` or in the
+    redial after a probe leaves the pool empty, and the next `send` dials fresh
     (`a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`,
-    `a_send_dropped_while_dialing_leaves_the_pool_empty`,
-    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`). The probe never
-    suspends, so there is no await inside it to drop at.
+    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`); one dropped in a first
+    dial counts nothing (`a_send_dropped_while_dialing_counts_nothing_and_the_next_send_dials_again`).
+    The probe never suspends, so there is no await inside it to drop at.
+  - The probe path over real sockets: `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed`
+    (a half-closed peer, a wait on the pooled stream probing `Eof`, and the second frame on a new
+    connection with nothing more on the first). The three sinks'
+    `a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost`
+    take the probe path too: each fails when the driver ignores the probe's answer, because the
+    write lands in the FIN'd socket and the message is lost. They see the FIN because awaiting the
+    collector's message runs the I/O driver before the next `send`.
   - The probe redial doesn't consume the retry: after an `Eof` or unsolicited-bytes probe, the
     redialed connection's first write fails and the retry still delivers
     (`a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`,

@@ -378,7 +378,8 @@ rustls, or tokio re-runs `stream_pins` and re-reads the functions each test name
   - Dial errors name the sink and the endpoint or socket path.
 - **Driver tests** (`stream::tests`), each asserting the `Fault`, what reached the peer, the pool
   afterwards, and the counters through `TelemetryProbe`:
-  - the dial: `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect`,
+  - the dial: `a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect` (a redial
+    after the probe finds the pooled connection closed),
     `a_stalled_tls_handshake_times_out_clean_within_twice_the_connect_timeout` (a peer that
     accepts TCP and never answers the ClientHello, the handshake timed out on a paused clock),
     and `a_tls_target_needs_a_server_name_in_the_endpoint_host`;
@@ -394,15 +395,24 @@ rustls, or tokio re-runs `stream_pins` and re-reads the functions each test name
     `a_tls_send_returns_only_once_the_peer_can_read_the_whole_frame` (a 100 000-byte frame over a
     4096-byte pipe);
   - cancellation: `a_send_dropped_inside_write_all_leaves_the_pool_empty_and_the_next_send_dials_fresh`,
-    `a_send_dropped_while_dialing_leaves_the_pool_empty`, and
-    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`. The probe itself never
-    suspends, so there is no await inside it to drop at;
+    `a_send_dropped_in_the_redial_after_a_probe_leaves_the_pool_empty`, and
+    `a_send_dropped_while_dialing_counts_nothing_and_the_next_send_dials_again`. The probe itself
+    never suspends, so there is no await inside it to drop at;
   - bounds and accounting: `one_send_dials_at_most_the_probe_redial_and_one_retry` (a table over
     every probe answer, plaintext and TLS) and
     `reconnects_count_every_successful_dial_after_the_first`;
-  - Unix streams: `unix_stream_redials_after_the_peer_closes_a_pooled_connection`,
-    `unix_stream_retries_a_first_write_the_peer_refused` (the peer's `SHUT_RD` makes the first
-    write fail with `EPIPE`), and `unix_stream_dial_failures_are_clean`.
+  - Unix streams, on real sockets:
+    `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` (the peer
+    half-closes, the test waits until the pooled stream probes `Eof`, and the second frame
+    arrives on a new connection with nothing more on the first, which only the probe's redial
+    produces), `unix_stream_retries_a_first_write_the_peer_refused` (the peer's `SHUT_RD` makes
+    the first write fail with `EPIPE`), and `unix_stream_dial_failures_are_clean`.
+
+  On a current-thread runtime the probe sees a peer's close only once the I/O driver has run
+  since it arrived. The real-socket tests of the probe path wait for it:
+  `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` on an observable, and
+  the three sinks' `a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost`
+  by awaiting the collector's message. Each fails when the driver ignores the probe's answer.
 
   `ScriptedDial` in `test_support.rs` hands the driver scripted fresh connections, including one
   that never completes, and counts dials.
