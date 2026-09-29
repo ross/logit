@@ -243,6 +243,6 @@ and `reject_write_stalled` for any `Reject` (the write is abandoned and the conn
   `connection_error` before. A close part-way through a header counts
   `logit.proto.errors{reason="truncated_header"}`.
 - **Control frames.** `logit_out` bounds a control frame at `control::MAX_CONTROL_MESSAGE_BYTES`
-  (4096 bytes), not the 64 MiB data-frame cap.
+  (4096 bytes), not the 64 MiB data-frame cap, and `logit_in` bounds a `Hello` the same way.
 - **`requests`.** `logit.output.requests` counts every returned attempt, including connect,
   handshake, and too-large returns, tagged `class=ok|clean|ambiguous|permanent`.

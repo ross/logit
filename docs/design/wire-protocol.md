@@ -359,7 +359,8 @@ decision record.
   corrupted stream. `logit_out` refuses a `HelloAck` with another `version`, or a `codec` or
   `compression` its `Hello` didn't offer, as permanent: the listener would answer the same way
   again. A control message is at most `control::MAX_CONTROL_MESSAGE_BYTES` (4096) bytes, and
-  `logit_out` refuses a longer one on its header.
+  each side refuses a longer one on its header: `logit_in` for a `Hello`, `logit_out` for a
+  reply.
 - **Sequence numbers are implicit.** TCP is ordered, so the Nth data frame on a connection is seq
   N, and `Ack.seq` is the cumulative count the receiver has forwarded. The native payload carries
   no transport fields.

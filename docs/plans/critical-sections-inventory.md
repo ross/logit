@@ -4641,6 +4641,12 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   - `read_control` bounds both lengths before allocating, on the first call: now at
     `control::MAX_CONTROL_MESSAGE_BYTES` (4096; the longest message is a 1033-byte `Reject`), not
     64 MiB. `read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over`.
+    `logit_in` reads a `Hello` against the same cap
+    (`a_hello_is_bounded_by_the_control_message_cap`, which failed before the fix).
+  - The dial is the shared `crate::stream::connect` (`sink/w2`), with the same per-phase
+    `request_timeout` bound and every failure `Clean`; `with_tls` parses the server name once,
+    so a bad endpoint fails startup (`with_tls_rejects_an_endpoint_with_no_valid_server_name`,
+    `a_tls_logit_output_endpoint_with_no_valid_server_name_fails_startup`).
   - ~~`Output::flush` is or isn't needed after a write under TLS.~~ The frame and the `Hello` are
     flushed before each wait (`a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait`,
     `the_hello_is_flushed_before_the_hello_ack_wait`), and so are `logit_in`'s `HelloAck`, `Ack`,

@@ -489,6 +489,10 @@ zstd frame, which `compression_from_u8` never yields, so the failure is unreacha
   `write_control` flushes the `Hello`. `logit_in`'s `write_control` flushes inside its bound.
   `LogitOutput::connect_and_handshake` is `dial` then `handshake(stream)`, so a test hands the
   handshake a stream it built.
+- **Shared dial.** `dial` is `crate::stream::connect` with `request_timeout` as its
+  `connect_timeout`: the TCP connect and the TLS handshake are each bounded by it, as before, and
+  every failure is `Clean`. `with_tls` builds a `TlsTarget`, so an endpoint with no valid server
+  name fails startup (decision 10), and `send` counts `requests` through `stream::count_request`.
 - **Faults.** Every write-phase failure is `Clean`, with the `io::Error` in the chain. A
   `HelloAck` that doesn't answer the `Hello` is `Permanent`, counted as no connection.
 - **`requests`.** `Output::send` wraps one inner attempt and counts `logit.output.requests`
@@ -497,7 +501,9 @@ zstd frame, which `compression_from_u8` never yields, so the failure is unreacha
   `UnexpectedEof` at a frame boundary as a close and counts a truncated header.
 - **Smaller.** `read_control` bounds a control frame at `control::MAX_CONTROL_MESSAGE_BYTES`
   (4096; the largest message this version writes is a 1033-byte `Reject`), not the 64 MiB data
-  cap. `LogitOutput::observe_batch`'s doc says once per batch.
+  cap, and `logit_in` reads a `Hello` against the same cap. An over-cap `Hello` header closes the
+  connection before any body is read, counted `logit.proto.errors{reason="handshake"}` like any
+  other bad `Hello`. `LogitOutput::observe_batch`'s doc says once per batch.
 
 The tests, in `crates/logit-outputs/src/logit.rs` unless named otherwise:
 
@@ -534,7 +540,12 @@ The tests, in `crates/logit-outputs/src/logit.rs` unless named otherwise:
   `a_tls_peer_gone_between_the_frame_and_its_ack_is_ambiguous_and_the_next_send_reconnects`.
 - The control cap: `read_control_accepts_a_message_at_the_control_message_cap_and_refuses_one_over`,
   and `the_largest_message_of_each_type_fits_the_control_message_cap` in
-  `crates/logit-proto/src/native/control.rs`.
+  `crates/logit-proto/src/native/control.rs`, and in `logit_in`,
+  `a_hello_is_bounded_by_the_control_message_cap` (a `Hello` at the cap is answered, and one
+  over it is closed on its header; before the fix, the connection waited for the body).
+- The shared dial: `with_tls_rejects_an_endpoint_with_no_valid_server_name`, and
+  `a_tls_logit_output_endpoint_with_no_valid_server_name_fails_startup` in
+  `crates/logit-cli/src/pipeline.rs`.
 
 Run them with `script/test -p logit-outputs -p logit-inputs -p logit-proto logit:: control::`.
 
