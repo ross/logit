@@ -271,11 +271,59 @@ No code from this record exists until a workstream lands it.
 
 ### `sink/w1`: pinned TLS semantics and one fake stream (SINK-03, WIRE-09)
 
-`sink/w1` reads tokio-rustls 0.26.5 and rustls 0.23.45 in the dev container's cargo registry and
-pins decision 8's facts with tests against a real TLS pair. It adds one `FakeStream` in
-`crates/logit-outputs/src/test_support.rs` to replace the two drifted `FakeTlsStream` copies, a
-test module for `crates/logit-outputs/src/tls.rs`, and corrects `poll_pending_close`'s doc and
-the "complete lines" prose.
+`sink/w1` changes no production behavior. It adds tests and corrects prose.
+
+- **Pinned facts.** `crates/logit-outputs/src/stream_pins.rs` pins decision 8's facts against
+  tokio-rustls 0.26.5, rustls 0.23.45, and tokio 1.53.1. Each test names the source function it
+  pins. The TLS tests run a real client and server over `tokio::io::duplex(4096)`, handshake
+  complete, with a counting wrapper (`TapIo`) under each end. No test sleeps or reads a clock:
+  "nothing more is available" is a one-poll read that answers `Pending` on an in-memory pipe,
+  and each body runs under `tokio::task::unconstrained` so the cooperative budget can't produce
+  that `Pending` on its own.
+  - `a_tls_write_returns_ok_with_ciphertext_still_queued_in_the_session`: a 100 000-byte write
+    returns `Ok(65536)`, rustls's buffer limit, with 4096 bytes on the pipe and `wants_write()`
+    still set.
+  - `a_tls_read_never_drives_queued_ciphertext_to_the_socket`: after the server drains the pipe,
+    a client read moves no ciphertext, and the server receives nothing more.
+  - `a_tls_flush_drives_every_queued_byte_to_the_peer`: a flush delivers every accepted byte.
+  - `a_peer_close_notify_reads_as_an_empty_ready` and
+    `a_peer_transport_close_without_close_notify_reads_as_unexpected_eof`: a `close_notify` reads
+    as `Ok(0)`, and a transport close without one reads as `ErrorKind::UnexpectedEof`.
+  - `one_poll_of_an_idle_tls_13_connection_after_the_handshake_is_pending`: the poll reads the
+    server's session tickets into the session and answers `Pending`, not an empty `Ready(Ok)`.
+  - `a_partial_tls_record_survives_a_dropped_read`: a read polled once over part of a record,
+    then dropped, loses nothing, and the rest of the record completes it.
+  - `a_tls_write_error_can_follow_a_whole_record_reaching_the_peer`: with the IO failing after
+    20 000 bytes, a 40 000-byte write returns `Err`, and the peer decrypts the first 16 384 bytes.
+  - `an_io_ok_zero_under_tokio_rustls_parks_a_full_session_write_with_no_waker`: an IO `Ok(0)`
+    counts as would-block. The first write still returns `Ok(65536)`. Once the session is full,
+    a write answers `Pending` and nothing holds its waker. A flush over the same IO fails with
+    `WriteZero` and doesn't park.
+  - `write_all_maps_an_ok_zero_write_to_write_zero`: tokio's `write_all` fails an `Ok(0)` write
+    with `WriteZero`.
+- **One fake stream.** `FakeStream` in `crates/logit-outputs/src/test_support.rs` replaces the two
+  `FakeTlsStream` copies in `statsd.rs` and `syslog.rs`, and the eight tests that used them keep
+  their names and assertions. It scripts short, `Ok(0)`, and failing writes by call number, a
+  failing flush, and a read that is `Pending`, EOF, an error, or unsolicited bytes. It records
+  what was written apart from what was flushed. Its doc says it never goes under tokio-rustls.
+- **`tls.rs` tests.** `poll_pending_close`'s four arms over `FakeStream`
+  (`a_pending_poll_is_open`, `an_empty_ready_is_eof`, `a_read_error_is_eof`,
+  `unsolicited_bytes_are_counted_up_to_the_probe_buffer`), and three over a real TLS pair
+  (`a_partial_tls_record_probes_open_and_is_still_readable`, `a_tls_close_notify_probes_eof`,
+  `a_tls_transport_close_without_close_notify_probes_eof`). `host_only_takes_the_host_of_a_bare_endpoint`
+  is a table over `host:port`, bracketed IPv6, a bare host, the empty string, and bare
+  unbracketed IPv6. The last yields a truncated host, as the doc's "the brackets are the
+  operator's to write" allows.
+- **Prose.** `poll_pending_close`'s doc now says a `Pending` poll can move a partial record or
+  whole post-handshake records into the session, that the kept session loses nothing, and that
+  the probe is one poll because it must not wait. The `Ready(Err)` arm says why it reads as
+  `Eof`. `send_tcp` in `statsd_out` and `syslog_out`, and ADRs `statsd-output` and
+  `syslog-output`, no longer say each TLS record holds complete lines or messages: rustls cuts a
+  record every 16 KiB of plaintext wherever it falls, and the complete lines or messages in what
+  arrived are what a receiver keeps.
+
+Run them with `script/test -p logit-outputs stream_pins tls::tests`. A bump of tokio-rustls,
+rustls, or tokio re-runs `stream_pins` and re-reads the functions each test names.
 
 ### `sink/w2`: the pooled-stream driver (SINK-01, SINK-02)
 
