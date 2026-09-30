@@ -135,8 +135,8 @@
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
-    status_class,
+    after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
+    redacted_snippet, status_class,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -269,17 +269,6 @@ fn is_busy(status: u16, reply: Option<&HecReply>) -> bool {
         429 => true,
         503 => reply.is_none_or(|reply| reply.code == HecStatus::SERVER_BUSY.code),
         _ => false,
-    }
-}
-
-/// A failure of a later request in a `send` that already had a body accepted: a `Clean` fault
-/// becomes [`Fault::Ambiguous`], since `write_loop` retries `Clean` under every posture and the
-/// retry would index the accepted bodies twice (module doc's "Faults" table).
-fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Error {
-    if sent_any && logit_pipeline::classify(&err) == Fault::Clean {
-        err.context(Fault::Ambiguous)
-    } else {
-        err
     }
 }
 
@@ -1500,52 +1489,13 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
 
-    /// A collector that answers one request with `status` and `body`, closes the connection,
-    /// and stops listening, so the next request's connect is refused.
-    async fn answers_once(status: u16, body: String) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-        let seen = bodies.clone();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            drop(listener);
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let body_start = loop {
-                let n = stream.read(&mut chunk).await.unwrap();
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break i + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&buf[..body_start]).to_ascii_lowercase();
-            let length: usize = head
-                .lines()
-                .find_map(|l| l.strip_prefix("content-length:"))
-                .map(|v| v.trim().parse().unwrap())
-                .unwrap();
-            while buf.len() < body_start + length {
-                let n = stream.read(&mut chunk).await.unwrap();
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            seen.lock().unwrap().push(buf[body_start..].to_vec());
-            let response = format!(
-                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
-        });
-        (addr, bodies)
-    }
+    use crate::test_support::answers_once;
 
     /// Once a body was accepted, a connect failure on the next is ambiguous, not clean: a
     /// `Clean` retry would index the first body twice.
     #[tokio::test]
     async fn a_connect_failure_after_an_accepted_body_is_ambiguous() {
-        let (addr, bodies) = answers_once(200, r#"{"text":"Success","code":0}"#.into()).await;
+        let (addr, bodies) = answers_once(200, r#"{"text":"Success","code":0}"#).await;
         let mut out = sink(addr).with_max_body_bytes(300);
         let err = out.send(&logs(10)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");

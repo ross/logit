@@ -151,10 +151,13 @@
 //! | 403 | [`Fault::Permanent`], with a throttled `api_key_rejected` diagnostic saying Datadog refused the key |
 //! | 413 | [`Fault::Permanent`], and the request's entries counted `records.dropped{reason="oversize"}` |
 //! | any other 3xx or 4xx | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
-//! | connect failure | [`Fault::Clean`] |
+//! | connect failure, before any request of this `send` was accepted | [`Fault::Clean`] |
+//! | connect failure after one was | [`Fault::Ambiguous`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
-//! Redirects aren't followed ([`crate::http::build_client`] says why).
+//! `Clean` means Datadog holds nothing of the batch, so once a request was accepted a connect
+//! failure on a later one is `Ambiguous` ([`after_delivery`]). Redirects aren't followed
+//! ([`crate::http::build_client`] says why).
 //!
 //! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
 //! retries an `Ambiguous` attempt, and a batch spans several requests, so a retry re-sends the
@@ -189,8 +192,8 @@
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    build_client, classify_reqwest_error, error_read_bytes, read_body_prefix, redacted_snippet,
-    split_encode, status_class, Caps, Encoded,
+    after_delivery, build_client, classify_reqwest_error, error_read_bytes, read_body_prefix,
+    redacted_snippet, split_encode, status_class, Caps, Encoded,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -764,12 +767,18 @@ impl DatadogOutput {
     /// counting encode-side only on the batch's first encode of it. A route is encoded only once
     /// the routes before it were sent, so a route an earlier attempt never reached counts on the
     /// attempt that first encodes it.
+    ///
+    /// Once a request was accepted, a failure that would be `Clean` is `Ambiguous`
+    /// ([`after_delivery`]). It wraps [`DatadogOutput::post`]'s result rather than living in it, so
+    /// `post`'s `requests{class}` and `request.bytes` follow the request's own fault: a refused
+    /// request counts no bytes whatever came before it.
     async fn attempt(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let (first, mut plan) = self.accounting.encode(0, || plan(batch, now));
         if first {
             self.count_plan_drops(&plan);
         }
         let gate = self.accounting.gate().clone();
+        let mut sent_any = false;
         for route in ROUTES {
             let items = std::mem::take(&mut plan.routes[route as usize]);
             if items.is_empty() {
@@ -808,7 +817,10 @@ impl DatadogOutput {
             }
             for (chunk, encoded) in split.requests {
                 let entries = chunk.iter().map(|item| item.weight).sum();
-                self.post(route, encoded, entries).await?;
+                self.post(route, encoded, entries)
+                    .await
+                    .map_err(|err| after_delivery(err, sent_any))?;
+                sent_any = true;
             }
         }
         Ok(())
@@ -1419,6 +1431,17 @@ mod tests {
         drop(listener);
         let err = sink(addr).send_at(&batch(vec![gauge(NOW)]), NOW).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    /// Once a route's request was accepted, a connect failure on the next is ambiguous: a
+    /// `Clean` retry would resend the accepted series.
+    #[tokio::test]
+    async fn a_connect_failure_after_an_accepted_request_is_ambiguous() {
+        let (addr, log) = crate::test_support::answers_once(202, Vec::new()).await;
+        let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
+        let err = sink(addr).send_at(&b, NOW).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(crate::test_support::recorded_paths(&log.lock().unwrap()), ["/api/v2/series"]);
     }
 
     /// A 413 counts the request's entries oversize.

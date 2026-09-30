@@ -1357,8 +1357,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [ADR `deployment-threat-model`](adr/deployment-threat-model.md) treats that as an accident to
   bound, not data to scale down ([ADR `untrusted-input-bounds`](adr/untrusted-input-bounds.md)
   has the rule).
-- **`datadog_out` reports a connect failure `Clean` after an earlier request of the same batch
-  succeeded.** One `send` is up to eight routes' requests, and `crate::http`'s
+- ~~**`datadog_out` reports a connect failure `Clean` after an earlier request of the same batch succeeded.**~~ **Closed 2026-09-30:** `crate::http::after_delivery` applies the rule on every transport of the sink (ADR `delivery-semantics`, item 9).
+
+  One `send` is up to eight routes' requests, and `crate::http`'s
   `classify_reqwest_error` makes any connect failure `Fault::Clean`. `write_loop` retries `Clean`
   under every delivery posture, and the retry re-sends the requests that already succeeded.
   - **Consequence:** under `buffer.delivery: at_most_once`, which promises no resend of an
@@ -1369,8 +1370,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
     `after_delivery`). [ADR `delivery-semantics`](adr/delivery-semantics.md), item 9, decides
     this for `datadog_out`, `datadog_trace_out`, and `otlp_out`; the plan's W2 builds it.
-- **`datadog_trace_out` reports a connect failure `Clean` after an earlier request of the same
-  batch was accepted.** One `send` is the trace requests, then the stats request, and a batch of
+- ~~**`datadog_trace_out` reports a connect failure `Clean` after an earlier request of the same batch was accepted.**~~ **Closed 2026-09-30:** `crate::http::after_delivery` applies the rule on every transport of the sink (ADR `delivery-semantics`, item 9).
+
+  One `send` is the trace requests, then the stats request, and a batch of
   more than 1,000 traces is several trace requests. Both transports make a connect failure
   `Fault::Clean`: `reqwest`'s through `classify_reqwest_error`, and the Unix socket's when the
   connector can't dial the path. `datadog_out` has the same gap, in the entry above, and
@@ -1808,8 +1810,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
   raced a close; it counts `send_failed` lines but can't force the race.
-- **`otlp_out` reports a connect failure `Clean` after an earlier request of the same batch
-  succeeded.** One `send` is one request per signal, sequentially, and a connect failure is
+- ~~**`otlp_out` reports a connect failure `Clean` after an earlier request of the same batch succeeded.**~~ **Closed 2026-09-30:** `crate::http::after_delivery` applies the rule on every transport of the sink (ADR `delivery-semantics`, item 9).
+
+  One `send` is one request per signal, sequentially, and a connect failure is
   `Fault::Clean` on either transport (`crate::http`'s `classify_reqwest_error` over HTTP,
   `grpc_roundtrip`'s `is_connect()` over gRPC). `write_loop` retries `Clean` under every delivery
   posture, and the retry re-sends every signal, the ones already accepted included.

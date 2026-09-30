@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -522,11 +522,9 @@ nature. The encode-side counters are the only ones that measure the batch and no
 
 - Align the HTTP sinks' `logit.output.requests` vocabulary with decision 4's four fault classes
   (`docs/known-gaps.md`, "Internal telemetry and self-logging").
-- Decide how `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a connect failure that
-  follows an accepted request in the same `send`. `Clean` re-sends what was accepted, and
-  `Ambiguous` under the default at-most-once posture drops what wasn't. `splunk_hec_out` classifies
-  it `Ambiguous`. The choice weighs duplicate delivery against loss and needs its own record (one
-  `docs/known-gaps.md` entry per sink).
+- How `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a connect failure that
+  follows an accepted request in the same `send` is decided by [ADR
+  `delivery-semantics`](delivery-semantics.md), item 9, and built; see the amendments below.
 - Fix or scope the pre-existing warnings that `cargo doc` reports with warnings denied in
   `logit-outputs`, `logit-pipeline`, and `logit-proto`, which CI doesn't check.
 - Configure a nextest per-test timeout, so a hung test fails and doesn't stall the run.
@@ -1073,3 +1071,13 @@ failure that follows an accepted request in the same `send`. [ADR
 `delivery-semantics`](delivery-semantics.md), item 9, decides it: `Ambiguous`, as
 `splunk_hec_out` does. Its item 5 makes `at_least_once` those sinks' default posture, so the
 `Ambiguous` fault is retried and not dropped.
+
+## Amendment: the `Clean`-after-accepted rule is built (2026-09-30)
+
+The rule lives in one place, `crate::http::after_delivery` (`crates/logit-outputs/src/http.rs`),
+moved there from `splunk.rs`. `otlp_out`, `datadog_out`, `datadog_trace_out`, and
+`splunk_hec_out` apply it on every transport each has: HTTP and gRPC for `otlp_out`, TCP and the
+Unix socket for `datadog_trace_out`. Each applies it outside the code that counts
+`logit.output.requests{class}` and `logit.output.request.bytes`, so a refused request still
+counts `network_error` and no bytes after an accepted one. The three `docs/known-gaps.md` entries
+are closed.

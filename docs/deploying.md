@@ -1872,7 +1872,8 @@ Agent's `max_request_bytes`. A trace too large to send alone is dropped and coun
 
 **Delivery.** Traces go first, then stats. The first request that fails stops the rest, and the
 batch is retried or dropped as one. `408`, `429`, `5xx`, and timeouts are retryable; a refused
-connection or a missing socket file is retried as a clean failure; any other `4xx` isn't retried.
+connection or a missing socket file is retried under every posture before any request of the
+batch was accepted, and after one is retryable like a timeout; any other `4xx` isn't retried.
 An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
 twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
 `buffer:` here is also what keeps

@@ -30,12 +30,17 @@
 //!
 //! | Condition | `Fault` |
 //! |---|---|
-//! | Connect refused, DNS failure (the request never reached anything) | `Clean` |
+//! | Connect refused, DNS failure, before any request of this `send` was accepted | `Clean` |
+//! | Connect refused, DNS failure, after one was | `Ambiguous` |
 //! | Request timeout | `Ambiguous` |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` |
 //! | Any HTTP 3xx (redirects are off; [`crate::http::build_client`] says why) | `Permanent` |
 //! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED` | `Permanent` |
 //! | Any other gRPC status (never retry an unrecognized code) | `Permanent` |
+//!
+//! `Clean` means the collector holds nothing of the batch, so once a signal's request was accepted
+//! a connect failure on a later one is `Ambiguous` ([`crate::http::after_delivery`], on both
+//! transports).
 //!
 //! A non-2xx HTTP response's body is quoted in the error, read bounded to
 //! [`crate::http::ERROR_BODY_SNIPPET_BYTES`] ([`crate::http::read_body_prefix`]).
@@ -67,8 +72,8 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
-    status_class, ERROR_BODY_SNIPPET_BYTES,
+    after_delivery, body_snippet, build_client, classify_reqwest_error, is_retryable_http_status,
+    read_body_prefix, status_class, ERROR_BODY_SNIPPET_BYTES,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -413,13 +418,20 @@ impl OtlpOutput {
     /// first failing request aborts the rest; `write_loop` then retries the whole batch, the
     /// requests that succeeded included (the module doc's "Delivery posture"). Every signal is
     /// encoded before the first request, as unit 0 of the batch accounting.
+    ///
+    /// Once a request was accepted, a failure that would be `Clean` is `Ambiguous`
+    /// ([`crate::http::after_delivery`]). A 2xx or `OK` whose `partial_success` rejected every
+    /// record counts as accepted: a resend of rejected records is only rejected again.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
+        let mut sent_any = false;
         for (signal, payload) in payloads? {
             match self.transport {
-                OtlpTransport::Http => self.send_http(signal, payload).await?,
-                OtlpTransport::Grpc => self.send_grpc(signal, payload).await?,
+                OtlpTransport::Http => self.send_http(signal, payload).await,
+                OtlpTransport::Grpc => self.send_grpc(signal, payload).await,
             }
+            .map_err(|err| after_delivery(err, sent_any))?;
+            sent_any = true;
         }
         Ok(())
     }
@@ -959,6 +971,16 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
 
+    /// Once a signal's request was accepted, a connect failure on the next is ambiguous: a
+    /// `Clean` retry would resend the accepted signal.
+    #[tokio::test]
+    async fn a_connect_failure_after_an_accepted_request_is_ambiguous() {
+        let (addr, log) = crate::test_support::answers_once(200, Vec::new()).await;
+        let err = http_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 1, "one request accepted, then refused");
+    }
+
     #[tokio::test]
     async fn a_request_timeout_is_classified_ambiguous() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1317,6 +1339,71 @@ mod tests {
     /// compressed flag and payload.
     async fn canned_grpc_server_capturing_request() -> (std::net::SocketAddr, GrpcLog) {
         recording_grpc_server(&[0]).await
+    }
+
+    #[tokio::test]
+    async fn grpc_connect_refused_is_clean() {
+        let addr = crate::test_support::refused_addr().await;
+        let err = grpc_output(addr).send(&metric_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+    }
+
+    /// An HTTP/2 peer that serves one connection and stops listening once it accepted it. It
+    /// answers the first call `grpc-status: 0`, then sends `GOAWAY`, so the pooled client dials
+    /// again for its next call and is refused.
+    async fn grpc_answers_once() -> (std::net::SocketAddr, GrpcLog) {
+        use hyper::service::service_fn;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: GrpcLog = Arc::default();
+        let task_log = log.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let answered = Arc::new(tokio::sync::Notify::new());
+            let notify = answered.clone();
+            let svc = service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                let (log, notify) = (task_log.clone(), notify.clone());
+                async move {
+                    let headers = req.headers().clone();
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    log.lock().unwrap().push((headers, body));
+                    notify.notify_one();
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    let resp_body = TestGrpcBody {
+                        data: Some(Bytes::from(grpc_frame(&[], false))),
+                        trailers: Some(trailers),
+                    };
+                    Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc+proto")
+                            .body(resp_body)
+                            .unwrap(),
+                    )
+                }
+            });
+            let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), svc);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                () = answered.notified() => conn.as_mut().graceful_shutdown(),
+            }
+            let _ = conn.await;
+        });
+        (addr, log)
+    }
+
+    /// The gRPC twin of `a_connect_failure_after_an_accepted_request_is_ambiguous`.
+    #[tokio::test]
+    async fn a_grpc_connect_failure_after_an_accepted_call_is_ambiguous() {
+        let (addr, log) = grpc_answers_once().await;
+        let err = grpc_output(addr).send(&all_three_signals_batch()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(log.lock().unwrap().len(), 1, "one call accepted, then refused");
     }
 
     #[tokio::test]
