@@ -1065,3 +1065,11 @@ inventory rows.
   statement of the three counter classes. Each sink's section and `docs/deploying.md` point at it.
 - **Inventory.** SINK-01..06, WIRE-08, WIRE-09, and RT-05 are `findings`, top leads 12 and 14 are
   done, and cluster 6 is done.
+
+## Amendment: the `Clean`-after-accepted follow-up is decided (2026-09-29)
+
+Follow-ups left open how `otlp_out`, `datadog_out`, and `datadog_trace_out` classify a connect
+failure that follows an accepted request in the same `send`. [ADR
+`delivery-semantics`](delivery-semantics.md), item 9, decides it: `Ambiguous`, as
+`splunk_hec_out` does. Its item 5 makes `at_least_once` those sinks' default posture, so the
+`Ambiguous` fault is retried and not dropped.

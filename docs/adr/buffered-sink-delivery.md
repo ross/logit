@@ -332,3 +332,19 @@ never mutes, so a caller that never calls `observe_batch` counts every `send`. `
 `prometheus_out`'s remote-write mode, and `splunk_hec_out` are gated the same way. `datadog_out`
 and `datadog_trace_out` are gated per unit: `datadog_out`'s plan and each route, and
 `datadog_trace_out`'s trace and stats routes, with a bisection's re-encodes muted (decision 2).
+
+## Amendment: a project target, and `at_least_once` as the default (2026-09-29)
+
+[ADR `delivery-semantics`](delivery-semantics.md) changes two things around "Delivery posture
+is a per-sink policy, chosen in three layers".
+
+- **There is a target.** `logit` aims for at-least-once on every hop. This record rejected "a
+  single fixed delivery guarantee for every sink", and that still holds: `buffer.delivery:`
+  stays per sink, and the target says which way the default leans.
+- **The sink no longer reports a fact.** `Output::duplicate_safe() -> bool` goes away. The
+  runtime's default posture is `at_least_once` for every sink, and the data model and the
+  receiver absorb the duplicate (its item 5). `statsd_out` declares `at_most_once` as its own
+  default, because a statsd line has no timestamp for a resend to overwrite at.
+
+The `Fault` table is unchanged. `Output::duplicate_safe()` is what the code has until that
+record's plan lands the new default.
