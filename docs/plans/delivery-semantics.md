@@ -41,9 +41,9 @@ the workstream it describes. W3 is independent.
   its destination, which kinds the destination aggregates, and the `aggregate`
   `temporality: cumulative` remedy where one applies (a delta `Sum` or `Histogram` at
   `otlp_out` and `splunk_hec_out`; a delta `Sum` at `collectd_out`). `prometheus_out`'s doc
-  says it skips a delta, so a resend has nothing to add. `datadog_out`'s doc
-  says the remedy doesn't apply to it: its series route skips a cumulative `Sum`, and its
-  sketches and APM stats have no remedy.
+  says it skips a delta, so a resend has nothing to add. `datadog_out`'s doc says the remedy
+  doesn't apply to it: its series route skips a cumulative `Sum`, and its sketches and APM
+  stats have no remedy. `datadog_trace_out`'s doc says the same of the APM stats it relays.
 - `logit_out` defaults to `at_least_once` here, before W5 can deduplicate. Between W1 and W5 a
   resend after a lost `Ack` reaches `logit_in`'s consumers twice, and a `statsd_out` or an
   aggregated kind behind that `logit_in` double-counts it. `buffer.delivery: at_most_once` on
@@ -128,7 +128,9 @@ W6 can land in pieces with the workstream each piece describes.
 - **W3:** what `logit_in` writes for a batch no consumer took, and whether a closed consumer
   propagates as a shutdown signal.
 - **W4:** everything its list names.
-- **W1:** whether `stdio_out` and `file_out` need a posture doc at all. Their write errors
-  carry no `Fault`, so they're `Permanent` and never retried. The one exception, `file_out`'s
-  failed re-open after a rotation, is `Clean`, which retries under both postures. The posture
-  has nothing to decide.
+- **W1:** what `stdio_out`'s and `file_out`'s posture docs say. Their write errors carry no
+  `Fault`, so they're `Permanent` and never retried, and `file_out`'s failed re-open after a
+  rotation is `Clean`, which retries under both postures. The one case posture decides is a
+  write the shutdown grace cuts off, which is `Ambiguous`: under `at_least_once` a
+  `buffer.disk:` spool replays it after the restart, which can repeat a block in the file, and
+  under `at_most_once` it's dropped and counted `shutdown`.

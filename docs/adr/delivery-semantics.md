@@ -149,12 +149,13 @@ the hook:
   overwrites. `datadog_out` has no remedy and needs none for its `Sum`: a Datadog `count`
   carries a per-interval value, so its series route skips a cumulative `Sum`, and a resent
   series point was measured to overwrite at its `(series, timestamp)`. No `aggregate` mode
-  changes a `Distribution`, `Samples`, or `Set`; each window's summary is self-contained. So a
-  Datadog distribution point, sketch, or APM stats payload has no upstream remedy today, and
-  is assumed to add on a resend until measured. Whether a Splunk metrics index adds a resent
-  running total or stores it as a second point is unmeasured too. An operator who sends such
-  a kind accepts the double count, as every surveyed sender does, or sets
-  `buffer.delivery: at_most_once` on that sink.
+  makes a `Distribution`, `Samples`, or `Set` cumulative; each window's summary is
+  self-contained. So a Datadog distribution point or sketch, and the APM stats `datadog_out`
+  and `datadog_trace_out` relay, have no upstream remedy today, and each is assumed to add on
+  a resend until measured. Whether a Splunk metrics index adds a resent running total or
+  stores it as a second point is unmeasured too. An operator who sends such a kind accepts
+  the double count, as every surveyed sender does, or sets `buffer.delivery: at_most_once` on
+  that sink.
 
 `statsd_out` is the one exception. The classic statsd grammar has no timestamp, and `statsd_out`
 writes a DogStatsD `|T` only when the event arrived with one, so a resent counter usually has
@@ -266,8 +267,10 @@ decision 1 and its four named exceptions. Whether a sink's counter counts per ba
 attempt is [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s
 decision 1.
 
-A component that can recognize a replay counts it: the disk spool's
-`logit.component.buffer.disk.replayed`, and the frames `logit_in` recognizes and doesn't forward.
+A component that can recognize a replay counts it. Today none can: the disk spool's
+`logit.component.buffer.disk.replayed` counts every record resumed after the cursor, backlog
+and re-delivery alike, because the spool can't tell them apart. The frames `logit_in`
+recognizes and doesn't forward (item 7) are the first replays `logit` can count.
 
 ### Retry ownership
 
@@ -328,8 +331,9 @@ an entry in [`docs/known-gaps.md`](../known-gaps.md).
 - A resend to a destination that aggregates the kind it carries double-counts. Each sink's
   operator doc says which kinds, and where `aggregate`'s `temporality: cumulative` is a remedy
   (a delta `Sum` or `Histogram` at `otlp_out` and `splunk_hec_out`; a delta `Sum` at
-  `collectd_out`) and where none exists (`datadog_out`'s distribution points,
-  sketches, and APM stats; every sink's `Distribution`, `Samples`, and `Set`).
+  `collectd_out`) and where none exists (`datadog_out`'s distribution points and sketches,
+  the APM stats `datadog_out` and `datadog_trace_out` relay, and a `Distribution`, `Samples`,
+  or `Set` at any receiver that aggregates it rather than storing a timestamped point).
 - `otlp_out`, `datadog_out`, and `datadog_trace_out` gain `splunk_hec_out`'s rule.
 - `logit_in`, `prometheus_in`'s remote-write receiver, and the other HTTP listeners need to
   learn from `Fanout` that no consumer took a batch.

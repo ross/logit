@@ -558,8 +558,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   once `checkpoint_interval` (1 s by default) has passed since the last write, on a segment
   roll, or at shutdown, with no timer. After a crash the spool replays the batch in flight and
   every batch committed since the last cursor write, which after an idle period can be far
-  older than the interval, counted
-  `logit.component.buffer.disk.replayed`. Under `at_most_once` that includes a batch the sink
+  older than the interval. `logit.component.buffer.disk.replayed` counts every record resumed
+  after the cursor, so it can't separate those re-deliveries from the backlog that was never
+  sent. Under `at_most_once` the re-deliveries include a batch the sink
   dropped as `Ambiguous` to avoid a duplicate. It isn't a gap to close: [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 8, keeps the combination valid and
   states the window. A `statsd_out`, or a sink whose destination aggregates a resend, with
