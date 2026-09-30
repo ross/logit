@@ -148,9 +148,9 @@ the hook:
   kind is a delta `Sum` or a delta `Histogram`, the remedy is upstream of the sink, not in its
   posture: an `aggregate` with `temporality: cumulative` turns it into a running total that a
   resend repeats rather than adds. `otlp_out` carries both forms, `splunk_hec_out` carries the
-  `Sum` and, under `multi_value: expand`, the `Histogram`, and `collectd_out` carries the `Sum`
-  (as `ABSOLUTE`, and as `COUNTER` once `aggregate` makes it cumulative) and drops every
-  `Histogram`. `prometheus_out` needs no remedy: it skips a delta
+  `Sum` and, under `multi_value: expand`, the `Histogram`, and `collectd_out` carries a
+  monotonic `Sum` (as `ABSOLUTE`, and as `COUNTER` once `aggregate` makes it cumulative) and
+  drops every `Histogram`. `prometheus_out` needs no remedy: it skips a delta
   outright, so cumulative mode decides whether the metric goes out at all, and what goes out
   overwrites. `datadog_out` has no remedy and needs none for its `Sum`: a Datadog `count`
   carries a per-interval value, so its series route skips a cumulative `Sum`, and a resent
