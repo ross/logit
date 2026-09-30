@@ -23,11 +23,11 @@
 //! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
 //!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
 //!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
-//!   cap; `REJECT_GOING_AWAY`, the peer shutting down or closing an idle connection; a code a
-//!   newer peer adds) is transient: `Clean` at the handshake. After a data frame left,
-//!   `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only before the frame it answers
-//!   is forwarded (its module doc's "Shutdown"), so the batch never landed and is resent at any
-//!   delivery posture. Any other transient code there is `Ambiguous`.
+//!   cap; `REJECT_GOING_AWAY`, the peer shutting down, closing an idle connection, or finding no
+//!   consumer to take a frame; a code a newer peer adds) is transient: `Clean` at the handshake.
+//!   After a data frame left, `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only for
+//!   a frame it didn't forward (its module doc's "Shutdown"), so the batch never landed and is
+//!   resent at any delivery posture. Any other transient code there is `Ambiguous`.
 //! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
 //!   `frame::compressed_bound` of that: `Permanent`, nothing written, a pooled connection kept.
 //! - **Write phase**: any failure before the frame is completely written and flushed (a write
@@ -442,9 +442,10 @@ impl LogitOutput {
         let ack = match ack_result {
             Ok(Ok(control::ControlMessage::Ack(ack))) => ack,
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
-                // `logit_in` writes `GOING_AWAY` only before a frame is forwarded, so in place of
-                // the `Ack` it means this batch never landed: `Clean`. Any other transient code
-                // after the frame left is `Ambiguous`.
+                // `logit_in` writes `GOING_AWAY` only for a frame it didn't forward (shutdown, an
+                // idle close, or no consumer taking it), so in place of the `Ack` it means this
+                // batch never landed: `Clean`. Any other transient code after the frame left is
+                // `Ambiguous`.
                 let fault = if reject_is_permanent(reject.code) {
                     Fault::Permanent
                 } else if reject.code == control::REJECT_GOING_AWAY {

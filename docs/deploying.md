@@ -1208,6 +1208,11 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 
+**A closed downstream stops the tailer.** When no consumer takes a batch, `tail_in`/`docker_in`
+stops at the first refused batch and freezes the checkpoint at the last line a consumer took, and
+the node finishes. A restart resumes there. It's counted
+`logit.input.batches.dropped{reason="closed_consumer"}`.
+
 Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
 directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
 one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
@@ -1516,6 +1521,13 @@ directly from a page on a different origin, can't reach it at all. Put a reverse
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
 (`docs/known-gaps.md`).
 
+## `otlp_in`: a request no consumer took
+
+When every consumer directly downstream of `otlp_in` has closed, which happens as a shutdown tears
+the graph down, a request is refused: HTTP `503` with `Retry-After: 1`, or gRPC status 14
+(`UNAVAILABLE`). Both are retryable, and OTLP exporters retry them. It's counted
+`logit.input.batches.dropped{reason="closed_consumer"}`.
+
 ## `datadog_in`: standing in for Datadog's intake
 
 To choose between this and the other Datadog topologies, and for the rules that lose data when
@@ -1602,6 +1614,9 @@ timeout, and then the same retry.
   payload, and a `503` partway through means the retry delivers the batches already delivered
   before the deadline again. Datadog's own intake has the same shape: a resent series point
   overwrites, a resent log or span duplicates.
+- **A request no consumer took gets the same `503` with `Retry-After: 1`**, counted
+  `logit.input.requests{class="closed_consumer"}`. It happens once every consumer directly
+  downstream has closed, and the Agent's retry delivers the payload after a restart.
 - **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
   with its Agents, and the Agents' retry queues are absorbing the difference.
   `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
@@ -1679,7 +1694,8 @@ seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
 `logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
 minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
 window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
-decision 11 is loss.
+decision 11 is loss. A request no consumer took (every consumer directly downstream has closed)
+gets the same `503` with `Retry-After: 1`, counted `logit.input.requests{class="closed_consumer"}`.
 Prevent it downstream: give the sinks this listener feeds a `buffer:` (memory, or `disk:` for a
 long outage) large enough to absorb a stall, so the channel `datadog_trace_in` sends into keeps
 draining.
@@ -1958,10 +1974,18 @@ seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
 `logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
-without a deadline and the request gets `200`, so a retry never repeats part of a body. From that
-answer until a later request's data is taken, for at most 5 seconds,
+without a deadline and the request gets `200`, so a retry never repeats part of a body. From a
+busy `503` until a later request's data is taken, for at most 5 seconds,
 `/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
 Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
+
+**A pipeline whose consumers have closed refuses the body.** Once every consumer directly
+downstream of `splunk_hec_in` has closed, which happens as a shutdown tears the graph down, a
+request whose first batch no consumer takes gets `503` code 9 with `Retry-After: 1`, and `/health`
+is left alone. If the consumers close after the first batch was taken, the request gets `500` code
+8 with no `ackId`, and a retry repeats the batches already taken. Both are counted
+`logit.input.requests{class="closed_consumer"}` and
+`logit.input.batches.dropped{reason="closed_consumer"}`.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token
@@ -2090,6 +2114,11 @@ mid-upload** is derived from it. With `idle_timeout:` unset, a half-uploaded req
 listener's 1024 connection permits until the sender goes away, and the stalled body never gets its
 `408`. Size it above the senders' longest normal gap; `60s` is comfortable for Prometheus's default
 `remote_timeout` of 30s.
+
+**A write no consumer took gets `503`.** Once every consumer directly downstream of the receiver
+has closed, the receiver answers `503` rather than `204`, so the sender keeps the write in its WAL
+and resends it. It's counted `logit.input.writes{class="closed_consumer"}`, and
+`logit.input.samples` doesn't count that write's samples.
 
 A Prometheus writing into the receiver needs only its own `remote_write:` block. It is the sender,
 so no server-side flag is involved:
@@ -2558,9 +2587,10 @@ that gets `Reject{code: REJECT_INTERNAL}` never classifies it `permanent`:
   consumers twice. Set `buffer.delivery: at_most_once` on the `logit_out` component to avoid the
   duplicate at the cost of that batch, which is then dropped and counted.
 
-Either way the sink reconnects on its own once the peer has capacity, with no operator action. `Reject{code: REJECT_GOING_AWAY}`, from the peer's own shutdown or an idle
-close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
-even after a frame left, and the batch is resent under either posture.
+Either way the sink reconnects on its own once the peer has capacity, with no operator action. `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
+idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has
+closed). `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean` even after a
+frame left, and the batch is resent under either posture: `logit_out` redials and resends it.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
 version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a

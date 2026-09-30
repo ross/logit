@@ -115,7 +115,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `docs/design/pipeline-graph.md`'s "Cancellation points" table has each site.
 - **A batch sent into a closed sink inbox after the sweep's bound runs out is lost uncounted.**
   `run_output` closes its inbox before its shutdown sweep, so a later send fails upstream as
-  `closed_consumer`. A producer that reserved its channel permit before the close can still send,
+  `closed_consumer` (a listener with an acknowledgement also refuses that batch to its client).
+  A producer that reserved its channel permit before the close can still send,
   and the sweep receives until `recv` returns `None`, but only for `SWEEP_DRAIN_TIMEOUT` (250 ms).
   A permit holder still blocked when that runs out, on another consumer of a fan-out, sends into a
   channel nobody reads, and the batch dies with the `Receiver`, counted `sent` upstream and nothing
@@ -544,14 +545,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   wire layout has its own record (the plan's W4 and W5), `buffer.delivery: at_most_once` on a
   `logit_out` whose far side feeds a counter sink avoids that at the cost of the batch.
 
-- **`logit_in` acknowledges a batch no consumer took.** `Fanout` skips a closed consumer, counts
-  `logit.component.events.dropped{reason="closed_consumer"}`, and tells its caller nothing, so
-  `logit_in` writes its `Ack` and `logit_out` commits a batch nothing kept. `otlp_in`,
-  `datadog_in`, `datadog_trace_in`, and `splunk_hec_in` answer success the same way, and
-  `prometheus_in`'s remote-write receiver has its own entry under Prometheus. It happens when
-  the downstream half of the graph is already torn down, which is a shutdown. [ADR
-  `delivery-semantics`](adr/delivery-semantics.md), item 3, says an input doesn't acknowledge
-  such a batch (the plan's W3).
+- ~~**`logit_in` acknowledges a batch no consumer took.**~~ **Closed 2026-09-30:** `Fanout`'s sends return whether any consumer took the batch, and `logit_in` answers `Reject{GOING_AWAY}` and closes for a frame none took. `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, and `prometheus_in`'s receiver answer their protocol's retryable failure, and `tail_in` and `docker_in` freeze their checkpoint and stop (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
 - **A disk-backed sink replays delivered and dropped batches after a crash, under either
   posture.** `commit` moves the read cursor in memory, and the cursor reaches disk on a commit
@@ -1973,24 +1967,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `X-Prometheus-Remote-Write-Samples-Written` header, and a counter disagreeing with that header
   would have no right answer. A mode tag was considered and not added: the modes are already told
   apart by which of `logit.input.scrapes`/`logit.input.writes` the component reports.
-- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**
-  `Fanout::send`, which the receiver's delivery task calls, silently skips a closed consumer (counted
-  `logit.component.events.dropped{reason="closed_consumer"}`,
-  `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
-  the `Fanout` *before* building the response — `otlp_in`'s ordering, which lets channel
-  backpressure throttle the sender's queue. So during a shutdown that has already torn down the
-  downstream half of the graph, a sender gets `204` (and, on 2.0, a non-zero `Samples-Written`) for
-  a batch nothing kept. A remote-write sender treats `204` as "stored, drop it from my WAL" and never
-  resends; an OTLP client's retry after `otlp_in`'s success is its own business, so this listener is
-  the first where the inherited fanout behaviour breaks a *durable* promise. The fanout behaviour is
-  [`docs/design/pipeline-graph.md`](design/pipeline-graph.md)'s own open question — *"today's
-  `send_batch` silently drops a send on a closed downstream; under a DAG that closure should really
-  propagate as a shutdown signal rather than vanish"* — and the general statement of the limit is
-  "No end-to-end acknowledgement" under
-  [Native wire format, `logit_in`/`logit_out`, and buffering](#native-wire-format-logit_inlogit_out-and-buffering).
-  Narrow in practice (shutdown is per-connection and the window is the drain); closes when that open
-  question does. [ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, decides the
-  input's half: no acknowledgment for a batch no consumer took.
+- ~~**A `prometheus_in(bind)` whose downstream is already closed still answers `204`.**~~ **Closed 2026-09-30:** the receiver answers `503` for a write no consumer took and counts `logit.input.writes{class="closed_consumer"}`. A shutdown-time closure that reaches only a sink behind an open transform is still acknowledged, which is the part of `docs/design/pipeline-graph.md`'s "Open question: a closed downstream" that stays open (ADR `delivery-semantics`, item 3, and its W3 amendment).
 
 - **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
   VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with

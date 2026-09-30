@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -351,3 +351,37 @@ an entry in [`docs/known-gaps.md`](../known-gaps.md).
 - `docs/deploying.md`, `docs/datadog.md`, and `docs/splunk.md` describe the old defaults until
   the posture change lands, and change with it.
 - `docs/OVERVIEW.md`'s "lossless transport" is read as field fidelity.
+
+## Amendment: W3 decisions (2026-09-30)
+
+The workstream that closes item 3 settled these:
+
+- **`Fanout` reports whether a batch was taken.** Every send returns a `bool`: `true` when the
+  batch is in at least one consumer's inbox at send time, `false` for zero consumers or all
+  closed. It never means the batch was processed.
+- **`logit_in` answers `Reject{GOING_AWAY, "no consumer took the batch"}` and closes** for a
+  frame no consumer took, before the sequence advances. `logit_out` already treats `GOING_AWAY`
+  as `Clean` and redials. `GOING_AWAY` now has three causes: shutdown, an idle close, and no
+  consumer took the frame ([ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md)).
+- **The other HTTP listeners answer their protocol's retryable failure.** `otlp_in` answers `503`
+  with `Retry-After: 1` over HTTP and status 14 (`UNAVAILABLE`) over gRPC, never a
+  `partial_success`. `prometheus_in`'s receiver answers `503`. `datadog_in` and `datadog_trace_in`
+  answer the `503` with `Retry-After: 1` they use for a busy pipeline, counted under their own
+  reason.
+- **`splunk_hec_in` answers by how much of the body was taken.** A refused first batch is `503`
+  code 9 with `Retry-After: 1`. A refused later batch is `500` code 8 with no `ackId`, because code
+  9 promises nothing was taken ([ADR `splunk-hec-relay`](splunk-hec-relay.md)).
+- **`tail_in` and `docker_in` freeze and stop.** On the first refused batch the driver freezes its
+  checkpoint at the last line a consumer took and returns, and the node finishes, like a finite
+  `generate_in`. A restart resumes at the frozen checkpoint.
+- **Counter.** Every acknowledging listener counts
+  `logit.input.batches.dropped{reason="closed_consumer"}`: every batch of the request no consumer
+  took, the refused one included. It isn't disjoint from `logit.component.batches.sent` (`Fanout`
+  counted the refused batch there, and once per consumer in
+  `logit.component.events.dropped{reason="closed_consumer"}`); batches after it that were never
+  offered appear only in the input counter. Listeners with nothing to withhold (UDP and TCP stream
+  inputs, `internal`, `generate_in`, the scrape path) stay on `Fanout`'s counter.
+- **Scope is direct consumers.** A listener refuses a batch only when every consumer directly
+  downstream has closed. A sink closing behind an open transform is still acknowledged. Propagating
+  a closure as a shutdown signal, and a per-edge `on_full` policy, stay open
+  (`docs/design/pipeline-graph.md`, "Open question: a closed downstream").

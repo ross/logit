@@ -36,6 +36,12 @@
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for which node kinds
 //! propagate a parent and which mint a root, and its "Provenance propagation" section for the
 //! stamping rule ([`Fanout::stamp`]/[`Fanout::stamp_relayed`]).
+//!
+//! **Every send returns whether the batch was taken.** `true` means the batch is in at least one
+//! consumer's inbox at send time, never that anything downstream processed it; `false` means no
+//! consumer took it (there are none, or every one is closed). A listener that acknowledges its
+//! client refuses the batch on `false`, which is the input's half of
+//! `docs/design/pipeline-graph.md`'s "Open question: a closed downstream".
 
 use logit_core::interner::intern;
 use logit_core::random_id_bytes;
@@ -217,18 +223,18 @@ impl Fanout {
     /// Its window is this call only: `Input::run` is a free-form loop, so the time spent building
     /// `batch` is unknowable here. Only listeners call this, so one `send` is one listener
     /// emission.
-    pub async fn send(&self, batch: EventBatch) {
+    pub async fn send(&self, batch: EventBatch) -> bool {
         let ctx = TraceContext::new_root();
         let mut span =
             self.telemetry.span("send", SpanKind::Producer, ctx.trace_id, ctx.span_id, None);
         span.events(batch.events.len() as u64);
-        self.send_with_own_context(batch, ctx.into()).await;
+        self.send_with_own_context(batch, ctx.into()).await
     }
 
     /// Sends `batch` to every consumer as a [`TraceContext::child`] of `parent`, recording no span
     /// and carrying empty incoming provenance. A caller with provenance to propagate, or a span
     /// of its own around the send, calls [`Fanout::send_with_own_context`] instead.
-    pub async fn send_with_context(&self, batch: EventBatch, parent: TraceContext) {
+    pub async fn send_with_context(&self, batch: EventBatch, parent: TraceContext) -> bool {
         self.send_with_own_context(batch, parent.child().into()).await
     }
 
@@ -240,17 +246,18 @@ impl Fanout {
     /// `origin`/`previous` (`docs/adr/batch-provenance-on-delivered.md`).
     ///
     /// A closed consumer is skipped and its events counted as
-    /// `logit.component.events.dropped{reason="closed_consumer"}`. Propagating a closed downstream
-    /// as a shutdown signal is an open question (`docs/design/pipeline-graph.md`'s backpressure
-    /// section).
+    /// `logit.component.events.dropped{reason="closed_consumer"}`. Returns `false` when no
+    /// consumer took the batch, which an acknowledging listener answers by refusing it;
+    /// propagating a closed downstream as a shutdown signal is still open
+    /// (`docs/design/pipeline-graph.md`'s "Open question: a closed downstream").
     ///
     /// One consumer gets the batch moved as [`Delivered::Owned`]. With more, the batch is wrapped
     /// in one `Arc`, cloned for every consumer but the last, which gets it moved (saving one
     /// refcount pair, not a privilege). Every consumer gets the same context: one fan-out is one
     /// emission.
-    pub async fn send_with_own_context(&self, batch: EventBatch, ctx: BatchContext) {
+    pub async fn send_with_own_context(&self, batch: EventBatch, ctx: BatchContext) -> bool {
         let ctx = self.stamp(ctx);
-        self.deliver(batch, ctx).await;
+        self.deliver(batch, ctx).await
     }
 
     /// [`Fanout::send`] with all-edges-or-nothing delivery under `deadline`: the call for a
@@ -265,19 +272,20 @@ impl Fanout {
     /// several), then counts as sent and finishes the span.
     ///
     /// A closed consumer is skipped and counted `events.dropped{reason="closed_consumer"}`, as in
-    /// `deliver`, but only once the batch actually goes out.
+    /// `deliver`, but only once the batch goes out. `Ok(false)` is a batch no consumer took (there
+    /// are none, or every one is closed), which the calling listener refuses to its client.
     pub async fn send_with_deadline(
         &self,
         batch: EventBatch,
         deadline: tokio::time::Instant,
-    ) -> Result<(), SendTimeout> {
+    ) -> Result<bool, SendTimeout> {
         let trace = TraceContext::new_root();
         let mut span =
             self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
         span.events(batch.events.len() as u64);
         let ctx = self.stamp(trace.into());
         if self.consumers.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         // Until every slot is held, a timeout or a dropped future discards both unrecorded.
@@ -296,16 +304,23 @@ impl Fanout {
         };
         let (span, timer) = unsent.0.take().expect("taken only here, once every slot is held");
         let n = batch.events.len();
+        let mut taken = false;
         if permits.len() == 1 {
             match permits.into_iter().next().flatten() {
-                Some(permit) => permit.send(Delivered::Owned(batch, ctx)),
+                Some(permit) => {
+                    permit.send(Delivered::Owned(batch, ctx));
+                    taken = true;
+                }
                 None => self.record_dropped_on_close(n),
             }
         } else {
             let batch = Arc::new(batch);
             for permit in permits {
                 match permit {
-                    Some(permit) => permit.send(Delivered::Shared(batch.clone(), ctx)),
+                    Some(permit) => {
+                        permit.send(Delivered::Shared(batch.clone(), ctx));
+                        taken = true;
+                    }
                     None => self.record_dropped_on_close(n),
                 }
             }
@@ -313,99 +328,114 @@ impl Fanout {
         self.record_send(n);
         drop(timer);
         span.finish();
-        Ok(())
+        Ok(taken)
     }
 
     /// `logit_in`'s send: [`Fanout::send`] (a fresh root and a listener span), stamped with
     /// [`Fanout::stamp_relayed`]'s back-fill rule so a peer's relayed `origin`/`previous` survive.
     /// See `docs/design/wire-protocol.md`'s `logit_out`/`logit_in` section.
-    pub async fn send_relayed(&self, batch: EventBatch, provenance: Provenance) {
+    pub async fn send_relayed(&self, batch: EventBatch, provenance: Provenance) -> bool {
         let trace = TraceContext::new_root();
         let mut span =
             self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
         span.events(batch.events.len() as u64);
         let ctx = self.stamp_relayed(BatchContext { trace, provenance });
-        self.deliver(batch, ctx).await;
+        self.deliver(batch, ctx).await
     }
 
-    /// The per-consumer delivery loop, with `ctx` already stamped.
-    async fn deliver(&self, batch: EventBatch, ctx: BatchContext) {
-        let Some((last, rest)) = self.consumers.split_last() else { return };
+    /// The per-consumer delivery loop, with `ctx` already stamped. Returns whether any consumer
+    /// took the batch.
+    async fn deliver(&self, batch: EventBatch, ctx: BatchContext) -> bool {
+        let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
             if last.send(Delivered::Owned(batch, ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
+                return false;
             }
-            return;
+            return true;
         }
         let batch = Arc::new(batch);
+        let mut taken = false;
         for tx in rest {
             if tx.send(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
                 self.record_dropped_on_close(n);
+            } else {
+                taken = true;
             }
         }
         if last.send(Delivered::Shared(batch, ctx)).await.is_err() {
             self.record_dropped_on_close(n);
+        } else {
+            taken = true;
         }
         drop(timer);
+        taken
     }
 
     /// The `blocking_send` equivalent of [`Fanout::send`], for a node on a plain OS thread (a Lua
     /// node; `docs/design/pipeline-graph.md`'s "Thread model" section).
-    pub fn send_blocking(&self, batch: EventBatch) {
+    pub fn send_blocking(&self, batch: EventBatch) -> bool {
         let ctx = TraceContext::new_root();
         let mut span =
             self.telemetry.span("send", SpanKind::Producer, ctx.trace_id, ctx.span_id, None);
         span.events(batch.events.len() as u64);
-        self.send_blocking_with_own_context(batch, ctx.into());
+        self.send_blocking_with_own_context(batch, ctx.into())
     }
 
     /// The `blocking_send` equivalent of [`Fanout::send_with_context`].
-    pub fn send_blocking_with_context(&self, batch: EventBatch, parent: TraceContext) {
+    pub fn send_blocking_with_context(&self, batch: EventBatch, parent: TraceContext) -> bool {
         self.send_blocking_with_own_context(batch, parent.child().into())
     }
 
     /// The `blocking_send` equivalent of [`Fanout::send_with_own_context`], stamping included.
-    pub fn send_blocking_with_own_context(&self, batch: EventBatch, ctx: BatchContext) {
+    pub fn send_blocking_with_own_context(&self, batch: EventBatch, ctx: BatchContext) -> bool {
         let ctx = self.stamp(ctx);
-        self.deliver_blocking(batch, ctx);
+        self.deliver_blocking(batch, ctx)
     }
 
     /// The `blocking_send` equivalent of [`Fanout::send_relayed`]. No shipped component calls it
     /// (`logit_in` is a tokio task); it completes the blocking/async pairing.
-    pub fn send_relayed_blocking(&self, batch: EventBatch, provenance: Provenance) {
+    pub fn send_relayed_blocking(&self, batch: EventBatch, provenance: Provenance) -> bool {
         let trace = TraceContext::new_root();
         let mut span =
             self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
         span.events(batch.events.len() as u64);
         let ctx = self.stamp_relayed(BatchContext { trace, provenance });
-        self.deliver_blocking(batch, ctx);
+        self.deliver_blocking(batch, ctx)
     }
 
     /// The blocking twin of [`Fanout::deliver`].
-    fn deliver_blocking(&self, batch: EventBatch, ctx: BatchContext) {
-        let Some((last, rest)) = self.consumers.split_last() else { return };
+    fn deliver_blocking(&self, batch: EventBatch, ctx: BatchContext) -> bool {
+        let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
             if last.blocking_send(Delivered::Owned(batch, ctx)).is_err() {
                 self.record_dropped_on_close(n);
+                return false;
             }
-            return;
+            return true;
         }
         let batch = Arc::new(batch);
+        let mut taken = false;
         for tx in rest {
             if tx.blocking_send(Delivered::Shared(batch.clone(), ctx)).is_err() {
                 self.record_dropped_on_close(n);
+            } else {
+                taken = true;
             }
         }
         if last.blocking_send(Delivered::Shared(batch, ctx)).is_err() {
             self.record_dropped_on_close(n);
+        } else {
+            taken = true;
         }
         drop(timer);
+        taken
     }
 
     /// Counts one batch of `n` events, once rather than per consumer: a fan-out is still one
@@ -566,7 +596,7 @@ mod tests {
         drop(rx); // closed before the send below
         let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
 
-        fanout.send(batch(4)).await;
+        assert!(!fanout.send(batch(4)).await, "no consumer took the batch");
 
         let events = registry.drain(0);
         assert_eq!(
@@ -688,10 +718,67 @@ mod tests {
         drop(rx);
         let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
 
-        fanout.send_with_deadline(batch(4), in_ms(100)).await.expect("closed isn't a timeout");
+        let taken =
+            fanout.send_with_deadline(batch(4), in_ms(100)).await.expect("closed isn't a timeout");
 
+        assert!(!taken, "no consumer took the batch");
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.component.events.dropped"), Some(4.0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_with_one_of_two_consumers_closed_is_taken() {
+        let (tx_a, rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        drop(rx_a);
+        let fanout = Fanout::new(vec![tx_a, tx_b]);
+
+        let taken = fanout.send_with_deadline(batch(1), in_ms(100)).await.expect("room in b");
+
+        assert!(taken, "b took the batch");
+        rx_b.recv().await.expect("b should receive");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_with_deadline_to_no_consumers_is_not_taken() {
+        let fanout = Fanout::default();
+        assert_eq!(fanout.send_with_deadline(batch(1), in_ms(100)).await, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn a_send_with_one_of_two_consumers_closed_is_taken() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+        let (tx_a, rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        drop(rx_a);
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        assert!(fanout.send(batch(2)).await, "b took the batch");
+
+        rx_b.recv().await.expect("b should receive");
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn a_send_to_no_consumers_is_not_taken() {
+        assert!(!Fanout::default().send(batch(1)).await);
+    }
+
+    #[test]
+    fn a_blocking_send_is_taken_only_when_a_consumer_is_open() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert!(!Fanout::new(vec![tx]).send_blocking(batch(1)), "the one consumer is closed");
+
+        let (tx_a, rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        drop(rx_a);
+        assert!(Fanout::new(vec![tx_a, tx_b]).send_blocking(batch(1)), "b took the batch");
+        assert!(rx_b.try_recv().is_ok());
+
+        assert!(!Fanout::default().send_blocking(batch(1)), "no consumers");
     }
 
     /// A `send_with_deadline` dropped before its deadline, while it waits on a full second

@@ -171,8 +171,13 @@ When the pipeline doesn't take a request's first batch within 5 seconds, `splunk
 was taken, and HEC clients retry a code 9, so this defers delivery rather than losing it. A
 `/event` body that carries several envelopes decodes into one batch per envelope; once the first
 is delivered, the listener waits for the pipeline to take the rest, however long that is, and
-answers `200`, so a retry never repeats part of a body. Give the sinks behind `splunk_hec_in` a
-`buffer:` large enough to absorb a stall.
+answers `200`, so a retry never repeats part of a body. The exception is a pipeline whose consumers
+all close after the first batch was taken: the answer is then `500` code 8 with no `ackId`, and a
+retry repeats the batches already taken. The OTel `splunk_hec` exporter and `splunk_hec_out` treat
+a `500` as retryable. What the other recorded clients do with a `500` isn't verified in this repo,
+and a client that drops on a `500` loses that body's later batches. When every consumer has closed
+before the first batch, the answer is `503` code 9 with `Retry-After: 1`. Give the sinks behind
+`splunk_hec_in` a `buffer:` large enough to absorb a stall.
 
 The default posture of `splunk_hec_out` is `at_least_once`, so a `500`, a `408`, or a timeout is
 retried. Splunk indexes a resent event or span twice, and one batch can be several requests.

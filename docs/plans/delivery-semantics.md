@@ -78,8 +78,8 @@ default drops.
   status that doesn't carry code 9's "nothing taken" promise. Decide which.
 - `tail_in` and `docker_in` don't advance past lines no consumer took.
 - Open question: `docs/design/pipeline-graph.md`'s "Open question: a closed downstream" asks
-  whether a closed consumer should propagate as a shutdown signal. W3 answers the input's half.
-  Settle whether it answers the whole question before the PR.
+  whether a closed consumer should propagate as a shutdown signal. W3 answers the input's half
+  only; the rest stays open (answered in the ADR's "Amendment: W3 decisions (2026-09-30)").
 
 ### W4: the native hop's wire record
 
@@ -125,8 +125,10 @@ W6 can land in pieces with the workstream each piece describes.
 
 ## Open questions
 
-- **W3:** what `logit_in` writes for a batch no consumer took, and whether a closed consumer
-  propagates as a shutdown signal.
+- **W3 (answered):** `logit_in` writes `Reject{GOING_AWAY}` for a batch no consumer took, and a
+  closed consumer doesn't propagate as a shutdown signal: W3 answers the input's half only (ADR
+  `delivery-semantics`, "Amendment: W3 decisions (2026-09-30)"). `splunk_hec_in` answers `500`
+  code 8 for a later batch, in the same amendment.
 - **W4:** everything its list names.
 - **W1 (answered):** `stdio_out`'s module doc, in `crates/logit-outputs/src/stdio.rs`, now says
   that a write error is `Permanent` and never retried, that `file_out`'s failed re-open after a

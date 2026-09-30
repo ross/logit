@@ -141,6 +141,10 @@
 //! decision 11 derives defers the payload and a longer one loses it; the counter can't tell which,
 //! so treat a sustained rate as loss.
 //!
+//! A batch no consumer takes, because every consumer of the listener has closed, is answered the
+//! same `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`, in the body and both
+//! counters, as `datadog_in` does.
+//!
 //! # The Unix socket
 //!
 //! `socket:` binds a Unix stream socket, the Agent's `receiver_socket`
@@ -160,12 +164,14 @@
 //! # Telemetry
 //!
 //! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (class `ok`,
-//! `rejected`, or `busy`; route one of [`Route::name`], or `unknown`), `logit.input.request.duration`
-//! (timing, every exit), and `logit.input.request.bytes` (the compressed body size, once read).
-//! Rejections: `logit.input.requests.rejected{reason}`, reason `unknown_route`, `unsupported_route`
-//! (also tagged `route`), `method`, `oversize`, `encoding`, `json_traces`, `malformed_encoding`,
-//! `malformed`, `stalled`, or `body_read`. `logit.input.requests.acknowledged{route}` counts a
-//! stub's upload, `logit.input.batches.dropped{reason="busy"}` a batch a `503` left undelivered,
+//! `rejected`, `busy`, or `closed_consumer`; route one of [`Route::name`], or `unknown`),
+//! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the
+//! compressed body size, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
+//! `unknown_route`, `unsupported_route` (also tagged `route`), `method`, `oversize`, `encoding`,
+//! `json_traces`, `malformed_encoding`, `malformed`, `stalled`, or `body_read`.
+//! `logit.input.requests.acknowledged{route}` counts a stub's upload,
+//! `logit.input.batches.dropped{reason}` (`busy` or `closed_consumer`) a batch a `503` left
+//! undelivered,
 //! and `logit.input.spans` the spans delivered. The connection metrics are `otlp_in`'s, with one
 //! difference: the kernel accept-queue gauges (`crate::tcp::AcceptQueueSampler`) cover the TCP
 //! listener only, since they read `TCP_INFO`, which a Unix socket has no counterpart for.
@@ -174,6 +180,7 @@ use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
     media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
+    Undelivered,
 };
 use crate::Input;
 use bytes::Bytes;
@@ -699,7 +706,6 @@ async fn handle(
 
 const OK: &str = "ok";
 const REJECTED: &str = "rejected";
-const BUSY: &str = "busy";
 
 /// One APM receiver route: a row of this module's routes table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -931,23 +937,34 @@ async fn respond(
             }
             (name, OK, success)
         }
-        Err(not_sent) => {
+        Err(undelivered) => {
+            let reason = undelivered.reason();
             shared.telemetry.count(
                 "logit.input.batches.dropped",
-                not_sent as f64,
-                &[("reason", "busy")],
+                undelivered.count() as f64,
+                &[("reason", reason)],
             );
-            shared.diag.clone().warn_throttled(
-                "busy",
-                format_args!(
-                    "datadog_trace_in: answered 503 to {}: the pipeline did not accept a batch \
-                     within {:?}; a tracer retries a few times, then drops it",
-                    shared.peer, shared.busy_after
+            let mut diag = shared.diag.clone();
+            let _ = match undelivered {
+                Undelivered::Busy(_) => diag.warn_throttled(
+                    "busy",
+                    format_args!(
+                        "datadog_trace_in: answered 503 to {}: the pipeline did not accept a \
+                         batch within {:?}; a tracer retries a few times, then drops it",
+                        shared.peer, shared.busy_after
+                    ),
                 ),
-            );
-            let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, "busy");
+                Undelivered::Closed(_) => diag.warn_throttled(
+                    "closed_consumer",
+                    format_args!(
+                        "datadog_trace_in: answered 503 to {}: no consumer took the batch",
+                        shared.peer
+                    ),
+                ),
+            };
+            let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, reason);
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-            (name, BUSY, response)
+            (name, reason, response)
         }
     }
 }
@@ -1853,6 +1870,28 @@ mod tests {
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
         assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
         assert_eq!(events.sum("logit.input.spans", &[]), 1.0, "only the first");
+    }
+
+    /// A batch no consumer takes is answered as busy is, but counted `closed_consumer`.
+    #[tokio::test]
+    async fn a_request_no_consumer_takes_is_answered_503_and_counted_closed_consumer() {
+        let (registry, input) = metered();
+        let (addr, rx) = start(input, 16).await;
+        drop(rx);
+
+        let response = post_raw(&addr, "/v0.4/traces", MSGPACK, &v04(1)).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("retry-after: 1\r\n"), "{response}");
+        assert!(body_of(&response).contains("closed_consumer"), "{response}");
+
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(
+            events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
+        );
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
     }
 
     #[test]

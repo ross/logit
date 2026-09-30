@@ -116,6 +116,7 @@
 //! | a body, or its decompressed size, over [`MAX_REQUEST_BYTES`] | `413` |
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
 //! | Snappy, zstd, or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
+//! | a decoded write no consumer takes (every consumer of the listener has closed) | `503`, `text/plain` reason |
 //!
 //! **`zstd` is the VictoriaMetrics remote write protocol**: a 1.0 request compressed with zstd,
 //! which vmagent sends by default
@@ -282,13 +283,15 @@
 //! ## Counters
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
-//! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. An `ok` count also carries
-//! `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent stayed on zstd. `logit.input.write.duration`
-//! -- a timing sample per request, recorded regardless of outcome. `logit.input.samples` --
-//! reused from scrape mode, counting the wire samples that reached the `Fanout`: every decoded
-//! series' worth minus every series the model mapping then dropped, the number the `-Written`
-//! header reports. The same number on purpose: a counter and a header disagreeing about one
-//! request would be a puzzle with no right answer.
+//! `method`, `unsupported`, `oversize`, `timeout`, `bad_request`, or `closed_consumer`. An `ok`
+//! count also carries `encoding` (`snappy` or `zstd`), which is how to see whether a vmagent
+//! stayed on zstd. `logit.input.write.duration` -- a timing sample per request, recorded
+//! regardless of outcome. `logit.input.samples` -- reused from scrape mode, counting the wire
+//! samples of a write a consumer took: every decoded series' worth minus every series the model
+//! mapping then dropped, the number the `-Written` header reports. A counter and a header
+//! disagreeing about one request would be a puzzle with no right answer.
+//! `logit.input.batches.dropped{reason="closed_consumer"}` -- the write's batch when no consumer
+//! took it, answered `503`.
 //!
 //! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
 //! whenever the table changes (a transition, like `logit.input.connections`, not a per-request
@@ -1613,15 +1616,30 @@ async fn write_response(
     // Both sides walk the same `decoded.groups`, so this cannot underflow; `saturating_sub` only
     // so a bug there is not a panic.
     let written = total.saturating_sub(dropped);
-    telemetry.count("logit.input.samples", written as f64, &[]);
     if !events.is_empty() {
         // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
         // `204` and the sender's queue throttles, remote-write's own flow-control model.
         // On its own task, so a sender that disconnects mid-wait cancels only the wait, never
         // part of the fan-out (`crate::http::deliver_detached`).
-        crate::http::deliver_detached(sink, vec![EventBatch { resource, scope: None, events }])
-            .await;
+        let batch = vec![EventBatch { resource, scope: None, events }];
+        if let Err(undelivered) = crate::http::deliver_detached(sink, batch).await {
+            telemetry.count(
+                "logit.input.batches.dropped",
+                undelivered.count() as f64,
+                &[("reason", undelivered.reason())],
+            );
+            diag.warn_throttled(
+                "closed_consumer",
+                format_args!(
+                    "prometheus_in: refusing a write from {peer}: no consumer took the batch"
+                ),
+            );
+            let message = "no consumer took the batch";
+            let response = text_response(seen, StatusCode::SERVICE_UNAVAILABLE, message);
+            return ("closed_consumer", None, response);
+        }
     }
+    telemetry.count("logit.input.samples", written as f64, &[]);
     ("ok", Some(encoding), no_content(seen, written, decoded.exemplars))
 }
 
@@ -3219,6 +3237,43 @@ mod tests {
             Some(1.0),
             "the receiver reuses scrape mode's own samples counter"
         );
+    }
+
+    /// A write no consumer takes is refused so the sender retries it, and none of it is counted
+    /// as received samples.
+    #[tokio::test]
+    async fn a_write_no_consumer_takes_is_answered_503_and_counts_no_samples() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry);
+        let rx = spawn_receiver(receiver, 4);
+        drop(rx);
+        let body = request_body(
+            &[vec![gauge_family("queue_depth", ("job", "api"), 7.0, millis(1))]],
+            remote_write::Version::V1,
+        );
+
+        let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.writes", ("class", "closed_consumer")),
+            Some(1.0)
+        );
+        assert_eq!(
+            counter_in(&events, "logit.input.batches.dropped", ("reason", "closed_consumer")),
+            Some(1.0)
+        );
+        assert!(
+            matches!(
+                counter_in(&events, "logit.input.samples", ("component", "receive")),
+                None | Some(0.0)
+            ),
+            "a refused write counts no samples"
+        );
+        assert_eq!(counter_in(&events, "logit.input.writes", ("class", "ok")), None);
     }
 
     #[tokio::test]
