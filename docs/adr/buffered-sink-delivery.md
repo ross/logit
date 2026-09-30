@@ -332,3 +332,19 @@ never mutes, so a caller that never calls `observe_batch` counts every `send`. `
 `prometheus_out`'s remote-write mode, and `splunk_hec_out` are gated the same way. `datadog_out`
 and `datadog_trace_out` are gated per unit: `datadog_out`'s plan and each route, and
 `datadog_trace_out`'s trace and stats routes, with a bisection's re-encodes muted (decision 2).
+
+## Amendment: a project target, and posture by duplicate harm (2026-09-29)
+
+"Delivery posture is a per-sink policy, chosen in three layers" stands: the sink reports a fact,
+the runtime derives a default, and `buffer.delivery:` overrides it. [ADR
+`delivery-semantics`](delivery-semantics.md) changes two things around it.
+
+- **There is a target.** `logit` aims for at-least-once on every hop. This record rejected "a
+  single fixed delivery guarantee for every sink", and that still holds: posture stays per sink,
+  and the target says which way a default leans.
+- **The fact a sink reports becomes a class.** `Output::duplicate_safe() -> bool` is replaced by
+  what a duplicate does at the destination: overwrites the first copy, is stored as a second
+  record, or corrupts a value. Only the last defaults to `at_most_once` (its item 5).
+
+The `Fault` table is unchanged. `Output::duplicate_safe()` is what the code has until that
+record's plan lands the class.

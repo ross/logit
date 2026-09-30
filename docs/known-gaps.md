@@ -491,7 +491,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     (`logit.component.datagrams.dropped`, ADR `decoupled-listener-io`), and the per-socket kernel
     counters count drops before `logit` sees the datagram (`logit.input.kernel.drops`; see "No
     visibility into the kernel's own UDP receive-buffer drops" under [UDP intake](#udp-intake)).
-    What remains is the delivery side past the first hop.
+    What remains is the delivery side past the first hop. [ADR
+    `delivery-semantics`](adr/delivery-semantics.md), item 3, makes end-to-end acknowledgment a
+    non-goal: an input's acknowledgment means accepted into the pipeline, and this entry stays
+    as the statement of that limit.
   - **No out-of-order/credit-based acknowledgement.** `SinkQueue` is deliberately in-order and
     single-in-flight (one queue, one writer, `peek`-then-`commit`-the-head only) until credit-based
     flow control lands; see the "Credit-based flow control" item of the native wire protocol entry
@@ -520,7 +523,43 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a cut inside the ack wait, after the frame landed, is truly ambiguous.
   `docs/design/pipeline-graph.md`'s "Cancellation points" table has the row. To keep such a
   batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
-  at the read cursor.
+  at the read cursor. [ADR `delivery-semantics`](adr/delivery-semantics.md), item 5, makes
+  `at_least_once` `logit_out`'s default, which leaves the batch queued.
+
+- **Sink default postures don't follow [ADR `delivery-semantics`](adr/delivery-semantics.md)
+  yet.** The record's item 5 derives a sink's default posture from what a duplicate does at its
+  destination, and only `statsd_out` and `collectd_out` default to `at_most_once`. The code
+  derives it from `Output::duplicate_safe()`, so `otlp_out`, `splunk_hec_out`, `datadog_out`,
+  `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`, and `logit_out` default to
+  `at_most_once` and drop a batch on an `Ambiguous` fault. Until the class lands
+  ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
+  `buffer.delivery: at_least_once` on a sink that should resend.
+
+- **The native hop has no sender identity and no deduplication.** [ADR
+  `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
+  `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
+  on a reconnect, and `logit_in` forwards every frame it receives. Under `at_least_once` a
+  resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach `logit_in`'s
+  consumers twice. The wire layout needs its own record first (the plan's W4 and W5).
+
+- **`logit_in` acknowledges a batch no consumer took.** `Fanout` skips a closed consumer, counts
+  `logit.component.events.dropped{reason="closed_consumer"}`, and tells its caller nothing, so
+  `logit_in` writes its `Ack` and `logit_out` commits a batch nothing kept. `otlp_in`,
+  `datadog_in`, `datadog_trace_in`, and `splunk_hec_in` answer success the same way, and
+  `prometheus_in`'s remote-write receiver has its own entry under Prometheus. It happens when the downstream half
+  of the graph is already torn down, which is a shutdown. [ADR
+  `delivery-semantics`](adr/delivery-semantics.md), item 3, says an input doesn't acknowledge
+  such a batch (the plan's W3).
+
+- **A disk-backed sink replays delivered and dropped batches after a crash, under either
+  posture.** `commit` moves the read cursor in memory, and the cursor reaches disk every
+  `checkpoint_interval` (1 s by default). After a crash the spool replays the batch in flight
+  and every batch committed since the last cursor write, counted
+  `logit.component.buffer.disk.replayed`. Under `at_most_once` that includes a batch the sink
+  dropped as `Ambiguous` to avoid a duplicate. It isn't a gap to close: [ADR
+  `delivery-semantics`](adr/delivery-semantics.md), item 8, keeps the combination valid and
+  states the window. A `statsd_out` or `collectd_out` with `buffer.disk:` can replay up to
+  `checkpoint_interval` of counters after a crash.
 
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one
@@ -1332,7 +1371,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     measured) twice.
   - **Fix:** `splunk_hec_out`'s rule: once a request of the `send` is accepted, a later
     transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
-    `after_delivery`).
+    `after_delivery`). [ADR `delivery-semantics`](adr/delivery-semantics.md), item 9, decides
+    this for `datadog_out`, `datadog_trace_out`, and `otlp_out`; the plan's W2 builds it.
 - **`datadog_trace_out` reports a connect failure `Clean` after an earlier request of the same
   batch was accepted.** One `send` is the trace requests, then the stats request, and a batch of
   more than 1,000 traces is several trace requests. Both transports make a connect failure
@@ -1936,7 +1976,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   "No end-to-end acknowledgement" under
   [Native wire format, `logit_in`/`logit_out`, and buffering](#native-wire-format-logit_inlogit_out-and-buffering).
   Narrow in practice (shutdown is per-connection and the window is the drain); closes when that open
-  question does.
+  question does. [ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, decides the
+  input's half: no acknowledgment for a batch no consumer took.
 
 - **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
   VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with

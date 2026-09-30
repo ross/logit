@@ -789,6 +789,16 @@ not a style preference:
   0–6 attributes, parsed structured logs at 9 and up, spans across both), so a number that is right
   for one leg is wrong for another. Reach for it before picking a "representative" shape, and mind
   its own §7: none of it is production traffic.
+- **Delivery targets at-least-once per hop.** Between losing a batch and delivering it twice,
+  `logit` delivers it twice, and a sink's default posture follows what a duplicate does at its
+  destination: only a sink where a duplicate corrupts a value (`statsd_out`, `collectd_out`)
+  defaults to `at_most_once`. An input's acknowledgment means the batch is in every downstream
+  inbox, never that a sink delivered it, and the `logit_out` to `logit_in` hop targets
+  effectively-once through a sender identity and a sequence that outlives a connection.
+  "Lossless" means field fidelity, never delivery. The code doesn't do all of this yet
+  ([`docs/plans/delivery-semantics.md`](docs/plans/delivery-semantics.md)), so check
+  [ADR `delivery-semantics`](docs/adr/delivery-semantics.md) before changing a sink's posture, a
+  fault class, or what an input acknowledges.
 - **The threat model is accidental data, not a malicious peer.** A listener, decoder, or transform
   must survive a misconfigured sender, a wedged peer, or a corrupt file; a problem only crafted
   input can trigger is defended only when the defense is free (a branch, a counter, a timeout

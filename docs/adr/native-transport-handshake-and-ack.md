@@ -246,3 +246,18 @@ and `reject_write_stalled` for any `Reject` (the write is abandoned and the conn
   (4096 bytes), not the 64 MiB data-frame cap, and `logit_in` bounds a `Hello` the same way.
 - **`requests`.** `logit.output.requests` counts every returned attempt, including connect,
   handshake, and too-large returns, tagged `class=ok|clean|ambiguous|permanent`.
+
+## Amendment: the native hop's target is effectively-once (2026-09-29)
+
+[ADR `delivery-semantics`](delivery-semantics.md), item 7, sets requirements this record's wire
+doesn't meet: a sender identity that outlives a connection, a sequence assigned when a batch
+enters the sink's store and persisted by a disk spool, and a bounded window in which `logit_in`
+recognizes a resend and doesn't forward it.
+
+"Sequence numbers are implicit" and the rejected alternative "An explicit `seq` field on every
+data frame" describe the wire as built. A follow-up record decides the new layout and supersedes
+both. Until it lands, `Ack.seq` counts frames on one connection and restarts on a reconnect, and
+`logit_in` forwards a resend.
+
+"Ack point" is unchanged, and that record's item 3 adds that `logit_in` doesn't acknowledge a
+batch no consumer took.
