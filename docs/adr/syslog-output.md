@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -303,3 +303,7 @@ connect failures. A TLS server name is parsed at construction, so a bad endpoint
 instead of retrying to budget exhaustion. Under TLS a write `Err` may follow a record that
 reached the wire, so it is `Ambiguous`. `syslog_out`'s UDP path still sends one datagram per
 message and uses the shared errno helper for an oversize datagram.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `syslog_out` now defaults to `at_least_once` on both transports: an `Ambiguous` fault (a timeout, or a write that fails after part of a batch left) is retried for up to `buffer.retry_budget`, and a resend can repeat a log line at the receiver. `buffer.delivery: at_most_once` restores the conservative posture this ADR chose. The reasoning above about a duplicated log line still holds; the decision to accept it by default changed. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

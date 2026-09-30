@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -458,3 +458,7 @@ and its UDP packing onto the packer `statsd_out` shares. `graphite_out` gains th
 each write and `logit.output.reconnects`, and its `logit.output.requests` is tagged
 `class=ok|clean|ambiguous|permanent`. The pickle and plaintext encoders, and `duplicate_safe`, are
 unchanged.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `graphite_out` keeps the posture the "Duplicate safety" section argues for, now through the runtime default rather than a `true` from `duplicate_safe()`. The Whisper argument and its boundary for a non-Whisper receiver are unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

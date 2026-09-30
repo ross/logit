@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -760,3 +760,7 @@ datagram transport. It also changes three behaviors: `logit.output.requests` is 
 what reached the kernel before a failure, and a TLS server name is parsed at construction, so a
 bad endpoint fails startup. A TLS write `Err` is `Ambiguous`. Over UDP, `max_packet_bytes` is at
 most 65507, the largest UDP payload, and an IPv6 endpoint is sent to over an IPv6 socket.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone. The posture this ADR chose is unchanged: `statsd_out` is the one sink that defaults to `at_most_once`, and it now declares that through `Output::default_posture()` instead of a `false` from `duplicate_safe()`. Every other sink defaults to `at_least_once`. The reasoning above (a resent `hits:5|c` increments the counter a second time) is the reason for the exception. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

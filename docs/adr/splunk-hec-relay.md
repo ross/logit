@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-26
+updated: 2026-09-30
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -522,3 +522,7 @@ of the choices. By decision:
   answered `503` code 9, less than 5 s ago, a fixed window rather than a config field. A later
   request whose data the pipeline takes clears it. It still checks no token. Neither run provoked
   code 18, so its text is still a reading of Splunk's documentation.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `splunk_hec_out` now retries an `Ambiguous` fault (a `500`, a `408`, a timeout, an ack timeout) for up to `buffer.retry_budget` by default, where it dropped the batch, and Splunk indexes a resent event twice. `buffer.delivery: at_most_once` restores the drop. The statements above about a `false` `duplicate_safe()` and a default at-most-once posture describe the earlier default. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

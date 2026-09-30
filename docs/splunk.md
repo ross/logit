@@ -174,9 +174,10 @@ is delivered, the listener waits for the pipeline to take the rest, however long
 answers `200`, so a retry never repeats part of a body. Give the sinks behind `splunk_hec_in` a
 `buffer:` large enough to absorb a stall.
 
-`splunk_hec_out` isn't duplicate-safe either: Splunk indexes a resent event twice, and one batch
-can be several requests. The default posture is at-most-once, so a `500`, a `408`, or a timeout
-drops the batch; `buffer: {delivery: at_least_once}` retries it and accepts duplicates. A busy
+The default posture of `splunk_hec_out` is `at_least_once`, so a `500`, a `408`, or a timeout is
+retried. Splunk indexes a resent event or span twice, and one batch can be several requests.
+Whether a metrics index adds a resent running total or stores it as a second point is unmeasured.
+`buffer: {delivery: at_most_once}` drops the batch instead of risking those duplicates. A busy
 Splunk is the exception: a `429`, or a `503` code 9, says Splunk didn't take the body, so while
 no body of the batch has been accepted the sink retries the batch under either posture, on the
 runtime's backoff. It ignores a `Retry-After` header. The same answer after an earlier body of the

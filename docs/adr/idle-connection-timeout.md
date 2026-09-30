@@ -1,6 +1,6 @@
 ---
 created: 2026-09-14
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe
@@ -347,3 +347,7 @@ behavior doesn't change. It still polls once, never wraps a read in a `timeout`,
 connection on EOF or unsolicited bytes. The one-poll shape stays because the probe must not
 wait. [ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md) pins the session's behavior with tests and makes a tokio-rustls bump a re-verification
 trigger.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `logit_out` now defaults to `at_least_once`. The ambiguous `logit_out` fault this ADR describes is retried for up to `buffer.retry_budget` by default instead of dropped, and until the native hop deduplicates a resend can reach `logit_in`'s consumers twice. `buffer.delivery: at_most_once` restores the drop. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

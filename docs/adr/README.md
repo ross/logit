@@ -22,10 +22,10 @@ the same date, write the record, then add a row here.
 | [Deployment threat model: accidental data inside a trust boundary, not a malicious peer](deployment-threat-model.md) | 2026-09-25 | 2026-09-25 |
 | [Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach](untrusted-input-bounds.md) | 2026-09-25 | 2026-09-25 |
 | [Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test](out-of-ci-fuzzing.md) | 2026-09-25 | 2026-09-25 |
-| [Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment](splunk-hec-relay.md) | 2026-09-25 | 2026-09-26 |
+| [Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment](splunk-hec-relay.md) | 2026-09-25 | 2026-09-30 |
 | [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-09-24 |
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
-| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-09-24 |
+| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-09-30 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-09-22 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-09-22 |
 | [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
@@ -35,15 +35,15 @@ the same date, write the record, then add a row here.
 | [`shape`: an observer component that turns each event into measurements of its own shape](shape-observer-component.md) | 2026-09-20 | 2026-09-20 |
 | [A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot](disposable-azure-perf-vm.md) | 2026-09-18 | 2026-09-18 |
 | [UDP intake batching and socket visibility](udp-intake-batching-and-socket-visibility.md) | 2026-09-18 | 2026-09-26 |
-| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-24 |
+| [Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-30 |
 | [`docker_in`: live container identity, and a minimal `inotify` watch set](docker-container-identity-and-minimal-watches.md) | 2026-09-17 | 2026-09-17 |
 | [`Transform::process` transforms in place: `&mut Event -> bool`, not `Event -> Option<Event>`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
 | [`keep_values`: an attribute-value allowlist, and an optional normalize-before-compare step](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-09-15 |
 | [A Lua `flush()` runs in a root context, not the last batch's](lua-flush-root-context.md) | 2026-09-15 | 2026-09-15 |
 | [`Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits](lua-event-constructor.md) | 2026-09-15 | 2026-09-26 |
-| [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-09-25 |
+| [Idle-connection timeouts on TCP listeners: an opt-in `idle_timeout`, a next-byte deadline, and a client-side pooled-connection probe](idle-connection-timeout.md) | 2026-09-14 | 2026-09-30 |
 | [`syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS](syslog-tcp-ingress-and-tls.md) | 2026-09-13 | 2026-09-14 |
-| [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-14 |
+| [Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-30 |
 | [`target` components: named destinations a router directs events into, beside `sources:`](target-components.md) | 2026-09-13 | 2026-09-13 |
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-09-18 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-09-13 |
@@ -52,7 +52,7 @@ the same date, write the record, then add a row here.
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-09-12 |
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-09-11 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
-| [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-09-29 |
+| [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-09-30 |
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-09-25 |
 | [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-09-23 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-09-10 |
@@ -78,7 +78,7 @@ the same date, write the record, then add a row here.
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-09-15 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-09-25 |
 | [Signal filtering is two transform components, not a sink field](signal-filtering-components.md) | 2026-09-03 | 2026-09-03 |
-| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-09-29 |
+| [Syslog egress: format, transport, and header-field precedence](syslog-output.md) | 2026-09-02 | 2026-09-30 |
 | [Decoupled listener I/O](decoupled-listener-io.md) | 2026-09-02 | 2026-09-26 |
 | [Relative gauge adjustments (`+`/`-` in statsd)](relative-gauge-adjustments.md) | 2026-09-02 | 2026-09-26 |
 | [Committed, pre-generated OTLP protobuf types; no `protoc` in any build path](committed-pregenerated-otlp-protobuf.md) | 2026-09-02 | 2026-09-11 |

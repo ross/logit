@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-09-24
+updated: 2026-09-30
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -299,3 +299,7 @@ ones that bear on these decisions:
 The survey facts about Datadog's backend (sketches and traces from a sender that isn't an Agent,
 zlib on distribution points, size limits, dedupe, URL classification for v3 series) are the
 trial-org run's; Consequences and decision 14 have what it settled.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `datadog_out` and `datadog_trace_out` now retry an `Ambiguous` fault for up to `buffer.retry_budget` by default, and a resend adds to the kinds Datadog aggregates (distribution points, sketches, APM stats) with no upstream remedy. The statements above that `duplicate_safe()` is `false` describe the earlier default; `buffer.delivery: at_most_once` restores it. See [`delivery-semantics.md`](delivery-semantics.md) item 5.

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Enabling plan: delivery semantics — at-least-once per hop, and an effectively-once native hop
@@ -128,9 +128,9 @@ W6 can land in pieces with the workstream each piece describes.
 - **W3:** what `logit_in` writes for a batch no consumer took, and whether a closed consumer
   propagates as a shutdown signal.
 - **W4:** everything its list names.
-- **W1:** what `stdio_out`'s and `file_out`'s posture docs say. Their write errors carry no
-  `Fault`, so they're `Permanent` and never retried, and `file_out`'s failed re-open after a
-  rotation is `Clean`, which retries under both postures. The one case posture decides is a
-  write the shutdown grace cuts off, which is `Ambiguous`: under `at_least_once` a
-  `buffer.disk:` spool replays it after the restart, which can repeat a block in the file, and
-  under `at_most_once` it's dropped and counted `shutdown`.
+- **W1 (answered):** `stdio_out`'s module doc, in `crates/logit-outputs/src/stdio.rs`, now says
+  that a write error is `Permanent` and never retried, that `file_out`'s failed re-open after a
+  rotation is `Clean` and retries under both postures, and that posture decides only a write the
+  shutdown grace cuts off: under `at_least_once` it stays queued and a `buffer.disk:` spool
+  replays it (the file can repeat a block), and under `at_most_once` it's dropped and counted
+  `reason="shutdown"`.

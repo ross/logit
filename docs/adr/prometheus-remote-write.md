@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-24
+updated: 2026-09-30
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -548,3 +548,7 @@ statements above change:
   Snappy's `decompress_len` is not.
 
 `ruzstd`, pure Rust, is the implementation; the trade-off is recorded in that ADR.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` and `DeliveryPosture::from_duplicate_safe` are gone. `at_least_once` is now every sink's default posture, so `prometheus_out` keeps the posture this section argues for through the runtime default rather than through a `true` from `duplicate_safe()`. The argument that a replayed request is an idempotent overwrite is unchanged. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
