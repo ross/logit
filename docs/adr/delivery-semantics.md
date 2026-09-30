@@ -77,6 +77,8 @@ The target covers the hop, not the process. These losses stay permitted, and ite
 one a running process can count:
 
 - a batch whose `buffer.retry_budget` ran out, or whose fault is `Permanent`;
+- a batch dropped on an `Ambiguous` fault under `at_most_once`, where `statsd_out`'s default
+  or an operator's `buffer.delivery:` chose that over a duplicate (item 5);
 - a batch a `drop_oldest` or `drop_newest` overflow policy evicted;
 - a batch in a memory queue when the shutdown grace ran out;
 - everything in memory when the process dies: channels, memory sink queues, receive queues,
@@ -150,8 +152,10 @@ the hook:
   carries a per-interval value, so its series route skips a cumulative `Sum`, and a resent
   series point was measured to overwrite at its `(series, timestamp)`. No `aggregate` mode
   makes a `Distribution`, `Samples`, or `Set` cumulative; each window's summary is
-  self-contained. So a Datadog distribution point or sketch, and the APM stats `datadog_out`
-  and `datadog_trace_out` relay, have no upstream remedy today, and each is assumed to add on
+  self-contained. An `ExponentialHistogram` and a `Summary` pass through `aggregate`
+  unchanged, so a delta `ExponentialHistogram` leaves `otlp_out` delta. So a Datadog
+  distribution point or sketch, the APM stats `datadog_out` and `datadog_trace_out` relay, and
+  a delta `ExponentialHistogram` have no upstream remedy today, and each is assumed to add on
   a resend until measured. Whether a Splunk metrics index adds a resent running total or
   stores it as a second point is unmeasured too. An operator who sends such a kind accepts
   the double count, as every surveyed sender does, or sets `buffer.delivery: at_most_once` on
@@ -332,8 +336,9 @@ an entry in [`docs/known-gaps.md`](../known-gaps.md).
   operator doc says which kinds, and where `aggregate`'s `temporality: cumulative` is a remedy
   (a delta `Sum` or `Histogram` at `otlp_out` and `splunk_hec_out`; a delta `Sum` at
   `collectd_out`) and where none exists (`datadog_out`'s distribution points and sketches,
-  the APM stats `datadog_out` and `datadog_trace_out` relay, and a `Distribution`, `Samples`,
-  or `Set` at any receiver that aggregates it rather than storing a timestamped point).
+  the APM stats `datadog_out` and `datadog_trace_out` relay, a delta `ExponentialHistogram`,
+  and a `Distribution`, `Samples`, or `Set` at any receiver that aggregates it rather than
+  storing a timestamped point).
 - `otlp_out`, `datadog_out`, and `datadog_trace_out` gain `splunk_hec_out`'s rule.
 - `logit_in`, `prometheus_in`'s remote-write receiver, and the other HTTP listeners need to
   learn from `Fanout` that no consumer took a batch.
