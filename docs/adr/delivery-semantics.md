@@ -142,13 +142,16 @@ the hook:
 - A kind the receiver aggregates rather than overwrites adds a resend to its total. Where the
   kind is a delta `Sum` or a delta `Histogram`, the remedy is upstream of the sink, not in its
   posture: an `aggregate` with `temporality: cumulative` turns it into a running total that a
-  resend repeats rather than adds. `otlp_out`, `prometheus_out`, and `splunk_hec_out` carry
-  both forms, and `collectd_out` carries the `Sum` (as `COUNTER`) and drops every `Histogram`.
-  `datadog_out` doesn't: its series route skips a cumulative `Sum`, because a resent series
-  point was measured to overwrite at its `(series, timestamp)`. No `aggregate` mode changes a
-  `Distribution`, `Samples`, or `Set`; each window's summary is self-contained. So a Datadog
-  distribution point, sketch, or APM stats payload has no upstream remedy today, and is
-  assumed to add on a resend until measured. Whether a Splunk metrics index adds a resent
+  resend repeats rather than adds. `otlp_out` carries both forms, `splunk_hec_out` carries the
+  `Sum` and, under `multi_value: expand`, the `Histogram`, and `collectd_out` carries the `Sum`
+  (as `COUNTER`) and drops every `Histogram`. `prometheus_out` needs no remedy: it skips a delta
+  outright, so cumulative mode decides whether the metric goes out at all, and what goes out
+  overwrites. `datadog_out` has no remedy and needs none for its `Sum`: a Datadog `count`
+  carries a per-interval value, so its series route skips a cumulative `Sum`, and a resent
+  series point was measured to overwrite at its `(series, timestamp)`. No `aggregate` mode
+  changes a `Distribution`, `Samples`, or `Set`; each window's summary is self-contained. So a
+  Datadog distribution point, sketch, or APM stats payload has no upstream remedy today, and
+  is assumed to add on a resend until measured. Whether a Splunk metrics index adds a resent
   running total or stores it as a second point is unmeasured too. An operator who sends such
   a kind accepts the double count, as every surveyed sender does, or sets
   `buffer.delivery: at_most_once` on that sink.
@@ -324,8 +327,8 @@ an entry in [`docs/known-gaps.md`](../known-gaps.md).
   head for that long, and its `overflow` policy decides what happens behind it.
 - A resend to a destination that aggregates the kind it carries double-counts. Each sink's
   operator doc says which kinds, and where `aggregate`'s `temporality: cumulative` is a remedy
-  (a delta `Sum` or `Histogram` at `otlp_out`, `prometheus_out`, and `splunk_hec_out`; a
-  delta `Sum` at `collectd_out`) and where none exists (`datadog_out`'s distribution points,
+  (a delta `Sum` or `Histogram` at `otlp_out` and `splunk_hec_out`; a delta `Sum` at
+  `collectd_out`) and where none exists (`datadog_out`'s distribution points,
   sketches, and APM stats; every sink's `Distribution`, `Samples`, and `Set`).
 - `otlp_out`, `datadog_out`, and `datadog_trace_out` gain `splunk_hec_out`'s rule.
 - `logit_in`, `prometheus_in`'s remote-write receiver, and the other HTTP listeners need to

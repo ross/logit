@@ -19,7 +19,8 @@ Make the code do what [ADR `delivery-semantics`](../adr/delivery-semantics.md) d
 
 ## Workstreams
 
-Each is one PR. W1 lands before W2 and W5, and W4 before W5. The rest are independent.
+Each is one PR. W1 lands before W2 and W5, and W4 before W5. W6 lands in pieces, each with
+the workstream it describes. W3 is independent.
 
 | WS | Change | ADR item |
 |---|---|---|
@@ -39,8 +40,8 @@ Each is one PR. W1 lands before W2 and W5, and W4 before W5. The rest are indepe
 - Rewrite every sink's posture doc in `crates/logit-outputs/src/` to say what a resend does at
   its destination, which kinds the destination aggregates, and the `aggregate`
   `temporality: cumulative` remedy where one applies (a delta `Sum` or `Histogram` at
-  `otlp_out`, `prometheus_out`, and `splunk_hec_out`; a delta `Sum` at `collectd_out`).
-  `datadog_out`'s doc
+  `otlp_out` and `splunk_hec_out`; a delta `Sum` at `collectd_out`). `prometheus_out`'s doc
+  says it skips a delta, so a resend has nothing to add. `datadog_out`'s doc
   says the remedy doesn't apply to it: its series route skips a cumulative `Sum`, and its
   sketches and APM stats have no remedy.
 - `logit_out` defaults to `at_least_once` here, before W5 can deduplicate. Between W1 and W5 a
