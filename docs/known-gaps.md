@@ -525,6 +525,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
   at the read cursor.
 
+- ~~**Sink default postures don't follow [ADR `delivery-semantics`](adr/delivery-semantics.md) yet.**~~ **Closed 2026-09-30:** every sink defaults to `at_least_once` through `Output::default_posture`, `statsd_out` declaring `at_most_once` (ADR `delivery-semantics`, item 5).
+
+  The record's item 5 makes `at_least_once` every sink's default but `statsd_out`'s.
+  The code derives the default from `Output::duplicate_safe()`, so `otlp_out`,
+  `splunk_hec_out`, `datadog_out`, `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`,
+  `collectd_out`, and `logit_out` default to `at_most_once` and drop a batch on an `Ambiguous`
+  fault. Until the new default lands
+  ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
+  `buffer.delivery: at_least_once` on a sink that should resend.
+
 - **The native hop has no sender identity and no deduplication.** [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
   `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
