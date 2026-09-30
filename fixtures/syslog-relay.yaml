@@ -61,7 +61,7 @@ components:
     #   max_batches: 1024
     #   max_bytes: 64MiB
     #   overflow: block
-    #   delivery: null             # null derives from duplicate_safe(): false for syslog_out, so at_most_once
+    #   delivery: null             # null is at_least_once here: a resent message is a second line
     #   retry_budget: 60s
     #   retry_max_delay: 10s
     #   shutdown_grace: 5s

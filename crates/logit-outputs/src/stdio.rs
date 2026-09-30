@@ -13,6 +13,14 @@
 //! the target. [`StreamEncoder`] picks `EventDump` or `logit_proto::native::NativeEncoder`
 //! (`format: native`, `docs/adr/file-output-native-format.md`); `Target`/`FileTarget` never see
 //! which.
+//!
+//! **Delivery posture**, for `stdio_out` and `file_out` alike. A write error carries no `Fault`,
+//! so it classifies `Permanent` and is never retried; a failed re-open after rotation is `Clean`
+//! and is retried under both postures (`FileTarget::rotate`). The one case the posture decides is
+//! a write the shutdown grace cuts off, which is `Ambiguous`: under the default, `at_least_once`
+//! (`docs/adr/delivery-semantics.md`, item 5), the batch stays queued, so a `buffer.disk:` spool
+//! replays it after a restart and the file can repeat its block; under `at_most_once` it's
+//! dropped and counted `reason="shutdown"`.
 
 use crate::file::{FileTarget, RotateOutcome, RotatePolicy};
 pub use crate::human::{EventDump, Format, MessageMode};

@@ -76,5 +76,5 @@ components:
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
     #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
-    #          `delivery:` derives from duplicate_safe(), which is true here: whisper is
-    #          last-write-wins per (path, second), so a redelivered datapoint overwrites itself)
+    #          `delivery:` defaults to at_least_once: whisper is last-write-wins per
+    #          (path, second), so a resent datapoint overwrites itself)

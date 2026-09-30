@@ -48,8 +48,8 @@ components:
     #   max_batches: 1024
     #   max_bytes: 64MiB
     #   overflow: block
-    #   delivery: null             # null derives from duplicate_safe(); logit_out is false, so
-    #                                 at_most_once
+    #   delivery: null             # null is at_least_once here: a resend after a lost ack reaches
+    #                                 the far side twice; at_most_once drops the batch instead
     #   retry_budget: 60s
     #   retry_max_delay: 10s
     #   shutdown_grace: 5s

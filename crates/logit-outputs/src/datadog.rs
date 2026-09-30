@@ -156,13 +156,15 @@
 //!
 //! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
-//! [`DatadogOutput::duplicate_safe`] is **`false`**: a batch spans several requests, so a retry
-//! re-sends the ones that succeeded. A trial org was sent two resends: a resent series point was
-//! stored once, the last write winning at its `(series, timestamp)`, and an identical log was
-//! stored twice. Every other route (distribution points, sketches, events, checks, traces, stats)
-//! is assumed to store a resend again until measured. So the default posture is at-most-once, and
-//! a 5xx drops the batch; `buffer: { delivery: at_least_once }` retries and accepts those
-//! duplicates instead.
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and a batch spans several requests, so a retry re-sends the
+//! ones that succeeded. A trial org was sent two resends: a resent series point was stored once,
+//! the last write winning at its `(series, timestamp)`, and an identical log was stored twice.
+//! The upstream `aggregate` `temporality: cumulative` remedy doesn't apply here: the series route
+//! skips a cumulative `Sum`, since a Datadog `count` carries a per-interval value. Distribution
+//! points, sketches, and APM stats have no remedy and are assumed to add on a resend, and events,
+//! checks, and traces to be stored again, until measured. `buffer.delivery: at_most_once` drops
+//! the batch instead.
 //!
 //! ## Telemetry
 //!
@@ -942,11 +944,6 @@ impl Output for DatadogOutput {
         let now = self.batch_now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
     }
-
-    /// `false`: the module doc's "Faults, retries, and duplicate safety" says why.
-    fn duplicate_safe(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
@@ -1601,11 +1598,6 @@ mod tests {
         assert_eq!(captured.header("dd-api-key"), Some(KEY));
         assert_eq!(captured.header("user-agent"), Some(USER_AGENT));
         assert_eq!(captured.headers.get_all("dd-api-key").iter().count(), 1);
-    }
-
-    #[test]
-    fn datadog_output_is_not_duplicate_safe() {
-        assert!(!DatadogOutput::new(KEY).unwrap().duplicate_safe());
     }
 
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decisions 2 and 3) --

@@ -61,5 +61,6 @@ components:
     # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
     #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
-    #          `delivery:` derives from duplicate_safe(), which is false here: a redelivered list
-    #          double-counts every COUNTER/DERIVE/ABSOLUTE it carries)
+    #          `delivery:` defaults to at_least_once: a resent ABSOLUTE value adds at the
+    #          receiver, so put an `aggregate` with `temporality: cumulative` upstream, or set
+    #          at_most_once to drop instead)

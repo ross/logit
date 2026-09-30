@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Buffered, decoupled sink delivery
@@ -86,6 +86,9 @@ dropping policies.
 
 ### Delivery posture is a per-sink policy, chosen in three layers
 
+[Superseded in part by "Amendment: a project target, and `at_least_once` as the default": the sink
+no longer reports `duplicate_safe`, and the runtime's default is `at_least_once`.]
+
 Observability data is usually fine best-effort; audit-shaped logging is not. Rather than pick one
 guarantee for every sink, the mechanism is always at-least-once-capable (the `peek`/`commit` shape
 above), and whether a given sink *uses* that is a policy decision made in three layers, each owning
@@ -113,7 +116,8 @@ std::error::Error` whose *concrete* type is anyhow's own internal context-wrappe
 itself, so the standard `dyn Error::downcast_ref` never matches. `anyhow::Error::downcast_ref` is a
 different, anyhow-specific inherent method that knows how to look inside its own context wrapper,
 including through further `.context(...)` layers stacked on top later) rather than a signature
-change — `StdioOutput` needs no changes beyond its default `duplicate_safe() -> false`:
+change — `StdioOutput` needs no changes beyond its default `duplicate_safe() -> false`
+[superseded by the amendment; `duplicate_safe` is gone]:
 
 ```rust
 pub enum Fault { Clean, Ambiguous, Permanent }
@@ -274,9 +278,11 @@ about what `Event` costs to move, not about bounding a queue's rough footprint.
 - `crates/logit-pipeline/src/output.rs`: `Output` gains `flush` (default no-op) and
   `duplicate_safe` (default `false`); doc comment rewritten — buffering is now the runtime's
   responsibility, not the output's, though a sink still owns fault classification and its
-  duplicate-safety fact.
+  duplicate-safety fact. [Superseded by the amendment: `duplicate_safe` became
+  `default_posture`.]
 - `crates/logit-outputs/src/influxdb.rs`: loses its retry loop and `RetryPolicy`/`with_retry`
   builder, keeps and reuses its classification helpers; gains `duplicate_safe() -> true`.
+  [Superseded by the amendment: it keeps the default posture.]
 - `crates/logit-config`: new `BufferConfig`/`OverflowPolicy`/`DeliveryPosture`, hoisted onto
   `Component`; `schema/logit.schema.json` regenerated.
 - Measured cost: one `Arc::new` per batch on the previously-zero-allocation `Delivered::Owned`
@@ -346,5 +352,6 @@ is a per-sink policy, chosen in three layers".
   receiver absorb the duplicate (its item 5). `statsd_out` declares `at_most_once` as its own
   default, because a statsd line has no timestamp for a resend to overwrite at.
 
-The `Fault` table is unchanged. `Output::duplicate_safe()` is what the code has until that
-record's plan lands the new default.
+The `Fault` table is unchanged. The code has `Output::default_posture()`, whose trait default is
+`at_least_once` and which `statsd_out` overrides; `buffer.delivery:` overrides either per
+component.

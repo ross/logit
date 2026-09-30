@@ -60,12 +60,14 @@
 //! after the first), and the `oversize_datagram` drop above. On UDP the sent counts include what
 //! reached the kernel before a failure; on TCP they count only a delivered frame.
 //!
-//! ## Duplicate safety
+//! ## Delivery posture
 //!
-//! [`GraphiteOutput::duplicate_safe`] is `true` because whisper is last-write-wins per
-//! `(path, second)`: a redelivered datapoint overwrites the same number rather than accumulating
-//! like a collectd COUNTER or statsd `|c`. That's whisper's behavior, not the carbon wire's; a
-//! non-whisper receiver on the same wire could add instead, and this sink can't tell.
+//! The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5), retries an
+//! `Ambiguous` attempt, and whisper is last-write-wins per `(path, second)`: a resent datapoint
+//! overwrites the same number rather than accumulating like a collectd `ABSOLUTE` or a statsd
+//! `|c`. That's whisper's behavior, not the carbon wire's; a non-whisper receiver on the same wire
+//! could add instead, and this sink can't tell. `buffer.delivery: at_most_once` drops the batch
+//! instead.
 
 use crate::accounting::BatchAccounting;
 use crate::count_request;
@@ -274,12 +276,6 @@ impl Output for GraphiteOutput {
             pool.flush().await.context("flushing graphite_out TCP stream")?;
         }
         Ok(())
-    }
-
-    /// Whisper is last-write-wins per `(path, second)`; the module doc's "Duplicate safety" has
-    /// the boundary. `buffer.delivery` overrides this posture for the component.
-    fn duplicate_safe(&self) -> bool {
-        true
     }
 }
 
@@ -789,12 +785,6 @@ mod tests {
         GraphiteOutput::tcp("127.0.0.1:2003", Duration::from_secs(1))
             .with_encoder(pickle())
             .expect("pickle over TCP is fine");
-    }
-
-    #[tokio::test]
-    async fn duplicate_safe_is_true() {
-        let output = GraphiteOutput::udp("127.0.0.1:0").unwrap();
-        assert!(output.duplicate_safe());
     }
 
     /// `with_encoder`/`with_max_packet_bytes` are order-independent: a 4-byte cap makes the

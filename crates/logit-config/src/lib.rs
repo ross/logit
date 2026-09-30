@@ -1805,8 +1805,8 @@ pub enum ComponentKind {
     /// event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource
     /// attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and
     /// `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed
-    /// field. A resent batch is indexed twice, so a failure Splunk may have partly applied (a
-    /// `5xx`, a timeout) drops the batch unless `buffer.delivery` is `at_least_once`.
+    /// field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch,
+    /// which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.
     SplunkHecOut {
         /// The collector's base URL, ending in `/services/collector`:
         /// `https://splunk.example.com:8088/services/collector`, or
@@ -1841,9 +1841,8 @@ pub enum ComponentKind {
         #[serde(default)]
         ack: bool,
         /// How long to wait for every request of a batch to be acknowledged. Past it the batch
-        /// fails, and is dropped unless `buffer.delivery` is `at_least_once`, which resends it
-        /// (and Splunk may index it twice). Only with `ack: true`. Defaults to `30s`; `0s` is
-        /// rejected.
+        /// fails and is resent, and Splunk may index it twice; `buffer.delivery: at_most_once`
+        /// drops it instead. Only with `ack: true`. Defaults to `30s`; `0s` is rejected.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         ack_timeout: Option<Duration>,
@@ -1996,6 +1995,9 @@ pub enum ComponentKind {
     /// `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian
     /// integer, on a connection opened on the first send and reopened after an error, as under
     /// TCP.
+    ///
+    /// Unlike every other sink, `buffer.delivery` defaults to `at_most_once` here: a statsd line
+    /// usually carries no timestamp, so a resent counter adds to the destination's total again.
     StatsdOut {
         /// `host:port` under `udp`/`tcp`, resolved at connect/send time, never at config-load
         /// time. Under `udp`, port 0 is rejected, and a name that resolves to both IPv4 and IPv6
@@ -3198,9 +3200,9 @@ pub struct BufferConfig {
     pub max_bytes: u64,
     /// What happens once both bounds are full. Defaults to `block`.
     pub overflow: OverflowPolicy,
-    /// Whether re-delivering an already-delivered batch is acceptable for this sink's
-    /// destination. Omitted (the default) derives it from the sink kind; set it to override for
-    /// this component.
+    /// What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a
+    /// `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it
+    /// (`at_most_once`). Set it to choose for this component.
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
     /// Hard ceiling on the total time spent retrying one batch, across every attempt and backoff
@@ -3298,13 +3300,15 @@ pub enum OverflowPolicy {
     DropNewest,
 }
 
-/// Whether re-delivering an already-delivered batch is acceptable for a sink's destination.
-/// `at_least_once` retries as aggressively as fault classification allows and risks a
-/// duplicate; `at_most_once` is the conservative posture.
+/// What a sink does with a batch whose delivery outcome is unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryPosture {
+    /// Resend it, accepting that the destination may receive it twice. The default for every
+    /// sink but `statsd_out`.
     AtLeastOnce,
+    /// Drop it and count it, accepting that the destination may never have received it. A
+    /// failure the destination provably never saw is still retried.
     AtMostOnce,
 }
 

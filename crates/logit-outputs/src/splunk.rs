@@ -83,8 +83,8 @@
 //! at object 0, or a lone object over Splunk Cloud's cap), so a busy answer later in the same
 //! `send` is still `Clean` and the whole batch is retried: a busy retry re-sends and re-counts a
 //! dropped object in `records.dropped`; the record is never delivered twice. Marking the drop
-//! as a delivery instead would make that busy answer `Ambiguous` and drop the rest of the batch
-//! under the default posture.
+//! as a delivery instead would make that busy answer `Ambiguous`, which `at_most_once` answers by
+//! dropping the rest of the batch.
 //!
 //! The code-6-at-object-0 test for an oversize body stands because Splunk Cloud answers a body
 //! over its cap that way, not with `413`, and an object that can't be parsed at the head of a
@@ -95,9 +95,13 @@
 //! `code` being the body's HEC code when Splunk documents it ([`code_tag`]), else `other`.
 //! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
-//! [`SplunkHecOutput::duplicate_safe`] is **`false`**: Splunk indexes a resent event twice, and a
-//! batch can span several requests, so a retry re-sends the ones that succeeded. The default
-//! posture is at-most-once; `buffer: { delivery: at_least_once }` retries and accepts duplicates.
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and a batch can span several requests, so a retry re-sends the
+//! ones that succeeded. Splunk indexes a resent log or span as a second event. A resent `Sum`, and
+//! under `multi_value: expand` a `Histogram`, takes the upstream remedy: an `aggregate` with
+//! `temporality: cumulative`, whose running total a resend repeats rather than adds. Whether a
+//! metrics index adds a resent running total or stores it as a second point is unmeasured.
+//! `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! ## Acknowledgment
 //!
@@ -880,11 +884,6 @@ impl Output for SplunkHecOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-
-    /// `false`: the module doc's "Faults, retries, and duplicate safety" says why.
-    fn duplicate_safe(&self) -> bool {
-        false
     }
 }
 
@@ -1794,13 +1793,6 @@ mod tests {
             assert!(!message.contains(TOKEN), "{message}");
             assert!(!format!("{err:?}").contains(TOKEN));
         }
-    }
-
-    #[test]
-    fn splunk_hec_output_is_not_duplicate_safe() {
-        assert!(!SplunkHecOutput::new("http://h/services/collector", TOKEN)
-            .unwrap()
-            .duplicate_safe());
     }
 
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) --------

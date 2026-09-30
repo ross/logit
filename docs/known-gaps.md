@@ -450,7 +450,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`).
   Every sink sits behind a bounded, byte-aware `SinkQueue` (`crates/logit-pipeline/src/queue.rs`)
   that keeps accepting while a delivery attempt is in flight or backing off, with retry
-  (`RetryConfig`, up to 60s by default) and fault-classification-driven duplicate-safety
+  (`RetryConfig`, up to 60s by default) and a fault-classification-driven delivery posture
   (`Fault`/`DeliveryPosture`, `crates/logit-pipeline/src/output.rs`) behind that boundary ([ADR
   `buffered-sink-delivery`](adr/buffered-sink-delivery.md)). A persistent failure no longer ends
   `logit run` by default: it drops the offending batch and continues, exiting only after a
@@ -517,30 +517,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   batch that provably never landed.** `write_loop` reads any cut-off send as `Fault::Ambiguous`,
   because it can't know how far the send got. On `logit_out` a cut inside the frame's write or
   flush leaves `logit_in` holding a truncated frame it never forwards, so the batch didn't
-  arrive. Under the default `at_most_once` posture the runtime then commits it and counts it
-  `logit.component.batches.dropped{reason="shutdown"}`; under `at_least_once` it stays queued. It
-  isn't fixed because the runtime sees a cancelled future, not where in the send it stopped, and
-  a cut inside the ack wait, after the frame landed, is truly ambiguous.
-  `docs/design/pipeline-graph.md`'s "Cancellation points" table has the row. To keep such a
+  arrive. Under `buffer.delivery: at_most_once` the runtime then commits it and counts it
+  `logit.component.batches.dropped{reason="shutdown"}`; under the default, `at_least_once`, it
+  stays queued. It isn't fixed because the runtime sees a cancelled future, not where in the send
+  it stopped, and a cut inside the ack wait, after the frame landed, is truly ambiguous.
+  `docs/design/pipeline-graph.md`'s "Cancellation points" table has the row. To keep a queued
   batch across the restart, set `buffer.disk:` on the `logit_out` component, which persists it
-  at the read cursor. [ADR `delivery-semantics`](adr/delivery-semantics.md), item 5, makes
-  `at_least_once` `logit_out`'s default, which leaves the batch queued.
-
-- **Sink default postures don't follow [ADR `delivery-semantics`](adr/delivery-semantics.md)
-  yet.** The record's item 5 makes `at_least_once` every sink's default but `statsd_out`'s.
-  The code derives the default from `Output::duplicate_safe()`, so `otlp_out`,
-  `splunk_hec_out`, `datadog_out`, `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`,
-  `collectd_out`, and `logit_out` default to `at_most_once` and drop a batch on an `Ambiguous`
-  fault. Until the new default lands
-  ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
-  `buffer.delivery: at_least_once` on a sink that should resend.
+  at the read cursor.
 
 - **The native hop has no sender identity and no deduplication.** [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 7, targets effectively-once between
   `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
-  on a reconnect, and `logit_in` forwards every frame it receives. Under `at_least_once` a
-  resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach `logit_in`'s
-  consumers twice, and a `statsd_out` or an aggregated kind among them double-counts. Until the
+  on a reconnect, and `logit_in` forwards every frame it receives. Under the default,
+  `at_least_once`, a resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach
+  `logit_in`'s consumers twice, and a `statsd_out` or an aggregated kind among them double-counts. Until the
   wire layout has its own record (the plan's W4 and W5), `buffer.delivery: at_most_once` on a
   `logit_out` whose far side feeds a counter sink avoids that at the cost of the batch.
 
@@ -1256,16 +1246,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   - **Consequence:** extra requests, never a `413`, on these routes.
   - **Revisit trigger:** Datadog documents these routes' limits, or the extra requests show up in
     a sink's request rate.
-- **`datadog_out` isn't duplicate-safe, because Datadog stores a resent log twice.** A batch is
+- **A `datadog_out` resend isn't idempotent: Datadog stores a resent log twice.** A batch is
   several requests, and a retry re-sends the ones that succeeded. A trial org was sent two
   resends: a series point resent at the same `(series, timestamp)` was stored once, the last write
   winning (a count sent twice read 5, not 10; a gauge sent as 7 then 9 read 9), and an identical
   log posted twice was stored as two logs. Every other route (distribution points, sketches,
   events, checks, traces, stats) is assumed to store a resend again until measured.
-  - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
-    `buffer: {delivery: at_least_once}` retries it and accepts duplicates on every route but
-    series: duplicate logs, and assumed inflated distribution, sketch, event, check, trace, and
-    stats counts.
+  - **Consequence:** the default posture, `at_least_once`, retries a `5xx` or timeout and accepts
+    duplicates on every route but series: duplicate logs, and assumed inflated distribution,
+    sketch, event, check, trace, and stats counts. `buffer: {delivery: at_most_once}` drops the
+    batch instead.
   - **Revisit trigger:** a measurement showing another route dedupes a resend, or a design that
     sends one batch as one request.
 - **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The series
@@ -1371,9 +1361,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   succeeded.** One `send` is up to eight routes' requests, and `crate::http`'s
   `classify_reqwest_error` makes any connect failure `Fault::Clean`. `write_loop` retries `Clean`
   under every delivery posture, and the retry re-sends the requests that already succeeded.
-  - **Consequence:** under the default at-most-once posture, a connect failure on route 2 after
-    route 1 was accepted resends route 1, and Datadog stores a resent log (and any route not
-    measured) twice.
+  - **Consequence:** under `buffer.delivery: at_most_once`, which promises no resend of an
+    accepted request, a connect failure on route 2 after route 1 was accepted still resends
+    route 1, and Datadog stores a resent log (and any route not measured) twice. Under the
+    default, `at_least_once`, the retry resends route 1 whichever way the fault is classified.
   - **Fix:** `splunk_hec_out`'s rule: once a request of the `send` is accepted, a later
     transport failure is `Fault::Ambiguous` (`crates/logit-outputs/src/splunk.rs`'s
     `after_delivery`). [ADR `delivery-semantics`](adr/delivery-semantics.md), item 9, decides
@@ -1384,9 +1375,10 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `Fault::Clean`: `reqwest`'s through `classify_reqwest_error`, and the Unix socket's when the
   connector can't dial the path. `datadog_out` has the same gap, in the entry above, and
   `otlp_out` in the OTLP section.
-  - **Consequence:** under the default at-most-once posture, an Agent that goes away between the
-    trace request and the stats request gets the traces again on the retry, and an Agent dedupes
-    nothing, so every span in them is stored twice.
+  - **Consequence:** under `buffer.delivery: at_most_once`, an Agent that goes away between the
+    trace request and the stats request still gets the traces again on the retry, and an Agent
+    dedupes nothing, so every span in them is stored twice. Under the default, `at_least_once`,
+    the retry resends them whichever way the fault is classified.
   - **Fix:** the same as `datadog_out`'s.
 - **Some Datadog codec counters count once per request body, not once per batch.** They
   describe a body and not a record: `spans.degraded{reason="no_wire_form"}` and
@@ -1490,7 +1482,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   and never polls, or many short-lived channels.
   - **Consequence:** an id on an evicted channel, or one that expired, answers `false`, and a
     client polling for it times out, counted `logit.input.acks.dropped{reason}`.
-    `splunk_hec_out` then fails the batch `Ambiguous`, and resends it under at-least-once.
+    `splunk_hec_out` then fails the batch `Ambiguous`, and resends it under the default,
+    `at_least_once`.
   - **Workaround:** raise `max_ack_channels` above the number of clients that send a channel at
     once.
   - **Revisit trigger:** a client that relies on Splunk's outstanding-id count, or channel churn
@@ -1800,16 +1793,17 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   98× shape needs crafted input, a non-goal under
   [ADR `deployment-threat-model`](adr/deployment-threat-model.md). **Revisit:** if
   an OTLP listener ever faces an untrusted network.
-- **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
-  close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
+- **VictoriaTraces's OTLP/gRPC listener fails a request that races its connection close.**
+  VictoriaTraces v0.11.1 closes every gRPC connection
   about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
   ([`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings", leg
   7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
-  because the server may have processed it, so `otlp_out`, at-most-once by default, drops the
-  batch. An isolated 20 s run at 1 batch/s saw 3 closes and 2 dropped batches.
+  because the server may have processed it. Under the default posture, `at_least_once`,
+  `otlp_out` retries it, at the cost of a duplicate span when the first attempt was stored; under
+  `buffer.delivery: at_most_once` it drops the batch. An isolated 20 s run at 1 batch/s under
+  `at_most_once` saw 3 closes and 2 dropped batches.
   **Workaround:** OTLP over HTTP to VictoriaTraces (`docs/deploying.md`'s "VictoriaMetrics,
-  VictoriaLogs, and VictoriaTraces"), or `buffer: { delivery: at_least_once }`, which retries at
-  the cost of a duplicate span when the first attempt was stored. Whether `otlp_out` should retry
+  VictoriaLogs, and VictoriaTraces") avoids both. Whether `otlp_out` should retry
   a gRPC request that got no response frame before the connection closed is a larger question:
   without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
   sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
@@ -1819,8 +1813,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `Fault::Clean` on either transport (`crate::http`'s `classify_reqwest_error` over HTTP,
   `grpc_roundtrip`'s `is_connect()` over gRPC). `write_loop` retries `Clean` under every delivery
   posture, and the retry re-sends every signal, the ones already accepted included.
-  - **Consequence:** under the default at-most-once posture, a collector restarted between a
-    mixed batch's traces request and its metrics request gets the traces twice.
+  - **Consequence:** under `buffer.delivery: at_most_once`, a collector restarted between a
+    mixed batch's traces request and its metrics request still gets the traces twice. Under the
+    default, `at_least_once`, the retry resends them whichever way the fault is classified.
   - **Fix:** `splunk_hec_out`'s rule, as for `datadog_out` in the Datadog section: once a
     request of the `send` is accepted, a later `Clean` failure is `Fault::Ambiguous`
     (`crates/logit-outputs/src/splunk.rs`'s `after_delivery`).

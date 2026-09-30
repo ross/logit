@@ -15,8 +15,15 @@
 //!
 //! **One `send`, several requests.** An [`EventBatch`] mixes logs, metrics, and spans (ADR
 //! `multi-payload-events`), but OTLP is three services, so `send` issues one request per
-//! non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially. That's
-//! one reason [`OtlpOutput::duplicate_safe`] is `false`.
+//! non-empty signal [`logit_proto::SignalEncoder::encode_signals`] returns, sequentially. A retry
+//! resends the whole batch, the signals whose requests succeeded included.
+//!
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and OTLP has no identity that makes a resend overwrite. A
+//! resent delta `Sum` or `Histogram` adds at the receiver; the remedy is an upstream `aggregate`
+//! with `temporality: cumulative`, whose running total a resend repeats rather than adds. A delta
+//! `ExponentialHistogram` passes `aggregate` unchanged and has no remedy. A resent log or span
+//! arrives as a second record. `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! **`Fault` classification.** The HTTP half is [`crate::http`]'s table, shared by name with
 //! `prometheus_out`'s remote-write sender; the gRPC half is this module's `grpc_fault`:
@@ -403,9 +410,9 @@ impl OtlpOutput {
     }
 
     /// One attempt per request, no retry in the sink (`docs/adr/buffered-sink-delivery.md`). The
-    /// first failing request aborts the rest; `write_loop` then retries the whole batch, which is
-    /// why [`OtlpOutput::duplicate_safe`] matters here. Every signal is encoded before the first
-    /// request, as unit 0 of the batch accounting.
+    /// first failing request aborts the rest; `write_loop` then retries the whole batch, the
+    /// requests that succeeded included (the module doc's "Delivery posture"). Every signal is
+    /// encoded before the first request, as unit 0 of the batch accounting.
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let (_, payloads) = self.accounting.encode(0, || self.encoder.encode_signals(batch));
         for (signal, payload) in payloads? {
@@ -437,19 +444,6 @@ impl Output for OtlpOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-
-    /// `false`, for two independent reasons, either sufficient:
-    ///
-    /// 1. **A multi-signal batch is several requests.** If the second of three fails, the retry
-    ///    re-sends the whole batch, including the first request, which already succeeded.
-    /// 2. **OTLP has no idempotency identity.** A replayed span is a second span; a replayed delta
-    ///    `Sum` double-counts. InfluxDB's `(measurement, tag set, timestamp)` identity has no
-    ///    equivalent here.
-    ///
-    /// So the default is at-most-once; `buffer: { delivery: at_least_once }` overrides it.
-    fn duplicate_safe(&self) -> bool {
-        false
     }
 }
 
@@ -1115,18 +1109,6 @@ mod tests {
         assert!(format!("{err:?}").contains("case is ignored"), "got: {err:?}");
     }
 
-    #[test]
-    fn otlp_output_reports_itself_not_duplicate_safe() {
-        let output =
-            OtlpOutput::new("http://localhost:4318".to_string(), OtlpTransport::Http).unwrap();
-        assert!(
-            !output.duplicate_safe(),
-            "a multi-signal batch issues several requests (a mid-batch failure would re-send an \
-             already-delivered signal on retry) and OTLP itself has no idempotency identity to \
-             make a re-sent request a safe overwrite -- see this module's doc comment"
-        );
-    }
-
     // ---- gRPC transport: a raw HTTP/2 peer built with `hyper::server::conn::http2`. ----
 
     /// An HTTP/2 peer answering every unary call with the given status, message, and payload.
@@ -1786,8 +1768,8 @@ mod tests {
         body
     }
 
-    /// `write_loop` retries an `Ambiguous` answer only at least once, and `otlp_out`'s own posture
-    /// is at most once.
+    /// [`fast_retry`] with `at_least_once` set as an override, so a test that retries an
+    /// `Ambiguous` answer doesn't depend on the sink's default posture.
     fn retrying() -> WriteLoopConfig {
         WriteLoopConfig { delivery_override: Some(DeliveryPosture::AtLeastOnce), ..fast_retry() }
     }

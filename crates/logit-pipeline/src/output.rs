@@ -18,8 +18,9 @@ use logit_core::EventBatch;
 ///
 /// Retry is the runtime's job too. `send` is a single attempt that reports what a failure means
 /// via [`Fault`] (`.context(fault)` on the returned error); `write_loop` owns retry timing,
-/// budget, and the retryable/permanent decision, from [`is_retryable`] and
-/// [`Output::duplicate_safe`]. A sink runs no retry loop of its own. Inside one attempt it may
+/// budget, and the retryable/permanent decision, from [`is_retryable`] and the resolved
+/// [`DeliveryPosture`]: `buffer.delivery` when the operator set it, else
+/// [`Output::default_posture`]. A sink runs no retry loop of its own. Inside one attempt it may
 /// resend, bounded, on a verdict that proves the resend safe, or poll, bounded, for a verdict:
 /// - the pooled-stream driver's one reconnect after a plaintext first write that accepted nothing
 ///   (`PooledStream::send` in `logit-outputs`);
@@ -86,12 +87,13 @@ pub trait Output {
         Ok(())
     }
 
-    /// Whether re-delivering an already-delivered batch is safe for this destination. Drives the
-    /// default [`DeliveryPosture`]; `buffer.delivery` overrides it per component
-    /// (`logit_config::BufferConfig::delivery`). Defaults to `false`, the safe choice for a sink
-    /// that hasn't opted in.
-    fn duplicate_safe(&self) -> bool {
-        false
+    /// The posture `write_loop` uses when the operator's `buffer.delivery` is unset: whether an
+    /// attempt whose outcome is unknown ([`Fault::Ambiguous`]) is retried. The default is
+    /// `AtLeastOnce` for every sink (`docs/adr/delivery-semantics.md`, item 5). A sink whose wire
+    /// gives a resend no identity at its destination declares `AtMostOnce` (`statsd_out`). A type
+    /// that implements `Output` by delegating to another must forward this too.
+    fn default_posture(&self) -> DeliveryPosture {
+        DeliveryPosture::AtLeastOnce
     }
 }
 
@@ -142,26 +144,16 @@ pub fn is_explicitly_permanent(err: &anyhow::Error) -> bool {
     matches!(err.downcast_ref::<Fault>(), Some(Fault::Permanent))
 }
 
-/// Whether re-delivering an already-delivered batch is an acceptable risk for a sink's
-/// destination. Decides which [`Fault`]s are retried (see [`is_retryable`]). Config can override
-/// the derived default per component (`logit_config::BufferConfig::delivery`, resolved into
-/// `WriteLoopConfig::delivery_override` by `logit-cli::pipeline::write_config`).
+/// Whether a sink retries an attempt whose outcome is unknown, accepting that the destination may
+/// receive the batch twice. Decides which [`Fault`]s are retried (see [`is_retryable`]). The
+/// runtime's default is `AtLeastOnce`; a sink may declare another through
+/// [`Output::default_posture`], and `buffer.delivery` overrides either per component
+/// (`logit_config::BufferConfig::delivery`, resolved into `WriteLoopConfig::delivery_override` by
+/// `logit-cli::pipeline::write_config`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryPosture {
     AtLeastOnce,
     AtMostOnce,
-}
-
-impl DeliveryPosture {
-    /// The default posture from [`Output::duplicate_safe`]: `true` gives `AtLeastOnce`, `false`
-    /// gives `AtMostOnce`.
-    pub fn from_duplicate_safe(duplicate_safe: bool) -> Self {
-        if duplicate_safe {
-            DeliveryPosture::AtLeastOnce
-        } else {
-            DeliveryPosture::AtMostOnce
-        }
-    }
 }
 
 /// Whether `fault` is worth retrying under `posture` (`docs/adr/buffered-sink-delivery.md`'s
@@ -213,9 +205,17 @@ mod tests {
     }
 
     #[test]
-    fn delivery_posture_from_duplicate_safe_maps_true_to_at_least_once() {
-        assert_eq!(DeliveryPosture::from_duplicate_safe(true), DeliveryPosture::AtLeastOnce);
-        assert_eq!(DeliveryPosture::from_duplicate_safe(false), DeliveryPosture::AtMostOnce);
+    fn a_sink_that_declares_nothing_defaults_to_at_least_once() {
+        struct Bare;
+
+        #[async_trait::async_trait]
+        impl Output for Bare {
+            async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(Bare.default_posture(), DeliveryPosture::AtLeastOnce);
     }
 
     #[test]

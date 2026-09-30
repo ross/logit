@@ -987,7 +987,8 @@ pub(crate) fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
     log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
 }
 
-/// [`fast_retry`] under `delivery: at_least_once`, so an `Ambiguous` failure retries.
+/// [`fast_retry`] with `delivery: at_least_once` set as an override, so a test that retries an
+/// `Ambiguous` failure doesn't depend on the sink's default posture.
 pub(crate) fn at_least_once() -> logit_pipeline::WriteLoopConfig {
     logit_pipeline::WriteLoopConfig {
         delivery_override: Some(logit_pipeline::DeliveryPosture::AtLeastOnce),

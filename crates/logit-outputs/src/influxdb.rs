@@ -13,6 +13,13 @@
 //! `crate::http::build_client`.
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
+//!
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and a resend overwrites. Every point's timestamp derives from
+//! `event.timestamp`, and the per-batch collision map (`InfluxLineEncoder::series`) is cleared at
+//! the top of every `encode`, so a retry re-encodes the same body byte for byte, and InfluxDB
+//! treats an identical `(measurement, tag set, timestamp)` write as an overwrite, not a second
+//! point.
 
 use crate::accounting::BatchAccounting;
 use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
@@ -208,16 +215,6 @@ impl Output for InfluxDbOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-
-    /// Every point's timestamp derives from `event.timestamp`, and the per-batch collision map
-    /// (`InfluxLineEncoder::series`) is cleared at the top of every `encode`, so a retry re-encodes
-    /// byte-for-byte the same body. InfluxDB treats an identical `(measurement, tag set,
-    /// timestamp)` write as an idempotent overwrite, not a second point.
-    /// See `docs/adr/buffered-sink-delivery.md`. `buffer.delivery` overrides this posture for the
-    /// component.
-    fn duplicate_safe(&self) -> bool {
-        true
     }
 }
 
@@ -1392,21 +1389,6 @@ mod tests {
 
         output.send(&one_metric_batch()).await.expect("a 204 should succeed");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn influxdb_output_reports_itself_duplicate_safe() {
-        let output = InfluxDbOutput::new(
-            "http://localhost:8086".to_string(),
-            "org".to_string(),
-            "bucket".to_string(),
-            "token".to_string(),
-        );
-        assert!(
-            output.duplicate_safe(),
-            "line protocol's (measurement, tag set, timestamp) identity makes a re-sent batch an \
-             idempotent overwrite, not a duplicate"
-        );
     }
 
     #[tokio::test]

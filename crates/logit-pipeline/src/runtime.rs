@@ -751,8 +751,8 @@ pub struct WriteLoopConfig {
     /// Caps `write_loop`'s drain time after shutdown fires, measured from the first signal (not
     /// reset per batch), so a down sink can't hang exit (`docs/adr/buffered-sink-delivery.md`).
     pub shutdown_grace: Duration,
-    /// Overrides the delivery posture derived from `output.duplicate_safe()`; `None` uses it.
-    /// Set from `logit-config::BufferConfig::delivery`.
+    /// Overrides the sink's `Output::default_posture()`; `None` uses it. Set from
+    /// `logit-config::BufferConfig::delivery`.
     pub delivery_override: Option<DeliveryPosture>,
 }
 
@@ -976,7 +976,7 @@ async fn finish_and_flush(
 
 /// Delivers from `store`'s head, one batch at a time, until `store.peek()` returns `None` (closed
 /// and empty) or shutdown grace expires. The posture is `write_config.delivery_override`, else
-/// `output.duplicate_safe()`'s default (`docs/adr/buffered-sink-delivery.md`).
+/// `output.default_posture()` (`docs/adr/delivery-semantics.md`, item 5).
 ///
 /// A failed batch is committed, counted, and warned about; the pipeline keeps running. The one
 /// exception: a run of nothing but explicitly classified `Fault::Permanent` outcomes
@@ -1000,9 +1000,7 @@ pub(crate) async fn write_loop(
     mut shutdown: watch::Receiver<bool>,
     shutdown_dropped: &AtomicU64,
 ) -> anyhow::Result<()> {
-    let posture = write_config
-        .delivery_override
-        .unwrap_or_else(|| DeliveryPosture::from_duplicate_safe(output.duplicate_safe()));
+    let posture = write_config.delivery_override.unwrap_or_else(|| output.default_posture());
     let mut diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
 
     let mut last_success: Option<tokio::time::Instant> = None;
@@ -4527,7 +4525,6 @@ mod tests {
     struct FaultyOutput {
         fault: Fault,
         fail_times: u32,
-        duplicate_safe: bool,
         attempts: Arc<std::sync::atomic::AtomicU32>,
         attempt_times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
         attempted: mpsc::UnboundedSender<()>,
@@ -4551,10 +4548,6 @@ mod tests {
             self.flushed.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-
-        fn duplicate_safe(&self) -> bool {
-            self.duplicate_safe
-        }
     }
 
     struct FaultyOutputHandles {
@@ -4564,11 +4557,7 @@ mod tests {
         flushed: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    fn faulty_output(
-        fault: Fault,
-        fail_times: u32,
-        duplicate_safe: bool,
-    ) -> (FaultyOutput, FaultyOutputHandles) {
+    fn faulty_output(fault: Fault, fail_times: u32) -> (FaultyOutput, FaultyOutputHandles) {
         let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let attempt_times = Arc::new(std::sync::Mutex::new(Vec::new()));
         let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4577,7 +4566,6 @@ mod tests {
             FaultyOutput {
                 fault,
                 fail_times,
-                duplicate_safe,
                 attempts: attempts.clone(),
                 attempt_times: attempt_times.clone(),
                 attempted: attempted_tx,
@@ -4603,17 +4591,19 @@ mod tests {
         }
     }
 
-    /// Runs `write_loop` over a closed queue holding `batches`, with no shutdown.
+    /// Runs `write_loop` over a closed queue holding `batches`, with no shutdown, under
+    /// `posture` set as the operator's override.
     async fn run_write_loop_to_completion(
         mut output: FaultyOutput,
         batches: Vec<Arc<EventBatch>>,
         retry: RetryConfig,
+        posture: DeliveryPosture,
     ) -> anyhow::Result<()> {
         let batches = batches.into_iter().map(Arc::unwrap_or_clone).collect();
         let write_config = WriteLoopConfig {
             retry,
             shutdown_grace: Duration::from_secs(5),
-            delivery_override: None,
+            delivery_override: Some(posture),
         };
         crate::test_util::drive_write_loop(&mut output, batches, write_config, Telemetry::default())
             .await
@@ -4660,22 +4650,26 @@ mod tests {
     /// `retries` when another attempt follows.
     #[tokio::test]
     async fn every_attempt_records_one_send_duration_sample_and_every_retry_one_error() {
+        use DeliveryPosture::{AtLeastOnce, AtMostOnce};
         // (fault, failures before a success, delivery posture, attempts, retries)
         let cases = [
-            (Fault::Clean, 0, false, 1, 0),
-            (Fault::Clean, 1, false, 2, 1),
-            (Fault::Clean, 3, false, 4, 3),
-            (Fault::Ambiguous, 3, true, 4, 3),
+            (Fault::Clean, 0, AtMostOnce, 1, 0),
+            (Fault::Clean, 1, AtMostOnce, 2, 1),
+            (Fault::Clean, 3, AtMostOnce, 4, 3),
+            (Fault::Ambiguous, 3, AtLeastOnce, 4, 3),
             // Dropped on its first failure: an error, but no retry follows.
-            (Fault::Ambiguous, u32::MAX, false, 1, 0),
-            (Fault::Permanent, u32::MAX, true, 1, 0),
+            (Fault::Ambiguous, u32::MAX, AtMostOnce, 1, 0),
+            (Fault::Permanent, u32::MAX, AtLeastOnce, 1, 0),
         ];
-        for (fault, fail_times, duplicate_safe, attempts, retries) in cases {
-            let label = format!("{fault:?} x{fail_times}, duplicate_safe {duplicate_safe}");
-            let (mut output, handles) = faulty_output(fault, fail_times, duplicate_safe);
+        for (fault, fail_times, posture, attempts, retries) in cases {
+            let label = format!("{fault:?} x{fail_times}, {posture:?}");
+            let (mut output, handles) = faulty_output(fault, fail_times);
             let mut probe = TelemetryProbe::new();
-            let config =
-                WriteLoopConfig { retry: fast_retry_config(), ..WriteLoopConfig::default() };
+            let config = WriteLoopConfig {
+                retry: fast_retry_config(),
+                delivery_override: Some(posture),
+                ..WriteLoopConfig::default()
+            };
             crate::test_util::drive_write_loop(
                 &mut output,
                 vec![Arc::unwrap_or_clone(one_event_batch(1.0))],
@@ -4749,11 +4743,16 @@ mod tests {
         assert_eq!(start.elapsed(), retry.total_budget, "cut off when the budget ran out");
     }
 
-    async fn assert_clean_fault_retries_and_eventually_delivers(duplicate_safe: bool) {
-        let (output, handles) = faulty_output(Fault::Clean, 2, duplicate_safe);
-        run_write_loop_to_completion(output, vec![one_event_batch(1.0)], fast_retry_config())
-            .await
-            .expect("a Clean fault should always eventually be retried into success");
+    async fn assert_clean_fault_retries_and_eventually_delivers(posture: DeliveryPosture) {
+        let (output, handles) = faulty_output(Fault::Clean, 2);
+        run_write_loop_to_completion(
+            output,
+            vec![one_event_batch(1.0)],
+            fast_retry_config(),
+            posture,
+        )
+        .await
+        .expect("a Clean fault should always eventually be retried into success");
         assert_eq!(
             handles.attempts.load(std::sync::atomic::Ordering::SeqCst),
             3,
@@ -4763,20 +4762,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_fault_is_retried_and_eventually_delivered_under_at_most_once() {
-        assert_clean_fault_retries_and_eventually_delivers(false).await;
+        assert_clean_fault_retries_and_eventually_delivers(DeliveryPosture::AtMostOnce).await;
     }
 
     #[tokio::test]
     async fn a_clean_fault_is_retried_and_eventually_delivered_under_at_least_once() {
-        assert_clean_fault_retries_and_eventually_delivers(true).await;
+        assert_clean_fault_retries_and_eventually_delivers(DeliveryPosture::AtLeastOnce).await;
     }
 
     #[tokio::test]
     async fn an_ambiguous_fault_is_dropped_immediately_under_at_most_once_with_no_retry() {
-        let (output, handles) = faulty_output(Fault::Ambiguous, u32::MAX, false);
-        run_write_loop_to_completion(output, vec![one_event_batch(1.0)], fast_retry_config())
-            .await
-            .expect("a dropped batch under AtMostOnce should not end write_loop with an error");
+        let (output, handles) = faulty_output(Fault::Ambiguous, u32::MAX);
+        run_write_loop_to_completion(
+            output,
+            vec![one_event_batch(1.0)],
+            fast_retry_config(),
+            DeliveryPosture::AtMostOnce,
+        )
+        .await
+        .expect("a dropped batch under AtMostOnce should not end write_loop with an error");
         assert_eq!(
             handles.attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -4786,18 +4790,114 @@ mod tests {
 
     #[tokio::test]
     async fn an_ambiguous_fault_is_retried_under_at_least_once_and_eventually_delivered() {
-        let (output, handles) = faulty_output(Fault::Ambiguous, 2, true);
-        run_write_loop_to_completion(output, vec![one_event_batch(1.0)], fast_retry_config())
-            .await
-            .expect("an Ambiguous fault under AtLeastOnce should retry into success");
+        let (output, handles) = faulty_output(Fault::Ambiguous, 2);
+        run_write_loop_to_completion(
+            output,
+            vec![one_event_batch(1.0)],
+            fast_retry_config(),
+            DeliveryPosture::AtLeastOnce,
+        )
+        .await
+        .expect("an Ambiguous fault under AtLeastOnce should retry into success");
         assert_eq!(handles.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
-    async fn assert_permanent_fault_is_never_retried(duplicate_safe: bool) {
-        let (output, handles) = faulty_output(Fault::Permanent, u32::MAX, duplicate_safe);
-        run_write_loop_to_completion(output, vec![one_event_batch(1.0)], fast_retry_config())
-            .await
-            .expect("a single permanent failure should not itself trip the failure window");
+    /// A sink that declares no posture: `FaultyOutput` with the trait's `default_posture`.
+    struct DeclaresNothing(FaultyOutput);
+
+    #[async_trait::async_trait]
+    impl Output for DeclaresNothing {
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            self.0.send(batch).await
+        }
+    }
+
+    /// A sink that declares `AtMostOnce` as its own default, as `statsd_out` does.
+    struct DeclaresAtMostOnce(FaultyOutput);
+
+    #[async_trait::async_trait]
+    impl Output for DeclaresAtMostOnce {
+        async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+            self.0.send(batch).await
+        }
+
+        fn default_posture(&self) -> DeliveryPosture {
+            DeliveryPosture::AtMostOnce
+        }
+    }
+
+    /// Runs `write_loop` over one batch under `delivery_override` and returns how many attempts
+    /// `handles` saw and how many batches `write_loop` counted dropped.
+    async fn attempts_and_drops<O: Output + Send>(
+        output: &mut O,
+        handles: &FaultyOutputHandles,
+        delivery_override: Option<DeliveryPosture>,
+    ) -> (u32, f64) {
+        let mut probe = TelemetryProbe::new();
+        let config =
+            WriteLoopConfig { retry: fast_retry_config(), delivery_override, ..Default::default() };
+        crate::test_util::drive_write_loop(
+            output,
+            vec![Arc::unwrap_or_clone(one_event_batch(1.0))],
+            config,
+            probe.telemetry("out", "influxdb_out", "sink"),
+        )
+        .await
+        .expect("no outcome here ends write_loop");
+        let dropped = probe.poll().sum("logit.component.batches.dropped", &[]);
+        (handles.attempts.load(std::sync::atomic::Ordering::SeqCst), dropped)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_fault_is_retried_by_default_for_a_sink_that_declares_nothing() {
+        let (output, handles) = faulty_output(Fault::Ambiguous, 2);
+        let mut output = DeclaresNothing(output);
+        assert_eq!(output.default_posture(), DeliveryPosture::AtLeastOnce);
+        let (attempts, dropped) = attempts_and_drops(&mut output, &handles, None).await;
+        assert_eq!(attempts, 3, "two Ambiguous failures retried, then delivered");
+        assert_eq!(dropped, 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffer_delivery_at_most_once_drops_an_ambiguous_fault_on_a_sink_that_declares_nothing()
+    {
+        let (output, handles) = faulty_output(Fault::Ambiguous, 2);
+        let mut output = DeclaresNothing(output);
+        let (attempts, dropped) =
+            attempts_and_drops(&mut output, &handles, Some(DeliveryPosture::AtMostOnce)).await;
+        assert_eq!(attempts, 1, "the override drops the batch after its one attempt");
+        assert_eq!(dropped, 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sink_declaring_at_most_once_drops_an_ambiguous_fault_by_default() {
+        let (output, handles) = faulty_output(Fault::Ambiguous, 2);
+        let mut output = DeclaresAtMostOnce(output);
+        let (attempts, dropped) = attempts_and_drops(&mut output, &handles, None).await;
+        assert_eq!(attempts, 1, "the sink's own default drops the batch after one attempt");
+        assert_eq!(dropped, 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffer_delivery_at_least_once_overrides_a_sink_declaring_at_most_once() {
+        let (output, handles) = faulty_output(Fault::Ambiguous, 2);
+        let mut output = DeclaresAtMostOnce(output);
+        let (attempts, dropped) =
+            attempts_and_drops(&mut output, &handles, Some(DeliveryPosture::AtLeastOnce)).await;
+        assert_eq!(attempts, 3, "the override retries past the sink's own default");
+        assert_eq!(dropped, 0.0);
+    }
+
+    async fn assert_permanent_fault_is_never_retried(posture: DeliveryPosture) {
+        let (output, handles) = faulty_output(Fault::Permanent, u32::MAX);
+        run_write_loop_to_completion(
+            output,
+            vec![one_event_batch(1.0)],
+            fast_retry_config(),
+            posture,
+        )
+        .await
+        .expect("a single permanent failure should not itself trip the failure window");
         assert_eq!(
             handles.attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -4807,26 +4907,31 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanent_fault_is_never_retried_under_at_most_once() {
-        assert_permanent_fault_is_never_retried(false).await;
+        assert_permanent_fault_is_never_retried(DeliveryPosture::AtMostOnce).await;
     }
 
     #[tokio::test]
     async fn a_permanent_fault_is_never_retried_under_at_least_once() {
-        assert_permanent_fault_is_never_retried(true).await;
+        assert_permanent_fault_is_never_retried(DeliveryPosture::AtLeastOnce).await;
     }
 
     /// Backoff between attempts doubles: 100, 200, 400, 800 ms.
     #[tokio::test(start_paused = true)]
     async fn backoff_between_retry_attempts_follows_the_configured_doubling_schedule() {
-        let (output, handles) = faulty_output(Fault::Clean, 4, false);
+        let (output, handles) = faulty_output(Fault::Clean, 4);
         let retry = RetryConfig {
             total_budget: Duration::from_secs(60),
             base_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(1),
         };
-        run_write_loop_to_completion(output, vec![one_event_batch(1.0)], retry)
-            .await
-            .expect("should eventually deliver");
+        run_write_loop_to_completion(
+            output,
+            vec![one_event_batch(1.0)],
+            retry,
+            DeliveryPosture::AtMostOnce,
+        )
+        .await
+        .expect("should eventually deliver");
 
         let times = handles.attempt_times.lock().unwrap();
         assert_eq!(times.len(), 5, "4 failed attempts plus the successful 5th");
@@ -4845,7 +4950,7 @@ mod tests {
     /// A retryable fault that exhausts its budget drops the batch and `write_loop` continues.
     #[tokio::test(start_paused = true)]
     async fn budget_exhaustion_on_a_retryable_fault_drops_the_batch_and_write_loop_continues() {
-        let (output, handles) = faulty_output(Fault::Ambiguous, u32::MAX, true);
+        let (output, handles) = faulty_output(Fault::Ambiguous, u32::MAX);
         let retry = RetryConfig {
             total_budget: Duration::from_millis(50),
             base_delay: Duration::from_millis(10),
@@ -4855,6 +4960,7 @@ mod tests {
             output,
             vec![one_event_batch(1.0), one_event_batch(2.0)],
             retry,
+            DeliveryPosture::AtLeastOnce,
         )
         .await;
         assert!(
@@ -4871,7 +4977,7 @@ mod tests {
     /// `write_loop` with `Err`.
     #[tokio::test(start_paused = true)]
     async fn sustained_permanent_failures_end_write_loop_once_the_failure_window_elapses() {
-        let (output, mut handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+        let (output, mut handles) = faulty_output(Fault::Permanent, u32::MAX);
         let telemetry = Telemetry::default();
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
             SinkQueueConfig::default(),
@@ -5069,10 +5175,6 @@ mod tests {
             let fault = if value == 2.0 { Fault::Ambiguous } else { Fault::Permanent };
             Err(anyhow::anyhow!("simulated failure for batch {value}")).context(fault)
         }
-
-        fn duplicate_safe(&self) -> bool {
-            true // AtLeastOnce, so Ambiguous is retryable at all.
-        }
     }
 
     /// A budget-exhausted `Ambiguous` drop resets the permanent-failure streak like a success.
@@ -5141,7 +5243,7 @@ mod tests {
     /// A sink stuck retrying still returns `Ok` within `shutdown_grace`, leaving its batch queued.
     #[tokio::test(start_paused = true)]
     async fn shutdown_grace_expiry_ends_write_loop_promptly_leaving_the_remainder_for_run_output() {
-        let (mut output, _handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let (mut output, _handles) = faulty_output(Fault::Clean, u32::MAX);
 
         let telemetry = Telemetry::default();
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
@@ -5196,7 +5298,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_output_flushes_exactly_once_and_never_loses_a_batch_racing_shutdown_grace() {
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
-        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX);
         let flushed = Arc::clone(&handles.flushed);
         let write_config = WriteLoopConfig {
             retry: RetryConfig {
@@ -5272,7 +5374,7 @@ mod tests {
     async fn a_batch_still_sitting_in_the_inbox_when_write_loop_gives_up_is_counted_not_silently_lost(
     ) {
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
-        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX);
         let write_config = WriteLoopConfig {
             retry: RetryConfig {
                 total_budget: Duration::from_secs(3600),
@@ -5379,7 +5481,7 @@ mod tests {
         let dir = crate::disk_queue::test_support::scratch_dir("shutdown-sweep-full-spool");
 
         let (inbox_tx, inbox_rx) = mpsc::channel::<Delivered>(64);
-        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let (output, mut handles) = faulty_output(Fault::Clean, u32::MAX);
         let write_config = WriteLoopConfig {
             retry: RetryConfig {
                 total_budget: Duration::from_secs(3600),
@@ -5538,10 +5640,6 @@ mod tests {
                     Ok(())
                 }
             }
-        }
-
-        fn duplicate_safe(&self) -> bool {
-            true
         }
     }
 
@@ -6072,7 +6170,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_grace_expiring_during_backoff_after_a_clean_failure_leaves_the_batch_uncommitted_under_at_most_once(
     ) {
-        let (mut output, mut handles) = faulty_output(Fault::Clean, u32::MAX, false);
+        let (mut output, mut handles) = faulty_output(Fault::Clean, u32::MAX);
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
@@ -6747,7 +6845,7 @@ mod tests {
 
         let (bad_tx, bad_rx) = mpsc::unbounded_channel();
         let (good_tx, good_rx) = mpsc::unbounded_channel();
-        let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+        let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX);
         let gate = Gate::new();
         let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
 
@@ -8933,7 +9031,7 @@ mod tests {
             graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
 
         let (bad_tx, bad_rx) = mpsc::unbounded_channel();
-        let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+        let (bad_output, mut bad_handles) = faulty_output(Fault::Permanent, u32::MAX);
 
         let mut specs: HashMap<String, NodeSpec> = HashMap::new();
         specs.insert(
@@ -9327,7 +9425,7 @@ mod tests {
     {
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
-        let (mut output, _handles) = faulty_output(Fault::Permanent, u32::MAX, false);
+        let (mut output, _handles) = faulty_output(Fault::Permanent, u32::MAX);
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
             SinkQueueConfig::default(),
             telemetry.clone(),
@@ -9362,7 +9460,7 @@ mod tests {
     async fn write_loop_records_a_sink_span_parented_on_the_incoming_batchs_context() {
         let registry = Registry::with_span_sampling(1.0);
         let telemetry = registry.telemetry_for("out", "influxdb_out", "sink");
-        let (mut output, _handles) = faulty_output(Fault::Clean, 0, false);
+        let (mut output, _handles) = faulty_output(Fault::Clean, 0);
         let store = Arc::new(SinkStore::Memory(SinkQueue::new(
             SinkQueueConfig::default(),
             telemetry.clone(),

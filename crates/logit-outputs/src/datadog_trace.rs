@@ -106,8 +106,11 @@
 //! | connect failure (refused, no such socket file) | [`Fault::Clean`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
-//! [`DatadogTraceOutput::duplicate_safe`] is **`false`**: an Agent dedupes nothing, so a resent
-//! trace is a second copy of every span in it.
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second
+//! fails re-sends the first. An Agent dedupes nothing: a resent trace is a second copy of every
+//! span in it, and the APM stats this sink relays have no upstream remedy and are assumed to add.
+//! `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! ## Telemetry
 //!
@@ -861,13 +864,6 @@ impl Output for DatadogTraceOutput {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
     }
-
-    /// `false`: an Agent dedupes nothing, and a batch can be two requests, so a retry after the
-    /// second fails re-sends the first. `buffer: { delivery: at_least_once }` accepts the
-    /// duplicates instead.
-    fn duplicate_safe(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
@@ -1432,11 +1428,6 @@ mod tests {
         let result =
             DatadogTraceOutput::unix("/run/apm.socket").with_tls(&settings, Path::new("."));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn datadog_trace_output_is_not_duplicate_safe() {
-        assert!(!DatadogTraceOutput::http("http://127.0.0.1:8126").duplicate_safe());
     }
 
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) --------

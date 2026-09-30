@@ -289,8 +289,8 @@ Per pair:
     operator picks the one their receiver speaks, as they already pick an exposition dialect.
     `compression: snappy | zstd` is chosen the same way: `zstd` is the VictoriaMetrics remote
     write protocol, `ruzstd`-encoded, `version: 1` only (graph rule 56), with no fallback to
-    Snappy. It sends one `POST` per batch with no retry in the sink; `duplicate_safe()` is `true` because
-    a sample's identity at a receiver is `(label set, timestamp)`.
+    Snappy. It sends one `POST` per batch with no retry in the sink; its posture is the default
+    `at_least_once` because a sample's identity at a receiver is `(label set, timestamp)`.
   - Native histograms are skipped and counted in both directions, pending their own follow-up.
 
   Examples: [fixtures/prometheus-remote-write-receive.yaml](fixtures/prometheus-remote-write-receive.yaml),
