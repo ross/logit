@@ -165,9 +165,16 @@
 //!
 //! TCP sends one octet-counted frame per batch through the pooled-stream driver in
 //! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
-//! fault rules. On TLS a write `Err` is `Fault::Ambiguous` and never retried, and on both a batch is
-//! called delivered only after a flush. Both transports count `logit.output.requests` tagged
+//! fault rules. On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
+//! delivered only after a flush. Both transports count `logit.output.requests` tagged
 //! `class=ok|clean|ambiguous|permanent`.
+//!
+//! ## Delivery posture
+//!
+//! The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5), retries an
+//! `Ambiguous` attempt on both transports, and a resent message is a second line at the receiver.
+//! `buffer.delivery: at_most_once` drops the batch instead; a `Fault::Clean` attempt is retried
+//! under either.
 
 use crate::accounting::BatchAccounting;
 use crate::count_request;
@@ -1340,14 +1347,6 @@ impl Output for SyslogOutput {
         }
         Ok(())
     }
-
-    /// `false` on both transports: a redelivered message is a duplicated log line. `AtMostOnce`
-    /// still retries a `Fault::Clean` (`docs/adr/buffered-sink-delivery.md`), which covers a
-    /// restarting receiver with no duplicate risk. `buffer.delivery` overrides this posture for
-    /// the component.
-    fn duplicate_safe(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]
@@ -1836,13 +1835,6 @@ mod tests {
         let mut output = SyslogOutput::udp("127.0.0.1:1").unwrap();
         let batch = batch_with(vec![metric_event(0)]);
         output.send(&batch).await.expect("an all-skipped batch must not attempt any I/O");
-    }
-
-    #[tokio::test]
-    async fn duplicate_safe_is_false() {
-        // A tokio test only because `UdpSocket::from_std` needs a runtime context.
-        let output = SyslogOutput::udp("127.0.0.1:0").unwrap();
-        assert!(!output.duplicate_safe());
     }
 
     /// A message longer than one UDP datagram can carry is truncated to fit one by the encoder,

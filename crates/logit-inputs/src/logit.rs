@@ -10,9 +10,11 @@
 //! bind-drop-rebind race. `run_until_shutdown` binds too when nobody did, for direct callers.
 //!
 //! **Ack point.** `Ack{seq}` is written only after `Fanout::send` returns, i.e. after the batch is
-//! in every downstream inbox. A stalled downstream delays the ack, which stalls the sender's
+//! in every open downstream inbox. A stalled downstream delays the ack, which stalls the sender's
 //! `write_loop`. That is this listener's backpressure; there is no receive-side queue the way a
-//! UDP listener has one (`crate::udp`).
+//! UDP listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
+//! listener has closed, is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes,
+//! and the frame's batch is counted `logit.input.batches.dropped{reason="closed_consumer"}`.
 //!
 //! **Shutdown.** Every connection task holds its own [`Fanout`] clone, and the cancel-by-drop
 //! shutdown (`docs/adr/service-lifecycle-and-output-retry.md`) needs nothing to outlive the
@@ -23,11 +25,13 @@
 //! buffer, or partly read into the header, when shutdown fires is answered `GOING_AWAY` and never
 //! forwarded.
 //!
-//! *`GOING_AWAY` and forwarding exclude each other.* Every `Reject` this listener writes (the
-//! past-the-cap one, the handshake's, the loop-top and `select!` shutdown arms, an idle close, and
-//! `FRAME_TOO_LARGE`) goes out before the frame it answers reaches `send_relayed`; after
-//! `send_relayed` the only write is that frame's `Ack`. So a `logit_out` that gets `GOING_AWAY`
-//! in place of an `Ack` knows the batch never landed, and resends it at any delivery posture.
+//! *`GOING_AWAY` and forwarding exclude each other.* `GOING_AWAY` is written only for a frame that
+//! wasn't forwarded, for one of three causes: shutdown (the loop-top and `select!` arms), an idle
+//! close, or no consumer taking the frame's batch (`send_relayed` returned `false`). Every other
+//! `Reject` (the past-the-cap one, the handshake's, and `FRAME_TOO_LARGE`) also goes out before
+//! the frame it answers reaches `send_relayed`, and a forwarded frame's only answer is its `Ack`.
+//! So a `logit_out` that gets `GOING_AWAY` in place of an `Ack` knows the batch never landed, and
+//! resends it at any delivery posture.
 //!
 //! **Bounded, flushed writes.** Every control write (`HelloAck`, `Ack`, and every `Reject`,
 //! including `GOING_AWAY`) is flushed, and the write and flush finish within `handshake_timeout`
@@ -593,16 +597,22 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
             &[("direction", "in")],
         );
 
-        // The ack point: `send_relayed` returns once every downstream inbox has the batch. It
+        // The ack point: `send_relayed` returns once every open downstream inbox has the batch. It
         // backfills only provenance the wire didn't carry (a v1 peer, or a v2 peer with none) and
         // passes a v2 peer's `origin`/`previous` through untouched
         // (`docs/adr/batch-provenance-on-delivered.md`).
-        sink.send_relayed(batch, provenance).await;
+        if !sink.send_relayed(batch, provenance).await {
+            // Before `seq` advances, so a redialing sender's numbering and this side's agree.
+            telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "closed_consumer")]);
+            going_away(&mut stream, "no consumer took the batch", handshake_timeout, &telemetry)
+                .await;
+            return Ok(());
+        }
 
         // `seq` is implicit: the Nth data frame on a connection is acked as N.
         seq += 1;
-        // After `send_relayed` this is the only write: a frame is never both forwarded and
-        // answered `GOING_AWAY` (module doc's "Shutdown").
+        // After a forwarding `send_relayed` this is the only write: a frame is never both
+        // forwarded and answered `GOING_AWAY` (module doc's "Shutdown").
         if let Err(err) = write_control(&mut stream, &control::Ack { seq }, handshake_timeout).await
         {
             if err.is::<WriteStalled>() {
@@ -616,8 +626,8 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     }
 }
 
-/// Writes `Reject{GOING_AWAY, why}` before this listener closes a connection, for a shutdown and
-/// an idle close alike. `logit_out` treats `REJECT_GOING_AWAY` as transient and reconnects.
+/// Writes `Reject{GOING_AWAY, why}` before this listener closes a connection, for a shutdown, an
+/// idle close, and a frame no consumer took alike. `logit_out` treats `REJECT_GOING_AWAY` as transient and reconnects.
 ///
 /// The write is bounded by `bound` and its result discarded: the connection is closing anyway,
 /// and a peer that already vanished or stopped reading is not a fault ([`write_reject`] counts a
@@ -2299,10 +2309,10 @@ mod tests {
         drop(unread);
     }
 
-    /// Every `Reject{GOING_AWAY}` goes out before the frame it answers reaches `send_relayed`,
-    /// so a frame answered with one is never forwarded, and a `logit_out` may resend it at any
-    /// delivery posture. A whole frame buffered as shutdown fires races the header read against
-    /// the shutdown arm; this runs the race until both outcomes have occurred.
+    /// `Reject{GOING_AWAY}` answers only a frame that wasn't forwarded, so a `logit_out` may
+    /// resend it at any delivery posture. A whole frame buffered as shutdown fires races the
+    /// header read against the shutdown arm; this runs the race until both outcomes have
+    /// occurred.
     #[tokio::test]
     async fn a_frame_answered_with_going_away_is_never_forwarded() {
         let (mut acked, mut going_away) = (0, 0);
@@ -2344,6 +2354,53 @@ mod tests {
         assert!(
             going_away > 0 && acked > 0,
             "both arms ran: {acked} acked, {going_away} going away"
+        );
+    }
+
+    /// A frame no consumer takes (the one consumer closed) is answered `Reject{GOING_AWAY}` in
+    /// place of its `Ack`, counted as a batch dropped for `closed_consumer`, and ends the
+    /// connection as a clean close.
+    #[tokio::test]
+    async fn a_frame_no_consumer_takes_is_answered_going_away_and_never_acked() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        let (sink, rx) = fanout_into_channel(16);
+        drop(rx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(serve_connection(
+            server,
+            sink,
+            telemetry,
+            frame::MAX_SANE_UNCOMPRESSED_LEN,
+            HANDSHAKE_TIMEOUT,
+            None,
+            shutdown_rx,
+        ));
+        write_msg(&mut client, &hello_v1()).await;
+        let _ = read_control_response_over(&mut client).await;
+
+        client.write_all(&sample_frame()).await.unwrap();
+
+        match read_control_response_over(&mut client).await {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+                assert_eq!(reject.message, "no consumer took the batch");
+            }
+            other => panic!("expected Reject{{GOING_AWAY}} in place of the Ack, got {other:?}"),
+        }
+        tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, task)
+            .await
+            .expect("the connection should end right behind the Reject")
+            .unwrap()
+            .expect("a refused frame is a clean close, not a connection error");
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "no Ack follows the Reject");
+        assert_eq!(
+            Totals::of(registry.drain(0))
+                .sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
         );
     }
 

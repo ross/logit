@@ -512,6 +512,33 @@ pub(crate) fn error_response(
     json_response(status, Bytes::from(format!(r#"{{"status":"error","errors":[{message}]}}"#)))
 }
 
+/// Why a request's batches were not all delivered, and how many were left: the refused batch and
+/// every one after it, which were never offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Undelivered {
+    /// The deadline passed before every consumer had room ([`deliver_with_deadline`] only).
+    Busy(usize),
+    /// No consumer took a batch: the listener's direct consumers are all closed.
+    Closed(usize),
+}
+
+impl Undelivered {
+    /// The `reason` (`logit.input.batches.dropped`) and `class` (`logit.input.requests`) value.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Undelivered::Busy(_) => "busy",
+            Undelivered::Closed(_) => "closed_consumer",
+        }
+    }
+
+    /// How many of the request's batches were not delivered, the refused one included.
+    pub(crate) fn count(self) -> usize {
+        match self {
+            Undelivered::Busy(n) | Undelivered::Closed(n) => n,
+        }
+    }
+}
+
 /// Sends one request's `batches` in order through [`logit_pipeline::Fanout::send`] on a task of
 /// their own, and waits for it. Dropping this future (a client that closed mid-request cancels
 /// hyper's service future) cancels only the wait: the task still delivers every batch to every
@@ -521,42 +548,55 @@ pub(crate) fn error_response(
 /// waiting on another consumer, so this cannot deadlock a diamond the way a reservation without a
 /// deadline would.
 ///
+/// The task stops at the first batch no consumer took and returns [`Undelivered::Closed`] with
+/// that batch and the rest: a closed consumer never reopens, so offering the rest would only
+/// count them dropped a second time.
+///
 /// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
-/// does ([`drive_with_idle`]'s wait-out loop). A panic inside it is resumed here.
+/// does ([`drive_with_idle`]'s wait-out loop). A panic inside it is resumed here; a task cancelled
+/// by a runtime shutting down reports every batch as undelivered, since which of them went out is
+/// unknown and the client must not be told they all did.
 pub(crate) async fn deliver_detached(
     sink: &logit_pipeline::Fanout,
     batches: Vec<logit_core::EventBatch>,
-) {
+) -> Result<(), Undelivered> {
     if batches.is_empty() {
-        return;
+        return Ok(());
     }
+    let total = batches.len();
     let sink = sink.clone();
     let delivery = tokio::spawn(async move {
-        for batch in batches {
-            sink.send(batch).await;
+        for (sent, batch) in batches.into_iter().enumerate() {
+            if !sink.send(batch).await {
+                return Err(Undelivered::Closed(total - sent));
+            }
         }
+        Ok(())
     });
-    if let Err(err) = delivery.await {
-        if err.is_panic() {
-            std::panic::resume_unwind(err.into_panic());
-        }
+    match delivery.await {
+        Ok(outcome) => outcome,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(_) => Err(Undelivered::Closed(total)),
     }
 }
 
 /// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait both
 /// Datadog listeners answer `503` after (`crate::datadog`'s "Backpressure" section). Each batch
-/// reaches every consumer or none ([`logit_pipeline::Fanout::send_with_deadline`]). `Err` carries
-/// how many were not delivered, the timed-out one included.
+/// reaches every consumer or none ([`logit_pipeline::Fanout::send_with_deadline`]). The `Err`
+/// counts the refused batch and every one after it: [`Undelivered::Busy`] for a deadline that
+/// passed, [`Undelivered::Closed`] for a batch no consumer took.
 pub(crate) async fn deliver_with_deadline(
     sink: &logit_pipeline::Fanout,
     batches: Vec<logit_core::EventBatch>,
     busy_after: std::time::Duration,
-) -> Result<(), usize> {
+) -> Result<(), Undelivered> {
     let deadline = tokio::time::Instant::now() + busy_after;
     let total = batches.len();
     for (sent, batch) in batches.into_iter().enumerate() {
-        if sink.send_with_deadline(batch, deadline).await.is_err() {
-            return Err(total - sent);
+        match sink.send_with_deadline(batch, deadline).await {
+            Ok(true) => {}
+            Ok(false) => return Err(Undelivered::Closed(total - sent)),
+            Err(_) => return Err(Undelivered::Busy(total - sent)),
         }
     }
     Ok(())

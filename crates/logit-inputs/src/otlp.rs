@@ -26,6 +26,12 @@
 //! batches (one per resource) it decoded to. The retry then duplicates on every branch alike
 //! rather than on some.
 //!
+//! **A request no consumer takes is refused, not acknowledged.** When every consumer of the
+//! listener has closed, the request is answered `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`,
+//! status 14) and its undelivered batches are counted
+//! `logit.input.batches.dropped{reason="closed_consumer"}`. Never a `partial_success`, which tells
+//! the exporter the rejected items are permanently bad and must not be retried.
+//!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
 //! per-connection task, after that connection's [`MAX_CONCURRENT_CONNECTIONS`] permit is
@@ -589,14 +595,22 @@ async fn handle_http(
         bytes
     };
 
-    let mut decoder = OtlpDecoder::new().with_telemetry(telemetry);
+    let mut decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
     let result = match encoding {
         RequestEncoding::Protobuf => decoder.decode_signal(signal, bytes),
         RequestEncoding::Json => decoder.decode_signal_json(signal, bytes),
     };
     match result {
         Ok(batches) => {
-            crate::http::deliver_detached(&sink, batches).await;
+            if let Err(undelivered) = crate::http::deliver_detached(&sink, batches).await {
+                count_undelivered(&telemetry, undelivered);
+                let mut response =
+                    text_response(StatusCode::SERVICE_UNAVAILABLE, NO_CONSUMER_TOOK_THE_BATCH);
+                response
+                    .headers_mut()
+                    .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return Ok(response);
+            }
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
             // ([`export_response_json`]).
@@ -724,14 +738,29 @@ async fn handle_grpc(
         Bytes::copy_from_slice(payload)
     };
 
-    let mut decoder = OtlpDecoder::new().with_telemetry(telemetry);
+    let mut decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
     match decoder.decode_signal(signal, payload) {
-        Ok(batches) => {
-            crate::http::deliver_detached(&sink, batches).await;
-            Ok(grpc_response(0, "", Some(export_response(0, ""))))
-        }
+        Ok(batches) => match crate::http::deliver_detached(&sink, batches).await {
+            Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
+            Err(undelivered) => {
+                count_undelivered(&telemetry, undelivered);
+                Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None))
+            }
+        },
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
     }
+}
+
+/// The refusal's message, on both transports.
+const NO_CONSUMER_TOOK_THE_BATCH: &str = "no consumer took the batch";
+
+/// Counts a request's batches that no consumer took, the refused one included.
+fn count_undelivered(telemetry: &Telemetry, undelivered: crate::http::Undelivered) {
+    telemetry.count(
+        "logit.input.batches.dropped",
+        undelivered.count() as f64,
+        &[("reason", undelivered.reason())],
+    );
 }
 
 /// Matches an OTLP/HTTP path (`/v1/logs`, `/v1/metrics`, `/v1/traces`) to its [`Signal`].
@@ -1438,6 +1467,47 @@ mod tests {
         let second = logit_pipeline::test_util::recv_batch(&mut rx).await;
         assert_eq!(first.resource.attributes.get("host").and_then(|v| v.as_str()), Some("a"));
         assert_eq!(second.resource.attributes.get("host").and_then(|v| v.as_str()), Some("b"));
+    }
+
+    // ---- A closed downstream refuses the request ----
+
+    /// With every consumer closed, the export is refused with a retryable `503`, never
+    /// acknowledged and never a `partial_success`.
+    #[tokio::test]
+    async fn an_http_request_no_consumer_takes_is_answered_503_with_retry_after() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry);
+        let (sink, rx) = fanout_into_channel();
+        drop(rx);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let response = post_raw(
+            &addr,
+            "/v1/traces",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &one_span_payload(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+        assert!(response.to_ascii_lowercase().contains("retry-after: 1"), "got: {response}");
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_grpc_request_no_consumer_takes_is_answered_unavailable() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Grpc).await;
+        let mut input = input.with_telemetry(telemetry);
+        let (sink, rx) = fanout_into_channel();
+        drop(rx);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let trailers = grpc_export(&addr, grpc_message(false, &one_span_payload()), None).await;
+        assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "14");
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
     }
 
     // ---- gRPC: garbage-frame status test ----

@@ -63,8 +63,8 @@ components:
     #   max_batches: 1024      # queue depth; whichever of this or max_bytes trips first
     #   max_bytes: "64MiB"     # a quoted string, always (KiB/MiB/GiB or a bare number)
     #   overflow: block        # block | drop_oldest | drop_newest
-    #   # delivery: at_least_once  # at_least_once | at_most_once; omitted derives from the sink's
-    #                              # duplicate_safe() (true for influxdb_out's idempotent overwrite)
+    #   # delivery: at_least_once  # at_least_once | at_most_once; omitted is at_least_once for
+    #                              # every sink but statsd_out (influxdb_out's resend overwrites)
     #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
     #   retry_max_delay: 10s   # backoff cap between attempts
     #   shutdown_grace: 5s

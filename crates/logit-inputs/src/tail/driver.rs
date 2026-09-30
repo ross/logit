@@ -110,6 +110,8 @@ enum DrainEnd {
     /// A pass completed with a poll, flush, or checkpoint deadline already past, so the run loop
     /// goes back to its `select!`, where that timer is ready at once.
     TimerDue,
+    /// No consumer took a batch ([`Tailer::untaken`]): the run loop stops.
+    Untaken,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +251,12 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// Set by [`Tailer::bind`] and taken into a local by [`Tailer::run_until_shutdown`].
     /// `Option` because `Watcher` has no "not yet opened" value.
     watcher: Option<super::watch::Watcher>,
+    /// Set once an emit finds no consumer to take its batch: every consumer of this listener has
+    /// closed. From then on nothing more is emitted and [`Tailer::write_checkpoint`] writes
+    /// nothing, so the persisted offset stays at the last checkpoint written, at or before the
+    /// last batch a consumer took, and a restart may replay lines a consumer already took. The
+    /// run loop then returns `Ok`, and the node finishes.
+    untaken: bool,
 }
 
 impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
@@ -267,6 +275,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             watched_dirs: HashSet::new(),
             scan_generation: 0,
             watcher: None,
+            untaken: false,
         }
     }
 
@@ -419,6 +428,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         Some(tokio::time::Instant::now() + self.config.checkpoint_interval);
                 }
             }
+            // The flush arm, and the checkpoint arm's flush, can find every consumer closed.
+            if self.untaken {
+                break;
+            }
 
             // The earliest pending deadline: `drain` hands control back once it's past, so a
             // sustained backlog can't starve the poll, flush, and checkpoint ticks. A flush or
@@ -433,14 +446,26 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 continue;
             }
             match self.drain(&sink, &shutdown, &mut watcher, due).await {
-                DrainEnd::Shutdown => break,
+                DrainEnd::Shutdown | DrainEnd::Untaken => break,
                 DrainEnd::Idle | DrainEnd::TimerDue => {}
             }
         }
 
-        self.close_all_for_shutdown(&sink).await;
-        self.flush_all(&sink, FlushReason::Shutdown).await;
+        if !self.untaken {
+            self.close_all_for_shutdown(&sink).await;
+        }
+        if !self.untaken {
+            self.flush_all(&sink, FlushReason::Shutdown).await;
+        }
+        // A no-op once a batch was refused, which leaves the checkpoint where it was.
         self.write_checkpoint(true).await;
+        if self.untaken {
+            self.diag.warn_throttled(
+                "closed_consumer",
+                "no consumer took a batch; stopped tailing, with the checkpoint left where it \
+                 was, at or before the last batch taken",
+            );
+        }
         Ok(())
     }
 
@@ -1080,6 +1105,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         due: tokio::time::Instant,
     ) -> DrainEnd {
         loop {
+            if self.untaken {
+                return DrainEnd::Untaken;
+            }
             // Before the reads: a pass parked on the downstream mustn't reap on an EOF it saw
             // before the grace ran out.
             let pass_start = tokio::time::Instant::now();
@@ -1099,8 +1127,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 } else {
                     at_eof.push(id);
                 }
+                if self.untaken {
+                    return DrainEnd::Untaken;
+                }
             }
             self.reap_drained(&at_eof, pass_start, sink, watcher).await;
+            if self.untaken {
+                return DrainEnd::Untaken;
+            }
             if !any_progress {
                 return DrainEnd::Idle;
             }
@@ -1112,7 +1146,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Reads one chunk from `id`, decodes its complete lines, and emits any batch that reaches a
     /// bound. Returns `false` (eligible for [`Tailer::reap_drained`]) at EOF, on a read error,
-    /// or for a [`FileState::Deselected`] file.
+    /// or for a [`FileState::Deselected`] file. A refused emit sets [`Tailer::untaken`] and
+    /// leaves the chunk's remaining lines undecoded.
     async fn read_one(&mut self, id: FileId, sink: &Fanout) -> bool {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
             return false;
@@ -1188,7 +1223,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             // No scope: a tailed line has no instrumentation scope.
             if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch)
             {
-                emit(sink, &self.telemetry, batch, reason).await;
+                if !emit(sink, &self.telemetry, batch, reason).await {
+                    self.untaken = true;
+                    break;
+                }
             }
         }
         if let Some(cp) = &mut self.checkpoint {
@@ -1262,9 +1300,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 watcher.unwatch(watch_id);
             }
             let deselected = tracked.state == FileState::Deselected;
-            close_decoder(&mut tracked, sink, &self.telemetry, &mut self.diag).await;
-            if let Some(batch) = tracked.accumulator.take() {
-                emit(sink, &self.telemetry, batch, FlushReason::Closed).await;
+            let mut taken =
+                close_decoder(&mut tracked, sink, &self.telemetry, &mut self.diag).await;
+            if taken {
+                if let Some(batch) = tracked.accumulator.take() {
+                    taken = emit(sink, &self.telemetry, batch, FlushReason::Closed).await;
+                }
+            }
+            if !taken {
+                self.untaken = true;
+                return;
             }
             if deselected {
                 // This inode is alive, only unselected (a `Draining` one may be gone and its
@@ -1297,24 +1342,34 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let ids: Vec<FileId> = self.files.keys().copied().collect();
         for id in ids {
             if let Some(tracked) = self.files.get_mut(&id) {
-                close_decoder(tracked, sink, &self.telemetry, &mut self.diag).await;
+                if !close_decoder(tracked, sink, &self.telemetry, &mut self.diag).await {
+                    self.untaken = true;
+                    return;
+                }
             }
         }
     }
 
+    /// Emits every accumulator's batch, stopping at the first one no consumer takes
+    /// ([`Tailer::untaken`]).
     async fn flush_all(&mut self, sink: &Fanout, reason: FlushReason) {
         let ids: Vec<FileId> = self.files.keys().copied().collect();
         for id in ids {
             let Some(tracked) = self.files.get_mut(&id) else { continue };
             if let Some(batch) = tracked.accumulator.take() {
-                emit(sink, &self.telemetry, batch, reason).await;
+                if !emit(sink, &self.telemetry, batch, reason).await {
+                    self.untaken = true;
+                    return;
+                }
             }
         }
     }
 
     /// Persists every tracked file's offset. The invariant: a persisted offset covers only bytes
-    /// whose events have been emitted, or absorbed into an accumulator the caller flushes first,
-    /// so a restart can replay lines but never skip one.
+    /// whose events have been emitted and taken by a consumer, or absorbed into an accumulator
+    /// the caller flushes first, so a restart can replay lines but never skip one. Once a batch
+    /// was refused ([`Tailer::untaken`]) nothing is written, forced or not: the offset already
+    /// covers lines whose events were never taken.
     ///
     /// `offset` advances per chunk, so it also covers bytes that haven't produced an event yet:
     /// the splitter's held partial line ([`LineSplitter::pending_bytes`]) and the complete lines
@@ -1327,6 +1382,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// too. Otherwise, at shutdown `close_all_for_shutdown` has already emitted both, so the
     /// offset is the file's full `offset`.
     async fn write_checkpoint(&mut self, force: bool) {
+        if self.untaken {
+            return;
+        }
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let tracked = self.files.values().map(|f| {
             let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
@@ -1347,13 +1405,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
 /// Emits a file's unterminated last line ([`LineSplitter::take_partial`]) and whatever
 /// [`TailDecoder::close`] produces into its accumulator, flushing if a bound is reached. Used by
-/// [`Tailer::reap_drained`] and [`Tailer::close_all_for_shutdown`].
+/// [`Tailer::reap_drained`] and [`Tailer::close_all_for_shutdown`]. Returns `false` once an emit
+/// finds no consumer to take its batch, emitting nothing after it.
 async fn close_decoder<D: TailDecoder>(
     tracked: &mut TrackedFile<D>,
     sink: &Fanout,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
-) {
+) -> bool {
     let mut scratch = Vec::new();
 
     // Read before `take_partial` empties the splitter: where the unterminated last line starts.
@@ -1380,7 +1439,9 @@ async fn close_decoder<D: TailDecoder>(
             }
         };
         if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {
-            emit(sink, telemetry, batch, reason).await;
+            if !emit(sink, telemetry, batch, reason).await {
+                return false;
+            }
         }
     }
 
@@ -1393,9 +1454,10 @@ async fn close_decoder<D: TailDecoder>(
     if !scratch.is_empty() {
         let resource = tracked.decoder.resource();
         if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch) {
-            emit(sink, telemetry, batch, reason).await;
+            return emit(sink, telemetry, batch, reason).await;
         }
     }
+    true
 }
 
 /// Reads a newly opened file's first `n` bytes from its current position, `0`. A short file is
@@ -1454,9 +1516,20 @@ fn truncated_message(path: &Path, prev_offset: u64, len: u64) -> String {
     )
 }
 
-async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: FlushReason) {
+/// Sends one batch, returning whether a consumer took it. A refused batch is counted
+/// `logit.input.batches.dropped{reason="closed_consumer"}`; the caller stops emitting after it.
+async fn emit(
+    sink: &Fanout,
+    telemetry: &Telemetry,
+    batch: EventBatch,
+    reason: FlushReason,
+) -> bool {
     telemetry.count("logit.component.receive.flushed", 1.0, &[("reason", reason.as_str())]);
-    sink.send(batch).await;
+    let taken = sink.send(batch).await;
+    if !taken {
+        telemetry.count("logit.input.batches.dropped", 1.0, &[("reason", "closed_consumer")]);
+    }
+    taken
 }
 
 /// `sleep_until` for an optional deadline: `None` never resolves.
@@ -1483,6 +1556,7 @@ mod tests {
     use logit_core::Resource;
     use logit_pipeline::test_util::{
         assert_no_batch, fanout_channel, recv_events, wait_until, Running, TelemetryProbe,
+        RECV_TIMEOUT,
     };
     use logit_pipeline::{unwrap_batch, Delivered};
     use std::io::Write;
@@ -3412,7 +3486,7 @@ mod tests {
              {busy_before_quiet} of its lines"
         );
 
-        drop(rx); // the rest of the backlog then fails fast as closed_consumer
+        drop(rx); // the driver then stops at its next emit
         running.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3467,6 +3541,115 @@ mod tests {
         let first = recv_events(&mut rx2, 1).await;
         let resumed_at = offset / BACKLOG_LINE_BYTES;
         assert_eq!(messages(&first[..1]), vec![format!("backlog-{resumed_at:05}")]);
+        drop(rx2);
+        running2.stop().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A downstream that closes mid-backlog stops the driver at its next emit, with no shutdown
+    /// signal, and freezes the checkpoint: no interval or final write advances it past the lines
+    /// a consumer took, so a restart replays from there rather than skipping what was refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_downstream_mid_backlog_stops_the_driver_and_freezes_the_checkpoint() {
+        let dir = scratch_dir("closed-under-backlog");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        std::fs::write(&path, backlog(8_000).as_bytes()).unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+        config.checkpoint_interval = Duration::from_millis(100);
+        config.batching.max_events = 1;
+
+        let mut probe = TelemetryProbe::new();
+        let (fanout, mut rx) = fanout_channel(1);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone())
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let mut running = spawn_tailer(tailer, fanout);
+
+        // Into the second chunk, so interval checkpoints have landed, then the downstream closes.
+        let delivered =
+            consume_slowly(&mut rx, Duration::from_millis(1), |e| e.len() >= 6_000).await.len();
+        drop(rx);
+
+        tokio::time::timeout(RECV_TIMEOUT, &mut running.handle)
+            .await
+            .expect("the driver should stop on its own once no consumer takes a batch")
+            .expect("the driver task panicked")
+            .expect("a closed downstream is a clean finish, not an error");
+        probe
+            .wait_for("the refused batch to be counted", |t| {
+                t.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]) == 1.0
+            })
+            .await;
+
+        let offset = checkpointed_offset(&checkpoint_path)
+            .expect("an interval checkpoint should have landed during the backlog");
+        let delivered_bytes = delivered as u64 * BACKLOG_LINE_BYTES;
+        assert!(
+            offset <= delivered_bytes,
+            "checkpoint {offset} covers lines past the {delivered} a consumer took"
+        );
+        assert_eq!(offset % BACKLOG_LINE_BYTES, 0, "the checkpoint must sit on a line boundary");
+
+        // A restart resumes at or before the first line never taken.
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let running2 = spawn_tailer(tailer2, fanout2);
+        let first = recv_events(&mut rx2, 1).await;
+        let resumed_at = offset / BACKLOG_LINE_BYTES;
+        assert_eq!(messages(&first[..1]), vec![format!("backlog-{resumed_at:05}")]);
+        drop(rx2);
+        running2.stop().await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Lines held in an accumulator when the downstream closes are refused by the flush tick
+    /// (or the checkpoint tick's flush), which stops the driver before any checkpoint write can
+    /// cover them.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_downstream_found_by_a_flush_tick_freezes_the_checkpoint() {
+        let dir = scratch_dir("closed-at-flush");
+        let path = dir.join("app.log");
+        let checkpoint_path = dir.join("checkpoint.json");
+        std::fs::write(&path, b"a\nb\n").unwrap();
+
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.checkpoint_path = Some(checkpoint_path.clone());
+
+        let (fanout, mut rx) = fanout_channel(8);
+        let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config.clone());
+        let mut running = spawn_tailer(tailer, fanout);
+
+        assert_eq!(messages(&recv_events(&mut rx, 2).await), vec!["a", "b"]);
+        wait_until("a checkpoint covering the two delivered lines", || {
+            checkpointed_offset(&checkpoint_path) == Some(4)
+        })
+        .await;
+
+        // Read into the accumulator only: `max_events` is far away, so the flush tick is the
+        // first emit.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"c\nd\n").unwrap();
+        drop(rx);
+
+        tokio::time::timeout(RECV_TIMEOUT, &mut running.handle)
+            .await
+            .expect("the driver should stop on its own once no consumer takes a batch")
+            .expect("the driver task panicked")
+            .expect("a closed downstream is a clean finish, not an error");
+        assert_eq!(
+            checkpointed_offset(&checkpoint_path),
+            Some(4),
+            "neither an interval nor the final write may cover the refused lines"
+        );
+
+        let (fanout2, mut rx2) = fanout_channel(8);
+        let tailer2 = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
+        let running2 = spawn_tailer(tailer2, fanout2);
+        assert_eq!(messages(&recv_events(&mut rx2, 2).await), vec!["c", "d"]);
         drop(rx2);
         running2.stop().await;
 

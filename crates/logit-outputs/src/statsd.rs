@@ -193,9 +193,18 @@
 //!
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
 //! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
-//! `Fault::Ambiguous` and never retried, since a resend would increment a counter twice
-//! ([`StatsdOutput::duplicate_safe`]). Every transport counts `logit.output.requests` tagged
-//! `class=ok|clean|ambiguous|permanent`.
+//! `Fault::Ambiguous`, not retried under this sink's default posture ("Delivery posture" below).
+//! Every transport counts `logit.output.requests` tagged `class=ok|clean|ambiguous|permanent`.
+//!
+//! ## Delivery posture
+//!
+//! `statsd_out` is the one sink whose default is `at_most_once`
+//! ([`StatsdOutput::default_posture`]; `docs/adr/delivery-semantics.md`, item 5), on every
+//! transport. A statsd line has no timestamp, and `|T` is written only when the event carried
+//! one, so a resent `hits:5|c` increments the destination counter a second time with no trace at
+//! the receiver. A `Fault::Ambiguous` attempt (a datagram send that fails after earlier datagrams
+//! of the batch left, a stream write error) drops the batch; a `Fault::Clean` one is still
+//! retried. `buffer.delivery: at_least_once` overrides this.
 //!
 //! ## Sample rate: never for a counter, real for `Samples`
 //!
@@ -330,7 +339,7 @@ use logit_core::{
     Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Temporality,
     Value,
 };
-use logit_pipeline::BatchContext;
+use logit_pipeline::{BatchContext, DeliveryPosture};
 use logit_proto::{FramedEncoder, MessageBuf};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1875,13 +1884,11 @@ impl Output for StatsdOutput {
         Ok(())
     }
 
-    /// `false`: a redelivered `hits:5|c` **increments the destination counter a second time**,
-    /// corrupting the value with no trace at the receiver (worse than `syslog_out`'s duplicated
-    /// log line). The derived `AtMostOnce` posture still retries a `Fault::Clean` failure, which
-    /// covers the common receiver-restart outage with no duplicate risk. `buffer.delivery`
-    /// overrides this posture for the component.
-    fn duplicate_safe(&self) -> bool {
-        false
+    /// `AtMostOnce` on every transport: a statsd line has no timestamp and `|T` is written only
+    /// when the event carried one, so a resent `|c` increments the destination counter a second
+    /// time. A `Fault::Clean` failure is still retried (the module doc's "Delivery posture").
+    fn default_posture(&self) -> DeliveryPosture {
+        DeliveryPosture::AtMostOnce
     }
 }
 
@@ -3933,9 +3940,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_safe_is_false() {
-        let output = StatsdOutput::udp("127.0.0.1:0").unwrap();
-        assert!(!output.duplicate_safe());
+    async fn every_transport_defaults_to_at_most_once() {
+        let timeout = Duration::from_secs(1);
+        let outputs = [
+            StatsdOutput::udp("127.0.0.1:0").unwrap(),
+            StatsdOutput::tcp("127.0.0.1:0", timeout),
+            StatsdOutput::unix_datagram("/nonexistent/statsd.sock", timeout),
+            StatsdOutput::unix_stream("/nonexistent/statsd.sock", timeout),
+        ];
+        for output in outputs {
+            assert_eq!(output.default_posture(), DeliveryPosture::AtMostOnce);
+        }
+    }
+
+    /// A batch whose second datagram fails after the first left, through the runtime's write
+    /// loop over a scripted destination.
+    async fn an_ambiguous_datagram_failure_through_write_loop(
+        config: logit_pipeline::WriteLoopConfig,
+    ) -> (crate::test_support::Sums, Vec<Vec<u8>>) {
+        let script = ScriptedDest::new([
+            SendStep::Accept,
+            SendStep::Fail(std::io::ErrorKind::ConnectionRefused),
+        ]);
+        let mut probe = TelemetryProbe::new();
+        let mut output = StatsdOutput::udp("127.0.0.1:8125")
+            .unwrap()
+            .with_max_packet_bytes(5) // one five-byte line per datagram
+            .with_telemetry(probe.telemetry("out", "statsd_out", "sink"));
+        output.conn = Conn::Udp(UdpDest::Scripted(Arc::clone(&script)));
+        let batch =
+            batch_with(["a", "b"].map(|n| metric_event(n, MetricKind::counter(1.0), &[])).to_vec());
+        let sums = crate::test_support::sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "statsd_out",
+            vec![batch],
+            config,
+        )
+        .await;
+        (sums, script.datagrams())
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_failure_is_dropped_by_default() {
+        let (sums, datagrams) =
+            an_ambiguous_datagram_failure_through_write_loop(crate::test_support::fast_retry())
+                .await;
+        let sum_of = crate::test_support::sum_of;
+        assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "ambiguous")]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "ok")]), 0.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
+        assert_eq!(datagrams, [b"a:1|c".to_vec()], "no resend");
+    }
+
+    #[tokio::test]
+    async fn buffer_delivery_at_least_once_retries_an_ambiguous_failure() {
+        let (sums, datagrams) =
+            an_ambiguous_datagram_failure_through_write_loop(crate::test_support::at_least_once())
+                .await;
+        let sum_of = crate::test_support::sum_of;
+        assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "ambiguous")]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 0.0);
+        assert_eq!(
+            datagrams,
+            [b"a:1|c".to_vec(), b"a:1|c".to_vec(), b"b:1|c".to_vec()],
+            "the retry resends the whole batch, the datagram that landed included"
+        );
     }
 
     // -- Sink: TCP over TLS (module doc's "TLS" section) ----------------------------------------

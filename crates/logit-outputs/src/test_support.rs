@@ -1,6 +1,7 @@
 //! Receivers that sink tests send to: a TCP, TLS, or UDP collector that reports each message on
 //! a channel, [`http_recorder`] for the HTTP sinks, which records each request and answers it by
-//! its index, and the `testdata/tls` fixtures a TLS collector and client are built from. The
+//! its index, [`answers_once`] and [`answers_once_unix`], which answer one request and refuse the
+//! next connect, and the `testdata/tls` fixtures a TLS collector and client are built from. The
 //! attempt-accounting helpers run a sink through the real write loop and compare its counters;
 //! [`HUNG_REQUEST_BUDGET`] is the retry budget for an HTTP request that never answers. Also the
 //! stream doubles: [`FakeStream`] for the sinks' plaintext `Box<dyn AsyncStream>` seam,
@@ -951,6 +952,70 @@ pub(crate) async fn http_recorder(
     (addr, log)
 }
 
+/// A server that answers one request with `status` and `body`, then refuses every later
+/// connect. It stops listening once it accepted its one connection, before it replies, and the
+/// reply carries `Connection: close`, so a pooled client dials again for its next request and is
+/// refused. The log holds the one request it answered.
+pub(crate) async fn answers_once(status: u16, body: impl Into<Vec<u8>>) -> (SocketAddr, RecordLog) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log: RecordLog = Arc::default();
+    let (task_log, body) = (Arc::clone(&log), body.into());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(listener);
+        serve_one_request(stream, task_log, status, body).await;
+    });
+    (addr, log)
+}
+
+/// [`answers_once`] over a Unix socket bound at `path`: once it accepted its one connection it
+/// stops listening and removes the socket file, so a later connect fails.
+pub(crate) async fn answers_once_unix(
+    path: &std::path::Path,
+    status: u16,
+    body: impl Into<Vec<u8>>,
+) -> RecordLog {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    let log: RecordLog = Arc::default();
+    let (task_log, body, path) = (Arc::clone(&log), body.into(), path.to_path_buf());
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        serve_one_request(stream, task_log, status, body).await;
+    });
+    log
+}
+
+/// Serves HTTP/1.1 on `io`, recording each request and answering it with `status`, `body`, and
+/// `Connection: close`, which ends the connection after the first reply.
+async fn serve_one_request<IO>(io: IO, log: RecordLog, status: u16, body: Vec<u8>)
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use http_body_util::BodyExt as _;
+
+    let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+        let (log, body) = (Arc::clone(&log), body.clone());
+        async move {
+            let path = req.uri().path().to_string();
+            let received = req.into_body().collect().await.unwrap().to_bytes().to_vec();
+            log.lock().unwrap().push(Recorded { path, body: received });
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(status)
+                    .header(http::header::CONNECTION, "close")
+                    .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                    .unwrap(),
+            )
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(hyper_util::rt::TokioIo::new(io), svc)
+        .await;
+}
+
 /// A `127.0.0.1` address nothing listens on: a connect to it is refused.
 pub(crate) async fn refused_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -987,7 +1052,8 @@ pub(crate) fn bodies(log: &[Recorded], path: &str) -> Vec<Vec<u8>> {
     log.iter().filter(|r| r.path == path).map(|r| r.body.clone()).collect()
 }
 
-/// [`fast_retry`] under `delivery: at_least_once`, so an `Ambiguous` failure retries.
+/// [`fast_retry`] with `delivery: at_least_once` set as an override, so a test that retries an
+/// `Ambiguous` failure doesn't depend on the sink's default posture.
 pub(crate) fn at_least_once() -> logit_pipeline::WriteLoopConfig {
     logit_pipeline::WriteLoopConfig {
         delivery_override: Some(logit_pipeline::DeliveryPosture::AtLeastOnce),

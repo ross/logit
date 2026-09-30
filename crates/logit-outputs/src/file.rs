@@ -348,8 +348,9 @@ impl FileTarget {
     /// - Cascading or promoting a retained file: `retention_failure`, continue.
     ///
     /// A re-open failure is `Fault::Clean`: the batch provably reached no file, so a retry is safe
-    /// under either delivery posture, and a likely-transient ENOSPC/EMFILE-class failure isn't a
-    /// configuration error (`docs/adr/rotating-file-output.md`, "Retention").
+    /// under either delivery posture (`crate::stdio`'s module doc, "Delivery posture"), and a
+    /// likely-transient ENOSPC/EMFILE-class failure isn't a configuration error
+    /// (`docs/adr/rotating-file-output.md`, "Retention").
     pub async fn rotate(&mut self, diag: &mut Diagnostics) -> anyhow::Result<RotateOutcome> {
         self.rotate_inner(diag, open_active).await
     }

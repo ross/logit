@@ -153,11 +153,13 @@
 //! socket, so a receiver answering `500` with an endless body costs a snippet per retry, not a
 //! connection's worth of allocation ([`crate::http::read_body_prefix`]).
 //!
-//! [`RemoteWriteOutput::duplicate_safe`] is **`true`**. A sample's identity at a remote-write
-//! receiver is `(label set, timestamp)`, so replaying an identical request is an idempotent
-//! overwrite, never a double count. And `true` selects `DeliveryPosture::AtLeastOnce`
-//! (`logit_pipeline::output`), the only posture that retries a `Fault::Ambiguous`: `false` would
-//! turn every 5xx into a dropped batch, not make delivery safer.
+//! **Delivery posture.** Both modes keep the default, `at_least_once`
+//! (`docs/adr/delivery-semantics.md`, item 5), which retries an `Ambiguous` attempt such as a
+//! 5xx. This sink skips a delta outright ("Telemetry" below), so nothing it sends adds at a
+//! receiver: a sample's identity there is `(label set, timestamp)`, and a retry re-encodes the
+//! same events, so a resend overwrites. In registry mode `send` replaces in-memory state, so a
+//! resend changes nothing. `buffer.delivery: at_most_once` would turn every 5xx into a dropped
+//! batch without making delivery safer.
 //!
 //! **Ordering is the topology's, not this sink's.** Samples go out in batch order and nothing
 //! reorders across batches. Two upstream branches writing the same series can draw out-of-order
@@ -235,7 +237,7 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
-use logit_pipeline::{BatchContext, Fault, Output};
+use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output};
 use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
@@ -520,7 +522,7 @@ impl From<RemoteWriteOutput> for PrometheusOutput {
     }
 }
 
-/// Pure delegation: every contract, [`Output::duplicate_safe`]'s included, is the mode's. Every
+/// Pure delegation: every contract, [`Output::default_posture`]'s included, is the mode's. Every
 /// method is forwarded, [`Output::observe_batch`] too: `build_spec` boxes this enum, so a method
 /// left to the trait's default never reaches the mode (ADR `sink-send-path-and-attempt-accounting`,
 /// decision 2).
@@ -554,12 +556,10 @@ impl Output for PrometheusOutput {
         }
     }
 
-    /// The mode's own posture, which each mode's `duplicate_safe` explains. `buffer.delivery`
-    /// overrides this posture for the component.
-    fn duplicate_safe(&self) -> bool {
+    fn default_posture(&self) -> DeliveryPosture {
         match self {
-            PrometheusOutput::Expose(output) => output.duplicate_safe(),
-            PrometheusOutput::Send(output) => output.duplicate_safe(),
+            PrometheusOutput::Expose(output) => output.default_posture(),
+            PrometheusOutput::Send(output) => output.default_posture(),
         }
     }
 }
@@ -728,12 +728,6 @@ impl Output for ExposeOutput {
             server.abort();
         }
         Ok(())
-    }
-
-    /// `true`: `send` is an idempotent replace into an in-memory registry, so a redelivered batch
-    /// changes nothing.
-    fn duplicate_safe(&self) -> bool {
-        true
     }
 }
 
@@ -1040,14 +1034,6 @@ impl Output for RemoteWriteOutput {
     /// Nothing is buffered: `send` has issued its request, if any, before returning.
     async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(())
-    }
-
-    /// `true`. A sample's identity at a receiver is `(label set, timestamp)` and a retry
-    /// re-encodes the same events, so a replay is an idempotent overwrite. `true` also selects
-    /// `DeliveryPosture::AtLeastOnce` (`logit_pipeline::output`'s `from_duplicate_safe`), the only
-    /// posture that retries a 5xx's `Fault::Ambiguous`; `false` would drop every 5xx batch.
-    fn duplicate_safe(&self) -> bool {
-        true
     }
 }
 
@@ -1815,11 +1801,6 @@ mod tests {
         let response = get(&format!("{url}/metrics"), &[]).await;
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "");
-    }
-
-    #[tokio::test]
-    async fn send_is_duplicate_safe_because_it_only_replaces_in_memory_state() {
-        assert!(ExposeOutput::new("127.0.0.1:0").duplicate_safe());
     }
 
     // -- telemetry --------------------------------------------------------------------------
@@ -2640,17 +2621,6 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "neither hook touches the network");
     }
 
-    /// `true`, which selects `AtLeastOnce`, the only posture that retries a 5xx.
-    #[test]
-    fn the_sender_is_duplicate_safe_and_that_selects_at_least_once() {
-        let sink = RemoteWriteOutput::new("http://mimir:8080/api/v1/push");
-        assert!(sink.duplicate_safe());
-        assert_eq!(
-            logit_pipeline::DeliveryPosture::from_duplicate_safe(sink.duplicate_safe()),
-            logit_pipeline::DeliveryPosture::AtLeastOnce
-        );
-    }
-
     #[test]
     fn a_header_name_that_is_not_a_legal_http_header_is_rejected_at_construction() {
         // `let ... else`, not `expect_err`, which would need the sink to be `Debug`.
@@ -2677,14 +2647,14 @@ mod tests {
     async fn the_mode_enum_delegates_to_the_selected_half() {
         let (url, seen) = canned_receiver(StatusCode::OK, "").await;
         let mut sink: PrometheusOutput = RemoteWriteOutput::new(&url).into();
-        assert!(sink.duplicate_safe());
+        assert_eq!(sink.default_posture(), DeliveryPosture::AtLeastOnce);
         sink.bind().await.expect("a sender has nothing to bind");
         sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("2xx is Ok");
         sink.flush().await.expect("a sender has nothing to flush");
         assert_eq!(only(&seen).method, Method::POST);
 
         let mut sink: PrometheusOutput = ExposeOutput::new("127.0.0.1:0").into();
-        assert!(sink.duplicate_safe());
+        assert_eq!(sink.default_posture(), DeliveryPosture::AtLeastOnce);
         sink.bind().await.expect("the exposition half binds");
         sink.send(&fixture_batch()).await.expect("the exposition half never fails a send");
         sink.flush().await.expect("the exposition half aborts its accept loop");

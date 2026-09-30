@@ -1,14 +1,14 @@
 //! `splunk_hec_out` under the runtime's retry loop: a busy Splunk (`503` code 9) that hasn't
-//! taken any body of a batch is retried under the sink's default at-most-once posture, and the
-//! batch is delivered once. The graph and its `NodeSpec`s are built through `logit_pipeline`'s
+//! taken any body of a batch is `Clean`, so it's retried even under `buffer.delivery:
+//! at_most_once`, and the batch is delivered once. The graph and its `NodeSpec`s are built through `logit_pipeline`'s
 //! public API so the listener can be a test double that sends one batch and returns.
 
 use logit_config::{Component, Config};
 use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Value};
 use logit_outputs::splunk::{SplunkCompression, SplunkHecOutput};
 use logit_pipeline::{
-    graph, Fanout, Input, InputRuntimeConfig, NodeSpec, SinkQueueConfig, SinkStoreConfig,
-    WriteLoopConfig,
+    graph, DeliveryPosture, Fanout, Input, InputRuntimeConfig, NodeSpec, SinkQueueConfig,
+    SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::splunk::SplunkDecoder;
 use std::collections::HashMap;
@@ -131,7 +131,6 @@ async fn a_busy_splunk_is_retried_and_the_batch_delivered_once() {
 
     let output =
         SplunkHecOutput::new(endpoint, TOKEN).unwrap().with_compression(SplunkCompression::None);
-    assert!(!logit_pipeline::Output::duplicate_safe(&output), "the default posture: at-most-once");
     let specs: HashMap<String, NodeSpec> = HashMap::from([
         (
             "in".to_string(),
@@ -142,7 +141,10 @@ async fn a_busy_splunk_is_retried_and_the_batch_delivered_once() {
             NodeSpec::Output(
                 Box::new(output),
                 SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                WriteLoopConfig::default(),
+                WriteLoopConfig {
+                    delivery_override: Some(DeliveryPosture::AtMostOnce),
+                    ..WriteLoopConfig::default()
+                },
             ),
         ),
     ]);

@@ -852,6 +852,14 @@ a handshake delivering), so a rejection is never also a handshake. An idle close
 
 There's no frame or request counter. This input's unit of arrival is an HTTP request or a gRPC
 call, and `Fanout` already sees one batch per accepted request, so a counter would only restate it.
+
+`logit.input.batches.dropped{reason="closed_consumer"}` (count): every batch of a request that no
+consumer took, the refused one included, because every consumer of the listener has closed. The
+request is answered HTTP `503` with `Retry-After: 1` or gRPC status 14 (`UNAVAILABLE`), never a
+`partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also
+counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`;
+batches after it that were never offered appear only here.
+
 The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`
 (`crates/logit-proto/src/otlp/metrics.rs`).
@@ -874,7 +882,7 @@ like, and counting it would add one point per probe interval to this key forever
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
 | bind | `logit.input.write.duration` | timing | one per request, every exit included, which is why the count and the timer live in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
@@ -891,12 +899,17 @@ mirror. In `logit.input.writes`:
   `idle_timeout:` is set**, because the per-frame stall bound is derived from it and it's off by
   default. On a default `bind:` this class never fires, and a half-uploaded request holds its
   connection permit instead.
+- `closed_consumer` is a write no consumer took, answered `503`. Its samples aren't counted in
+  `logit.input.samples`, and `logit.input.batches.dropped{reason="closed_consumer"}` counts the
+  batch. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there
+  and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`.
 
 `logit.input.samples` counts the series a scrape decoded (one event per series) in scrape mode. In
-bind mode it counts the **wire samples** that reached the `Fanout`: every decoded series' samples,
-minus those of any series the model mapping then dropped. That's exactly the number the 2.0
-`X-Prometheus-Remote-Write-Samples-Written` header reports for that request, by design: a counter
-and a header disagreeing about one request would be a puzzle with no right answer.
+bind mode it counts the **wire samples** of a delivered write: every decoded series' samples,
+minus those of any series the model mapping then dropped. A write no consumer took counts none.
+That's the number the 2.0 `X-Prometheus-Remote-Write-Samples-Written` header reports for that
+request, by design: a counter and a header disagreeing about one request would be a puzzle with no
+right answer.
 `docs/known-gaps.md` tracks the unit difference as its own row.
 
 **The bind-mode metadata cache** is the one piece of cross-request state on this kind, and it
@@ -943,7 +956,8 @@ client, with no socket of its own.
 `Diagnostics` keys: `bound` (bind mode's listener), `scrape_failed` (scrape mode; the failing
 target's redacted URL appears in the message text only, never a tag), `write_rejected` (bind mode,
 every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
-tag-cardinality reason), and `connection_error` (never an idle close).
+tag-cardinality reason), `closed_consumer` (bind mode, a `503` for a write no consumer took), and
+`connection_error` (never an idle close).
 
 ##### `datadog_in`
 
@@ -961,12 +975,13 @@ arriving or which were refused.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy`, or `closed_consumer` (a `503` for a request no consumer took); `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
 | `logit.input.requests.acknowledged{route}` | count | a payload answered `2xx` and never sent: `host_metadata`, `metadata`, `collector`, `container`, and `orch` on every request, and `intake` for host metadata posted to `/intake/` |
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`: a batch is one or the other. See below |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of the request that no consumer took, the refused one included, answered `503`. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
 
 **A busy request is not a lost one.** When the pipeline doesn't accept a request's batches within
 5 seconds, the request gets `503` with `Retry-After: 1`, counted `class="busy"`, and its
@@ -988,7 +1003,7 @@ component's id.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
 rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and an API key never appears at all), and `busy` (a `503`).
+and an API key never appears at all), `busy` (a `503`), and `closed_consumer` (a `503`).
 
 ##### `datadog_trace_in`
 
@@ -1003,12 +1018,13 @@ has no counterpart for, so a `socket:`-only listener has none.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `traces_v03`, `traces_v04`, `traces_v05`, `traces_v07`, `stats_v06`, `info`, one of the `404` or stub routes below, or `unknown` |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy`, or `closed_consumer` (a `503` for a request no consumer took); `route` is `traces_v03`, `traces_v04`, `traces_v05`, `traces_v07`, `stats_v06`, `info`, one of the `404` or stub routes below, or `unknown` |
 | `logit.input.request.duration` | timing | one per request, every exit included |
 | `logit.input.request.bytes` | count | the body size as sent, once read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `unsupported_route` (`404`, also tagged `route`: `traces_v01`, `traces_v02`, `traces_v10`, `pipeline_stats`, `telemetry_proxy`, `remote_config`), `method` (`405`), `encoding` (`415`, anything but identity or gzip), `json_traces` (`415`, a JSON v0.3/v0.4 body), `oversize` (`413`), `stalled` (`408`), `body_read` (`413`), `malformed_encoding` (`400`), or `malformed` (`400`) |
 | `logit.input.requests.acknowledged{route}` | count | a stub's upload, answered `200` and discarded: `evp_proxy_v1`–`v4`, `profiling`, `debugger_v1_input`, `debugger_v1_diagnostics`, `debugger_v2_input`, `symdb`, `dogstatsd_v1_proxy`, `dogstatsd_v2_proxy`, `tracer_flare`, `openlineage` |
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of the request that no consumer took, the refused one included, answered `503`. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
 | `logit.input.spans` | count | spans delivered, counted once the batch is accepted |
 
 **A busy request is soon a lost one.** The wait is 2 seconds, not `datadog_in`'s 5, and a dd-trace
@@ -1021,7 +1037,7 @@ The codec's own counters are in the [`datadog` codec section](#datadog), under t
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a connect-and-close
 probe), `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
-appears in the message text only), `busy` (a `503`), `trace_count_mismatch` (an
+appears in the message text only), `busy` (a `503`), `closed_consumer` (a `503`), `trace_count_mismatch` (an
 `X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
 served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
 left out of the resource).
@@ -1038,11 +1054,12 @@ and the accept-queue gauges.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy` (a `503`: code 9 on a post, code 18 on `/health`); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy` (a `503`: code 9 on a post, code 18 on `/health`), or `closed_consumer` (no consumer took a batch: `503` code 9 for the first batch of a body, `500` code 8 for a later one); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), `malformed` (`400` code 6: a `/event` object the codec can't parse, after the objects before it were delivered, or an `/ack` body that isn't `{"acks":[…]}`), or `no_channel` (`400` code 10, an `/ack` request that names no channel) |
 | `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered, disjoint from `logit.component.batches.sent`. See below |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of the request that no consumer took, the refused one included, answered `503` code 9 for the first batch of a body and `500` code 8 for a later one. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
 | `logit.input.acks.issued` | count | `ackId`s issued, one per `200`, or code 6 after a delivered prefix, to a request that names a channel |
 | `logit.input.acks.polled{result}` | count | ids asked about on `/ack`: `acked` (answered `true`), or `unknown` (answered `false`: already reported, never issued on that channel, or dropped) |
 | `logit.input.acks.dropped{reason}` | count | ids issued and never reported: `expired` (more than `max_pending_acks` newer ids issued on the channel) or `evicted` (with its channel) |
@@ -1065,7 +1082,7 @@ submodules, under this component's id.
 
 `Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
 rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
-and a token never appears at all), and `busy` (a `503`).
+and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503` code 9 or `500` code 8).
 
 ##### `tail_in` and `docker_in`
 
@@ -1083,6 +1100,7 @@ own read-side counters:
 | `.files.rotated` / `.files.truncated` | count | a known path now naming another inode (each such path in a scan, so a rotation chain under a wildcard counts every renamed name), or the same inode shrinking |
 | `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
 | `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes hash differently, or the offset is past its length. The fingerprint comes from a checkpoint entry or a de-selection retention. Decision 2 of the same ADR |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch no consumer took, the refused one included. The driver then stops writing the checkpoint, which stays at the last one written (at or before the last line a consumer took), and stops. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
 | `.checkpoint.writes` | count | only on an actual write; `checkpoint_interval` ticks that find nothing dirty record nothing |
 | `.checkpoint.errors{op="load"\|"write"}` | count | `load`: a checkpoint present but unusable at startup (unreadable, malformed, empty, wrong version, or missing beside a stray `.tmp`), after which every file present starts at its beginning; `write`: a failed durable write, retried on the next tick |
 | `.watch.wakes{source="inotify"\|"poll"}` | count | which wake source fired |
@@ -1107,6 +1125,7 @@ the property the minimal-watch-set design is for.
 | `scan_error` | A `scan`'s `read_dir` or `stat` failed, carrying the first failing path, its error, and how many failed in that scan. One per `.scan.errors` point. |
 | `resume_rejected` | A resume refused (a short file, a head mismatch, or an offset past the end), naming the path and the offset it would have sought to. One per `.files.resume_rejected` point. |
 | `truncated` | A tracked file whose length fell below the tracked offset, so it restarts at `0` with its splitter and decoder state reset. One per `.files.truncated` point; the message carries the pre-truncation offset. |
+| `closed_consumer` | No consumer took a batch. The driver stops and its node finishes; a restart resumes at the frozen checkpoint. |
 | `checkpoint_error` | Loading or writing the checkpoint file itself, one per `.checkpoint.errors` point. A write failure names the step that failed. |
 | `watch_error` | The one-shot cases: `auto` falling back to polling; a *file* watch that failed, which isn't retried (the file is still tailed, at `poll_interval`); or the `inotify` wake source itself becoming unusable, after which the listener runs poll-only. |
 | `watch_dir_error` | A directory watch that failed, carrying the errno. Its own key because it's retried, and so re-counted, on every later `scan` while the directory is missing, and `warn_throttled` logs a key only at powers of two of its count. Sharing a key would silence the one-shot cases above. |
@@ -1144,6 +1163,11 @@ the property the minimal-watch-set design is for.
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
   `logit.proto.errors{reason="handshake"}` or any other diagnostic.
+
+- `logit.input.batches.dropped{reason="closed_consumer"}` (count): the frame no consumer took,
+  answered `Reject{GOING_AWAY, "no consumer took the batch"}` before the connection closes, and
+  never acknowledged. Not disjoint from `logit.component.batches.sent`: the refused batch is also
+  counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`.
 
 `Diagnostics` keys: `bound`, `decode_budget` (a batch refused by its decode budget, naming the
 budget and `max_frame_bytes`), and `connection_error` (any other connection failing; never an

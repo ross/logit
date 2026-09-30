@@ -105,10 +105,18 @@
 //! batch delivered; it saw no answer, so its retry duplicates the body, the ordinary at-least-once
 //! outcome.
 //!
+//! **A batch no consumer takes is refused.** When every consumer of the listener has closed, a
+//! refused first batch is answered as busy is (`503` code 9, `Retry-After: 1`, nothing of the
+//! body taken) but counted `closed_consumer`, and leaves `/health` alone: a closed downstream
+//! doesn't drain. A refused later batch is answered `500` code 8 with no `ackId` drawn, ahead of
+//! any code 6 the body would have earned; the batches before it were delivered, so a client's
+//! retry repeats them. Either way `logit.input.batches.dropped{reason="closed_consumer"}` counts
+//! the refused batch and every one after it.
+//!
 //! # Telemetry
 //!
 //! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (class `ok`,
-//! `rejected`, or `busy`; route `event`, `raw`, `ack`, `health`, or `unknown`),
+//! `rejected`, `busy`, or `closed_consumer`; route `event`, `raw`, `ack`, `health`, or `unknown`),
 //! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the body
 //! size as sent, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
 //! `unknown_route`, `method`, `oversize`, `query_token`, `auth`, `encoding`,
@@ -116,7 +124,8 @@
 //! that failed for a reason other than its size, such as a client disconnecting mid-upload). A code
 //! 6 that follows a delivered prefix is `class="rejected"`, `reason="malformed"`, and its objects
 //! are counted where any delivered batch's are, on the listener's fanout edge.
-//! `logit.input.batches.dropped{reason="busy"}` counts the batches a `503` left undelivered.
+//! `logit.input.batches.dropped{reason}` (`busy` or `closed_consumer`) counts the batches a `503`
+//! or a closed-consumer `500` left undelivered.
 //! Acknowledgment: `logit.input.acks.issued`, `logit.input.acks.polled{result}` (`acked`, or
 //! `unknown` for an id not pending on the polled channel), `logit.input.acks.dropped{reason}`
 //! (`expired` past `max_pending_acks`, `evicted` with its channel), and
@@ -127,7 +136,7 @@
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_detached, deliver_with_deadline, drive_with_idle, is_length_limit, json_response,
-    matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
+    matches_any_key, now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::Input;
 use base64::Engine as _;
@@ -949,29 +958,39 @@ async fn respond(
         let total = batches.len();
         let mut batches = batches.into_iter();
         let first: Vec<EventBatch> = batches.by_ref().take(1).collect();
-        if deliver_with_deadline(&shared.sink, first, shared.busy_after).await.is_ok() {
-            // Only a delivery clears a busy `/health`: a body the codec skipped whole says
-            // nothing about the pipeline.
-            shared.health.mark_accepted();
-            deliver_detached(&shared.sink, batches.collect()).await;
-        } else {
-            shared.telemetry.count(
-                "logit.input.batches.dropped",
-                total as f64,
-                &[("reason", "busy")],
-            );
-            shared.diag.clone().warn_throttled(
-                "busy",
-                format_args!(
-                    "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
-                     within {:?}",
-                    shared.peer, shared.busy_after
-                ),
-            );
-            shared.health.mark_busy();
-            let mut response = hec_response(HecStatus::SERVER_BUSY);
-            response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-            return (name, BUSY, response);
+        match deliver_with_deadline(&shared.sink, first, shared.busy_after).await {
+            Ok(()) => {
+                // Only a delivery clears a busy `/health`: a body the codec skipped whole says
+                // nothing about the pipeline.
+                shared.health.mark_accepted();
+                if let Err(undelivered) = deliver_detached(&shared.sink, batches.collect()).await {
+                    // Before the `ackId` draw, so a refused body mints no id.
+                    count_closed(shared, undelivered.count());
+                    let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
+                    return (name, undelivered.reason(), response);
+                }
+            }
+            Err(Undelivered::Busy(_)) => {
+                shared.telemetry.count(
+                    "logit.input.batches.dropped",
+                    total as f64,
+                    &[("reason", "busy")],
+                );
+                shared.diag.clone().warn_throttled(
+                    "busy",
+                    format_args!(
+                        "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
+                         within {:?}",
+                        shared.peer, shared.busy_after
+                    ),
+                );
+                shared.health.mark_busy();
+                return (name, BUSY, server_busy());
+            }
+            Err(undelivered @ Undelivered::Closed(_)) => {
+                count_closed(shared, total);
+                return (name, undelivered.reason(), server_busy());
+            }
         }
     }
     // Drawn once from the channel's ledger, for a `200` or a delivered prefix's code 6 alike.
@@ -980,6 +999,31 @@ async fn respond(
         return (name, REJECTED, reject_hec_error(shared, &err, ack_id));
     }
     (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
+}
+
+/// `503` code 9 with `Retry-After: 1`: nothing of the body was taken, so the client resends it
+/// whole.
+fn server_busy() -> http::Response<Full<Bytes>> {
+    let mut response = hec_response(HecStatus::SERVER_BUSY);
+    response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+/// Counts `n` batches of a body that no consumer took and reports it through the throttled
+/// `closed_consumer` diagnostic.
+fn count_closed(shared: &Shared, n: usize) {
+    shared.telemetry.count(
+        "logit.input.batches.dropped",
+        n as f64,
+        &[("reason", "closed_consumer")],
+    );
+    shared.diag.clone().warn_throttled(
+        "closed_consumer",
+        format_args!(
+            "splunk_hec_in: refused a body from {}: no consumer took a batch",
+            shared.peer
+        ),
+    );
 }
 
 /// Issues `channel`'s next `ackId` and counts it, with anything the ledger's bounds dropped.
@@ -1559,6 +1603,73 @@ mod tests {
         // The `503` post and the two busy `/health` answers.
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 3.0);
         assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+    }
+
+    /// A first batch no consumer takes is answered as a full downstream is, but counted
+    /// `closed_consumer`, and leaves `/health` alone.
+    #[tokio::test]
+    async fn a_first_batch_no_consumer_takes_is_503_code_9_and_leaves_health_alone() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let input = SplunkHecInput::new("127.0.0.1:0").with_telemetry(telemetry);
+        let (addr, rx) = start(input, 16).await;
+        drop(rx);
+        let channel = "X-Splunk-Request-Channel: c\r\n";
+
+        let response = post_raw(&addr, "/services/collector/event", channel, ONE_EVENT).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("retry-after: 1\r\n"), "{response}");
+        assert_eq!(body_of(&response), r#"{"text":"Server is busy","code":9}"#);
+
+        let response = request_raw(&addr, "GET", "/services/collector/health", "", b"").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "a closed downstream is not busy: {response}"
+        );
+
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(
+            events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
+        );
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.acks.issued", &[]), 0.0);
+    }
+
+    /// The consumer closes after the body's first batch is in: the refused second batch is a
+    /// `500` code 8 that draws no `ackId`, and counts itself.
+    #[tokio::test]
+    async fn a_later_batch_no_consumer_takes_is_500_code_8_and_draws_no_ack_id() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let input = SplunkHecInput::new("127.0.0.1:0").with_telemetry(telemetry);
+        let (addr, rx) = start(input, 1).await;
+        let body = b"{\"host\":\"a\",\"event\":\"1\",\"time\":1}\
+                     {\"host\":\"b\",\"event\":\"2\",\"time\":2}";
+        let channel = "X-Splunk-Request-Channel: c\r\n";
+        let request = tokio::spawn({
+            let addr = addr.clone();
+            async move { post_raw(&addr, "/services/collector/event", channel, body).await }
+        });
+
+        // The one slot holds the first batch, so the handler is now at the second.
+        logit_pipeline::test_util::wait_until("the first batch is queued", || rx.len() == 1).await;
+        drop(rx);
+
+        let response = request.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+        assert!(body_of(&response).contains(r#""code":8"#), "{response}");
+        assert!(!body_of(&response).contains("ackId"), "{response}");
+
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(
+            events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
+        );
+        assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
+        assert_eq!(events.sum("logit.input.acks.issued", &[]), 0.0);
     }
 
     #[tokio::test]

@@ -232,6 +232,35 @@ To tune it, add a `buffer:` block to the sink; see the commented example in
 `buffer:` on anything but a sink. Every field has a default, so omitting `buffer:` gives the values
 in this section. To make the queue survive a restart, see [Durable buffering](#durable-buffering).
 
+### Default delivery posture
+
+Every sink defaults to `at_least_once`: it retries a failure whose outcome is unknown (a timeout,
+a `5xx`, a `429`, or a failure after part of a batch was written) for up to `retry_budget`, and
+the destination may receive the batch twice. `statsd_out` is the one exception and defaults to
+`at_most_once`, because a statsd line has no timestamp: a resent counter has no identity at its
+destination, so the resend adds to it. Set `buffer.delivery: at_most_once` on any other sink to
+drop a batch on its first ambiguous failure instead of risking a duplicate
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5).
+
+A resend is harmless where the destination overwrites on identity: a sample at its
+`(series, timestamp)`, or a cumulative sum. A log or a span arrives twice. A resend double-counts
+where the destination aggregates the kind it carries:
+
+- **A remedy exists upstream.** Put an `aggregate` with `temporality: cumulative` in front of the
+  sink, so it sends a running total that a resend repeats instead of adds. That covers a delta
+  `Sum` or `Histogram` at `otlp_out` and `splunk_hec_out`, and a delta `Sum` at `collectd_out`.
+- **No remedy exists.** `datadog_out`'s distribution points and sketches, the APM stats
+  `datadog_out` and `datadog_trace_out` relay, and a delta `ExponentialHistogram` have no
+  cumulative form. Accept the double count, or set `buffer.delivery: at_most_once` on that sink
+  and accept the loss instead.
+
+**A destination that fails ambiguously on every attempt holds the queue head.** Under
+`at_least_once`, each batch is retried for up to `retry_budget` (60s by default) before it's
+dropped, where an `at_most_once` sink drops it at once. With the default `overflow: block`, a
+queue that fills behind that batch backs up into the inputs. Watch
+`logit.component.buffer.utilization`, and lower `retry_budget` or choose a `drop_*` policy if
+intake matters more than the batch.
+
 ### Sink failure semantics: degrade to dropping, don't exit
 
 A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
@@ -305,6 +334,18 @@ spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)).
 delivery from the last persisted read cursor and replays at most the batches committed since the
 last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes.
 
+**A crash replays a window, under either posture.** After a crash, the spool replays the batch
+that was in flight and every batch committed since the last cursor write. The cursor is written
+when a commit lands once `checkpoint_interval` has passed since the previous write, on a segment
+roll, at open, and at shutdown, with no timer. So the window is whatever committed within
+`checkpoint_interval` after the last write, and after an idle period that write can be any age.
+The window includes batches the sink delivered and batches it dropped as ambiguous.
+`buffer.disk:` with `delivery: at_most_once` is valid: the posture governs the retry of an
+unknown outcome while the process runs, and `at_most_once` then holds across a graceful restart,
+which persists the cursor. A spool under `statsd_out`, or under a sink whose destination
+aggregates a resend, can replay counters from a crash window
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 8).
+
 ```yaml
 buffer:
   disk:
@@ -360,7 +401,9 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
 the `reason`s `frame_too_large`, `disk_corrupt`, `disk_full`, and `disk_io_error`; and a
-disk-backed sink never emits `reason="shutdown"`, because it drops nothing at shutdown. Also watch:
+disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
+off a write in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
+shutdown, because the spool keeps it. Also watch:
 
 - `logit.component.buffer.disk.segments` (gauge): segment files currently on disk.
 - `logit.component.buffer.disk.replayed` (count): records found between the resume point and the
@@ -491,7 +534,8 @@ resident (`docs/design/performance.md` §7). On small-datagram traffic the 1024 
 and there is rarely a reason to go near it.
 
 **It widens one shutdown loss.** A shutdown that lands while the reader is handing a batch to a full
-queue drops what the reader still holds, uncounted: up to `read_batch` datagrams instead of one.
+queue drops what the reader still holds: up to `read_batch` datagrams instead of one. The listener
+counts them as `logit.component.datagrams.dropped` and `bytes.dropped` with `reason="shutdown"`.
 The loss is bounded and happens only on the shutdown path.
 
 A `read_batch` larger than `receive.max_datagrams` is legal. A batch that can't fit is admitted
@@ -1002,8 +1046,7 @@ one:
   attempt) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a
   climbing count means the peer or the network is unstable. TCP sends through the same connection
   handling as `statsd_out` and `syslog_out`.
-- **Retries rely on whisper's semantics.** This is the first non-HTTP sink with a real destination
-  to report `duplicate_safe: true` (`null_out` reports it trivially, having no destination):
+- **Retries rely on whisper's semantics.** The sink uses the default `at_least_once` posture:
   whisper is last-write-wins per `(path, second)`, so a datapoint redelivered on retry overwrites
   itself with the same number instead of double-counting, unlike a collectd COUNTER or a statsd
   `|c`. That argument holds for whisper's storage, not the carbon wire protocol in general: a
@@ -1048,7 +1091,7 @@ components:
   no such proof, because rustls may already have put complete records on the wire, so every failure
   at or after the first write is `Fault::Ambiguous` and the batch is never resent
   ([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment). That is deliberately conservative:
-  `statsd_out` reports `duplicate_safe: false` because a redelivered `hits:5|c` *increments the
+  `statsd_out` defaults to `at_most_once` because a redelivered `hits:5|c` *increments the
   destination counter a second time*. Watch `logit.component.batches.dropped` accordingly.
 - **What to watch.** `logit.output.requests{class="ok"|"clean"|"ambiguous"|"permanent"}` (one per
   attempt, tagged with its fault class) and, on TCP, `logit.output.reconnects`, which should stay near zero in steady state; a climbing count means the
@@ -1164,6 +1207,13 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 `checkpoint_interval` or one 64 KiB chunk per file, whichever is more. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+**A closed downstream stops the tailer.** When no consumer takes a batch, `tail_in`/`docker_in`
+stops at the first refused batch and stops writing the checkpoint, and the node finishes. The
+checkpoint on disk is the last one written, at or before the last line a consumer took, up to one
+`checkpoint_interval` of lines behind it. A restart resumes there and may replay lines a consumer
+already took. It's counted
+`logit.input.batches.dropped{reason="closed_consumer"}`.
 
 Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
 directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
@@ -1473,6 +1523,13 @@ directly from a page on a different origin, can't reach it at all. Put a reverse
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
 (`docs/known-gaps.md`).
 
+## `otlp_in`: a request no consumer took
+
+When every consumer directly downstream of `otlp_in` has closed, which happens as a shutdown tears
+the graph down, a request is refused: HTTP `503` with `Retry-After: 1`, or gRPC status 14
+(`UNAVAILABLE`). Both are retryable, and OTLP exporters retry them. It's counted
+`logit.input.batches.dropped{reason="closed_consumer"}`.
+
 ## `datadog_in`: standing in for Datadog's intake
 
 To choose between this and the other Datadog topologies, and for the rules that lose data when
@@ -1559,6 +1616,9 @@ timeout, and then the same retry.
   payload, and a `503` partway through means the retry delivers the batches already delivered
   before the deadline again. Datadog's own intake has the same shape: a resent series point
   overwrites, a resent log or span duplicates.
+- **A request no consumer took gets the same `503` with `Retry-After: 1`**, counted
+  `logit.input.requests{class="closed_consumer"}`. It happens once every consumer directly
+  downstream has closed, and the Agent's retry delivers the payload after a restart.
 - **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
   with its Agents, and the Agents' retry queues are absorbing the difference.
   `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
@@ -1636,7 +1696,8 @@ seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
 `logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
 minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
 window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
-decision 11 is loss.
+decision 11 is loss. A request no consumer took (every consumer directly downstream has closed)
+gets the same `503` with `Retry-After: 1`, counted `logit.input.requests{class="closed_consumer"}`.
 Prevent it downstream: give the sinks this listener feeds a `buffer:` (memory, or `disk:` for a
 long outage) large enough to absorb a stall, so the channel `datadog_trace_in` sends into keeps
 draining.
@@ -1733,12 +1794,12 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 event, and a route over its size cap is split), sent one after another. The first that fails
 stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
 and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
-retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded. A trial
-org stored a resent series point once, the last write winning at its `(series, timestamp)`, and an
-identical log twice. Assume every other route (distribution points, sketches, events, checks,
-traces, stats) stores a resend again: none was measured. So the default is at-most-once and a
-`5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to retry instead and accept those
-duplicates.
+retried. A retry re-sends the requests that succeeded, so the default posture, `at_least_once`,
+can deliver a resend. A trial org stored a resent series point once, the last write winning at
+its `(series, timestamp)`, and an identical log twice. Assume every other route (distribution
+points, sketches, events, checks, traces, stats) stores a resend again: none was measured.
+Distribution points, sketches, and stats add on a resend and have no upstream remedy. Set
+`buffer: {delivery: at_most_once}` to drop the batch on a `5xx` instead.
 
 **Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
 is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
@@ -1829,9 +1890,11 @@ Agent's `max_request_bytes`. A trace too large to send alone is dropped and coun
 
 **Delivery.** Traces go first, then stats. The first request that fails stops the rest, and the
 batch is retried or dropped as one. `408`, `429`, `5xx`, and timeouts are retryable; a refused
-connection or a missing socket file is retried as a clean failure; any other `4xx` isn't retried.
-The sink isn't duplicate-safe (an Agent dedupes nothing), so the default is at-most-once; `buffer:
-{delivery: at_least_once}` retries and accepts duplicates. A `buffer:` here is also what keeps
+connection or a missing socket file is retried under every posture before any request of the
+batch was accepted, and after one is retryable like a timeout; any other `4xx` isn't retried.
+An Agent dedupes nothing, so under the default `at_least_once` posture a resend stores its spans
+twice and adds its stats; `buffer: {delivery: at_most_once}` drops the batch on a `5xx` instead. A
+`buffer:` here is also what keeps
 `datadog_trace_in` from answering tracers `503` while the Agent is unreachable.
 
 **What to watch.** `logit.output.requests{route, class}` (`route` is `traces` or `stats`),
@@ -1913,10 +1976,18 @@ seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
 `logit.input.requests{class="busy"}`, and its batches `logit.input.batches.dropped{reason="busy"}`.
 Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
 decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
-without a deadline and the request gets `200`, so a retry never repeats part of a body. From that
-answer until a later request's data is taken, for at most 5 seconds,
+without a deadline and the request gets `200`, so a retry never repeats part of a body. From a
+busy `503` until a later request's data is taken, for at most 5 seconds,
 `/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
 Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
+
+**A pipeline whose consumers have closed refuses the body.** Once every consumer directly
+downstream of `splunk_hec_in` has closed, which happens as a shutdown tears the graph down, a
+request whose first batch no consumer takes gets `503` code 9 with `Retry-After: 1`, and `/health`
+is left alone. If the consumers close after the first batch was taken, the request gets `500` code
+8 with no `ackId`, and a retry repeats the batches already taken. Both are counted
+`logit.input.requests{class="closed_consumer"}` and
+`logit.input.batches.dropped{reason="closed_consumer"}`.
 
 **What to watch.** `logit.input.requests{route, class}` shows which routes arrive and how they're
 answered, and `logit.input.requests.rejected{reason}` why a `4xx` happened: `auth` for a token
@@ -1985,9 +2056,8 @@ object Splunk names, counted `records.dropped{reason="invalid_event"}`, and rese
 that body once. A code 6 naming the first object of a body over 5 MiB is Splunk Cloud's oversize
 answer instead: the sink splits the body in two and sends each half, or drops a lone object,
 counted `records.dropped{reason="oversize"}`. The first failing request stops the rest of the
-batch, and the sink isn't duplicate-safe, since Splunk indexes a resent event twice. So the default
-posture is at-most-once, and a `500` drops the batch; `buffer: {delivery: at_least_once}` retries
-it and accepts duplicates.
+batch. Under the default `at_least_once` posture a `500` is retried, and Splunk indexes a resent
+event twice; `buffer: {delivery: at_most_once}` drops the batch instead.
 
 **Acknowledgment.** With `ack: true`, the sink polls `/services/collector/ack` after the last body
 of a batch is accepted, until Splunk confirms every request or `ack_timeout` (30s by default)
@@ -2046,6 +2116,11 @@ mid-upload** is derived from it. With `idle_timeout:` unset, a half-uploaded req
 listener's 1024 connection permits until the sender goes away, and the stalled body never gets its
 `408`. Size it above the senders' longest normal gap; `60s` is comfortable for Prometheus's default
 `remote_timeout` of 30s.
+
+**A write no consumer took gets `503`.** Once every consumer directly downstream of the receiver
+has closed, the receiver answers `503` rather than `204`, so the sender keeps the write in its WAL
+and resends it. It's counted `logit.input.writes{class="closed_consumer"}`, and
+`logit.input.samples` doesn't count that write's samples.
 
 A Prometheus writing into the receiver needs only its own `remote_write:` block. It is the sender,
 so no server-side flag is involved:
@@ -2185,9 +2260,10 @@ meaningful value on either product, write `scope.name` and `scope.version` in a 
 
 **Send traces to VictoriaTraces over HTTP, not gRPC.** VictoriaTraces's gRPC listener closes every
 connection about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`. A request in flight
-at that moment fails as ambiguous, because the server may have processed it, and `otlp_out` is
-at-most-once by default, so it drops that batch. `buffer: { delivery: at_least_once }` retries it
-instead, at the cost of a duplicate span whenever VictoriaTraces had stored the first attempt. The
+at that moment fails as ambiguous, because the server may have processed it, and `otlp_out`'s
+default `at_least_once` posture retries it, at the cost of a duplicate span whenever
+VictoriaTraces had stored the first attempt. `buffer: { delivery: at_most_once }` drops the batch
+instead. The
 HTTP endpoint has neither problem (`docs/known-gaps.md`'s OTLP section has the row).
 
 ### Sending with `compression: zstd`
@@ -2502,20 +2578,21 @@ listener"](#idle_timeout-on-a-tcp-listener) above. Before that close, the `logit
 `Reject{GOING_AWAY, "idle for <dur>"}`, and it probes for exactly that signal before reusing a
 pooled connection, so an idle-timed-out `logit_in` costs `logit_out` a reconnect, not a lost batch.
 
-**A `logit_in` at its connection cap can cost a batch under the default delivery posture.** A peer
+**A `logit_in` at its connection cap can cost a duplicate under the default delivery posture.** A peer
 that gets `Reject{code: REJECT_INTERNAL}` never classifies it `permanent`:
 
 - At the handshake, with nothing of the batch written yet, it's `clean`, and the batch is retried
   within `retry_budget`.
 - Once a frame has left on that connection, it's `ambiguous`. Under `logit_out`'s default
-  `at_most_once` posture that isn't retried: the batch is dropped and counted, and only the
-  connection recovers.
+  `at_least_once` posture it's retried within `retry_budget`. Until the native hop deduplicates
+  (`docs/plans/delivery-semantics.md`, W5), a resend after a lost `Ack` reaches `logit_in`'s
+  consumers twice. Set `buffer.delivery: at_most_once` on the `logit_out` component to avoid the
+  duplicate at the cost of that batch, which is then dropped and counted.
 
-Either way the sink reconnects on its own once the peer has capacity, with no operator action. To
-risk a duplicate instead of losing that batch, set `buffer.delivery: at_least_once` on the
-`logit_out` component. `Reject{code: REJECT_GOING_AWAY}`, from the peer's own shutdown or an idle
-close, is different: `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean`
-even after a frame left, and the batch is resent under either posture.
+Either way the sink reconnects on its own once the peer has capacity, with no operator action. `Reject{code: REJECT_GOING_AWAY}` is different. It has three causes: the peer's own shutdown, an
+idle close, and no consumer taking the frame (every consumer directly downstream of `logit_in` has
+closed). `logit_in` writes it only for a frame it hasn't forwarded, so it's `clean` even after a
+frame left, and the batch is resent under either posture: `logit_out` redials and resends it.
 
 **A `HelloAck` that doesn't answer the `Hello` is permanent.** A peer that acks another protocol
 version, or a codec or compression this sink didn't offer, fails every attempt `permanent`, like a

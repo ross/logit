@@ -23,11 +23,11 @@
 //! - A `Reject`: [`reject_is_permanent`] decides, not where it arrives.
 //!   `REJECT_VERSION_MISMATCH`/`REJECT_NO_COMMON_CODEC`/`REJECT_FRAME_TOO_LARGE` would recur
 //!   identically, so `Permanent`. Any other code (`REJECT_INTERNAL`, the peer at its connection
-//!   cap; `REJECT_GOING_AWAY`, the peer shutting down or closing an idle connection; a code a
-//!   newer peer adds) is transient: `Clean` at the handshake. After a data frame left,
-//!   `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only before the frame it answers
-//!   is forwarded (its module doc's "Shutdown"), so the batch never landed and is resent at any
-//!   delivery posture. Any other transient code there is `Ambiguous`.
+//!   cap; `REJECT_GOING_AWAY`, the peer shutting down, closing an idle connection, or finding no
+//!   consumer to take a frame; a code a newer peer adds) is transient: `Clean` at the handshake.
+//!   After a data frame left, `REJECT_GOING_AWAY` is still `Clean`: `logit_in` writes it only for
+//!   a frame it didn't forward (its module doc's "Shutdown"), so the batch never landed and is
+//!   resent at any delivery posture. Any other transient code there is `Ambiguous`.
 //! - A batch over the sanity cap or the peer's `max_frame_bytes`, or a compressed frame over
 //!   `frame::compressed_bound` of that: `Permanent`, nothing written, a pooled connection kept.
 //! - **Write phase**: any failure before the frame is completely written and flushed (a write
@@ -40,7 +40,12 @@
 //! - **Ack wait**: a timeout, a read error, a message other than `Ack` or `Reject`, or a
 //!   mismatched `Ack.seq`: `Ambiguous`, and the connection is dropped.
 //!
-//! `duplicate_safe()` is `false`: the receiver has no dedupe identity.
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt. `logit_in` has no dedupe identity yet and forwards a frame
+//! before it acks it, so a resend after a lost `Ack` reaches `logit_in`'s consumers twice, and a
+//! `statsd_out` or an aggregated kind behind it double-counts. The native hop's deduplication
+//! (`docs/plans/delivery-semantics.md`, W5) closes that; until then `buffer.delivery:
+//! at_most_once` avoids it at the cost of the batch.
 //!
 //! **Close.** `Output::flush`, called once after the last batch, shuts the pooled connection
 //! down, which under TLS sends `close_notify`. A connection dropped after a failed or cancelled
@@ -437,9 +442,10 @@ impl LogitOutput {
         let ack = match ack_result {
             Ok(Ok(control::ControlMessage::Ack(ack))) => ack,
             Ok(Ok(control::ControlMessage::Reject(reject))) => {
-                // `logit_in` writes `GOING_AWAY` only before a frame is forwarded, so in place of
-                // the `Ack` it means this batch never landed: `Clean`. Any other transient code
-                // after the frame left is `Ambiguous`.
+                // `logit_in` writes `GOING_AWAY` only for a frame it didn't forward (shutdown, an
+                // idle close, or no consumer taking it), so in place of the `Ack` it means this
+                // batch never landed: `Clean`. Any other transient code after the frame left is
+                // `Ambiguous`.
                 let fault = if reject_is_permanent(reject.code) {
                     Fault::Permanent
                 } else if reject.code == control::REJECT_GOING_AWAY {
@@ -502,12 +508,6 @@ impl Output for LogitOutput {
             let _ = tokio::time::timeout(self.timeout, conn.stream.shutdown()).await;
         }
         Ok(())
-    }
-
-    /// `false`: `logit_in` forwards a frame before it acks it, so a resend after a lost ack
-    /// forwards the batch twice. `buffer.delivery` overrides this posture for the component.
-    fn duplicate_safe(&self) -> bool {
-        false
     }
 }
 
@@ -689,7 +689,7 @@ mod tests {
     // the condition under test, which paused time can't produce.
 
     /// A batch sent after `logit_in`'s `idle_timeout:` closed the pooled connection lands: one
-    /// reconnect and no `ambiguous` request, which at-most-once would have dropped.
+    /// reconnect and no `ambiguous` request, which `at_most_once` would have dropped.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost(
     ) {
@@ -1756,7 +1756,7 @@ mod tests {
     /// A TLS write returns with ciphertext still queued in the session, and a waiting ack read
     /// never sends it (`crate::stream_pins`). A frame larger than the socket can take at once
     /// reaches the peer only through the flush after it; without one the peer never holds the
-    /// frame, the ack wait times out `Ambiguous`, and at-most-once drops a batch the peer never
+    /// frame, and the ack wait times out `Ambiguous`: `at_most_once` drops a batch the peer never
     /// received.
     #[tokio::test]
     async fn a_tls_frame_larger_than_the_socket_buffer_is_flushed_before_the_ack_wait() {

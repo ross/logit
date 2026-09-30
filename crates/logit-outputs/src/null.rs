@@ -24,10 +24,9 @@
 //! `logit.component.events.received`, and `logit.component.send.duration` still count every batch.
 //! This sink emits nothing of its own.
 //!
-//! ## Faults and duplicate safety
+//! ## Faults
 //!
-//! [`NullOutput::send`] never fails. [`NullOutput::duplicate_safe`] is `true`: there's no
-//! destination to double-write to.
+//! [`NullOutput::send`] never fails, so its delivery posture, the default, never comes into play.
 
 use logit_core::EventBatch;
 use logit_pipeline::Output;
@@ -41,12 +40,6 @@ impl Output for NullOutput {
     /// Drops `batch` and returns `Ok`.
     async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
         Ok(())
-    }
-
-    /// No destination to double-write to. `buffer.delivery` overrides this posture for the
-    /// component.
-    fn duplicate_safe(&self) -> bool {
-        true
     }
 }
 
@@ -65,10 +58,5 @@ mod tests {
         let mut output = NullOutput;
         assert!(output.send(&batch(vec![Event::empty(0, AttrMap::new())])).await.is_ok());
         assert!(output.send(&batch(vec![])).await.is_ok());
-    }
-
-    #[test]
-    fn null_out_is_duplicate_safe() {
-        assert!(NullOutput.duplicate_safe());
     }
 }

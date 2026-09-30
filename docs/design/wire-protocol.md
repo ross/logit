@@ -378,12 +378,13 @@ decision record.
 - **The body is read once.** `logit_in` reads a frame's body into one buffer sized from the header,
   after a copy of the header, and verifies it in place. Peak memory for a frame is one
   `24 + compressed_len` buffer.
-- **`GOING_AWAY` means not forwarded.** `logit_in` writes every `Reject`, `GOING_AWAY` included,
-  before the frame it answers is forwarded; after forwarding, the only write is that frame's `Ack`.
-  A shutdown or idle close that finds a frame still in the socket buffer answers it `GOING_AWAY`
-  and drops it unread. So `logit_out` treats `GOING_AWAY` in place of an `Ack` as a clean fault
-  and resends the batch at any delivery posture. An EOF, reset, or ack timeout after a frame left
-  stays ambiguous: the batch may have been forwarded.
+- **`GOING_AWAY` means not forwarded.** `logit_in` writes a `Reject`, `GOING_AWAY` included, only
+  for a frame it hasn't forwarded; after forwarding, the only write is that frame's `Ack`.
+  `GOING_AWAY` has three causes: a shutdown or an idle close, either of which drops a frame still
+  in the socket buffer unread, and a frame no consumer took (every direct consumer of `logit_in`
+  has closed), after which the connection closes. So `logit_out` treats `GOING_AWAY` in place of
+  an `Ack` as a clean fault, redials, and resends the batch at any delivery posture. An EOF,
+  reset, or ack timeout after a frame left stays ambiguous: the batch may have been forwarded.
 - **A frame is whole or not held.** `logit_in` reads the whole frame and checks its CRC before it
   decodes or forwards anything, so a `logit_out` write or flush that fails part-way through a
   frame is a clean fault, although bytes of the frame may have left. The ack wait is the one

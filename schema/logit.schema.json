@@ -63,7 +63,7 @@
       "type": "object",
       "properties": {
         "delivery": {
-          "description": "Whether re-delivering an already-delivered batch is acceptable for this sink's destination. Omitted (the default) derives it from the sink kind; set it to override for this component.",
+          "description": "What the sink does with a batch whose delivery outcome is unknown, such as a timeout or a `5xx`. Omitted, the sink resends it (`at_least_once`), except `statsd_out`, which drops it (`at_most_once`). Set it to choose for this component.",
           "default": null,
           "anyOf": [
             {
@@ -1987,7 +1987,7 @@
           }
         },
         {
-          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed field. A resent batch is indexed twice, so a failure Splunk may have partly applied (a `5xx`, a timeout) drops the batch unless `buffer.delivery` is `at_least_once`.",
+          "description": "Sends logs, metrics, and spans to Splunk's HTTP Event Collector (HEC) as `/event` JSON, in the shape the OpenTelemetry Collector's `splunk_hec` exporter writes, so a Splunk index fed by both sees one schema. Spans go out as ordinary events: Splunk has no trace store. Each event's `index`, `source`, `sourcetype`, and `host` come from the batch's resource attributes `com.splunk.index`, `com.splunk.source`, `com.splunk.sourcetype`, and `host.name`: set them upstream with `set`. Every other attribute goes out as an indexed field. A failure Splunk may have partly applied (a `5xx`, a timeout) resends the batch, which Splunk may index twice; `buffer.delivery: at_most_once` drops it instead.",
           "type": "object",
           "required": [
             "endpoint",
@@ -2001,7 +2001,7 @@
               "type": "boolean"
             },
             "ack_timeout": {
-              "description": "How long to wait for every request of a batch to be acknowledged. Past it the batch fails, and is dropped unless `buffer.delivery` is `at_least_once`, which resends it (and Splunk may index it twice). Only with `ack: true`. Defaults to `30s`; `0s` is rejected.",
+              "description": "How long to wait for every request of a batch to be acknowledged. Past it the batch fails and is resent, and Splunk may index it twice; `buffer.delivery: at_most_once` drops it instead. Only with `ack: true`. Defaults to `30s`; `0s` is rejected.",
               "default": null,
               "type": [
                 "string",
@@ -2318,7 +2318,7 @@
           }
         },
         {
-          "description": "statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a real relay: names, values, and tags round-trip through the decoder on the other end.\n\nUnder `transport: unix` each packet is one datagram sent to the socket; under `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian integer, on a connection opened on the first send and reopened after an error, as under TCP.",
+          "description": "statsd / DogStatsD egress over UDP, TCP, or a Unix socket, the mirror of `statsd_in` and a real relay: names, values, and tags round-trip through the decoder on the other end.\n\nUnder `transport: unix` each packet is one datagram sent to the socket; under `transport: unix_stream` each packet is preceded by its length as a 4-byte little-endian integer, on a connection opened on the first send and reopened after an error, as under TCP.\n\nUnlike every other sink, `buffer.delivery` defaults to `at_most_once` here: a statsd line usually carries no timestamp, so a resent counter adds to the destination's total again.",
           "type": "object",
           "required": [
             "endpoint",
@@ -2920,11 +2920,22 @@
       ]
     },
     "DeliveryPosture": {
-      "description": "Whether re-delivering an already-delivered batch is acceptable for a sink's destination. `at_least_once` retries as aggressively as fault classification allows and risks a duplicate; `at_most_once` is the conservative posture.",
-      "type": "string",
-      "enum": [
-        "at_least_once",
-        "at_most_once"
+      "description": "What a sink does with a batch whose delivery outcome is unknown.",
+      "oneOf": [
+        {
+          "description": "Resend it, accepting that the destination may receive it twice. The default for every sink but `statsd_out`.",
+          "type": "string",
+          "enum": [
+            "at_least_once"
+          ]
+        },
+        {
+          "description": "Drop it and count it, accepting that the destination may never have received it. A failure the destination provably never saw is still retried.",
+          "type": "string",
+          "enum": [
+            "at_most_once"
+          ]
+        }
       ]
     },
     "DiskBufferConfig": {

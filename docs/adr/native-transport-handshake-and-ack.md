@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-29
+updated: 2026-09-30
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -261,3 +261,14 @@ both. Until it lands, `Ack.seq` counts frames on one connection and restarts on 
 
 "Ack point" is unchanged, and that record's item 3 adds that `logit_in` doesn't acknowledge a
 batch no consumer took.
+
+## Amendment: `GOING_AWAY` also answers a frame no consumer took (2026-09-30)
+
+"Ack point" holds that a frame is acknowledged once the batch is in every open downstream inbox.
+`Fanout::send_relayed` now reports whether any consumer took the batch, and a batch none took is
+not acknowledged: `logit_in` writes `Reject{GOING_AWAY, "no consumer took the batch"}` and closes
+the connection, before the sequence advances. `GOING_AWAY` has three causes: shutdown, an idle
+close, and no consumer taking the frame. The frame wasn't forwarded, so `logit_out` classifies it
+`Clean`, redials, and resends, and the sender and receiver sequences stay aligned. The invariant
+in the 2026-09-25 amendment, that `GOING_AWAY` is written only for a frame that wasn't forwarded,
+holds. See [`delivery-semantics.md`](delivery-semantics.md), item 3, and its W3 amendment.

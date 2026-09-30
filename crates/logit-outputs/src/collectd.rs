@@ -44,11 +44,14 @@
 //! (Σ sent entries' meta) and `logit.output.datagrams`, both counting what reached the kernel
 //! before a failure too, and the `oversize_datagram` drop above.
 //!
-//! ## Duplicate safety
+//! ## Delivery posture
 //!
-//! [`CollectdOutput::duplicate_safe`] is `false`: collectd has no idempotency key, so a
-//! redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE it carries, as a statsd `|c`
-//! would.
+//! The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5), retries an
+//! `Ambiguous` attempt, and collectd has no idempotency key, so a receiving collectd adds a resent
+//! `ABSOLUTE` value to its rate. A monotonic `Sum` takes the upstream remedy: an `aggregate` with
+//! `temporality: cumulative` makes it a `COUNTER`, whose running total a resend repeats rather
+//! than adds. Every `Histogram` is dropped at encode, so none is resent.
+//! `buffer.delivery: at_most_once` drops the batch instead.
 
 use crate::accounting::BatchAccounting;
 use crate::count_request;
@@ -184,12 +187,6 @@ impl Output for CollectdOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-
-    /// A redelivered value list double-counts every COUNTER/DERIVE/ABSOLUTE; there's no
-    /// idempotency key. `buffer.delivery` overrides this posture for the component.
-    fn duplicate_safe(&self) -> bool {
-        false
     }
 }
 
@@ -485,12 +482,6 @@ mod tests {
         assert_eq!(probe.sum("logit.output.datagrams", &[]), 2.0);
         assert_eq!(probe.sum("logit.output.requests", &[("class", "ambiguous")]), 1.0);
         assert_eq!(probe.sum("logit.output.requests", &[("class", "error")]), 0.0);
-    }
-
-    #[tokio::test]
-    async fn duplicate_safe_is_false() {
-        let output = CollectdOutput::udp("127.0.0.1:0").unwrap();
-        assert!(!output.duplicate_safe());
     }
 
     /// `with_encoder`/`with_max_packet_bytes` are order-independent: an 8-byte cap drops the event

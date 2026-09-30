@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-09-26
+updated: 2026-09-30
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -522,3 +522,26 @@ of the choices. By decision:
   answered `503` code 9, less than 5 s ago, a fixed window rather than a config field. A later
   request whose data the pipeline takes clears it. It still checks no token. Neither run provoked
   code 18, so its text is still a reading of Splunk's documentation.
+
+## Amendment: the default delivery posture is `at_least_once` (2026-09-30)
+
+`Output::duplicate_safe()` is gone, and `at_least_once` is every sink's default posture. `splunk_hec_out` now retries an `Ambiguous` fault (a `500`, a `408`, a timeout, an ack timeout) for up to `buffer.retry_budget` by default, where it dropped the batch, and Splunk indexes a resent event twice. `buffer.delivery: at_most_once` restores the drop. The statements above about a `false` `duplicate_safe()` and a default at-most-once posture describe the earlier default. See [`delivery-semantics.md`](delivery-semantics.md) item 5.
+
+## Amendment: a closed downstream answers `503` code 9, or `500` code 8 for a later batch (2026-09-30)
+
+Decision 3's promise that a `/event` body whose first batch was taken is answered `200`, so a
+retry never repeats part of it, assumed the pipeline stays open for the rest of the body. When
+every consumer directly downstream of `splunk_hec_in` closes, `Fanout` reports the batch as taken
+by none (ADR `delivery-semantics`, item 3, and its W3 amendment). **Changed:**
+
+- **First batch refused:** `503` code 9 with `Retry-After: 1`, no `ackId`, counted
+  `logit.input.requests{class="closed_consumer"}`. Nothing of the body was taken, so code 9's
+  promise holds, and the listener doesn't mark itself busy for `/health`.
+- **A later batch refused:** `500` code 8 (`Internal server error`), no `ackId` drawn, and it
+  pre-empts a pending code 6 for the same body. The batches taken before it stay delivered, so
+  the `200` promise has this exception, and a retry repeats them. Code 9 would claim nothing was
+  taken, which is false here. The OTel `splunk_hec` exporter and `splunk_hec_out` treat a `500`
+  as retryable. What the other recorded clients do with a `500` isn't verified in this repo, and
+  a client that drops on a `500` loses the body's later batches.
+- **Telemetry:** `logit.input.batches.dropped{reason="closed_consumer"}` counts every batch of
+  the request no consumer took, the refused one included.

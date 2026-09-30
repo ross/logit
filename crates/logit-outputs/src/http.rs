@@ -8,6 +8,10 @@
 //! ambiguous, every other 4xx is permanent, only a connect failure is clean. Two copies of one
 //! table are two things to drift.
 //!
+//! [`after_delivery`] is the `Fault` rule every sink that sends one batch as several requests
+//! applies, whatever carries the request: `otlp_out`'s gRPC and `datadog_trace_out`'s Unix socket
+//! go over `hyper`, not `reqwest`.
+//!
 //! [`split_encode`] is the request splitter `datadog_out` and `datadog_trace_out` share: both cut a
 //! batch into requests under a per-route entry count and body size.
 //!
@@ -173,6 +177,23 @@ pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
         Fault::Clean
     } else {
         Fault::Ambiguous
+    }
+}
+
+/// The fault of a failed request in a `send` of several requests. `sent_any` says whether an
+/// earlier request of the same `send` was accepted; once one was, a [`Fault::Clean`] failure
+/// becomes [`Fault::Ambiguous`]. `Clean` means the destination holds nothing of the batch, and
+/// `write_loop` retries it under every posture, `at_most_once` included, which would resend the
+/// accepted requests (`docs/adr/delivery-semantics.md`, item 9). Every other fault passes through
+/// unchanged.
+///
+/// The added context is the outermost, and [`logit_pipeline::classify`] reads the outermost
+/// `Fault`, so it overrides the request's own.
+pub(crate) fn after_delivery(err: anyhow::Error, sent_any: bool) -> anyhow::Error {
+    if sent_any && logit_pipeline::classify(&err) == Fault::Clean {
+        err.context(Fault::Ambiguous)
+    } else {
+        err
     }
 }
 

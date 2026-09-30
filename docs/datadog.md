@@ -153,14 +153,14 @@ send a point that far past the end of its window.
 
 ### `at_least_once` duplicates everything but series
 
-`datadog_out` isn't duplicate-safe. One batch goes out over up to eight routes, each as one or
-more requests (one per event, and a route over its size cap is split), and a retry re-sends the
-ones that succeeded. Datadog stores a resent series point once, the last write winning at its
-`(series, timestamp)`, but stores a resent log twice. Every other route is assumed to duplicate
-too. So the default posture is at-most-once, and a `5xx` or a timeout drops the batch.
-`buffer: {delivery: at_least_once}` retries instead and accepts duplicate logs, events, and
-checks, and inflated distribution, sketch, trace, and stats counts. `datadog_trace_out` is the
-same: an Agent dedupes nothing.
+The default posture is `at_least_once`, so a `5xx` or a timeout is retried. One batch goes out
+over up to eight routes, each as one or more requests (one per event, and a route over its size
+cap is split), and a retry re-sends the ones that succeeded. Datadog stores a resent series point
+once, the last write winning at its `(series, timestamp)`, but stores a resent log twice. Every
+other route is assumed to duplicate too: expect duplicate logs, spans, events, and checks, and
+inflated distribution point, sketch, and APM stats counts, which no upstream `aggregate` setting
+prevents. `datadog_trace_out` is the same: an Agent dedupes nothing. To drop the batch on a `5xx`
+or a timeout instead, set `buffer: {delivery: at_most_once}` on the sink.
 
 ### Events go uncompressed
 

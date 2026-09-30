@@ -20,7 +20,10 @@ The second problem is **splitting collection from processing**. Running a thin c
 edge and a heavier processor centrally is common, but it usually means gluing two different tools
 together through a lossy intermediate format. `logit` has a first-class, efficient, lossless
 transport between nodes: a native wire protocol that carries the internal event model as is.
-OpenTelemetry Protocol (OTLP) is the interoperable option at the edges.
+OpenTelemetry Protocol (OTLP) is the interoperable option at the edges. "Lossless" means field
+fidelity, as ADR [`lossless-transit`](adr/lossless-transit.md) defines it. Delivery is
+at-least-once per hop, with duplicates absorbed by the data model
+([ADR `delivery-semantics`](adr/delivery-semantics.md)).
 
 Relaying a protocol to itself is lossless. Each of these pairs is a transparent relay:
 

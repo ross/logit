@@ -104,16 +104,23 @@
 //! once, and the Agent's retry queue, not this listener, holds the payload while the pipeline
 //! catches up.
 //!
+//! A batch no consumer takes, because every consumer of the listener has closed, gets the same
+//! `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`: in the body, in
+//! `logit.input.requests{class}`, and in `logit.input.batches.dropped{reason}`, which counts that
+//! batch and every later one of the request. The refused batch was offered, so unlike a timed-out
+//! one it also counts in `logit.component.batches.sent`.
+//!
 //! # Telemetry
 //!
 //! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (class `ok`,
-//! `rejected`, or `busy`; route one of [`Route::name`], or `unknown`), `logit.input.request.duration`
-//! (timing, every exit), and `logit.input.request.bytes` (the compressed body size, once read).
-//! Rejections: `logit.input.requests.rejected{reason}`, reason `unknown_route`, `method`,
-//! `oversize`, `auth`, `encoding`, `malformed_encoding`, `malformed`, `stalled`, or `body_read` (a
-//! body that failed for a reason other than its size, such as a client disconnecting mid-upload).
-//! `logit.input.requests.acknowledged{route}` counts a payload answered without a send, and
-//! `logit.input.batches.dropped{reason="busy"}` the batches a `503` left undelivered. The
+//! `rejected`, `busy`, or `closed_consumer`; route one of [`Route::name`], or `unknown`),
+//! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the
+//! compressed body size, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
+//! `unknown_route`, `method`, `oversize`, `auth`, `encoding`, `malformed_encoding`, `malformed`,
+//! `stalled`, or `body_read` (a body that failed for a reason other than its size, such as a
+//! client disconnecting mid-upload). `logit.input.requests.acknowledged{route}` counts a payload
+//! answered without a send, and `logit.input.batches.dropped{reason}` (`busy` or
+//! `closed_consumer`) the batches a `503` left undelivered. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s `datadog_in`
 //! section is the operator-facing account.
 
@@ -121,7 +128,7 @@ use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
     deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
     matches_any_key, media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding,
-    MediaType,
+    MediaType, Undelivered,
 };
 use crate::Input;
 use bytes::Bytes;
@@ -456,7 +463,6 @@ async fn handle(
 
 const OK: &str = "ok";
 const REJECTED: &str = "rejected";
-const BUSY: &str = "busy";
 
 /// One Datadog intake route: a row of this module's routes table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,23 +723,34 @@ async fn respond(
 
     match deliver_with_deadline(&shared.sink, batches, shared.busy_after).await {
         Ok(()) => (name, OK, route.success()),
-        Err(not_sent) => {
+        Err(undelivered) => {
+            let reason = undelivered.reason();
             shared.telemetry.count(
                 "logit.input.batches.dropped",
-                not_sent as f64,
-                &[("reason", "busy")],
+                undelivered.count() as f64,
+                &[("reason", reason)],
             );
-            shared.diag.clone().warn_throttled(
-                "busy",
-                format_args!(
-                    "datadog_in: answered 503 to {}: the pipeline did not accept a batch within \
-                     {:?}",
-                    shared.peer, shared.busy_after
+            let mut diag = shared.diag.clone();
+            let _ = match undelivered {
+                Undelivered::Busy(_) => diag.warn_throttled(
+                    "busy",
+                    format_args!(
+                        "datadog_in: answered 503 to {}: the pipeline did not accept a batch \
+                         within {:?}",
+                        shared.peer, shared.busy_after
+                    ),
                 ),
-            );
-            let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, "busy");
+                Undelivered::Closed(_) => diag.warn_throttled(
+                    "closed_consumer",
+                    format_args!(
+                        "datadog_in: answered 503 to {}: no consumer took the batch",
+                        shared.peer
+                    ),
+                ),
+            };
+            let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, reason);
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-            (name, BUSY, response)
+            (name, reason, response)
         }
     }
 }
@@ -1219,6 +1236,31 @@ mod tests {
         let events = Totals::of(registry.drain(0));
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
         assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 1.0);
+    }
+
+    /// A batch no consumer takes is answered as busy is, but counted `closed_consumer` and
+    /// without waiting out `busy_after`.
+    #[tokio::test]
+    async fn a_request_no_consumer_takes_is_answered_503_and_counted_closed_consumer() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("dd", "datadog_in", "listener");
+        let input = DatadogInput::new("127.0.0.1:0").with_telemetry(telemetry);
+        let (addr, rx) = start(input, 16).await;
+        drop(rx);
+
+        let response = post_raw(&addr, "/api/v1/series", "", SERIES_V1).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.to_ascii_lowercase().contains("retry-after: 1\r\n"), "{response}");
+        assert!(body_of(&response).contains("closed_consumer"), "{response}");
+
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(
+            events.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
+            1.0
+        );
+        assert_eq!(events.sum("logit.input.batches.dropped", &[("reason", "busy")]), 0.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "closed_consumer")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
     }
 
     /// With two consumers and the second full, a `503` leaves the first holding nothing, and the

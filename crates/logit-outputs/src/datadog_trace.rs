@@ -103,11 +103,18 @@
 //! | 408, 429, any 5xx | [`Fault::Ambiguous`] |
 //! | 413 | [`Fault::Permanent`], and the request's records counted `records.dropped{reason="oversize"}` |
 //! | any other 1xx, 3xx, or 4xx | [`Fault::Permanent`], with a throttled `request_rejected` diagnostic quoting the first 256 bytes of the body |
-//! | connect failure (refused, no such socket file) | [`Fault::Clean`] |
+//! | connect failure (refused, no such socket file), before any request of this `send` was accepted | [`Fault::Clean`] |
+//! | connect failure after one was | [`Fault::Ambiguous`] |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
-//! [`DatadogTraceOutput::duplicate_safe`] is **`false`**: an Agent dedupes nothing, so a resent
-//! trace is a second copy of every span in it.
+//! `Clean` means the Agent holds nothing of the batch, so once a request was accepted a connect
+//! failure on a later one is `Ambiguous` ([`after_delivery`]), on either transport.
+//!
+//! **Delivery posture.** The default, `at_least_once` (`docs/adr/delivery-semantics.md`, item 5),
+//! retries an `Ambiguous` attempt, and a batch can be two requests, so a retry after the second
+//! fails re-sends the first. An Agent dedupes nothing: a resent trace is a second copy of every
+//! span in it, and the APM stats this sink relays have no upstream remedy and are assumed to add.
+//! `buffer.delivery: at_most_once` drops the batch instead.
 //!
 //! ## Telemetry
 //!
@@ -132,8 +139,8 @@
 
 use crate::accounting::BatchAccounting;
 use crate::http::{
-    body_snippet, build_client, classify_reqwest_error, read_body_prefix, split_encode,
-    status_class, Caps, Encoded, ERROR_BODY_SNIPPET_BYTES,
+    after_delivery, body_snippet, build_client, classify_reqwest_error, read_body_prefix,
+    split_encode, status_class, Caps, Encoded, ERROR_BODY_SNIPPET_BYTES,
 };
 /// `tls:`: the shared `crate::tls` type, re-exported as the other sinks do.
 pub use crate::tls::TlsClientSettings;
@@ -588,7 +595,7 @@ impl DatadogTraceOutput {
     /// The trace route's requests: the batch's span events other than APM stats, one item per
     /// trace so a trace is never split. The encode and the tracer headers are [`TRACES_UNIT`]:
     /// the oversize drops and the `bad_header` diagnostic count on its first encode only.
-    async fn send_traces(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+    async fn send_traces(&mut self, batch: &EventBatch, sent_any: &mut bool) -> anyhow::Result<()> {
         let resource = &batch.resource;
         let chunks: Vec<Vec<usize>> = trace_chunks(batch)
             .into_iter()
@@ -642,14 +649,14 @@ impl DatadogTraceOutput {
         for (_, encoded) in split.requests {
             let mut headers = headers.clone();
             headers.insert(HEADER_TRACE_COUNT, HeaderValue::from(encoded.meta.traces));
-            self.post(Route::Traces, headers, encoded).await?;
+            self.post(Route::Traces, headers, encoded, sent_any).await?;
         }
         Ok(())
     }
 
     /// The stats route's requests: one item per APM stats event (a stats group). The encode is
     /// [`STATS_UNIT`]: the oversize drops count on its first encode only.
-    async fn send_stats(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+    async fn send_stats(&mut self, batch: &EventBatch, sent_any: &mut bool) -> anyhow::Result<()> {
         let items: Vec<usize> = (0..batch.events.len())
             .filter(|&i| is_datadog_stats(&batch.resource, &batch.events[i]))
             .collect();
@@ -688,7 +695,7 @@ impl DatadogTraceOutput {
             }
         }
         for (_, encoded) in split.requests {
-            self.post(Route::Stats, HeaderMap::new(), encoded).await?;
+            self.post(Route::Stats, HeaderMap::new(), encoded, sent_any).await?;
         }
         Ok(())
     }
@@ -762,16 +769,38 @@ impl DatadogTraceOutput {
         headers
     }
 
-    /// One attempt: traces, then stats.
+    /// One attempt: traces, then stats. `sent_any` says whether a request of this attempt was
+    /// accepted ([`DatadogTraceOutput::post`]).
     async fn attempt(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        self.send_traces(batch).await?;
-        self.send_stats(batch).await
+        let mut sent_any = false;
+        self.send_traces(batch, &mut sent_any).await?;
+        self.send_stats(batch, &mut sent_any).await
+    }
+
+    /// One request ([`DatadogTraceOutput::request`]), whose failure is `Ambiguous` rather than
+    /// `Clean` once an earlier request of the attempt was accepted ([`after_delivery`]). Sets
+    /// `sent_any` when this one is.
+    async fn post(
+        &mut self,
+        route: Route,
+        protocol: HeaderMap,
+        encoded: Encoded<RequestMeta>,
+        sent_any: &mut bool,
+    ) -> anyhow::Result<()> {
+        match self.request(route, protocol, encoded).await {
+            Ok(()) => {
+                *sent_any = true;
+                Ok(())
+            }
+            Err(err) => Err(after_delivery(err, *sent_any)),
+        }
     }
 
     /// One request, one attempt (module doc's "Faults, retries, and duplicate safety").
     /// `request.bytes` counts a request that may have left: any answer, and any error but a
-    /// [`Fault::Clean`] one, which never connected.
-    async fn post(
+    /// [`Fault::Clean`] one, which never connected. The counters follow this request's own fault,
+    /// before [`DatadogTraceOutput::post`] applies [`after_delivery`].
+    async fn request(
         &mut self,
         route: Route,
         protocol: HeaderMap,
@@ -860,13 +889,6 @@ impl Output for DatadogTraceOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let result = self.attempt(batch).await;
         self.accounting.finish(result)
-    }
-
-    /// `false`: an Agent dedupes nothing, and a batch can be two requests, so a retry after the
-    /// second fails re-sends the first. `buffer: { delivery: at_least_once }` accepts the
-    /// duplicates instead.
-    fn duplicate_safe(&self) -> bool {
-        false
     }
 }
 
@@ -1411,6 +1433,34 @@ mod tests {
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
     }
 
+    /// Traces, then stats.
+    fn traces_and_stats() -> EventBatch {
+        let mut events = two_traces().events;
+        events.push(stats_event());
+        batch(events)
+    }
+
+    /// The Agent takes the traces and the stats request's connect is refused: `Ambiguous`, since
+    /// a `Clean` retry would resend the traces.
+    #[tokio::test]
+    async fn a_connect_failure_after_an_accepted_request_is_ambiguous() {
+        let (addr, log) = crate::test_support::answers_once(200, RATES).await;
+        let err = sink(addr).send(&traces_and_stats()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(crate::test_support::recorded_paths(&log.lock().unwrap()), ["/v0.4/traces"]);
+    }
+
+    /// The same over the Unix socket, whose file is gone by the stats request.
+    #[tokio::test]
+    async fn a_missing_socket_after_an_accepted_request_is_ambiguous() {
+        let dir = TempDir::new("once");
+        let path = dir.0.join("apm.socket");
+        let log = crate::test_support::answers_once_unix(&path, 200, RATES).await;
+        let err = DatadogTraceOutput::unix(&path).send(&traces_and_stats()).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        assert_eq!(crate::test_support::recorded_paths(&log.lock().unwrap()), ["/v0.4/traces"]);
+    }
+
     /// A socket that accepts and never answers times out as `Ambiguous`.
     #[tokio::test]
     async fn a_silent_socket_times_out_ambiguous() {
@@ -1432,11 +1482,6 @@ mod tests {
         let result =
             DatadogTraceOutput::unix("/run/apm.socket").with_tls(&settings, Path::new("."));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn datadog_trace_output_is_not_duplicate_safe() {
-        assert!(!DatadogTraceOutput::http("http://127.0.0.1:8126").duplicate_safe());
     }
 
     // ---- attempt accounting (ADR `sink-send-path-and-attempt-accounting`, decision 2) --------

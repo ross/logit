@@ -93,11 +93,6 @@ impl Output for RecordingOutput {
             Err(anyhow::anyhow!("simulated failure")).context_fault()
         }
     }
-
-    fn duplicate_safe(&self) -> bool {
-        // At-least-once: the posture that retries and redelivers, which surviving a restart needs.
-        true
-    }
 }
 
 fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueConfig) {
