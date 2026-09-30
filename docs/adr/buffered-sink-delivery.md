@@ -333,18 +333,18 @@ never mutes, so a caller that never calls `observe_batch` counts every `send`. `
 and `datadog_trace_out` are gated per unit: `datadog_out`'s plan and each route, and
 `datadog_trace_out`'s trace and stats routes, with a bisection's re-encodes muted (decision 2).
 
-## Amendment: a project target, and posture by duplicate harm (2026-09-29)
+## Amendment: a project target, and `at_least_once` as the default (2026-09-29)
 
-"Delivery posture is a per-sink policy, chosen in three layers" stands: the sink reports a fact,
-the runtime derives a default, and `buffer.delivery:` overrides it. [ADR
-`delivery-semantics`](delivery-semantics.md) changes two things around it.
+[ADR `delivery-semantics`](delivery-semantics.md) changes two things around "Delivery posture
+is a per-sink policy, chosen in three layers".
 
 - **There is a target.** `logit` aims for at-least-once on every hop. This record rejected "a
-  single fixed delivery guarantee for every sink", and that still holds: posture stays per sink,
-  and the target says which way a default leans.
-- **The fact a sink reports becomes a class.** `Output::duplicate_safe() -> bool` is replaced by
-  what a duplicate does at the destination: overwrites the first copy, is stored as a second
-  record, or corrupts a value. Only the last defaults to `at_most_once` (its item 5).
+  single fixed delivery guarantee for every sink", and that still holds: `buffer.delivery:`
+  stays per sink, and the target says which way the default leans.
+- **The sink no longer reports a fact.** `Output::duplicate_safe() -> bool` goes away. The
+  runtime's default posture is `at_least_once` for every sink, and the data model and the
+  receiver absorb the duplicate (its item 5). `statsd_out` declares `at_most_once` as its own
+  default, because a statsd line has no timestamp for a resend to overwrite at.
 
 The `Fault` table is unchanged. `Output::duplicate_safe()` is what the code has until that
-record's plan lands the class.
+record's plan lands the new default.

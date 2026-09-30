@@ -527,11 +527,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `at_least_once` `logit_out`'s default, which leaves the batch queued.
 
 - **Sink default postures don't follow [ADR `delivery-semantics`](adr/delivery-semantics.md)
-  yet.** The record's item 5 derives a sink's default posture from what a duplicate does at its
-  destination, and only `statsd_out` and `collectd_out` default to `at_most_once`. The code
-  derives it from `Output::duplicate_safe()`, so `otlp_out`, `splunk_hec_out`, `datadog_out`,
-  `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`, and `logit_out` default to
-  `at_most_once` and drop a batch on an `Ambiguous` fault. Until the class lands
+  yet.** The record's item 5 makes `at_least_once` every sink's default but `statsd_out`'s.
+  The code derives the default from `Output::duplicate_safe()`, so `otlp_out`,
+  `splunk_hec_out`, `datadog_out`, `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`,
+  `collectd_out`, and `logit_out` default to `at_most_once` and drop a batch on an `Ambiguous`
+  fault. Until the new default lands
   ([`docs/plans/delivery-semantics.md`](plans/delivery-semantics.md), W1), set
   `buffer.delivery: at_least_once` on a sink that should resend.
 
@@ -540,14 +540,16 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `logit_out` and `logit_in`. As built, `Ack.seq` counts frames on one connection and restarts
   on a reconnect, and `logit_in` forwards every frame it receives. Under `at_least_once` a
   resend after a lost `Ack`, and a `buffer.disk:` replay after a crash, reach `logit_in`'s
-  consumers twice. The wire layout needs its own record first (the plan's W4 and W5).
+  consumers twice, and a `statsd_out` or an aggregated kind among them double-counts. Until the
+  wire layout has its own record (the plan's W4 and W5), `buffer.delivery: at_most_once` on a
+  `logit_out` whose far side feeds a counter sink avoids that at the cost of the batch.
 
 - **`logit_in` acknowledges a batch no consumer took.** `Fanout` skips a closed consumer, counts
   `logit.component.events.dropped{reason="closed_consumer"}`, and tells its caller nothing, so
   `logit_in` writes its `Ack` and `logit_out` commits a batch nothing kept. `otlp_in`,
   `datadog_in`, `datadog_trace_in`, and `splunk_hec_in` answer success the same way, and
-  `prometheus_in`'s remote-write receiver has its own entry under Prometheus. It happens when the downstream half
-  of the graph is already torn down, which is a shutdown. [ADR
+  `prometheus_in`'s remote-write receiver has its own entry under Prometheus. It happens when
+  the downstream half of the graph is already torn down, which is a shutdown. [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 3, says an input doesn't acknowledge
   such a batch (the plan's W3).
 
@@ -558,8 +560,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `logit.component.buffer.disk.replayed`. Under `at_most_once` that includes a batch the sink
   dropped as `Ambiguous` to avoid a duplicate. It isn't a gap to close: [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 8, keeps the combination valid and
-  states the window. A `statsd_out` or `collectd_out` with `buffer.disk:` can replay up to
-  `checkpoint_interval` of counters after a crash.
+  states the window. A `statsd_out`, or a sink whose destination aggregates a resend, with
+  `buffer.disk:` can replay counters from that window after a crash.
 
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ **Closed (2026-09-12).** `syslog_out` needs one UDP datagram or one

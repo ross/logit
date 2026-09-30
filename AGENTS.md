@@ -790,10 +790,11 @@ not a style preference:
   for one leg is wrong for another. Reach for it before picking a "representative" shape, and mind
   its own §7: none of it is production traffic.
 - **Delivery targets at-least-once per hop.** Between losing a batch and delivering it twice,
-  `logit` delivers it twice, and a sink's default posture follows what a duplicate does at its
-  destination: only a sink where a duplicate corrupts a value (`statsd_out`, `collectd_out`)
-  defaults to `at_most_once`. An input's acknowledgment means the batch is in every downstream
-  inbox, never that a sink delivered it, and the `logit_out` to `logit_in` hop targets
+  `logit` delivers it twice: every sink defaults to `at_least_once`, and the data model and the
+  receiver absorb the duplicate (a cumulative sum or a timestamped sample overwrites; an
+  aggregated kind is made cumulative upstream). `statsd_out` is the one exception, because a
+  statsd line has no timestamp. An input's acknowledgment means the batch is in every open
+  downstream inbox, never that a sink delivered it, and the `logit_out` to `logit_in` hop targets
   effectively-once through a sender identity and a sequence that outlives a connection.
   "Lossless" means field fidelity, never delivery. The code doesn't do all of this yet
   ([`docs/plans/delivery-semantics.md`](docs/plans/delivery-semantics.md)), so check

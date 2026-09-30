@@ -3,7 +3,7 @@ created: 2026-09-29
 updated: 2026-09-29
 ---
 
-# Delivery semantics: at-least-once per hop, posture by duplicate harm, and an effectively-once native hop
+# Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
 
 ## Status
 Accepted
@@ -28,8 +28,7 @@ None says what `logit` aims for, so behavior follows from defaults nobody chose:
   transport should lose a batch where it could resend one.
 - **Every sink but four defaults to at-most-once.** `influxdb_out`, `graphite_out`,
   `prometheus_out`, and `null_out` report `true`. For the rest, an attempt whose outcome is
-  unknown drops the batch, whether a duplicate would cost an extra log line or a corrupted
-  counter.
+  unknown drops the batch, whatever a duplicate would have cost at its destination.
 - **`at_most_once` doesn't hold across a crash with `buffer.disk:`.** `commit` moves the read
   cursor in memory, and the cursor reaches disk on `checkpoint_interval`. A crash replays the
   batch in flight and every batch committed since the last cursor write, under either posture.
@@ -87,14 +86,16 @@ ahead of the sink.
 
 ### 3. An input's acknowledgment means accepted into the pipeline
 
-An acknowledgment from a `logit` input means the batch is in every downstream inbox of that
-process. It says nothing about a sink. This is `logit_in`'s `Ack`, an HTTP listener's success
-status, `splunk_hec_in`'s `/ack` answer of `true`, and the offset `tail_in` and `docker_in`
-checkpoint.
+An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
+that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
+HTTP listener's success status, `splunk_hec_in`'s `/ack` answer of `true`, and the offset
+`tail_in` and `docker_in` checkpoint.
 
-An input doesn't acknowledge a batch no consumer took. When every consumer of a batch is closed,
-the input answers as it does for a batch it couldn't deliver: `logit_in` writes no `Ack`, and an
-HTTP listener answers its protocol's retryable failure.
+A closed consumer is outside the promise: `Fanout` skips it and counts `closed_consumer`, and
+the batch is still acknowledged if another consumer took it. An input doesn't acknowledge a
+batch no consumer took. When every consumer of a batch is closed, the input answers as it does
+for a batch it couldn't deliver: `logit_in` writes no `Ack`, and an HTTP listener answers its
+protocol's retryable failure.
 
 End-to-end acknowledgment, where an input answers only once every sink delivered, is a non-goal.
 A listener has no view of what its fan-out's sinks did, and a stateful transform such as
@@ -107,25 +108,46 @@ drops only into a closed consumer, and it never delivers a batch twice. No seque
 batch identifier exists on an edge, because there's no loss or duplicate there for one to repair.
 Identity belongs where a batch crosses a process boundary (item 7).
 
-### 5. A sink's default posture follows what a duplicate does at its destination
+### 5. Every sink defaults to `at_least_once`; the data model and the receiver absorb the duplicate
 
-`Output::duplicate_safe() -> bool` becomes a three-way class. The sink reports it, the runtime
-derives the default posture, and `buffer.delivery:` overrides it per component.
+`Output::duplicate_safe()` goes away. The runtime's default posture is `at_least_once` for every
+sink, `buffer.delivery:` overrides it per component, and one sink, `statsd_out`, declares
+`at_most_once` as its own default.
 
-| Class | A duplicate at the destination | Default posture | Sinks |
-|---|---|---|---|
-| Idempotent | Overwrites the first copy | `at_least_once` | `influxdb_out`, `prometheus_out`, `graphite_out`, `null_out` |
-| Extra record | Is stored as a second record | `at_least_once` | `otlp_out`, `splunk_hec_out`, `datadog_out`, `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`, `logit_out` |
-| Corrupts a value | Changes what a stored value means | `at_most_once` | `statsd_out`, `collectd_out` |
+This is what the protocols and their official senders do. OTLP retries 429, 502, 503, 504, and
+its retryable gRPC codes, and its specification says a resend "may result in duplicate data on
+the server side". Prometheus remote-write senders must retry a 5xx, and version 2.0 requires a
+receiver to be idempotent. The Datadog Agent's forwarder retries timeouts and 5xx for every
+metric type alike. Splunk's own guidance for HEC is to resend after a missing acknowledgment and
+mark the resend as a possible duplicate. The OpenTelemetry Collector, Vector, and Fluentd's
+`forward` with acknowledgments are at-least-once, and none of them varies that by signal or by
+metric kind.
 
-An extra record is visible and a reader can discard it. A counter incremented twice can't be
-told from a counter that counted twice as much, so `statsd_out` and `collectd_out` keep the
-posture that can't produce one.
+What those systems do instead is make the data resilient to a duplicate, and that's where
+`logit` puts the responsibility too. The data model and the receiver, not the sender, are on
+the hook:
 
-`logit_out` moves to the idempotent class when item 7 is built.
+- A metric with an identity at its destination overwrites on a resend: a Prometheus or
+  InfluxDB sample at its `(series, timestamp)`, a Datadog series point at its timestamp, a
+  Whisper point at its second. A cumulative sum with a start time is the same metric whether
+  it arrives once or twice. OpenTelemetry SDKs default to cumulative temporality for this
+  reason.
+- A log or a span arrives as a second record, which a reader can see and discard.
+- A kind the receiver aggregates rather than overwrites adds a resend to its total: a delta
+  `Sum` at a receiver that sums it, a Datadog distribution or sketch, a Splunk metrics index.
+  `logit`'s remedy is upstream of the sink, not in its posture: an `aggregate` with
+  `temporality: cumulative` ahead of such a sink turns the kind into one a resend overwrites.
+  An operator who sends an aggregated kind as-is accepts the double count, as every surveyed
+  sender does, or sets `buffer.delivery: at_most_once` on that sink.
 
-`graphite_out`'s class holds for a Whisper-backed receiver. An operator with another backend
-overrides it.
+`statsd_out` is the one exception. The classic statsd grammar has no timestamp, and `statsd_out`
+writes a DogStatsD `|T` only when the event arrived with one, so a resent counter usually has
+no identity at its destination, and the remedy above doesn't exist for it. Over a stream it
+defaults to `at_most_once`; over a datagram, item 6 applies. `collectd_out` is not an
+exception: a collectd value carries its timestamp.
+
+`logit_out` is at-least-once like the rest, and item 7 makes its duplicates rare. A resend
+outside item 7's window is still forwarded as a second record.
 
 The `Fault` table in [ADR `buffered-sink-delivery`](buffered-sink-delivery.md) is unchanged:
 `Clean` retries under both postures, `Ambiguous` under `at_least_once`, and `Permanent` under
@@ -170,24 +192,27 @@ are implicit".
 - **Identity is advisory.** Under [ADR `deployment-threat-model`](deployment-threat-model.md) it
   protects against accident, not a peer that lies about who it is.
 
-Deduplication covers a resend of one enqueued batch. It absorbs a resend after a lost `Ack`, the
-TLS 1.3 `KeyUpdate` residual in [ADR
+Deduplication covers a resend of one enqueued batch that reaches the same `logit_in` process
+while the batch is inside its window. There it absorbs a resend after a lost `Ack`, the TLS 1.3
+`KeyUpdate` residual in [ADR
 `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md)'s decision 6,
-and a spool replay. It doesn't cover a duplicate that arrived at the sending process as two
-batches, such as a `tail_in` replay or a client's retry.
+and a spool replay. It doesn't cover a resend that reaches a `logit_in` that restarted in
+between, or a different `logit_in` when the sender's `endpoint` resolves to more than one, and
+it doesn't cover a duplicate that arrived at the sending process as two batches, such as a
+`tail_in` replay or a client's retry. Each of those is forwarded.
 
 `window` stays 1. Credit-based flow control is separate work and this record doesn't design it.
 
 ### 8. A disk spool is at-least-once across a crash, under either posture
 
 After a crash, a `buffer.disk:` sink replays the batch that was in flight and every batch
-committed since the last cursor write, up to `checkpoint_interval` of them. That includes a
+committed since the last cursor write, which is at most `checkpoint_interval` ago. That includes a
 batch the sink delivered and a batch it dropped as `Ambiguous`.
 
 `buffer.disk:` with `at_most_once` stays valid. Posture governs the retry of an unknown outcome
 while the process runs, and `at_most_once` then holds across a graceful restart, which persists
-the cursor. An operator who puts a spool under `statsd_out` or `collectd_out` accepts that a
-crash can replay up to `checkpoint_interval` of counters.
+the cursor. An operator who puts a spool under `statsd_out`, or under a sink whose destination
+aggregates a resend, accepts that a crash can replay counters from that window.
 
 ### 9. A multi-request sink reports `Ambiguous` once a request was accepted
 
@@ -202,15 +227,15 @@ request, and the loss of the requests that hadn't gone.
 
 ### 10. A replaying input is at-least-once up to the in-memory queues
 
-`tail_in` and `docker_in` checkpoint an offset once its lines are in every downstream inbox. A
-crash replays the lines since the last checkpoint and loses the checkpointed lines that were
-still in memory. Two records decide the details:
+`tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3
+defines it. A crash replays the lines since the last checkpoint and loses the checkpointed
+lines that were still in memory. Two records decide the details:
 [ADR `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md) and
 [ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md).
 
-A replaying input ahead of a sink in the "corrupts a value" class can corrupt a value after a
-crash. `logit` doesn't reject that graph. The operator decides whether the pipeline tolerates
-it.
+A replaying input ahead of a sink whose destination aggregates a resend (item 5) can
+double-count after a crash. `logit` doesn't reject that graph. The operator decides whether the
+pipeline tolerates it.
 
 ### 11. Every permitted loss is counted, and so is every replay
 
@@ -235,16 +260,26 @@ bounded resends a sink may make inside one attempt. This record adds none.
   batch.
 - **Effectively-once on every hop.** Most destinations offer no identity to deduplicate on. A
   target most hops can't meet says nothing about any of them.
-- **`at_least_once` for every sink, counters included.** A duplicated `statsd` counter or
-  collectd `COUNTER` is wrong data that looks right. Losing the increment is visible as a gap.
+- **A default posture per sink, by what a duplicate does at its destination.** Three classes:
+  a duplicate overwrites, is a second record, or corrupts a value, with the last defaulting to
+  `at_most_once`. `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out` each
+  carry kinds from two classes (a span is a second record; a delta sum or a sketch is added),
+  so the class is a property of the payload, not the sink. No surveyed sender makes the
+  distinction, and the remedy for the aggregated kinds is upstream (item 5).
+- **A posture per batch, from the kinds the batch carries.** More precise than any surveyed
+  sender, at the cost of a check per batch and a posture that changes with content. The
+  upstream remedy makes the content one a resend overwrites instead.
+- **`at_least_once` for `statsd_out` too.** A statsd counter has no timestamp and no identity,
+  so a resend over a stream double-increments with no way to see it. Losing the increment is
+  visible as a gap.
 - **At-least-once on the native hop with no deduplication.** It needs no wire change. It also
-  sends every duplicate downstream, where a sink in the "corrupts a value" class can't absorb
+  sends every duplicate downstream, where a `statsd_out` or an aggregated kind can't absorb
   it, and `logit` controls both ends of this hop.
 - **Sequence numbers on in-process edges.** Item 4: an edge neither drops nor duplicates.
 - **Rejecting `buffer.disk:` with `at_most_once` in config validation.** It removes a
   combination whose crash behavior surprises. It also takes durable buffering away from
-  `statsd_out` and `collectd_out`, where an operator may prefer a bounded replay after a crash
-  to losing the queue.
+  `statsd_out`, where an operator may prefer a bounded replay after a crash to losing the
+  queue.
 - **Persisting the cursor before each send under `at_most_once`.** It makes the posture hold
   across a crash. It costs an `fsync` per batch and turns a crash during a send into a loss,
   which is the opposite of the target.
@@ -260,12 +295,17 @@ Each of these is a workstream in
 [`docs/plans/delivery-semantics.md`](../plans/delivery-semantics.md). Until it lands, the gap is
 an entry in [`docs/known-gaps.md`](../known-gaps.md).
 
-- `Output::duplicate_safe()` is replaced by a class, `DeliveryPosture`'s derivation changes, and
-  eight sinks change their default posture to `at_least_once`. A deployment that relied on the
-  old default sets `buffer.delivery: at_most_once`. This is a pre-release break with no alias.
-- An `Ambiguous` fault on those eight sinks is retried for up to `buffer.retry_budget`, 60 s by
+- `Output::duplicate_safe()` goes away, `at_least_once` becomes the runtime's default posture,
+  and nine sinks change default: `otlp_out`, `splunk_hec_out`, `datadog_out`,
+  `datadog_trace_out`, `syslog_out`, `stdio_out`, `file_out`, `collectd_out`, and `logit_out`.
+  A deployment that relied on the old default sets `buffer.delivery: at_most_once`. This is a
+  pre-release break with no alias.
+- An `Ambiguous` fault on those nine sinks is retried for up to `buffer.retry_budget`, 60 s by
   default, where it was dropped at once. A sink whose destination answers `5xx` holds its queue
   head for that long, and its `overflow` policy decides what happens behind it.
+- A resend to a destination that aggregates the kind it carries double-counts. The operator
+  docs for `datadog_out` and `splunk_hec_out` say which kinds, and point at `aggregate`'s
+  `temporality: cumulative`.
 - `otlp_out`, `datadog_out`, and `datadog_trace_out` gain `splunk_hec_out`'s rule.
 - `logit_in`, `prometheus_in`'s remote-write receiver, and the other HTTP listeners need to
   learn from `Fanout` that no consumer took a batch.

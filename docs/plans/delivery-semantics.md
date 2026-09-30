@@ -19,33 +19,39 @@ Make the code do what [ADR `delivery-semantics`](../adr/delivery-semantics.md) d
 
 ## Workstreams
 
-Each is one PR. W1 lands before W2, and W4 before W5. The rest are independent.
+Each is one PR. W1 lands before W2 and W5, and W4 before W5. The rest are independent.
 
 | WS | Change | ADR item |
 |---|---|---|
-| W1 | A duplicate-harm class replaces `Output::duplicate_safe()`, and the default postures follow it | 5 |
+| W1 | `Output::duplicate_safe()` goes away and `at_least_once` becomes the default posture | 5 |
 | W2 | `otlp_out`, `datadog_out`, and `datadog_trace_out` report `Ambiguous` once a request was accepted | 9 |
 | W3 | An input doesn't acknowledge a batch no consumer took | 3 |
 | W4 | A record for the native hop's wire: identity, sequence, window, and spool record | 7 |
 | W5 | The native hop's implementation | 7 |
 | W6 | Operator docs | all |
 
-### W1: duplicate-harm class and default postures
+### W1: `at_least_once` by default
 
-- Replace `Output::duplicate_safe() -> bool` with a method that returns the class, and
-  `DeliveryPosture::from_duplicate_safe` with a derivation from it
-  (`crates/logit-pipeline/src/output.rs`).
-- Assign every sink in `crates/logit-outputs/src/` its class from the ADR's table, and rewrite
-  its doc to say what a duplicate does at its destination.
-- `logit_out` takes the "extra record" class here and the idempotent class in W5.
-- Tests: one per class that an `Ambiguous` fault is retried or dropped as the class says, and
-  one that `buffer.delivery:` overrides each.
+- Remove `Output::duplicate_safe()` and `DeliveryPosture::from_duplicate_safe`
+  (`crates/logit-pipeline/src/output.rs`). The runtime's default is `at_least_once`. Decide how
+  `statsd_out` declares its `at_most_once` default: a method on `Output` that returns the
+  default posture, with the trait default `at_least_once`, is the smallest shape.
+- Rewrite every sink's posture doc in `crates/logit-outputs/src/` to say what a resend does at
+  its destination, which kinds the destination aggregates, and the `aggregate`
+  `temporality: cumulative` remedy where one applies (`datadog_out`, `splunk_hec_out`,
+  `otlp_out`).
+- `logit_out` defaults to `at_least_once` here, before W5 can deduplicate. Between W1 and W5 a
+  resend after a lost `Ack` reaches `logit_in`'s consumers twice, and a `statsd_out` or an
+  aggregated kind behind that `logit_in` double-counts it. `buffer.delivery: at_most_once` on
+  the `logit_out` avoids that until W5.
+- Tests: an `Ambiguous` fault is retried by default and dropped on `statsd_out`, and
+  `buffer.delivery:` overrides each.
 - Update the posture text in [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md) by
   amendment, and `docs/known-gaps.md`'s "Sink default postures don't follow ADR
   `delivery-semantics` yet" entry closes.
 
-W1 lands first because W2 turns a `Clean` fault into an `Ambiguous` one, which the old default
-drops.
+W1 lands before W2 because W2 turns a `Clean` fault into an `Ambiguous` one, which the old
+default drops.
 
 ### W2: `Ambiguous` after an accepted request
 
@@ -80,7 +86,8 @@ A record that supersedes "Sequence numbers are implicit" in [ADR
 - how a disk spool's record carries the sequence, and what an old spool's records replay as;
 - the window's size and bound per sender, the bound on senders, and eviction;
 - what `Ack.seq` means once sequences outlive a connection;
-- how a restart without a spool takes a new identity;
+- how a restart without a spool takes a new identity, and how a spool whose records have all
+  been unlinked recovers its next sequence number or takes a new identity too;
 - the counter for a recognized resend.
 
 The native-transport record rejected an explicit `seq` field so that one frame's bytes serve a
@@ -90,7 +97,6 @@ socket and a file. W4 says whether that still holds.
 
 - `logit_out`, `logit_in`, `crates/logit-proto/src/native/control.rs`, and
   `crates/logit-pipeline/src/disk_queue.rs`, per W4.
-- `LogitOutput`'s class becomes idempotent.
 - Tests: a resend after a lost `Ack` is forwarded once; a spool replay after a crash is
   forwarded once; a frame outside the window is forwarded; a sender with a new identity isn't
   read as a resend.
@@ -116,7 +122,7 @@ W6 can land in pieces with the workstream each piece describes.
 - **W3:** what `logit_in` writes for a batch no consumer took, and whether a closed consumer
   propagates as a shutdown signal.
 - **W4:** everything its list names.
-- **W1:** whether `stdio_out` and `file_out` need a class at all. Their write errors carry no
-  `Fault`, so they're `Permanent` and never retried. The one exception, `file_out`'s failed
-  re-open after a rotation, is `Clean`, which retries under both postures. The posture has
-  nothing to decide.
+- **W1:** whether `stdio_out` and `file_out` need a posture doc at all. Their write errors
+  carry no `Fault`, so they're `Permanent` and never retried. The one exception, `file_out`'s
+  failed re-open after a rotation, is `Clean`, which retries under both postures. The posture
+  has nothing to decide.
