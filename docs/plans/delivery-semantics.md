@@ -38,8 +38,11 @@ Each is one PR. W1 lands before W2 and W5, and W4 before W5. The rest are indepe
   default posture, with the trait default `at_least_once`, is the smallest shape.
 - Rewrite every sink's posture doc in `crates/logit-outputs/src/` to say what a resend does at
   its destination, which kinds the destination aggregates, and the `aggregate`
-  `temporality: cumulative` remedy where one applies (`datadog_out`, `splunk_hec_out`,
-  `otlp_out`).
+  `temporality: cumulative` remedy where one applies (a delta `Sum` or `Histogram` at
+  `otlp_out`, `prometheus_out`, and `splunk_hec_out`; a delta `Sum` at `collectd_out`).
+  `datadog_out`'s doc
+  says the remedy doesn't apply to it: its series route skips a cumulative `Sum`, and its
+  sketches and APM stats have no remedy.
 - `logit_out` defaults to `at_least_once` here, before W5 can deduplicate. Between W1 and W5 a
   resend after a lost `Ack` reaches `logit_in`'s consumers twice, and a `statsd_out` or an
   aggregated kind behind that `logit_in` double-counts it. `buffer.delivery: at_most_once` on
@@ -69,7 +72,9 @@ default drops.
 - `logit_in` writes no `Ack` for a batch no consumer took. Decide what it writes: `GOING_AWAY`
   is `Clean` at `logit_out`, which resends, and it's written only before a forward today.
 - `prometheus_in`'s remote-write receiver, `otlp_in`, `datadog_in`, `datadog_trace_in`, and
-  `splunk_hec_in` answer their protocol's retryable failure.
+  `splunk_hec_in` answer their protocol's retryable failure. `splunk_hec_in` answers a `503`
+  code 9 only when no batch of the request was taken; for a later batch it needs a retryable
+  status that doesn't carry code 9's "nothing taken" promise. Decide which.
 - `tail_in` and `docker_in` don't advance past lines no consumer took.
 - Open question: `docs/design/pipeline-graph.md`'s "Open question: a closed downstream" asks
   whether a closed consumer should propagate as a shutdown signal. W3 answers the input's half.

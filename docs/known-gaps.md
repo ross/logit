@@ -554,9 +554,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   such a batch (the plan's W3).
 
 - **A disk-backed sink replays delivered and dropped batches after a crash, under either
-  posture.** `commit` moves the read cursor in memory, and the cursor reaches disk every
-  `checkpoint_interval` (1 s by default). After a crash the spool replays the batch in flight
-  and every batch committed since the last cursor write, counted
+  posture.** `commit` moves the read cursor in memory, and the cursor reaches disk on a commit
+  once `checkpoint_interval` (1 s by default) has passed since the last write, on a segment
+  roll, or at shutdown, with no timer. After a crash the spool replays the batch in flight and
+  every batch committed since the last cursor write, which after an idle period can be far
+  older than the interval, counted
   `logit.component.buffer.disk.replayed`. Under `at_most_once` that includes a batch the sink
   dropped as `Ambiguous` to avoid a duplicate. It isn't a gap to close: [ADR
   `delivery-semantics`](adr/delivery-semantics.md), item 8, keeps the combination valid and

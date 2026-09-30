@@ -30,8 +30,9 @@ None says what `logit` aims for, so behavior follows from defaults nobody chose:
   `prometheus_out`, and `null_out` report `true`. For the rest, an attempt whose outcome is
   unknown drops the batch, whatever a duplicate would have cost at its destination.
 - **`at_most_once` doesn't hold across a crash with `buffer.disk:`.** `commit` moves the read
-  cursor in memory, and the cursor reaches disk on `checkpoint_interval`. A crash replays the
-  batch in flight and every batch committed since the last cursor write, under either posture.
+  cursor in memory, and the cursor reaches disk on a later commit, a segment roll, or shutdown.
+  A crash replays the batch in flight and every batch committed since the last cursor write,
+  under either posture.
 - **Three sinks duplicate under `at_most_once`.** `otlp_out`, `datadog_out`, and
   `datadog_trace_out` send several requests per batch and report a connect failure `Clean` after
   an earlier request was accepted. The retry resends what was accepted. [ADR
@@ -95,7 +96,12 @@ A closed consumer is outside the promise: `Fanout` skips it and counts `closed_c
 the batch is still acknowledged if another consumer took it. An input doesn't acknowledge a
 batch no consumer took. When every consumer of a batch is closed, the input answers as it does
 for a batch it couldn't deliver: `logit_in` writes no `Ack`, and an HTTP listener answers its
-protocol's retryable failure.
+protocol's retryable failure. Once a listener can see that case (the plan's W3; today `Fanout`
+reports nothing), a request that decodes to several batches answers that failure even when an
+earlier batch of it was taken, and the sender's retry duplicates that prefix. `splunk_hec_in`
+is the one listener whose retryable answer promises more: its `503` code 9 means nothing of
+the body was taken, so for a later batch it must answer a retryable status that makes no such
+promise.
 
 End-to-end acknowledgment, where an input answers only once every sink delivered, is a non-goal.
 A listener has no view of what its fan-out's sinks did, and a stateful transform such as
@@ -133,18 +139,27 @@ the hook:
   it arrives once or twice. OpenTelemetry SDKs default to cumulative temporality for this
   reason.
 - A log or a span arrives as a second record, which a reader can see and discard.
-- A kind the receiver aggregates rather than overwrites adds a resend to its total: a delta
-  `Sum` at a receiver that sums it, a Datadog distribution or sketch, a Splunk metrics index.
-  `logit`'s remedy is upstream of the sink, not in its posture: an `aggregate` with
-  `temporality: cumulative` ahead of such a sink turns the kind into one a resend overwrites.
-  An operator who sends an aggregated kind as-is accepts the double count, as every surveyed
-  sender does, or sets `buffer.delivery: at_most_once` on that sink.
+- A kind the receiver aggregates rather than overwrites adds a resend to its total. Where the
+  kind is a delta `Sum` or a delta `Histogram`, the remedy is upstream of the sink, not in its
+  posture: an `aggregate` with `temporality: cumulative` turns it into a running total that a
+  resend repeats rather than adds. `otlp_out`, `prometheus_out`, and `splunk_hec_out` carry
+  both forms, and `collectd_out` carries the `Sum` (as `COUNTER`) and drops every `Histogram`.
+  `datadog_out` doesn't: its series route skips a cumulative `Sum`, because a resent series
+  point was measured to overwrite at its `(series, timestamp)`. No `aggregate` mode changes a
+  `Distribution`, `Samples`, or `Set`; each window's summary is self-contained. So a Datadog
+  distribution point, sketch, or APM stats payload has no upstream remedy today, and is
+  assumed to add on a resend until measured. Whether a Splunk metrics index adds a resent
+  running total or stores it as a second point is unmeasured too. An operator who sends such
+  a kind accepts the double count, as every surveyed sender does, or sets
+  `buffer.delivery: at_most_once` on that sink.
 
 `statsd_out` is the one exception. The classic statsd grammar has no timestamp, and `statsd_out`
 writes a DogStatsD `|T` only when the event arrived with one, so a resent counter usually has
-no identity at its destination, and the remedy above doesn't exist for it. Over a stream it
-defaults to `at_most_once`; over a datagram, item 6 applies. `collectd_out` is not an
-exception: a collectd value carries its timestamp.
+no identity at its destination, and the remedy above doesn't exist for it. It defaults to
+`at_most_once` on every transport: a datagram send that fails after earlier datagrams landed is
+`Ambiguous` too, and item 6 bounds what a successful send proves, not the posture.
+`collectd_out` is not an exception. Its `ABSOLUTE` values are the aggregated case above, a
+resend may double-count at a receiving collectd, and the cumulative remedy applies to it.
 
 `logit_out` is at-least-once like the rest, and item 7 makes its duplicates rare. A resend
 outside item 7's window is still forwarded as a second record.
@@ -206,8 +221,11 @@ it doesn't cover a duplicate that arrived at the sending process as two batches,
 ### 8. A disk spool is at-least-once across a crash, under either posture
 
 After a crash, a `buffer.disk:` sink replays the batch that was in flight and every batch
-committed since the last cursor write, which is at most `checkpoint_interval` ago. That includes a
-batch the sink delivered and a batch it dropped as `Ambiguous`.
+committed since the last cursor write. The cursor is written by a commit once
+`checkpoint_interval` has passed since the last write, on a segment roll, at open, and at
+shutdown, with no timer. So the batches that replay are those committed within
+`checkpoint_interval` after the last write, and after an idle period that write can be any
+age. The set includes a batch the sink delivered and a batch it dropped as `Ambiguous`.
 
 `buffer.disk:` with `at_most_once` stays valid. Posture governs the retry of an unknown outcome
 while the process runs, and `at_most_once` then holds across a graceful restart, which persists
@@ -267,8 +285,9 @@ bounded resends a sink may make inside one attempt. This record adds none.
   so the class is a property of the payload, not the sink. No surveyed sender makes the
   distinction, and the remedy for the aggregated kinds is upstream (item 5).
 - **A posture per batch, from the kinds the batch carries.** More precise than any surveyed
-  sender, at the cost of a check per batch and a posture that changes with content. The
-  upstream remedy makes the content one a resend overwrites instead.
+  sender, at the cost of a check per batch and a posture that changes with content. Where an
+  upstream remedy exists it makes the content one a resend repeats instead, and where none
+  exists the surveyed senders resend anyway.
 - **`at_least_once` for `statsd_out` too.** A statsd counter has no timestamp and no identity,
   so a resend over a stream double-increments with no way to see it. Losing the increment is
   visible as a gap.
@@ -303,9 +322,11 @@ an entry in [`docs/known-gaps.md`](../known-gaps.md).
 - An `Ambiguous` fault on those nine sinks is retried for up to `buffer.retry_budget`, 60 s by
   default, where it was dropped at once. A sink whose destination answers `5xx` holds its queue
   head for that long, and its `overflow` policy decides what happens behind it.
-- A resend to a destination that aggregates the kind it carries double-counts. The operator
-  docs for `datadog_out` and `splunk_hec_out` say which kinds, and point at `aggregate`'s
-  `temporality: cumulative`.
+- A resend to a destination that aggregates the kind it carries double-counts. Each sink's
+  operator doc says which kinds, and where `aggregate`'s `temporality: cumulative` is a remedy
+  (a delta `Sum` or `Histogram` at `otlp_out`, `prometheus_out`, and `splunk_hec_out`; a
+  delta `Sum` at `collectd_out`) and where none exists (`datadog_out`'s distribution points,
+  sketches, and APM stats; every sink's `Distribution`, `Samples`, and `Set`).
 - `otlp_out`, `datadog_out`, and `datadog_trace_out` gain `splunk_hec_out`'s rule.
 - `logit_in`, `prometheus_in`'s remote-write receiver, and the other HTTP listeners need to
   learn from `Fanout` that no consumer took a batch.
